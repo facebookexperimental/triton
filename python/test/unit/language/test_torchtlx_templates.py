@@ -1,11 +1,12 @@
 # Owner(s): ["module: inductor"]
+import inspect
 import unittest
 from unittest import mock
 
 import torch
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -53,6 +54,17 @@ def flex_choices_hook_available() -> bool:
 
         return hasattr(InductorChoices, "append_flex_attention_choices")
     except Exception:
+        return False
+
+
+def flex_backward_choices_hook_available() -> bool:
+    """True when torch exposes the complete backward choices-hook contract."""
+    try:
+        from torch._inductor.choices import InductorChoices
+
+        parameters = inspect.signature(InductorChoices.append_flex_attention_choices).parameters
+        return "mutated_inputs" in parameters
+    except (AttributeError, ImportError, TypeError, ValueError):
         return False
 
 
@@ -1682,6 +1694,597 @@ HEURISTIC_CODEGEN_CASES = [
 ]
 
 
+class TestFlexAttentionChoiceRegistration(TestCase):
+    """Host-only contracts for the forward/backward TLX choices hook."""
+
+    class _Node:
+
+        def __init__(self, size, dtype=torch.bfloat16, device="cuda:0"):
+            self._size = list(size)
+            self._dtype = dtype
+            self._device = torch.device(device)
+
+        def get_size(self):
+            return self._size
+
+        def get_dtype(self):
+            return self._dtype
+
+        def get_device(self):
+            return self._device
+
+    class _Template:
+
+        def maybe_append_choice(self, choices, **kwargs):
+            choices.append(kwargs)
+
+    class _RejectingTemplate:
+
+        def maybe_append_choice(self, choices, **kwargs):
+            pass
+
+    @staticmethod
+    def _forward_inputs(dtype=torch.bfloat16, head_dim=128):
+        query = TestFlexAttentionChoiceRegistration._Node([2, 8, 512, head_dim], dtype)
+        return [query, object(), object(), object(), object()] + [object() for _ in range(4)]
+
+    @staticmethod
+    def _forward_config():
+        return type(
+            "ForwardConfig",
+            (),
+            {
+                "block_m": 128,
+                "block_n": 128,
+                "num_warps": 4,
+                "num_stages": 1,
+            },
+        )()
+
+    @staticmethod
+    def _backward_inputs(dtype=torch.bfloat16, head_dim=128):
+        q = TestFlexAttentionChoiceRegistration._Node([2, 8, 512, head_dim], dtype)
+        k = TestFlexAttentionChoiceRegistration._Node([2, 1, 512, head_dim], dtype)
+        v = TestFlexAttentionChoiceRegistration._Node([2, 1, 512, head_dim], dtype)
+        return [q, k, v] + [object() for _ in range(13)]
+
+    @staticmethod
+    def _backward_config():
+        return type(
+            "BackwardConfig",
+            (),
+            {
+                "block_m1": 32,
+                "block_n1": 128,
+                "block_m2": 128,
+                "block_n2": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+        )()
+
+    @staticmethod
+    def _stock_backward_config():
+        """Representative PyTorch default before its gfx950 config change."""
+        return type(
+            "StockBackwardConfig",
+            (),
+            {
+                "block_m1": 64,
+                "block_n1": 128,
+                "block_m2": 128,
+                "block_n2": 64,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        )()
+
+    def test_flex_backward_registration_does_not_depend_on_stock_config(self):
+        """The reviewed TLX tile must be offered without PyTorch config support."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._stock_backward_config()],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {},
+                128,
+                128,
+                mutated_inputs=[],
+            )
+
+        self.assertEqual(1, len(choices))
+        self.assertEqual(32, choices[0]["BLOCK_M1"])
+        self.assertEqual(128, choices[0]["BLOCK_N1"])
+        self.assertEqual(128, choices[0]["BLOCK_M2"])
+        self.assertEqual(32, choices[0]["BLOCK_N2"])
+        self.assertEqual(4, choices[0]["num_warps"])
+
+    def test_flex_forward_force_replaces_stock_only_after_choice_appends(self):
+        """Rejected or absent forward candidates must retain stock choices."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        for is_amd in (False, True):
+            for case, template, configs, keeps_stock in (
+                (
+                    "rejected",
+                    self._RejectingTemplate(),
+                    [self._forward_config()],
+                    True,
+                ),
+                ("empty", self._Template(), [], True),
+                (
+                    "accepted",
+                    self._Template(),
+                    [self._forward_config()],
+                    False,
+                ),
+            ):
+                with self.subTest(is_amd=is_amd, case=case):
+                    choices = ["stock"]
+                    with (
+                            config.patch({"triton.tlx_mode": "force"}),
+                            mock.patch.object(
+                                flex_attention_templates,
+                                "_use_amd_flex_template",
+                                return_value=is_amd,
+                            ),
+                            mock.patch.object(
+                                flex_attention_templates,
+                                "gfx950_flex_attention_template",
+                                template,
+                            ),
+                            mock.patch.object(
+                                flex_attention_templates,
+                                "blackwell_flex_attention_template",
+                                template,
+                            ),
+                            mock.patch.object(
+                                flex_attention_templates,
+                                "current_target",
+                                return_value=type("Target", (), {"num_sms": 256})(),
+                            ),
+                    ):
+                        flex_attention_templates.append_tlx_flex(
+                            choices,
+                            configs,
+                            self._forward_inputs(),
+                            [object(), object()],
+                            object(),
+                            {},
+                            128,
+                            128,
+                        )
+
+                    if keeps_stock:
+                        self.assertEqual(["stock"], choices)
+                    else:
+                        self.assertEqual(1, len(choices))
+                        self.assertIsInstance(choices[0], dict)
+
+    def test_flex_backward_registration_honors_effective_bwd_overrides(self):
+        """Compatible user overrides must take precedence over the stock config."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._stock_backward_config()],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {
+                    "bwd_BLOCK_M1": 32,
+                    "bwd_BLOCK_N1": 128,
+                    "bwd_BLOCK_M2": 128,
+                    "bwd_BLOCK_N2": 32,
+                    "bwd_num_warps": 4,
+                },
+                128,
+                128,
+                mutated_inputs=[],
+            )
+
+        self.assertEqual(1, len(choices))
+        self.assertEqual(4, choices[0]["num_warps"])
+
+    def test_flex_backward_registration_emits_effective_gfx950_backend_options(self):
+        """Advertised options must match what the gfx950 backend compiles."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._backward_config()],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {},
+                128,
+                128,
+                mutated_inputs=[],
+            )
+
+        self.assertEqual(1, len(choices))
+        choice = choices[0]
+        self.assertEqual(16, choice["matrix_instr_nonkdim"])
+        self.assertEqual(1, choice["kpack"])
+        self.assertEqual(0, choice["waves_per_eu"])
+
+    def test_flex_backward_registration_preserves_full_mutation_contract(self):
+        """Preserve captured mutations and deduplicate equivalent choices."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        inputs = self._backward_inputs()
+        mutated_inputs = [inputs[6], inputs[7], object()]
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                    create=True,
+                ),
+        ):
+            result = flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._backward_config(), self._backward_config()],
+                inputs,
+                [object(), object(), object(), []],
+                object(),
+                {
+                    "fwd_BLOCK_M": 64,
+                    "bwd_BLOCK_M1": 32,
+                    "BLOCKS_ARE_CONTIGUOUS": False,
+                },
+                128,
+                128,
+                mutated_inputs=mutated_inputs,
+            )
+
+        self.assertIs(result, choices)
+        self.assertEqual(1, len(choices))
+        choice = choices[0]
+        self.assertIs(choice["input_nodes"], inputs)
+        self.assertIs(choice["mutated_inputs"], mutated_inputs)
+        self.assertEqual([2, 8, 512, 128, 1, 512], choice["call_sizes"])
+        self.assertEqual(1, choice["num_stages"])
+        self.assertEqual(4, choice["num_warps"])
+        self.assertFalse(choice["USE_TMA"])
+        self.assertEqual(32, choice["BLOCK_M1"])
+        self.assertEqual(128, choice["BLOCK_N1"])
+        self.assertEqual(128, choice["BLOCK_M2"])
+        self.assertEqual(32, choice["BLOCK_N2"])
+        self.assertNotIn("fwd_BLOCK_M", choice)
+        self.assertNotIn("bwd_BLOCK_M1", choice)
+
+    def test_flex_backward_registration_requires_complete_mutation_contract(self):
+        """Missing captured mutations must retain the stock fallback."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._backward_config()],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {},
+                128,
+                128,
+                mutated_inputs=None,
+            )
+
+        self.assertEqual(["stock"], choices)
+
+    def test_flex_backward_arch_uses_shared_exact_gfx950_target(self):
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        for key, expected in (
+            ("gfx950", True),
+            ("gfx942", False),
+            ("gfx1250", False),
+            ("sm100", False),
+            ("", False),
+        ):
+            with (
+                    self.subTest(key=key),
+                    mock.patch.object(
+                        flex_attention_templates,
+                        "current_target",
+                        return_value=type("Target", (), {"key": key})(),
+                    ),
+            ):
+                self.assertEqual(
+                    expected,
+                    flex_attention_templates._use_amd_flex_template(),
+                )
+
+    def test_flex_backward_registration_keeps_stock_for_unsupported_input(self):
+        """Force mode must not clear the only choice when TLX is ineligible."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        for dtype, head_dim in (
+            (torch.float16, 128),
+            (torch.bfloat16, 96),
+        ):
+            with self.subTest(dtype=dtype, head_dim=head_dim):
+                choices = ["stock"]
+                with (
+                        config.patch({"triton.tlx_mode": "force"}),
+                        mock.patch.object(
+                            flex_attention_templates,
+                            "_use_amd_flex_template",
+                            return_value=True,
+                        ),
+                        mock.patch.object(
+                            flex_attention_templates,
+                            "gfx950_flex_attention_backward_template",
+                            self._Template(),
+                            create=True,
+                        ),
+                ):
+                    result = (flex_attention_templates.append_tlx_flex(
+                        choices,
+                        [self._backward_config()],
+                        self._backward_inputs(dtype, head_dim),
+                        [object(), object(), object(), []],
+                        object(),
+                        {},
+                        128,
+                        128,
+                        mutated_inputs=[],
+                    ))
+                self.assertIs(result, choices)
+                self.assertEqual(["stock"], choices)
+
+    def test_flex_backward_registration_rejects_16_row_lds_transpose(self):
+        """The gfx950 TLX local-transpose inference cannot represent 16 rows."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._stock_backward_config()],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {"bwd_BLOCK_M1": 16, "bwd_BLOCK_N2": 16},
+                128,
+                128,
+                mutated_inputs=[],
+            )
+
+        self.assertEqual(["stock"], choices)
+
+    def test_flex_backward_empty_configs_never_fall_through_to_forward(self):
+        """A malformed backward payload must retain the stock fallback."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {},
+                128,
+                128,
+                mutated_inputs=[],
+            )
+
+        self.assertEqual(["stock"], choices)
+
+    def test_flex_backward_force_replaces_stock_only_after_choice_appends(self):
+        """Rejected candidates and unsafe effective overrides keep stock."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        for template, kernel_options in (
+            (self._RejectingTemplate(), {}),
+            (self._Template(), {"bwd_BLOCK_M1": 16}),
+            (self._Template(), {"bwd_num_warps": 8}),
+            (self._Template(), {"SPARSE_Q_BLOCK_SIZE": 96}),
+            (self._Template(), {"SPARSE_KV_BLOCK_SIZE": 0}),
+        ):
+            with self.subTest(template=type(template).__name__, kernel_options=kernel_options):
+                choices = ["stock"]
+                with (
+                        config.patch({"triton.tlx_mode": "force"}),
+                        mock.patch.object(
+                            flex_attention_templates,
+                            "_use_amd_flex_template",
+                            return_value=True,
+                        ),
+                        mock.patch.object(
+                            flex_attention_templates,
+                            "gfx950_flex_attention_backward_template",
+                            template,
+                        ),
+                ):
+                    flex_attention_templates.append_tlx_flex(
+                        choices,
+                        [self._backward_config()],
+                        self._backward_inputs(),
+                        [object(), object(), object(), []],
+                        object(),
+                        kernel_options,
+                        128,
+                        128,
+                        mutated_inputs=[],
+                    )
+
+                self.assertEqual(["stock"], choices)
+
+    def test_flex_backward_registration_only_offers_native_k32_tile(self):
+        """Scheduled MFMA candidates must use the reviewed native fragments."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        choices = ["stock"]
+        with (
+                config.patch({"triton.tlx_mode": "force"}),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "_use_amd_flex_template",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    flex_attention_templates,
+                    "gfx950_flex_attention_backward_template",
+                    self._Template(),
+                ),
+        ):
+            flex_attention_templates.append_tlx_flex(
+                choices,
+                [self._stock_backward_config()],
+                self._backward_inputs(),
+                [object(), object(), object(), []],
+                object(),
+                {"bwd_BLOCK_N2": 64},
+                128,
+                128,
+                mutated_inputs=[],
+            )
+
+        self.assertEqual(["stock"], choices)
+
+    def test_flex_backward_template_exposes_stock_abi_grid(self):
+        """A forward grid on the backward template silently misowns dK/dV."""
+        from torch._inductor.select_algorithm import TritonTemplate
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        template = (flex_attention_templates.gfx950_flex_attention_backward_template)
+        self.assertIsInstance(template, TritonTemplate)
+        self.assertEqual("tlx_gfx950_flex_attention_bwd", template.name)
+        self.assertEqual(
+            (36, 2, 1),
+            template.grid(
+                2,
+                8,
+                512,
+                128,
+                1,
+                512,
+                {"BLOCK_M2": 128, "BLOCK_N1": 128},
+            ),
+        )
+
+    def test_flex_backward_checked_loads_match_utility_abi(self):
+        """Checked pointer loads must pass PyTorch's index-dtype argument."""
+        import ast
+
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        def load_checked_2d(
+            ptr,
+            offs_m,
+            offs_n,
+            stride_m,
+            stride_n,
+            is_divisible_m,
+            is_divisible_n,
+            m_len,
+            n_len,
+            index_dtype,
+        ):
+            return index_dtype
+
+        source = load_tlx_template("gfx950_flex_attention_bwd")
+        call_sources = [line.partition("=")[2].strip() for line in source.splitlines() if "= load_checked_2d(" in line]
+        self.assertTrue(call_sources)
+
+        utility_signature = inspect.signature(load_checked_2d)
+        for call_source in call_sources:
+            call = ast.parse(call_source, mode="eval").body
+            self.assertIsInstance(call, ast.Call)
+            self.assertFalse(call.keywords)
+            argument_names = [argument.id for argument in call.args]
+            bound = utility_signature.bind(*argument_names)
+            self.assertEqual("INDEX_DTYPE", bound.arguments["index_dtype"])
+
+
 @instantiate_parametrized_tests
 class TestFlexAttention(TestCase):
     """AMD (gfx950/MI350) FlexAttention Inductor template.
@@ -1705,6 +2308,23 @@ class TestFlexAttention(TestCase):
         }):
             out, code = run_and_get_code(torch.compile(fn), q, k, v)
         return out, "\n".join(code)
+
+    def _run_backward(self, fn, q, k, v):
+        q = q.detach().requires_grad_(True)
+        k = k.detach().requires_grad_(True)
+        v = v.detach().requires_grad_(True)
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": False,
+        }):
+            out, code = run_fw_bw_and_get_code(lambda: torch.compile(fn)(q, k, v))
+        return out, (q.grad, k.grad, v.grad), "\n".join(code)
+
+    def _assert_tlx_backward_generated(self, code):
+        self.assertIn("# TLX_TEMPLATE: gfx950_flex_attention_bwd", code)
+        self.assertIn("tlx.amd_scheduled_mfma", code)
+        self.assertIn("tlx.amd_mfma_commit", code)
 
     @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -1800,6 +2420,144 @@ class TestFlexAttention(TestCase):
         torch.testing.assert_close(out, ref_o, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(lse, ref_lse, atol=3e-2, rtol=3e-2)
         self.assertIn("tlx_gfx950_flex_attention", "\n".join(code))
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_backward_choices_hook_available(),
+        "torch lacks the FlexAttention backward choices-hook contract",
+    )
+    @parametrize("head_dim", (64, 128))
+    def test_flex_backward_dense(self, head_dim):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        B, H, N, D = 1, 2, (257 if head_dim == 64 else 256), head_dim
+        sm = 1.0 / (D**0.5)
+        q, k, v = self._qkv(B, H, N, D, torch.bfloat16)
+        fn = lambda q, k, v: flex_attention(q, k, v, scale=sm)  # noqa: E731
+        out, grads, code = self._run_backward(fn, q, k, v)
+
+        ref_q = q.detach().requires_grad_(True)
+        ref_k = k.detach().requires_grad_(True)
+        ref_v = v.detach().requires_grad_(True)
+        ref = fn(ref_q, ref_k, ref_v)
+        ref.sum().backward()
+
+        torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+        for actual, expected in zip(grads, (ref_q.grad, ref_k.grad, ref_v.grad)):
+            torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+        self._assert_tlx_backward_generated(code)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_backward_choices_hook_available(),
+        "torch lacks the FlexAttention backward choices-hook contract",
+    )
+    @parametrize(
+        "case",
+        ((128, "causal"), (128, "sliding"), (128, "striped"), (64, "striped")),
+        name_fn=lambda case: f"d{case[0]}_{case[1]}",
+    )
+    def test_flex_backward_partial_block_mask_gqa(self, case):
+        from torch.nn.attention.flex_attention import (
+            create_block_mask,
+            flex_attention,
+        )
+
+        D, mask_kind = case
+        B, Hq, Hkv, N = 1, 4, 1, 256
+        sm = 1.0 / (D**0.5)
+        torch.manual_seed(0)
+        q = torch.randn(B, Hq, N, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        k = torch.randn(B, Hkv, N, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        v = torch.randn(B, Hkv, N, D, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        def mask_mod(b, h, m, n):
+            if mask_kind == "causal":
+                return m >= n
+            if mask_kind == "sliding":
+                return (m >= n) & (m - n <= 160)
+            return (m == n) | ((m >= n) & ((n // 64) % 3 != 1))
+
+        block_mask = create_block_mask(
+            mask_mod,
+            B,
+            Hq,
+            N,
+            N,
+            device=GPU_TYPE,
+        )
+        score_mod = lambda score, b, h, m, n: score * 0.7  # noqa: E731
+        fn = lambda q, k, v: flex_attention(  # noqa: E731
+            q,
+            k,
+            v,
+            score_mod=score_mod,
+            block_mask=block_mask,
+            scale=sm,
+            enable_gqa=True,
+        )
+        out, grads, code = self._run_backward(fn, q, k, v)
+
+        ref_q = q.detach().requires_grad_(True)
+        ref_k = k.detach().requires_grad_(True)
+        ref_v = v.detach().requires_grad_(True)
+        ref = fn(ref_q, ref_k, ref_v)
+        ref.sum().backward()
+
+        torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+        for actual, expected in zip(grads, (ref_q.grad, ref_k.grad, ref_v.grad)):
+            torch.testing.assert_close(actual, expected, atol=6e-2, rtol=6e-2)
+        self._assert_tlx_backward_generated(code)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_backward_choices_hook_available(),
+        "torch lacks the FlexAttention backward choices-hook contract",
+    )
+    def test_flex_backward_captured_score_mod_gradient(self):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        B, H, N, D = 1, 2, 128, 128
+        sm = 1.0 / (D**0.5)
+        q, k, v = self._qkv(B, H, N, D, torch.bfloat16)
+        bias = torch.randn(H, N, N, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        def fn(q, k, v, bias):
+
+            def score_mod(score, b, h, m, n):
+                return score + bias[h, m, n]
+
+            return flex_attention(q, k, v, score_mod=score_mod, scale=sm)
+
+        q = q.detach().requires_grad_(True)
+        k = k.detach().requires_grad_(True)
+        v = v.detach().requires_grad_(True)
+        bias = bias.detach().requires_grad_(True)
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+        }):
+            out, code = run_fw_bw_and_get_code(lambda: torch.compile(fn)(q, k, v, bias))
+
+        ref_q = q.detach().requires_grad_(True)
+        ref_k = k.detach().requires_grad_(True)
+        ref_v = v.detach().requires_grad_(True)
+        ref_bias = bias.detach().requires_grad_(True)
+        ref = fn(ref_q, ref_k, ref_v, ref_bias)
+        ref.sum().backward()
+
+        torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+        for actual, expected in zip(
+            (q.grad, k.grad, v.grad, bias.grad),
+            (ref_q.grad, ref_k.grad, ref_v.grad, ref_bias.grad),
+        ):
+            torch.testing.assert_close(actual, expected, atol=7e-2, rtol=7e-2)
+        code = "\n".join(code)
+        self._assert_tlx_backward_generated(code)
 
 
 class TestResourceModel(TestCase):
