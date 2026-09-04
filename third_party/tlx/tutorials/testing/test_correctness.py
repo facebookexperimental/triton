@@ -919,6 +919,11 @@ def _make_attention_numeric_inputs(shape, dtype, distribution):
         return tuple(torch.empty(shape, device=DEVICE, dtype=dtype).uniform_(-0.5, 0.5) for _ in range(3))
     if distribution == "normal_random":
         return tuple(torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5) for _ in range(3))
+    if distribution in ("positive_shift", "negative_shift"):
+        q = torch.full(shape, 1.5, device=DEVICE, dtype=dtype)
+        k = torch.full(shape, 1.5 if distribution == "positive_shift" else -1.5, device=DEVICE, dtype=dtype)
+        v = torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5)
+        return q, k, v
     q = torch.ones(shape, device=DEVICE, dtype=dtype)
     q[:, :, shape[2] // 2:, :] = -1
     amplitude = 0.625 if shape[3] == 128 else 0.2
@@ -938,7 +943,9 @@ def test_blackwell_fa_ws_pipelined_persistent_fast_fixed_bf16_numerics(distribut
 
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
     ref_o = torch.matmul(torch.softmax(scores, dim=-1), v.float())
-    ref_m = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
+    # Fast fixed-gauge forward stores the reciprocal normalization factor.
+    fixed_gauge = 4.055517269
+    ref_m = torch.sum(torch.exp2(scores * math.log2(math.e) - fixed_gauge), dim=-1).reciprocal()
 
     outputs = [_run_blackwell_fa_numeric(q, k, v, sm_scale) for _ in range(3)]
     tri_o, tri_m = outputs[0]
@@ -951,13 +958,12 @@ def test_blackwell_fa_ws_pipelined_persistent_fast_fixed_bf16_numerics(distribut
     print(f"{distribution}: O max/RMSE="
           f"{o_error.max().item():.8g}/{o_error.square().mean().sqrt().item():.8g}")
     torch.testing.assert_close(tri_o.float(), ref_o, atol=1e-2, rtol=0)
-    # The fixed-gauge BF16 exp approximation has a bounded bias in the saved
-    # base-2 log-sum-exp; backward consumes the matching value from forward.
-    torch.testing.assert_close(tri_m, ref_m, atol=0.125, rtol=0)
+    torch.testing.assert_close(tri_m, ref_m, atol=0, rtol=0.125)
 
 
 @pytest.mark.parametrize("rescale_opt", [False, True])
-@pytest.mark.parametrize("distribution", ["uniform_random", "normal_random", "far_apart"])
+@pytest.mark.parametrize("distribution",
+                         ["uniform_random", "normal_random", "far_apart", "positive_shift", "negative_shift"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_2cta_non_fast_fixed_numerics(distribution, rescale_opt):
     Z, H, N_CTX, HEAD_DIM = 4, 48, 1024, 128
@@ -1211,7 +1217,19 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         PRE_BLOCK = 128
         pre_grid = (N_CTX // PRE_BLOCK, Z * H)
         delta = torch.empty_like(M)
-        _blackwell_fa_bwd_preprocess[pre_grid](o, do, delta, N_CTX, BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM)
+        _blackwell_fa_bwd_preprocess[pre_grid](
+            o,
+            do,
+            M,
+            do,
+            delta,
+            do,
+            N_CTX,
+            SCALE_DO_BY_INV_L=False,
+            ZERO_DQ=False,
+            BLOCK_M=PRE_BLOCK,
+            HEAD_DIM=HEAD_DIM,
+        )
 
         # Backward: main kernel
         dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32) if direct_dq_output else torch.empty(
@@ -1231,12 +1249,17 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_bq = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         if direct_dq_output:
-            _dq_desc_shape = desc_shape
-            _dq_desc_strides = desc_strides
+            _dq_desc_shape = [Z, H, 2, N_CTX, _HALF_HD]
+            _dq_desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, HEAD_DIM, 1]
         else:
             _dq_desc_shape = [Z, H, 2 * N_CTX, _HALF_HD]
             _dq_desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, 1]
-        desc_dq = TensorDescriptor(dq_accum, shape=_dq_desc_shape, strides=_dq_desc_strides, block_shape=dummy_block_4d)
+        desc_dq = TensorDescriptor(
+            dq_accum,
+            shape=_dq_desc_shape,
+            strides=_dq_desc_strides,
+            block_shape=[1, 1, 1, 1, 1] if direct_dq_output else dummy_block_4d,
+        )
         desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
@@ -1285,6 +1308,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             STAGE=stage,
             DQ_STAGE_COUNT=2,
             SCALE_QK_IN_KERNEL=direct_dq_output,
+            PRENORMALIZED_DO=False,
         )
 
         if not direct_dq_output:
@@ -1335,6 +1359,17 @@ def test_blackwell_fa_ws_pipelined_persistent_direct_dq_pruning():
     assert odd_tiles
     assert all(config.kwargs.get("NUM_CTAS", 1) == 1 for config in odd_tiles)
 
+    for n_ctx in (256, 512, 768):
+        short_dense = _prune_bwd_configs(
+            configs,
+            {},
+            SCALE_QK_IN_KERNEL=True,
+            HEAD_DIM=128,
+            N_CTX=n_ctx,
+        )
+        assert short_dense
+        assert all(config.kwargs.get("NUM_CTAS", 1) == 2 for config in short_dense)
+
 
 @pytest.mark.parametrize(
     "dtype,N_CTX,causal",
@@ -1342,6 +1377,9 @@ def test_blackwell_fa_ws_pipelined_persistent_direct_dq_pruning():
         (torch.float16, 128, False),
         (torch.float16, 384, False),
         (torch.float16, 1024, False),
+        (torch.bfloat16, 256, False),
+        (torch.bfloat16, 512, False),
+        (torch.bfloat16, 768, False),
         (torch.bfloat16, 1024, False),
         (torch.bfloat16, 1024, True),
         (torch.bfloat16, 4096, False),

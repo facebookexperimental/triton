@@ -915,6 +915,9 @@ class TestStorageAlias2CTA:
             import torch
             import triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent as fa
 
+            # Avoid unrelated forward autotuning in this backward regression test.
+            fa._attn_fwd_ws.configs = [fa.configs[0]]
+
             # Force the backward autotuner to only the 2-CTA config (BLOCK_M1=128).
             # Its dq tile is (BLOCK_M1//NUM_CTAS, HEAD_DIM) = (64,128): a blockM=64
             # TwoCTA_RHS storage-alias tile placed at a non-zero column offset via
