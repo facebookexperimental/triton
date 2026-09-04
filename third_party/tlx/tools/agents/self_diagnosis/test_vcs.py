@@ -54,8 +54,13 @@ class GitAutoCommitTest(unittest.TestCase):
             snapshot,
             "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
             "Tune kernel",
-            body="Fold the scale into the exponent.\n\nTLX agent authored",
             validate_committed_source=validated.append,
+            body=(
+                "What changed: tune B\n"
+                "Why it works: less work\n"
+                "Correctness: PASS (2/2 cases)\n"
+                "Performance: target 10.0 us -> 8.0 us (1.2500x)"
+            ),
         )
 
         self.assertTrue(result.success)
@@ -76,9 +81,13 @@ class GitAutoCommitTest(unittest.TestCase):
             "kernels/kernel.py",
         )
         message = _run(["git", "log", "-1", "--format=%B"], root)
-        self.assertIn("Fold the scale into the exponent.", message)
         self.assertEqual(message.count(ATTRIBUTION), 1)
         self.assertTrue(message.rstrip().endswith(ATTRIBUTION))
+        self.assertIn(ATTRIBUTION, message)
+        self.assertIn("What changed: tune B", message)
+        self.assertIn("Why it works: less work", message)
+        self.assertIn("Correctness: PASS (2/2 cases)", message)
+        self.assertIn("Performance: target 10.0 us -> 8.0 us (1.2500x)", message)
 
     def test_sequential_promotion_commits_and_forward_rollback(self) -> None:
         temporary, root, kernel = self._repo()

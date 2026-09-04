@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title description">
-  <title id="title">FBTriton agent organization</title>
+  <title id="title">Kernel optimization role organization</title>
   <desc id="description">The Manager dispatches profiling, causal analysis, implementation, build, and validation work. Confirmed findings may be proposed to the Knowledge Keeper for human-approved durable guidance. Self Diagnosis checks the complete agent system.</desc>
   <defs>
     <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
@@ -18,7 +18,7 @@
     </style>
   </defs>
   <rect width="1600" height="900" fill="#080c17"/>
-  <text x="64" y="68" class="title">FBTRITON AGENT TEAM</text>
+  <text x="64" y="68" class="title">KERNEL OPTIMIZATION ROLES</text>
   <text x="64" y="98" class="subtitle">one role per folder · explicit handoffs · deterministic validation</text>
 
   <g transform="translate(610 135)">

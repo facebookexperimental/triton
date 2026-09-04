@@ -48,6 +48,9 @@ Evidence-driven optimization workflow:
    predicate that preserves each win, have the Worker implement it, and require full-shape
    revalidation. Do not combine a branch that fails to beat the current incumbent on the
    shapes it would serve.
+7. Keep production source terse. Remove nonessential strings, comments, docstrings, benchmark
+   history, and role/process narration. Retain text only for a non-obvious correctness,
+   synchronization, or hardware invariant that the code cannot express clearly.
 
 TLX API guidance:
 - Treat `.claude/skills/tlx-api-reference/SKILL.md` in the target repository as the primary
@@ -69,7 +72,8 @@ actual source change, without performance claims or attribution. `commit_summary
 under 4000 characters and contain exactly two clearly labeled
 sections: `Change summary:` explains what changed, its affected scope, and preserved
 invariants or fallback paths; `Why:` explains the measured evidence and optimization
-rationale. Do not include a commit subject, a `Performance:` section, `TLX agent authored`,
+rationale. Do not include a commit subject, a `Performance:` section,
+`Kernel optimization agent authored`,
 or any unverified performance or correctness claim. The external harness adds a formatted
 `Performance:` section with authoritative numbers after final revalidation.
 Do not modify any other file. Keep the final response to one short plain-text summary;

@@ -217,7 +217,7 @@ class AutoCommitResult:
     base_revision: str | None = None
     commit_revision: str | None = None
     subject: str | None = None
-    attribution: str = "TLX agent authored"
+    attribution: str = "Kernel optimization agent authored"
     dirty_target_at_start: bool = False
     diagnostics: str = ""
 

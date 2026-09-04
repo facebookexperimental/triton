@@ -10,7 +10,7 @@ description: >
 
 # Run The TLX Kernel Optimization Agent
 
-The executable is `third_party/tlx/tools/agents/kernel_optimization/cli.py`.
+The executable is `third_party/tlx/tools/agents/manager/cli.py`.
 Follow the layers below in order. Target-specific profiling rules supplement,
 but never replace, the generic workflow.
 
@@ -23,7 +23,7 @@ but never replace, the generic workflow.
    Never clean or revert a dirty worktree.
 3. Keep candidate generation isolated from the live checkout. Candidate source
    may exist only in the provider's temporary workspace and output artifacts
-   until final promotion.
+   until promotion.
 4. Run stdout and stderr separately. Tee stderr to a stable absolute live log;
    write stdout JSON to a separate artifact. When starting a run, respond only
    with the absolute log path unless the user asks for more.
@@ -80,8 +80,8 @@ Read `references/input-contract.md` for the complete construction and
 validation checklist. Do not start the optimization loop until the bundle is
 validated.
 
-Candidate generation automatically receives trusted source-optimization skills
-owned by `third_party/tlx/tools/agents/kernel_optimization/skills/`: every target
+Candidate generation automatically receives trusted source-optimization strategies
+owned by `third_party/tlx/tools/agents/tl/strategies/`: every target
 receives layout-conversion efficiency guidance, CUDA/NVIDIA targets additionally
 receive async TMA output publication guidance, and Blackwell targets additionally
 receive persistent CLC scheduling and persistent pipeline efficiency guidance.
@@ -213,19 +213,21 @@ Promote only when:
 - measurement variance is within budget;
 - target profiling shows no material main-kernel regression.
 
-Revalidate the finalist with benchmark, Proton attribution, summary target
-profile, and required deep target profile. Only then may the default commit
-occur. Auto-commit must detect Git or Mercurial from the kernel path, preserve
-unrelated dirty/staged work, include `TLX agent authored` in the commit body,
-and log VCS, revision, repository, target, subject, and failure diagnostics. If
-commit fails, keep all artifacts and return the distinct commit-failure status.
+Commit each candidate only after it passes the promotion gates and merged-source
+revalidation. Revalidate the finalist with benchmark, Proton attribution, summary
+target profile, and required deep target profile. Auto-commit must detect Git or
+Mercurial from the kernel path, preserve unrelated dirty/staged work, include
+`Kernel optimization agent authored` in promotion commit bodies, and log VCS,
+revision, repository, target, subject, and failure diagnostics. If final
+revalidation fails after promotions, create a forward rollback commit. If a VCS
+operation fails, keep all artifacts and return the distinct commit-failure status.
 
 ## Layer 7: Command And Completion
 
 From the repository root:
 
 ```bash
-PYTHONPATH=<repo-root> python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+PYTHONPATH=<repo-root> python -m third_party.tlx.tools.agents.manager.cli \
   --kernel <absolute-kernel.py> \
   --harness <absolute-harness.py> \
   --cases <absolute-cases.json> \

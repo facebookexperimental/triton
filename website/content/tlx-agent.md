@@ -168,10 +168,14 @@ The finalist is rebuilt and revalidated with the frozen bundle. A generated
 
 ## Version-control behavior
 
-After successful final validation, TLX Agent creates a local winner commit by
-default. It detects Git or Mercurial from the kernel path, commits only the
-baseline-to-winner delta, preserves unrelated staged and dirty work, and adds
-`TLX agent authored` to the commit body.
+Each candidate that passes the promotion gates is checkpointed in a local commit
+before the next candidate is generated. The agent detects Git or Mercurial from
+the kernel path, preserves unrelated staged and dirty work, and records the
+change, rationale, correctness, per-shape performance, and
+`Kernel optimization agent authored` in each promotion commit.
+
+If final revalidation fails after promotions, the agent creates a forward
+rollback commit while retaining the checkpoint history for diagnosis.
 
 If the live kernel changed during the run or edits overlap unsafely, the Agent
 keeps the winner artifact and reports a commit failure instead of overwriting

@@ -10,7 +10,7 @@ Implement only the assigned finding in an isolated candidate workspace; preserve
 
 ## Constraints
 
-Never deviate from the finding, add unrelated optimization, modify agent or knowledge Markdown, change validation policy, claim correctness/performance, merge, commit, or publish. A candidate must not mutate the live checkout during generation.
+Never deviate from the finding, add unrelated optimization, modify agent or knowledge Markdown, change validation policy, claim correctness/performance, merge, commit, or publish. A candidate must not mutate the live checkout during generation. Do not leave narrative experiment history, benchmark numbers, role names, or generic explanatory prose in production source. Add a comment or string only when the code cannot clearly express a critical correctness, synchronization, or hardware invariant.
 
 ## Callback
 
