@@ -527,10 +527,10 @@ def _attn_bwd_tlx(
                 dpT = tlx.async_dot_wait(0, dpT).to(tl.float32)
                 tlx.barrier_arrive(do_empties[q_buf], 1)
                 dsT = pT * (dpT - Di[None, :])
+                dk = tlx.async_dot(dsT.to(tlx.dtype_of(desc_q)), q, dk)
                 tlx.local_store(score_smem, dsT.to(tlx.dtype_of(desc_q)))
                 tlx.fence_async_shared()
 
-                dk = tlx.async_dot(score_smem, q, dk)
                 dq = tlx.async_dot(score_smem_t, k_slice)
                 dk = tlx.async_dot_wait(1, dk)
                 tlx.barrier_arrive(q_empties[q_buf], 1)
