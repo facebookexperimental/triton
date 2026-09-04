@@ -608,11 +608,13 @@ tt.func @restore_ws_arrive_stops_at_named_barrier(
   %out1 = arith.addf %v1, %bias1 : tensor<128x64xf32, #linear64>
 
   // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttng.user_named_barrier_id
   // CHECK-NEXT: ttng.wait_barrier_named
   // CHECK-NEXT: ttng.arrive_barrier
   // CHECK-SAME: channelGraph = array<i32: 4>
   ttng.tmem_store %zero, %noalias_alloc, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-  ttng.wait_barrier_named %c9, %c128 : i32, i32
+  %user_barrier = ttng.user_named_barrier_id %c9 : i32
+  ttng.wait_barrier_named %user_barrier, %c128 : !ttng.named_barrier_id, i32
   ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 4>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   tt.return %out0, %out1 : tensor<128x64xf32, #linear64>, tensor<128x64xf32, #linear64>
 }

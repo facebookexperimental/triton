@@ -835,11 +835,15 @@ void init_triton_tlx_ir(py::module_ &m) {
           py::arg("pred").none())
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
-             self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);
+             Value barrierId =
+                 self.create<ttng::UserNamedBarrierIdOp>(barrier);
+             self.create<ttng::NamedBarrierWaitOp>(barrierId, numThreads);
            })
       .def("create_named_barrier_arrive",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
-             self.create<ttng::NamedBarrierArriveOp>(barrier, numThreads);
+             Value barrierId =
+                 self.create<ttng::UserNamedBarrierIdOp>(barrier);
+             self.create<ttng::NamedBarrierArriveOp>(barrierId, numThreads);
            })
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {

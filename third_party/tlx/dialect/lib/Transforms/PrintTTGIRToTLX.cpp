@@ -493,6 +493,8 @@ getValueName(Value v,
         "arith.sitofp",       "arith.uitofp",  "arith.fptosi",
         "arith.fptoui",       "arith.bitcast", "arith.index_cast",
         "arith.index_castui", "tt.splat",      "tt.broadcast",
+        "ttng.user_named_barrier_id",
+        "ttng.compiler_named_barrier_id",
     };
     if (transparentOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
@@ -816,6 +818,8 @@ bool shouldSkipOp(
       "arith.bitcast",
       "arith.index_cast",
       "arith.index_castui",
+      "ttng.user_named_barrier_id",
+      "ttng.compiler_named_barrier_id",
       "ttng.inval_barrier",
       "tt.splat",
       "tt.broadcast",

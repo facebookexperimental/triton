@@ -1126,3 +1126,23 @@ module {
     tt.return %result : i32
   }
 }
+
+// -----
+
+module {
+  // CHECK-LABEL: def named_barrier_ids(
+  // CHECK-NOT: user_named_barrier_id
+  // CHECK-NOT: compiler_named_barrier_id
+  // CHECK: tlx.named_barrier_wait(9, 128)
+  // CHECK: tlx.named_barrier_arrive(10, 128)
+  tt.func public @named_barrier_ids() {
+    %c9 = arith.constant 9 : i32
+    %c10 = arith.constant 10 : i32
+    %c128 = arith.constant 128 : i32
+    %user = ttng.user_named_barrier_id %c9 : i32
+    %compiler = ttng.compiler_named_barrier_id %c10 : i32
+    ttng.wait_barrier_named %user, %c128 : !ttng.named_barrier_id, i32
+    ttng.arrive_barrier_named %compiler, %c128 : !ttng.named_barrier_id, i32
+    tt.return
+  }
+}
