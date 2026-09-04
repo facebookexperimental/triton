@@ -376,6 +376,28 @@ class shared_linear_layout_encoding(shared_layout_encoding):
         )
 
 
+class nv_mma_layout(layout_encoding):
+    """NVIDIA Hopper WGMMA accumulator/register layout."""
+
+    def __init__(self, warps_per_cta, instr_shape, version=(3, 0), cga_layout=None):
+        super().__init__()
+        self.version = list(map(int, tl._unwrap_if_constexpr(version)))
+        self.warps_per_cta = list(map(int, tl._unwrap_if_constexpr(warps_per_cta)))
+        self.instr_shape = list(map(int, tl._unwrap_if_constexpr(instr_shape)))
+        cga_layout = tl._unwrap_if_constexpr(cga_layout)
+        self.cga_layout = [list(map(int, basis)) for basis in (cga_layout or [])]
+        assert self.version == [3, 0], "nv_mma_layout currently supports Hopper WGMMA only"
+        assert len(self.warps_per_cta) == 2, "warps_per_cta must have two entries"
+        assert all(warps > 0 for warps in self.warps_per_cta), "warps_per_cta entries must be positive"
+        assert len(self.instr_shape) == 3, "instr_shape must have three entries"
+        assert all(dim > 0 for dim in self.instr_shape), "instr_shape entries must be positive"
+        assert all(len(basis) == 2 for basis in self.cga_layout), "cga_layout basis rank must be two"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape, element_type
+        return builder.make_nv_mma_layout_attr(self.version, self.warps_per_cta, self.instr_shape, self.cga_layout)
+
+
 class amd_mfma_layout(layout_encoding):
     """AMD MFMA distributed layout for explicit shared-load consumers."""
 
