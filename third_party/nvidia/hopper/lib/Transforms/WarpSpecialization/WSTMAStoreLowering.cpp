@@ -195,7 +195,6 @@ struct NVGPUWSTMAStoreLoweringPass
 static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
 static constexpr const char *kCLCPersistentLoop = "ttg.clc_persistent";
-static constexpr const char *kPlannedPendingCount = "planned_pending_count";
 
 static bool isTMAStoreLikeOp(Operation *op) {
   return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
@@ -466,14 +465,14 @@ void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
     auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
     if (!tmaOp) {
       waitOp->removeAttr(kCanRotateByBufferCount);
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
       return;
     }
 
     auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
     if (!allocOp) {
       waitOp->removeAttr(kCanRotateByBufferCount);
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
       return;
     }
   });
@@ -545,7 +544,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   SmallVector<std::pair<scf::WhileOp, Attribute>> whileDrains;
   funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
     if (waitOp->hasAttr(kCanRotateByBufferCount))
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
 
     Operation *parentLoop = waitOp->getParentOfType<LoopLikeOpInterface>();
     auto whileOp = dyn_cast_or_null<scf::WhileOp>(parentLoop);
@@ -560,7 +559,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
     if (!rotateBy || rotateBy.getInt() <= 0)
       return;
-    waitOp->setAttr(kPlannedPendingCount,
+    waitOp->setAttr(ttng::kPlannedPendingCount,
                     IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32),
                                      rotateBy.getInt() - 1));
     if (rotateBy.getInt() == 1)
@@ -691,7 +690,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       if (!attr)
         continue;
       int k = attr.getInt();
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
 
       // Find the defining TMA store op.
       Value buffer;
@@ -833,7 +832,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       if (!erasedWait) {
         waitOp->removeAttr(kCanRotateByBufferCount);
         waitOp->setAttr(
-            kPlannedPendingCount,
+            ttng::kPlannedPendingCount,
             IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32), k - 1));
       }
       changed = true;
@@ -1075,7 +1074,7 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
 // pendings = number of TMA store-like ops issued after the token's defining
 // store and before this wait, in program execution order.
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
-  if (auto planned = waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
+  if (auto planned = waitOp->getAttrOfType<IntegerAttr>(ttng::kPlannedPendingCount))
     return planned.getInt();
 
   ConditionContext context = getConditionContext(waitOp);
