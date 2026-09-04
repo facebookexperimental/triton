@@ -1975,16 +1975,6 @@ void printSimplifiedOp(
     return;
   }
 
-  // nvg.cluster_id: the CLC-persistent lowering replaces the source's
-  // tl.program_id(0) with the cluster id, identical for single-CTA clusters.
-  if (opName == "nvg.cluster_id") {
-    if (op->getNumResults() > 0)
-      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
-    os << "tl.program_id(axis=0)";
-    printLocComment(op, os);
-    return;
-  }
-
   // ttng.async_clc_try_cancel(mbar, response): TLX takes (response, barrier).
   if (opName == "ttng.async_clc_try_cancel") {
     os << "tlx._clc_issue("
