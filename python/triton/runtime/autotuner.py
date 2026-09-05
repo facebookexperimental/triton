@@ -1121,8 +1121,11 @@ class Config:
         auto_tma=None,
         enable_tree_reduction=None,
         enable_nvptx_v2i32=None,
+        num_cpu_threads=0,
     ):
         self.kwargs = kwargs
+        # Required by torch dynamo HOP: triton_kernel_wrap passes num_cpu_threads unconditionally.
+        self.num_cpu_threads = num_cpu_threads
         self.num_warps = num_warps
         self.num_ctas = num_ctas
         self.num_stages = num_stages
@@ -1166,6 +1169,7 @@ class Config:
         self.auto_tma = state.get("auto_tma", None)
         self.enable_tree_reduction = state.get("enable_tree_reduction", None)
         self.enable_nvptx_v2i32 = state.get("enable_nvptx_v2i32", None)
+        self.num_cpu_threads = state.get("num_cpu_threads", 0)
 
     def all_kwargs(self):
         return {
@@ -1190,6 +1194,8 @@ class Config:
                     ("auto_tma", self.auto_tma),
                     ("enable_tree_reduction", self.enable_tree_reduction),
                     ("enable_nvptx_v2i32", self.enable_nvptx_v2i32),
+                    # Omit when 0: unknown to GPU options and rejected by _pack_args.
+                    ("num_cpu_threads", self.num_cpu_threads or None),
                 ) if v is not None
             },
         }
@@ -1214,6 +1220,7 @@ class Config:
         res.append(f"auto_tma: {self.auto_tma}")
         res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
         res.append(f"enable_nvptx_v2i32: {self.enable_nvptx_v2i32}")
+        res.append(f"num_cpu_threads: {self.num_cpu_threads}")
         return ", ".join(res)
 
     def __hash__(self):
