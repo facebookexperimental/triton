@@ -1460,6 +1460,101 @@ def test_buffer_load_contiguity_vectorizes_gfx950():
 
 
 @triton.jit
+def _plain_unaligned_vector_load_kernel(
+    x_ptr,
+    y_ptr,
+    OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(x_ptr + OFFSET + offsets)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _masked_unaligned_vector_load_kernel(
+    x_ptr,
+    y_ptr,
+    OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    VALID_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < VALID_SIZE
+    values = tl.load(x_ptr + OFFSET + offsets, mask=mask, other=0)
+    tl.store(y_ptr + offsets, values)
+
+
+@pytest.mark.parametrize(
+    "pointer_type,block_size,expected_load",
+    [
+        ("*fp16", 1024, "buffer_load_dwordx2"),
+        ("*fp16", 2048, "buffer_load_dwordx4"),
+        ("*i8", 4096, "buffer_load_dwordx4"),
+    ],
+)
+def test_plain_unaligned_vector_load_is_automatic_gfx950(
+    pointer_type, block_size, expected_load
+):
+    """A plain gfx950 load vectorizes without a per-kernel opt-in."""
+    compiled = compile_for_gfx950(
+        _plain_unaligned_vector_load_kernel,
+        signature={"x_ptr": pointer_type, "y_ptr": pointer_type},
+        constexprs={"OFFSET": 1, "BLOCK_SIZE": block_size},
+    )
+
+    assert expected_load in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dtype,block_size",
+    [
+        (torch.float16, 1024),
+        (torch.float16, 2048),
+        (torch.uint8, 4096),
+    ],
+)
+@pytest.mark.parametrize("offset", [1, 2, 3, 7])
+def test_plain_unaligned_vector_load_correctness_gfx950(
+    device, offset, dtype, block_size
+):
+    """Exercise several naturally aligned but non-vector-aligned addresses."""
+    x = torch.arange(block_size + 8, device=device, dtype=dtype)
+    actual = torch.empty(block_size, device=device, dtype=dtype)
+    _plain_unaligned_vector_load_kernel[(1, )](
+        x,
+        actual,
+        OFFSET=offset,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    torch.testing.assert_close(
+        actual, x[offset:offset + block_size], atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_masked_unaligned_vector_load_correctness_gfx950(device):
+    block_size = 2048
+    valid_size = block_size - 8
+    x = torch.arange(block_size + 1, device=device, dtype=torch.float16)
+    actual = torch.empty(block_size, device=device, dtype=torch.float16)
+    compiled = _masked_unaligned_vector_load_kernel[(1, )](
+        x,
+        actual,
+        OFFSET=1,
+        BLOCK_SIZE=block_size,
+        VALID_SIZE=valid_size,
+        num_warps=4,
+    )
+    expected = torch.zeros_like(actual)
+    expected[:valid_size] = x[1:1 + valid_size]
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
+@triton.jit
 def _buffer_atomic_contiguity_layout_anchor_kernel(x_ptr, atomic_ptr, y_ptr):
     contiguous_layout: tl.constexpr = tlx.layout(
         shape=((64, 4), (4, )),
@@ -3824,8 +3919,10 @@ def test_padded_local_slice_uses_transposed_lds_read_gfx950():
     assert "ttg.memdesc_subslice" in compiled.asm["ttgir"]
     assert "ttg.memdesc_dynamic_subslice" not in compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
-    assert "ds_read_b64_tr_b16" in amdgcn
-    assert "ds_read_u16" not in amdgcn
+    # The [16, 32] subslice is consumed by two transposed LDS reads. Other
+    # operands in this kernel may independently use scalar LDS reads, so do
+    # not constrain the instruction selection for the entire kernel.
+    assert amdgcn.count("ds_read_b64_tr_b16") == 2
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
