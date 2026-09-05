@@ -1209,3 +1209,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// AMD buffer ops address global memory as a scalar base pointer plus a tensor
+// of offsets, which Triton spells `ptr + offsets`, and tl.assume reaches the
+// printer as llvm.intr.assume.
+//
+// mask/other/stride are optional operand *segments*, so they have to be
+// resolved through operandSegmentSizes: reading them positionally shifts every
+// operand after the first absent one, which is why the unmapped form printed
+// with inconsistent arity. The masked and unmasked loads below differ only in
+// which segments are populated.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def amd_buffer_ops(
+  // CHECK: tl.assume(arg4)
+  // CHECK: {{[a-z0-9_]+}} = tl.load(arg0 + arg1, mask=arg2)
+  // An absent mask segment must not pull the next operand into its place.
+  // CHECK: {{[a-z0-9_]+}} = tl.load(arg0 + arg1)
+  // CHECK: {{[a-z0-9_]+}} = tl.load(arg0 + arg1, mask=arg2, other=arg3)
+  // CHECK: {{[a-z0-9_]+}} = tlx.async_load(arg0 + arg1, {{[a-z0-9_]+}}, mask=arg2)
+  // CHECK: tl.store(arg0 + arg1, arg3, mask=arg2)
+  tt.func public @amd_buffer_ops(%ptr: !tt.ptr<f16>, %offs: tensor<64x64xi32, #blocked>,
+                                 %mask: tensor<64x64xi1, #blocked>,
+                                 %val: tensor<64x64xf16, #blocked>,
+                                 %pred: i1) attributes {noinline = false} {
+    llvm.intr.assume %pred : i1
+    %masked = amdg.buffer_load %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
+    %plain = amdg.buffer_load %ptr[%offs] : tensor<64x64xf16, #blocked>
+    %other = amdg.buffer_load %ptr[%offs], %mask, %val : tensor<64x64xf16, #blocked>
+    %dst = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %tok = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %dst : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    amdg.buffer_store %val, %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
+    tt.return
+  }
+}
