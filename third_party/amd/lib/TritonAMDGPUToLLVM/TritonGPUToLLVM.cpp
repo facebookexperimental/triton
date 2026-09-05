@@ -313,6 +313,7 @@ struct ConvertTritonAMDGPUToLLVM
                                     mlir::triton::AMD::membarFilter);
     membarPass.run();
     materializeDeferredSchedGroupBarriers(mod);
+    AMD::inferScheduledMfmaHazards(mod);
 
     // Lower functions
     {

@@ -6,6 +6,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -13,10 +14,121 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+
 using mlir::triton::amdgpu::ISAFamily;
 using ::mlir::triton::gpu::MemDescType;
 
 namespace {
+
+constexpr StringLiteral kMfmaRepairHazardsAfterRaAttr =
+    "ttg.amdg.scheduled_mfma.repair_hazards_after_ra";
+constexpr StringLiteral kMfmaDeferResultDrainAttr =
+    "ttg.amdg.scheduled_mfma.defer_result_drain";
+
+static bool usesPersistentAgprAccumulator(triton::amdgpu::ScheduledMfmaOp op) {
+  return op.getAccumulatorRole() == "persistent" &&
+         op.getAccumulatorRegisterClass() != "vgpr";
+}
+
+// A loop-header block argument can feed the loop body or the exit block. Those
+// uses are mutually exclusive for one visit to the header and represent one
+// dynamic accumulator chain, not two live copies. Accept only the narrow form
+// where each use is in a different direct successor; any reconverged, nested,
+// or repeated use remains conservative.
+static bool hasMutuallyExclusiveSuccessorUses(Value value) {
+  auto blockArgument = dyn_cast<BlockArgument>(value);
+  if (!blockArgument)
+    return false;
+  Operation *terminator = blockArgument.getOwner()->getTerminator();
+  if (!isa<BranchOpInterface>(terminator) || terminator->getNumSuccessors() < 2)
+    return false;
+
+  llvm::DenseSet<Block *> successorBlocks;
+  for (unsigned index = 0; index < terminator->getNumSuccessors(); ++index)
+    successorBlocks.insert(terminator->getSuccessor(index));
+
+  llvm::DenseSet<Block *> usedSuccessors;
+  for (OpOperand &use : value.getUses()) {
+    Block *useBlock = use.getOwner()->getBlock();
+    if (!successorBlocks.contains(useBlock) ||
+        !usedSuccessors.insert(useBlock).second)
+      return false;
+  }
+  if (usedSuccessors.size() < 2)
+    return false;
+
+  SmallVector<Block *> blocks(usedSuccessors.begin(), usedSuccessors.end());
+  Block *header = blockArgument.getOwner();
+  auto isReachableWithoutHeader = [header](Block *from, Block *to) {
+    llvm::SmallPtrSet<Block *, 16> excluded;
+    excluded.insert(header);
+    return from->isReachable(to, std::move(excluded));
+  };
+  for (auto [index, lhs] : llvm::enumerate(blocks)) {
+    for (Block *rhs : ArrayRef(blocks).drop_front(index + 1)) {
+      if (isReachableWithoutHeader(lhs, rhs) ||
+          isReachableWithoutHeader(rhs, lhs))
+        return false;
+    }
+  }
+  return true;
+}
+
+// Persistent scheduled MFMAs use inline assembly, so LLVM cannot infer their
+// source and destination hazards. Prove that a persistent AGPR result remains
+// inside one linear accumulator chain until an explicit completion boundary.
+// Eligible MFMAs are marked for exact post-RA input-hazard repair. A dataflow
+// fork fails closed; mutually exclusive CFG successor paths remain eligible
+// when every path stays in the same chain and reaches a commit.
+static bool hasLinearMfmaChainToCommit(Value root) {
+  SmallVector<Value> worklist{root};
+  llvm::DenseSet<Value> visited;
+  bool foundCommit = false;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    // A destructive AGPR accumulator update is safe to defer only when no
+    // copy of the not-yet-drained result can escape to another consumer.
+    if (!value.hasOneUse() && !hasMutuallyExclusiveSuccessorUses(value))
+      return false;
+
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto next = dyn_cast<triton::amdgpu::ScheduledMfmaOp>(user)) {
+        if (next.getAcc() != value || !usesPersistentAgprAccumulator(next))
+          return false;
+        worklist.push_back(next.getResult());
+        continue;
+      }
+      if (auto commit = dyn_cast<triton::amdgpu::MfmaCommitOp>(user)) {
+        // A commit with a BF16 dot-operand dependency is a transient handoff
+        // with a shorter result-read delay, not the target-specific persistent
+        // epilogue drain required by a deferred accumulator chain.
+        if (llvm::any_of(commit.getInputs(), [](Value input) {
+              return !cast<RankedTensorType>(input.getType())
+                          .getElementType()
+                          .isF32();
+            }))
+          return false;
+        foundCommit = true;
+        continue;
+      }
+      if (auto branch = dyn_cast<BranchOpInterface>(user)) {
+        std::optional<BlockArgument> successorArgument =
+            branch.getSuccessorBlockArgument(use.getOperandNumber());
+        if (!successorArgument)
+          return false;
+        worklist.push_back(*successorArgument);
+        continue;
+      }
+      return false;
+    }
+  }
+  return foundCommit;
+}
 
 static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
                                              LLVM::AtomicOrdering ordering,
@@ -1380,12 +1492,14 @@ public:
       constraints += "," + std::to_string(index);
     constraints += ",~{memory}";
 
-    // Preserve the established gfx950 boundary. On gfx942, use the largest
-    // result-read delay among the native layouts carried by this boundary;
-    // `getMfmaDrainWaitStates` is the same requirement the scheduled-MFMA
-    // lowering pads for, so the two stay in sync.
+    // gfx950 uses the established six-state transient handoff when this
+    // boundary also carries a live dot operand. CDNA3 still needs its full,
+    // layout-specific result-read delay. A persistent epilogue likewise uses
+    // the largest target-specific delay carried by the boundary.
+    bool useGfx950LiveDependencyHandoff =
+        targetInfo.getISAFamily() == ISAFamily::CDNA4 && hasLiveDependency;
     int waitStates = 6;
-    if (targetInfo.getISAFamily() == ISAFamily::CDNA3) {
+    if (!useGfx950LiveDependencyHandoff) {
       waitStates = 0;
       for (Value input : op.getInputs()) {
         auto tensorTy = cast<RankedTensorType>(input.getType());
@@ -1553,6 +1667,8 @@ public:
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
     auto operandAttrs = ArrayAttr::get(ctx, {});
     bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
+    bool repairHazardsAfterRa = op->hasAttr(kMfmaRepairHazardsAfterRaAttr);
+    bool resultNeedsDrain = !op->hasAttr(kMfmaDeferResultDrainAttr);
 
     SmallVector<Value> updatedFragments = accumulatorFragments;
     // Keep one SSA chain per output fragment while making source order
@@ -1626,17 +1742,16 @@ public:
               asmOperands.push_back(current);
               constraints += ",0";
             }
-            // The hazard recognizer cannot see this MFMA (it lives inside an
-            // `asm sideeffect` block), so it will not pad a preceding VALU
-            // write of srcA/srcB or of EXEC. Per LLVM's checkMAIHazards90A
-            // that needs `LegacyVALUNotDotWritesVGPRWaitStates` (2) and
-            // `VALUWritesExecWaitStates` (4) respectively; 4 covers both. An
-            // exact same-register srcC forward from the previous MFMA in the
-            // chain is explicitly not a hazard, so this does not serialize
-            // the accumulation chain.
-            std::string mfmaAsm = mfmaWaitStateAsm(info.inputWaitStates) +
-                                  "\n" + info.asmMnemonic.str() +
-                                  " $0, $1, $2, ";
+            // Inline assembly hides MFMA hazards from LLVM. For an
+            // automatically proven persistent AGPR chain, preserve a marker
+            // so the backend can inspect the final physical registers and add
+            // only the residual wait after scheduling and register allocation.
+            // Unproven chains retain the conservative pre-MFMA padding.
+            std::string mfmaAsm = info.asmMnemonic.str() + " $0, $1, $2, ";
+            if (repairHazardsAfterRa)
+              mfmaAsm = "; triton_amd_scheduled_mfma\n" + mfmaAsm;
+            else
+              mfmaAsm = mfmaWaitStateAsm(info.inputWaitStates) + "\n" + mfmaAsm;
             mfmaAsm += zeroThisInstruction ? "0" : "$0";
             auto inlineAsm = LLVM::InlineAsmOp::create(
                 rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
@@ -1650,11 +1765,12 @@ public:
       }
     }
 
-    if (!useLatencyAwareIntrinsic) {
+    if (!useLatencyAwareIntrinsic && resultNeedsDrain) {
       // The consumer is unknown at this point, so use the target-specific
       // result-read requirement from `getMfmaDrainWaitStates`. Sizing the drain
       // for the worst consumer keeps it sufficient on its own, rather than
-      // relying on the next MFMA's input padding to make up a shortfall.
+      // relying on the next MFMA's input padding to make up a shortfall. A
+      // proven accumulator-only chain moves this drain to mfma_commit.
       for (int64_t n = 0; n < numRepN; ++n) {
         for (int64_t m = 0; m < numRepM; ++m) {
           int64_t accumulatorIndex = m * numRepN + n;
@@ -1862,6 +1978,24 @@ private:
 };
 
 } // namespace
+
+void mlir::triton::AMD::inferScheduledMfmaHazards(ModuleOp mod) {
+  mod.walk([&](triton::amdgpu::ScheduledMfmaOp op) {
+    // These are compiler-owned facts. Clear any attributes supplied by input
+    // IR before recomputing them, so textual TTGIR cannot bypass this proof.
+    op->removeAttr(kMfmaRepairHazardsAfterRaAttr);
+    op->removeAttr(kMfmaDeferResultDrainAttr);
+
+    // "auto" selects AGPRs for persistent accumulators. Explicit VGPR chains
+    // retain conservative lowering because the post-RA repair is deliberately
+    // scoped to the tuned persistent-AGPR path.
+    if (!usesPersistentAgprAccumulator(op) ||
+        !hasLinearMfmaChainToCommit(op.getResult()))
+      return;
+    op->setAttr(kMfmaRepairHazardsAfterRaAttr, UnitAttr::get(mod.getContext()));
+    op->setAttr(kMfmaDeferResultDrainAttr, UnitAttr::get(mod.getContext()));
+  });
+}
 
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,

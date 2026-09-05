@@ -151,6 +151,11 @@ def amd_scheduled_mfma(
     drain, so AGPR accumulators are rejected there and a ``"persistent"`` chain
     must pass ``accumulator_register_class="vgpr"``; the default is an error
     rather than a silent downgrade.
+
+    The compiler automatically recognizes persistent AGPR accumulator chains
+    ending at ``amd_mfma_commit``. For those chains it repairs source and EXEC
+    hazards after scheduling and physical register assignment, while unknown
+    dataflow and VGPR accumulators retain conservative waits.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
