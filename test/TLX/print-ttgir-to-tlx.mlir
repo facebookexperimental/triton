@@ -26,7 +26,8 @@
 
 // Verify MMA operations are replaced
 // CHECK-DAG: tlx.async_dot(
-// CHECK-DAG: use_acc=False, pred=True, mBarriers=[{{[^]]+}}], two_ctas=True, force_async=True
+// A constant-true predicate is the default and is elided.
+// CHECK-DAG: use_acc=False, mBarriers=[{{[^]]+}}], two_ctas=True, force_async=True
 // CHECK-DAG: tlx.tcgen05_commit({{[^,)]+}}, two_ctas=True)
 
 // Verify TMA operations are replaced
@@ -1123,5 +1124,127 @@ module {
       scf.yield %next : i32
     }
     tt.return %result : i32
+  }
+}
+
+// -----
+
+// A loop whose iter_arg is initialized from a previous loop's result must carry
+// that accumulator over, not be re-initialized.
+//
+// The printer synthesizes an initializer for a block argument that has no
+// defining op, because a warp_specialize region capture is not bound anywhere
+// in the emitted Python. An scf loop's iter_arg is also a block argument with
+// no defining op, but it *is* bound -- by the init line above the loop and the
+// parallel copies at the end of the body. Chaining two loops makes the second
+// loop's init resolve, through the warp_specialize substitution map, onto the
+// first loop's iter_arg, so the synthetic initializer would overwrite a live
+// accumulator with -inf.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def ws_chained_loops(
+  // CHECK: [[ACC:[a-z0-9_]+]] = cst
+  // CHECK: for {{[a-z0-9_]+}} in range(
+  // CHECK: [[ACC]] = {{[a-z0-9_]+}}
+  // The carry between the two loops, and not a fresh -inf tensor.
+  // CHECK: [[ACC]] = [[ACC]]
+  // CHECK-NOT: tl.full({{.*}}-inf
+  // CHECK: for {{[a-z0-9_]+}} in range(
+  tt.func public @ws_chained_loops(%n: i32) attributes {noinline = false} {
+    ttg.warp_specialize(%n) attributes {requestedRegisters = array<i32: 24>}
+    default {
+      %c0_i32 = arith.constant 0 : i32
+      %c1_i32 = arith.constant 1 : i32
+      %zero = arith.constant dense<0.000000e+00> : tensor<256xf32, #blocked>
+      %one = arith.constant dense<1.000000e+00> : tensor<256xf32, #blocked>
+      %l1 = scf.for %i = %c0_i32 to %n step %c1_i32 iter_args(%acc = %zero)
+          -> (tensor<256xf32, #blocked>) : i32 {
+        %a = arith.addf %acc, %one : tensor<256xf32, #blocked>
+        scf.yield %a : tensor<256xf32, #blocked>
+      }
+      %l2 = scf.for %j = %c0_i32 to %n step %c1_i32 iter_args(%acc2 = %l1)
+          -> (tensor<256xf32, #blocked>) : i32 {
+        %b = arith.mulf %acc2, %one : tensor<256xf32, #blocked>
+        scf.yield %b : tensor<256xf32, #blocked>
+      }
+      ttg.warp_yield
+    }
+    partition0(%arg0: i32) num_warps(1) {
+      ttg.warp_return
+    } : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// A loop result consumed after the loop must print as the iter_arg the parallel
+// copy assigns, not as the loop op's own SSA name. Only warp_specialize used to
+// create the substitution map that records this, so a loop outside one emitted
+// unbound names -- which on AMD CDNA, having no warp_specialize, is every loop.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def loop_results_outside_ws(
+  // CHECK: [[ACC:[a-z0-9_]+]] = cst
+  // CHECK: [[L:[a-z0-9_]+]] = cst_0
+  // CHECK: for {{[a-z0-9_]+}} in range(
+  // CHECK: [[ACC]], [[L]] = {{[a-z0-9_]+}}, {{[a-z0-9_]+}}
+  // Both results resolve to their iter_args, not to %0#0 / %0#1.
+  // CHECK: = [[ACC]] / [[L]]
+  // CHECK-NOT: var_0_0
+  tt.func public @loop_results_outside_ws(%n: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<256xf32, #blocked>
+    %one = arith.constant dense<1.000000e+00> : tensor<256xf32, #blocked>
+    %res:2 = scf.for %i = %c0_i32 to %n step %c1_i32 iter_args(%acc = %zero, %l = %one)
+        -> (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) : i32 {
+      %a = arith.addf %acc, %l : tensor<256xf32, #blocked>
+      %b = arith.mulf %l, %l : tensor<256xf32, #blocked>
+      scf.yield %a, %b : tensor<256xf32, #blocked>, tensor<256xf32, #blocked>
+    }
+    %div = arith.divf %res#0, %res#1 : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// AMD buffer ops address global memory as a scalar base pointer plus a tensor
+// of offsets, which Triton spells `ptr + offsets`, and tl.assume reaches the
+// printer as llvm.intr.assume.
+//
+// mask/other/stride are optional operand *segments*, so they have to be
+// resolved through operandSegmentSizes: reading them positionally shifts every
+// operand after the first absent one, which is why the unmapped form printed
+// with inconsistent arity. The masked and unmasked loads below differ only in
+// which segments are populated.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def amd_buffer_ops(
+  // CHECK: tl.assume(arg4)
+  // CHECK: {{[a-z0-9_]+}} = tl.load(arg0 + arg1, mask=arg2)
+  // An absent mask segment must not pull the next operand into its place.
+  // CHECK: {{[a-z0-9_]+}} = tl.load(arg0 + arg1)
+  // CHECK: {{[a-z0-9_]+}} = tl.load(arg0 + arg1, mask=arg2, other=arg3)
+  // CHECK: {{[a-z0-9_]+}} = tlx.async_load(arg0 + arg1, {{[a-z0-9_]+}}, mask=arg2)
+  // CHECK: tl.store(arg0 + arg1, arg3, mask=arg2)
+  tt.func public @amd_buffer_ops(%ptr: !tt.ptr<f16>, %offs: tensor<64x64xi32, #blocked>,
+                                 %mask: tensor<64x64xi1, #blocked>,
+                                 %val: tensor<64x64xf16, #blocked>,
+                                 %pred: i1) attributes {noinline = false} {
+    llvm.intr.assume %pred : i1
+    %masked = amdg.buffer_load %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
+    %plain = amdg.buffer_load %ptr[%offs] : tensor<64x64xf16, #blocked>
+    %other = amdg.buffer_load %ptr[%offs], %mask, %val : tensor<64x64xf16, #blocked>
+    %dst = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %tok = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %dst : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    amdg.buffer_store %val, %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
+    tt.return
   }
 }

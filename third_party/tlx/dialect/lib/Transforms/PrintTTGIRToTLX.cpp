@@ -370,6 +370,17 @@ StringRef getCmpFOperator(int64_t predicate) {
   }
 }
 
+// True if `v` is a constant-true i1. Such a predicate is the default, so it is
+// elided rather than emitted.
+bool isConstantTrue(Value v) {
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getName().getStringRef() != "arith.constant")
+    return false;
+  if (auto intAttr = def->getAttrOfType<IntegerAttr>("value"))
+    return intAttr.getValue().isOne();
+  return false;
+}
+
 // Build a lookup map for fast operation name lookup
 llvm::StringMap<StringRef> buildOpNameMap() {
   llvm::StringMap<StringRef> map;
@@ -861,6 +872,19 @@ static Value resolveThroughCasts(Value v) {
   return v;
 }
 
+// An scf loop's region arguments are bound in the emitted Python, by the
+// iter_args init line and the body's parallel copies; captures are not.
+static bool isLoopCarriedBlockArg(Value v) {
+  auto blockArg = dyn_cast<BlockArgument>(v);
+  if (!blockArg)
+    return false;
+  Operation *parent = blockArg.getOwner()->getParentOp();
+  if (!parent)
+    return false;
+  StringRef parentName = parent->getName().getStringRef();
+  return parentName == "scf.for" || parentName == "scf.while";
+}
+
 // Forward declarations
 void printRegion(Region &region, llvm::raw_ostream &os,
                  const llvm::StringMap<StringRef> &opNameMap,
@@ -966,7 +990,8 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
     // and need proper initialization (e.g., from ub.poison in the TTIR).
     // Detect by checking: no defining op + is BlockArgument + is tensor/f32
     bool needsInit = false;
-    if (!resolved.getDefiningOp() && isa<BlockArgument>(resolved)) {
+    if (!resolved.getDefiningOp() && isa<BlockArgument>(resolved) &&
+        !isLoopCarriedBlockArg(resolved)) {
       Type type = resolved.getType();
       if (isa<RankedTensorType>(type) || type.isF32())
         needsInit = true;
@@ -1306,6 +1331,21 @@ void printLocComment(Operation *op, llvm::raw_ostream &os) {
   os << "\n";
 }
 
+// Resolve an operand of an AttrSizedOperandSegments op by declared position.
+// Absent optional groups have size 0, so positional reads shift.
+static Value getSegmentOperand(Operation *op, unsigned segmentIdx) {
+  auto segments = op->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes");
+  if (!segments)
+    return nullptr;
+  ArrayRef<int32_t> sizes = segments.asArrayRef();
+  if (segmentIdx >= sizes.size() || sizes[segmentIdx] == 0)
+    return nullptr;
+  unsigned start = 0;
+  for (unsigned i = 0; i < segmentIdx; ++i)
+    start += sizes[i];
+  return start < op->getNumOperands() ? op->getOperand(start) : nullptr;
+}
+
 // Print operation in simplified TLX format
 void printSimplifiedOp(
     Operation *op, llvm::raw_ostream &os,
@@ -1590,11 +1630,25 @@ void printSimplifiedOp(
     return;
   }
 
-  // ttng.wait_barrier: emit barrier_wait(bar, phase) without pred
+  // ttng.wait_barrier: emit barrier_wait(bar, phase[, pred=...]).
   if (opName == "ttng.wait_barrier" && op->getNumOperands() >= 2) {
     os << "tlx.barrier_wait("
        << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
-       << getValueName(op->getOperand(1), argSubstitutionMap) << ")";
+       << getValueName(op->getOperand(1), argSubstitutionMap);
+    // After (alloc, phase) come an optional i1 predicate and variadic memdesc
+    // dependency buffers. Only the predicate changes whether the wait executes,
+    // so emit that and skip the deps.
+    Value pred;
+    for (unsigned i = 2; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (!isa<ttg::MemDescType>(v.getType())) {
+        pred = v;
+        break;
+      }
+    }
+    if (pred && !isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    os << ")";
     printLocComment(op, os);
     return;
   }
@@ -1762,9 +1816,12 @@ void printSimplifiedOp(
       int idx = 3 + sizes[3]; // skip a,b,d,acc_dep
       os << ", use_acc="
          << getValueName(op->getOperand(idx), argSubstitutionMap);
-      ++idx;
-      os << ", pred=" << getValueName(op->getOperand(idx), argSubstitutionMap);
-      ++idx;
+      // The predicate operand follows useD, and guards whether the dot runs
+      // at all.
+      Value mmaPred = op->getOperand(idx + 1);
+      idx += 2; // skip useD, pred
+      if (!isConstantTrue(mmaPred))
+        os << ", pred=" << getValueName(mmaPred, argSubstitutionMap);
       int numBarriers = sizes[6];
       if (numBarriers > 0) {
         os << ", mBarriers=[";
@@ -1918,16 +1975,6 @@ void printSimplifiedOp(
     return;
   }
 
-  // nvg.cluster_id: the CLC-persistent lowering replaces the source's
-  // tl.program_id(0) with the cluster id, identical for single-CTA clusters.
-  if (opName == "nvg.cluster_id") {
-    if (op->getNumResults() > 0)
-      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
-    os << "tl.program_id(axis=0)";
-    printLocComment(op, os);
-    return;
-  }
-
   // ttng.async_clc_try_cancel(mbar, response): TLX takes (response, barrier).
   if (opName == "ttng.async_clc_try_cancel") {
     os << "tlx._clc_issue("
@@ -1948,6 +1995,75 @@ void printSimplifiedOp(
       os << " = ";
     os << "tlx._clc_query("
        << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // AMD buffer ops address global memory as base pointer + offset tensor,
+  // which Triton spells `ptr + offsets`. `stride` is a codegen hint.
+  if (opName == "amdg.buffer_load" || opName == "amdg.buffer_store" ||
+      opName == "amdg.buffer_load_to_local") {
+    // Declared operand order differs per op; see TritonAMDGPUOps.td.
+    Value value, dest, ptr, offsets, mask, other;
+    if (opName == "amdg.buffer_load") {
+      ptr = getSegmentOperand(op, 0);
+      offsets = getSegmentOperand(op, 1);
+      mask = getSegmentOperand(op, 3);
+      other = getSegmentOperand(op, 4);
+    } else if (opName == "amdg.buffer_store") {
+      value = getSegmentOperand(op, 0);
+      ptr = getSegmentOperand(op, 1);
+      offsets = getSegmentOperand(op, 2);
+      mask = getSegmentOperand(op, 4);
+    } else {
+      dest = getSegmentOperand(op, 0);
+      ptr = getSegmentOperand(op, 1);
+      offsets = getSegmentOperand(op, 2);
+      mask = getSegmentOperand(op, 3);
+      other = getSegmentOperand(op, 4);
+    }
+
+    // Guard every non-optional segment, not just ptr/offsets: getValueName
+    // dereferences the Value, so a missing one would crash rather than print.
+    if (!ptr || !offsets || (opName == "amdg.buffer_store" && !value) ||
+        (opName == "amdg.buffer_load_to_local" && !dest)) {
+      op->emitError("buffer op is missing a required operand and does not "
+                    "round-trip to TLX");
+      os << "# unsupported: " << opName << " (malformed operands)";
+      printLocComment(op, os);
+      return;
+    }
+
+    std::string addr = getValueName(ptr, argSubstitutionMap) + " + " +
+                       getValueName(offsets, argSubstitutionMap);
+
+    if (opName == "amdg.buffer_store") {
+      os << "tl.store(" << addr << ", "
+         << getValueName(value, argSubstitutionMap);
+    } else if (opName == "amdg.buffer_load") {
+      if (op->getNumResults() > 0)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tl.load(" << addr;
+    } else {
+      // buffer_load_to_local returns an async token, like tlx.async_load.
+      if (op->getNumResults() > 0)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tlx.async_load(" << addr << ", "
+         << getValueName(dest, argSubstitutionMap);
+    }
+    if (mask)
+      os << ", mask=" << getValueName(mask, argSubstitutionMap);
+    if (other)
+      os << ", other=" << getValueName(other, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // llvm.intr.assume is a tl.assume from the source kernel.
+  if (opName == "llvm.intr.assume" && op->getNumOperands() == 1) {
+    os << "tl.assume(" << getValueName(op->getOperand(0), argSubstitutionMap)
+       << ")";
     printLocComment(op, os);
     return;
   }
@@ -2913,6 +3029,12 @@ void printRegion(Region &region, llvm::raw_ostream &os,
                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
                  DenseMap<Value, Value> *argSubstitutionMap,
                  ArrayRef<Value> yieldTargets) {
+  // A substitution recorded while printing an op (scf.for maps its results
+  // onto its iter_args) must outlive it for the siblings that consume it.
+  DenseMap<Value, Value> ownedSubstitutionMap;
+  if (!argSubstitutionMap)
+    argSubstitutionMap = &ownedSubstitutionMap;
+
   // For multi-block regions with CF control flow, use the CF-aware printer
   if (std::distance(region.begin(), region.end()) > 1) {
     printCFRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent,

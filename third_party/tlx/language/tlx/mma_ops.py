@@ -493,7 +493,9 @@ def async_dot(
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
         use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred,
+        # The builder wants an ir.value or None, so unwrap a tl.tensor pred.
+        pred_handle = pred.handle if isinstance(pred, tl.tensor) else pred
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred_handle,
                                                      bool(two_ctas), handles, bool(is_async))
         return tl.tensor(output, tl.void)
     else:
@@ -658,6 +660,8 @@ def async_dot_scaled(
     bar_handles = [t.handle for t in mBarriers]
     is_async = force_async or len(bar_handles) > 0
     use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
+    # The builder wants an ir.value or None, so unwrap a tl.tensor pred.
+    pred_handle = pred.handle if isinstance(pred, tl.tensor) else pred
     output = _semantic.builder.create_tcgen5_dot_scaled(
         A_handle,
         B_handle,
@@ -667,7 +671,7 @@ def async_dot_scaled(
         A_type,
         B_type,
         use_acc_handle,
-        pred,
+        pred_handle,
         bool(two_ctas),
         bar_handles,
         bool(is_async),
