@@ -1309,19 +1309,19 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
         # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
         # returns a plain False, so this stays safe for symbolic scalars.
         scalars = getattr(kernel_inputs, "_scalars", None) or {}
-        # Split-K is opt-in via TORCHINDUCTOR_TLX_SPLIT_K=1 (default off). It was gated
-        # because autotune scored each addmm candidate on the GEMM kernel's own time only
-        # and excluded the separate reduce_k kernel, so a split-K TLX addmm could beat
-        # rocBLAS on the GEMM yet be net-slower e2e (HIM: split-K on 46.4K vs off 47.6K
-        # qps T2). TritonTemplateCaller.benchmark now charges every SPLIT_K > 1 candidate
-        # for its measured reducer (see _tlx_caller_benchmark and
-        # reduce_k.reduce_k_cost_ms), which removes that asymmetry -- the default flip is
-        # a follow-up so it can be A/B'd on its own. Correctness also requires
-        # alpha == beta == 1.
+        # Split-K is on by default; TORCHINDUCTOR_TLX_SPLIT_K=0 suppresses the candidates.
+        # It was gated off because autotune scored each addmm candidate on the GEMM
+        # kernel's own time only and excluded the separate reduce_k kernel, so a split-K
+        # TLX addmm could beat rocBLAS on the GEMM yet be net-slower e2e (HIM: split-K on
+        # 46.4K vs off 47.6K qps T2). TritonTemplateCaller.benchmark now charges every
+        # SPLIT_K > 1 candidate for its measured reducer (see _tlx_caller_benchmark and
+        # reduce_k.reduce_k_cost_ms), so the comparison against SPLIT_K=1 candidates is
+        # apples-to-apples and the candidates can compete on their true cost.
+        # Correctness also requires alpha == beta == 1.
         allow_split_k = (
             scalars.get("alpha", 1) == 1
             and scalars.get("beta", 1) == 1
-            and os.environ.get("TORCHINDUCTOR_TLX_SPLIT_K", "0") == "1"
+            and os.environ.get("TORCHINDUCTOR_TLX_SPLIT_K", "1") == "1"
         )
         m_hint = sizevars.optimization_hint(m, fallback=NUM_SMS)
         n_hint = sizevars.optimization_hint(n, fallback=NUM_SMS)
@@ -1530,6 +1530,15 @@ class Gfx950AddMMPersistentWarpPipeConfigHeuristic(
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs, op_name
         ):
+            # The persistent template has NO split-K body -- it never peels split_id and
+            # never writes split_k_ws; it stores straight through store_output. But
+            # SPLIT_K > 1 alone makes _tlx_tt_generate allocate the UNINITIALIZED
+            # split_k_ws and _tlx_emit_post_kernel_code emit _reduce_k after the kernel,
+            # and that reducer then sums the never-written workspace over the output.
+            # Inheriting the per-tile heuristic's split-K candidates therefore yields
+            # silently WRONG results whenever autotune happens to pick one. Drop them.
+            if int(template_kwargs.get("SPLIT_K", 1)) > 1:
+                continue
             yield {**template_kwargs, "NUM_SMS": num_sms}
 
 
