@@ -1110,6 +1110,7 @@ class Config:
         num_warps=4,
         num_stages=3,
         num_ctas=1,
+        num_cpu_threads=0,
         maxnreg=None,
         pre_hook=None,
         ir_override=None,
@@ -1135,6 +1136,7 @@ class Config:
         self.num_warps = num_warps
         self.num_ctas = num_ctas
         self.num_stages = num_stages
+        self.num_cpu_threads = num_cpu_threads
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
         self.ir_override = ir_override
@@ -1161,6 +1163,7 @@ class Config:
         self.num_warps = state.get("num_warps", 4)
         self.num_stages = state.get("num_stages", 3)
         self.num_ctas = state.get("num_ctas", 1)
+        self.num_cpu_threads = state.get("num_cpu_threads", 0)
         self.maxnreg = state.get("maxnreg", None)
         self.pre_hook = state.get("pre_hook", None)
         self.ir_override = state.get("ir_override", None)
@@ -1187,6 +1190,8 @@ class Config:
                     ("num_warps", self.num_warps),
                     ("num_ctas", self.num_ctas),
                     ("num_stages", self.num_stages),
+                    # Omit when 0: unknown to GPU options and rejected by _pack_args.
+                    ("num_cpu_threads", self.num_cpu_threads or None),
                     ("maxnreg", self.maxnreg),
                     ("ir_override", self.ir_override),
                     ("minRegAutoWS", self.minRegAutoWS),
@@ -1213,6 +1218,7 @@ class Config:
         res.append(f"num_warps: {self.num_warps}")
         res.append(f"num_ctas: {self.num_ctas}")
         res.append(f"num_stages: {self.num_stages}")
+        res.append(f"num_cpu_threads: {self.num_cpu_threads}")
         res.append(f"maxnreg: {self.maxnreg}")
         res.append(f"ir_override: {self.ir_override}")
         res.append(f"minRegAutoWS: {self.minRegAutoWS}")
