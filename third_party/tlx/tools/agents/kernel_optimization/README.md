@@ -237,9 +237,14 @@ CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
   --python-executable /path/to/python-with-torch \
   --gpu-id 0 \
   --max-rounds 3 --candidates-per-round 2 \
-  --benchmark-warmup-ms 100 \
-  --benchmark-duration-ms 500
+  --benchmark-warmup-ms 500 \
+  --benchmark-duration-ms 2000
 ```
+
+If the reference needs process-local compatibility settings, pass them without
+contaminating the candidate process, for example
+`--reference-env TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1`. Supplying any
+`--reference-env` also isolates the two benchmark legs when AutoWS is disabled.
 
 Each fused and TLX leg uses `triton.testing.do_bench(return_mode="all")`.
 Warmup and measurement are duration-based, every timed execution starts after
@@ -268,6 +273,13 @@ TTGIR contains both `ttg.warp_specialize` and materialized partition regions.
 When a matching TLX kernel uses TMA and persistent scheduling, first establish
 a correct plain-Triton TMA/persistent candidate, then add AutoWS as a separate
 experiment so the performance effects remain attributable.
+
+Before compiler-level experiments, calculate the persistent tile count and its
+number of waves over the target SM count. Sweep configurations that avoid an
+underfilled first wave. Treat TMA operand loading and TMA epilogue publication
+as separate choices: if final TTGIR shows that descriptor stores add staging or
+wait overhead, benchmark a TMA-operand/direct-pointer-epilogue candidate rather
+than discarding TMA wholesale.
 
 For an unattended run, replace the prompt with
 `--triton-dir /path/to/triton`. If native compiler code changed, run `make` in

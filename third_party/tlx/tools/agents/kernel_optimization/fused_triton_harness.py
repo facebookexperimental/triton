@@ -78,8 +78,8 @@ def _run_evaluation(
     parameters = case.get("parameters", {})
     if not isinstance(parameters, Mapping):
         raise TypeError("case parameters must be a mapping")
-    warmup_ms = int(parameters.get("warmup_ms", 100))
-    benchmark_ms = int(parameters.get("benchmark_ms", 500))
+    warmup_ms = int(parameters.get("warmup_ms", 500))
+    benchmark_ms = int(parameters.get("benchmark_ms", 2000))
 
     def command(result_path: Path, only: str = "both") -> list[str]:
         result = [
@@ -142,9 +142,26 @@ def _run_evaluation(
             )
         return json.loads(result_path.read_text())
 
-    if artifact["target_environment"].get("FUSED_TRITON_AUTOWS") == "1":
+    reference_environment_overrides: dict[str, str] = {}
+    reference_environment_json = artifact["target_environment"].get(
+        "FUSED_TRITON_REFERENCE_ENV"
+    )
+    if reference_environment_json:
+        parsed = json.loads(reference_environment_json)
+        if not isinstance(parsed, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in parsed.items()
+        ):
+            raise TypeError("FUSED_TRITON_REFERENCE_ENV must encode string pairs")
+        reference_environment_overrides = parsed
+
+    if (
+        artifact["target_environment"].get("FUSED_TRITON_AUTOWS") == "1"
+        or reference_environment_overrides
+    ):
         reference_environment = dict(environment)
         reference_environment.pop("TRITON_USE_META_WS", None)
+        reference_environment.update(reference_environment_overrides)
         reference = invoke(
             artifact["root"] / "reference_result.json",
             "reference",
@@ -199,8 +216,8 @@ def benchmark(
     if not isinstance(samples, list) or not samples:
         raise RuntimeError("fused Triton evaluation did not report timing samples")
     parameters = case.get("parameters", {})
-    warmup_ms = int(parameters.get("warmup_ms", 100))
-    benchmark_ms = int(parameters.get("benchmark_ms", 500))
+    warmup_ms = int(parameters.get("warmup_ms", 500))
+    benchmark_ms = int(parameters.get("benchmark_ms", 2000))
     return {
         "samples_us": samples,
         "warmup_count": 0,

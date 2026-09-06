@@ -22,6 +22,19 @@ Do not optimize a metric that is outside the measured critical path. If a
 profiler is unavailable, make the narrowest hypothesis supported by source
 structure and end-to-end timings, and keep the claimed evidence explicit.
 
+For a persistent kernel, calculate the logical tile count before changing the
+compiler or synchronization: `ceil(M / BLOCK_M) * ceil(N / BLOCK_N)` (times any
+batch or split dimension). Compare it with the launched persistent grid and the
+GPU SM count. A tile that exposes substantially fewer CTAs than SMs can leave a
+large fraction of the device idle even when its per-CTA compute is efficient.
+Sweep tile shapes that produce roughly one or more full waves before attributing
+the gap to warp specialization. Record both the logical CTA tile and the
+per-compute-group MMA tile when a reference splits one CTA across multiple MMA
+groups. Derive the persistent stride and grid from the selected runtime device;
+do not reuse a generated `multi_processor_count` captured on another GPU. Pay
+special attention to a tiny final wave such as `148 + 148 + 4` blocks, which can
+cost an entire additional wave even though only a few blocks remain.
+
 CUDA-event timing around a Python callable is not automatically kernel-only:
 when the stream becomes idle after the start event, Python registry lookup,
 descriptor construction, allocation, and launch submission can delay the stop
@@ -76,6 +89,14 @@ For an NVIDIA TLX reference that uses TMA and persistent scheduling, first port
 and measure those independently useful structures in a plain Triton candidate.
 Enable AutoWS only after that candidate is correct and stable. This keeps TMA,
 persistence, and warp-specialization effects separately attributable.
+
+Treat TMA placement as multiple independent choices rather than an all-or-none
+conversion. Measure operand loads and epilogue loads/stores separately. If
+descriptor stores introduce extra staging copies, token waits, or partitions,
+retain TMA for the recurring GEMM operands and test a direct pointer epilogue.
+Accept the hybrid only when final IR, correctness, and direct timing all confirm
+the change; a hand-written reference's preferred TMA strategy need not be the
+best lowering produced by the current compiler.
 
 Without a reference, use source inspection and profiles to generate hypotheses.
 Prefer changes supported by counters or launch attribution over broad rewrites.

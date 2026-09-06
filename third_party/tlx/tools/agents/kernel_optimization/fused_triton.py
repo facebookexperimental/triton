@@ -216,6 +216,16 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reference-env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            "Environment override applied only to the isolated reference process; "
+            "repeat for multiple values."
+        ),
+    )
+    parser.add_argument(
         "--registry-reference",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -225,8 +235,8 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--gpu-id", type=int, default=0)
-    parser.add_argument("--benchmark-warmup-ms", type=int, default=100)
-    parser.add_argument("--benchmark-duration-ms", type=int, default=500)
+    parser.add_argument("--benchmark-warmup-ms", type=int, default=500)
+    parser.add_argument("--benchmark-duration-ms", type=int, default=2000)
     parser.add_argument(
         "--autows",
         action="store_true",
@@ -309,6 +319,14 @@ def main(arguments: list[str] | None = None) -> int:
             ) from error
         if not isinstance(reference_config_payload, dict):
             raise SystemExit("reference configuration must be a JSON object")
+    reference_environment: dict[str, str] = {}
+    for assignment in args.reference_env:
+        name, separator, value = assignment.partition("=")
+        if not separator or not name:
+            raise SystemExit(
+                f"invalid --reference-env {assignment!r}; expected NAME=VALUE"
+            )
+        reference_environment[name] = value
 
     if (output_dir / "result.json").exists() or (output_dir / "experiments").exists():
         raise SystemExit(
@@ -351,6 +369,10 @@ def main(arguments: list[str] | None = None) -> int:
     }
     if reference_config is not None:
         target_environment["FUSED_TRITON_REFERENCE_CONFIG"] = str(reference_config)
+    if reference_environment:
+        target_environment["FUSED_TRITON_REFERENCE_ENV"] = json.dumps(
+            reference_environment, sort_keys=True
+        )
     if args.autows:
         target_environment.update(
             {

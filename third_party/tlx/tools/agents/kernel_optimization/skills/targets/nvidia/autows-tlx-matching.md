@@ -31,6 +31,16 @@ of routing or descriptor-setup work. Report wrapper latency separately when it
 is itself a deployment target; never compare direct latency on one leg with
 wrapper latency on the other.
 
+Before lower-level matching, compare persistent-grid coverage. Report logical
+CTA tiles, launched CTAs, SM count, and waves for both candidates. Match total
+tile work and the per-MMA-group tile separately: a TLX program may use two
+replicated 128-row MMA groups while a Triton program uses one 256-row MMA. These
+have the same CTA tile area but different compute structure. Conversely, using a
+tile with twice the area can halve the grid and dominate latency through SM
+underfill even when its generated pipeline looks reasonable. Obtain `NUM_SMS`
+from the selected runtime device instead of trusting stale generated device
+metadata; a nearly empty final persistent wave can be a double-digit regression.
+
 ## Prove The Transformation Fired
 
 After every AutoWS source or compiler change, compile from a fresh cache and
@@ -56,6 +66,12 @@ When a semantically matching TLX implementation exists, use this staged order:
    process. Prove materialized partitions in final TTGIR before comparing it
    with either the plain-Triton baseline or TLX.
 
+If full descriptor/TMA epilogues regress, inspect final TTGIR for extra
+epilogue-store partitions, staging allocations, and token waits. Test a hybrid
+with descriptor/TMA GEMM operands and direct pointer epilogue I/O as a separate
+hypothesis. This retains asynchronous operand loading while avoiding an
+unprofitable store pipeline; it is preferable to abandoning TMA globally.
+
 Do not enable AutoWS first and simultaneously rewrite pointer I/O to TMA: if the
 candidate fails or changes speed, the cause is ambiguous. Keep each step as one
 correctness-gated, measured hypothesis.
@@ -73,3 +89,11 @@ or call from the candidate.
 Change one structural axis at a time. Re-run the final-TTGIR gate, correctness,
 and isolated timing after each change. A correct but slower first AutoWS result
 is expected; promotion still requires stable end-to-end improvement.
+
+When TLX manually issues multiple independent MMAs per K iteration, first test
+`data_partition_factor` on a legal doubled tile. If compiler DP adds excessive
+partition or synchronization overhead, explicitly express the independent
+accumulators and shared operand in Triton as a diagnostic/source candidate.
+Compare static MMA count, TMEM allocations, load-buffer depths, and barriers to
+TLX. A successful explicit form identifies a general compiler opportunity to
+lower DP into per-group accumulators without the extra synchronization.

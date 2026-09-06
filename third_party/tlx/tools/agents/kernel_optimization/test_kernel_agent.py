@@ -357,6 +357,9 @@ class ScoringTest(unittest.TestCase):
                 "target_environment": {
                     "FUSED_TRITON_AUTOWS": "1",
                     "FUSED_TRITON_REFERENCE_CONFIG": str(reference_config),
+                    "FUSED_TRITON_REFERENCE_ENV": json.dumps(
+                        {"TRITON_ALLOW_NON_CONSTEXPR_GLOBALS": "1"}
+                    ),
                     "TRITON_USE_META_WS": "1",
                     "TRITON_DISABLE_WSBARRIER_REORDER": "1",
                 },
@@ -389,7 +392,11 @@ class ScoringTest(unittest.TestCase):
             )
             self.assertEqual([only for only, _ in calls], ["reference", "fused"])
             self.assertNotIn("TRITON_USE_META_WS", calls[0][1])
+            self.assertEqual(
+                calls[0][1]["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"], "1"
+            )
             self.assertEqual(calls[1][1]["TRITON_USE_META_WS"], "1")
+            self.assertNotIn("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", calls[1][1])
 
     def test_fused_runner_preserves_raw_do_bench_samples(self) -> None:
         call = Mock()
