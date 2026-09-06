@@ -761,12 +761,15 @@ private:
     Operation &combinerOp = combineRegion.front().front();
     unsigned arity =
         enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
-    // A linear fold still needs bounded dependency chains. The contiguous
-    // register span is the lowering contract used by the legacy path: reduce
-    // one span, immediately merge it into the running result, then continue.
-    // Flattening all spans into one chain prevents LLVM from packing adjacent
-    // loop-carried values and sharply increases register pressure.
+    // Chunk only long scalar fadd folds: several register-contiguous spans can
+    // otherwise form a high-pressure dependency chain. With one or two spans,
+    // there is no repeated cross-span fold to break. Keep other combiners flat
+    // so target combines such as AMD's ternary max remain visible. Inner-tree
+    // reductions are handled separately above.
     unsigned linearChunkSize = helper.getContigPerThreadOnReductionAxis();
+    bool chunkLinearFAdd =
+        arity == 1 && isa_and_nonnull<arith::AddFOp>(op.getSingleCombiner()) &&
+        llvm::divideCeil(axisPack, linearChunkSize) > 2;
 
     // Perform the in-thread reduction.
     unsigned numOperands = accs.size();
@@ -781,7 +784,7 @@ private:
         vals.push_back(std::move(cur));
       }
       SmallVector<Value> acc;
-      if (arity == 1 && linearChunkSize < vals.size()) {
+      if (chunkLinearFAdd) {
         auto numChunks =
             llvm::divideCeil(vals.size(), static_cast<size_t>(linearChunkSize));
         for (size_t chunkIdx : llvm::seq(numChunks)) {
