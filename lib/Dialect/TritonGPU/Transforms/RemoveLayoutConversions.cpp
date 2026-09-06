@@ -450,9 +450,27 @@ void LayoutPropagation::initAnchorLayout() {
   }
 
   funcOp.walk([&](Operation *op) {
+    // Once a requirement has been materialized, its source and result already
+    // have the same type. Keep the operation as a propagation fence without
+    // treating it as another layout-selection anchor on subsequent runs.
+    if (auto requireOp = dyn_cast<RequireLayoutOp>(op);
+        requireOp && requireOp.getSrc().getType() == requireOp.getType())
+      return;
     if (isLayoutAnchor(op)) {
       for (auto result : op->getResults()) {
-        addAnchor(result);
+        if (isa<RequireLayoutOp>(op)) {
+          // TlxPropagateLayout lowers only source-level pin=True constraints
+          // to ttg.require_layout. pin=False constraints fold or become
+          // ordinary ttg.convert_layout ops before reaching this pass.
+          // The wrapper is a semantic constraint on the require_layout
+          // boundary, not a second physical representation to propagate.
+          // The require op retains its wrapped result type; downstream layout
+          // inference should see only its concrete physical encoding.
+          auto type = cast<RankedTensorType>(result.getType());
+          layouts.insert({result, LayoutInfo(triton::unwrapTlxWrappers(
+                                      type.getEncoding()))});
+        } else
+          addAnchor(result);
       }
     }
   });
