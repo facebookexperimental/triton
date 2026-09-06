@@ -4,8 +4,10 @@ import argparse
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import ModuleType
 
@@ -19,6 +21,12 @@ _FUSED_TRITON_GUIDANCE = """The candidate is a generated Inductor output_code_fu
 Preserve call(args), argument order, output structure, shapes, strides, and dtypes. Optimize
 the complete wrapper, including avoidable launch boundaries and global intermediates. The
 TLX source is optional design evidence and must never be imported by the candidate."""
+
+_FUSED_AUTOWS_GUIDANCE = """
+This run enables Meta-Triton autoWS only for the fused leg. Annotate the recurring
+load/MMA loop with tl.range(..., warp_specialize=True); do not add or modify process-global
+environment settings in candidate.py. Treat final-TTGIR proof of materialized
+ttg.warp_specialize partitions as mandatory before attributing results to autoWS."""
 
 
 def _load_module(path: Path) -> ModuleType:
@@ -116,6 +124,56 @@ def _validate_local_runtime(triton_dir: Path, python_executable: Path) -> None:
         )
 
 
+def _persist_completed_kernel(output_dir: Path, destination: Path) -> None:
+    """Atomically install a correctness-validated session winner in its case."""
+    result_path = output_dir / "result.json"
+    best_path = output_dir / "best_kernel.py"
+    if not result_path.is_file() or not best_path.is_file():
+        raise RuntimeError(
+            f"agent session did not produce result.json and best_kernel.py in {output_dir}"
+        )
+
+    result = json.loads(result_path.read_text())
+    final = result.get("final")
+    cases = final.get("cases") if isinstance(final, dict) else None
+    if not isinstance(cases, list) or not cases:
+        raise RuntimeError("agent result has no final correctness evaluation")
+    if any(
+        not isinstance(case, dict)
+        or not isinstance(case.get("verification"), dict)
+        or case["verification"].get("passed") is not True
+        for case in cases
+    ):
+        raise RuntimeError(
+            "refusing to persist a kernel that failed final verification"
+        )
+
+    best_source = best_path.read_text()
+    if result.get("best_kernel") != best_source:
+        raise RuntimeError("best_kernel.py does not match the completed agent result")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(best_source)
+            temporary_path = Path(temporary.name)
+        if destination.exists():
+            temporary_path.chmod(stat.S_IMODE(destination.stat().st_mode))
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Tune one generated PostFuser case with the kernel optimization agent."
@@ -149,6 +207,15 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--reference-kernel", type=Path, default=None)
     parser.add_argument(
+        "--reference-config-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional fixed configuration passed to the registry reference kernel; "
+            "use this when its default heuristic is invalid or would cold-autotune."
+        ),
+    )
+    parser.add_argument(
         "--registry-reference",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -160,6 +227,14 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--benchmark-warmup-ms", type=int, default=100)
     parser.add_argument("--benchmark-duration-ms", type=int, default=500)
+    parser.add_argument(
+        "--autows",
+        action="store_true",
+        help=(
+            "Enable Meta-Triton autoWS for the fused leg and benchmark the TLX "
+            "reference in a separate process. The candidate must annotate its loop."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--candidates-per-round", type=int, default=2)
     parser.add_argument("--max-candidate-seconds", type=float, default=900.0)
@@ -216,6 +291,24 @@ def main(arguments: list[str] | None = None) -> int:
             )
     if reference is not None and not reference.is_file():
         raise SystemExit(f"TLX reference kernel does not exist: {reference}")
+    reference_config = (
+        args.reference_config_json.expanduser().resolve()
+        if args.reference_config_json is not None
+        else None
+    )
+    if reference_config is not None:
+        if not reference_config.is_file():
+            raise SystemExit(
+                f"reference configuration does not exist: {reference_config}"
+            )
+        try:
+            reference_config_payload = json.loads(reference_config.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot read reference configuration {reference_config}: {error}"
+            ) from error
+        if not isinstance(reference_config_payload, dict):
+            raise SystemExit("reference configuration must be a JSON object")
 
     if (output_dir / "result.json").exists() or (output_dir / "experiments").exists():
         raise SystemExit(
@@ -246,20 +339,35 @@ def main(arguments: list[str] | None = None) -> int:
         )
         + "\n"
     )
+    target_environment = {
+        "CUDA_VISIBLE_DEVICES": str(args.gpu_id),
+        "FUSED_TRITON_CASE_DIR": str(case_dir),
+        "FUSED_TRITON_FBSOURCE_ROOT": str(fbsource_root),
+        "FUSED_TRITON_DIR": str(triton_dir),
+        "FUSED_TRITON_PYTHON": str(python_executable),
+        # Shape-specific TLX references expose a heuristic path that
+        # bypasses their otherwise very large cold autotune search.
+        "TLX_GEMM_USE_HEURISTIC": "1",
+    }
+    if reference_config is not None:
+        target_environment["FUSED_TRITON_REFERENCE_CONFIG"] = str(reference_config)
+    if args.autows:
+        target_environment.update(
+            {
+                "FUSED_TRITON_AUTOWS": "1",
+                "TRITON_USE_META_WS": "1",
+                "TRITON_DISABLE_WSBARRIER_REORDER": "1",
+            }
+        )
     target_path.write_text(
         json.dumps(
             {
                 "backend": "cuda",
                 "architecture": "GB200",
                 "device": "cuda:0",
-                "environment": {
-                    "CUDA_VISIBLE_DEVICES": str(args.gpu_id),
-                    "FUSED_TRITON_CASE_DIR": str(case_dir),
-                    "FUSED_TRITON_FBSOURCE_ROOT": str(fbsource_root),
-                    "FUSED_TRITON_DIR": str(triton_dir),
-                    "FUSED_TRITON_PYTHON": str(python_executable),
-                },
-                "optimization_guidance": _FUSED_TRITON_GUIDANCE,
+                "environment": target_environment,
+                "optimization_guidance": _FUSED_TRITON_GUIDANCE
+                + (_FUSED_AUTOWS_GUIDANCE if args.autows else ""),
             },
             indent=2,
             sort_keys=True,
@@ -303,7 +411,14 @@ def main(arguments: list[str] | None = None) -> int:
         cli_arguments.extend(("--model", args.model))
     if args.prior_run:
         cli_arguments.extend(("--prior-run", str(args.prior_run.resolve())))
-    return cli.main(cli_arguments)
+    exit_code = cli.main(cli_arguments)
+    # Keep the complete audit trail in output_dir, and also install the final
+    # revalidated winner where the generated benchmark suite consumes it.
+    if exit_code in (0, 2):
+        destination = case_dir / "output_code_fused.py"
+        _persist_completed_kernel(output_dir, destination)
+        print(f"Saved validated fused kernel: {destination}", file=sys.stderr)
+    return exit_code
 
 
 if __name__ == "__main__":

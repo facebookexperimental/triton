@@ -244,7 +244,30 @@ CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
 Each fused and TLX leg uses `triton.testing.do_bench(return_mode="all")`.
 Warmup and measurement are duration-based, every timed execution starts after
 an L2 cache flush, and the agent computes median, p95, and CV from the returned
-raw device-time samples.
+raw device-time samples. Shape-specific TLX GEMM references use their fixed
+heuristic configuration so a large cold autotune search does not run for every
+candidate. This is a stable reference measurement, not a claim that TLX was
+autotuned to its best configuration. If that heuristic is stale for the selected GPU (for example, it
+exceeds the device shared-memory limit), pass a verified kernel configuration
+object with `--reference-config-json PATH`. The reference is correctness-checked
+before candidate timing, and the same fixed configuration is reused for every
+candidate.
+
+For a best-TLX comparison, first sweep the reference on the target GPU using
+the same L2-cache policy, correctness-check every measured configuration, and
+save all kernel and launch fields (`num_warps`, `num_stages`, and cluster shape
+included) in the reference config JSON. Keep direct kernel latency distinct
+from complete Python-wrapper latency: CUDA events around a wrapper can include
+host dispatch gaps whenever the stream drains before the kernel is submitted.
+
+Pass `--autows` when the candidate source annotates its recurring load/MMA loop
+with `tl.range(..., warp_specialize=True)`. This enables the required Meta-WS
+environment only for the fused leg and benchmarks the hand-written TLX leg in a
+separate process. An AutoWS result is not established until the exact final
+TTGIR contains both `ttg.warp_specialize` and materialized partition regions.
+When a matching TLX kernel uses TMA and persistent scheduling, first establish
+a correct plain-Triton TMA/persistent candidate, then add AutoWS as a separate
+experiment so the performance effects remain attributable.
 
 For an unattended run, replace the prompt with
 `--triton-dir /path/to/triton`. If native compiler code changed, run `make` in
@@ -252,10 +275,13 @@ that checkout before starting or continuing the agent. Python-only kernel or
 agent changes do not require a rebuild.
 
 The launcher deliberately disables automatic winner commits because generated
-suite files are not checked in. Inspect `best_kernel.py`, `result.json`, and the
-per-experiment patches in the output directory. To continue learning without
-repeating rejected candidates, start from the prior winner in a fresh output
-directory and pass the old run as evidence:
+suite files are not checked in. At normal session completion it atomically
+copies the final correctness-validated `best_kernel.py` to the case's
+`output_code_fused.py`; it refuses to replace that file if final verification
+did not pass. The run directory retains `best_kernel.py`, `result.json`, and the
+per-experiment patches as an audit trail. To continue learning without repeating
+rejected candidates, start from the prior winner in a fresh output directory
+and pass the old run as evidence:
 
 ```bash
 python -m third_party.tlx.tools.agents.kernel_optimization.fused_triton \

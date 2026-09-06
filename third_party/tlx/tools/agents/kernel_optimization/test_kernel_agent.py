@@ -19,6 +19,7 @@ from .cli import (
 )
 from .fused_triton import (
     _case_payload,
+    _persist_completed_kernel,
     _resolve_triton_dir,
     _validate_local_runtime,
     resolve_registry_reference,
@@ -211,6 +212,7 @@ class ScoringTest(unittest.TestCase):
                     "FUSED_TRITON_FBSOURCE_ROOT": str(root),
                     "FUSED_TRITON_DIR": str(triton_dir),
                     "FUSED_TRITON_PYTHON": "/usr/bin/python3",
+                    "TLX_GEMM_USE_HEURISTIC": "1",
                 },
             }
 
@@ -260,6 +262,52 @@ class ScoringTest(unittest.TestCase):
                 environment["PYTHONPATH"].split(":")[0], str(root / "python")
             )
 
+    def test_fused_triton_persists_verified_winner_in_case(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "run"
+            output_dir.mkdir()
+            destination = root / "case/output_code_fused.py"
+            destination.parent.mkdir()
+            destination.write_text("old source\n")
+            best_source = "optimized source\n"
+            (output_dir / "best_kernel.py").write_text(best_source)
+            (output_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "best_kernel": best_source,
+                        "final": {"cases": [{"verification": {"passed": True}}]},
+                    }
+                )
+            )
+
+            _persist_completed_kernel(output_dir, destination)
+
+            self.assertEqual(destination.read_text(), best_source)
+
+    def test_fused_triton_does_not_persist_unverified_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "run"
+            output_dir.mkdir()
+            destination = root / "output_code_fused.py"
+            destination.write_text("old source\n")
+            best_source = "bad source\n"
+            (output_dir / "best_kernel.py").write_text(best_source)
+            (output_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "best_kernel": best_source,
+                        "final": {"cases": [{"verification": {"passed": False}}]},
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "failed final verification"):
+                _persist_completed_kernel(output_dir, destination)
+
+            self.assertEqual(destination.read_text(), "old source\n")
+
     def test_fused_triton_evaluation_uses_local_python_without_buck(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -272,6 +320,7 @@ class ScoringTest(unittest.TestCase):
                 "fbsource_root": root / "fbsource",
                 "candidate_path": root / "output_code_fused.py",
                 "original_path": root / "output_code.py",
+                "target_environment": {},
             }
 
             def run(command: list[str], **kwargs: object) -> Mock:
@@ -290,6 +339,57 @@ class ScoringTest(unittest.TestCase):
                 )
 
             self.assertEqual(result, {"fused": {}, "reference": {}})
+
+    def test_fused_triton_autows_isolates_reference_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference_config = root / "reference.json"
+            reference_config.write_text("{}")
+            artifact = {
+                "evaluation": None,
+                "root": root,
+                "python": Path("/runtime/python"),
+                "benchmark_path": root / "bench_vs_geo.py",
+                "triton_dir": root / "triton",
+                "fbsource_root": root / "fbsource",
+                "candidate_path": root / "output_code_fused.py",
+                "original_path": root / "output_code.py",
+                "target_environment": {
+                    "FUSED_TRITON_AUTOWS": "1",
+                    "FUSED_TRITON_REFERENCE_CONFIG": str(reference_config),
+                    "TRITON_USE_META_WS": "1",
+                    "TRITON_DISABLE_WSBARRIER_REORDER": "1",
+                },
+            }
+            calls: list[tuple[str, dict[str, str]]] = []
+
+            def run(command: list[str], **kwargs: object) -> Mock:
+                only = command[command.index("--only") + 1]
+                environment = kwargs["env"]
+                assert isinstance(environment, dict)
+                calls.append((only, environment))
+                result_path = Path(command[command.index("--json") + 1])
+                result_path.write_text(json.dumps({only: {"accuracy": "PASS"}}))
+                return Mock(returncode=0, stdout="", stderr="")
+
+            with patch(
+                "third_party.tlx.tools.agents.kernel_optimization.fused_triton_harness.subprocess.run",
+                side_effect=run,
+            ):
+                result = run_fused_triton_evaluation(
+                    artifact, {"parameters": {"warmup_ms": 100, "benchmark_ms": 500}}
+                )
+
+            self.assertEqual(
+                result,
+                {
+                    "fused": {"accuracy": "PASS"},
+                    "reference": {"accuracy": "PASS"},
+                },
+            )
+            self.assertEqual([only for only, _ in calls], ["reference", "fused"])
+            self.assertNotIn("TRITON_USE_META_WS", calls[0][1])
+            self.assertEqual(calls[1][1]["TRITON_USE_META_WS"], "1")
 
     def test_fused_runner_preserves_raw_do_bench_samples(self) -> None:
         call = Mock()

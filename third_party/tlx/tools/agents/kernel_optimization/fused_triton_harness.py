@@ -58,6 +58,7 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
                 "triton_dir": Path(_environment(target, "FUSED_TRITON_DIR")),
                 "python": Path(_environment(target, "FUSED_TRITON_PYTHON")),
                 "source": kernel_source,
+                "target_environment": dict(target.get("environment", {})),
                 "evaluation": None,
             },
         }
@@ -79,51 +80,81 @@ def _run_evaluation(
         raise TypeError("case parameters must be a mapping")
     warmup_ms = int(parameters.get("warmup_ms", 100))
     benchmark_ms = int(parameters.get("benchmark_ms", 500))
-    result_path = artifact["root"] / "benchmark_result.json"
-    command = [
-        str(artifact["python"]),
-        str(_RUNNER),
-        "--benchmark",
-        str(artifact["benchmark_path"]),
-        "--triton-dir",
-        str(artifact["triton_dir"]),
-        "--fbsource-root",
-        str(artifact["fbsource_root"]),
-        "--fused",
-        str(artifact["candidate_path"]),
-        "--original",
-        str(artifact["original_path"]),
-        "--json",
-        str(result_path),
-        "--warmup-ms",
-        str(warmup_ms),
-        "--benchmark-ms",
-        str(benchmark_ms),
-    ]
+
+    def command(result_path: Path, only: str = "both") -> list[str]:
+        result = [
+            str(artifact["python"]),
+            str(_RUNNER),
+            "--benchmark",
+            str(artifact["benchmark_path"]),
+            "--triton-dir",
+            str(artifact["triton_dir"]),
+            "--fbsource-root",
+            str(artifact["fbsource_root"]),
+            "--fused",
+            str(artifact["candidate_path"]),
+            "--original",
+            str(artifact["original_path"]),
+            "--json",
+            str(result_path),
+            "--warmup-ms",
+            str(warmup_ms),
+            "--benchmark-ms",
+            str(benchmark_ms),
+        ]
+        reference_config = artifact["target_environment"].get(
+            "FUSED_TRITON_REFERENCE_CONFIG"
+        )
+        if reference_config:
+            result.extend(("--reference-config-json", str(reference_config)))
+        result.extend(("--only", only))
+        return result
+
     environment = dict(os.environ)
+    environment.update(
+        {str(key): str(value) for key, value in artifact["target_environment"].items()}
+    )
     python_path = str(artifact["triton_dir"] / "python")
     if existing := environment.get("PYTHONPATH"):
         python_path = os.pathsep.join((python_path, existing))
     environment["PYTHONPATH"] = python_path
-    completed = subprocess.run(
-        command,
-        cwd=artifact["root"],
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0 or not result_path.is_file():
-        output = "\n".join(
-            part.strip()
-            for part in (completed.stdout, completed.stderr)
-            if part.strip()
+
+    def invoke(
+        result_path: Path, only: str, run_environment: dict[str, str]
+    ) -> dict[str, Any]:
+        completed = subprocess.run(
+            command(result_path, only),
+            cwd=artifact["root"],
+            env=run_environment,
+            text=True,
+            capture_output=True,
+            check=False,
         )
-        raise RuntimeError(
-            f"local fused Triton evaluation failed with code {completed.returncode}: "
-            f"{output[-6000:]}"
+        if completed.returncode != 0 or not result_path.is_file():
+            output = "\n".join(
+                part.strip()
+                for part in (completed.stdout, completed.stderr)
+                if part.strip()
+            )
+            raise RuntimeError(
+                f"local fused Triton {only} evaluation failed with code "
+                f"{completed.returncode}: {output[-6000:]}"
+            )
+        return json.loads(result_path.read_text())
+
+    if artifact["target_environment"].get("FUSED_TRITON_AUTOWS") == "1":
+        reference_environment = dict(environment)
+        reference_environment.pop("TRITON_USE_META_WS", None)
+        reference = invoke(
+            artifact["root"] / "reference_result.json",
+            "reference",
+            reference_environment,
         )
-    result = json.loads(result_path.read_text())
+        fused = invoke(artifact["root"] / "fused_result.json", "fused", environment)
+        result = dict(fused)
+        result["reference"] = reference["reference"]
+    else:
+        result = invoke(artifact["root"] / "benchmark_result.json", "both", environment)
     artifact["evaluation"] = result
     return result
 

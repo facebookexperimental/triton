@@ -17,6 +17,7 @@ _TRITON_PERFORMANCE_SKILL = _SKILLS_ROOT / "common/triton-performance-optimizati
 _LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
 _NVIDIA_TARGET_SKILLS = _SKILLS_ROOT / "targets/nvidia"
 _ASYNC_TMA_OUTPUT_SKILL = _NVIDIA_TARGET_SKILLS / "async-tma-output-publication.md"
+_AUTOWS_TLX_MATCHING_SKILL = _NVIDIA_TARGET_SKILLS / "autows-tlx-matching.md"
 _BLACKWELL_CLC_SKILL = _NVIDIA_TARGET_SKILLS / "blackwell-persistent-clc-scheduling.md"
 _BLACKWELL_PIPELINE_SKILL = (
     _NVIDIA_TARGET_SKILLS / "blackwell-persistent-pipeline-efficiency.md"
@@ -304,7 +305,7 @@ def _target_skill_paths(target: KernelTarget) -> tuple[Path, ...]:
     if backend not in {"cuda", "nvidia"}:
         return tuple(skills)
     architecture = target.architecture.strip().lower()
-    skills.append(_ASYNC_TMA_OUTPUT_SKILL)
+    skills.extend((_ASYNC_TMA_OUTPUT_SKILL, _AUTOWS_TLX_MATCHING_SKILL))
     if architecture in _BLACKWELL_ARCHITECTURES:
         skills.extend((_BLACKWELL_CLC_SKILL, _BLACKWELL_PIPELINE_SKILL))
     return tuple(skills)
