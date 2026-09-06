@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -16,32 +17,44 @@ from .cli import (
     _resolve_harness_paths,
     _validate_host_matches_target,
 )
+from .fused_triton import (
+    _case_payload,
+    _resolve_triton_dir,
+    _validate_local_runtime,
+    resolve_registry_reference,
+)
+from .fused_triton_harness import (
+    _run_evaluation as run_fused_triton_evaluation,
+    build as build_fused_triton,
+)
+from .fused_triton_runner import _time_us as fused_time_us
 from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
     AutoCommitResult,
     CaseEvaluation,
     InputCase,
+    is_promotable,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
+    per_case_speedups,
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
     TimingSamples,
     VerificationResult,
-    is_promotable,
-    per_case_speedups,
     weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer, _profile_log_parts
+from .optimizer import _profile_log_parts, KernelOptimizer
 from .profiling import ProfileRequest
 from .providers import (
-    CandidateContext,
-    CandidateProposal,
-    FixedCandidateProvider,
-    MockLLMProvider,
     _build_prompt,
     _read_candidate_metadata,
+    CandidateContext,
+    CandidateProposal,
+    CodexCandidateProvider,
+    FixedCandidateProvider,
+    MockLLMProvider,
 )
 from .source import (
     apply_candidate_diff,
@@ -120,6 +133,7 @@ class ScoringTest(unittest.TestCase):
         )
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
+            reference_kernel_source="def reference():\n    return 1\n",
             harness_path=Path(__file__),
             cases=(InputCase("target", {"mode": "bwd"}),),
             target=KernelTarget(
@@ -158,14 +172,20 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Why:", prompt)
         self.assertIn("Performance:", prompt)
         self.assertIn("external harness adds", prompt)
+        self.assertIn("reference_kernel.py", prompt)
         self.assertIn("expected_effect", prompt)
         self.assertIn("Trusted built-in target optimization skills", prompt)
+        self.assertIn("# General Triton Performance Optimization", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
         self.assertIn("# Blackwell Persistent CLC Scheduling", prompt)
         self.assertIn("# Blackwell Persistent Pipeline Efficiency", prompt)
         self.assertIn("optimize data movement and scheduling", prompt)
         self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+        self.assertLess(
+            prompt.index("# General Triton Performance Optimization"),
+            prompt.index("# TLX Layout Conversion Efficiency"),
+        )
         self.assertLess(
             prompt.index("# TLX Layout Conversion Efficiency"),
             prompt.index("# NVIDIA Async TMA Output Publication"),
@@ -174,6 +194,195 @@ class ScoringTest(unittest.TestCase):
             prompt.index("Trusted built-in target optimization skills"),
             prompt.index("Frozen target-specific optimization guidance"),
         )
+
+    def test_fused_triton_build_stages_candidate_and_original(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "geo_unfused" / "case"
+            case_dir.mkdir(parents=True)
+            (case_dir / "manifest.json").write_text('{"cases": [{}]}')
+            (case_dir / "output_code.py").write_text("def call(args): return args\n")
+            (case_dir / "bench_vs_geo.py").write_text("def main(args): return 0\n")
+            triton_dir = root / "triton"
+            target = {
+                "backend": "cuda",
+                "environment": {
+                    "FUSED_TRITON_CASE_DIR": str(case_dir),
+                    "FUSED_TRITON_FBSOURCE_ROOT": str(root),
+                    "FUSED_TRITON_DIR": str(triton_dir),
+                    "FUSED_TRITON_PYTHON": "/usr/bin/python3",
+                },
+            }
+
+            result = build_fused_triton("def call(args): return args\n", target)
+
+            self.assertTrue(result["success"])
+            artifact = result["artifact"]
+            self.assertEqual(
+                artifact["candidate_path"].read_text(),
+                "def call(args): return args\n",
+            )
+            self.assertTrue(artifact["original_path"].is_file())
+            self.assertTrue(artifact["benchmark_path"].is_file())
+            self.assertEqual(artifact["triton_dir"], triton_dir)
+            artifact["temporary"].cleanup()
+
+    def test_fused_triton_prompts_for_triton_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "python/triton/_C").mkdir(parents=True)
+            (root / "python/triton/__init__.py").write_text("")
+            (root / "python/triton/_C/libtriton.so").write_text("")
+            with patch("builtins.input", return_value=str(root)) as prompt:
+                resolved = _resolve_triton_dir(None)
+
+            self.assertEqual(resolved, root)
+            self.assertIn("Triton checkout to use", prompt.call_args.args[0])
+
+    def test_fused_triton_validates_selected_python_and_triton(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root / "bin/python"
+            python.parent.mkdir()
+            python.write_text("")
+            imported = root / "python/triton"
+            imported.mkdir(parents=True)
+            with patch(
+                "third_party.tlx.tools.agents.kernel_optimization.fused_triton.subprocess.run",
+                return_value=Mock(returncode=0, stdout=f"{imported}\n", stderr=""),
+            ) as run:
+                _validate_local_runtime(root, python)
+
+            command = run.call_args.args[0]
+            environment = run.call_args.kwargs["env"]
+            self.assertEqual(command[0], str(python))
+            self.assertEqual(
+                environment["PYTHONPATH"].split(":")[0], str(root / "python")
+            )
+
+    def test_fused_triton_evaluation_uses_local_python_without_buck(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = {
+                "evaluation": None,
+                "root": root,
+                "python": Path("/runtime/python"),
+                "benchmark_path": root / "bench_vs_geo.py",
+                "triton_dir": root / "triton",
+                "fbsource_root": root / "fbsource",
+                "candidate_path": root / "output_code_fused.py",
+                "original_path": root / "output_code.py",
+            }
+
+            def run(command: list[str], **kwargs: object) -> Mock:
+                self.assertEqual(command[0], "/runtime/python")
+                self.assertNotIn("buck2", command)
+                result_path = Path(command[command.index("--json") + 1])
+                result_path.write_text('{"fused": {}, "reference": {}}')
+                return Mock(returncode=0, stdout="", stderr="")
+
+            with patch(
+                "third_party.tlx.tools.agents.kernel_optimization.fused_triton_harness.subprocess.run",
+                side_effect=run,
+            ):
+                result = run_fused_triton_evaluation(
+                    artifact, {"parameters": {"warmup_ms": 100, "benchmark_ms": 500}}
+                )
+
+            self.assertEqual(result, {"fused": {}, "reference": {}})
+
+    def test_fused_runner_preserves_raw_do_bench_samples(self) -> None:
+        call = Mock()
+        triton = Mock()
+        triton.testing.do_bench.return_value = [0.125, 0.100, 0.150]
+        with patch.dict(sys.modules, {"triton": triton}):
+            result = fused_time_us(Mock(), call, 100, 500)
+
+        triton.testing.do_bench.assert_called_once_with(
+            call,
+            warmup=100,
+            rep=500,
+            return_mode="all",
+        )
+        self.assertEqual(result["samples_us"], [125.0, 100.0, 150.0])
+        self.assertEqual(result["latency_us"], 125.0)
+
+    def test_fused_triton_case_payload_requires_one_case(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory)
+            (case_dir / "manifest.json").write_text('{"cases": []}')
+            with self.assertRaisesRegex(ValueError, "exactly one case"):
+                _case_payload(case_dir)
+
+    def test_fused_triton_resolves_shape_specific_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            postfuser = root / "fbcode/triton/tools/post-fuser"
+            case_dir = postfuser / "geo_unfused/case"
+            case_dir.mkdir(parents=True)
+            analyzer = postfuser / "analyze_geo_unfused_corpus.py"
+            implementation = root / "kernel.py"
+            implementation.write_text("def kernel(): pass\n")
+            analyzer.write_text(
+                "from types import SimpleNamespace\n"
+                "from pathlib import Path\n"
+                "def load_geo_sources(root, manifest):\n"
+                f"    return {{'case': SimpleNamespace(implementation=Path({str(implementation)!r}), implementation_status='resolved')}}\n"
+            )
+            (case_dir / "manifest.json").write_text(
+                '{"cases": [{"geo_kernel": "case"}]}'
+            )
+
+            resolved = resolve_registry_reference(case_dir, root)
+
+            self.assertEqual(resolved, implementation)
+
+    def test_codex_provider_exposes_complete_reference_file(self) -> None:
+        reference = "# full reference\n" + "x = 1\n" * 1000
+        request = KernelOptimizationRequest(
+            kernel_source="def kernel():\n    return 1\n",
+            reference_kernel_source=reference,
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget("cuda", "blackwell"),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+
+        def run(command: list[str], **kwargs: object) -> Mock:
+            workspace = Path(command[command.index("--cd") + 1])
+            self.assertEqual((workspace / "reference_kernel.py").read_text(), reference)
+            (workspace / "candidate_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "hypothesis": "test",
+                        "evidence": "test",
+                        "change": "test",
+                        "expected_effect": "test",
+                        "risk": "test",
+                        "commit_title": "Keep candidate unchanged",
+                        "commit_summary": "Change summary: test\n\nWhy: test",
+                    }
+                )
+            )
+            return Mock(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "third_party.tlx.tools.agents.kernel_optimization.providers.subprocess.run",
+            side_effect=run,
+        ):
+            proposal = CodexCandidateProvider().propose(
+                request,
+                CandidateContext(
+                    1,
+                    0,
+                    request.kernel_source,
+                    _performance(("target", 100.0)),
+                    (),
+                ),
+            )
+
+        self.assertEqual(proposal.source, request.kernel_source)
 
     def test_codex_prompt_selects_nvidia_non_blackwell_skill(self) -> None:
         request = KernelOptimizationRequest(
@@ -193,6 +402,7 @@ class ScoringTest(unittest.TestCase):
                 (),
             ),
         )
+        self.assertIn("# General Triton Performance Optimization", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
         self.assertLess(
@@ -228,6 +438,7 @@ class ScoringTest(unittest.TestCase):
         )
         self.assertIn(guidance, prompt)
         self.assertIn("Trusted built-in target optimization skills", prompt)
+        self.assertIn("# General Triton Performance Optimization", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
@@ -294,7 +505,9 @@ class ScoringTest(unittest.TestCase):
             )
             metadata = _read_candidate_metadata(path)
             self.assertEqual(metadata["hypothesis"], "reduce work")
-            self.assertEqual(metadata["commit_title"], "Fold half scale into dS encoding")
+            self.assertEqual(
+                metadata["commit_title"], "Fold half scale into dS encoding"
+            )
             self.assertIn("encoded exponent", metadata["commit_summary"])
             self.assertIn("generic fallback", metadata["commit_summary"])
 
@@ -376,7 +589,9 @@ class ScoringTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty"):
             validate_kernel_source("   \n")
 
-    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(self) -> None:
+    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(
+        self,
+    ) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
@@ -516,6 +731,18 @@ class CliTest(unittest.TestCase):
         )
         self.assertFalse(args.commit_winner)
 
+    def test_host_validation_can_be_delegated_to_external_harness(self) -> None:
+        args = _parse_args(
+            [
+                "--kernel",
+                "kernel.py",
+                "--output-dir",
+                "/tmp/out",
+                "--skip-host-validation",
+            ]
+        )
+        self.assertTrue(args.skip_host_validation)
+
     def test_diagnostic_proton_intra_kernel_is_disabled_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertFalse(args.diagnostic_proton_intra_kernel)
@@ -577,9 +804,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_default_arch_only_uses_arches_with_matching_target(self) -> None:
         kernel = Path("vector_add.py")
-        harness, cases, target = _resolve_harness_paths(
-            kernel, None, None, None, None
-        )
+        harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
             Path(__file__).with_name("harnesses")
@@ -622,7 +847,9 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(performance.cases[0].profile.get("bottleneck"), "synthetic")
 
-    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(self) -> None:
+    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "three_arg_harness.py"
             harness_path.write_text(
@@ -682,7 +909,9 @@ class HarnessTest(unittest.TestCase):
                 "    return {'case_id': case['case_id'], 'request': request, 'exists': Path(request['artifacts_dir']).exists()}\n"
             )
             artifacts_dir = Path(tmp) / "profiles"
-            performance = SubprocessHarness(harness_path, timeout_seconds=30.0).evaluate(
+            performance = SubprocessHarness(
+                harness_path, timeout_seconds=30.0
+            ).evaluate(
                 "source",
                 (InputCase("case a", {}),),
                 KernelTarget("cuda", "blackwell"),
@@ -702,7 +931,9 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual(request["tools"], ["proton_launch", "ncu"])
             self.assertEqual(Path(str(request["artifacts_dir"])).parent, artifacts_dir)
 
-    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(self) -> None:
+    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "big_profile_harness.py"
             harness_path.write_text(
@@ -813,7 +1044,9 @@ class KernelOptimizerTest(unittest.TestCase):
     def test_prior_source_is_rejected_without_adopting_prior_winner(self) -> None:
         baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
         prior_source = "LATENCY_US = 80\nCORRECT = True\n"
-        provider = FixedCandidateProvider([CandidateProposal(prior_source, "duplicate")])
+        provider = FixedCandidateProvider(
+            [CandidateProposal(prior_source, "duplicate")]
+        )
         prior = PriorRunEvidence(
             run_path=Path("/tmp/prior"),
             experiments_path=Path("/tmp/prior/experiments.json"),
@@ -916,9 +1149,7 @@ class KernelOptimizerTest(unittest.TestCase):
         candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
         with tempfile.TemporaryDirectory() as directory:
             result = KernelOptimizer(
-                FixedCandidateProvider(
-                    [CandidateProposal(candidate_source, "faster")]
-                )
+                FixedCandidateProvider([CandidateProposal(candidate_source, "faster")])
             ).optimize(
                 KernelOptimizationRequest(
                     kernel_source=baseline_source,
@@ -1233,13 +1464,19 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertEqual(result.stopping_reason, "finalist_revalidation_failed")
             self.assertEqual(result.best_kernel, baseline_source)
             self.assertEqual(result.final.cases[0].profile["marker"], "baseline")
-            self.assertEqual((output_dir / "best_kernel.py").read_text(), baseline_source)
+            self.assertEqual(
+                (output_dir / "best_kernel.py").read_text(), baseline_source
+            )
             self.assertEqual(best_profile, baseline_profile)
             self.assertEqual(final_profile, baseline_profile)
 
     def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = _write_policy_harness(Path(tmp))
@@ -1326,7 +1563,11 @@ class KernelOptimizerTest(unittest.TestCase):
 
     def test_ncu_regression_diagnostic_vetoes_candidate(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             stderr = io.StringIO()
@@ -1402,16 +1643,20 @@ class KernelOptimizerTest(unittest.TestCase):
             "proton.intra.tile=start_n:3840/logical_block:31/curr_m:3968/mma_producer_j:32/load_input_j:31",
             parts,
         )
-        self.assertIn(
-            "proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts
-        )
+        self.assertIn("proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts)
         self.assertIn(f"proton.intra.trace={trace_path}", parts)
 
-    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(self) -> None:
+    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(
+        self,
+    ) -> None:
         provider = FixedCandidateProvider(
             [
-                CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"),
-                CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"),
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"
+                ),
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                ),
             ]
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -1443,7 +1688,10 @@ class KernelOptimizerTest(unittest.TestCase):
             if request["tools"] == ["proton_intra_kernel"]
         ]
         self.assertEqual(
-            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [
+                (request["experiment_id"], request["reason"])
+                for request in diagnostic_requests
+            ],
             [("baseline", "baseline_diagnostic"), ("final", "final_winner_diagnostic")],
         )
         candidate_diagnostics = [
@@ -1456,7 +1704,9 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "rejected")
         self.assertEqual(result.experiments[2].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
-        self.assertIn("diagnostic_proton_intra_kernel", result.baseline.cases[0].profile)
+        self.assertIn(
+            "diagnostic_proton_intra_kernel", result.baseline.cases[0].profile
+        )
         self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
         self.assertNotIn(
             "diagnostic_proton_intra_kernel",
@@ -1466,11 +1716,22 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(baseline_diag["tools"], ["proton_intra_kernel"])
         self.assertEqual(baseline_diag["artifacts"]["trace"], "/tmp/proton.trace")
         self.assertNotIn("trace_events", baseline_diag)
-        self.assertEqual(best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"]["granularity"], "warp")
+        self.assertEqual(
+            best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"][
+                "granularity"
+            ],
+            "warp",
+        )
 
-    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(self) -> None:
+    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(
+        self,
+    ) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1499,14 +1760,21 @@ class KernelOptimizerTest(unittest.TestCase):
         ]
         self.assertFalse(result.success)
         self.assertEqual(
-            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [
+                (request["experiment_id"], request["reason"])
+                for request in diagnostic_requests
+            ],
             [("baseline", "baseline_diagnostic")],
         )
         self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
 
     def test_diagnostic_proton_is_promotion_neutral(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1531,7 +1799,9 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
         self.assertEqual(
-            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"]["summary"]["duration_us"],
+            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"][
+                "summary"
+            ]["duration_us"],
             999999.0,
         )
 

@@ -18,8 +18,8 @@ from .models import (
     KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
-    PerformanceSummary,
     passes_protected_cases,
+    PerformanceSummary,
     to_json_value,
 )
 from .optimizer import KernelOptimizer
@@ -43,7 +43,12 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         description="Optimize a Triton or TLX kernel with a deterministic harness."
     )
     parser.add_argument("--kernel", type=Path, required=True)
-    parser.add_argument("--reference-kernel", type=Path, default=None, help="Optional reference kernel source used as correctness oracle (harness verify can compare candidate vs reference).")
+    parser.add_argument(
+        "--reference-kernel",
+        type=Path,
+        default=None,
+        help="Optional reference kernel source used as correctness oracle (harness verify can compare candidate vs reference).",
+    )
     parser.add_argument("--harness", type=Path, default=None)
     parser.add_argument("--cases", type=Path, default=None)
     parser.add_argument("--target", type=Path, default=None)
@@ -51,6 +56,14 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         "--arch",
         default=None,
         help="Target arch under harnesses/<arch>/targets/<kernel> (e.g. blackwell, hopper, host). Defaults to first available.",
+    )
+    parser.add_argument(
+        "--skip-host-validation",
+        action="store_true",
+        help=(
+            "Skip the driver's in-process CUDA capability probe when the harness "
+            "runs GPU evaluation in an external environment such as Buck."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
@@ -157,7 +170,13 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
     )
 
 
-def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | None, target: Path | None, arch: str | None) -> tuple[Path, Path, Path]:
+def _resolve_harness_paths(
+    kernel: Path,
+    harness: Path | None,
+    cases: Path | None,
+    target: Path | None,
+    arch: str | None,
+) -> tuple[Path, Path, Path]:
     # Kernel-only invocation: infer harness/cases/target from
     # harnesses/<arch>/targets/<stem>/
     # e.g. --kernel gemm.py -> harnesses/blackwell/targets/gemm/{harness.py,cases.json,target.json}
@@ -182,8 +201,14 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
             if target is None and (tdir / "target.json").exists():
                 target = tdir / "target.json"
     if harness is None or cases is None or target is None:
-        missing = [n for n, v in [("harness", harness), ("cases", cases), ("target", target)] if v is None]
-        raise SystemExit(f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/")
+        missing = [
+            n
+            for n, v in [("harness", harness), ("cases", cases), ("target", target)]
+            if v is None
+        ]
+        raise SystemExit(
+            f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/"
+        )
     return harness, cases, target
 
 
@@ -217,7 +242,9 @@ def _probe_cuda_compute_capability(device: str | None) -> tuple[int, int]:
 def _validate_host_matches_target(
     target: KernelTarget,
     arch: str | None,
-    capability_probe: Callable[[str | None], tuple[int, int]] = _probe_cuda_compute_capability,
+    capability_probe: Callable[
+        [str | None], tuple[int, int]
+    ] = _probe_cuda_compute_capability,
 ) -> None:
     if target.backend != "cuda":
         return
@@ -279,14 +306,24 @@ def _performance_commit_body(
             )
         )
 
-    headers = ("Case", "Baseline us", "Winner us", "Speedup", "Base CV", "Winner CV", "Correct")
+    headers = (
+        "Case",
+        "Baseline us",
+        "Winner us",
+        "Speedup",
+        "Base CV",
+        "Winner CV",
+        "Correct",
+    )
     widths = [len(header) for header in headers]
     for row in rows:
         for index, value in enumerate(row):
             widths[index] = max(widths[index], len(value))
 
     def format_row(row: tuple[str, ...]) -> str:
-        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+        return "  ".join(
+            value.ljust(widths[index]) for index, value in enumerate(row)
+        ).rstrip()
 
     table = [format_row(headers), format_row(tuple("-" * width for width in widths))]
     table.extend(format_row(row) for row in rows)
@@ -342,7 +379,9 @@ class _PromotionAutoCommitter:
         )
         self._output_dir.joinpath(
             "experiments", experiment_id, "commit_revalidation.json"
-        ).write_text(json.dumps(to_json_value(validation), indent=2, sort_keys=True) + "\n")
+        ).write_text(
+            json.dumps(to_json_value(validation), indent=2, sort_keys=True) + "\n"
+        )
         if not passes_protected_cases(validation, self._cases):
             raise HarnessExecutionError(
                 "merged promotion source failed one or more protected correctness cases"
@@ -355,7 +394,9 @@ class _PromotionAutoCommitter:
         baseline: PerformanceSummary,
         performance: PerformanceSummary,
     ) -> AutoCommitResult:
-        subject = self._override_subject or experiment.commit_title or self._fallback_subject
+        subject = (
+            self._override_subject or experiment.commit_title or self._fallback_subject
+        )
         try:
             result = commit_promotion(
                 self._session,
@@ -419,9 +460,11 @@ def _report_commit(commit_result: object) -> None:
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
-def main() -> int:
-    args = _parse_args()
-    harness_path, cases_path, target_path = _resolve_harness_paths(args.kernel, args.harness, args.cases, args.target, args.arch)
+def main(arguments: list[str] | None = None) -> int:
+    args = _parse_args(arguments)
+    harness_path, cases_path, target_path = _resolve_harness_paths(
+        args.kernel, args.harness, args.cases, args.target, args.arch
+    )
     case_payloads = _load_json(cases_path)
     target_payload = _load_json(target_path)
     cases = tuple(
@@ -440,7 +483,8 @@ def main() -> int:
         environment=target_payload.get("environment", {}),
         optimization_guidance=str(target_payload.get("optimization_guidance", "")),
     )
-    _validate_host_matches_target(target, args.arch)
+    if not args.skip_host_validation:
+        _validate_host_matches_target(target, args.arch)
     budget = _budget_from_args(args)
     # CLI always evaluates via the optimizer's SubprocessHarness. The legacy
     # --harness-mode flag is kept for compatibility and documented as such;
@@ -474,7 +518,9 @@ def main() -> int:
             _report_commit(commit_result)
             print(json.dumps(to_json_value(commit_result), indent=2, sort_keys=True))
             return 3
-    reference_source = args.reference_kernel.read_text() if args.reference_kernel else None
+    reference_source = (
+        args.reference_kernel.read_text() if args.reference_kernel else None
+    )
     prior_run_evidence = None
     if args.prior_run is not None:
         try:
@@ -523,7 +569,8 @@ def main() -> int:
     exit_code = 0 if result.success else 2
     if result.auto_commit is not None:
         args.output_dir.joinpath("auto_commit.json").write_text(
-            json.dumps(to_json_value(result.auto_commit), indent=2, sort_keys=True) + "\n"
+            json.dumps(to_json_value(result.auto_commit), indent=2, sort_keys=True)
+            + "\n"
         )
     if result.stopping_reason in {"promotion_commit_failed", "rollback_commit_failed"}:
         exit_code = 3

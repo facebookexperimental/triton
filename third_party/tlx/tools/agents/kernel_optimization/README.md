@@ -1,4 +1,4 @@
-# TLX Kernel Optimization Agent
+# Triton/TLX Kernel Optimization Agent
 
 This directory contains the TLX-local optimization loop for standalone Triton and TLX
 kernels. It lives inside the TLX codebase (`third_party/tlx/tools/agents/kernel_optimization/`) and
@@ -7,6 +7,12 @@ is the canonical location for the loop in this checkout; a future sync to
 
 The language used by the kernel is not part of the control-plane contract. A
 user-supplied harness owns compilation, correctness, timing, and profiling.
+The built-in optimization policy classifies
+launch, data-movement, compute, occupancy, synchronization, layout, and spill
+bottlenecks, then asks for one measurable source or compiler hypothesis at a
+time. A TLX or other reference kernel is optional design evidence. Without a
+reference, the agent derives hypotheses from correctness-gated benchmark and
+profiler results supplied by the harness.
 
 The loop is:
 
@@ -79,7 +85,10 @@ sanitized experiment evidence for candidate prompts. It never mutates prior
 artifacts or adopts the prior winner; the current kernel is always rebuilt and
 validated as the new baseline.
 
-`--reference-kernel` is optional: a trusted oracle kernel. When provided it is persisted to `reference_kernel.py` in the output dir, exposed to harness workers via `TLX_REFERENCE_KERNEL_PATH`, and shown (truncated) to Codex in the prompt as comparison context. `verify` may load it to compare candidate vs reference.
+`--reference-kernel` is optional: a trusted oracle kernel. When provided it is
+persisted to `reference_kernel.py` in the output dir, exposed to harness
+workers via `TLX_REFERENCE_KERNEL_PATH`, and copied in full into the candidate
+agent's workspace. `verify` may load it to compare candidate vs reference.
 
 `--provider` is `codex` (default, shells `codex exec`) or `mock` (deterministic stub for
 CI that replays canned candidates or echoes the current source). When `codex` is not
@@ -197,4 +206,64 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --max-rounds 3 --candidates-per-round 4 \
   --max-candidate-seconds 600 --max-total-seconds 3600 \
   --provider codex
+```
+
+## Generated fused Triton case
+
+`fused_triton` adapts one generated PostFuser case to this same optimization
+loop. The candidate is the case's complete `output_code_fused.py`; correctness
+and CUDA-event timing run directly with a locally built Triton checkout; Buck
+is not used. The shape-matched TLX implementation is resolved automatically
+and made available to the candidate agent as `reference_kernel.py`. Pass
+`--no-registry-reference` to exercise the latency/source-evidence path without it,
+or `--reference-kernel PATH` to use another implementation.
+
+Run the launcher from the Triton source repository root, wrapped in
+`denoise.sh` on NVIDIA. The generated case directory must already contain
+`output_code.py`, `output_code_fused.py`, `manifest.json`, and
+`bench_vs_geo.py`. At session start the launcher asks which Triton checkout to
+use, validates its `python/triton/_C/libtriton.so`, and verifies that the chosen
+Python runtime imports that exact checkout. The Python runtime must provide
+PyTorch; pass `--python-executable` when it differs from the launcher:
+
+```bash
+CASE=matmul_add
+FBS=/path/to/fbsource
+CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
+  python -m third_party.tlx.tools.agents.kernel_optimization.fused_triton \
+  --case-dir "$FBS/fbcode/triton/tools/post-fuser/geo_unfused/$CASE" \
+  --fbsource-root "$FBS" \
+  --output-dir "/tmp/fused-agent-$CASE" \
+  --python-executable /path/to/python-with-torch \
+  --gpu-id 0 \
+  --max-rounds 3 --candidates-per-round 2 \
+  --benchmark-warmup-ms 100 \
+  --benchmark-duration-ms 500
+```
+
+Each fused and TLX leg uses `triton.testing.do_bench(return_mode="all")`.
+Warmup and measurement are duration-based, every timed execution starts after
+an L2 cache flush, and the agent computes median, p95, and CV from the returned
+raw device-time samples.
+
+For an unattended run, replace the prompt with
+`--triton-dir /path/to/triton`. If native compiler code changed, run `make` in
+that checkout before starting or continuing the agent. Python-only kernel or
+agent changes do not require a rebuild.
+
+The launcher deliberately disables automatic winner commits because generated
+suite files are not checked in. Inspect `best_kernel.py`, `result.json`, and the
+per-experiment patches in the output directory. To continue learning without
+repeating rejected candidates, start from the prior winner in a fresh output
+directory and pass the old run as evidence:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.fused_triton \
+  --case-dir "$FBS/fbcode/triton/tools/post-fuser/geo_unfused/$CASE" \
+  --kernel "/tmp/fused-agent-$CASE/best_kernel.py" \
+  --prior-run "/tmp/fused-agent-$CASE" \
+  --triton-dir /path/to/triton \
+  --python-executable /path/to/python-with-torch \
+  --fbsource-root "$FBS" \
+  --output-dir "/tmp/fused-agent-$CASE-next"
 ```

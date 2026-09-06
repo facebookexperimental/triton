@@ -13,6 +13,7 @@ from .profiling import compact_profile_summary
 from .source import validate_replacement_source
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
+_TRITON_PERFORMANCE_SKILL = _SKILLS_ROOT / "common/triton-performance-optimization.md"
 _LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
 _NVIDIA_TARGET_SKILLS = _SKILLS_ROOT / "targets/nvidia"
 _ASYNC_TMA_OUTPUT_SKILL = _NVIDIA_TARGET_SKILLS / "async-tma-output-publication.md"
@@ -130,7 +131,9 @@ class MockLLMProvider:
         if index < len(self.canned):
             return self.canned[index]
         if self.fallback_source is not None:
-            return CandidateProposal(source=self.fallback_source, summary="mock-fallback")
+            return CandidateProposal(
+                source=self.fallback_source, summary="mock-fallback"
+            )
         # Default: echo current source so the harness re-evaluates it (dedup will
         # turn the second echo into a deterministic failure rather than a hang).
         return CandidateProposal(source=context.current_source, summary="mock-echo")
@@ -166,19 +169,22 @@ def _fallback_commit_summary(metadata: dict[str, str]) -> str:
     risk = metadata.get("risk", "")
     if risk:
         change = f"{change} Preserved behavior and risk: {risk}"
-    why = " ".join(
-        part
-        for part in (
-            metadata.get("hypothesis", ""),
-            f"Evidence: {metadata['evidence']}" if metadata.get("evidence") else "",
-            (
-                f"Expected effect: {metadata['expected_effect']}"
-                if metadata.get("expected_effect")
-                else ""
-            ),
+    why = (
+        " ".join(
+            part
+            for part in (
+                metadata.get("hypothesis", ""),
+                f"Evidence: {metadata['evidence']}" if metadata.get("evidence") else "",
+                (
+                    f"Expected effect: {metadata['expected_effect']}"
+                    if metadata.get("expected_effect")
+                    else ""
+                ),
+            )
+            if part
         )
-        if part
-    ) or "TLX Agent selected this candidate for external correctness and performance evaluation."
+        or "TLX Agent selected this candidate for external correctness and performance evaluation."
+    )
     return _clean_commit_summary(f"Change summary:\n{change}\n\nWhy:\n{why}")
 
 
@@ -222,12 +228,17 @@ class CodexCandidateProvider:
     ) -> CandidateProposal:
         prompt = _build_prompt(request, context)
         try:
-            with tempfile.TemporaryDirectory(prefix="tlx-agent-candidate-") as directory:
+            with tempfile.TemporaryDirectory(
+                prefix="tlx-agent-candidate-"
+            ) as directory:
                 workspace = Path(directory)
                 candidate_path = workspace / "candidate.py"
+                reference_path = workspace / "reference_kernel.py"
                 output_path = workspace / "last-message.txt"
                 metadata_path = workspace / "candidate_metadata.json"
                 candidate_path.write_text(context.current_source)
+                if request.reference_kernel_source:
+                    reference_path.write_text(request.reference_kernel_source)
                 command = [
                     "codex",
                     "exec",
@@ -282,11 +293,13 @@ def _read_target_skill(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8").strip()
     except OSError as error:
-        raise RuntimeError(f"unable to read built-in target skill {path}: {error}") from error
+        raise RuntimeError(
+            f"unable to read built-in target skill {path}: {error}"
+        ) from error
 
 
 def _target_skill_paths(target: KernelTarget) -> tuple[Path, ...]:
-    skills = [_LAYOUT_CONVERSION_SKILL]
+    skills = [_TRITON_PERFORMANCE_SKILL, _LAYOUT_CONVERSION_SKILL]
     backend = target.backend.strip().lower()
     if backend not in {"cuda", "nvidia"}:
         return tuple(skills)
@@ -345,9 +358,19 @@ def _build_prompt(
         for case in context.current_performance.cases
     )
     diagnostics = "\n".join(context.previous_diagnostics[-5:]) or "None"
-    reference_block = ""
+    reference_block = (
+        "\nNo reference kernel was supplied. Use correctness results and profiler "
+        "evidence to derive the next hypothesis.\n"
+    )
     if getattr(request, "reference_kernel_source", None):
-        reference_block = f"\nReference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):\n```python\n{request.reference_kernel_source[:4000]}\n```\n"
+        reference_block = f"""
+Reference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):
+The complete source is available as `reference_kernel.py` in the writable working
+directory. Read it before proposing a change. An initial excerpt follows:
+```python
+{request.reference_kernel_source[:4000]}
+```
+"""
     target_skills = _target_skill_guidance(request.target)
     target_skills_block = (
         f"\nTrusted built-in target optimization skills:\n{target_skills}\n"
