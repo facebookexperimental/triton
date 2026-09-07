@@ -266,13 +266,21 @@ from complete Python-wrapper latency: CUDA events around a wrapper can include
 host dispatch gaps whenever the stream drains before the kernel is submitted.
 
 Pass `--autows` when the candidate source annotates its recurring load/MMA loop
-with `tl.range(..., warp_specialize=True)`. This enables the required Meta-WS
-environment only for the fused leg and benchmarks the hand-written TLX leg in a
-separate process. An AutoWS result is not established until the exact final
+with `tl.range(..., warp_specialize=True)`. This enables the selected AutoWS
+implementation only for the fused leg and benchmarks the hand-written TLX leg
+in a separate process. An AutoWS result is not established until the exact final
 TTGIR contains both `ttg.warp_specialize` and materialized partition regions.
 When a matching TLX kernel uses TMA and persistent scheduling, first establish
 a correct plain-Triton TMA/persistent candidate, then add AutoWS as a separate
 experiment so the performance effects remain attributable.
+
+`--autows` defaults to `--autows-implementation meta`. Also run a separate
+session with `--autows-implementation upstream` when the standard Triton WS
+lowering is deployable. The launcher removes both `TRITON_USE_META_WS` and
+`TRITON_DISABLE_WSBARRIER_REORDER` from the upstream candidate and from the
+isolated TLX reference. Treat the two AutoWS implementations as independent
+variants: use fresh output/cache directories, prove physical partitions in each
+final TTGIR, and retain whichever correctness-valid mode is faster.
 
 Before compiler-level experiments, calculate the persistent tile count and its
 number of waves over the target SM count. Sweep configurations that avoid an

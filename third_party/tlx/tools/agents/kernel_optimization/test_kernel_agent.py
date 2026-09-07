@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from .cli import (
 )
 from .fused_triton import (
     _case_payload,
+    _parse_args as parse_fused_triton_args,
     _persist_completed_kernel,
     _resolve_triton_dir,
     _validate_local_runtime,
@@ -241,6 +243,24 @@ class ScoringTest(unittest.TestCase):
             self.assertEqual(resolved, root)
             self.assertIn("Triton checkout to use", prompt.call_args.args[0])
 
+    def test_fused_triton_accepts_upstream_autows(self) -> None:
+        args = parse_fused_triton_args(
+            [
+                "--case-dir",
+                "case",
+                "--fbsource-root",
+                "fbsource",
+                "--output-dir",
+                "run",
+                "--autows",
+                "--autows-implementation",
+                "upstream",
+            ]
+        )
+
+        self.assertTrue(args.autows)
+        self.assertEqual(args.autows_implementation, "upstream")
+
     def test_fused_triton_validates_selected_python_and_triton(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -453,11 +473,61 @@ class ScoringTest(unittest.TestCase):
             )
             self.assertEqual([only for only, _ in calls], ["reference", "fused"])
             self.assertNotIn("TRITON_USE_META_WS", calls[0][1])
+            self.assertNotIn("TRITON_DISABLE_WSBARRIER_REORDER", calls[0][1])
             self.assertEqual(
                 calls[0][1]["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"], "1"
             )
             self.assertEqual(calls[1][1]["TRITON_USE_META_WS"], "1")
             self.assertNotIn("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", calls[1][1])
+
+    def test_fused_triton_upstream_autows_clears_meta_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = {
+                "evaluation": None,
+                "root": root,
+                "python": Path("/runtime/python"),
+                "benchmark_path": root / "bench_vs_geo.py",
+                "triton_dir": root / "triton",
+                "fbsource_root": root / "fbsource",
+                "candidate_path": root / "output_code_fused.py",
+                "original_path": root / "output_code.py",
+                "target_environment": {
+                    "FUSED_TRITON_AUTOWS": "1",
+                    "FUSED_TRITON_AUTOWS_IMPLEMENTATION": "upstream",
+                },
+            }
+            calls: list[tuple[str, dict[str, str]]] = []
+
+            def run(command: list[str], **kwargs: object) -> Mock:
+                only = command[command.index("--only") + 1]
+                environment = kwargs["env"]
+                assert isinstance(environment, dict)
+                calls.append((only, environment))
+                result_path = Path(command[command.index("--json") + 1])
+                result_path.write_text(json.dumps({only: {"accuracy": "PASS"}}))
+                return Mock(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "TRITON_USE_META_WS": "1",
+                        "TRITON_DISABLE_WSBARRIER_REORDER": "1",
+                    },
+                ),
+                patch(
+                    "third_party.tlx.tools.agents.kernel_optimization."
+                    "fused_triton_harness.subprocess.run",
+                    side_effect=run,
+                ),
+            ):
+                run_fused_triton_evaluation(artifact, {"parameters": {}})
+
+            self.assertEqual([only for only, _ in calls], ["reference", "fused"])
+            for _, environment in calls:
+                self.assertNotIn("TRITON_USE_META_WS", environment)
+                self.assertNotIn("TRITON_DISABLE_WSBARRIER_REORDER", environment)
 
     def test_fused_runner_preserves_raw_do_bench_samples(self) -> None:
         call = Mock()

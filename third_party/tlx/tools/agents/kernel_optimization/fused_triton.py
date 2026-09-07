@@ -24,10 +24,12 @@ the complete wrapper, including avoidable launch boundaries and global intermedi
 TLX source is optional design evidence and must never be imported by the candidate."""
 
 _FUSED_AUTOWS_GUIDANCE = """
-This run enables Meta-Triton autoWS only for the fused leg. Annotate the recurring
-load/MMA loop with tl.range(..., warp_specialize=True); do not add or modify process-global
-environment settings in candidate.py. Treat final-TTGIR proof of materialized
-ttg.warp_specialize partitions as mandatory before attributing results to autoWS."""
+This run enables {implementation} Triton AutoWS only for the fused leg. Annotate the
+recurring load/MMA loop with tl.range(..., warp_specialize=True); do not add or modify
+process-global environment settings in candidate.py. Treat final-TTGIR proof of
+materialized ttg.warp_specialize partitions as mandatory before attributing results to
+AutoWS. Do not assume upstream and Meta-WS have equivalent performance; benchmark them
+as distinct lowering modes when either could be deployed."""
 
 
 def _load_module(path: Path) -> ModuleType:
@@ -360,6 +362,15 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
             "reference in a separate process. The candidate must annotate its loop."
         ),
     )
+    parser.add_argument(
+        "--autows-implementation",
+        choices=("meta", "upstream"),
+        default="meta",
+        help=(
+            "AutoWS lowering selected by --autows (default: meta). Use upstream "
+            "to exercise Triton's non-Meta warp-specialization pass."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--candidates-per-round", type=int, default=2)
     parser.add_argument("--max-candidate-seconds", type=float, default=900.0)
@@ -492,10 +503,16 @@ def main(arguments: list[str] | None = None) -> int:
         target_environment.update(
             {
                 "FUSED_TRITON_AUTOWS": "1",
-                "TRITON_USE_META_WS": "1",
-                "TRITON_DISABLE_WSBARRIER_REORDER": "1",
+                "FUSED_TRITON_AUTOWS_IMPLEMENTATION": args.autows_implementation,
             }
         )
+        if args.autows_implementation == "meta":
+            target_environment.update(
+                {
+                    "TRITON_USE_META_WS": "1",
+                    "TRITON_DISABLE_WSBARRIER_REORDER": "1",
+                }
+            )
     target_path.write_text(
         json.dumps(
             {
@@ -504,7 +521,13 @@ def main(arguments: list[str] | None = None) -> int:
                 "device": "cuda:0",
                 "environment": target_environment,
                 "optimization_guidance": _FUSED_TRITON_GUIDANCE
-                + (_FUSED_AUTOWS_GUIDANCE if args.autows else ""),
+                + (
+                    _FUSED_AUTOWS_GUIDANCE.format(
+                        implementation=args.autows_implementation
+                    )
+                    if args.autows
+                    else ""
+                ),
             },
             indent=2,
             sort_keys=True,

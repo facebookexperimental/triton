@@ -114,6 +114,9 @@ def _run_evaluation(
     environment.update(
         {str(key): str(value) for key, value in artifact["target_environment"].items()}
     )
+    if environment.get("FUSED_TRITON_AUTOWS_IMPLEMENTATION") == "upstream":
+        environment.pop("TRITON_USE_META_WS", None)
+        environment.pop("TRITON_DISABLE_WSBARRIER_REORDER", None)
     python_path = str(artifact["triton_dir"] / "python")
     if existing := environment.get("PYTHONPATH"):
         python_path = os.pathsep.join((python_path, existing))
@@ -161,6 +164,7 @@ def _run_evaluation(
     ):
         reference_environment = dict(environment)
         reference_environment.pop("TRITON_USE_META_WS", None)
+        reference_environment.pop("TRITON_DISABLE_WSBARRIER_REORDER", None)
         reference_environment.update(reference_environment_overrides)
         reference = invoke(
             artifact["root"] / "reference_result.json",

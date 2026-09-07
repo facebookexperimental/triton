@@ -12,6 +12,14 @@ Annotate the loop that contains the recurring load/MMA pipeline with
 warp count, and stage count while iterating; `num_stages >= 2` is normally
 required for stage/order scheduling.
 
+On builds that retain Triton's upstream warp-specialization path, the same loop
+annotation with `TRITON_USE_META_WS` unset selects a different compiler
+implementation. Treat upstream WS and Meta-WS as separate candidates: compile
+them in fresh cache directories, prove physical partitions for both, and time
+both. Do not reuse a cubin across modes or infer the winner from the source
+annotation. `fused_triton --autows-implementation upstream|meta` isolates these
+settings; `--autows` defaults to `meta` for compatibility.
+
 Meta-WS is process-global and must not be applied to the hand-written TLX
 reference. Compile and benchmark the AutoWS candidate and TLX reference in
 separate processes. Keep their input shapes, correctness oracle, timing method,
