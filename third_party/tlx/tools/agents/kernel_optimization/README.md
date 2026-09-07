@@ -265,6 +265,13 @@ included) in the reference config JSON. Keep direct kernel latency distinct
 from complete Python-wrapper latency: CUDA events around a wrapper can include
 host dispatch gaps whenever the stream drains before the kernel is submitted.
 
+For isolated TLX and AutoWS legs, final validation additionally uses identical
+seeded inputs for one untimed launch, temporarily serializes the TLX outputs,
+and records `tlx_precision_comparison` for every fused output. It reports shape,
+dtype, exact-match fraction, maximum and mean absolute error, and maximum
+relative error. The temporary reference tensors are removed after comparison
+and their transfer cost is never included in performance timing.
+
 Pass `--autows` when the candidate source annotates its recurring load/MMA loop
 with `tl.range(..., warp_specialize=True)`. This enables the selected AutoWS
 implementation only for the fused leg and benchmarks the hand-written TLX leg

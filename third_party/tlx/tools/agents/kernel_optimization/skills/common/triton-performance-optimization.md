@@ -130,6 +130,32 @@ repeated-launch behavior. For asynchronous or warp-specialized code, prove
 producer/consumer ownership, buffer lifetime, barrier phase, arrival count, and
 store completion before changing scheduling or storage.
 
+When a TLX reference exists, final validation must include a direct numerical
+comparison of every returned Triton and TLX tensor using identical deterministic
+inputs. Record shape, dtype, exact-match fraction, maximum and mean absolute
+error, and maximum relative error per output. Keep this untimed; transferring a
+reference result between isolated TLX and AutoWS processes must not enter either
+performance measurement.
+
+Also write an operation-level precision trace for both implementations:
+
+```text
+step                 Triton                         TLX
+operand load         dtype / conversion             dtype / conversion
+dot                  input precision / accumulator  input precision / accumulator
+intermediate         cast and rounding boundary     cast and rounding boundary
+epilogue arithmetic  operation dtype                operation dtype
+store                output dtype                   output dtype
+```
+
+Do not infer hidden intermediate equality from final allclose. If the traces
+differ or the final comparison is not exact, use diagnostic-only kernel copies
+that publish the relevant intermediate values and compare them at each semantic
+boundary. Never time or promote an instrumented kernel. For reductions, note
+that equal input and accumulator dtypes can still differ because of reduction
+order; identify the first divergent boundary before deciding whether the change
+is acceptable.
+
 Reject changes that fail any protected case, increase measurement variance
 beyond the configured threshold, or improve only an instrumented profile while
 regressing the uninstrumented end-to-end benchmark.

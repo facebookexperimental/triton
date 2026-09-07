@@ -81,7 +81,9 @@ def _run_evaluation(
     warmup_ms = int(parameters.get("warmup_ms", 500))
     benchmark_ms = int(parameters.get("benchmark_ms", 2000))
 
-    def command(result_path: Path, only: str = "both") -> list[str]:
+    def command(
+        result_path: Path, only: str = "both", extra: tuple[str, ...] = ()
+    ) -> list[str]:
         result = [
             str(artifact["python"]),
             str(_RUNNER),
@@ -108,6 +110,7 @@ def _run_evaluation(
         if reference_config:
             result.extend(("--reference-config-json", str(reference_config)))
         result.extend(("--only", only))
+        result.extend(extra)
         return result
 
     environment = dict(os.environ)
@@ -123,10 +126,13 @@ def _run_evaluation(
     environment["PYTHONPATH"] = python_path
 
     def invoke(
-        result_path: Path, only: str, run_environment: dict[str, str]
+        result_path: Path,
+        only: str,
+        run_environment: dict[str, str],
+        extra: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         completed = subprocess.run(
-            command(result_path, only),
+            command(result_path, only, extra),
             cwd=artifact["root"],
             env=run_environment,
             text=True,
@@ -162,6 +168,7 @@ def _run_evaluation(
         artifact["target_environment"].get("FUSED_TRITON_AUTOWS") == "1"
         or reference_environment_overrides
     ):
+        reference_output = artifact["root"] / "reference_output.pt"
         reference_environment = dict(environment)
         reference_environment.pop("TRITON_USE_META_WS", None)
         reference_environment.pop("TRITON_DISABLE_WSBARRIER_REORDER", None)
@@ -170,8 +177,17 @@ def _run_evaluation(
             artifact["root"] / "reference_result.json",
             "reference",
             reference_environment,
+            ("--input-seed", "0", "--save-output", str(reference_output)),
         )
-        fused = invoke(artifact["root"] / "fused_result.json", "fused", environment)
+        try:
+            fused = invoke(
+                artifact["root"] / "fused_result.json",
+                "fused",
+                environment,
+                ("--input-seed", "0", "--compare-output", str(reference_output)),
+            )
+        finally:
+            reference_output.unlink(missing_ok=True)
         result = dict(fused)
         result["reference"] = reference["reference"]
     else:
@@ -196,13 +212,17 @@ def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
             and bool(candidate.get("samples_us"))
             and bool(reference.get("samples_us"))
         )
+        metrics = {
+            "candidate_median_us": candidate.get("latency_us"),
+            "tlx_median_us": reference.get("latency_us"),
+        }
+        precision = result.get("tlx_precision_comparison")
+        if isinstance(precision, Mapping):
+            metrics["tlx_precision_comparison"] = dict(precision)
         return {
             "passed": passed,
             "diagnostics": "" if passed else "fused or TLX correctness failed",
-            "metrics": {
-                "candidate_median_us": candidate.get("latency_us"),
-                "tlx_median_us": reference.get("latency_us"),
-            },
+            "metrics": metrics,
         }
     except Exception as error:  # noqa: BLE001
         return {

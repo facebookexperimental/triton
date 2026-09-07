@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -62,6 +63,9 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-ms", type=int, required=True)
     parser.add_argument("--benchmark-ms", type=int, required=True)
     parser.add_argument("--reference-config-json", type=Path, default=None)
+    parser.add_argument("--input-seed", type=int, default=0)
+    parser.add_argument("--save-output", type=Path, default=None)
+    parser.add_argument("--compare-output", type=Path, default=None)
     parser.add_argument(
         "--only",
         choices=("both", "fused", "reference"),
@@ -69,6 +73,160 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         help="Run both benchmark legs or one leg for process-isolated autoWS timing.",
     )
     return parser.parse_args(arguments)
+
+
+def _cpu_output(torch: Any, value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, tuple):
+        return tuple(_cpu_output(torch, item) for item in value)
+    if isinstance(value, list):
+        return [_cpu_output(torch, item) for item in value]
+    if isinstance(value, dict):
+        return {key: _cpu_output(torch, item) for key, item in value.items()}
+    raise TypeError(f"unsupported output leaf for precision comparison: {type(value)}")
+
+
+def _precision_comparison(torch: Any, actual: Any, expected: Any) -> dict[str, Any]:
+    """Return direct per-output Triton-vs-TLX numerical differences."""
+    rows: list[dict[str, Any]] = []
+
+    def visit(lhs: Any, rhs: Any, path: str) -> None:
+        if isinstance(lhs, (tuple, list)) and len(lhs) == 1 and isinstance(
+            rhs, torch.Tensor
+        ):
+            visit(lhs[0], rhs, f"{path}[0]")
+            return
+        if isinstance(rhs, (tuple, list)) and len(rhs) == 1 and isinstance(
+            lhs, torch.Tensor
+        ):
+            visit(lhs, rhs[0], f"{path}[0]")
+            return
+        if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+            lhs_cpu = lhs.detach().cpu()
+            rhs_cpu = rhs.detach().cpu()
+            if lhs_cpu.shape != rhs_cpu.shape:
+                raise ValueError(
+                    f"output {path} shape differs: {lhs_cpu.shape} vs {rhs_cpu.shape}"
+                )
+            if lhs_cpu.dtype != rhs_cpu.dtype:
+                raise ValueError(
+                    f"output {path} dtype differs: {lhs_cpu.dtype} vs {rhs_cpu.dtype}"
+                )
+            total = lhs_cpu.numel()
+            equal = torch.eq(lhs_cpu, rhs_cpu)
+            if lhs_cpu.is_floating_point() or lhs_cpu.is_complex():
+                equal = equal | (torch.isnan(lhs_cpu) & torch.isnan(rhs_cpu))
+                lhs_float = lhs_cpu.float()
+                rhs_float = rhs_cpu.float()
+                absolute = (lhs_float - rhs_float).abs()
+                denominator = rhs_float.abs().clamp_min(torch.finfo(torch.float32).tiny)
+                relative = absolute / denominator
+                finite_relative = relative[torch.isfinite(relative)]
+                max_relative = (
+                    float(finite_relative.max().item())
+                    if finite_relative.numel()
+                    else math.inf
+                )
+                max_absolute = float(absolute.max().item()) if total else 0.0
+                mean_absolute = float(absolute.mean().item()) if total else 0.0
+                reference_max = float(rhs_float.abs().max().item()) if total else 0.0
+                relative_linf = (
+                    max_absolute / reference_max
+                    if reference_max
+                    else (0.0 if max_absolute == 0.0 else math.inf)
+                )
+                reference_norm = float(torch.linalg.vector_norm(rhs_float).item())
+                difference_norm = float(torch.linalg.vector_norm(lhs_float - rhs_float).item())
+                relative_l2 = (
+                    difference_norm / reference_norm
+                    if reference_norm
+                    else (0.0 if difference_norm == 0.0 else math.inf)
+                )
+            else:
+                max_relative = 0.0
+                max_absolute = float((lhs_cpu != rhs_cpu).any().item())
+                mean_absolute = float((lhs_cpu != rhs_cpu).float().mean().item())
+                relative_linf = max_absolute
+                relative_l2 = mean_absolute
+            exact = int(equal.sum().item())
+            rows.append(
+                {
+                    "path": path,
+                    "shape": list(lhs_cpu.shape),
+                    "dtype": str(lhs_cpu.dtype),
+                    "elements": total,
+                    "exact_elements": exact,
+                    "exact_fraction": exact / total if total else 1.0,
+                    "max_abs_error": max_absolute,
+                    "mean_abs_error": mean_absolute,
+                    "max_relative_error": max_relative,
+                    "relative_linf": relative_linf,
+                    "relative_l2": relative_l2,
+                }
+            )
+            return
+        if isinstance(lhs, (tuple, list)) and isinstance(rhs, type(lhs)):
+            if len(lhs) != len(rhs):
+                raise ValueError(f"output {path} length differs")
+            for index, (lhs_item, rhs_item) in enumerate(zip(lhs, rhs)):
+                visit(lhs_item, rhs_item, f"{path}[{index}]")
+            return
+        if isinstance(lhs, dict) and isinstance(rhs, dict):
+            if lhs.keys() != rhs.keys():
+                raise ValueError(f"output {path} keys differ")
+            for key in lhs:
+                visit(lhs[key], rhs[key], f"{path}[{key!r}]")
+            return
+        raise TypeError(f"output {path} structures differ")
+
+    visit(actual, expected, "output")
+    return {"outputs": rows}
+
+
+def _install_output_capture(
+    benchmark: ModuleType,
+    torch: Any,
+    *,
+    save_output: Path | None,
+    compare_output: Path | None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    if save_output is None and compare_output is None:
+        return metrics
+    expected = torch.load(compare_output, map_location="cpu", weights_only=True) if compare_output else None
+    captured = False
+    original_measure_legs = benchmark.measure_legs
+
+    def measure_legs(*args: Any, **kwargs: Any) -> dict[str, dict[str, Any]]:
+        nonlocal captured
+        legs = kwargs.get("legs", args[6] if len(args) > 6 else ())
+        wrapped = []
+        for name, call in legs:
+            def capture(call: Callable[[], Any] = call) -> Any:
+                nonlocal captured
+                value = call()
+                if not captured:
+                    cpu_value = _cpu_output(torch, value)
+                    if save_output is not None:
+                        save_output.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save(cpu_value, save_output)
+                    if expected is not None:
+                        metrics.update(_precision_comparison(torch, cpu_value, expected))
+                    captured = True
+                return value
+
+            wrapped.append((name, capture))
+        if "legs" in kwargs:
+            kwargs["legs"] = wrapped
+        else:
+            positional = list(args)
+            positional[6] = wrapped
+            args = tuple(positional)
+        return original_measure_legs(*args, **kwargs)
+
+    benchmark.measure_legs = measure_legs
+    return metrics
 
 
 def _install_reference_config(benchmark: ModuleType, path: Path) -> None:
@@ -172,11 +330,19 @@ def main(arguments: list[str] | None = None) -> int:
     if not torch.cuda.is_available():
         raise SystemExit("the selected Python environment has no available CUDA GPU")
     _install_generated_wrapper_compat(torch)
+    torch.manual_seed(args.input_seed)
+    torch.cuda.manual_seed_all(args.input_seed)
 
     benchmark = _load_benchmark(args.benchmark)
     if args.reference_config_json is not None:
         _install_reference_config(benchmark, args.reference_config_json)
     _select_benchmark_leg(benchmark, args.only)
+    precision_comparison = _install_output_capture(
+        benchmark,
+        torch,
+        save_output=args.save_output,
+        compare_output=args.compare_output,
+    )
     benchmark.time_us = lambda torch, call, _warmup, _samples: _time_us(
         torch,
         call,
@@ -210,6 +376,8 @@ def main(arguments: list[str] | None = None) -> int:
             if args.only == "reference":
                 payload.pop("fused", None)
         payload["triton_package"] = str(loaded_package)
+        if precision_comparison:
+            payload["tlx_precision_comparison"] = precision_comparison
         args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return int(result)
 

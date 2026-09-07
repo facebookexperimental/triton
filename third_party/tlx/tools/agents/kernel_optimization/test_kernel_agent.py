@@ -30,7 +30,10 @@ from .fused_triton_harness import (
     _run_evaluation as run_fused_triton_evaluation,
     build as build_fused_triton,
 )
-from .fused_triton_runner import _time_us as fused_time_us
+from .fused_triton_runner import (
+    _precision_comparison,
+    _time_us as fused_time_us,
+)
 from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
     AutoCommitResult,
@@ -69,6 +72,36 @@ from .source import (
 
 
 class ScoringTest(unittest.TestCase):
+    def test_fused_precision_comparison_reports_each_output(self) -> None:
+        import torch
+
+        actual = (
+            torch.tensor([1.0, 2.0], dtype=torch.bfloat16),
+            torch.tensor([3.0], dtype=torch.bfloat16),
+        )
+        expected = (
+            torch.tensor([1.0, 2.25], dtype=torch.bfloat16),
+            torch.tensor([3.0], dtype=torch.bfloat16),
+        )
+
+        result = _precision_comparison(torch, actual, expected)
+
+        self.assertEqual(len(result["outputs"]), 2)
+        self.assertEqual(result["outputs"][0]["path"], "output[0]")
+        self.assertEqual(result["outputs"][0]["exact_fraction"], 0.5)
+        self.assertEqual(result["outputs"][0]["max_abs_error"], 0.25)
+        self.assertGreater(result["outputs"][0]["relative_l2"], 0.0)
+        self.assertEqual(result["outputs"][1]["exact_fraction"], 1.0)
+
+    def test_fused_precision_comparison_unwraps_single_output(self) -> None:
+        import torch
+
+        tensor = torch.tensor([1.0], dtype=torch.bfloat16)
+        result = _precision_comparison(torch, (tensor,), tensor)
+
+        self.assertEqual(result["outputs"][0]["path"], "output[0]")
+        self.assertEqual(result["outputs"][0]["exact_fraction"], 1.0)
+
     def test_weighted_geometric_speedup(self) -> None:
         cases = (
             InputCase("large", {}, weight=3.0),
@@ -311,7 +344,19 @@ class ScoringTest(unittest.TestCase):
                                 {
                                     "verification": {
                                         "passed": True,
-                                        "metrics": {"tlx_median_us": 70.0},
+                                        "metrics": {
+                                            "tlx_median_us": 70.0,
+                                            "tlx_precision_comparison": {
+                                                "outputs": [
+                                                    {
+                                                        "path": "output[0]",
+                                                        "exact_fraction": 0.75,
+                                                        "max_abs_error": 0.01,
+                                                        "relative_l2": 0.001,
+                                                    }
+                                                ]
+                                            },
+                                        },
                                     },
                                     "timing": {"samples_us": [80.0]},
                                 }
@@ -333,6 +378,10 @@ class ScoringTest(unittest.TestCase):
                 persisted,
             )
             self.assertIn("tuned TLX 70.000 us", persisted)
+            self.assertIn(
+                "TLX precision output[0]: exact=0.750000, max_abs=0.01, relative_l2=0.001",
+                persisted,
+            )
             self.assertTrue(persisted.endswith(best_source))
 
     def test_fused_triton_replaces_existing_winner_summary(self) -> None:

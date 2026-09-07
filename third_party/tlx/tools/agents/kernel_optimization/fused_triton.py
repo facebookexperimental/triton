@@ -214,6 +214,27 @@ def _summary_header(
             f"#   {label} {tlx_us:.3f} us; optimized/TLX speedup "
             f"{tlx_us / winner_us:.3f}x."
         )
+    precision = (
+        metrics.get("tlx_precision_comparison")
+        if isinstance(metrics, dict)
+        else None
+    )
+    precision_outputs = (
+        precision.get("outputs") if isinstance(precision, dict) else None
+    )
+    if isinstance(precision_outputs, list):
+        for output in precision_outputs:
+            if not isinstance(output, dict):
+                continue
+            try:
+                lines.append(
+                    "#   TLX precision "
+                    f"{output['path']}: exact={float(output['exact_fraction']):.6f}, "
+                    f"max_abs={float(output['max_abs_error']):.8g}, "
+                    f"relative_l2={float(output['relative_l2']):.8g}."
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
     lines.extend(
         (
             "# Timings use the run's configured warmup, sampling, and cache policy.",
