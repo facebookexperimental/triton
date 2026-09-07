@@ -35,6 +35,7 @@ from .fused_triton_runner import (
     _precision_comparison,
     _time_us as fused_time_us,
 )
+from .fused_triton_reference_tuner import tune_reference
 from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
     AutoCommitResult,
@@ -580,6 +581,70 @@ class ScoringTest(unittest.TestCase):
             self.assertEqual(physical["warp_specialize_ops"], 1)
             self.assertEqual(physical["partition_regions"], 1)
             self.assertEqual(physical["physical_files"], ["physical.ttgir"])
+
+    def test_fused_triton_reference_tuner_persists_fastest_stable_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = root / "candidates.json"
+            candidates.write_text(
+                json.dumps(
+                    {
+                        "configs": [
+                            {"name": "slow", "kernel_config": {"BLOCK_M": 64}},
+                            {"name": "fast", "kernel_config": {"BLOCK_M": 128}},
+                        ]
+                    }
+                )
+            )
+            output = root / "tuned.json"
+
+            def run(command: list[str], **kwargs: object) -> Mock:
+                result_path = Path(command[command.index("--json") + 1])
+                config_path = Path(
+                    command[command.index("--reference-config-json") + 1]
+                )
+                config = json.loads(config_path.read_text())
+                latency = 20.0 if config["kernel_config"]["BLOCK_M"] == 64 else 10.0
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "reference": {
+                                "accuracy": "PASS",
+                                "samples_us": [latency, latency, latency],
+                            }
+                        }
+                    )
+                )
+                return Mock(returncode=0, stdout="", stderr="")
+
+            with patch(
+                "third_party.tlx.tools.agents.kernel_optimization."
+                "fused_triton_reference_tuner.subprocess.run",
+                side_effect=run,
+            ):
+                result = tune_reference(
+                    benchmark=root / "bench.py",
+                    fused=root / "fused.py",
+                    original=root / "original.py",
+                    triton_dir=root / "triton",
+                    fbsource_root=root / "fbsource",
+                    python_executable=root / "python",
+                    candidates_path=candidates,
+                    output_path=output,
+                    artifacts_dir=root / "artifacts",
+                    warmup_ms=100,
+                    benchmark_ms=500,
+                    gpu_id=0,
+                    max_cv=0.1,
+                    environment_overrides={},
+                )
+
+            self.assertTrue(result["tuned"])
+            self.assertEqual(result["kernel_config"]["BLOCK_M"], 128)
+            self.assertEqual(result["tuning"]["candidate_name"], "fast")
+            self.assertEqual(json.loads(output.read_text()), result)
 
     def test_fused_triton_upstream_autows_clears_meta_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

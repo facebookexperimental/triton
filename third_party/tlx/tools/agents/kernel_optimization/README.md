@@ -238,7 +238,8 @@ CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
   --gpu-id 0 \
   --max-rounds 3 --candidates-per-round 2 \
   --benchmark-warmup-ms 500 \
-  --benchmark-duration-ms 2000
+  --benchmark-duration-ms 2000 \
+  --reference-tuning-configs-json /path/to/tlx_candidates.json
 ```
 
 If the reference needs process-local compatibility settings, pass them without
@@ -249,21 +250,49 @@ contaminating the candidate process, for example
 Each fused and TLX leg uses `triton.testing.do_bench(return_mode="all")`.
 Warmup and measurement are duration-based, every timed execution starts after
 an L2 cache flush, and the agent computes median, p95, and CV from the returned
-raw device-time samples. Shape-specific TLX GEMM references use their fixed
-heuristic configuration so a large cold autotune search does not run for every
-candidate. This is a stable reference measurement, not a claim that TLX was
-autotuned to its best configuration. If that heuristic is stale for the selected GPU (for example, it
-exceeds the device shared-memory limit), pass a verified kernel configuration
-object with `--reference-config-json PATH`. The reference is correctness-checked
-before candidate timing, and the same fixed configuration is reused for every
-candidate.
+raw device-time samples. The production flow requires TLX tuning before Triton
+hill climbing. Provide a JSON list of explicit TLX candidates with
+`--reference-tuning-configs-json`; the launcher runs every candidate in a fresh
+process under the same L2-cold timing policy, rejects incorrect or noisy
+candidates, writes `OUTPUT_DIR/config/tuned_tlx.json`, and pins that winner for
+every Triton iteration. A previously generated winner can instead be supplied
+with `--reference-config-json`. Use `--allow-untuned-reference` only for
+diagnostic runs; those results are labelled as a TLX reference rather than
+tuned TLX.
 
-For a best-TLX comparison, first sweep the reference on the target GPU using
-the same L2-cache policy, correctness-check every measured configuration, and
-save all kernel and launch fields (`num_warps`, `num_stages`, and cluster shape
-included) in the reference config JSON. Keep direct kernel latency distinct
-from complete Python-wrapper latency: CUDA events around a wrapper can include
-host dispatch gaps whenever the stream drains before the kernel is submitted.
+For a best-TLX comparison, candidate entries may contain `kernel_config` for a
+benchmark's explicit-config path and/or `module_overrides` for a specialized TLX
+module whose launch constants are fixed in Python. A module override names the
+kernel-relative source path and every global constant to change. Include all
+kernel and launch fields (`num_warps`, `num_stages`, and cluster shape where
+configurable), not just tile sizes. For example:
+
+```json
+{
+  "configs": [
+    {
+      "name": "bm128_bn256_bk64_split6",
+      "module_overrides": [
+        {
+          "relative_path": "compute/bf16/fused/fwd/example/shape/kernel.py",
+          "values": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 256,
+            "BLOCK_K": 64,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 1,
+            "SPLIT_K": 6
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Keep direct kernel latency distinct from complete Python-wrapper latency: CUDA
+events around a wrapper can include idle-stream time between the start event and
+kernel submission.
 
 For isolated TLX and AutoWS legs, final validation additionally uses identical
 seeded inputs for one untimed launch, temporarily serializes the TLX outputs,

@@ -13,6 +13,7 @@ from pathlib import Path
 from types import ModuleType
 
 from . import cli
+from .fused_triton_reference_tuner import tune_reference
 
 
 _HERE = Path(__file__).resolve().parent
@@ -366,6 +367,23 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reference-tuning-configs-json",
+        type=Path,
+        default=None,
+        help=(
+            "Sweep these explicit TLX configurations before the Triton agent, then "
+            "pin the fastest correctness-valid stable winner for every iteration."
+        ),
+    )
+    parser.add_argument(
+        "--allow-untuned-reference",
+        action="store_true",
+        help=(
+            "Allow a heuristic/native TLX reference for diagnostic runs. Such results "
+            "are not labelled tuned TLX."
+        ),
+    )
+    parser.add_argument(
         "--reference-env",
         action="append",
         default=[],
@@ -460,11 +478,17 @@ def main(arguments: list[str] | None = None) -> int:
             )
     if reference is not None and not reference.is_file():
         raise SystemExit(f"TLX reference kernel does not exist: {reference}")
+    if args.reference_config_json and args.reference_tuning_configs_json:
+        raise SystemExit(
+            "pass either --reference-config-json or "
+            "--reference-tuning-configs-json, not both"
+        )
     reference_config = (
         args.reference_config_json.expanduser().resolve()
         if args.reference_config_json is not None
         else None
     )
+    reference_is_tuned = False
     if reference_config is not None:
         if not reference_config.is_file():
             raise SystemExit(
@@ -478,6 +502,15 @@ def main(arguments: list[str] | None = None) -> int:
             ) from error
         if not isinstance(reference_config_payload, dict):
             raise SystemExit("reference configuration must be a JSON object")
+        if (
+            reference_config_payload.get("tuned") is not True
+            and not args.allow_untuned_reference
+        ):
+            raise SystemExit(
+                "reference configuration is not marked tuned=true; use the TLX "
+                "reference tuner or pass --allow-untuned-reference for diagnostics"
+            )
+        reference_is_tuned = reference_config_payload.get("tuned") is True
     reference_environment: dict[str, str] = {}
     for assignment in args.reference_env:
         name, separator, value = assignment.partition("=")
@@ -495,6 +528,37 @@ def main(arguments: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     config_dir = output_dir / "config"
     config_dir.mkdir(exist_ok=True)
+    if args.reference_tuning_configs_json is not None:
+        if reference is None:
+            raise SystemExit("cannot tune TLX because no registry reference was resolved")
+        candidates_path = args.reference_tuning_configs_json.expanduser().resolve()
+        if not candidates_path.is_file():
+            raise SystemExit(f"TLX tuning candidate file does not exist: {candidates_path}")
+        reference_config = config_dir / "tuned_tlx.json"
+        tune_reference(
+            benchmark=case_dir / "bench_vs_geo.py",
+            fused=kernel,
+            original=case_dir / "output_code.py",
+            triton_dir=triton_dir,
+            fbsource_root=fbsource_root,
+            python_executable=python_executable,
+            candidates_path=candidates_path,
+            output_path=reference_config,
+            artifacts_dir=output_dir / "reference_tuning",
+            warmup_ms=args.benchmark_warmup_ms,
+            benchmark_ms=args.benchmark_duration_ms,
+            gpu_id=args.gpu_id,
+            max_cv=args.max_cv,
+            environment_overrides=reference_environment,
+        )
+        reference_is_tuned = True
+    if reference is not None and reference_config is None and not args.allow_untuned_reference:
+        raise SystemExit(
+            "a TLX registry reference is available but has not been tuned; pass "
+            "--reference-tuning-configs-json CANDIDATES.json, pass a persisted "
+            "--reference-config-json, or explicitly opt into diagnostic-only "
+            "comparison with --allow-untuned-reference"
+        )
     case = _case_payload(case_dir)
     cases_path = config_dir / "cases.json"
     target_path = config_dir / "target.json"
@@ -612,7 +676,7 @@ def main(arguments: list[str] | None = None) -> int:
         _persist_completed_kernel(
             output_dir,
             destination,
-            reference_is_tuned=reference_config is not None,
+            reference_is_tuned=reference_is_tuned,
         )
         print(f"Saved validated optimized fused kernel: {destination}", file=sys.stderr)
     return exit_code

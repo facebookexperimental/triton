@@ -231,9 +231,51 @@ def _install_output_capture(
 
 def _install_reference_config(benchmark: ModuleType, path: Path) -> None:
     """Pass one fixed configuration through a generated benchmark's kernel leg."""
-    config = json.loads(path.read_text())
-    if not isinstance(config, dict):
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
         raise TypeError("reference configuration must be a JSON object")
+    if payload.get("schema_version") == 1:
+        overrides = payload.get("module_overrides", [])
+        if not isinstance(overrides, list):
+            raise TypeError("module_overrides must be a list")
+        if overrides:
+            original_build_benchmark = benchmark.build_benchmark
+
+            def build_benchmark(*args: Any, **kwargs: Any) -> Any:
+                instance = original_build_benchmark(*args, **kwargs)
+                from gem.next_gen.geo.kernel_library.kernels.path_loader import (
+                    load_kernel_module,
+                )
+
+                for override in overrides:
+                    if not isinstance(override, dict):
+                        raise TypeError("each module override must be an object")
+                    relative_path = override.get("relative_path")
+                    values = override.get("values")
+                    if not isinstance(relative_path, str) or not isinstance(
+                        values, dict
+                    ):
+                        raise TypeError(
+                            "module override requires relative_path and values"
+                        )
+                    module = load_kernel_module(relative_path, "reference_tuning")
+                    for name, value in values.items():
+                        if not isinstance(name, str) or not hasattr(module, name):
+                            raise ValueError(
+                                f"reference module {relative_path} has no global "
+                                f"{name!r}"
+                            )
+                        setattr(module, name, value)
+                return instance
+
+            benchmark.build_benchmark = build_benchmark
+        config = payload.get("kernel_config")
+        if config is None:
+            return
+    else:
+        config = payload
+    if not isinstance(config, dict):
+        raise TypeError("kernel_config must be an object or null")
     if isinstance(config.get("ctas_per_cga"), list):
         config["ctas_per_cga"] = tuple(config["ctas_per_cga"])
     original_method_by_mro = benchmark.method_by_mro
