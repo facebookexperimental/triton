@@ -150,8 +150,8 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
   bool compatible =
       descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
                                     descLayout == effectiveAllocLayout);
-  // Padded layouts bake in the tile shape, so compare the physical padding
-  // only.
+  // Padded encodings include the allocation shape. Compare padding here and
+  // the physical address mapping over the copied tile below.
   auto descPad = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(descLayout);
   auto allocPad =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(effectiveAllocLayout);
@@ -166,6 +166,32 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
         smemTy.getShape(), smemTy.getElementType(), effectiveAllocLayout);
     compatible = gpu::updateEncodingForShape(op, descEncoding, smemTensorTy) ==
                  effectiveAllocLayout;
+  }
+
+  if (compatible && !descPartitioned && !allocPartitioned) {
+    auto tensorTy = RankedTensorType::get(smemTy.getShape(),
+                                          smemTy.getElementType(), descLayout);
+    auto expectedEncoding = gpu::updateEncodingForShape(
+        op, cast<gpu::SharedEncodingTrait>(descLayout), tensorTy);
+    auto allocShape = smemTy.getAllocShape().take_back(smemTy.getRank());
+    auto expected =
+        gpu::isPaddedEncoding(expectedEncoding)
+            ? gpu::paddedLinearLayout(smemTy.getShape(), expectedEncoding)
+            : gpu::toLinearLayout(smemTy.getShape(), expectedEncoding);
+    auto actual = gpu::isPaddedEncoding(allocLayout)
+                      ? gpu::paddedLinearLayout(allocShape, allocLayout)
+                      : gpu::toLinearLayout(allocShape, allocLayout);
+    // Restrict logical coordinates, not physical offsets: shrinking the
+    // allocation before inversion would hide an incompatible row pitch.
+    auto expectedInverse = expected.pseudoinvert();
+    auto actualInverse = actual.pseudoinvert();
+    for (auto [dim, size] :
+         llvm::zip(standardOutDimNames(op->getContext(), smemTy.getRank()),
+                   smemTy.getShape())) {
+      expectedInverse = expectedInverse.resizeInDim(dim, size);
+      actualInverse = actualInverse.resizeInDim(dim, size);
+    }
+    compatible = actualInverse.equalIgnoringOutDimSizes(expectedInverse);
   }
 
   if (!compatible)

@@ -4124,3 +4124,75 @@ def test_assume_uniform_rejects_narrow_type_gfx950(device):
             signature={"in_ptr": "*i8", "out_ptr": "*fp32"},
             constexprs={"BLOCK": 64},
         )
+
+
+@triton.jit
+def _tdm_copy_view_kernel(input_ptr, other_ptr, output_ptr, row, VIEW: tl.constexpr, MODE: tl.constexpr,
+                          PADDED: tl.constexpr = True):
+    narrow_store: tl.constexpr = MODE == "store" and (VIEW == "transpose" or VIEW == "compatible_transpose"
+                                                      or VIEW == "reshape" or VIEW == "inner_slice")
+    interval: tl.constexpr = 64 if narrow_store else 128
+    order: tl.constexpr = [0, 1] if VIEW == "compatible_transpose" else [1, 0]
+    if PADDED:
+        layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(interval, 8)], [64, 128], order)
+    else:
+        layout: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=order)
+    buffers = tlx.local_alloc((64, 128), tl.float16, 1, layout=layout)
+    full = tlx.local_view(buffers, 0)
+    if MODE == "store":
+        offsets = tl.arange(0, 64)[:, None] * 128 + tl.arange(0, 128)[None, :]
+        tlx.local_store(full, tl.load(input_ptr + offsets))
+    if VIEW == "transpose" or VIEW == "compatible_transpose":
+        view = tlx.local_trans(full)
+        M: tl.constexpr = 128
+        N: tl.constexpr = 64
+    elif VIEW == "reshape":
+        view = tlx.local_reshape(full, [128, 64])
+        M: tl.constexpr = 128
+        N: tl.constexpr = 64
+    elif VIEW == "slice":
+        view = tlx.local_slice(full, [32, 0], [32, 128])
+        M: tl.constexpr = 32
+        N: tl.constexpr = 128
+    elif VIEW == "dynamic_slice":
+        view = tlx.local_slice(full, [row, 0], [32, 128])
+        M: tl.constexpr = 32
+        N: tl.constexpr = 128
+    elif VIEW == "inner_slice":
+        view = tlx.local_slice(full, [0, 64], [64, 64])
+        M: tl.constexpr = 64
+        N: tl.constexpr = 64
+    else:
+        view = full
+        M: tl.constexpr = 64
+        N: tl.constexpr = 128
+    if MODE == "store":
+        desc = tl.make_tensor_descriptor(output_ptr, [M, N], [N, 1], [M, N])
+        tlx.async_amd_descriptor_store(desc, view, [0, 0])
+        tlx.async_amd_descriptor_wait(pendings=0)
+    else:
+        desc = tl.make_tensor_descriptor(input_ptr, [M, N], [N, 1], [M, N])
+        if MODE == "fused":
+            other_buffers = tlx.local_alloc((M, N), tl.float16, 1)
+            other = tlx.local_view(other_buffers, 0)
+            other_desc = tl.make_tensor_descriptor(other_ptr, [M, N], [N, 1], [M, N])
+            other_desc = tlx.update_tensor_descriptor(other_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+            desc = tlx.update_tensor_descriptor(desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+            token = tlx.async_amd_descriptor_load_fused([(desc, view, 3), (other_desc, other, 12)])
+        else:
+            token = tlx.async_amd_descriptor_load(desc, view, [0, 0])
+        tlx.async_amd_descriptor_wait(tokens=[token])
+        values = tlx.local_load(view)
+        tl.store(output_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], values)
+
+
+@pytest.mark.parametrize("view", ["transpose", "inner_slice"])
+@pytest.mark.parametrize("mode", ["load", "fused", "store"])
+def test_tdm_copy_view_incompatible_gfx1250(view, mode, capfd):
+    with pytest.raises(RuntimeError, match="shared layout of the tensor descriptor .* is inconsistent"):
+        compile_for_gfx1250(
+            _tdm_copy_view_kernel,
+            signature={"input_ptr": "*fp16", "other_ptr": "*fp16", "output_ptr": "*fp16", "row": "i32"},
+            constexprs={"VIEW": view, "MODE": mode, "PADDED": True},
+        )
+    assert "is inconsistent with the shared memory allocation layout" in capfd.readouterr().err
