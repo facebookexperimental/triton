@@ -98,6 +98,13 @@ Accept the hybrid only when final IR, correctness, and direct timing all confirm
 the change; a hand-written reference's preferred TMA strategy need not be the
 best lowering produced by the current compiler.
 
+For shallow-K or otherwise small GEMMs, benchmark a plain descriptor/TMA kernel
+before requiring persistence or AutoWS. A small tile can expose more independent
+CTAs, and a single K iteration may have too little recurring work to amortize a
+specialized producer/consumer pipeline. Sweep plain and AutoWS forms over the
+same tile space, and keep the plain form when AutoWS is slower; matching the
+reference's scheduling structure is evidence to test, not a promotion rule.
+
 Without a reference, use source inspection and profiles to generate hypotheses.
 Prefer changes supported by counters or launch attribution over broad rewrites.
 

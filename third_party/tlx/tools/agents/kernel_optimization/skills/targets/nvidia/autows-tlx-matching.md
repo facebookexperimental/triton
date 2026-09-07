@@ -66,6 +66,12 @@ When a semantically matching TLX implementation exists, use this staged order:
    process. Prove materialized partitions in final TTGIR before comparing it
    with either the plain-Triton baseline or TLX.
 
+Before expecting an AutoWS gain, calculate the number of K iterations and the
+number of outer-loop iterations per program. When both are one for most or all
+programs, producer/consumer startup and synchronization can dominate the useful
+work. Still measure AutoWS as the requested ablation, but retain a faster plain
+TMA result instead of forcing structural similarity to TLX.
+
 If full descriptor/TMA epilogues regress, inspect final TTGIR for extra
 epilogue-store partitions, staging allocations, and token waits. Test a hybrid
 with descriptor/TMA GEMM operands and direct pointer epilogue I/O as a separate
