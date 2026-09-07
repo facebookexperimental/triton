@@ -147,6 +147,34 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
   SmallVector<Value> visited;
   Attribute desiredEncoding;
 
+  auto mergeEncoding = [&](ttg::MemDescType memoryType) {
+    Attribute encoding = memoryType.getEncoding();
+    while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+      encoding = pinned.getPinnedLayout();
+    if (auto partitioned =
+            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
+      encoding = partitioned.getPartitionLayout();
+    while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+      encoding = pinned.getPinnedLayout();
+    encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
+                                           memoryType.getElementType());
+    if (!encoding)
+      return true;
+    // Compare descriptor encodings, not allocation types. A full tile and a
+    // slice of a larger allocation may require exactly the same descriptor.
+    // The TDM verifier separately checks that the tile's physical strides
+    // agree with the preserved allocation layout.
+    auto descTy = descriptor.getType();
+    auto tensorTy = RankedTensorType::get(descTy.getShape(),
+                                          descTy.getElementType(), encoding);
+    encoding = ttg::updateEncodingForShape(
+        nullptr, cast<ttg::SharedEncodingTrait>(encoding), tensorTy);
+    if (desiredEncoding && desiredEncoding != encoding)
+      return false;
+    desiredEncoding = encoding;
+    return true;
+  };
+
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     if (llvm::is_contained(visited, value))
@@ -173,11 +201,10 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
              llvm::zip_equal(fused.getDescs(), fused.getDests())) {
           if (desc != value)
             continue;
-          auto candidate = cast<ttg::MemDescType>(dest.getType());
-          if (memoryType && memoryType != candidate)
+          if (!mergeEncoding(cast<ttg::MemDescType>(dest.getType())))
             return {};
-          memoryType = candidate;
         }
+        continue;
       } else if (auto store =
                      dyn_cast<triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                          user)) {
@@ -196,21 +223,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
       if (!memoryType)
         continue;
 
-      Attribute encoding = memoryType.getEncoding();
-      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-        encoding = pinned.getPinnedLayout();
-      if (auto partitioned =
-              dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
-        encoding = partitioned.getPartitionLayout();
-      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-        encoding = pinned.getPinnedLayout();
-      encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
-                                             memoryType.getElementType());
-      if (!encoding)
-        continue;
-      if (desiredEncoding && desiredEncoding != encoding)
+      if (!mergeEncoding(memoryType))
         return {};
-      desiredEncoding = encoding;
     }
   }
 

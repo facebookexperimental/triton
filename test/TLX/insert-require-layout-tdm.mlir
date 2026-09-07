@@ -432,29 +432,28 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // -----
 
 // Preserve the operand view's padded encoding, not the allocation's shape or
-// order. The non-square transpose used to crash while constructing the anchor.
-// CHECK-DAG: #[[$TRANS_VIEW:.*]] = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
-// PROP-DAG: #[[$TRANS_BASE:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
-// PROP-DAG: #[[$TRANS_VIEW:.*]] = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
-// PROP-DAG: #[[$TRANS_DESC:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
-#base = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
-#view = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
+// order. The transposed view is row-major and descriptor-compatible even
+// though its pinned allocation is column-major.
+// CHECK-DAG: #[[$TRANS_VIEW:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
+// PROP-DAG: #[[$TRANS_BASE:.*]] = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [64, 128]}>
+// PROP-DAG: #[[$TRANS_VIEW:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
+#base = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [64, 128]}>
+#view = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 #pinned_base = #tlx.user_layout<#base>
-#pinned_view = #tlx.user_layout<#view>
 #smem = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_preserves_pinned_transpose
   // PROP-LABEL: @tdm_preserves_pinned_transpose
-  // PROP-SAME: %[[DESC:.*]]: !tt.tensordesc<128x64xf16, #[[$TRANS_DESC]]>
+  // PROP-SAME: %[[DESC:.*]]: !tt.tensordesc<128x64xf16, #[[$TRANS_VIEW]]>
   tt.func public @tdm_preserves_pinned_transpose(%desc: !tt.tensordesc<128x64xf16>) {
     // PROP: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #[[$TRANS_BASE]], #smem, mutable>
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #pinned_base, #smem, mutable>
     // PROP: %[[VIEW:.*]] = ttg.memdesc_trans %[[ALLOC]] {{.*}} -> !ttg.memdesc<128x64xf16, #[[$TRANS_VIEW]], #smem, mutable>
-    %trans = ttg.memdesc_trans %alloc {order = array<i32: 1, 0>} : !ttg.memdesc<64x128xf16, #pinned_base, #smem, mutable> -> !ttg.memdesc<128x64xf16, #pinned_view, #smem, mutable>
+    %trans = ttg.memdesc_trans %alloc {order = array<i32: 1, 0>} : !ttg.memdesc<64x128xf16, #pinned_base, #smem, mutable> -> !ttg.memdesc<128x64xf16, #view, #smem, mutable>
     // CHECK: %[[REQ:.*]] = tlx.require_layout {{.*}} -> !ttg.memdesc<128x64xf16, #[[$TRANS_VIEW]], #smem, mutable>
     // CHECK-NEXT: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[REQ]]
     // PROP: amdg.async_tdm_copy_global_to_local %[[DESC]] into %[[VIEW]]
-    %tok = amdg.async_tdm_copy_global_to_local %desc into %trans : !tt.tensordesc<128x64xf16> -> !ttg.memdesc<128x64xf16, #pinned_view, #smem, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %desc into %trans : !tt.tensordesc<128x64xf16> -> !ttg.memdesc<128x64xf16, #view, #smem, mutable>
     tt.return
   }
 }
@@ -469,7 +468,6 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #base = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [64, 128]}>
 #view = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [128, 64]}>
 #pinned_base = #tlx.user_layout<#base>
-#pinned_view = #tlx.user_layout<#view>
 #smem = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_store_preserves_pinned_reshape
@@ -478,12 +476,15 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
   tt.func public @tdm_store_preserves_pinned_reshape(%desc: !tt.tensordesc<128x64xf16>) {
     // PROP: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #[[$RESHAPE_BASE]], #smem, mutable>
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #pinned_base, #smem, mutable>
+    // Match materializeConcreteMemDesc in the TLX frontend: keep the root pin
+    // but expose the concrete encoding to reshape inference.
+    %concrete = tlx.require_layout %alloc : !ttg.memdesc<64x128xf16, #pinned_base, #smem, mutable> -> !ttg.memdesc<64x128xf16, #base, #smem, mutable>
     // PROP: %[[VIEW:.*]] = ttg.memdesc_reshape %[[ALLOC]] {{.*}} -> !ttg.memdesc<128x64xf16, #[[$RESHAPE_VIEW]], #smem, mutable>
-    %reshape = ttg.memdesc_reshape %alloc : !ttg.memdesc<64x128xf16, #pinned_base, #smem, mutable> -> !ttg.memdesc<128x64xf16, #pinned_view, #smem, mutable>
+    %reshape = ttg.memdesc_reshape %concrete : !ttg.memdesc<64x128xf16, #base, #smem, mutable> -> !ttg.memdesc<128x64xf16, #view, #smem, mutable>
     // CHECK: %[[REQ:.*]] = tlx.require_layout {{.*}} -> !ttg.memdesc<128x64xf16, #[[$RESHAPE_VIEW]], #smem, mutable>
     // CHECK-NEXT: amdg.async_tdm_copy_local_to_global %{{.*}} from %[[REQ]]
     // PROP: amdg.async_tdm_copy_local_to_global %[[DESC]] from %[[VIEW]]
-    amdg.async_tdm_copy_local_to_global %desc from %reshape : !ttg.memdesc<128x64xf16, #pinned_view, #smem, mutable> -> !tt.tensordesc<128x64xf16>
+    amdg.async_tdm_copy_local_to_global %desc from %reshape : !ttg.memdesc<128x64xf16, #view, #smem, mutable> -> !tt.tensordesc<128x64xf16>
     tt.return
   }
 }
@@ -492,20 +493,19 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 // The fused path preserves each view independently, also for unpinned padded
 // allocations. Both views differ in shape from their respective roots.
-// CHECK-DAG: #[[$FUSED_TRANS:.*]] = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
+// CHECK-DAG: #[[$FUSED_TRANS:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 // CHECK-DAG: #[[$FUSED_RESHAPE:.*]] = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 64]}>
-// PROP-DAG: #[[$FUSED_TRANS:.*]] = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
+// PROP-DAG: #[[$FUSED_TRANS:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 // PROP-DAG: #[[$FUSED_RESHAPE:.*]] = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 64]}>
-// PROP-DAG: #[[$FUSED_TRANS_DESC:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
-#base_a = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
-#view_a = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
+#base_a = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [64, 128]}>
+#view_a = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 #base_b = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [64, 128]}>
 #view_b = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 64]}>
 #smem = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @fused_tdm_preserves_padded_views
   // PROP-LABEL: @fused_tdm_preserves_padded_views
-  // PROP-SAME: %[[A:.*]]: !tt.tensordesc<128x64xf16, #[[$FUSED_TRANS_DESC]]>, %[[B:.*]]: !tt.tensordesc<128x64xf16, #[[$FUSED_RESHAPE]]>
+  // PROP-SAME: %[[A:.*]]: !tt.tensordesc<128x64xf16, #[[$FUSED_TRANS]]>, %[[B:.*]]: !tt.tensordesc<128x64xf16, #[[$FUSED_RESHAPE]]>
   tt.func public @fused_tdm_preserves_padded_views(%a: !tt.tensordesc<128x64xf16>, %b: !tt.tensordesc<128x64xf16>) {
     %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #base_a, #smem, mutable>
     %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #base_b, #smem, mutable>
