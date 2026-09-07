@@ -34,6 +34,7 @@ from .fused_triton_harness import (
 )
 from .fused_triton_runner import (
     _install_reference_config,
+    _pin_autotuner_config,
     _precision_comparison,
     _time_us as fused_time_us,
 )
@@ -667,6 +668,27 @@ class ScoringTest(unittest.TestCase):
                 _install_reference_config(benchmark, config)
                 self.assertEqual(os.environ["TLX_TEST_TUNED_CONFIG"], "selected")
                 os.environ.pop("TLX_TEST_TUNED_CONFIG", None)
+
+    def test_fused_triton_reference_config_pins_existing_autotuner_entry(self) -> None:
+        class Config:
+            def __init__(self, block_m: int, ctas: tuple[int, ...] | None) -> None:
+                self.kwargs = {"BLOCK_M": block_m}
+                self.num_warps = 8
+                self.num_stages = 1
+                self.ctas_per_cga = ctas
+
+        autotuner = Mock(configs=[Config(64, None), Config(128, (2, 1, 1))])
+        _pin_autotuner_config(
+            autotuner,
+            {
+                "BLOCK_M": 128,
+                "num_warps": 8,
+                "num_stages": 1,
+                "ctas_per_cga": [2, 1, 1],
+            },
+        )
+        self.assertEqual(len(autotuner.configs), 1)
+        self.assertEqual(autotuner.configs[0].kwargs["BLOCK_M"], 128)
 
     def test_fused_triton_upstream_autows_clears_meta_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

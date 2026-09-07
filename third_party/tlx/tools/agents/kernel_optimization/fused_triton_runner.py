@@ -246,7 +246,10 @@ def _install_reference_config(benchmark: ModuleType, path: Path) -> None:
         overrides = payload.get("module_overrides", [])
         if not isinstance(overrides, list):
             raise TypeError("module_overrides must be a list")
-        if overrides:
+        autotune_overrides = payload.get("autotune_overrides", [])
+        if not isinstance(autotune_overrides, list):
+            raise TypeError("autotune_overrides must be a list")
+        if overrides or autotune_overrides:
             original_build_benchmark = benchmark.build_benchmark
 
             def build_benchmark(*args: Any, **kwargs: Any) -> Any:
@@ -274,6 +277,29 @@ def _install_reference_config(benchmark: ModuleType, path: Path) -> None:
                                 f"{name!r}"
                             )
                         setattr(module, name, value)
+                for override in autotune_overrides:
+                    if not isinstance(override, dict):
+                        raise TypeError("each autotune override must be an object")
+                    relative_path = override.get("relative_path")
+                    kernel_name = override.get("kernel_name")
+                    selected_config = override.get("config")
+                    if (
+                        not isinstance(relative_path, str)
+                        or not isinstance(kernel_name, str)
+                        or not isinstance(selected_config, dict)
+                    ):
+                        raise TypeError(
+                            "autotune override requires relative_path, kernel_name, "
+                            "and config"
+                        )
+                    module = load_kernel_module(relative_path, "reference_tuning")
+                    autotuner = getattr(module, kernel_name, None)
+                    if autotuner is None:
+                        raise ValueError(
+                            f"reference module {relative_path} has no autotuner "
+                            f"{kernel_name!r}"
+                        )
+                    _pin_autotuner_config(autotuner, selected_config)
                 return instance
 
             benchmark.build_benchmark = build_benchmark
@@ -299,6 +325,36 @@ def _install_reference_config(benchmark: ModuleType, path: Path) -> None:
         return configured
 
     benchmark.method_by_mro = method_by_mro
+
+
+def _pin_autotuner_config(autotuner: Any, selected: dict[str, Any]) -> None:
+    """Restrict an already-imported Triton autotuner to one existing config."""
+    configs = getattr(autotuner, "configs", None)
+    if not isinstance(configs, list) or not configs:
+        raise TypeError(
+            "selected reference kernel is not a populated Triton autotuner"
+        )
+
+    def normalized(value: Any) -> Any:
+        return list(value) if isinstance(value, tuple) else value
+
+    def matches(config: Any) -> bool:
+        kwargs = getattr(config, "kwargs", {})
+        for name, expected in selected.items():
+            actual = (
+                kwargs.get(name) if name in kwargs else getattr(config, name, None)
+            )
+            if normalized(actual) != normalized(expected):
+                return False
+        return True
+
+    matches_ = [config for config in configs if matches(config)]
+    if len(matches_) != 1:
+        raise ValueError(
+            "autotune config selector must match exactly one existing config; "
+            f"matched {len(matches_)}"
+        )
+    autotuner.configs = matches_
 
 
 def _select_benchmark_leg(benchmark: ModuleType, only: str) -> None:

@@ -261,10 +261,14 @@ diagnostic runs; those results are labelled as a TLX reference rather than
 tuned TLX.
 
 For a best-TLX comparison, candidate entries may contain `kernel_config` for a
-benchmark's explicit-config path and/or `module_overrides` for a specialized TLX
-module whose launch constants are fixed in Python. A module override names the
-kernel-relative source path and every global constant to change. An
-`environment` mapping can select a registry kernel's named single-config mode.
+benchmark's explicit-config path, `module_overrides` for a specialized TLX
+module whose launch constants are fixed in Python, and/or `autotune_overrides`
+for a benchmark that ignores `config=` and calls an internally autotuned kernel.
+A module override names the kernel-relative source path and every global constant
+to change. An autotune override names the module, autotuner object, and the full
+metadata of exactly one existing `triton.Config`; the runner reduces that
+autotuner to the selected entry before its first launch. An `environment` mapping
+can select a registry kernel's named single-config mode.
 Include all kernel and launch fields (`num_warps`, `num_stages`, and cluster
 shape where configurable), not just tile sizes. For example:
 
@@ -288,6 +292,27 @@ shape where configurable), not just tile sizes. For example:
       ]
     }
   ]
+}
+```
+
+An internally autotuned kernel can be pinned without editing its source:
+
+```json
+{
+  "name": "bm128_bn128_g4_ep2",
+  "autotune_overrides": [{
+    "relative_path": "compute/bf16/fused/fwd/example/shape/kernel.py",
+    "kernel_name": "fused_kernel",
+    "config": {
+      "BLOCK_SIZE_M": 128,
+      "BLOCK_SIZE_N": 128,
+      "BLOCK_SIZE_K": 128,
+      "GROUP_SIZE_M": 4,
+      "num_warps": 8,
+      "num_stages": 1,
+      "ctas_per_cga": null
+    }
+  }]
 }
 ```
 
