@@ -263,9 +263,10 @@ tuned TLX.
 For a best-TLX comparison, candidate entries may contain `kernel_config` for a
 benchmark's explicit-config path and/or `module_overrides` for a specialized TLX
 module whose launch constants are fixed in Python. A module override names the
-kernel-relative source path and every global constant to change. Include all
-kernel and launch fields (`num_warps`, `num_stages`, and cluster shape where
-configurable), not just tile sizes. For example:
+kernel-relative source path and every global constant to change. An
+`environment` mapping can select a registry kernel's named single-config mode.
+Include all kernel and launch fields (`num_warps`, `num_stages`, and cluster
+shape where configurable), not just tile sizes. For example:
 
 ```json
 {

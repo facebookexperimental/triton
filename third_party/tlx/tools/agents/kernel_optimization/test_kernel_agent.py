@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 from . import optimizer as optimizer_module
@@ -32,6 +33,7 @@ from .fused_triton_harness import (
     build as build_fused_triton,
 )
 from .fused_triton_runner import (
+    _install_reference_config,
     _precision_comparison,
     _time_us as fused_time_us,
 )
@@ -645,6 +647,26 @@ class ScoringTest(unittest.TestCase):
             self.assertEqual(result["kernel_config"]["BLOCK_M"], 128)
             self.assertEqual(result["tuning"]["candidate_name"], "fast")
             self.assertEqual(json.loads(output.read_text()), result)
+
+    def test_fused_triton_reference_config_applies_process_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "tuned.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "tuned": True,
+                        "kernel_config": None,
+                        "environment": {"TLX_TEST_TUNED_CONFIG": "selected"},
+                    }
+                )
+            )
+            benchmark = ModuleType("synthetic_benchmark")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TLX_TEST_TUNED_CONFIG", None)
+                _install_reference_config(benchmark, config)
+                self.assertEqual(os.environ["TLX_TEST_TUNED_CONFIG"], "selected")
+                os.environ.pop("TLX_TEST_TUNED_CONFIG", None)
 
     def test_fused_triton_upstream_autows_clears_meta_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -235,6 +236,13 @@ def _install_reference_config(benchmark: ModuleType, path: Path) -> None:
     if not isinstance(payload, dict):
         raise TypeError("reference configuration must be a JSON object")
     if payload.get("schema_version") == 1:
+        config_environment = payload.get("environment", {})
+        if not isinstance(config_environment, dict) or any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in config_environment.items()
+        ):
+            raise TypeError("reference configuration environment must contain strings")
+        os.environ.update(config_environment)
         overrides = payload.get("module_overrides", [])
         if not isinstance(overrides, list):
             raise TypeError("module_overrides must be a list")
