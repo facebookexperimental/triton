@@ -898,25 +898,35 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
                                       tt::TensorDescType descTy,
                                       bool allowDotAware,
                                       DataFlowSolver &solver) {
-  Value root = findMemDescRoot(buf);
-  if (auto rootType = dyn_cast<ttg::MemDescType>(root.getType())) {
-    Attribute encoding = rootType.getEncoding();
-    if (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-      encoding = pinned.getPinnedLayout();
-    if (isa<ttg::PaddedSharedEncodingAttr>(encoding))
-      return encoding;
+  // The root determines whether the allocation is pinned, but the constraint
+  // must use the operand's encoding: transpose/reshape views may have a
+  // different order, shape, or rank than their allocation.
+  Attribute bufEncoding = bufType.getEncoding();
+  bool isExplicit =
+      isa<ttg::PinnedEncodingTrait>(bufEncoding) || isUserPinnedMemDesc(buf);
+  while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(bufEncoding))
+    bufEncoding = pinned.getPinnedLayout();
+  if (isa<ttg::PaddedSharedEncodingAttr>(bufEncoding))
+    return bufEncoding;
 
-    bool isExplicit = isa<ttg::PinnedEncodingTrait>(rootType.getEncoding());
-    if (isExplicit) {
-      tdmOp->emitError()
-          << "TDM operand requires a padded shared encoding, but the alloc "
-             "carries "
-          << encoding
-          << ". Pass `layout=tlx.padded_shared_layout_encoding(...)` to "
-             "`tlx.local_alloc`, or omit `layout=` to let the compiler pick "
-             "a descriptor-compatible encoding.";
-      return Attribute();
+  if (isExplicit) {
+    // maxPhase=1 is an unpadded layout supported by TDM, including the
+    // fallback for tiles wider than the descriptor's padding interval limit.
+    // Only preserve it when pinned; generic default allocations still need
+    // the descriptor-compatible encoding selected below.
+    if (auto swizzled =
+            dyn_cast<ttg::SwizzledSharedEncodingAttr>(bufEncoding)) {
+      if (swizzled.getMaxPhase() == 1)
+        return bufEncoding;
     }
+    tdmOp->emitError()
+        << "TDM operand requires a padded or non-swizzled shared encoding, "
+           "but the view carries "
+        << bufEncoding
+        << ". Pass `layout=tlx.padded_shared_layout_encoding(...)` to "
+           "`tlx.local_alloc`, or omit `layout=` to let the compiler pick "
+           "a descriptor-compatible encoding.";
+    return Attribute();
   }
 
   ArrayRef<int64_t> shape = descTy.getBlockType().getShape();
@@ -948,9 +958,9 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
 }
 
 // Insert `tlx.require_layout` between `buf` and `tdmOp`'s memdesc operand,
-// rewriting it to a descriptor-compatible padded encoding. Idempotent: if
+// rewriting it to a descriptor-compatible shared encoding. Idempotent: if
 // the buffer is already produced by a `require_layout`, leave it alone.
-// Returns failure after diagnosing an explicit non-padded TDM layout.
+// Returns failure after diagnosing an unsupported explicit TDM layout.
 template <typename TDMOp>
 static LogicalResult
 anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
