@@ -98,6 +98,20 @@ Accept the hybrid only when final IR, correctness, and direct timing all confirm
 the change; a hand-written reference's preferred TMA strategy need not be the
 best lowering produced by the current compiler.
 
+Also keep full-TMA epilogues in the search space when the residual or output is
+large. Descriptor residual loads and descriptor stores can outperform direct
+pointer I/O even when the GEMM operand strategy is unchanged. Compare the full
+TMA and hybrid variants with identical tiles and scheduling instead of assuming
+that output staging is always overhead.
+
+Materialized padding is another independent data-movement target. A descriptor
+load may replace zero-padding only when its out-of-bounds fill is exactly the
+graph's padding value and the descriptor coordinates preserve the original
+layout. Likewise, preserve explicit numerical barriers when fusing casts: if
+the graph rounds a GEMM to BF16 and promotes it before an FP32 epilogue, perform
+that BF16 round in the fused kernel before the epilogue. Passing a loose final
+tolerance does not justify reassociating or deleting the intermediate round.
+
 For shallow-K or otherwise small GEMMs, benchmark a plain descriptor/TMA kernel
 before requiring persistence or AutoWS. A small tile can expose more independent
 CTAs, and a single K iteration may have too little recurring work to amortize a

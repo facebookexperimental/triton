@@ -287,7 +287,10 @@ number of waves over the target SM count. Sweep configurations that avoid an
 underfilled first wave. Treat TMA operand loading and TMA epilogue publication
 as separate choices: if final TTGIR shows that descriptor stores add staging or
 wait overhead, benchmark a TMA-operand/direct-pointer-epilogue candidate rather
-than discarding TMA wholesale.
+than discarding TMA wholesale. Keep the full-TMA form in that A/B test for large
+residuals or outputs, where descriptor epilogue I/O can win. When folding casts
+or padding, preserve graph-visible intermediate rounding and use descriptor
+out-of-bounds zero fill only when it exactly matches the padding semantics.
 
 For an unattended run, replace the prompt with
 `--triton-dir /path/to/triton`. If native compiler code changed, run `make` in

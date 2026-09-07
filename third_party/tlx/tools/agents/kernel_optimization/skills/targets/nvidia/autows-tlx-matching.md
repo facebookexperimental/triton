@@ -85,6 +85,10 @@ epilogue-store partitions, staging allocations, and token waits. Test a hybrid
 with descriptor/TMA GEMM operands and direct pointer epilogue I/O as a separate
 hypothesis. This retains asynchronous operand loading while avoiding an
 unprofitable store pipeline; it is preferable to abandoning TMA globally.
+For large residual and output tensors, test the converse outcome too: a fully
+descriptor-based epilogue may save enough address generation and global-memory
+instruction overhead to beat the hybrid. Hold tile and WS settings fixed while
+comparing these epilogue choices.
 
 Do not enable AutoWS first and simultaneously rewrite pointer I/O to TMA: if the
 candidate fails or changes speed, the cause is ambiguous. Keep each step as one
