@@ -267,10 +267,66 @@ class ScoringTest(unittest.TestCase):
             root = Path(directory)
             output_dir = root / "run"
             output_dir.mkdir()
-            destination = root / "case/output_code_fused.py"
+            destination = root / "case/output_code_fused_opt.py"
             destination.parent.mkdir()
             destination.write_text("old source\n")
             best_source = "optimized source\n"
+            (output_dir / "best_kernel.py").write_text(best_source)
+            (output_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "best_kernel": best_source,
+                        "winner_experiment_id": "r001-c000",
+                        "experiments": [
+                            {
+                                "experiment_id": "r001-c000",
+                                "mutation_summary": "Use descriptor loads and a smaller tile.",
+                            }
+                        ],
+                        "baseline": {
+                            "cases": [{"timing": {"samples_us": [100.0]}}]
+                        },
+                        "final": {
+                            "cases": [
+                                {
+                                    "verification": {
+                                        "passed": True,
+                                        "metrics": {"tlx_median_us": 70.0},
+                                    },
+                                    "timing": {"samples_us": [80.0]},
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+
+            _persist_completed_kernel(
+                output_dir, destination, reference_is_tuned=True
+            )
+
+            persisted = destination.read_text()
+            self.assertIn("# BEGIN FUSED TRITON AGENT SUMMARY", persisted)
+            self.assertIn("Use descriptor loads and a smaller tile.", persisted)
+            self.assertIn(
+                "generated baseline 100.000 us -> optimized 80.000 us (1.250x)",
+                persisted,
+            )
+            self.assertIn("tuned TLX 70.000 us", persisted)
+            self.assertTrue(persisted.endswith(best_source))
+
+    def test_fused_triton_replaces_existing_winner_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "run"
+            output_dir.mkdir()
+            destination = root / "case/output_code_fused_opt.py"
+            best_source = (
+                "# BEGIN FUSED TRITON AGENT SUMMARY\n"
+                "# stale summary\n"
+                "# END FUSED TRITON AGENT SUMMARY\n\n"
+                "optimized source\n"
+            )
             (output_dir / "best_kernel.py").write_text(best_source)
             (output_dir / "result.json").write_text(
                 json.dumps(
@@ -283,7 +339,12 @@ class ScoringTest(unittest.TestCase):
 
             _persist_completed_kernel(output_dir, destination)
 
-            self.assertEqual(destination.read_text(), best_source)
+            persisted = destination.read_text()
+            self.assertEqual(
+                persisted.count("# BEGIN FUSED TRITON AGENT SUMMARY"), 1
+            )
+            self.assertNotIn("stale summary", persisted)
+            self.assertTrue(persisted.endswith("optimized source\n"))
 
     def test_fused_triton_does_not_persist_unverified_winner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

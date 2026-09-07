@@ -287,13 +287,17 @@ that checkout before starting or continuing the agent. Python-only kernel or
 agent changes do not require a rebuild.
 
 The launcher deliberately disables automatic winner commits because generated
-suite files are not checked in. At normal session completion it atomically
-copies the final correctness-validated `best_kernel.py` to the case's
-`output_code_fused.py`; it refuses to replace that file if final verification
-did not pass. The run directory retains `best_kernel.py`, `result.json`, and the
-per-experiment patches as an audit trail. To continue learning without repeating
-rejected candidates, start from the prior winner in a fresh output directory
-and pass the old run as evidence:
+suite files are not checked in. At normal session completion it preserves the
+generated `output_code_fused.py` baseline and atomically writes the final
+correctness-validated winner to `output_code_fused_opt.py`. The optimized file
+starts with a generated comment summary of the applied change, baseline and
+winner wrapper latency, and the TLX comparison. A supplied
+`--reference-config-json` marks that comparison as tuned TLX; otherwise it is
+labelled only as the TLX reference. The launcher refuses to write the optimized
+file if final verification did not pass. The run directory retains
+`best_kernel.py`, `result.json`, and the per-experiment patches as an audit
+trail. To continue learning without repeating rejected candidates, start from
+the prior winner in a fresh output directory and pass the old run as evidence:
 
 ```bash
 python -m third_party.tlx.tools.agents.kernel_optimization.fused_triton \

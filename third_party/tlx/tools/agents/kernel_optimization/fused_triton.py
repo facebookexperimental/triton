@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -124,8 +125,119 @@ def _validate_local_runtime(triton_dir: Path, python_executable: Path) -> None:
         )
 
 
-def _persist_completed_kernel(output_dir: Path, destination: Path) -> None:
-    """Atomically install a correctness-validated session winner in its case."""
+_SUMMARY_BEGIN = "# BEGIN FUSED TRITON AGENT SUMMARY"
+_SUMMARY_END = "# END FUSED TRITON AGENT SUMMARY"
+
+
+def _median_from_case(case: object) -> float | None:
+    if not isinstance(case, dict):
+        return None
+    timing = case.get("timing")
+    if not isinstance(timing, dict):
+        return None
+    samples = timing.get("samples_us")
+    if not isinstance(samples, list) or not samples:
+        return None
+    try:
+        return statistics.median(float(sample) for sample in samples)
+    except (TypeError, ValueError):
+        return None
+
+
+def _winner_change(result: dict[str, object]) -> str:
+    winner_id = result.get("winner_experiment_id")
+    experiments = result.get("experiments")
+    if isinstance(experiments, list):
+        for experiment in experiments:
+            if not isinstance(experiment, dict):
+                continue
+            if experiment.get("experiment_id") != winner_id:
+                continue
+            for key in ("mutation_summary", "hypothesis"):
+                value = experiment.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    title = result.get("winner_commit_title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return "Retained the correctness-validated agent winner."
+
+
+def _summary_header(
+    result: dict[str, object], *, reference_is_tuned: bool
+) -> str:
+    baseline = result.get("baseline")
+    final = result.get("final")
+    baseline_cases = baseline.get("cases") if isinstance(baseline, dict) else None
+    final_cases = final.get("cases") if isinstance(final, dict) else None
+    baseline_case = (
+        baseline_cases[0]
+        if isinstance(baseline_cases, list) and baseline_cases
+        else None
+    )
+    final_case = (
+        final_cases[0]
+        if isinstance(final_cases, list) and final_cases
+        else None
+    )
+    baseline_us = _median_from_case(baseline_case)
+    winner_us = _median_from_case(final_case)
+    verification = (
+        final_case.get("verification") if isinstance(final_case, dict) else None
+    )
+    metrics = verification.get("metrics") if isinstance(verification, dict) else None
+    tlx_us = metrics.get("tlx_median_us") if isinstance(metrics, dict) else None
+    try:
+        tlx_us = float(tlx_us) if tlx_us is not None else None
+    except (TypeError, ValueError):
+        tlx_us = None
+
+    lines = [
+        _SUMMARY_BEGIN,
+        "# Optimized, correctness-validated fused Triton wrapper.",
+        "# Applied:",
+    ]
+    lines.extend(f"#   {line}" for line in _winner_change(result).splitlines())
+    lines.append("# Performance (complete-wrapper CUDA-event timing):")
+    if baseline_us is not None and winner_us is not None:
+        lines.append(
+            f"#   generated baseline {baseline_us:.3f} us -> optimized {winner_us:.3f} us "
+            f"({baseline_us / winner_us:.3f}x)."
+        )
+    elif winner_us is not None:
+        lines.append(f"#   optimized {winner_us:.3f} us.")
+    if tlx_us is not None and winner_us is not None:
+        label = "tuned TLX" if reference_is_tuned else "TLX reference"
+        lines.append(
+            f"#   {label} {tlx_us:.3f} us; optimized/TLX speedup "
+            f"{tlx_us / winner_us:.3f}x."
+        )
+    lines.extend(
+        (
+            "# Timings use the run's configured warmup, sampling, and cache policy.",
+            _SUMMARY_END,
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _strip_summary(source: str) -> str:
+    if not source.startswith(_SUMMARY_BEGIN):
+        return source
+    end = source.find(_SUMMARY_END)
+    if end < 0:
+        return source
+    return source[end + len(_SUMMARY_END) :].lstrip("\r\n")
+
+
+def _persist_completed_kernel(
+    output_dir: Path,
+    destination: Path,
+    *,
+    reference_is_tuned: bool = False,
+) -> None:
+    """Atomically install a summarized, correctness-validated session winner."""
     result_path = output_dir / "result.json"
     best_path = output_dir / "best_kernel.py"
     if not result_path.is_file() or not best_path.is_file():
@@ -151,6 +263,9 @@ def _persist_completed_kernel(output_dir: Path, destination: Path) -> None:
     best_source = best_path.read_text()
     if result.get("best_kernel") != best_source:
         raise RuntimeError("best_kernel.py does not match the completed agent result")
+    persisted_source = _summary_header(
+        result, reference_is_tuned=reference_is_tuned
+    ) + _strip_summary(best_source)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -163,7 +278,7 @@ def _persist_completed_kernel(output_dir: Path, destination: Path) -> None:
             suffix=".tmp",
             delete=False,
         ) as temporary:
-            temporary.write(best_source)
+            temporary.write(persisted_source)
             temporary_path = Path(temporary.name)
         if destination.exists():
             temporary_path.chmod(stat.S_IMODE(destination.stat().st_mode))
@@ -434,12 +549,16 @@ def main(arguments: list[str] | None = None) -> int:
     if args.prior_run:
         cli_arguments.extend(("--prior-run", str(args.prior_run.resolve())))
     exit_code = cli.main(cli_arguments)
-    # Keep the complete audit trail in output_dir, and also install the final
-    # revalidated winner where the generated benchmark suite consumes it.
+    # Keep the complete audit trail in output_dir and save the final revalidated
+    # winner beside, without replacing, the generated fused baseline.
     if exit_code in (0, 2):
-        destination = case_dir / "output_code_fused.py"
-        _persist_completed_kernel(output_dir, destination)
-        print(f"Saved validated fused kernel: {destination}", file=sys.stderr)
+        destination = case_dir / "output_code_fused_opt.py"
+        _persist_completed_kernel(
+            output_dir,
+            destination,
+            reference_is_tuned=reference_config is not None,
+        )
+        print(f"Saved validated optimized fused kernel: {destination}", file=sys.stderr)
     return exit_code
 
 
