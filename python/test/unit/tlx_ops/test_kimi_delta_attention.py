@@ -1,12 +1,40 @@
 """L1 correctness for `tlx.ops.kimi_delta_attention`."""
 
+import platform
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from triton._internal_testing import is_blackwell
+from triton._internal_testing import is_cuda
 
-pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.kimi_delta_attention is sm100-only today")
+
+def _torch_cuda_version():
+    try:
+        major, minor, *_ = (torch.version.cuda or "").split(".")
+        return (int(major), int(minor))
+    except ValueError:
+        # Version undetectable; let the run proceed and fail loudly rather
+        # than silently skipping coverage.
+        return (99, 99)
+
+
+def _is_supported_device():
+    # B200 and GB200 are sm100; GB300 is sm103. The Grace pairings
+    # (GB200/GB300, i.e. aarch64 hosts) need CUDA >= 13 at runtime. The b300a
+    # codegen arch for GB300 is selected by the build's arch generation, not
+    # by this test (which always pins the sm100 kernel entry below).
+    if not is_cuda():
+        return False
+    if torch.cuda.get_device_capability()[:2] not in ((10, 0), (10, 3)):
+        return False
+    return platform.machine() != "aarch64" or _torch_cuda_version() >= (13, 0)
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_supported_device(),
+    reason="tlx.ops.kimi_delta_attention needs B200/GB200 (sm100) or GB300 (sm103); GB200/GB300 need CUDA >= 13",
+)
 
 torch.manual_seed(0)
 
