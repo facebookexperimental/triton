@@ -235,6 +235,18 @@ def _summary_header(
                 )
             except (KeyError, TypeError, ValueError):
                 continue
+    autows_proof = metrics.get("autows_proof") if isinstance(metrics, dict) else None
+    if isinstance(autows_proof, dict) and autows_proof.get("requested") is True:
+        if autows_proof.get("materialized") is True:
+            lines.append(
+                "#   AutoWS proof: final TTGIR contains physical warp-specialized "
+                "partitions."
+            )
+        else:
+            lines.append(
+                "#   AutoWS proof: annotation requested but no physical final-TTGIR "
+                "partitions materialized; do not attribute performance to AutoWS."
+            )
     lines.extend(
         (
             "# Timings use the run's configured warmup, sampling, and cache policy.",

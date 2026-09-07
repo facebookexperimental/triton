@@ -27,6 +27,7 @@ from .fused_triton import (
     resolve_registry_reference,
 )
 from .fused_triton_harness import (
+    _inspect_autows_dump,
     _run_evaluation as run_fused_triton_evaluation,
     build as build_fused_triton,
 )
@@ -356,6 +357,10 @@ class ScoringTest(unittest.TestCase):
                                                     }
                                                 ]
                                             },
+                                            "autows_proof": {
+                                                "requested": True,
+                                                "materialized": False,
+                                            },
                                         },
                                     },
                                     "timing": {"samples_us": [80.0]},
@@ -380,6 +385,10 @@ class ScoringTest(unittest.TestCase):
             self.assertIn("tuned TLX 70.000 us", persisted)
             self.assertIn(
                 "TLX precision output[0]: exact=0.750000, max_abs=0.01, relative_l2=0.001",
+                persisted,
+            )
+            self.assertIn(
+                "annotation requested but no physical final-TTGIR partitions",
                 persisted,
             )
             self.assertTrue(persisted.endswith(best_source))
@@ -494,6 +503,9 @@ class ScoringTest(unittest.TestCase):
                     "TRITON_DISABLE_WSBARRIER_REORDER": "1",
                 },
             }
+            artifact["candidate_path"].write_text(
+                "for index in tl.range(0, 1, warp_specialize=True):\n    pass\n"
+            )
             calls: list[tuple[str, dict[str, str]]] = []
 
             def run(command: list[str], **kwargs: object) -> Mock:
@@ -518,6 +530,14 @@ class ScoringTest(unittest.TestCase):
                 {
                     "fused": {"accuracy": "PASS"},
                     "reference": {"accuracy": "PASS"},
+                    "autows_proof": {
+                        "requested": True,
+                        "materialized": False,
+                        "ttgir_files": 0,
+                        "warp_specialize_ops": 0,
+                        "partition_regions": 0,
+                        "physical_files": [],
+                    },
                 },
             )
             self.assertEqual([only for only, _ in calls], ["reference", "fused"])
@@ -528,6 +548,38 @@ class ScoringTest(unittest.TestCase):
             )
             self.assertEqual(calls[1][1]["TRITON_USE_META_WS"], "1")
             self.assertNotIn("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", calls[1][1])
+
+    def test_fused_triton_autows_proof_requires_physical_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "annotation_only.ttgir").write_text(
+                "scf.for attributes {tt.warp_specialize = true}\n"
+            )
+
+            annotation_only = _inspect_autows_dump(
+                root, "tl.range(0, 1, warp_specialize=True)"
+            )
+
+            self.assertTrue(annotation_only["requested"])
+            self.assertFalse(annotation_only["materialized"])
+            self.assertEqual(annotation_only["warp_specialize_ops"], 0)
+            self.assertEqual(annotation_only["partition_regions"], 0)
+
+            (root / "physical.ttgir").write_text(
+                "ttg.warp_specialize %arg0 {\n"
+                "  partition0(%arg1) num_warps(4) {\n"
+                "  }\n"
+                "}\n"
+            )
+
+            physical = _inspect_autows_dump(
+                root, "tl.range(0, 1, warp_specialize=True)"
+            )
+
+            self.assertTrue(physical["materialized"])
+            self.assertEqual(physical["warp_specialize_ops"], 1)
+            self.assertEqual(physical["partition_regions"], 1)
+            self.assertEqual(physical["physical_files"], ["physical.ttgir"])
 
     def test_fused_triton_upstream_autows_clears_meta_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

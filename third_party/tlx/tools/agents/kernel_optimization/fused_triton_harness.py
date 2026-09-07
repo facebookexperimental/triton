@@ -179,6 +179,11 @@ def _run_evaluation(
             reference_environment,
             ("--input-seed", "0", "--save-output", str(reference_output)),
         )
+        autows_dump = artifact["root"] / "autows_dump"
+        if artifact["target_environment"].get("FUSED_TRITON_AUTOWS") == "1":
+            environment["TRITON_KERNEL_DUMP"] = "1"
+            environment["TRITON_DUMP_DIR"] = str(autows_dump)
+            environment["TRITON_CACHE_DIR"] = str(artifact["root"] / "triton_cache")
         try:
             fused = invoke(
                 artifact["root"] / "fused_result.json",
@@ -190,6 +195,14 @@ def _run_evaluation(
             reference_output.unlink(missing_ok=True)
         result = dict(fused)
         result["reference"] = reference["reference"]
+        if artifact["target_environment"].get("FUSED_TRITON_AUTOWS") == "1":
+            source = artifact.get("source")
+            if not isinstance(source, str):
+                candidate_path = artifact["candidate_path"]
+                source = candidate_path.read_text() if candidate_path.is_file() else ""
+            result["autows_proof"] = _inspect_autows_dump(
+                autows_dump, source, requested=True
+            )
     else:
         result = invoke(artifact["root"] / "benchmark_result.json", "both", environment)
     artifact["evaluation"] = result
@@ -199,6 +212,33 @@ def _run_evaluation(
 def _leg(result: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     payload = result.get(name, {})
     return payload if isinstance(payload, Mapping) else {}
+
+
+def _inspect_autows_dump(
+    root: Path, source: str, *, requested: bool | None = None
+) -> dict[str, Any]:
+    if requested is None:
+        requested = bool(re.search(r"warp_specialize\s*=\s*True", source))
+    files = sorted(root.rglob("*.ttgir")) if root.is_dir() else []
+    physical_files: list[str] = []
+    warp_specialize_ops = 0
+    partition_regions = 0
+    for path in files:
+        text = path.read_text(errors="replace")
+        warp_count = text.count("ttg.warp_specialize")
+        partition_count = len(re.findall(r"partition[0-9]+\(", text))
+        warp_specialize_ops += warp_count
+        partition_regions += partition_count
+        if warp_count and partition_count:
+            physical_files.append(str(path.relative_to(root)))
+    return {
+        "requested": requested,
+        "materialized": bool(physical_files),
+        "ttgir_files": len(files),
+        "warp_specialize_ops": warp_specialize_ops,
+        "partition_regions": partition_regions,
+        "physical_files": physical_files,
+    }
 
 
 def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
@@ -219,9 +259,23 @@ def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
         precision = result.get("tlx_precision_comparison")
         if isinstance(precision, Mapping):
             metrics["tlx_precision_comparison"] = dict(precision)
+        autows_proof = result.get("autows_proof")
+        if isinstance(autows_proof, Mapping):
+            metrics["autows_proof"] = dict(autows_proof)
+        diagnostics = "" if passed else "fused or TLX correctness failed"
+        if (
+            passed
+            and isinstance(autows_proof, Mapping)
+            and autows_proof.get("requested") is True
+            and autows_proof.get("materialized") is not True
+        ):
+            diagnostics = (
+                "AutoWS requested but final TTGIR has no physical partitions; "
+                "do not attribute timing to AutoWS"
+            )
         return {
             "passed": passed,
-            "diagnostics": "" if passed else "fused or TLX correctness failed",
+            "diagnostics": diagnostics,
             "metrics": metrics,
         }
     except Exception as error:  # noqa: BLE001
@@ -284,6 +338,7 @@ def profile(
                 "triton_poi_fused__to_copy"
             ),
             "uses_ieee_dot": 'input_precision="ieee"' in source,
+            "autows_proof": result.get("autows_proof"),
         },
         "diagnostics": (
             "Profiler-specific counters are not collected by this adapter; "
