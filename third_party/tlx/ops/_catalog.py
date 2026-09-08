@@ -33,6 +33,7 @@ class OpSpec:
 
 
 _FP16 = frozenset({"float16", "bfloat16"})
+_BF16 = frozenset({"bfloat16"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -59,6 +60,14 @@ CATALOG: tuple[OpSpec, ...] = (
         # No `accepts`: operands are read through explicit strides rather than a
         # descriptor, so there is no alignment rule to fail. This arch therefore
         # admits shapes sm100 declines -- see kernels/mm/_shapes.py.
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="linear",
+        arch="gfx942",
+        variant="shape_specialized",
+        impl="kernels.linear.gfx942:linear",
+        dtypes=_BF16,
         requires=frozenset(),
     ),
     OpSpec(
