@@ -56,4 +56,13 @@ __all__ = [
     "resolve_warmup_and_rep",
     "summarize",
     "to_tflops",
+    "driver",
+    "Prepared",
+    "bind",
+    "close_enough",
 ]
+
+# Last: `driver` imports the modules above, so it can only be pulled in once
+# they are bound on the package.
+from . import driver  # noqa: E402
+from .driver import Prepared, bind, close_enough  # noqa: E402

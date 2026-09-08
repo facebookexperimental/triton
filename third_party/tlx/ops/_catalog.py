@@ -130,6 +130,16 @@ def _arches_for(op: str) -> list[str]:
     return sorted(s.arch for s in CATALOG if s.op == op)
 
 
+def has_impl(op: str, arch: str) -> bool:
+    """Is there a catalog entry for this pair, without importing the kernel?
+
+    A table lookup, not a capability check: the benchmark suite uses it to skip
+    an op cleanly on an arch it was never written for, rather than running every
+    shape and reporting each one as an error.
+    """
+    return (op, arch) in _BY_KEY
+
+
 def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:
     """The blessed callable for `op`, plus its spec.
 

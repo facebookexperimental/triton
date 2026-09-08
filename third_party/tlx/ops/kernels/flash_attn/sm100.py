@@ -19,6 +19,11 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ._shapes import SM100_FOCUS
+
+#: The shapes `bench_flash_attn.py` gates on for this arch.
+PERF_SHAPES = SM100_FOCUS
+
 
 class Policy(IntEnum):
     DENSE = 0

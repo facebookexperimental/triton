@@ -44,14 +44,31 @@ def _fmt_compile(result) -> str:
     return f"{result.t_cold_s:.2f}s" if result.t_cold_s < 10 else f"{result.t_cold_s:.0f}s"
 
 
-def table(results: Sequence[Result]) -> str:
+def _fmt_extra(result, key: str) -> str:
+    value = result.extra.get(key)
+    if value is None:
+        return "-"
+    return f"{value:.3g}" if isinstance(value, float) else str(value)
+
+
+def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str:
+    """The common columns, then whichever op-specific ones the op asked for.
+
+    ``extra_columns`` is a sequence of ``(header, key)`` where ``key`` indexes
+    ``Result.extra``. Nothing here knows what any of them mean -- an op that
+    wants one of its derived metrics in the table declares it and the width is
+    taken from the data.
+    """
     width = max([len(r.case.input) for r in results] + [len("input")])
+    extra_widths = [max([len(head)] + [len(_fmt_extra(r, key)) for r in results]) for head, key in extra_columns]
+    heads = "".join(f" {head:>{w}}" for (head, _), w in zip(extra_columns, extra_widths))
     lines = [
         f"{'input':<{width}} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
-        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}  status",
-        "-" * (width + 84),
+        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}{heads}  status",
+        "-" * (width + 84 + sum(w + 1 for w in extra_widths)),
     ]
     for r in results:
+        cells = "".join(f" {_fmt_extra(r, key):>{w}}" for (_, key), w in zip(extra_columns, extra_widths))
         lines.append(f"{r.case.input:<{width}} "
                      f"{_tf(_stat(r.ref, 'mean'))} {_tf(_stat(r.tlx, 'mean'))} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
@@ -60,7 +77,7 @@ def table(results: Sequence[Result]) -> str:
                      f"{_fmt_cv(r):>6} "
                      f"{_tf(_stat(r.tlx, 'p50'))} "
                      f"{_tf(_stat(r.tlx, 'p95'))} "
-                     f"{_tf(_stat(r.tlx, 'p99'))}  {_MARK[r.status]}")
+                     f"{_tf(_stat(r.tlx, 'p99'))}{cells}  {_MARK[r.status]}")
     return "\n".join(lines)
 
 
@@ -88,8 +105,30 @@ def _details(results: Sequence[Result], statuses: tuple[Status, ...]) -> list[st
     return [f"  {r.case.key}: {'; '.join(r.notes) or _MARK[r.status]}" for r in results if r.status in statuses]
 
 
-def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None) -> str:
-    out = [table(results), ""]
+def by_direction(results: Sequence[Result]) -> dict:
+    """Results grouped by `Case.direction`, in the order the directions appear."""
+    groups: dict = {}
+    for r in results:
+        groups.setdefault(r.case.direction, []).append(r)
+    return groups
+
+
+def tables(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str:
+    """One table per direction, or just the one when the op has a single one.
+
+    Split because forward and backward are different kernels doing different
+    amounts of work: interleaving them puts two unrelated TFLOP/s scales in one
+    column, and the eye reads down a column.
+    """
+    groups = by_direction(results)
+    if len(groups) <= 1:
+        return table(results, extra_columns)
+    return "\n\n".join(f"[{direction}]\n{table(group, extra_columns)}" for direction, group in groups.items())
+
+
+def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None,
+           extra_columns: Sequence[tuple] = ()) -> str:
+    out = [tables(results, extra_columns), ""]
     if json_path:
         out.append(f"artifact: {write_json(results, env, json_path)}")
     out.append(summary(results))

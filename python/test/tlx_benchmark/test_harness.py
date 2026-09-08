@@ -554,3 +554,328 @@ def test_governor_can_be_disabled():
     with Governor(Device(NVIDIA, 0, "NVIDIA B200"), enable=False) as g:
         pass
     assert g.applied == []
+
+
+# --------------------------------------------------------------------------
+# direction: the one op-specific axis that is a Case field
+# --------------------------------------------------------------------------
+
+
+def test_forward_keys_are_unchanged_by_the_direction_field():
+    # Schema 3 added `direction`. Every key an op with no backward has ever
+    # written has to survive it, or old artifacts stop being diffable.
+    case = Case(op="mm", arch="sm100", dtype="float16", shape=(1024, 2048, 512, True, False))
+    assert case.direction == "fwd"
+    assert case.key == "mm/sm100/float16/1024x2048x512xTruexFalse"
+
+
+def test_forward_and_backward_do_not_collide_in_the_artifact():
+    shape = (4, 32, 4096, 128, False)
+    fwd = Case(op="flash_attn", arch="sm100", dtype="bfloat16", shape=shape)
+    bwd = Case(op="flash_attn", arch="sm100", dtype="bfloat16", shape=shape, direction="bwd")
+    assert fwd.key != bwd.key
+    assert bwd.key.endswith("/bwd")
+    assert json.loads(json.dumps(fwd.to_dict()))["direction"] == "fwd"
+
+
+# --------------------------------------------------------------------------
+# extra: op-specific derived metrics
+# --------------------------------------------------------------------------
+
+
+def test_extra_defaults_to_empty_and_round_trips():
+    result = Result(case=_case(), status=Status.OK)
+    assert result.extra == {}
+    doc = json.loads(json.dumps(artifact([result], env={})))
+    assert doc["results"][0]["extra"] == {}
+
+
+def test_declared_extra_columns_are_rendered_and_undeclared_ones_are_not():
+    from _harness import report
+
+    result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]),
+                    extra={"ref_backend": "cudnn", "tokens": 32768})
+    without = report.table([result])
+    assert "cudnn" not in without and "32768" not in without
+
+    with_col = report.table([result], (("ref bknd", "ref_backend"), ))
+    assert "ref bknd" in with_col and "cudnn" in with_col
+    # Only what was declared: `tokens` stays in the artifact.
+    assert "32768" not in with_col
+
+
+def test_a_missing_extra_key_renders_as_absent_not_as_a_crash():
+    from _harness import report
+
+    result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]), extra={})
+    # The data row, not the dashed separator: the cell itself must be a dash.
+    row = report.table([result], (("Mtok/s", "mtokens_per_s"), )).splitlines()[2]
+    assert row.endswith("-  ok")
+
+
+# --------------------------------------------------------------------------
+# verdict: the absolute floor, for an op with no reference
+# --------------------------------------------------------------------------
+
+
+def test_floor_gates_an_op_that_has_no_reference():
+    from _harness import verdict
+
+    slow = verdict.judge(_case(), _stat(mean=40.0), None, floor_tflops=100.0)
+    assert slow.status is Status.PIP
+    assert "under the 100 TFLOP/s floor" in "; ".join(slow.notes)
+
+    fast = verdict.judge(_case(), _stat(mean=140.0), None, floor_tflops=100.0)
+    assert fast.status is Status.OK
+
+
+def test_no_floor_means_a_reference_less_op_reports_rather_than_gates():
+    from _harness import verdict
+
+    assert verdict.judge(_case(), _stat(mean=1.0), None).status is Status.OK
+    assert verdict.judge(_case(), _stat(mean=1.0), None, floor_tflops=None).status is Status.OK
+
+
+def test_the_speedup_floor_wins_when_a_reference_exists():
+    from _harness import verdict
+
+    # A floor is the substitute for a ratio, not an addition to one: with a
+    # reference present the ratio decides, so the two can never disagree.
+    result = verdict.judge(_case(), _stat(mean=100.0), _stat(mean=50.0), floor_tflops=1e6)
+    assert result.status is Status.OK
+
+
+# --------------------------------------------------------------------------
+# driver: the adapter contract
+# --------------------------------------------------------------------------
+
+BENCH_MODULES = ("bench_mm", "bench_flash_attn", "bench_hstu_attn", "bench_kda")
+
+
+@pytest.mark.parametrize("module_name", BENCH_MODULES)
+def test_every_bench_module_satisfies_the_adapter_contract(module_name):
+    import importlib
+
+    bench = importlib.import_module(module_name)
+    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "cases", "prepare", "supported", "default_json", "run", "main"):
+        assert hasattr(bench, name), f"{module_name} is missing {name}"
+    assert all(len(col) == 2 for col in bench.EXTRA_COLUMNS)
+    # An op with no reference must say so rather than leave it implicit.
+    assert isinstance(bench.REF_NAME, str)
+
+
+@pytest.mark.parametrize("module_name", BENCH_MODULES)
+def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
+    import importlib
+
+    bench = importlib.import_module(module_name)
+    cases = bench.cases(synthetic=True)
+    assert cases, f"{module_name} has no synthetic shapes"
+    for case in cases:
+        assert case.op == bench.OP
+        assert case.direction in ("fwd", "bwd")
+        assert case.label, "an op must render its own shape tuple"
+        assert case.key.count("/") >= 3
+
+
+def test_space_resolves_to_each_ops_own_default():
+    import importlib
+
+    from _harness import driver
+
+    # mm has a heuristic_config; the attention ops do not, and their kernels
+    # accept only "full"/"smoke" -- a shared "heuristic" default is a KeyError.
+    assert driver.resolve_space(importlib.import_module("bench_mm"), None) == "heuristic"
+    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "full"
+    # An explicit choice still wins.
+    assert driver.resolve_space(importlib.import_module("bench_mm"), "full") == "full"
+
+
+def test_bind_returns_the_four_entry_points_bound_to_the_module():
+    import importlib
+
+    from _harness import driver
+
+    bench = importlib.import_module("bench_mm")
+    supported, default_json, run, main = driver.bind(bench)
+    assert callable(supported) and callable(run) and callable(main)
+    assert default_json() == bench.default_json()
+
+
+# --------------------------------------------------------------------------
+# driver: how often the cold-compile pass is paid
+# --------------------------------------------------------------------------
+
+
+class _FakeBench:
+    """A bench module stand-in whose `prepare` records what it was asked for."""
+
+    OP = "fake"
+    REF_NAME = ""
+    EXTRA_COLUMNS = ()
+
+    def __init__(self, cold_compile=None, directions=("fwd", "bwd"), n=3):
+        if cold_compile is not None:
+            self.COLD_COMPILE = cold_compile
+        self._directions = directions
+        self._n = n
+
+    def cases(self, synthetic=False):
+        return [
+            Case(op=self.OP, arch="sm100", dtype="bfloat16", shape=(i, ), direction=d)
+            for i in range(self._n)
+            for d in self._directions
+        ]
+
+
+def _cold_flags(bench, monkeypatch, mode=None):
+    """Which cases the driver would pay a cold pass for."""
+    from _harness import driver
+
+    seen = []
+
+    def fake_run_case(_bench, case, *, space, cold=True):
+        seen.append((case.direction, cold))
+        return Result(case=case, status=Status.OK)
+
+    monkeypatch.setattr(driver, "run_case", fake_run_case)
+    monkeypatch.setattr(driver, "capture_env", lambda *a, **k: {})
+    monkeypatch.setattr(driver, "stable", __import__("contextlib").contextmanager(lambda *a, **k: iter([{}])))
+    driver.run(bench, space="full", cold_compile_mode=mode)
+    return seen
+
+
+def test_first_mode_samples_one_cold_pass_per_direction(monkeypatch):
+    # The whole point: hstu_attn compiles 48 forward configs per cold pass, and
+    # paying that once per case is most of the suite's runtime for a question
+    # that is not per-shape.
+    seen = _cold_flags(_FakeBench(cold_compile="first"), monkeypatch)
+    assert [c for _, c in seen].count(True) == 2  # one fwd, one bwd
+    assert {d for d, c in seen if c} == {"fwd", "bwd"}
+    # And it is the FIRST of each, so a later shape never pays it.
+    assert seen[0] == ("fwd", True) and seen[1] == ("bwd", True)
+    assert all(not c for _, c in seen[2:])
+
+
+def test_all_is_the_default_so_an_op_that_says_nothing_is_unchanged(monkeypatch):
+    seen = _cold_flags(_FakeBench(), monkeypatch)
+    assert all(cold for _, cold in seen)
+
+
+def test_none_skips_every_cold_pass(monkeypatch):
+    seen = _cold_flags(_FakeBench(cold_compile="none"), monkeypatch)
+    assert not any(cold for _, cold in seen)
+
+
+def test_an_explicit_mode_overrides_the_ops_own(monkeypatch):
+    seen = _cold_flags(_FakeBench(cold_compile="first"), monkeypatch, mode="all")
+    assert all(cold for _, cold in seen)
+
+
+def test_an_unknown_cold_compile_mode_is_rejected():
+    from _harness import driver
+
+    with pytest.raises(ValueError, match="cold_compile"):
+        driver.resolve_cold_compile(_FakeBench(), "sometimes")
+
+
+def test_mm_still_times_every_case_and_the_full_space_ops_do_not():
+    import importlib
+
+    from _harness import driver
+
+    # mm's cold pass is under a second at heuristic space, so sampling it would
+    # drop information for no saving.
+    assert driver.resolve_cold_compile(importlib.import_module("bench_mm"), None) == "all"
+    for name in ("bench_flash_attn", "bench_hstu_attn", "bench_kda"):
+        assert driver.resolve_cold_compile(importlib.import_module(name), None) == "first"
+
+
+def test_a_case_with_no_cold_pass_reports_no_compile_time_and_is_not_gated():
+    from _harness import report, verdict
+
+    result = verdict.judge(_case(), _stat(mean=100.0), _stat(mean=100.0), compile_stat=None)
+    assert result.t_cold_s is None
+    assert result.status is Status.OK
+    # input, ref, tlx, speedup, compile, ...
+    assert report.table([result]).splitlines()[2].split()[4] == "-"
+
+
+# --------------------------------------------------------------------------
+# report: one table per direction
+# --------------------------------------------------------------------------
+
+
+def _result(direction="fwd", shape=(4, 32, 4096, 128, False)):
+    case = Case(op="flash_attn", arch="sm100", dtype="bfloat16", shape=shape, direction=direction)
+    return Result(case=case, status=Status.OK, tlx=summarize([1.0]), ref=summarize([1.0]), speedup=1.0)
+
+
+def test_an_op_with_one_direction_gets_one_unlabelled_table():
+    from _harness import report
+
+    rendered = report.tables([_result(), _result(shape=(2, 32, 8192, 128, True))])
+    assert "[fwd]" not in rendered
+    assert len(rendered.splitlines()) == 4  # header, rule, two rows
+
+
+def test_forward_and_backward_are_reported_as_two_tables():
+    from _harness import report
+
+    # Interleaved on the way in, as `cases()` produces them.
+    rendered = report.tables([
+        _result("fwd"),
+        _result("bwd"),
+        _result("fwd", (2, 32, 8192, 128, True)),
+        _result("bwd", (2, 32, 8192, 128, True))
+    ])
+    assert "[fwd]" in rendered and "[bwd]" in rendered
+    assert rendered.index("[fwd]") < rendered.index("[bwd]")
+    # Each table has its own header, and each case landed under its own heading.
+    fwd_block, bwd_block = rendered.split("[bwd]")
+    assert fwd_block.count("ref TF/s") == 1 and bwd_block.count("ref TF/s") == 1
+    assert fwd_block.count("4096") == 1 and bwd_block.count("4096") == 1
+
+
+def test_the_summary_and_the_artifact_stay_whole_across_the_split(tmp_path):
+    from _harness import report
+
+    rendered = report.render([_result("fwd"), _result("bwd")], {}, tmp_path / "fa.json")
+    assert rendered.count("2 ok") == 1  # one summary over both tables
+    doc = json.loads((tmp_path / "fa.json").read_text())
+    assert {r["case"]["direction"] for r in doc["results"]} == {"fwd", "bwd"}
+
+
+def _picked(monkeypatch, bench, **kwargs):
+    """The cases the driver would actually run."""
+    from _harness import driver
+
+    picked = []
+
+    def fake_run_case(_bench, case, *, space, cold=True):
+        picked.append(case)
+        return Result(case=case, status=Status.OK)
+
+    monkeypatch.setattr(driver, "run_case", fake_run_case)
+    monkeypatch.setattr(driver, "capture_env", lambda *a, **k: {})
+    monkeypatch.setattr(driver, "stable", __import__("contextlib").contextmanager(lambda *a, **k: iter([{}])))
+    _, env = driver.run(bench, space="full", **kwargs)
+    return picked, env
+
+
+def test_head_counts_per_direction_not_overall(monkeypatch):
+    # A flat slice of the interleaved fwd/bwd list would give `head/2` shapes of
+    # each, so `--head 2` would quietly measure one shape.
+    picked, _ = _picked(monkeypatch, _FakeBench(cold_compile="none", n=5), head=2)
+    assert [(c.shape[0], c.direction) for c in picked] == [(0, "fwd"), (0, "bwd"), (1, "fwd"), (1, "bwd")]
+
+
+def test_head_is_unchanged_for_an_op_with_one_direction(monkeypatch):
+    picked, _ = _picked(monkeypatch, _FakeBench(cold_compile="none", directions=("fwd", ), n=5), head=2)
+    assert [c.shape[0] for c in picked] == [0, 1]
+
+
+def test_direction_filter_runs_before_head(monkeypatch):
+    picked, env = _picked(monkeypatch, _FakeBench(cold_compile="none"), head=2, directions=("bwd", ))
+    assert [c.direction for c in picked] == ["bwd", "bwd"]
+    assert env["directions"] == ["bwd"]

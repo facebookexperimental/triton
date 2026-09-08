@@ -24,6 +24,11 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 
+from ._shapes import SM100_FOCUS
+
+#: The shapes `bench_kda.py` reports on for this arch.
+PERF_SHAPES = SM100_FOCUS
+
 
 @triton.jit
 def _add_f32x2(a, b):
