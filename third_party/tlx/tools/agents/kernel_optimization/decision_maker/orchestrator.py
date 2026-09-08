@@ -1,41 +1,43 @@
 from __future__ import annotations
 
-import sys
 import tempfile
 import time
-from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
-from .artifacts import ArtifactStore, CandidateArtifactPaths
+from .artifacts import ArtifactStore
+from .evaluation import (
+    collect_diagnostic_profiles as _collect_diagnostic_profiles,
+    merge_diagnostic_profiles as _merge_diagnostic_profiles,
+    profile_request as _profile_request,
+    profiles_by_case as _profiles_by_case,
+)
 from .harness import HarnessExecutionError, SubprocessHarness
-from .models import (
+from ..contracts import (
     AutoCommitResult,
     ExperimentSummary,
-    InputCase,
     KernelOptimizationRequest,
     KernelOptimizationResult,
     PerformanceSummary,
+)
+from .policy import (
+    is_correct_and_stable as _is_correct_and_stable,
+    is_near_threshold as _is_near_threshold,
     is_promotable,
     passes_protected_cases,
-    per_case_speedups,
+    profiler_regression_diagnostics as _ncu_regression_diagnostics,
     weighted_geometric_speedup,
 )
-from .profiling import (
-    ProfileRequest,
-    compact_profile_summary,
-    extract_ncu_duration_us,
-    ncu_regression_diagnostic,
+from .reporting import (
+    profile_log_parts as _profile_log_parts,  # noqa: F401 - compatibility export
+    rejection_feedback as _rejection_feedback,
+    report_candidate_artifacts as _report_candidate_artifacts,
+    report_candidate_summary as _report_candidate_summary,
+    report_performance as _report_performance,
 )
-from .providers import CandidateContext, CandidateProvider, CodexCandidateProvider
-from .source import source_digest
-
-_PROFILE_TOOLS = ("proton_launch", "native_profiler")
-_DIAGNOSTIC_PROFILE_TOOLS = ("proton_intra_kernel",)
-_DIAGNOSTIC_PROFILE_KEY = "diagnostic_proton_intra_kernel"
-_NEAR_THRESHOLD_WINDOW = 0.01
-
+from ..optimizer.agent import CandidateContext, CandidateProvider, CodexCandidateProvider
+from ..optimizer.source import source_digest
 
 class PromotionCommitter(Protocol):
     def commit_promotion(
@@ -49,373 +51,7 @@ class PromotionCommitter(Protocol):
     def rollback_to_baseline(self, diagnostics: str) -> AutoCommitResult: ...
 
 
-def _profile_request(
-    artifacts_dir: Path,
-    experiment_id: str,
-    *,
-    level: str,
-    reason: str,
-) -> ProfileRequest:
-    return ProfileRequest(
-        level=level,
-        tools=_PROFILE_TOOLS,
-        experiment_id=experiment_id,
-        artifacts_dir=artifacts_dir / "experiments" / experiment_id / "profile_artifacts",
-        reason=reason,
-    )
-
-
-def _diagnostic_profile_request(
-    artifacts_dir: Path,
-    experiment_id: str,
-    *,
-    reason: str,
-) -> ProfileRequest:
-    return ProfileRequest(
-        level="deep",
-        tools=_DIAGNOSTIC_PROFILE_TOOLS,
-        experiment_id=experiment_id,
-        artifacts_dir=artifacts_dir
-        / "experiments"
-        / experiment_id
-        / "diagnostic_profile_artifacts",
-        reason=reason,
-        diagnostic_only=True,
-        granularity="warp",
-    )
-
-
-def _profiles_by_case(performance: PerformanceSummary) -> dict[str, dict[str, Any]]:
-    return {evaluation.case_id: dict(evaluation.profile) for evaluation in performance.cases}
-
-
-def _diagnostic_error_profiles(
-    cases: tuple[InputCase, ...], error: Exception
-) -> dict[str, dict[str, Any]]:
-    return {
-        case.case_id: {"error": f"{type(error).__name__}: {error}"}
-        for case in cases
-    }
-
-
-def _collect_diagnostic_profiles(
-    harness: SubprocessHarness,
-    source: str,
-    request: KernelOptimizationRequest,
-    artifacts_dir: Path,
-    experiment_id: str,
-    *,
-    reason: str,
-) -> dict[str, dict[str, Any]]:
-    try:
-        performance = harness.evaluate(
-            source,
-            request.cases,
-            request.target,
-            request.budget.benchmark_repetitions,
-            profile=_diagnostic_profile_request(
-                artifacts_dir,
-                experiment_id,
-                reason=reason,
-            ),
-        )
-    except Exception as error:  # noqa: BLE001
-        return _diagnostic_error_profiles(request.cases, error)
-    return _profiles_by_case(performance)
-
-
-def _merge_diagnostic_profiles(
-    performance: PerformanceSummary,
-    diagnostic_profiles: Mapping[str, Mapping[str, Any]],
-) -> PerformanceSummary:
-    if not diagnostic_profiles:
-        return performance
-    merged_cases = []
-    for evaluation in performance.cases:
-        diagnostic_profile = diagnostic_profiles.get(evaluation.case_id)
-        if not diagnostic_profile:
-            merged_cases.append(evaluation)
-            continue
-        profile = dict(evaluation.profile)
-        profile[_DIAGNOSTIC_PROFILE_KEY] = compact_profile_summary(diagnostic_profile)
-        merged_cases.append(replace(evaluation, profile=profile))
-    return replace(performance, cases=tuple(merged_cases))
-
-
-def _report_candidate_summary(experiment_id: str, proposal: object) -> None:
-    fields = (
-        ("hypothesis", getattr(proposal, "hypothesis", "")),
-        ("evidence", getattr(proposal, "evidence", "")),
-        ("change", getattr(proposal, "summary", "")),
-        ("expected", getattr(proposal, "expected_effect", "")),
-        ("risk", getattr(proposal, "risk", "")),
-    )
-    details = " ".join(
-        f"{name}={value!r}" for name, value in fields if value
-    ) or "change='candidate source edited'"
-    print(f"[tlx-agent] {experiment_id} {details}", file=sys.stderr, flush=True)
-
-
-def _report_performance(
-    experiment_id: str,
-    status: str,
-    performance: PerformanceSummary | None,
-    *,
-    baseline: PerformanceSummary | None = None,
-    cases: tuple[InputCase, ...] = (),
-    diagnostics: str = "",
-) -> None:
-    parts = [f"[tlx-agent] {experiment_id} status={status}"]
-    if performance is not None:
-        parts.append(f"aggregate_speedup={performance.aggregate_speedup:.4f}x")
-        speedups = (
-            per_case_speedups(baseline, performance, cases)
-            if baseline is not None
-            else {}
-        )
-        for evaluation in performance.cases:
-            case_parts = [
-                evaluation.case_id,
-                "correct" if evaluation.verification.passed else "incorrect",
-            ]
-            if evaluation.timing is not None:
-                timing = evaluation.timing
-                case_parts.extend(
-                    (
-                        f"median={timing.median_us:.3f}us",
-                        f"p95={timing.p95_us:.3f}us",
-                        f"cv={timing.coefficient_of_variation:.4f}",
-                    )
-                )
-            speedup = speedups.get(evaluation.case_id)
-            if speedup is not None:
-                case_parts.append(f"speedup={speedup:.4f}x")
-            case_parts.extend(_profile_log_parts(evaluation.profile))
-            parts.append("case=" + ",".join(case_parts))
-    if diagnostics:
-        parts.append(f"diagnostics={diagnostics}")
-    print(" ".join(parts), file=sys.stderr, flush=True)
-
-
-def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
-    if not profile:
-        return ["ncu=unavailable"]
-    compact = compact_profile_summary(profile)
-    parts: list[str] = []
-    proton_totals = _find_mapping_with_keys(
-        compact,
-        frozenset({"wrapper_us", "main_kernel_us", "non_main_kernel_us"}),
-    ) or _find_mapping_with_keys(
-        profile,
-        frozenset({"wrapper_us", "main_kernel_us", "non_main_kernel_us"}),
-    )
-    if proton_totals is not None:
-        for label, key in (
-            ("proton.wrapper_us", "wrapper_us"),
-            ("proton.main_kernel_us", "main_kernel_us"),
-            ("proton.non_main_kernel_us", "non_main_kernel_us"),
-        ):
-            value = _coerce_float(proton_totals.get(key))
-            if value is not None:
-                parts.append(f"{label}={value:.3f}")
-    ncu_duration = extract_ncu_duration_us(compact)
-    if ncu_duration is None:
-        ncu_duration = extract_ncu_duration_us(profile)
-    if ncu_duration is not None:
-        parts.append(f"ncu.duration_us={ncu_duration:.3f}")
-    else:
-        parts.append("ncu=unavailable")
-    diagnostic = compact.get(_DIAGNOSTIC_PROFILE_KEY)
-    if not isinstance(diagnostic, Mapping):
-        diagnostic = profile.get(_DIAGNOSTIC_PROFILE_KEY)
-    if isinstance(diagnostic, Mapping):
-        intra = diagnostic.get(_DIAGNOSTIC_PROFILE_KEY)
-        if not isinstance(intra, Mapping):
-            intra = diagnostic
-        valid = intra.get("valid")
-        if isinstance(valid, bool):
-            parts.append(f"proton.intra.valid={str(valid).lower()}")
-        selected_cta = intra.get("selected_cta")
-        if selected_cta is not None:
-            parts.append(f"proton.intra.cta={selected_cta}")
-        coordinates = intra.get("logical_coordinates")
-        if isinstance(coordinates, Mapping):
-            coordinate_text = "/".join(
-                f"{key}:{coordinates[key]}"
-                for key in (
-                    "start_n",
-                    "logical_block",
-                    "curr_m",
-                    "mma_producer_j",
-                    "load_input_j",
-                )
-                if key in coordinates
-            )
-            if coordinate_text:
-                parts.append(f"proton.intra.tile={coordinate_text}")
-        waits = intra.get("dominant_waits")
-        if isinstance(waits, list) and waits and isinstance(waits[0], Mapping):
-            wait_name = waits[0].get("name")
-            wait_duration = _coerce_float(waits[0].get("duration"))
-            if wait_name and wait_duration is not None:
-                parts.append(
-                    f"proton.intra.dominant_wait={wait_name}:{wait_duration:.3f}us"
-                )
-        trace_path = intra.get("trace_path")
-        if trace_path:
-            parts.append(f"proton.intra.trace={trace_path}")
-    error = compact.get("error")
-    if error:
-        parts.append(f"profile.error={error}")
-    artifact = compact.get("artifact")
-    if artifact:
-        parts.append(f"profile.artifact={artifact}")
-    return parts
-
-
-def _rejection_feedback(
-    experiment_id: str,
-    proposal: object,
-    performance: PerformanceSummary,
-    baseline: PerformanceSummary,
-    cases: tuple[InputCase, ...],
-    decision: str,
-) -> str:
-    parts = [
-        f"{experiment_id}: rejected",
-        f"hypothesis={getattr(proposal, 'hypothesis', '')!r}",
-        f"change={getattr(proposal, 'summary', '')!r}",
-        f"decision={decision}",
-        f"aggregate_speedup={performance.aggregate_speedup:.4f}x",
-    ]
-    speedups = per_case_speedups(baseline, performance, cases)
-    for evaluation in performance.cases:
-        case_parts = [
-            evaluation.case_id,
-            "correct" if evaluation.verification.passed else "incorrect",
-        ]
-        if evaluation.timing is not None:
-            case_parts.extend(
-                (
-                    f"median={evaluation.timing.median_us:.3f}us",
-                    f"cv={evaluation.timing.coefficient_of_variation:.4f}",
-                )
-            )
-        speedup = speedups.get(evaluation.case_id)
-        if speedup is not None:
-            case_parts.append(f"speedup={speedup:.4f}x")
-        case_parts.extend(_profile_log_parts(evaluation.profile))
-        parts.append("case=" + ",".join(case_parts))
-    return " ".join(parts)[:4000]
-
-
-def _find_mapping_with_keys(
-    value: Any,
-    keys: frozenset[str],
-) -> Mapping[str, Any] | None:
-    if isinstance(value, Mapping):
-        if keys.issubset({str(key) for key in value.keys()}):
-            return value
-        for item in value.values():
-            match = _find_mapping_with_keys(item, keys)
-            if match is not None:
-                return match
-    if isinstance(value, list | tuple):
-        for item in value:
-            match = _find_mapping_with_keys(item, keys)
-            if match is not None:
-                return match
-    return None
-
-
-def _coerce_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int | float):
-        return float(value)
-    try:
-        return float(str(value).strip().replace(",", ""))
-    except ValueError:
-        return None
-
-
-def _is_correct_and_stable(
-    performance: PerformanceSummary,
-    budget: object,
-    cases: tuple[InputCase, ...],
-) -> bool:
-    case_by_id = {case.case_id: case for case in cases}
-    for evaluation in performance.cases:
-        case = case_by_id.get(evaluation.case_id)
-        protected = case.protected if case is not None else True
-        if not evaluation.verification.passed:
-            if protected:
-                return False
-            continue
-        if evaluation.timing is None:
-            return False
-        if evaluation.timing.coefficient_of_variation > budget.max_cv:
-            return False
-    return True
-
-
-def _is_near_threshold(speedup: float, threshold: float) -> bool:
-    return threshold - _NEAR_THRESHOLD_WINDOW <= speedup <= threshold + _NEAR_THRESHOLD_WINDOW
-
-
-def _ncu_regression_diagnostics(
-    baseline: PerformanceSummary,
-    candidate: PerformanceSummary,
-) -> str:
-    baseline_by_case = {evaluation.case_id: evaluation for evaluation in baseline.cases}
-    diagnostics: list[str] = []
-    for evaluation in candidate.cases:
-        baseline_evaluation = baseline_by_case.get(evaluation.case_id)
-        if baseline_evaluation is None:
-            continue
-        diagnostic = ncu_regression_diagnostic(
-            baseline_evaluation.profile,
-            evaluation.profile,
-        )
-        if diagnostic:
-            diagnostics.append(f"{evaluation.case_id}: {diagnostic}")
-    return "; ".join(diagnostics)
-
-
-def _report_candidate_artifacts(
-    experiment_id: str, artifacts: CandidateArtifactPaths
-) -> None:
-    print(
-        " ".join(
-            [
-                f"[tlx-agent] {experiment_id} status=artifacts",
-                f"source={str(artifacts.source_path.resolve())!r}",
-                f"incremental_patch={str(artifacts.incremental_patch_path.resolve())!r}",
-                f"cumulative_patch={str(artifacts.cumulative_patch_path.resolve())!r}",
-            ]
-        ),
-        file=sys.stderr,
-        flush=True,
-    )
-    print(
-        f"[tlx-agent] {experiment_id} incremental-diff-begin",
-        file=sys.stderr,
-    )
-    patch = artifacts.incremental_patch_path.read_text()
-    if patch:
-        sys.stderr.write(patch)
-        if not patch.endswith("\n"):
-            sys.stderr.write("\n")
-    else:
-        print("(no source changes)", file=sys.stderr)
-    print(
-        f"[tlx-agent] {experiment_id} incremental-diff-end",
-        file=sys.stderr,
-        flush=True,
-    )
-
-
-class KernelOptimizer:
+class DecisionMaker:
     def __init__(self, provider: CandidateProvider | None = None) -> None:
         self._provider = provider or CodexCandidateProvider()
 
@@ -811,3 +447,7 @@ class KernelOptimizer:
         )
         store.write_json("result.json", result)
         return result
+
+
+# Compatibility with the original public API and CLI implementation.
+KernelOptimizer = DecisionMaker

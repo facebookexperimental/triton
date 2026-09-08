@@ -12,7 +12,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping, Protocol, runtime_checkable
 
-from .models import (
+from ..contracts import (
     CaseEvaluation,
     InputCase,
     JsonValue,
@@ -98,7 +98,7 @@ class SubprocessHarness:
                 to_json_value(target),  # type: ignore[arg-type]
             ),
         }
-        worker_path = Path(__file__).with_name("worker.py")
+        worker_path = Path(__file__).with_name("runner.py")
         environment = os.environ.copy()
         environment.update(target.environment)
         response_file = tempfile.NamedTemporaryFile(
@@ -192,7 +192,7 @@ class StandaloneHarness:
             )
         target_dict: Mapping[str, JsonValue] = to_json_value(target)  # type: ignore[assignment]
         # Reuse worker normalization helpers for consistency.
-        from .worker import _normalize_build, _normalize_timing, _normalize_verification
+        from .runner import _normalize_build, _normalize_timing, _normalize_verification
 
         profile_payload_root = resolve_profile_request_for_target(
             profile_request_to_json(profile),

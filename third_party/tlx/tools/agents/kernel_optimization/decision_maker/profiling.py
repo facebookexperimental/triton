@@ -927,3 +927,4 @@ def _compact_value(value: Any) -> Any:
     if isinstance(value, (str, bytes)) and len(value) > 4096:
         return f"<omitted {len(value)} bytes>"
     return value
+

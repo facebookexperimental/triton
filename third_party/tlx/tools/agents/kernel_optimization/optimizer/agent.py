@@ -11,8 +11,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from .models import KernelOptimizationRequest, KernelTarget, PerformanceSummary
-from .profiling import compact_profile_summary
+from ..contracts import KernelOptimizationRequest, KernelTarget, PerformanceSummary
+from ..decision_maker.profiling import compact_profile_summary
 from .source import validate_replacement_source
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
@@ -110,6 +110,9 @@ class CandidateProvider(Protocol):
         request: KernelOptimizationRequest,
         context: CandidateContext,
     ) -> CandidateProposal: ...
+
+
+Optimizer = CandidateProvider
 
 
 @dataclass

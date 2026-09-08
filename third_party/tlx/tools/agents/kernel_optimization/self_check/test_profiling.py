@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from .profiling import (
+from ..decision_maker.profiling import (
     ProfileRequest,
     compact_profile_summary,
     export_ncu_report_details,
