@@ -260,6 +260,14 @@ private:
   llvm::DenseMap<std::pair<Type, uint32_t>, AddressSet> footprintCache;
 };
 
+namespace gpu {
+class MemDescType;
+}
+
+/// Return the layout-correct size of a MemDescType in the native unit of its
+/// memory space: bytes for shared memory and columns for tensor memory.
+unsigned getMemDescSize(gpu::MemDescType ty);
+
 } // namespace mlir::triton
 
 #endif // TRITON_ANALYSIS_BUFFER_REGION_H

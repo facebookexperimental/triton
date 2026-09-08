@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "AssignSemaphoreStagePhase.h"
 #include "Utilities.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -2103,6 +2104,12 @@ LogicalResult assignStagePhase(triton::FuncOp funcOp) {
 // ----------------------------------------------------------------------------
 
 } // anonymous namespace
+
+bool nvws_semas::isFirstUseFreshWriteAfterAcquire(SemaphoreAcquireOp acquireOp,
+                                                  ArrayRef<Value> semaphores) {
+  return AssignStagePhase(semaphores)
+      .isFirstUseFreshWriteAfterAcquire(acquireOp);
+}
 
 class NVWSAssignSemaphoreStagePhase
     : public impl::NVWSAssignSemaphoreStagePhaseBase<

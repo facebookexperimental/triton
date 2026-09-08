@@ -56,44 +56,6 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
   return colOffset | (rowOffset << 16);
 }
 
-unsigned getMemDescSize(ttg::MemDescType ty) {
-  auto encoding = ty.getEncoding();
-  auto shape = ttg::dropPipeliningDim(ty.getShape(), encoding);
-  auto allocShape = ttg::dropPipeliningDim(ty.getAllocShape(), encoding);
-  uint64_t stages = product(ty.getShape().drop_back(shape.size()));
-
-  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
-    if (stages == 1)
-      return ttng::getTmemAllocSizes(ty).numCols;
-    uint32_t stageCols =
-        ttng::getTMemSubSliceOffset(ty, /*offset=*/1, /*dim=*/0);
-    return (stages - 1) * stageCols +
-           ttng::getTmemAllocSizes(ty).numCols / stages;
-  }
-  assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
-         "Unsupported memory space");
-  unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
-  if (auto padded = ttg::getPaddedEncoding(encoding)) {
-    uint64_t logicalElements = product(ttg::getShapePerCTA(ty));
-    return padded.getPaddedSize({static_cast<int64_t>(logicalElements)}) *
-           elSize;
-  }
-
-  auto allocation = ttg::toLinearLayout(allocShape, encoding);
-  auto view = allocation.pseudoinvert();
-  auto logicalDims = llvm::to_vector(view.getInDimNames());
-  for (auto [dim, size] : llvm::zip_equal(logicalDims, shape))
-    view = view.resizeInDim(dim, size);
-  auto offsetDim = StringAttr::get(ty.getContext(), "offset");
-  // Zero physical bases are still owned by the allocation and its subviews.
-  uint64_t zeroMask = (allocation.getInDimSize(offsetDim) - 1) &
-                      ~getInputBasisMask(allocation, offsetDim, logicalDims);
-  uint64_t viewSpan =
-      (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
-  return ((stages - 1) * allocation.getInDimSize(offsetDim) + viewSpan) *
-         elSize;
-}
-
 uint32_t applySharedPadding(uint32_t byteOffset, ttg::MemDescType ty) {
   auto padded = ttg::getPaddedEncoding(ty.getEncoding());
   if (!padded)
@@ -264,7 +226,7 @@ triton::BufferRegionView getMemDescView(
                         (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())
                              ? affineOffset
                              : applySharedPadding(affineOffset, ty));
-  return {{baseOffset, getMemDescSize(ty), std::move(footprint)},
+  return {{baseOffset, triton::getMemDescSize(ty), std::move(footprint)},
           storageBase,
           affineOffset,
           llvm::to_vector<2>(partitionBases),
@@ -519,6 +481,44 @@ BufferStatePlan createBufferStatePlan(ArrayRef<BufferRegion> regions,
   }
   assert(laneBegin + includeUnknown == plan.numLanes);
   return plan;
+}
+
+unsigned getMemDescSize(ttg::MemDescType ty) {
+  auto encoding = ty.getEncoding();
+  auto shape = ttg::dropPipeliningDim(ty.getShape(), encoding);
+  auto allocShape = ttg::dropPipeliningDim(ty.getAllocShape(), encoding);
+  uint64_t stages = product(ty.getShape().drop_back(shape.size()));
+
+  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
+    if (stages == 1)
+      return ttng::getTmemAllocSizes(ty).numCols;
+    uint32_t stageCols =
+        ttng::getTMemSubSliceOffset(ty, /*offset=*/1, /*dim=*/0);
+    return (stages - 1) * stageCols +
+           ttng::getTmemAllocSizes(ty).numCols / stages;
+  }
+  assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
+         "Unsupported memory space");
+  unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
+  if (auto padded = ttg::getPaddedEncoding(encoding)) {
+    uint64_t logicalElements = product(ttg::getShapePerCTA(ty));
+    return padded.getPaddedSize({static_cast<int64_t>(logicalElements)}) *
+           elSize;
+  }
+
+  auto allocation = ttg::toLinearLayout(allocShape, encoding);
+  auto view = allocation.pseudoinvert();
+  auto logicalDims = llvm::to_vector(view.getInDimNames());
+  for (auto [dim, size] : llvm::zip_equal(logicalDims, shape))
+    view = view.resizeInDim(dim, size);
+  auto offsetDim = StringAttr::get(ty.getContext(), "offset");
+  // Zero physical bases are still owned by the allocation and its subviews.
+  uint64_t zeroMask = (allocation.getInDimSize(offsetDim) - 1) &
+                      ~getInputBasisMask(allocation, offsetDim, logicalDims);
+  uint64_t viewSpan =
+      (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
+  return ((stages - 1) * allocation.getInDimSize(offsetDim) + viewSpan) *
+         elSize;
 }
 
 LogicalResult BufferRegionAnalysis::initialize(Operation *top) {
