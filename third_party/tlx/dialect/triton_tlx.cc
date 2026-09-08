@@ -645,6 +645,11 @@ void init_triton_tlx_ir(py::module_ &m) {
              auto retType = cast<RankedTensorType>(opndAcc.getType());
              auto retShapePerCTA = retType.getShape();
              Block *parentBlock = self.getBuilder().getInsertionBlock();
+             auto module = parentBlock->getParentOp()->getParentOfType<ModuleOp>();
+             if (!module->hasAttr(ttg::AttrNumWarpsName))
+               module->setAttr(
+                   ttg::AttrNumWarpsName,
+                   self.getBuilder().getI32IntegerAttr(moduleNumWarps));
              unsigned numWarps =
                  ttg::maybeLookupNumWarps(parentBlock).value_or(moduleNumWarps);
              if (auto mmaLayout = dyn_cast_or_null<ttg::NvidiaMmaEncodingAttr>(
