@@ -28,9 +28,14 @@ struct MemEffectsOpInfo {
   // those op-local writes and proxy-ordering facts, and nothing else. Use this
   // for PTX ops that perform the write and also signal the barrier via
   // `mbarrier::complete_tx`.
+  //
+  // CountOnly updates the barrier's arrival count and phase without attaching
+  // any memory or proxy frontier. Use this for relaxed control rendezvous,
+  // which do not release prior accesses to a waiter.
   enum class BarrierTrackingMode {
     Frontier,
     EffectWrites,
+    CountOnly,
   };
   struct Effects {
     struct StaticSharedBuffer {

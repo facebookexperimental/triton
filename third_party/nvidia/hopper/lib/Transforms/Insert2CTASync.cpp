@@ -203,7 +203,12 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
       builder, loc, remoteBarType, barrierView, leaderRank);
 
   // Both CTAs arrive on leader's barrier (count=1 each, total=2).
-  ttng::ArriveBarrierOp::create(builder, loc, remoteBar, /*count=*/1u);
+  auto arrive =
+      ttng::ArriveBarrierOp::create(builder, loc, remoteBar, /*count=*/1u);
+  // This barrier only rendezvous the two CTAs before issuing a 2-CTA MMA. The
+  // operands have their own completion barriers, so there is no memory to
+  // publish here. A release.cluster arrive serializes the inner K loop.
+  arrive.setRelaxed(true);
 
   // Compute phase from iterations within the barrier's lifetime.
   // WaitBarrierOp expects I32 for the phase parameter.

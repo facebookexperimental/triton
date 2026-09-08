@@ -348,8 +348,11 @@ public:
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
       info->pred = arriveOp.getPred();
+      auto mode = arriveOp.getRelaxed()
+                      ? MemEffectsOpInfo::BarrierTrackingMode::CountOnly
+                      : MemEffectsOpInfo::BarrierTrackingMode::Frontier;
       info->barriers.push_back(
-          {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount()});
+          {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount(), mode});
     }
     auto baseInfo = ConSanTargetHooks::getMemEffectsOpInfo(op);
     if (failed(baseInfo))
