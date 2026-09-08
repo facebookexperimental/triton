@@ -611,7 +611,10 @@ def TTNG_ArriveBarrierOp
     and the barrier must have the identity CGA layout `[[1], [2], ...]`. The
     default value of `ctaMask` is 0 (no multicast).
 
-    The operation accepts an optional predicate.
+    The operation accepts an optional predicate. `relaxed` may be used for a
+    pure cross-CTA control rendezvous which does not publish memory to another
+    CTA. PTX 8.6 and later encode this explicitly; earlier PTX versions retain
+    the unqualified arrival used for physical-cluster barriers.
 
     Example:
 
@@ -626,7 +629,7 @@ def TTNG_ArriveBarrierOp
       (ins Arg<TTG_MemDescType,
                "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
           I32Attr:$count, DefaultValuedOptionalAttr<I32Attr, "0">:$ctaMask,
-          Optional<I1>:$pred, UnitAttr:$perThread,
+          Optional<I1>:$pred, UnitAttr:$perThread, UnitAttr:$relaxed,
           OptionalAttr<DictionaryAttr>:$constraints);
 
   let assemblyFormat = [{
@@ -635,28 +638,28 @@ def TTNG_ArriveBarrierOp
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*relaxed=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*relaxed=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "uint32_t":$ctaMask,
                      "Value":$pred),
                  [{
-      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*relaxed=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*relaxed=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*relaxed=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread, "DictionaryAttr":$constraints),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, constraints);
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*relaxed=*/false, constraints);
     }]>];
 
   let extraClassDeclaration = [{

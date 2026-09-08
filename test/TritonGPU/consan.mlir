@@ -828,6 +828,51 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#relaxed_data = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1]]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+#relaxed_writer = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 1]]}>
+#relaxed_reader = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[1, 0]]}>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
+  // A relaxed arrive remains a real barrier arrival, but must not make any
+  // preceding access visible to the peer CTA. This preserves the runtime
+  // visibility check that reports a race if relaxed is misused for publishing.
+  // CHECK-LABEL: @relaxed_arrive_is_count_only
+  tt.func public @relaxed_arrive_is_count_only() {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %values = arith.constant dense<1> : tensor<8x32xi32, #relaxed_writer>
+    %buf = ttg.local_alloc %values {allocation.offset = 0 : i32} : (tensor<8x32xi32, #relaxed_writer>) -> !ttg.memdesc<8x32xi32, #relaxed_data, #smem, mutable>
+    %bar = ttg.local_alloc {allocation.offset = 65536 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    // CHECK: ttng.init_barrier
+    // CHECK: tti.experimental_lock_acquire
+    // CHECK: tt.call @__triton_consan_verify_barrier_initialized
+    // CHECK-NOT: tt.call @__triton_consan_track_visible_writes
+    // CHECK-NOT: tt.call @__triton_consan_track_visible_reads
+    // CHECK-NOT: tt.call @__triton_consan_track_proxy_accesses
+    // CHECK: tt.call @__triton_consan_verify_barrier_arrive
+    // CHECK: tt.call @__triton_consan_update_barrier_state
+    // CHECK: tti.experimental_lock_release
+    // CHECK: ttng.arrive_barrier {{.*}} {relaxed}
+    ttng.arrive_barrier %bar, 1, %true {relaxed} : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    // The matching wait still completes, but transfers an empty frontier.
+    ttng.wait_barrier %bar, %c0_i32, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    // CHECK: ttng.wait_barrier
+    // CHECK: tt.call @__triton_consan_transfer_visible_writes
+    // CHECK: tt.call @__triton_consan_transfer_visible_reads
+    // The reader layout reaches both CTA rows. The retained visibility check
+    // reports the missing peer publication at runtime.
+    // CHECK: %[[READ_CTAS:.*]] = arith.constant 3 : i32
+    // CHECK: tt.call @__triton_consan_verify_write_visibility{{.*}}%[[READ_CTAS]]
+    // CHECK: ttg.local_load
+    %value = ttg.local_load %buf : !ttg.memdesc<8x32xi32, #relaxed_data, #smem, mutable> -> tensor<8x32xi32, #relaxed_reader>
+    tt.return
+  }
+}
+
+// -----
+
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {

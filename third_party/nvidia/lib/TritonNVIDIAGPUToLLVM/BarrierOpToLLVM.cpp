@@ -490,6 +490,11 @@ struct ArriveBarrierOpConversion
       auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
         std::stringstream ptxAsm;
         ptxAsm << "@$0 mbarrier.arrive.";
+        bool needsClusterScope =
+            isCrossClusterBarrier || isRemoteBarrier || op.isMulticast();
+        if (needsClusterScope && op.getRelaxed() &&
+            targetInfo->getPtxVersion() >= 86)
+          ptxAsm << "relaxed.cluster.";
         ptxAsm << (isRemoteBarrier || isCrossClusterBarrier || op.isMulticast()
                        ? "shared::cluster"
                        : "shared::cta");

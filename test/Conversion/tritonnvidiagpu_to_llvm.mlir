@@ -139,6 +139,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // CHECK-LABEL: arrive_barrier_remote_relaxed
+  // CHECK: mbarrier.arrive.shared::cluster.b64
+  // PTX85-LABEL: arrive_barrier_remote_relaxed
+  // PTX85: mbarrier.arrive.shared::cluster.b64
+  // PTX86-LABEL: arrive_barrier_remote_relaxed
+  // PTX86: mbarrier.arrive.relaxed.cluster.shared::cluster.b64
+  // PTX88-LABEL: arrive_barrier_remote_relaxed
+  // PTX88: mbarrier.arrive.relaxed.cluster.shared::cluster.b64
+  tt.func @arrive_barrier_remote_relaxed(%alloc: !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>, %pred: i1) {
+    ttng.arrive_barrier %alloc, 2, %pred {relaxed} : !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>
+    tt.return
+  }
+
   // CHECK-LABEL: arrive_barrier_per_thread_remote
   tt.func @arrive_barrier_per_thread_remote(%alloc: !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>) {
     // CHECK-NOT: nvvm.read.ptx.sreg.tid.x

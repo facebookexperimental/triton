@@ -23,7 +23,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: scf.for
     // CHECK:   nvg.cluster_id
     // CHECK:   ttng.map_to_remote_buffer
-    // CHECK:   ttng.arrive_barrier
+    // CHECK:   ttng.arrive_barrier {{.*}} {relaxed}
     // CHECK:   ttng.wait_barrier
     // CHECK:   ttng.tc_gen5_mma
     scf.for %iv = %c0 to %c4 step %c1 {
