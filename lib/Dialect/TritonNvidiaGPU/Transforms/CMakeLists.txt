@@ -22,6 +22,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   TMALowering.cpp
   TMAStoreBufferReuse.cpp
   TMAUtilities.cpp
+  UnifyWSBarrierLocations.cpp
 
   DEPENDS
   TritonNvidiaGPUTransformsIncGen

@@ -125,6 +125,34 @@ inline bool wouldBreakOperandDominance(Operation *op, Operation *insertPt) {
   return false;
 }
 
+// Check the barrier-specific part of raising `wait` before `crossedOp`.
+// Profitability and non-barrier side-effect checks remain the caller's
+// responsibility.
+//
+// Safety against crossing an unrelated barrier rests on the WSBarrier
+// constraint metadata, not on comparing mbarrier values: a crossed arrive is
+// admitted only when canAdvanceWSBarrierArrivePastWait proves disjoint channel
+// graphs or a strict ordered-region precedence. An arrive on the very barrier
+// this wait is waiting on shares that wait's channel graph, so it fails
+// disjointness and, being in the same region, fails the ordering proof too.
+//
+// The isBarrierLikeOp rejection below is deliberately stricter than the
+// hasArriveLikeSemantics fallthrough it replaced in raiseWSWaits: it also
+// rejects InitBarrierOp, so a wait can never be raised above the
+// initialization of its own barrier.
+inline bool canRaiseWSWaitPast(WaitBarrierOp wait, Operation *crossedOp) {
+  if (crossedOp->getNumRegions() != 0)
+    return false;
+  if (auto otherWait = dyn_cast<WaitBarrierOp>(crossedOp))
+    return hasWSBarrierConstraints(otherWait.getConstraints());
+  if (auto arrive = dyn_cast<ArriveBarrierOp>(crossedOp))
+    return canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
+                                             wait.getConstraints());
+  if (isBarrierLikeOp(crossedOp))
+    return false;
+  return !hasArriveLikeSemantics(crossedOp);
+}
+
 // Return the latest same-block operation that an arrive must follow when it is
 // restored near its associated memory op.
 inline Operation *getArriveAnchorAfterOperands(ArriveBarrierOp arrive,
@@ -193,7 +221,6 @@ inline bool raiseWSWaits(Block &block) {
       waits.push_back(wait);
 
   for (auto wait : llvm::reverse(waits)) {
-    auto constraints = wait.getConstraints();
     Operation *insertPt = wait.getOperation();
     for (auto *cur = wait->getPrevNode(); cur; cur = cur->getPrevNode()) {
       // Don't raise past the definition of any of our operands.
@@ -206,14 +233,7 @@ inline bool raiseWSWaits(Block &block) {
       }
       if (definesOperand)
         break;
-      if (auto otherWait = dyn_cast<WaitBarrierOp>(cur)) {
-        if (!hasWSBarrierConstraints(otherWait.getConstraints()))
-          break;
-      } else if (auto arrive = dyn_cast<ArriveBarrierOp>(cur)) {
-        if (!canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
-                                               constraints))
-          break;
-      } else if (!canAdvanceWSBarrier(constraints, cur)) {
+      if (!canRaiseWSWaitPast(wait, cur)) {
         break;
       }
       insertPt = cur;
