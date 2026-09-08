@@ -1058,6 +1058,47 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#sync_restrict_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#sync_restrict_smem = #ttg.shared_memory
+#sync_restrict_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
+#sync_restrict_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1, CGALayout = [[1, 0]]>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 72 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 64 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
+  // A sync-restrict handoff publishes and acquires the shared/proxy frontier,
+  // but not the unrelated tensor-memory frontier. The single calls below are
+  // the shared-memory lane; an ordinary release/acquire barrier emits two.
+  // CHECK-LABEL: @sync_restrict_arrive_is_shared_only
+  tt.func public @sync_restrict_arrive_is_shared_only() {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16xi32, #sync_restrict_shared, #sync_restrict_smem, mutable>
+    %tmem = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<256x64xf32, #sync_restrict_tmem, #ttng.tensor_memory, mutable>
+    %bar = ttg.local_alloc {allocation.offset = 64 : i32} : () -> !ttg.memdesc<1xi64, #sync_restrict_shared, #sync_restrict_smem, mutable>
+    %remote = ttng.map_to_remote_buffer %bar, %c1_i32 : !ttg.memdesc<1xi64, #sync_restrict_shared, #sync_restrict_smem, mutable> -> !ttg.memdesc<1xi64, #sync_restrict_shared, #ttng.shared_cluster_memory, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #sync_restrict_shared, #sync_restrict_smem, mutable>
+    %before = ttg.local_load %buf : !ttg.memdesc<16xi32, #sync_restrict_shared, #sync_restrict_smem, mutable> -> tensor<16xi32, #sync_restrict_blocked>
+    %t_before = ttng.tmem_load %tmem : !ttg.memdesc<256x64xf32, #sync_restrict_tmem, #ttng.tensor_memory, mutable> -> tensor<256x64xf32>
+    // CHECK: tt.call @__triton_consan_track_visible_writes
+    // CHECK-NOT: tt.call @__triton_consan_track_visible_writes
+    // CHECK: tt.call @__triton_consan_track_visible_reads
+    // CHECK-NOT: tt.call @__triton_consan_track_visible_reads
+    // CHECK: ttng.arrive_barrier {{.*}}syncRestrict
+    ttng.arrive_barrier %remote, 1, %true {syncRestrict} : !ttg.memdesc<1xi64, #sync_restrict_shared, #ttng.shared_cluster_memory, mutable>
+    // CHECK: ttng.wait_barrier {{.*}}syncRestrict
+    ttng.wait_barrier %bar, %c0_i32, %true {syncRestrict} : !ttg.memdesc<1xi64, #sync_restrict_shared, #sync_restrict_smem, mutable>
+    // CHECK: tt.call @__triton_consan_transfer_visible_writes
+    // CHECK-NOT: tt.call @__triton_consan_transfer_visible_writes
+    // CHECK: tt.call @__triton_consan_transfer_visible_reads
+    // CHECK-NOT: tt.call @__triton_consan_transfer_visible_reads
+    // CHECK: tt.call @__triton_consan_clear_waiting
+    %after = ttg.local_load %buf : !ttg.memdesc<16xi32, #sync_restrict_shared, #sync_restrict_smem, mutable> -> tensor<16xi32, #sync_restrict_blocked>
+    %t_after = ttng.tmem_load %tmem : !ttg.memdesc<256x64xf32, #sync_restrict_tmem, #ttng.tensor_memory, mutable> -> tensor<256x64xf32>
+    tt.return
+  }
+}
+
+// -----
+
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {

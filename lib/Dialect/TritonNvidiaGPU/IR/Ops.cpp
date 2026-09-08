@@ -573,6 +573,14 @@ TypedValue<MemDescType> BarrierExpectOp::getBarrier() { return getAlloc(); }
 LogicalResult WaitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
+  if (getSyncRestrict()) {
+    auto barrierTy = cast<MemDescType>(getAlloc().getType());
+    if (!isa<SharedMemorySpaceAttr>(barrierTy.getMemorySpace()))
+      return emitOpError(
+          "syncRestrict wait requires a CTA-local shared-memory barrier");
+    if (!gpu::isPhysicalCluster(getOperation()))
+      return emitOpError("syncRestrict wait requires a physical cluster");
+  }
   return success();
 }
 
@@ -601,6 +609,18 @@ LogicalResult ArriveBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  if (getSyncRestrict()) {
+    auto barrierTy = cast<MemDescType>(getAlloc().getType());
+    if (!isa<SharedClusterMemorySpaceAttr>(barrierTy.getMemorySpace()))
+      return emitOpError(
+          "syncRestrict arrive requires a remote shared-memory barrier");
+    if (getPerThread())
+      return emitOpError("syncRestrict arrive does not support perThread");
+    if (getRelaxed())
+      return emitOpError("syncRestrict and relaxed are mutually exclusive");
+    if (!gpu::isPhysicalCluster(getOperation()))
+      return emitOpError("syncRestrict arrive requires a physical cluster");
+  }
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
