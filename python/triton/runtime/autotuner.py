@@ -1089,6 +1089,8 @@ class Config:
     :ivar enable_nvptx_v2i32: opt in to NVPTX v2i32 register legalization. Off by default;
         the packed form costs an unpack/repack per use and no integer op is legal on it.
     :type enable_nvptx_v2i32: bool | None
+    :ivar num_cpu_threads: number of threads to use for CPU backend kernels. 0 (default) means unset.
+    :type num_cpu_threads: int
     """
 
     @staticmethod
@@ -1220,7 +1222,8 @@ class Config:
         res.append(f"auto_tma: {self.auto_tma}")
         res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
         res.append(f"enable_nvptx_v2i32: {self.enable_nvptx_v2i32}")
-        res.append(f"num_cpu_threads: {self.num_cpu_threads}")
+        if self.num_cpu_threads:
+            res.append(f"num_cpu_threads: {self.num_cpu_threads}")
         return ", ".join(res)
 
     def __hash__(self):
