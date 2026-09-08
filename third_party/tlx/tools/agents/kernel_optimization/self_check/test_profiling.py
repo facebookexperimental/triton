@@ -10,9 +10,10 @@ from types import ModuleType
 from unittest import mock
 from unittest.mock import patch
 
-from . import rocm_profiler as rocm_profiler_module
-from .amd_att import collect_fb_att
-from .profiling import (
+from ..decision_maker import rocm_profiler as rocm_profiler_module
+from ..decision_maker.amd_att import collect_fb_att
+from ..decision_maker.profiling import (
+    ProfileRequest,
     compact_profile_summary,
     export_ncu_report_details,
     extract_native_profiler_duration_us,
@@ -25,12 +26,11 @@ from .profiling import (
     parse_ncu_query_metrics,
     parse_proton_launch_attribution,
     per_case_profile_request,
-    ProfileRequest,
     resolve_profile_request_for_target,
     resolve_profile_tools,
     select_ncu_metric_names,
 )
-from .rocm_profiler import (
+from ..decision_maker.rocm_profiler import (
     collect_rocprofv3,
     filter_extreme_timing_outliers,
     find_rocprofv3,
@@ -679,7 +679,9 @@ class ProfileParsingTest(unittest.TestCase):
 
     def test_gfx950_benchmark_surfaces_rocprof_error(self) -> None:
         harness_path = (
-            Path(__file__).with_name("harnesses")
+            Path(__file__).parents[1]
+            / "decision_maker"
+            / "harnesses"
             / "gfx950"
             / "targets"
             / "gemm"

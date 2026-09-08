@@ -5,13 +5,12 @@ import json
 import os
 import re
 import sys
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from .artifacts import load_prior_run_evidence
 from .harness import HarnessExecutionError, SubprocessHarness
-from .models import (
+from ..contracts import (
     AutoCommitResult,
     ExperimentSummary,
     InputCase,
@@ -20,11 +19,11 @@ from .models import (
     KernelTarget,
     OptimizationBudget,
     PerformanceSummary,
-    passes_protected_cases,
     to_json_value,
 )
-from .optimizer import KernelOptimizer
-from .providers import CodexCandidateProvider, MockLLMProvider
+from ..optimizer.agent import CodexCandidateProvider, MockLLMProvider
+from .orchestrator import KernelOptimizer
+from .policy import passes_protected_cases
 from .vcs import (
     AutoCommitSession,
     commit_promotion,
@@ -450,7 +449,7 @@ class _PromotionAutoCommitter:
         return result
 
     def rollback_to_baseline(self, diagnostics: str) -> AutoCommitResult:
-        subject = f"Revert TLX agent promotions after failed final revalidation"
+        subject = "Revert TLX agent promotions after failed final revalidation"
         try:
             result = commit_rollback(self._session, subject, diagnostics)
         except Exception as error:  # noqa: BLE001

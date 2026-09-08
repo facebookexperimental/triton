@@ -1,9 +1,17 @@
 # TLX Kernel Optimization Agent
 
-This directory contains the TLX-local optimization loop for standalone Triton and TLX
-kernels. It lives inside the TLX codebase (`third_party/tlx/tools/agents/kernel_optimization/`) and
-is the canonical location for the loop in this checkout; a future sync to
-`third_party/tlx/` will copy from here.
+This directory contains the TLX-local optimization system for standalone Triton and TLX
+kernels. Its implementation has two runtime components and one deterministic self-check
+suite:
+
+- `optimizer/` is the only autonomous, Codex-backed component. It interprets measured
+  evidence and proposes config, kernel, or compiler work.
+- `decision_maker/` owns authoritative evaluation, budgets, run state, promotion, stopping,
+  persistence, and VCS finalization.
+- `self_check/` contains deterministic regression tests. It is not an agent.
+
+The root package contains shared contracts and public exports; implementation lives in the
+three directories above.
 
 The language used by the kernel is not part of the control-plane contract. A
 user-supplied harness owns compilation, correctness, timing, and profiling.
@@ -13,6 +21,9 @@ The loop is:
 ```text
 build -> verify -> benchmark -> profile -> propose source mutation -> repeat
 ```
+
+The Decision Maker establishes the authoritative baseline and supplies normalized evidence
+to the Optimizer.
 
 The candidate generator can propose source, but it cannot declare a candidate correct or
 faster. A candidate is promoted only when every protected case passes and the weighted
@@ -37,13 +48,13 @@ a bool or `{passed, diagnostics, metrics}`. `benchmark` returns microsecond samp
 called after a successful `verify` + `benchmark` pair and its return value (a JSON object)
 is persisted per case.
 
-The default harness mode is **subprocess isolation** (`worker.py` subprocess per candidate):
+The default harness mode is **subprocess isolation** (`decision_maker/runner.py` subprocess per candidate):
 candidate state and imported kernel modules never leak across evaluations. An in-process
-`StandaloneHarness` is available programmatically (via `from third_party.tlx.tools.agents.kernel_optimization.harness import StandaloneHarness`)
+`StandaloneHarness` is available programmatically (via `from third_party.tlx.tools.agents.kernel_optimization.decision_maker.harness import StandaloneHarness`)
 for debugging and unit tests.
 
 Build/verify/benchmark/profile run in a new subprocess for every source candidate via
-`worker.py`. On timeout the agent sends `SIGTERM` then `SIGKILL` to the whole process
+`decision_maker/runner.py`. On timeout the Decision Maker sends `SIGTERM` then `SIGKILL` to the whole process
 group. Large profile payloads (>1MB inline JSON) are spilled to
 `artifacts/profile_traces/` with a pointer left in `experiments/<id>/profile.json`.
 
@@ -52,27 +63,27 @@ group. Large profile payloads (>1MB inline JSON) are spilled to
 Run the module directly from the Triton source repository root:
 
 ```bash
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --kernel my_kernel.py --reference-kernel reference_kernel.py \
   --output-dir /tmp/tlx-kernel-agent-run \
   --max-rounds 5 \
   --provider codex --arch blackwell
 
 # Continue from a completed run without adopting its winner:
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-next \
   --prior-run /tmp/tlx-kernel-agent-run \
   --provider codex --arch blackwell
 
 # A revalidated winner is committed by default:
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-run \
   --vcs auto \
   --commit-message "Optimize my kernel with TLX agent"
 ```
 
 `--arch` and `--target-name` select
-`harnesses/<arch>/targets/<target-name>`. `--target-name` defaults to the kernel
+`decision_maker/harnesses/<arch>/targets/<target-name>`. `--target-name` defaults to the kernel
 filename stem; use it when an implementation-specific filename such as
 `amd_gemm_warp_pipeline.py` should use the generic `gemm` target contract.
 `harness`/`cases`/`target` can also be passed explicitly.
@@ -152,7 +163,7 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 ## TLX GEMM example
 
-`harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
+`decision_maker/harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
 `matmul(a, b)`. It compares against `torch.matmul`, benchmarks with
 `triton.testing.do_bench`, and reports latency and TFLOP/s. Its legacy two-argument
 `profile(build_artifact, case)` returns latency and throughput, and can optionally collect a
@@ -161,8 +172,8 @@ requests or NCU collection.
 
 ### Target-supplied profiling
 
-Canonical workflow guidance lives in `docs/profiling/proton.md` for Proton and
-`docs/profiling/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
+Canonical workflow guidance lives in `decision_maker/docs/profiling/proton.md` for Proton
+and `decision_maker/docs/profiling/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
 run orchestration; they are not injected into candidate source prompts.
 
 A target harness may implement `profile(build_artifact, case, request)` to honor structured
@@ -183,13 +194,14 @@ non-null when those tools are available.
 - **Diagnostic instrumentation:** `proton_intra_kernel` requires a target-supplied instrumented
   replay. Instrumented source and timing must never be benchmarked, promoted, or committed.
 
-Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
-`sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the
+Target-specific `harness.py`/`cases.json`/`target.json` live under
+`decision_maker/harnesses/<arch>/targets/<kernel>/` (B200, `sm_100` for Blackwell and H100,
+`sm_90` for Hopper); pick `--arch` to match the
 device you are tuning for. Architecture-wide notes, known optimization tricks, and shared
-target metadata can live directly under `harnesses/<arch>/`. Pass an existing TLX tutorial such as
+target metadata can live directly under `decision_maker/harnesses/<arch>/`. Pass an existing TLX tutorial such as
 `third_party/tlx/tutorials/blackwell_gemm_ws.py` as `--kernel`.
 
-AMD gfx950 GEMM is available under `harnesses/gfx950/targets/gemm/`. The target uses
+AMD gfx950 GEMM is available under `decision_maker/harnesses/gfx950/targets/gemm/`. The target uses
 the ROCm PyTorch convention `device="cuda:0"` with `backend="hip"` and accepts any
 complete candidate source that exports `matmul(a, b)`.
 
@@ -216,7 +228,7 @@ The tutorial below is only a convenient seed, not a reference implementation or 
 of optimality:
 
 ```bash
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --kernel third_party/tlx/tutorials/amd_gemm_warp_pipeline.py \
   --arch gfx950 --target-name gemm \
   --output-dir /tmp/tlx-agent-gfx950 \
@@ -224,7 +236,7 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --min-speedup 1.05 --no-commit-winner
 ```
 
-`harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
+`decision_maker/harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
 without a real GPU. Candidate must export `vector_add(a, b)`; on CPU the benchmark uses
 synthetic `LATENCY_US` timing so unit tests pass on any host.
 
@@ -232,7 +244,7 @@ synthetic `LATENCY_US` timing so unit tests pass on any host.
 
 ```bash
 # Kernel-only: arch auto-resolved, or pass --arch hopper for H100
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --kernel my_gemm_kernel.py --reference-kernel baseline_gemm.py \
   --arch hopper \
   --output-dir /tmp/tlx-agent-h100 \

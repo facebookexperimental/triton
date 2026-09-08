@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .vcs import (
+from ..decision_maker.vcs import (
     ATTRIBUTION,
     AutoCommitError,
     AutoCommitSession,

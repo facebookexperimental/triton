@@ -10,42 +10,44 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from . import optimizer as optimizer_module
-from .artifacts import load_prior_run_evidence
-from .cli import (
+from ..decision_maker import orchestrator as optimizer_module
+from ..decision_maker.artifacts import load_prior_run_evidence
+from ..decision_maker.cli import (
     _commit_body,
     _parse_args,
     _resolve_harness_paths,
     _validate_host_matches_target,
 )
-from .harness import StandaloneHarness, SubprocessHarness
-from .models import (
+from ..decision_maker.harness import StandaloneHarness, SubprocessHarness
+from ..contracts import (
     AutoCommitResult,
     CaseEvaluation,
     InputCase,
-    is_promotable,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
-    per_case_speedups,
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
     TimingSamples,
     VerificationResult,
+)
+from ..decision_maker.policy import (
+    is_promotable,
+    per_case_speedups,
     weighted_geometric_speedup,
 )
-from .optimizer import _profile_log_parts, KernelOptimizer
-from .profiling import ProfileRequest
-from .providers import (
-    _build_prompt,
-    _read_candidate_metadata,
+from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
+from ..decision_maker.profiling import ProfileRequest
+from ..optimizer.agent import (
     CandidateContext,
     CandidateProposal,
     FixedCandidateProvider,
     MockLLMProvider,
+    _build_prompt,
+    _read_candidate_metadata,
 )
-from .source import (
+from ..optimizer.source import (
     apply_candidate_diff,
     extract_python_source,
     source_digest,
@@ -830,7 +832,9 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(
             harness,
-            Path(__file__).with_name("harnesses")
+            Path(__file__).parents[1]
+            / "decision_maker"
+            / "harnesses"
             / "hopper"
             / "targets"
             / "gemm"
@@ -848,7 +852,14 @@ class HarnessTest(unittest.TestCase):
             "gfx950",
             "gemm",
         )
-        expected = Path(__file__).with_name("harnesses") / "gfx950" / "targets" / "gemm"
+        expected = (
+            Path(__file__).parents[1]
+            / "decision_maker"
+            / "harnesses"
+            / "gfx950"
+            / "targets"
+            / "gemm"
+        )
         self.assertEqual(harness, expected / "harness.py")
         self.assertEqual(cases, expected / "cases.json")
         self.assertEqual(target, expected / "target.json")
@@ -858,7 +869,9 @@ class HarnessTest(unittest.TestCase):
         harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
-            Path(__file__).with_name("harnesses")
+            Path(__file__).parents[1]
+            / "decision_maker"
+            / "harnesses"
             / "host"
             / "targets"
             / "vector_add"
@@ -869,7 +882,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_standalone_harness_evaluates_fake_kernel(self) -> None:
         harness = StandaloneHarness(
-            Path(__file__).with_name("testdata") / "fake_harness.py"
+            Path(__file__).with_name("fixtures") / "fake_harness.py"
         )
         cases = (InputCase("a", {"scale": 1.0}), InputCase("b", {"scale": 2.0}))
         target = KernelTarget("fake", "fake")
@@ -886,7 +899,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_subprocess_harness_evaluates_legacy_profile_signature(self) -> None:
         harness = SubprocessHarness(
-            Path(__file__).with_name("testdata") / "fake_harness.py",
+            Path(__file__).with_name("fixtures") / "fake_harness.py",
             timeout_seconds=30.0,
         )
         performance = harness.evaluate(
@@ -1015,7 +1028,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_standalone_harness_reports_build_error(self) -> None:
         harness = StandaloneHarness(
-            Path(__file__).with_name("testdata") / "fake_harness.py"
+            Path(__file__).with_name("fixtures") / "fake_harness.py"
         )
         cases = (InputCase("a", {}),)
         target = KernelTarget("fake", "fake")
@@ -1036,17 +1049,17 @@ class HarnessTest(unittest.TestCase):
         )
         request = KernelOptimizationRequest(
             kernel_source="LATENCY_US = 100\nCORRECT = True\n",
-            harness_path=Path(__file__).with_name("testdata") / "fake_harness.py",
+            harness_path=Path(__file__).with_name("fixtures") / "fake_harness.py",
             cases=(InputCase("a", {"scale": 1.0}),),
             target=KernelTarget("fake", "fake"),
         )
-        from .models import PerformanceSummary as PS
+        from ..contracts import PerformanceSummary as PS
 
         ctx = provider.propose.__code__  # touch to avoid unused
         del ctx
         # Simulate two sequential proposals via the same provider instance.
         dummy_perf = PS(cases=())
-        from .providers import CandidateContext
+        from ..optimizer.agent import CandidateContext
 
         first = provider.propose(
             request,
@@ -1067,7 +1080,7 @@ class CommitBodyTest(unittest.TestCase):
             cases=_performance(("large", 80.0), ("small", 40.0)).cases,
             aggregate_speedup=1.25,
         )
-        from .models import KernelOptimizationResult
+        from ..contracts import KernelOptimizationResult
 
         result = KernelOptimizationResult(
             success=True,
@@ -1113,7 +1126,7 @@ class KernelOptimizerTest(unittest.TestCase):
             result = KernelOptimizer(provider).optimize(
                 KernelOptimizationRequest(
                     kernel_source=baseline_source,
-                    harness_path=Path(__file__).with_name("testdata")
+                    harness_path=Path(__file__).with_name("fixtures")
                     / "fake_harness.py",
                     cases=(InputCase("a", {"scale": 1.0}),),
                     target=KernelTarget("fake", "fake"),
@@ -1158,7 +1171,7 @@ class KernelOptimizerTest(unittest.TestCase):
             result = KernelOptimizer(provider).optimize(
                 KernelOptimizationRequest(
                     kernel_source=baseline_source,
-                    harness_path=Path(__file__).with_name("testdata")
+                    harness_path=Path(__file__).with_name("fixtures")
                     / "fake_harness.py",
                     cases=(InputCase("a", {"scale": 1.0}),),
                     target=KernelTarget("fake", "fake"),
@@ -1204,7 +1217,7 @@ class KernelOptimizerTest(unittest.TestCase):
             ).optimize(
                 KernelOptimizationRequest(
                     kernel_source=baseline_source,
-                    harness_path=Path(__file__).with_name("testdata")
+                    harness_path=Path(__file__).with_name("fixtures")
                     / "fake_harness.py",
                     cases=(InputCase("a", {"scale": 1.0}),),
                     target=KernelTarget("fake", "fake"),
@@ -1252,7 +1265,7 @@ class KernelOptimizerTest(unittest.TestCase):
                 result = KernelOptimizer(provider).optimize(
                     KernelOptimizationRequest(
                         kernel_source="LATENCY_US = 100\nCORRECT = True\n",
-                        harness_path=Path(__file__).with_name("testdata")
+                        harness_path=Path(__file__).with_name("fixtures")
                         / "fake_harness.py",
                         cases=(InputCase("a", {"scale": 1.0}),),
                         target=KernelTarget("fake", "fake"),
@@ -1299,7 +1312,7 @@ class KernelOptimizerTest(unittest.TestCase):
                 ).optimize(
                     KernelOptimizationRequest(
                         kernel_source=source,
-                        harness_path=Path(__file__).with_name("testdata")
+                        harness_path=Path(__file__).with_name("fixtures")
                         / "fake_harness.py",
                         cases=(InputCase("a", {"scale": 1.0}),),
                         target=KernelTarget("fake", "fake"),
@@ -1350,7 +1363,7 @@ class KernelOptimizerTest(unittest.TestCase):
             result = KernelOptimizer(RecordingProvider()).optimize(
                 KernelOptimizationRequest(
                     kernel_source="LATENCY_US = 100\nCORRECT = True\n",
-                    harness_path=Path(__file__).with_name("testdata")
+                    harness_path=Path(__file__).with_name("fixtures")
                     / "fake_harness.py",
                     cases=(InputCase("a", {"scale": 1.0}),),
                     target=KernelTarget("fake", "fake"),
@@ -1388,7 +1401,7 @@ class KernelOptimizerTest(unittest.TestCase):
             result = KernelOptimizer(provider).optimize(
                 KernelOptimizationRequest(
                     kernel_source="LATENCY_US = 100\nCORRECT = True\n",
-                    harness_path=Path(__file__).with_name("testdata")
+                    harness_path=Path(__file__).with_name("fixtures")
                     / "fake_harness.py",
                     cases=(InputCase("a", {"scale": 1.0}),),
                     target=KernelTarget("fake", "fake"),
@@ -1419,7 +1432,7 @@ class KernelOptimizerTest(unittest.TestCase):
             result = KernelOptimizer(provider).optimize(
                 KernelOptimizationRequest(
                     kernel_source="LATENCY_US = 100\nCORRECT = True\n",
-                    harness_path=Path(__file__).with_name("testdata")
+                    harness_path=Path(__file__).with_name("fixtures")
                     / "fake_harness.py",
                     cases=(
                         InputCase("a", {"scale": 1.0}, weight=2.0),

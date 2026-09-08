@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .models import PriorExperimentEvidence, PriorRunEvidence, JsonValue, to_json_value
-from .source import source_digest, source_diff
+from ..contracts import PriorExperimentEvidence, PriorRunEvidence, JsonValue, to_json_value
+from ..optimizer.source import source_digest, source_diff
 
 _INLINE_PROFILE_LIMIT_BYTES = 1_000_000
 _MAX_PRIOR_JSON_BYTES = 8 * 1024 * 1024

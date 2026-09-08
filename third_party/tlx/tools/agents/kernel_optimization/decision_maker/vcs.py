@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Literal
 
-from .models import AutoCommitResult
+from ..contracts import AutoCommitResult
 
 VcsKind = Literal["git", "hg"]
 ATTRIBUTION = "TLX agent authored"

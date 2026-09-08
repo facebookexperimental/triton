@@ -1,13 +1,5 @@
-from .amd_att import collect_fb_att, find_fb_att
-from .harness import (
-    BuildError,
-    HarnessExecutionError,
-    HarnessTimeoutError,
-    KernelHarness,
-    StandaloneHarness,
-    SubprocessHarness,
-)
-from .models import (
+from .decision_maker.amd_att import collect_fb_att, find_fb_att
+from .contracts import (
     BuildResult,
     CaseEvaluation,
     ExperimentSummary,
@@ -16,24 +8,33 @@ from .models import (
     KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
-    per_case_speedups,
     PerformanceSummary,
     TimingSamples,
     VALID_STRATEGIES,
     VerificationResult,
-    weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer
-from .providers import (
+from .decision_maker import (
+    BuildError,
+    DecisionMaker,
+    HarnessExecutionError,
+    HarnessTimeoutError,
+    KernelHarness,
+    StandaloneHarness,
+    SubprocessHarness,
+    KernelOptimizer,
+)
+from .decision_maker.policy import per_case_speedups, weighted_geometric_speedup
+from .optimizer import (
     CandidateContext,
     CandidateProposal,
     CandidateProvider,
     CodexCandidateProvider,
     FixedCandidateProvider,
     MockLLMProvider,
+    Optimizer,
     TLX_PROMPT_PREAMBLE,
 )
-from .rocm_profiler import collect_rocprofv3, find_rocprofv3
+from .decision_maker.rocm_profiler import collect_rocprofv3, find_rocprofv3
 
 __all__ = [
     "BuildError",
@@ -45,6 +46,7 @@ __all__ = [
     "CodexCandidateProvider",
     "collect_fb_att",
     "collect_rocprofv3",
+    "DecisionMaker",
     "ExperimentSummary",
     "find_fb_att",
     "find_rocprofv3",
@@ -59,6 +61,7 @@ __all__ = [
     "KernelTarget",
     "MockLLMProvider",
     "OptimizationBudget",
+    "Optimizer",
     "PerformanceSummary",
     "StandaloneHarness",
     "SubprocessHarness",
