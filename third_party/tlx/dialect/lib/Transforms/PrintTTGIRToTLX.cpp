@@ -440,6 +440,57 @@ static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
   return cache;
 }
 
+std::string getElementTypeName(Type type);
+
+// Casts that change a value's element type. These are user-visible in TLX --
+// the kernel wrote `x.to(dtype)` -- unlike the width/index casts below.
+static const llvm::StringSet<> elementTypeCastOps = {
+    "arith.extf",   "arith.truncf", "arith.sitofp",
+    "arith.uitofp", "arith.fptosi", "arith.fptoui",
+};
+
+
+// Element types getElementTypeName can spell as a TLX dtype. Anything else it
+// renders as raw MLIR, which is not usable in emitted Python.
+static bool isNameableElementType(Type type) {
+  return type.isF32() || type.isF16() || type.isBF16() || type.isF64() ||
+         type.isInteger(1) || type.isInteger(8) || type.isInteger(16) ||
+         type.isInteger(32) || type.isInteger(64) ||
+         isa<Float8E4M3FNType, Float8E4M3FNUZType, Float8E5M2Type,
+             Float8E5M2FNUZType>(type);
+}
+
+// Element type of a tensor, or the type itself for a scalar.
+static Type getElementType(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    return tensorType.getElementType();
+  return type;
+}
+
+// Whether an emitted expression names a value `.to(...)` can be called on.
+// The keyword literals lex as identifiers but are not tensors, so they take
+// the tl.cast path with the other inlined constants.
+static bool isPythonIdentifier(StringRef s) {
+  if (s.empty() || isdigit(static_cast<unsigned char>(s[0])))
+    return false;
+  if (s == "True" || s == "False" || s == "None")
+    return false;
+  return llvm::all_of(s, [](char c) {
+    return isalnum(static_cast<unsigned char>(c)) || c == '_';
+  });
+}
+
+// Whether getValueName spells an element-type cast or erases it: erased when
+// TLX cannot name the dtype, or the operand is `None`. Shared with the resolver.
+static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
+  return castOp && castOp->getNumOperands() > 0 &&
+         castOp->getNumResults() > 0 &&
+         elementTypeCastOps.contains(castOp->getName().getStringRef()) &&
+         isNameableElementType(
+             getElementType(castOp->getResult(0).getType())) &&
+         operandName != "None";
+}
+
 // Get simplified name for a value (just the SSA name)
 // If argSubstitutionMap is provided, substitute block args with their mapped
 // values
@@ -487,6 +538,28 @@ getValueName(Value v,
       return "None";
     }
 
+    // An element-type cast is user-visible -- the kernel wrote `x.to(dtype)` --
+    // so unlike the layout-only casts below it is re-emitted, inline at each use.
+    if (elementTypeCastOps.contains(defOp->getName().getStringRef()) &&
+        defOp->getNumOperands() > 0) {
+      std::string operand = getValueName(defOp->getOperand(0),
+                                         argSubstitutionMap, inlineConstants);
+      if (spellsElementTypeCast(defOp, operand)) {
+        std::string dtype = getElementTypeName(getElementType(v.getType()));
+        // `.to` is a method on a tensor, so it only works when the operand
+        // names one: an inlined constant reaches here as a Python literal and
+        // `(0).to(tl.float32)` raises AttributeError at kernel compile time.
+        if (!isPythonIdentifier(operand))
+          return "tl.cast(" + operand + ", " + dtype + ")";
+        return operand + ".to(" + dtype + ")";
+      }
+      // Otherwise the cast is erased: fall through to the transparent list.
+    }
+
+    // Layout- and shape-only ops, plus the width/index casts Triton leaves
+    // implicit. The float element-type casts are still listed: the block above
+    // intercepts them whenever their dtype is nameable, so reaching one here
+    // means it is not, and erasing it beats emitting an uncompilable dtype.
     static const llvm::StringSet<> transparentOps = {
         "ttg.convert_layout", "arith.extui",   "arith.extsi",
         "arith.extf",         "arith.trunci",  "arith.truncf",
@@ -639,6 +712,15 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
 
 // Get element type name as a simple string
 std::string getElementTypeName(Type type) {
+  // Mirrors the builder types in python/src/ir.cc (get_fp8e4nv_ty etc).
+  if (isa<Float8E4M3FNType>(type))
+    return "tl.float8e4nv";
+  if (isa<Float8E4M3FNUZType>(type))
+    return "tl.float8e4b8";
+  if (isa<Float8E5M2Type>(type))
+    return "tl.float8e5";
+  if (isa<Float8E5M2FNUZType>(type))
+    return "tl.float8e5b16";
   if (type.isF32())
     return "tl.float32";
   if (type.isF16())
@@ -868,6 +950,24 @@ static Value resolveThroughCasts(Value v) {
       v = op->getOperand(0);
     else
       break;
+  }
+  return v;
+}
+
+// As above, but stops at an element-type cast. The store paths use this to
+// decide whether to append a dtype cast: getValueName already spells those
+// casts, so walking past one reports the pre-cast dtype and the store appends
+// a second, redundant `.to(...)`.
+static Value resolveThroughNonElementCasts(Value v) {
+  while (auto *op = v.getDefiningOp()) {
+    StringRef name = op->getName().getStringRef();
+    if (!castOpsSet.contains(name) || op->getNumOperands() == 0)
+      break;
+    // Stop where getValueName spells the cast; walking past one it erased would
+    // report a dtype the emitted name does not carry.
+    if (spellsElementTypeCast(op, getValueName(op->getOperand(0))))
+      break;
+    v = op->getOperand(0);
   }
   return v;
 }
@@ -1575,7 +1675,7 @@ void printSimplifiedOp(
 
     // Check if transparent ops resolve the source name to a different-dtype
     // value. Resolve through casts to find the actual Python-level type.
-    Value resolvedSrc = resolveThroughCasts(src);
+    Value resolvedSrc = resolveThroughNonElementCasts(src);
     Type dstElemType;
     Type resolvedSrcElemType;
     if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
@@ -1584,6 +1684,8 @@ void printSimplifiedOp(
       resolvedSrcElemType = resolvedType.getElementType();
 
     os << "tlx.local_store(" << dstName << ", " << srcName;
+    // dstElemType is always nameable: local_store requires src and dst element
+    // types to match, and TT_Float is exactly what isNameableElementType covers.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
@@ -1600,7 +1702,7 @@ void printSimplifiedOp(
     Value src = op->getOperand(1);
     std::string srcName = getValueName(src, argSubstitutionMap);
 
-    Value resolvedSrc = resolveThroughCasts(src);
+    Value resolvedSrc = resolveThroughNonElementCasts(src);
     Type dstElemType;
     Type resolvedSrcElemType;
     if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
@@ -1610,6 +1712,7 @@ void printSimplifiedOp(
 
     os << "tlx.local_store(" << getValueName(dst, argSubstitutionMap) << ", "
        << srcName;
+    // dstElemType is always nameable here, as in ttg.local_store above.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
@@ -2055,6 +2158,35 @@ void printSimplifiedOp(
       os << ", mask=" << getValueName(mask, argSubstitutionMap);
     if (other)
       os << ", other=" << getValueName(other, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // Both take their tokens as a list, and async_wait carries its outstanding-
+  // group count in the `num` attribute rather than as an operand.
+  if (opName == "ttg.async_commit_group" || opName == "ttg.async_wait") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    bool isWait = opName == "ttg.async_wait";
+    os << (isWait ? "tlx.async_load_wait_group("
+                  : "tlx.async_load_commit_group(");
+    if (isWait) {
+      auto num = op->getAttrOfType<IntegerAttr>("num");
+      os << (num ? num.getInt() : 0);
+      // The tokens list is optional; omit it entirely when there are none.
+      if (op->getNumOperands() > 0)
+        os << ", ";
+    }
+    if (!isWait || op->getNumOperands() > 0) {
+      os << "[";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << getValueName(op->getOperand(i), argSubstitutionMap);
+      }
+      os << "]";
+    }
     os << ")";
     printLocComment(op, os);
     return;
