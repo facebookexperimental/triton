@@ -633,6 +633,7 @@ public:
       int numWarpSpecializeOps = 0;
       bool hasExclusiveWS = false;
       bool hasNoEndingClusterSync = false;
+      bool hasLessRegMMA = false;
       std::optional<int32_t> mbarrierTryWaitSuspendNs;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
@@ -640,6 +641,8 @@ public:
           hasExclusiveWS = true;
         if (op->hasAttr("tlx.no_ending_cluster_sync"))
           hasNoEndingClusterSync = true;
+        if (op->hasAttr("tlx.less_reg_mma"))
+          hasLessRegMMA = true;
         if (auto attr = op->getAttrOfType<IntegerAttr>(
                 "tlx.mbarrier_try_wait_suspend_ns")) {
           int32_t value = attr.getInt();
@@ -650,6 +653,11 @@ public:
       if (mbarrierTryWaitSuspendNs)
         mod->setAttr("tlx.mbarrier_try_wait_suspend_ns",
                      b.getI32IntegerAttr(*mbarrierTryWaitSuspendNs));
+      // `less_reg_mma`: give every MMA its own SMEM operand address
+      // computation instead of letting LLVM CSE one across distant MMAs. The
+      // NVIDIA MMA lowering reads this off the module.
+      if (hasLessRegMMA)
+        mod->setAttr("tlx.less_reg_mma", b.getUnitAttr());
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
           mod.emitError()
