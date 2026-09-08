@@ -58,7 +58,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
     v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS)
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
 
-    with tlx.async_tasks():
+    with tlx.async_tasks(exclusive=True):
         # producer group
         with tlx.async_task("default"):
             # initialize offsets
@@ -253,6 +253,321 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             desc_o.store([qo_offset_y_split, 0], acc.to(tlx.dtype_of(desc_o)))
 
 
+@triton.jit
+# Triton TR001: backward preprocess uses the fixed 128-row FA tile from the wrapper.
+def _attn_bwd_preprocess(  # noqa: TR001
+    O,
+    DO,
+    Delta,
+    DQ,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_hz = tl.program_id(1)
+    off_n = tl.arange(0, HEAD_DIM)
+    mask = (off_m[:, None] < N_CTX) & (off_n[None, :] < HEAD_DIM)
+    o = tl.load(
+        O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    do = tl.load(
+        DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    delta = tl.sum(o * do, axis=1)
+    tl.store(Delta + off_hz * N_CTX + off_m, delta, mask=off_m < N_CTX)
+    tl.store(
+        DQ + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :],
+        tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32),
+        mask=mask,
+    )
+
+
+def _host_descriptor_bwd_pre_hook(nargs):
+    if not isinstance(nargs["desc_q"], TensorDescriptor):
+        return
+    BLOCK_M = nargs["BLOCK_M"]
+    BLOCK_N = nargs["BLOCK_N"]
+    HEAD_DIM = nargs["HEAD_DIM"]
+    NUM_MMA_GROUPS_BWD = nargs["NUM_MMA_GROUPS_BWD"]
+    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
+    nargs["desc_do"].block_shape = [BLOCK_M, HEAD_DIM]
+    nargs["desc_dq"].block_shape = [BLOCK_M, HEAD_DIM]
+    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
+    nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
+    nargs["desc_dk"].block_shape = [BLOCK_N // NUM_MMA_GROUPS_BWD, HEAD_DIM]
+    nargs["desc_dv"].block_shape = [BLOCK_N // NUM_MMA_GROUPS_BWD, HEAD_DIM]
+
+
+configs_bwd = [
+    triton.Config(
+        {
+            "BLOCK_M": 64,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 2,
+            "NUM_BUFFERS_DQ_STORE": 2,
+            "NUM_MMA_GROUPS_BWD": 2,
+            "NUM_MMA_WARPS_BWD": 8,
+            "BWD_REGISTERS": 240,
+        },
+        num_stages=1,
+        num_warps=4,
+        pre_hook=_host_descriptor_bwd_pre_hook,
+    ),
+]
+
+
+@triton.autotune(configs=configs_bwd, key=["N_CTX", "HEAD_DIM"])
+@triton.jit
+def _attn_bwd_tlx(
+    desc_q,
+    desc_k,
+    desc_v,
+    sm_scale,
+    desc_do,
+    desc_dq,
+    desc_dk,
+    desc_dv,
+    M,
+    D,
+    H,
+    N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_BUFFERS_Q: tl.constexpr,
+    NUM_BUFFERS_DQ_STORE: tl.constexpr,
+    NUM_MMA_GROUPS_BWD: tl.constexpr,
+    NUM_MMA_WARPS_BWD: tl.constexpr,
+    BWD_REGISTERS: tl.constexpr,
+):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+
+    bhid = tl.program_id(2)
+    off_chz = (bhid * N_CTX).to(tl.int32)
+    pid = tl.program_id(0)
+
+    M += off_chz
+    D += off_chz
+
+    row_base = off_chz
+    start_n = pid * BLOCK_N
+    global_start_n = row_base + start_n
+    num_steps = N_CTX // BLOCK_M
+    CID_BLOCK_N: tl.constexpr = BLOCK_N // NUM_MMA_GROUPS_BWD
+
+    kv_atom_layout: tl.constexpr = tlx.nv_mma_shared_layout_encoding(
+        (CID_BLOCK_N, HEAD_DIM // NUM_MMA_GROUPS_BWD),
+        [1, 0],
+        tlx.dtype_of(desc_k),
+        [1, 1],
+        [1, 1],
+        [1, 0],
+        False,
+        True,
+    )
+    kv_smem_layout: tl.constexpr = kv_atom_layout.tile_to_shape((BLOCK_N, HEAD_DIM))
+    k_smem = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), 1, layout=kv_smem_layout)
+    v_smem = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), 1, layout=kv_smem_layout)
+    qdo_atom_layout: tl.constexpr = tlx.nv_mma_shared_layout_encoding(
+        (BLOCK_M, HEAD_DIM // NUM_MMA_GROUPS_BWD),
+        [1, 0],
+        tlx.dtype_of(desc_q),
+        [1, 1],
+        [1, 1],
+        [1, 0],
+        False,
+        True,
+    )
+    qdo_smem_layout: tl.constexpr = qdo_atom_layout.tile_to_shape((BLOCK_M, HEAD_DIM))
+    q_smem = tlx.local_alloc((BLOCK_M, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q, layout=qdo_smem_layout)
+    do_smem = tlx.local_alloc((BLOCK_M, HEAD_DIM), tlx.dtype_of(desc_do), NUM_BUFFERS_Q, layout=qdo_smem_layout)
+    dq_store_smem = tlx.local_alloc(
+        (BLOCK_M, HEAD_DIM),
+        tlx.dtype_of(desc_dq),
+        NUM_BUFFERS_DQ_STORE * NUM_MMA_GROUPS_BWD,
+    )
+    score_atom_layout: tl.constexpr = tlx.nv_mma_shared_layout_encoding(
+        (CID_BLOCK_N, BLOCK_M),
+        [1, 0],
+        tlx.dtype_of(desc_q),
+        [1, 1],
+        [1, 1],
+        [1, 0],
+        False,
+        True,
+    )
+    score_smem_layout: tl.constexpr = score_atom_layout.tile_to_shape((BLOCK_N, BLOCK_M))
+    score_smem_full = tlx.local_alloc(
+        (BLOCK_N, BLOCK_M),
+        tlx.dtype_of(desc_q),
+        1,
+        layout=score_smem_layout,
+    )
+
+    kv_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q, arrive_count=1)
+    q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q, arrive_count=NUM_MMA_GROUPS_BWD)
+    do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q, arrive_count=1)
+    do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q, arrive_count=NUM_MMA_GROUPS_BWD)
+
+    K_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_k))
+    V_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_v))
+    Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
+    DO_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_do))
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            k_load_view = tlx.local_reinterpret(
+                k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
+            )
+            v_load_view = tlx.local_reinterpret(
+                v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
+            )
+            tlx.barrier_expect_bytes(
+                kv_full[0],
+                BLOCK_N * HEAD_DIM * (K_BYTES_PER_ELEM + V_BYTES_PER_ELEM),
+            )
+            tlx.async_descriptor_load(desc_k, k_load_view, [global_start_n, 0], kv_full[0])
+            tlx.async_descriptor_load(desc_v, v_load_view, [global_start_n, 0], kv_full[0])
+
+            for blk in range(num_steps):
+                q_buf = blk % NUM_BUFFERS_Q
+                q_phase = (blk // NUM_BUFFERS_Q) & 1
+                start_m = blk * BLOCK_M
+                global_start_m = row_base + start_m
+                q_load_view = tlx.local_reinterpret(
+                    q_smem[q_buf],
+                    tlx.dtype_of(desc_q),
+                    [BLOCK_M, HEAD_DIM],
+                    layout=qdo_atom_layout,
+                    pin=False,
+                )
+                do_load_view = tlx.local_reinterpret(
+                    do_smem[q_buf],
+                    tlx.dtype_of(desc_do),
+                    [BLOCK_M, HEAD_DIM],
+                    layout=qdo_atom_layout,
+                    pin=False,
+                )
+                tlx.barrier_wait(q_empties[q_buf], q_phase ^ 1)
+                tlx.barrier_expect_bytes(q_fulls[q_buf], BLOCK_M * HEAD_DIM * Q_BYTES_PER_ELEM)
+                tlx.async_descriptor_load(desc_q, q_load_view, [global_start_m, 0], q_fulls[q_buf])
+
+                tlx.barrier_wait(do_empties[q_buf], q_phase ^ 1)
+                tlx.barrier_expect_bytes(do_fulls[q_buf], BLOCK_M * HEAD_DIM * DO_BYTES_PER_ELEM)
+                tlx.async_descriptor_load(desc_do, do_load_view, [global_start_m, 0], do_fulls[q_buf])
+
+        with tlx.async_task(
+            num_warps=NUM_MMA_WARPS_BWD // NUM_MMA_GROUPS_BWD,
+            registers=BWD_REGISTERS,
+            replicate=NUM_MMA_GROUPS_BWD,
+        ):
+            cid: tl.constexpr = tlx.async_task_replica_id()
+            cid_start_n: tl.constexpr = cid * CID_BLOCK_N
+            k_view = tlx.local_reinterpret(
+                k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
+            )
+            v_view = tlx.local_reinterpret(
+                v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
+            )
+            score_view = tlx.local_reinterpret(
+                score_smem_full[0],
+                tlx.dtype_of(desc_q),
+                [BLOCK_N, BLOCK_M],
+                layout=score_atom_layout,
+                pin=False,
+            )
+            score_view_t = tlx.local_trans(score_view)
+            k_slice = tlx.local_slice(k_view, [cid_start_n, 0], [CID_BLOCK_N, HEAD_DIM])
+            v_slice = tlx.local_slice(v_view, [cid_start_n, 0], [CID_BLOCK_N, HEAD_DIM])
+            score_smem = tlx.local_slice(score_view, [cid_start_n, 0], [CID_BLOCK_N, BLOCK_M])
+            score_smem_t = tlx.local_slice(score_view_t, [0, cid_start_n], [BLOCK_M, CID_BLOCK_N])
+            tlx.barrier_wait(kv_full[0], 0)
+            dk = tl.zeros([CID_BLOCK_N, HEAD_DIM], dtype=tl.float32)
+            dv = tl.zeros([CID_BLOCK_N, HEAD_DIM], dtype=tl.float32)
+            for blk in range(num_steps):
+                q_buf = blk % NUM_BUFFERS_Q
+                q_phase = (blk // NUM_BUFFERS_Q) & 1
+                start_m = blk * BLOCK_M
+                offs_m = start_m + tl.arange(0, BLOCK_M)
+
+                tlx.barrier_wait(q_fulls[q_buf], q_phase)
+                q = tlx.local_reinterpret(
+                    q_smem[q_buf],
+                    tlx.dtype_of(desc_q),
+                    [BLOCK_M, HEAD_DIM],
+                    layout=qdo_atom_layout,
+                    pin=False,
+                )
+                qT = tlx.local_trans(q)
+
+                qkT = tlx.async_dot(k_slice, qT)
+                m = tl.load(M + offs_m)
+                Di = tl.load(D + offs_m)
+                tlx.barrier_wait(do_fulls[q_buf], q_phase)
+                do = tlx.local_reinterpret(
+                    do_smem[q_buf],
+                    tlx.dtype_of(desc_do),
+                    [BLOCK_M, HEAD_DIM],
+                    layout=qdo_atom_layout,
+                    pin=False,
+                )
+                doT = tlx.local_trans(do)
+                qkT = tlx.async_dot_wait(0, qkT)
+                qkT *= sm_scale * RCP_LN2
+                pT = tl.math.exp2(qkT - m[None, :])
+                dv = tlx.async_dot(pT.to(tlx.dtype_of(desc_q)), do, dv)
+                dpT = tlx.async_dot(v_slice, doT)
+                dv = tlx.async_dot_wait(1, dv)
+                dpT = tlx.async_dot_wait(0, dpT).to(tl.float32)
+                tlx.barrier_arrive(do_empties[q_buf], 1)
+                dsT = pT * (dpT - Di[None, :])
+                tlx.local_store(score_smem, dsT.to(tlx.dtype_of(desc_q)))
+                tlx.fence_async_shared()
+
+                dk = tlx.async_dot(score_smem, q, dk)
+                dq = tlx.async_dot(score_smem_t, k_slice)
+                dk = tlx.async_dot_wait(1, dk)
+                tlx.barrier_arrive(q_empties[q_buf], 1)
+                dq = tlx.async_dot_wait(0, dq)
+                dq *= sm_scale
+                dq_store_buf = cid * NUM_BUFFERS_DQ_STORE + blk % NUM_BUFFERS_DQ_STORE
+                tlx.async_descriptor_store_wait(NUM_BUFFERS_DQ_STORE - 1)
+                tlx.local_store(dq_store_smem[dq_store_buf], dq.to(tlx.dtype_of(desc_dq)))
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(
+                    desc_dq,
+                    dq_store_smem[dq_store_buf],
+                    [row_base + start_m, 0],
+                    store_reduce="add",
+                )
+
+            dk *= sm_scale
+            tlx.async_descriptor_store_wait(0)
+            dkv_store_buf: tl.constexpr = cid * NUM_BUFFERS_DQ_STORE
+            tlx.local_store(dq_store_smem[dkv_store_buf], dk.to(tlx.dtype_of(desc_dk)))
+            tlx.fence_async_shared()
+            tlx.async_descriptor_store(
+                desc_dk,
+                dq_store_smem[dkv_store_buf],
+                [global_start_n + cid_start_n, 0],
+            )
+            tlx.async_descriptor_store_wait(0)
+            tlx.local_store(dq_store_smem[dkv_store_buf], dv.to(tlx.dtype_of(desc_dv)))
+            tlx.fence_async_shared()
+            tlx.async_descriptor_store(
+                desc_dv,
+                dq_store_smem[dkv_store_buf],
+                [global_start_n + cid_start_n, 0],
+            )
+            tlx.async_descriptor_store_wait(0)
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -301,6 +616,57 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, M = ctx.saved_tensors
+        assert do.is_contiguous()
+        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        PRE_BLOCK = 128
+        BLOCK_N = 128
+        assert N_CTX % PRE_BLOCK == 0
+        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        delta = torch.empty_like(M)
+        _attn_bwd_preprocess[pre_grid](
+            o,
+            do,
+            delta,
+            dq,
+            N_CTX,
+            BLOCK_M=PRE_BLOCK,
+            HEAD_DIM=ctx.HEAD_DIM,
+        )
+        grid = (N_CTX // BLOCK_N, 1, BATCH * N_HEAD)
+        y_dim = BATCH * N_HEAD * N_CTX
+        dummy_block = [1, 1]
+        desc_q = TensorDescriptor(q, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        desc_k = TensorDescriptor(k, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        desc_v = TensorDescriptor(v, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        desc_do = TensorDescriptor(do, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dq = TensorDescriptor(dq, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dk = TensorDescriptor(dk, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        desc_dv = TensorDescriptor(dv, shape=[y_dim, ctx.HEAD_DIM], strides=[ctx.HEAD_DIM, 1], block_shape=dummy_block)
+        _attn_bwd_tlx[grid](
+            desc_q,
+            desc_k,
+            desc_v,
+            ctx.sm_scale,
+            desc_do,
+            desc_dq,
+            desc_dk,
+            desc_dv,
+            M,
+            delta,
+            N_HEAD,
+            N_CTX,
+            HEAD_DIM=ctx.HEAD_DIM,
+        )
+
+        return dq, dk, dv, None
 
 
 def attention(q, k, v, sm_scale, config=None):
