@@ -919,6 +919,11 @@ def _make_attention_numeric_inputs(shape, dtype, distribution):
         return tuple(torch.empty(shape, device=DEVICE, dtype=dtype).uniform_(-0.5, 0.5) for _ in range(3))
     if distribution == "normal_random":
         return tuple(torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5) for _ in range(3))
+    if distribution in ("positive_shift", "negative_shift"):
+        q = torch.full(shape, 1.5, device=DEVICE, dtype=dtype)
+        k = torch.full(shape, 1.5 if distribution == "positive_shift" else -1.5, device=DEVICE, dtype=dtype)
+        v = torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5)
+        return q, k, v
     q = torch.ones(shape, device=DEVICE, dtype=dtype)
     q[:, :, shape[2] // 2:, :] = -1
     amplitude = 0.625 if shape[3] == 128 else 0.2
@@ -957,7 +962,8 @@ def test_blackwell_fa_ws_pipelined_persistent_fast_fixed_bf16_numerics(distribut
 
 
 @pytest.mark.parametrize("rescale_opt", [False, True])
-@pytest.mark.parametrize("distribution", ["uniform_random", "normal_random", "far_apart"])
+@pytest.mark.parametrize("distribution",
+                         ["uniform_random", "normal_random", "far_apart", "positive_shift", "negative_shift"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_2cta_non_fast_fixed_numerics(distribution, rescale_opt):
     Z, H, N_CTX, HEAD_DIM = 4, 48, 1024, 128
