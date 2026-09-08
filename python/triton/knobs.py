@@ -451,7 +451,8 @@ class autotuning_knobs(base_knobs):
     dump_best_config_ir: env_bool = env_bool("TRITON_KERNEL_DUMP_BEST_CONFIG")
     warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
     rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
-    use_entropy: env_bool = env_bool("TRITON_AUTOTUNE_USE_ENTROPY", True)
+    # Disabled by default due to increased compilation/autotuning time.
+    use_entropy: env_bool = env_bool("TRITON_AUTOTUNE_USE_ENTROPY", False)
     listener: Union[AutotuneListener, None] = None
 
 
