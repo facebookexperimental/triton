@@ -105,17 +105,42 @@ def run_case(case: Case, *, space: str):
     return result
 
 
+_FATAL_CUDA_ERRORS = (
+    "device-side assert",
+    "illegal memory access",
+    "launch failure",
+    "launch timeout",
+    "misaligned address",
+)
+
+
+def _is_fatal_cuda_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _FATAL_CUDA_ERRORS)
+
+
+def _run_cases(case_list, run_one):
+    results = []
+    for case in case_list:
+        try:
+            results.append(run_one(case))
+        except Exception as exc:
+            results.append(_errored(case, exc))
+            # Validation failures are isolated to one case. A fatal CUDA
+            # error poisons the process context, so every later error would
+            # be a cascade rather than an independent result.
+            if _is_fatal_cuda_error(exc):
+                results[-1].notes.append("stopping: the CUDA context may be unusable after this error")
+                break
+    return results
+
+
 def run(*, space="heuristic", head=None, synthetic=False, governor=None):
     env = capture_env()
     if governor is not None:
         env["governed"] = governor.to_dict()
-    results = []
     with stable() as info:
-        for case in cases(head, synthetic):
-            try:
-                results.append(run_case(case, space=space))
-            except Exception as exc:  # a broken case must not hide the others
-                results.append(_errored(case, exc))
+        results = _run_cases(cases(head, synthetic), lambda case: run_case(case, space=space))
     # The autotune space is part of what a number means: a heuristic-space
     # latency and a full-space latency for the same shape differ by 4x, so two
     # artifacts are only comparable when this matches.
