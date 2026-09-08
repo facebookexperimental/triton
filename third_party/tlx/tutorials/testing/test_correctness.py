@@ -2372,11 +2372,21 @@ def test_amd_gemm_large_output_offsets():
     torch.testing.assert_close(out[-1], torch.full_like(out[-1], K))
 
 
+def test_amd_addmm_rejects_register_config_for_inter_wave():
+    a = torch.empty((256, 2048), device="meta", dtype=torch.float16)
+    b = torch.empty((256, 2048), device="meta", dtype=torch.float16).T
+    bias = torch.empty(256, device="meta", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="config is only supported by the register path"):
+        _amd_addmm(bias, a, b, path="inter_wave", config={})
+
+
 def _check_addmm_all_paths(bias, a, b, split_k=None):
     ref = torch.addmm(bias, a, b)
     config = Gemm.CONFIGS["amd_standalone_addmm_register"]
     for path in _amd_addmm_paths(bias, a, b):
-        out = _amd_addmm(bias, a, b, SPLIT_K=split_k, path=path, config=config)
+        path_config = config if path == "register" else None
+        out = _amd_addmm(bias, a, b, SPLIT_K=split_k, path=path, config=path_config)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2, msg=lambda m, path=path: f"path={path}\n{m}")
 
 

@@ -48,6 +48,7 @@ def _path_key(
     a: torch.Tensor,
     b: torch.Tensor,
     split_k,
+    config,
 ) -> tuple[object, ...]:
     return (
         a.device.type,
@@ -59,6 +60,7 @@ def _path_key(
         a.stride(),
         b.stride(),
         split_k,
+        tuple(sorted(config.items())) if config is not None else None,
     )
 
 
@@ -153,6 +155,8 @@ def available_paths(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> tup
 
 
 def _dispatch(path: str, bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, split_k, config=None):
+    if config is not None and path != "register":
+        raise ValueError("config is only supported by the register path")
     if path == "inter_wave":
         return _launch(a, b, bias=bias, SPLIT_K=split_k)
     if path == "inter_wave_tail":
@@ -167,13 +171,17 @@ def _autotune_path(
     a: torch.Tensor,
     b: torch.Tensor,
     split_k,
+    config=None,
 ) -> str:
-    key = _path_key(bias, a, b, split_k)
+    key = _path_key(bias, a, b, split_k, config)
     cached = _PATH_CACHE.get(key)
     if cached is not None:
         return cached
 
-    register = lambda: _launch_register(a, b, bias=bias)
+    register = lambda: _launch_register(a, b, bias=bias, config=config)
+    if config is not None:
+        _PATH_CACHE[key] = "register"
+        return "register"
     register_output = register()
     candidates = {"register": register}
     if _can_use_inter_wave(a):
@@ -206,9 +214,8 @@ def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None, pa
 
     ``path`` pins one of `available_paths`; the default (None) times the valid
     paths against each other and keeps the winner per shape. ``config`` pins
-    the register path's kernel config, bypassing its autotuner. Correctness
-    tests should pass both: neither the path race nor the config sweep tells
-    them anything, and together they dominate the suite's wall clock.
+    both the register path and its kernel config, bypassing both autotuners.
+    Supplying ``config`` with an explicit non-register path is an error.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("addmm expects two-dimensional matrix operands")
@@ -230,10 +237,19 @@ def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None, pa
             raise ValueError("SPLIT_K is only supported by the inter-wave kernel")
         if path not in (None, "inter_wave"):
             raise ValueError(f"SPLIT_K > 1 requires the inter_wave path, got {path!r}")
+        if config is not None:
+            raise ValueError("config is only supported by the register path, but SPLIT_K > 1 requires inter_wave")
         return _launch(a, b, bias=bias_2d, SPLIT_K=SPLIT_K)
     if path is not None:
         valid = available_paths(bias_2d, a, b)
         if path not in valid:
             raise ValueError(f"Path {path!r} is not valid for this shape; valid paths are {valid}")
         return _dispatch(path, bias_2d, a, b, SPLIT_K, config=config)
-    return _dispatch(_autotune_path(bias_2d, a, b, SPLIT_K), bias_2d, a, b, SPLIT_K, config=config)
+    return _dispatch(
+        _autotune_path(bias_2d, a, b, SPLIT_K, config=config),
+        bias_2d,
+        a,
+        b,
+        SPLIT_K,
+        config=config,
+    )
