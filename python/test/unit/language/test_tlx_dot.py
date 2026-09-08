@@ -243,6 +243,237 @@ def test_async_dot(device):
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
+def test_async_dot_explicit_accumulator_layout(device):
+
+    @triton.jit
+    def _kernel(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        off_m = tl.arange(0, BLOCK_M)
+        off_n = tl.arange(0, BLOCK_N)
+        off_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = X + off_m[:, None] * stride_xm + off_k[None, :] * stride_xk
+        b_ptrs = Y + off_k[:, None] * stride_yk + off_n[None, :] * stride_yn
+
+        b_alloc = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(Y), 1)
+        b_tile = tlx.local_view(b_alloc, 0)
+
+        a_tile = tl.load(a_ptrs)
+        tlx.async_load(b_ptrs, b_tile)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        acc_layout: tl.constexpr = tlx.nv_mma_layout(
+            warps_per_cta=(2, 2),
+            instr_shape=(16, 64, 16),
+        )
+        acc = tlx.zeros((BLOCK_M, BLOCK_N), tl.float32, layout=acc_layout)
+        c = tlx.async_dot(a_tile, b_tile, acc)
+        c = tlx.async_dot_wait(tl.constexpr(0), c).to(tlx.dtype_of(Z))
+        c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.empty((M, N), device=device, dtype=torch.float16)
+
+    kernel = _kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        BLOCK_M=M,
+        BLOCK_K=K,
+        BLOCK_N=N,
+        num_stages=1,
+        num_warps=4,
+    )
+
+    assert "warpsPerCTA = [2, 2]" in kernel.asm["ttgir"]
+    torch.testing.assert_close(z, torch.matmul(x, y))
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
+def test_async_dot_explicit_nv_mma_shared_layout(device):
+
+    @triton.jit
+    def _kernel(
+        X,
+        stride_xm,
+        stride_xk,
+        Y,
+        stride_yk,
+        stride_yn,
+        Z,
+        stride_zm,
+        stride_zn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        off_m = tl.arange(0, BLOCK_M)
+        off_n = tl.arange(0, BLOCK_N)
+        off_k = tl.arange(0, BLOCK_K)
+
+        a_ptrs = X + off_m[:, None] * stride_xm + off_k[None, :] * stride_xk
+        b_ptrs = Y + off_k[:, None] * stride_yk + off_n[None, :] * stride_yn
+
+        b_layout: tl.constexpr = tlx.nv_mma_shared_layout_encoding(
+            (BLOCK_K, BLOCK_N // 2),
+            [1, 0],
+            tlx.dtype_of(Y),
+            [1, 1],
+            [1, 1],
+            [1, 0],
+            False,
+            True,
+        ).make_shared_linear(tile_shape=(BLOCK_K, BLOCK_N))
+        b_alloc = tlx.local_alloc(
+            (BLOCK_K, BLOCK_N),
+            tlx.dtype_of(Y),
+            1,
+            layout=b_layout,
+        )
+        b_tile = tlx.local_view(b_alloc, 0)
+
+        a_tile = tl.load(a_ptrs)
+        tlx.async_load(b_ptrs, b_tile)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+
+        acc_layout: tl.constexpr = tlx.nv_mma_layout(
+            warps_per_cta=(2, 2),
+            instr_shape=(16, 64, 16),
+        )
+        acc = tlx.zeros((BLOCK_M, BLOCK_N), tl.float32, layout=acc_layout)
+        c = tlx.async_dot(a_tile, b_tile, acc)
+        c = tlx.async_dot_wait(tl.constexpr(0), c).to(tlx.dtype_of(Z))
+        c_ptrs = Z + stride_zm * off_m[:, None] + stride_zn * off_n[None, :]
+        tl.store(c_ptrs, c)
+
+    torch.manual_seed(0)
+    M, N, K = (64, 64, 32)
+    x = torch.randn((M, K), device=device, dtype=torch.float16)
+    y = torch.randn((K, N), device=device, dtype=torch.float16)
+    z = torch.empty((M, N), device=device, dtype=torch.float16)
+
+    kernel = _kernel[(1, 1)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        z,
+        z.stride(0),
+        z.stride(1),
+        BLOCK_M=M,
+        BLOCK_K=K,
+        BLOCK_N=N,
+        num_stages=1,
+        num_warps=4,
+    )
+
+    assert "warpsPerCTA = [2, 2]" in kernel.asm["ttgir"]
+    assert "#ttg.shared_linear" in kernel.asm["ttgir"]
+    torch.testing.assert_close(z, torch.matmul(x, y))
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
+def test_memdesc_trans_sliced_shared_linear_layout(device):
+
+    @triton.jit
+    def _kernel(X, K, Z, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
+        NUM_MMA_GROUPS: tl.constexpr = 2
+        CID_BLOCK_N: tl.constexpr = BLOCK_N // NUM_MMA_GROUPS
+
+        off_n = tl.arange(0, CID_BLOCK_N)
+        off_m = tl.arange(0, BLOCK_M)
+        off_d = tl.arange(0, HEAD_DIM)
+
+        score_layout: tl.constexpr = tlx.nv_mma_shared_layout_encoding(
+            (CID_BLOCK_N, BLOCK_M),
+            [1, 0],
+            tlx.dtype_of(X),
+            [1, 1],
+            [1, 1],
+            [1, 0],
+            False,
+            True,
+        ).tile_to_shape((BLOCK_N, BLOCK_M))
+        k_layout: tl.constexpr = tlx.nv_mma_shared_layout_encoding(
+            (CID_BLOCK_N, HEAD_DIM // NUM_MMA_GROUPS),
+            [1, 0],
+            tlx.dtype_of(K),
+            [1, 1],
+            [1, 1],
+            [1, 0],
+            False,
+            True,
+        ).tile_to_shape((BLOCK_N, HEAD_DIM))
+
+        score_full = tlx.local_alloc((BLOCK_N, BLOCK_M), tlx.dtype_of(X), 1, layout=score_layout)
+        k_full = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(K), 1, layout=k_layout)
+        score = tlx.local_slice(score_full[0], [0, 0], [CID_BLOCK_N, BLOCK_M])
+        score_t = tlx.local_trans(score)
+        k_tile = tlx.local_slice(k_full[0], [0, 0], [CID_BLOCK_N, HEAD_DIM])
+
+        x = tl.load(X + off_n[:, None] * BLOCK_M + off_m[None, :])
+        k = tl.load(K + off_n[:, None] * HEAD_DIM + off_d[None, :])
+        tlx.local_store(score, x)
+        tlx.local_store(k_tile, k)
+        tlx.fence_async_shared()
+
+        z = tlx.async_dot(score_t, k_tile)
+        z = tlx.async_dot_wait(0, z)
+        tl.store(Z + off_m[:, None] * HEAD_DIM + off_d[None, :], z)
+
+    torch.manual_seed(0)
+    block_m = 64
+    block_n = 128
+    head_dim = 128
+    cid_block_n = block_n // 2
+    x = torch.randn((cid_block_n, block_m), device=device, dtype=torch.bfloat16)
+    k = torch.randn((cid_block_n, head_dim), device=device, dtype=torch.bfloat16)
+    z = torch.empty((block_m, head_dim), device=device, dtype=torch.float32)
+
+    kernel = _kernel[(1, 1)](
+        x,
+        k,
+        z,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_stages=1,
+        num_warps=4,
+    )
+
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.memdesc_trans" in ttgir
+    assert "ttg.local_load" not in ttgir
+    torch.testing.assert_close(z, x.T.float() @ k.float(), atol=0.2, rtol=0.2)
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
 @pytest.mark.parametrize("BLOCK", [64, 128])
 def test_async_dot_local_store(BLOCK, device):
     """Test WGMMA dot result stored to SMEM via local_store then TMA-stored out."""

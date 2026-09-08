@@ -582,8 +582,11 @@ MemDescTransOp::inferReturnTypes(MLIRContext *context,
   if (argEncoding) {
     Dialect &dialect = argEncoding.getDialect();
     auto inferLayoutInterface = cast<DialectInferLayoutInterface>(&dialect);
+    auto layoutShape = shape;
+    if (isa<SharedLinearEncodingAttr>(argEncoding))
+      layoutShape = argTy.getAllocShape().take_back(order.size());
     if (failed(inferLayoutInterface->inferTransOpEncoding(
-            argEncoding, shape, order, retEncoding, loc))) {
+            argEncoding, layoutShape, order, retEncoding, loc))) {
       return failure();
     }
   }
