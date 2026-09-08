@@ -143,6 +143,10 @@ class ScoringTest(unittest.TestCase):
             ),
         )
         self.assertIn("Evidence-driven optimization workflow", prompt)
+        self.assertIn("Begin with measured evidence and feedback", prompt)
+        self.assertIn("Try low-effort scopes first", prompt)
+        self.assertIn("Modify PTX or AMDGCN experimentally", prompt)
+        self.assertIn("Escalate broader compiler changes to a human", prompt)
         self.assertIn("Keep measurement scopes separate", prompt)
         self.assertIn("exactly one testable hypothesis", prompt)
         self.assertIn(".claude/skills/tlx-api-reference/SKILL.md", prompt)
@@ -166,7 +170,7 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Performance:", prompt)
         self.assertIn("external harness adds", prompt)
         self.assertIn("expected_effect", prompt)
-        self.assertIn("Trusted built-in target optimization skills", prompt)
+        self.assertIn("Trusted built-in target optimization knowledge", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
         self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
@@ -194,7 +198,7 @@ class ScoringTest(unittest.TestCase):
             prompt.index("# NVIDIA Persistent Pipeline Efficiency"),
         )
         self.assertLess(
-            prompt.index("Trusted built-in target optimization skills"),
+            prompt.index("Trusted built-in target optimization knowledge"),
             prompt.index("Frozen target-specific optimization guidance"),
         )
 
@@ -293,7 +297,7 @@ class ScoringTest(unittest.TestCase):
                     ),
                 )
                 self.assertIn(guidance, prompt)
-                self.assertIn("Trusted built-in target optimization skills", prompt)
+                self.assertIn("Trusted built-in target optimization knowledge", prompt)
                 self.assertIn("# TLX Layout Conversion Efficiency", prompt)
                 self.assertIn("# AMD Kernel Optimization", prompt)
                 self.assertNotIn("# AMD TLX Attention Optimization", prompt)
@@ -834,9 +838,9 @@ class HarnessTest(unittest.TestCase):
             harness,
             Path(__file__).parents[1]
             / "decision_maker"
-            / "harnesses"
-            / "hopper"
             / "targets"
+            / "nvidia"
+            / "hopper"
             / "gemm"
             / "harness.py",
         )
@@ -855,9 +859,9 @@ class HarnessTest(unittest.TestCase):
         expected = (
             Path(__file__).parents[1]
             / "decision_maker"
-            / "harnesses"
-            / "gfx950"
             / "targets"
+            / "amd"
+            / "gfx950"
             / "gemm"
         )
         self.assertEqual(harness, expected / "harness.py")
@@ -871,9 +875,8 @@ class HarnessTest(unittest.TestCase):
             harness,
             Path(__file__).parents[1]
             / "decision_maker"
-            / "harnesses"
-            / "host"
             / "targets"
+            / "host"
             / "vector_add"
             / "harness.py",
         )

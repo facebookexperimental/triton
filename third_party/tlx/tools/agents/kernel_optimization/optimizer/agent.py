@@ -7,51 +7,20 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from ..contracts import KernelOptimizationRequest, KernelTarget, PerformanceSummary
+from ..contracts import (
+    CandidateChange,
+    ChangeScope,
+    ExperimentKind,
+    KernelOptimizationRequest,
+    PerformanceSummary,
+)
 from ..decision_maker.profiling import compact_profile_summary
+from .knowledge import load_knowledge
 from .source import validate_replacement_source
-
-_SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
-_LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
-_NVIDIA_TARGET_SKILLS = _SKILLS_ROOT / "targets/nvidia"
-_ASYNC_TMA_OUTPUT_SKILL = _NVIDIA_TARGET_SKILLS / "async-tma-output-publication.md"
-_NVIDIA_WARP_BARRIER_SKILL = (
-    _NVIDIA_TARGET_SKILLS / "nvidia-warp-barrier-efficiency.md"
-)
-_BLACKWELL_CLC_SKILL = _NVIDIA_TARGET_SKILLS / "blackwell-persistent-clc-scheduling.md"
-_NVIDIA_PERSISTENT_PIPELINE_SKILL = (
-    _NVIDIA_TARGET_SKILLS / "nvidia-persistent-pipeline-efficiency.md"
-)
-_AMD_TARGET_SKILLS = _SKILLS_ROOT / "targets/amd"
-_AMD_GENERAL_SKILL = _AMD_TARGET_SKILLS / "amd-kernel-optimization.md"
-_AMD_ATTENTION_SKILL = _AMD_TARGET_SKILLS / "amd-attention-optimization.md"
-_AMD_ATTENTION_REFERENCE = (
-    _AMD_TARGET_SKILLS / "references/attention-variant-study.md"
-)
-_AMD_LIVE_RANGE_SKILL = _AMD_TARGET_SKILLS / "amd-ir-live-range-analysis.md"
-_AMD_LIVE_RANGE_REFERENCE = (
-    _AMD_TARGET_SKILLS / "references/live-range-interpretation.md"
-)
-_AMD_OPTIONAL_SKILLS = {
-    "optimize-amd-tlx-attention": (
-        _AMD_ATTENTION_SKILL,
-        _AMD_ATTENTION_REFERENCE,
-    ),
-    "analyze-amd-ir-live-ranges": (
-        _AMD_LIVE_RANGE_SKILL,
-        _AMD_LIVE_RANGE_REFERENCE,
-    ),
-}
-_AMD_BACKENDS = frozenset({"amd", "hip", "rocm"})
-_BLACKWELL_ARCHITECTURES = frozenset(
-    {"blackwell", "sm100", "sm_100", "b200", "b200a", "gb200", "gb300"}
-)
-_HOPPER_ARCHITECTURES = frozenset({"hopper", "h100", "sm90", "sm_90"})
-_PERSISTENT_PIPELINE_ARCHITECTURES = _BLACKWELL_ARCHITECTURES | _HOPPER_ARCHITECTURES
+from .strategy import OPTIMIZATION_STRATEGY
 
 
 TLX_PROMPT_PREAMBLE = """You are optimizing one Triton or TLX kernel against an external deterministic harness.
@@ -114,6 +83,10 @@ class CandidateProposal:
     risk: str = ""
     commit_title: str = ""
     commit_summary: str = ""
+    change_scopes: frozenset[ChangeScope] = frozenset({ChangeScope.KERNEL})
+    experiment_kind: ExperimentKind = ExperimentKind.PROMOTABLE
+    blast_radius: str = "local"
+    changes: tuple[CandidateChange, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -418,53 +391,6 @@ class CodexCandidateProvider:
         )
 
 
-@lru_cache(maxsize=None)
-def _read_target_skill(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError as error:
-        raise RuntimeError(f"unable to read built-in target skill {path}: {error}") from error
-
-
-def _target_skill_paths(target: KernelTarget) -> tuple[Path, ...]:
-    skills = [_LAYOUT_CONVERSION_SKILL]
-    backend = target.backend.strip().lower()
-    if backend in {"cuda", "nvidia"}:
-        architecture = target.architecture.strip().lower()
-        skills.extend((_ASYNC_TMA_OUTPUT_SKILL, _NVIDIA_WARP_BARRIER_SKILL))
-        if architecture in _BLACKWELL_ARCHITECTURES:
-            skills.append(_BLACKWELL_CLC_SKILL)
-        if architecture in _PERSISTENT_PIPELINE_ARCHITECTURES:
-            skills.append(_NVIDIA_PERSISTENT_PIPELINE_SKILL)
-        if target.optimization_skills:
-            raise ValueError(
-                "optimization_skills are not supported for NVIDIA targets"
-            )
-        return tuple(skills)
-    if backend in _AMD_BACKENDS:
-        skills.append(_AMD_GENERAL_SKILL)
-        unknown = [
-            name for name in target.optimization_skills if name not in _AMD_OPTIONAL_SKILLS
-        ]
-        if unknown:
-            supported = ", ".join(sorted(_AMD_OPTIONAL_SKILLS))
-            raise ValueError(
-                f"unsupported AMD optimization skill {unknown[0]!r}; "
-                f"supported skills: {supported}"
-            )
-        for name in target.optimization_skills:
-            skills.extend(_AMD_OPTIONAL_SKILLS[name])
-    elif target.optimization_skills:
-        raise ValueError(
-            "optimization_skills are only supported for AMD targets"
-        )
-    return tuple(skills)
-
-
-def _target_skill_guidance(target: KernelTarget) -> str:
-    return "\n\n".join(_read_target_skill(path) for path in _target_skill_paths(target))
-
-
 def _prior_run_prompt_block(request: KernelOptimizationRequest) -> str:
     prior = request.prior_run_evidence
     if prior is None or not prior.experiments:
@@ -512,10 +438,10 @@ def _build_prompt(
     reference_block = ""
     if getattr(request, "reference_kernel_source", None):
         reference_block = f"\nReference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):\n```python\n{request.reference_kernel_source[:4000]}\n```\n"
-    target_skills = _target_skill_guidance(request.target)
-    target_skills_block = (
-        f"\nTrusted built-in target optimization skills:\n{target_skills}\n"
-        if target_skills
+    target_knowledge = load_knowledge(request.target)
+    target_knowledge_block = (
+        f"\nTrusted built-in target optimization knowledge:\n{target_knowledge}\n"
+        if target_knowledge
         else ""
     )
     guidance = request.target.optimization_guidance.strip()
@@ -525,7 +451,10 @@ def _build_prompt(
         else ""
     )
     prior_run_block = _prior_run_prompt_block(request)
-    return f"""{TLX_PROMPT_PREAMBLE}{target_skills_block}{guidance_block}{reference_block}{prior_run_block}
+    return f"""{TLX_PROMPT_PREAMBLE}
+Optimization strategy:
+{OPTIMIZATION_STRATEGY}
+{target_knowledge_block}{guidance_block}{reference_block}{prior_run_block}
 You are proposing one candidate for the closed loop `build -> verify -> benchmark -> profile -> propose -> repeat`.
 Edit `candidate.py` directly. Do not return source or a diff, and do not claim correctness
 or performance; an external deterministic harness reads the file and decides both.

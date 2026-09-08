@@ -1,7 +1,12 @@
-from .decision_maker.amd_att import collect_fb_att, find_fb_att
 from .contracts import (
     BuildResult,
+    CandidateChange,
+    CandidateSubmission,
     CaseEvaluation,
+    ChangeScope,
+    Decision,
+    DecisionStatus,
+    ExperimentKind,
     ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
@@ -23,6 +28,8 @@ from .decision_maker import (
     SubprocessHarness,
     KernelOptimizer,
 )
+from .decision_maker.profiling.amd_att import collect_fb_att, find_fb_att
+from .decision_maker.profiling.rocm_profiler import collect_rocprofv3, find_rocprofv3
 from .decision_maker.policy import per_case_speedups, weighted_geometric_speedup
 from .optimizer import (
     CandidateContext,
@@ -31,23 +38,29 @@ from .optimizer import (
     CodexCandidateProvider,
     FixedCandidateProvider,
     MockLLMProvider,
+    OPTIMIZATION_STRATEGY,
     Optimizer,
     TLX_PROMPT_PREAMBLE,
 )
-from .decision_maker.rocm_profiler import collect_rocprofv3, find_rocprofv3
 
 __all__ = [
     "BuildError",
     "BuildResult",
+    "CandidateChange",
     "CandidateContext",
     "CandidateProposal",
     "CandidateProvider",
+    "CandidateSubmission",
     "CaseEvaluation",
+    "ChangeScope",
     "CodexCandidateProvider",
     "collect_fb_att",
     "collect_rocprofv3",
+    "Decision",
     "DecisionMaker",
+    "DecisionStatus",
     "ExperimentSummary",
+    "ExperimentKind",
     "find_fb_att",
     "find_rocprofv3",
     "FixedCandidateProvider",
@@ -61,6 +74,7 @@ __all__ = [
     "KernelTarget",
     "MockLLMProvider",
     "OptimizationBudget",
+    "OPTIMIZATION_STRATEGY",
     "Optimizer",
     "PerformanceSummary",
     "StandaloneHarness",

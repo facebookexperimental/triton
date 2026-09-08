@@ -18,8 +18,8 @@ _AGENT_DIR = Path(__file__).resolve().parents[4]
 if str(_AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_DIR))
 
-from amd_att import collect_fb_att  # noqa: E402
-from rocm_profiler import (  # noqa: E402
+from profiling.amd_att import collect_fb_att  # noqa: E402
+from profiling.rocm_profiler import (  # noqa: E402
     collect_rocprofv3,
     filter_extreme_timing_outliers,
 )

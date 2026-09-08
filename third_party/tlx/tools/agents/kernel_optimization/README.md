@@ -82,11 +82,11 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --commit-message "Optimize my kernel with TLX agent"
 ```
 
-`--arch` and `--target-name` select
-`decision_maker/harnesses/<arch>/targets/<target-name>`. `--target-name` defaults to the kernel
-filename stem; use it when an implementation-specific filename such as
-`amd_gemm_warp_pipeline.py` should use the generic `gemm` target contract.
-`harness`/`cases`/`target` can also be passed explicitly.
+`--arch` and `--target-name` select a manifest-backed bundle under
+`decision_maker/targets/<vendor>/<arch>/<target-name>`. `--target-name` defaults to the
+kernel filename stem; use it when an implementation-specific filename such as
+`amd_gemm_warp_pipeline.py` should use the generic `gemm` target contract. `harness`,
+`cases`, and `target` can also be passed explicitly.
 
 `--prior-run` accepts a completed output directory or its `experiments.json`. It
 imports recomputed source hashes for exact cross-run deduplication and bounded,
@@ -126,12 +126,9 @@ independently of live progress.
 max_total_seconds, min_speedup, max_cv, benchmark_repetitions}`).
 
 `cases.json` is a list of `{case_id, parameters, weight, protected}` objects. `target.json`
-contains `{backend, architecture, device, environment}` and may include
-`optimization_guidance` plus an `optimization_skills` list. AMD targets may explicitly
-select `optimize-amd-tlx-attention` or `analyze-amd-ir-live-ranges`; specialized guidance
-is not inferred from the backend or source text. The harness receives the full `target`
-dict (including `environment` merged into `os.environ` for the worker) and each `case` dict
-verbatim.
+contains `{backend, architecture, device, environment}`. The harness receives the full
+`target` dict (including `environment` merged into `os.environ` for the worker) and each
+`case` dict verbatim.
 
 The output directory contains:
 
@@ -163,7 +160,7 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 ## TLX GEMM example
 
-`decision_maker/harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
+`decision_maker/targets/nvidia/blackwell/gemm/harness.py` runs any complete candidate source that exports
 `matmul(a, b)`. It compares against `torch.matmul`, benchmarks with
 `triton.testing.do_bench`, and reports latency and TFLOP/s. Its legacy two-argument
 `profile(build_artifact, case)` returns latency and throughput, and can optionally collect a
@@ -172,8 +169,8 @@ requests or NCU collection.
 
 ### Target-supplied profiling
 
-Canonical workflow guidance lives in `decision_maker/docs/profiling/proton.md` for Proton
-and `decision_maker/docs/profiling/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
+Canonical workflow guidance lives in `decision_maker/profiling/docs/proton.md` for Proton
+and `decision_maker/profiling/docs/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
 run orchestration; they are not injected into candidate source prompts.
 
 A target harness may implement `profile(build_artifact, case, request)` to honor structured
@@ -195,37 +192,23 @@ non-null when those tools are available.
   replay. Instrumented source and timing must never be benchmarked, promoted, or committed.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live under
-`decision_maker/harnesses/<arch>/targets/<kernel>/` (B200, `sm_100` for Blackwell and H100,
-`sm_90` for Hopper); pick `--arch` to match the
-device you are tuning for. Architecture-wide notes, known optimization tricks, and shared
-target metadata can live directly under `decision_maker/harnesses/<arch>/`. Pass an existing TLX tutorial such as
+`decision_maker/targets/<vendor>/<arch>/<kernel>/` and are discovered through
+`bundle.json`. Pick `--arch` to match the device you are tuning for. GPU knowledge is
+selected independently from `optimizer/knowledge/<vendor>/<arch>/`. Pass an existing TLX tutorial such as
 `third_party/tlx/tutorials/blackwell_gemm_ws.py` as `--kernel`.
 
-AMD gfx950 GEMM is available under `decision_maker/harnesses/gfx950/targets/gemm/`. The target uses
-the ROCm PyTorch convention `device="cuda:0"` with `backend="hip"` and accepts any
+AMD gfx950 GEMM is available under `decision_maker/targets/amd/gfx950/gemm/`. The target
+uses the ROCm PyTorch convention `device="cuda:0"` with `backend="hip"` and accepts any
 complete candidate source that exports `matmul(a, b)`.
 
 AMD timing uses `rocprofv3 --kernel-trace` device timestamps after a 20-second
-steady-state burn, rather than short `do_bench` wall-clock measurements that can catch
-the transient MI350 boost clock. A conservative 3x-IQR filter removes only extreme
-system-noise samples before variance checks; raw trace samples remain in the profile
-artifacts. Summary and deep profile requests also collect
-supported PMC groups, including `MfmaUtil`, `VALUBusy`, `MemUnitStalled`, HBM fetch
-size, and LDS conflicts. Raw commands, logs, traces, and counter CSVs remain under the
-experiment artifacts directory. Set `TLX_AMD_STEADY_STATE_SECONDS` to override the
-burn duration for debugging, and `TLX_ROCPROFV3` when `rocprofv3` is not on `PATH`.
+steady-state burn. A conservative 3x-IQR filter removes only extreme system-noise samples;
+raw traces and samples remain in the profile artifacts. Summary and deep profile requests
+also collect supported PMC groups. Deep profiles additionally run `fb_att` for one selected
+dispatch of the dominant kernel. Set `TLX_ROCPROFV3` or `TLX_FB_ATT` when those tools are
+not on `PATH`.
 
-Deep profiles additionally run `fb_att` by default for one selected dispatch of the
-dominant kernel. Its local `_ui` directory contains the per-wave instruction timeline
-and source mapping. Set `TLX_FB_ATT` when the wrapper is not on `PATH`. Candidate
-summary profiles use rocprofv3 only; ATT is reserved for baseline/final or other deep
-profiles because it is diagnostic instrumentation, not a promotion timing source.
-Unsupported PMC groups and ATT failures are retained as diagnostics without discarding
-correctness results.
-
-For an initial AMD smoke run, disable automatic commits and use a small search budget.
-The tutorial below is only a convenient seed, not a reference implementation or claim
-of optimality:
+For an initial AMD smoke run, disable automatic commits and use a small search budget:
 
 ```bash
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
@@ -236,7 +219,7 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --min-speedup 1.05 --no-commit-winner
 ```
 
-`decision_maker/harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
+`decision_maker/targets/host/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
 without a real GPU. Candidate must export `vector_add(a, b)`; on CPU the benchmark uses
 synthetic `LATENCY_US` timing so unit tests pass on any host.
 
