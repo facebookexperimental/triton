@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 
@@ -734,7 +735,7 @@ def _cold_flags(bench, monkeypatch, mode=None):
 
     seen = []
 
-    def fake_run_case(_bench, case, *, space, cold=True):
+    def fake_run_case(_bench, case, *, space, cold=True, latency_mode="wallclock"):
         seen.append((case.direction, cold))
         return Result(case=case, status=Status.OK)
 
@@ -852,7 +853,7 @@ def _picked(monkeypatch, bench, **kwargs):
 
     picked = []
 
-    def fake_run_case(_bench, case, *, space, cold=True):
+    def fake_run_case(_bench, case, *, space, cold=True, latency_mode="wallclock"):
         picked.append(case)
         return Result(case=case, status=Status.OK)
 
@@ -879,3 +880,78 @@ def test_direction_filter_runs_before_head(monkeypatch):
     picked, env = _picked(monkeypatch, _FakeBench(cold_compile="none"), head=2, directions=("bwd", ))
     assert [c.direction for c in picked] == ["bwd", "bwd"]
     assert env["directions"] == ["bwd"]
+
+
+# --------------------------------------------------------------------------
+# driver: the selected device is the single source of truth
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unpinned_driver():
+    """Restore the module-level device pin, which is process-wide."""
+    from _harness import driver
+
+    saved = list(driver._SELECTED)
+    driver._SELECTED.clear()
+    yield driver
+    driver._SELECTED[:] = saved
+
+
+def test_arch_follows_the_selected_device_not_physical_gpu_zero(unpinned_driver, monkeypatch):
+    from _harness.denoise import NVIDIA, Device
+
+    # A heterogeneous host: `--device 1` must not report GPU 0's arch, and
+    # nvidia-smi enumerates physical devices whatever the visibility variable
+    # says, so list_devices()[0] is simply the wrong answer here.
+    monkeypatch.setattr(
+        unpinned_driver, "list_devices",
+        lambda: [Device(NVIDIA, 0, "NVIDIA H100"), Device(NVIDIA, 1, "NVIDIA B200")])
+    # Unpinned falls back to the first device, i.e. what torch calls cuda:0.
+    # H100 is not in ARCH_BY_PART, so that answer is None -- and None is exactly
+    # what the old code would have reported for a run pinned to the B200.
+    assert unpinned_driver.arch() is None
+
+    unpinned_driver.select(Device(NVIDIA, 1, "NVIDIA B200"))
+    assert unpinned_driver.arch() == "sm100"
+    assert unpinned_driver.device_index() == 1
+
+
+def test_every_arch_consumer_reads_the_same_pin(unpinned_driver, monkeypatch):
+    import importlib
+
+    from _harness.denoise import NVIDIA, Device
+
+    monkeypatch.setattr(unpinned_driver, "list_devices", lambda: [Device(NVIDIA, 0, "NVIDIA H100")])
+    unpinned_driver.select(Device(NVIDIA, 3, "NVIDIA B200"))
+    bench = importlib.import_module("bench_mm")
+    # The artifact name, the support check and the cases all agree.
+    assert unpinned_driver.default_json(bench).endswith("mm.sm100.json")
+    assert unpinned_driver.supported(bench)
+    assert {c.arch for c in bench.cases(synthetic=True)} == {"sm100"}
+
+
+def test_no_gpu_stays_distinguishable_from_an_unset_pin(unpinned_driver, monkeypatch):
+    monkeypatch.setattr(unpinned_driver, "list_devices", lambda: [])
+    assert unpinned_driver.arch() is None
+    assert unpinned_driver.device_index() == 0  # the denoise helpers still need an int
+
+
+# --------------------------------------------------------------------------
+# measure: the two latency modes
+# --------------------------------------------------------------------------
+
+
+def test_wallclock_is_the_default_and_the_documented_vocabulary():
+    from _harness import LATENCY_MODES
+    from _harness.measure import measure
+
+    assert LATENCY_MODES == ("wallclock", "gpu_events")
+    assert "wallclock" == inspect.signature(measure).parameters["mode"].default
+
+
+def test_an_unknown_latency_mode_is_rejected():
+    from _harness.measure import measure
+
+    with pytest.raises(ValueError, match="mode must be one of"):
+        measure(lambda: None, mode="profiler")

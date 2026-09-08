@@ -26,6 +26,9 @@ options:
                         mostly too small to time, so this is for looking, not for gating
   --fwd-only            skip the backward cases
   --bwd-only            skip the forward cases
+  --latency-measure-mode {wallclock,gpu_events}
+                        'wallclock' (default) times each call as a caller sees it; 'gpu_events'
+                        pre-enqueues the batch behind a blocked stream to isolate device time
   --cold-compile {all,first,none}
                         how often to time a first call on a fresh cache; the default is each
                         op's own (mm: all, everything else: first)
@@ -100,6 +103,29 @@ pip: speedup < 0.9, or TFLOP/s under an op's absolute floor when it has no
      no heuristic raise it, see above)
 noisy: CV% > 3%
 ok: everything else
+
+## How a call is timed
+
+`wallclock`, the default, is `triton.testing.do_bench`: CUDA events around each
+`fn()`, dispatched from the host one call at a time. It is the authoritative
+mode here for two reasons. It measures what a caller actually gets -- if the
+host cannot keep the GPU fed, that is a real cost of using the op, and
+`tlx_host_us` sits in the artifact to say how much of the number it is. And it
+is what every existing figure in this suite was taken with, so switching the
+default would silently invalidate comparisons against them.
+
+`gpu_events` is tritonbench's `--latency-measure-mode=gpu_events`: the whole
+batch is enqueued behind a blocked stream so the host runs far ahead, and the
+measured interval contains no dispatch gaps. Use it when the question is about
+the kernels rather than the end-to-end path -- most usefully on the
+multi-kernel backward passes (`flash_attn`, `hstu_attn`, `kda`), where a
+wallclock reading folds in several launches' worth of host work. It flatters
+both providers, so `speedup` moves much less than either absolute number; a
+large gap between the two modes for one case is itself the finding, and it will
+agree with a large `tlx_host_us`.
+
+Neither mode is a profiler. There is no per-kernel breakdown here; use
+`ir-debugging` or nsys for that.
 
 ## Compile time
 

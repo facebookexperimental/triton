@@ -33,7 +33,7 @@ from . import verdict
 from .compile import COLD_COMPILE_CAP_S, cold_compile
 from .contract import Case, Result, Status
 from .denoise import Governor, capture_env, list_devices, select_device, stable
-from .measure import DEFAULT_REPLICATES, host_overhead_us, measure
+from .measure import DEFAULT_REPLICATES, LATENCY_MODES, host_overhead_us, measure
 
 
 @dataclasses.dataclass
@@ -72,10 +72,43 @@ class Prepared:
     cap_s: float = COLD_COMPILE_CAP_S
 
 
-@functools.lru_cache(maxsize=1)
+#: The GPU this run is about. Everything downstream -- which `PERF_SHAPES` are
+#: imported, which `arch=` the op is pinned to, which device's clocks are
+#: captured, what the artifact is named -- has to agree with it.
+#:
+#: Set once by `select`, from `main`'s `--device`. Absent that (the pytest
+#: entry point, which does no selection) it falls back to the first device,
+#: matching what torch will call `cuda:0`. It cannot be derived from
+#: `list_devices()[0]` unconditionally: `main` may pin GPU N and set the
+#: visibility variable, and `nvidia-smi` enumerates physical devices regardless
+#: of that, so on a heterogeneous host GPU 0's arch is simply the wrong answer.
+_SELECTED: list = []  # a one-slot box, so "unset" and "no GPU" stay distinct
+
+
+def select(device) -> None:
+    _SELECTED[:] = [device]
+
+
+def selected_device():
+    if not _SELECTED:
+        devices = list_devices()
+        _SELECTED.append(devices[0] if devices else None)
+    return _SELECTED[0]
+
+
 def arch() -> Optional[str]:
-    devices = list_devices()
-    return devices[0].arch if devices else None
+    device = selected_device()
+    return device.arch if device else None
+
+
+def device_index() -> int:
+    """Physical index, for the `nvidia-smi`-backed denoise helpers.
+
+    Physical rather than CUDA-visible: those helpers shell out to `nvidia-smi`,
+    which enumerates every GPU and does not honour the visibility variable.
+    """
+    device = selected_device()
+    return device.index if device else 0
 
 
 def close_enough(out, ref, rel: float) -> tuple:
@@ -107,7 +140,7 @@ def default_json(bench) -> str:
     return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}.json"
 
 
-def run_case(bench, case: Case, *, space: str, cold: bool = True) -> Result:
+def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: str = "wallclock") -> Result:
     import torch
 
     prep = bench.prepare(case, space)
@@ -131,11 +164,11 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True) -> Result:
     # providers come back in TFLOP/s with the dispersion measured on that
     # quantity rather than on latency.
     tlx = measure(prep.tlx_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                  grad_to_none=prep.grad_to_none)
+                  grad_to_none=prep.grad_to_none, mode=latency_mode)
     ref = None
     if prep.ref_fn is not None:
         ref = measure(prep.ref_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                      grad_to_none=prep.grad_to_none)
+                      grad_to_none=prep.grad_to_none, mode=latency_mode)
     host_us = host_overhead_us(prep.tlx_fn)
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
@@ -211,10 +244,11 @@ def _head_per_direction(cases, head: int):
     return kept
 
 
-def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_compile_mode=None, directions=None):
+def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_compile_mode=None, directions=None,
+        latency_mode="wallclock"):
     space = resolve_space(bench, space)
     cold_mode = resolve_cold_compile(bench, cold_compile_mode)
-    env = capture_env()
+    env = capture_env(device_index())
     if governor is not None:
         env["governed"] = governor.to_dict()
     cases = bench.cases(synthetic)
@@ -224,13 +258,13 @@ def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_co
         cases = _head_per_direction(cases, head)
     results = []
     sampled = set()
-    with stable() as info:
+    with stable(device_index()) as info:
         for case in cases:
             cold = cold_mode == "all" or (cold_mode == "first" and case.direction not in sampled)
             if cold:
                 sampled.add(case.direction)
             try:
-                results.append(run_case(bench, case, space=space, cold=cold))
+                results.append(run_case(bench, case, space=space, cold=cold, latency_mode=latency_mode))
             except Exception as exc:  # a broken case must not hide the others
                 results.append(_errored(case, exc))
     # The autotune space is part of what a number means: a heuristic-space
@@ -241,6 +275,7 @@ def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_co
     env["space"] = space
     env["ref"] = getattr(bench, "REF_NAME", "")
     env["cold_compile"] = cold_mode
+    env["latency_mode"] = latency_mode
     if directions:
         env["directions"] = sorted(directions)
     env["replicates"] = DEFAULT_REPLICATES
@@ -269,6 +304,11 @@ def main(bench, argv=None) -> int:
     only.add_argument("--fwd-only", action="store_true", help="skip the backward cases")
     only.add_argument("--bwd-only", action="store_true", help="skip the forward cases")
     parser.add_argument(
+        "--latency-measure-mode", choices=LATENCY_MODES, default="wallclock", dest="latency_mode",
+        help="'wallclock' (default) times each call as a caller would see it, host dispatch "
+        "included; 'gpu_events' pre-enqueues the batch behind a blocked stream to isolate "
+        "device time, which matters most on the multi-kernel backward passes")
+    parser.add_argument(
         "--cold-compile", choices=COLD_COMPILE_MODES, default=None, dest="cold_compile",
         help=f"how often to time a first call on a fresh cache (default {resolve_cold_compile(bench, None)}); "
         "'all' is per case, 'first' samples one case per direction, 'none' skips it")
@@ -282,6 +322,10 @@ def main(bench, argv=None) -> int:
     # and it has to happen before the first CUDA call because the visibility
     # variable is read once at context creation.
     device = select_device(args.device)
+    # Pin it before anything reads `arch()`: the shape import, the `arch=` the
+    # op is dispatched on, the denoise capture and the artifact name all come
+    # from this one object.
+    select(device)
     if device is not None:
         os.environ[device.visibility_env] = str(device.index)
         print(f"device: gpu{device.index} {device.name} "
@@ -296,7 +340,7 @@ def main(bench, argv=None) -> int:
         for step in governor.skipped:
             print(f"  denoise: SKIPPED {step}")
         results, env = run(bench, space=args.space, head=args.head, synthetic=args.synthetic, governor=governor,
-                           cold_compile_mode=args.cold_compile, directions=directions)
+                           cold_compile_mode=args.cold_compile, directions=directions, latency_mode=args.latency_mode)
     if not results:
         # An empty focus list is legitimate -- an arch may have no capture yet --
         # but a silent zero-row table reads like a pass. Say what was empty.

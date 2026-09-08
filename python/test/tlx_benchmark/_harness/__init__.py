@@ -5,9 +5,10 @@ from .contract import SCHEMA_VERSION, Case, Result, Stat, Status, artifact
 from .denoise import (MAX_CLOCK_IDR, DEGRADING_REASONS, EVENT_REASONS, ClockTrace, GpuState, capture_env, check,
                       decode_event_reasons, foreign_processes, gpu_state, numa_bound, numa_node, nvml, parse_cpulist,
                       stable)
-from .measure import (DEFAULT_REPLICATES, DEFAULT_WARMUP_ITERS, MAX_REPLICATE_DEVIATION, MIN_REP_MS, MIN_TOTAL_SAMPLES,
-                      estimate_runtime_ms, host_overhead_us, measure, percentiles, relative_interdecile_range,
-                      reject_outliers_iqr, resolve_warmup_and_rep, summarize, to_tflops, window_for)
+from .measure import (DEFAULT_REPLICATES, DEFAULT_WARMUP_ITERS, LATENCY_MODES, MAX_REPLICATE_DEVIATION, MIN_REP_MS,
+                      MIN_TOTAL_SAMPLES, estimate_runtime_ms, host_overhead_us, measure, percentiles,
+                      relative_interdecile_range, reject_outliers_iqr, resolve_warmup_and_rep, summarize, to_tflops,
+                      window_for)
 
 __all__ = [
     "report",
@@ -43,6 +44,7 @@ __all__ = [
     "relative_interdecile_range",
     "stable",
     "DEFAULT_REPLICATES",
+    "LATENCY_MODES",
     "DEFAULT_WARMUP_ITERS",
     "MAX_REPLICATE_DEVIATION",
     "MIN_REP_MS",

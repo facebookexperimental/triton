@@ -25,6 +25,7 @@ def test_op_perf(module_name, pytestconfig):
         head=pytestconfig.getoption("--head"),
         synthetic=pytestconfig.getoption("--synthetic"),
         cold_compile_mode=pytestconfig.getoption("--cold-compile"),
+        latency_mode=pytestconfig.getoption("--latency-measure-mode"),
         directions=("fwd", ) if fwd_only else ("bwd", ) if bwd_only else None,
     )
     if not results:
