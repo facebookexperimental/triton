@@ -484,11 +484,23 @@ struct ArriveBarrierOpConversion
       if (op.getPred())
         pred = b.and_(pred, adaptor.getPred());
 
+      // Cluster-scope release semantics only apply to the logical num-ctas
+      // cluster model, where every CTA of the cluster runs the arrive. TLX /
+      // AutoWS instead use the physical ctas_per_cga model (num-ctas == 1, so
+      // each CTA is its own program): there the arrive is emitted from a single
+      // thread of one warp-specialized partition, and its peer-CTA barriers are
+      // already ordered by explicit bar.sync + fence_async_shared. ptxas
+      // expands .release.cluster into MEMBAR.ALL.CTA / MEMBAR.ALL.GPU / ERRBAR
+      // / CGAERRBAR, and issuing that sequence from one partition faults at
+      // runtime on Blackwell (CUDA 719, unspecified launch failure).
+      bool isPerCTAProgramCluster =
+          getPhysicalClusterInfo(op).hasPerCTAProgramIds;
       auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
         std::stringstream ptxAsm;
         ptxAsm << "@$0 mbarrier.arrive.";
-        if (isCrossCluster || isCrossClusterBarrier || isRemoteBarrier ||
-            op.isMulticast())
+        if (op.isMulticast() ||
+            (!isPerCTAProgramCluster &&
+             (isCrossCluster || isCrossClusterBarrier || isRemoteBarrier)))
           ptxAsm << "release.cluster.";
         ptxAsm << (isRemoteBarrier || isCrossClusterBarrier || op.isMulticast()
                        ? "shared::cluster"
