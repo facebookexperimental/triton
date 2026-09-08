@@ -218,6 +218,11 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
   // look like a conflict. Encoding-free callers retain the original.
   SmallVector<std::pair<::mlir::triton::CallOp, ::mlir::triton::FuncOp>>
       concreteClones;
+  // Build the symbol-to-user index once. Calling getSymbolUses(callee, mod)
+  // for each concrete call repeatedly walks the whole module and is quadratic
+  // for large helper-heavy TLX kernels.
+  SymbolTableCollection symbolTables;
+  SymbolUserMap symbolUsers(symbolTables, mod);
   mod.walk([&](::mlir::triton::CallOp call) {
     if (!llvm::any_of(call.getOperandTypes(), isConcreteDistributed))
       return;
@@ -225,15 +230,7 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
         call, call.getCalleeAttr());
     if (!callee || callee.getBody().empty())
       return;
-    auto uses = SymbolTable::getSymbolUses(callee, mod);
-    if (!uses)
-      return;
-    unsigned useCount = 0;
-    for (const auto &use : *uses) {
-      (void)use;
-      ++useCount;
-    }
-    if (useCount > 1)
+    if (symbolUsers.getUsers(callee).size() > 1)
       concreteClones.emplace_back(call, callee);
   });
   for (auto [call, callee] : concreteClones) {
