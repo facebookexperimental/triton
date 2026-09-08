@@ -310,8 +310,13 @@ struct WaitBarrierOpConversion
 
     bool isCrossClusterBarrier =
         LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
+    bool useSyncRestrict =
+        op.getSyncRestrict() && targetInfo->getPtxVersion() >= 86;
     std::string acquire =
-        isCrossCluster || isCrossClusterBarrier ? ".acquire.cluster" : "";
+        useSyncRestrict
+            ? ".relaxed.cluster"
+            : (isCrossCluster || isCrossClusterBarrier ? ".acquire.cluster"
+                                                       : "");
     bool predicated = pred && !matchPattern(pred, m_NonZero());
     int suspendNs = 0;
     if (targetInfo->getComputeCapability() >= 100) {
@@ -390,6 +395,18 @@ struct WaitBarrierOpConversion
 
     waitLoop(operands, /*onlyAttachMLIRArgs=*/true);
     ptxBuilder.launch(rewriter, loc, void_ty(ctx));
+    if (useSyncRestrict) {
+      PTXBuilder fenceBuilder;
+      std::string fence = predicated ? "@$0 " : "";
+      fence += "fence.acquire.sync_restrict::shared::cluster.cluster;";
+      auto &fenceOp = *fenceBuilder.create(fence);
+      if (predicated)
+        fenceOp({fenceBuilder.newOperand(pred, "b")},
+                /*onlyAttachMLIRArgs=*/true);
+      else
+        fenceOp({}, /*onlyAttachMLIRArgs=*/true);
+      fenceBuilder.launch(rewriter, loc, void_ty(ctx));
+    }
     rewriter.eraseOp(op);
     return success();
   }
@@ -485,12 +502,23 @@ struct ArriveBarrierOpConversion
         pred = b.and_(pred, adaptor.getPred());
 
       auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
+        bool useSyncRestrict =
+            op.getSyncRestrict() && targetInfo->getPtxVersion() >= 86;
+        if (useSyncRestrict) {
+          PTXBuilder fenceBuilder;
+          auto &fence = *fenceBuilder.create(
+              "@$0 fence.release.sync_restrict::shared::cta.cluster;");
+          fence({fenceBuilder.newOperand(pred, "b")},
+                /*onlyAttachMLIRArgs=*/true);
+          fenceBuilder.launch(rewriter, loc, void_ty(getContext()));
+        }
         std::stringstream ptxAsm;
         ptxAsm << "@$0 mbarrier.arrive.";
         bool needsClusterScope = isCrossCluster || isCrossClusterBarrier ||
                                  isRemoteBarrier || op.isMulticast();
         if (needsClusterScope)
-          ptxAsm << (op.getRelaxed() && targetInfo->getPtxVersion() >= 86
+          ptxAsm << ((op.getRelaxed() || useSyncRestrict) &&
+                             targetInfo->getPtxVersion() >= 86
                          ? "relaxed.cluster."
                          : "release.cluster.");
         ptxAsm << (isRemoteBarrier || isCrossClusterBarrier || op.isMulticast()

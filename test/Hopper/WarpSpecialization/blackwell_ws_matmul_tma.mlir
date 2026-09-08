@@ -12,8 +12,10 @@
 // CHECK: default
 // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "forward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
 // Each consumer CTA relays completion to its peer after consuming the load.
-// CHECK: ttng.arrive_barrier {{.*}}shared_cluster_memory
-// CHECK: ttng.arrive_barrier {{.*}}shared_cluster_memory
+// CHECK: ttng.arrive_barrier {{.*}}syncRestrict{{.*}}shared_cluster_memory
+// CHECK: ttng.wait_barrier {{.*}}syncRestrict
+// CHECK: ttng.arrive_barrier {{.*}}syncRestrict{{.*}}shared_cluster_memory
+// CHECK: ttng.wait_barrier {{.*}}syncRestrict
 // CHECK: ttng.tc_gen5_mma
 // Group 0: Descriptor load operations (producer)
 // CHECK: partition0

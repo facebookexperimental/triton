@@ -29,11 +29,16 @@ struct MemEffectsOpInfo {
   // for PTX ops that perform the write and also signal the barrier via
   // `mbarrier::complete_tx`.
   //
+  // SharedFrontier snapshots shared-memory reads/writes and proxy ordering,
+  // but excludes unrelated tensor-memory accesses. Use this for a split
+  // sync-restrict shared-memory release/relaxed-arrive protocol.
+  //
   // CountOnly updates the barrier's arrival count and phase without attaching
   // any memory or proxy frontier. Use this for relaxed control rendezvous,
   // which do not release prior accesses to a waiter.
   enum class BarrierTrackingMode {
     Frontier,
+    SharedFrontier,
     EffectWrites,
     CountOnly,
   };
@@ -90,6 +95,8 @@ struct BarrierWaitInfo {
   Value alloc;
   Value phase;
   Value pred;
+  // Acquire shared/proxy visibility without importing tensor-memory state.
+  bool sharedOnly = false;
 };
 
 struct BarrierInvalidateInfo {

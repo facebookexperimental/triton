@@ -829,7 +829,7 @@ private:
         // listener and return early)
         b.setListener(nullptr);
         instrumentBarrierWait(op, info->alloc, info->phase, info->pred, thread,
-                              baseThread, funcBuilder);
+                              baseThread, info->sharedOnly, funcBuilder);
         return WalkResult::advance();
       }
 
@@ -991,6 +991,7 @@ private:
 
   void instrumentBarrierWait(Operation *op, Value alloc, Value phase,
                              Value pred, int thread, int baseThread,
+                             bool sharedOnly,
                              tti::FunctionBuilder &funcBuilder) {
     ImplicitLocOpBuilder wb(op->getLoc(), op);
     pred = tti::maybeAnd(wb, pred, hooks.getIssuerCTAPred(wb, op));
@@ -1011,6 +1012,8 @@ private:
     wb.setInsertionPointAfter(op);
     tti::ExperimentalLockAcquireOp::create(wb, lock, pred);
     for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
+      if (sharedOnly && memType != MemType::SHARED_MEM)
+        continue;
       funcBuilder.createTransferVisibleWritesCall(
           wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
           memType, op);
@@ -1149,10 +1152,16 @@ private:
       funcBuilder.createVerifyBarrierInitializedCall(b, barrier, combinedPred,
                                                      op, recipientCTAs);
       if (barrierInfo.trackingMode ==
-          MemEffectsOpInfo::BarrierTrackingMode::Frontier) {
+              MemEffectsOpInfo::BarrierTrackingMode::Frontier ||
+          barrierInfo.trackingMode ==
+              MemEffectsOpInfo::BarrierTrackingMode::SharedFrontier) {
         // If the op has barriers, we treat it as a commit emitted for each
         // barrier.
         for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
+          if (barrierInfo.trackingMode ==
+                  MemEffectsOpInfo::BarrierTrackingMode::SharedFrontier &&
+              memType != MemType::SHARED_MEM)
+            continue;
           funcBuilder.createTrackVisibleWritesCall(
               b, barrier, thread, combinedPred, memType, op, recipientCTAs);
           funcBuilder.createTrackVisibleReadsCall(

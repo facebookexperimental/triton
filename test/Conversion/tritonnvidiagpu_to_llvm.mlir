@@ -18,6 +18,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: sync_restrict_barrier_handoff
+  // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64
+  // CHECK: mbarrier.try_wait.parity.shared::cta.b64
+  // CHECK-NOT: sync_restrict
+  // PTX85-LABEL: sync_restrict_barrier_handoff
+  // PTX85: mbarrier.arrive.release.cluster.shared::cluster.b64
+  // PTX85: mbarrier.try_wait.parity.shared::cta.b64
+  // PTX85-NOT: sync_restrict
+  // PTX86-LABEL: sync_restrict_barrier_handoff
+  // PTX86: fence.release.sync_restrict::shared::cta.cluster
+  // PTX86-NEXT: {{.*}}mbarrier.arrive.relaxed.cluster.shared::cluster.b64
+  // PTX86: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64
+  // PTX86: fence.acquire.sync_restrict::shared::cluster.cluster
+  // PTX88-LABEL: sync_restrict_barrier_handoff
+  // PTX88: fence.release.sync_restrict::shared::cta.cluster
+  // PTX88-NEXT: {{.*}}mbarrier.arrive.relaxed.cluster.shared::cluster.b64
+  // PTX88: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64
+  // PTX88: fence.acquire.sync_restrict::shared::cluster.cluster
+  tt.func @sync_restrict_barrier_handoff(
+      %remote: !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>,
+      %local: !ttg.memdesc<1xi64, #shared0, #smem>, %phase: i32, %pred: i1) {
+    ttng.arrive_barrier %remote, 1, %pred {syncRestrict} : !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>
+    ttng.wait_barrier %local, %phase, %pred {syncRestrict} : !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {

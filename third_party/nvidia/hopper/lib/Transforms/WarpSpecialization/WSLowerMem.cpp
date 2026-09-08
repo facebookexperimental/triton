@@ -440,11 +440,13 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     // handoff, while cluster barriers require participation from every warp.
     builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
         loc, /*bCluster=*/false);
-    builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+    auto publish = builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
         loc, peerBarrier, /*count=*/1, waitPred);
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+    publish.setSyncRestrict(true);
+    auto acquire = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
         consumerWaitConstraints);
+    acquire.setSyncRestrict(true);
   }
   for (int extraTaskId : additionalConsumerTaskIds) {
     builder.setAsynTaskIdsFromArray({extraTaskId});
@@ -454,11 +456,13 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     if (twoCTA) {
       builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
           loc, /*bCluster=*/false);
-      builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+      auto publish = builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
           loc, peerBarrier, /*count=*/1, waitPred);
-      builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+      publish.setSyncRestrict(true);
+      auto acquire = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
           loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
           consumerWaitConstraints);
+      acquire.setSyncRestrict(true);
     }
   }
 

@@ -75,7 +75,7 @@ public:
   getBarrierWaitInfo(Operation *op) const override {
     if (auto waitOp = dyn_cast<ttng::WaitBarrierOp>(op))
       return BarrierWaitInfo{waitOp.getBarrier(), waitOp.getPhase(),
-                             waitOp.getPred()};
+                             waitOp.getPred(), waitOp.getSyncRestrict()};
     return std::nullopt;
   }
 
@@ -348,9 +348,11 @@ public:
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
       info->pred = arriveOp.getPred();
-      auto mode = arriveOp.getRelaxed()
-                      ? MemEffectsOpInfo::BarrierTrackingMode::CountOnly
-                      : MemEffectsOpInfo::BarrierTrackingMode::Frontier;
+      auto mode = MemEffectsOpInfo::BarrierTrackingMode::Frontier;
+      if (arriveOp.getRelaxed())
+        mode = MemEffectsOpInfo::BarrierTrackingMode::CountOnly;
+      else if (arriveOp.getSyncRestrict())
+        mode = MemEffectsOpInfo::BarrierTrackingMode::SharedFrontier;
       info->barriers.push_back(
           {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount(), mode});
     }
