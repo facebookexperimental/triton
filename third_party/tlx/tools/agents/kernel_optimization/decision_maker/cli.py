@@ -23,6 +23,7 @@ from ..contracts import (
 from ..optimizer.agent import CodexCandidateProvider, MockLLMProvider
 from .orchestrator import KernelOptimizer
 from .policy import passes_protected_cases
+from .targets import expected_cuda_major, resolve_target_paths
 from .vcs import (
     AutoCommitSession,
     commit_promotion,
@@ -49,7 +50,10 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--arch",
         default=None,
-        help="Target arch under harnesses/<arch>/targets/<kernel> (e.g. blackwell, hopper, host). Defaults to first available.",
+        help=(
+            "Target architecture registered under decision_maker/targets "
+            "(e.g. blackwell, hopper, host). Defaults to the first match."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
@@ -157,42 +161,11 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
 
 
 def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | None, target: Path | None, arch: str | None) -> tuple[Path, Path, Path]:
-    # Kernel-only invocation: infer harness/cases/target from
-    # harnesses/<arch>/targets/<stem>/
-    # e.g. --kernel gemm.py -> harnesses/blackwell/targets/gemm/{harness.py,cases.json,target.json}
-    # Harness must be colocated with cases (target-specific), so both are resolved together.
-    base = Path(__file__).resolve().parent / "harnesses"
-    stem = kernel.stem  # gemm, vector_add, etc.
-    if base.exists() and (harness is None or cases is None or target is None):
-        archs = sorted(
-            p.name
-            for p in base.iterdir()
-            if p.is_dir() and (p / "targets" / stem).is_dir()
-        )
-        chosen = arch or (archs[0] if archs else None)
-        if chosen is None:
-            chosen = "blackwell" if harness is None else None
-        if chosen is not None:
-            tdir = base / chosen / "targets" / stem
-            if harness is None and (tdir / "harness.py").exists():
-                harness = tdir / "harness.py"
-            if cases is None and (tdir / "cases.json").exists():
-                cases = tdir / "cases.json"
-            if target is None and (tdir / "target.json").exists():
-                target = tdir / "target.json"
-    if harness is None or cases is None or target is None:
-        missing = [n for n, v in [("harness", harness), ("cases", cases), ("target", target)] if v is None]
-        raise SystemExit(f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/")
-    return harness, cases, target
+    return resolve_target_paths(kernel, harness, cases, target, arch)
 
 
 def _expected_cuda_major(arch: str) -> int | None:
-    normalized = arch.lower().replace("-", "_").replace(" ", "_")
-    if normalized in {"hopper", "h100", "sm90", "sm_90"}:
-        return 9
-    if normalized in {"blackwell", "b200", "gb200", "sm100", "sm_100"}:
-        return 10
-    return None
+    return expected_cuda_major(arch)
 
 
 def _probe_cuda_compute_capability(device: str | None) -> tuple[int, int]:

@@ -12,6 +12,32 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .registry import native_profiler_for_backend
+
+__all__ = [
+    "DEEP_NCU_METRIC_ALIASES",
+    "ProfileRequest",
+    "SUMMARY_NCU_METRIC_ALIASES",
+    "compact_profile_output",
+    "compact_profile_summary",
+    "export_ncu_report_details",
+    "extract_ncu_duration_us",
+    "invoke_profile",
+    "ncu_regression_diagnostic",
+    "normalize_ncu_metrics",
+    "normalize_profile_request",
+    "parse_ncu_csv",
+    "parse_ncu_query_metrics",
+    "parse_proton_launch_attribution",
+    "per_case_profile_request",
+    "profile_accepts_request",
+    "profile_request_to_json",
+    "resolve_profile_request_for_target",
+    "resolve_profile_tools",
+    "safe_case_id",
+    "select_ncu_metric_names",
+]
+
 _INLINE_PROFILE_LIMIT_BYTES = 1_000_000
 _PROFILE_LEVELS = frozenset({"summary", "deep"})
 _RAW_PROFILE_KEYS = frozenset(
@@ -267,8 +293,7 @@ def resolve_profile_request_for_target(
     request = normalize_profile_request(request_payload)
     if request is None:
         return None
-    backend = str(target.get("backend", "")).strip().lower()
-    native_profiler = "ncu" if backend in {"cuda", "nvidia"} else None
+    native_profiler = native_profiler_for_backend(str(target.get("backend", "")))
     return replace(
         request,
         tools=resolve_profile_tools(
@@ -852,7 +877,6 @@ def _subprocess_output_text(value: str | bytes | None) -> str:
         return value.decode("utf-8", errors="replace")
     return value
 
-
 def _coerce_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -927,4 +951,3 @@ def _compact_value(value: Any) -> Any:
     if isinstance(value, (str, bytes)) and len(value) > 4096:
         return f"<omitted {len(value)} bytes>"
     return value
-

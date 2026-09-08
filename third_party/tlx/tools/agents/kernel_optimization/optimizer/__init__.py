@@ -8,6 +8,7 @@ from .agent import (
     Optimizer,
     TLX_PROMPT_PREAMBLE,
 )
+from .strategy import OPTIMIZATION_STRATEGY
 
 __all__ = [
     "CandidateContext",
@@ -17,5 +18,6 @@ __all__ = [
     "FixedCandidateProvider",
     "MockLLMProvider",
     "Optimizer",
+    "OPTIMIZATION_STRATEGY",
     "TLX_PROMPT_PREAMBLE",
 ]

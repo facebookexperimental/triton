@@ -3,12 +3,42 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, TypeAlias
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 VALID_STRATEGIES: frozenset[str] = frozenset({"best_first", "beam"})
+
+
+class ChangeScope(str, Enum):
+    CONFIG = "config"
+    KERNEL = "kernel"
+    COMPILER = "compiler"
+
+
+class ExperimentKind(str, Enum):
+    PROMOTABLE = "promotable"
+    PTX_ABLATION = "ptx_ablation"
+    AMDGCN_ABLATION = "amdgcn_ablation"
+    IR_OVERRIDE = "ir_override"
+    HUMAN_REVIEW = "human_review"
+
+
+class DecisionStatus(str, Enum):
+    PROMOTE = "promote"
+    RETRY = "retry"
+    RECORD_SIGNAL = "record_signal"
+    STOP = "stop"
+    NEEDS_HUMAN = "needs_human"
+
+
+@dataclass(frozen=True)
+class CandidateChange:
+    scope: ChangeScope
+    summary: str
+    files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,6 +213,23 @@ class PerformanceSummary:
 
 
 @dataclass(frozen=True)
+class CandidateSubmission:
+    source: str
+    rationale: str
+    changes: tuple[CandidateChange, ...] = ()
+    experiment_kind: ExperimentKind = ExperimentKind.PROMOTABLE
+    blast_radius: str = "local"
+
+
+@dataclass(frozen=True)
+class Decision:
+    status: DecisionStatus
+    rationale: str
+    feedback: str = ""
+    evaluation: PerformanceSummary | None = None
+
+
+@dataclass(frozen=True)
 class ExperimentSummary:
     experiment_id: str
     round_index: int
@@ -242,6 +289,8 @@ def to_json_value(value: Any) -> JsonValue:
         return to_json_value(asdict(value))
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, Enum):
+        return value.value
     if isinstance(value, Mapping):
         return {str(key): to_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

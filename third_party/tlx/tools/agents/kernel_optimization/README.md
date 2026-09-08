@@ -82,8 +82,9 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --commit-message "Optimize my kernel with TLX agent"
 ```
 
-`--arch` selects `decision_maker/harnesses/<arch>/targets/<kernel>`; `harness`, `cases`,
-and `target` can also be passed explicitly.
+`--arch` selects a manifest-backed bundle under
+`decision_maker/targets/<vendor>/<arch>/<kernel>`; `harness`, `cases`, and `target` can
+also be passed explicitly.
 
 `--prior-run` accepts a completed output directory or its `experiments.json`. It
 imports recomputed source hashes for exact cross-run deduplication and bounded,
@@ -157,7 +158,7 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 ## TLX GEMM example
 
-`decision_maker/harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
+`decision_maker/targets/nvidia/blackwell/gemm/harness.py` runs any complete candidate source that exports
 `matmul(a, b)`. It compares against `torch.matmul`, benchmarks with
 `triton.testing.do_bench`, and reports latency and TFLOP/s. Its legacy two-argument
 `profile(build_artifact, case)` returns latency and throughput, and can optionally collect a
@@ -166,8 +167,8 @@ requests or NCU collection.
 
 ### Target-supplied profiling
 
-Canonical workflow guidance lives in `decision_maker/docs/profiling/proton.md` for Proton
-and `decision_maker/docs/profiling/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
+Canonical workflow guidance lives in `decision_maker/profiling/docs/proton.md` for Proton
+and `decision_maker/profiling/docs/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
 run orchestration; they are not injected into candidate source prompts.
 
 A target harness may implement `profile(build_artifact, case, request)` to honor structured
@@ -189,13 +190,12 @@ non-null when those tools are available.
   replay. Instrumented source and timing must never be benchmarked, promoted, or committed.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live under
-`decision_maker/harnesses/<arch>/targets/<kernel>/` (B200, `sm_100` for Blackwell and H100,
-`sm_90` for Hopper); pick `--arch` to match the
-device you are tuning for. Architecture-wide notes, known optimization tricks, and shared
-target metadata can live directly under `decision_maker/harnesses/<arch>/`. Pass an existing TLX tutorial such as
+`decision_maker/targets/<vendor>/<arch>/<kernel>/` and are discovered through
+`bundle.json`. Pick `--arch` to match the device you are tuning for. GPU knowledge is
+selected independently from `optimizer/knowledge/<vendor>/<arch>/`. Pass an existing TLX tutorial such as
 `third_party/tlx/tutorials/blackwell_gemm_ws.py` as `--kernel`.
 
-`decision_maker/harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
+`decision_maker/targets/host/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
 without a real GPU. Candidate must export `vector_add(a, b)`; on CPU the benchmark uses
 synthetic `LATENCY_US` timing so unit tests pass on any host.
 
