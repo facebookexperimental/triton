@@ -356,6 +356,14 @@ def test_autows_addmm_hoist_convert_before_broadcast():
     assert "tt.descriptor_store" not in ttgir, "Expected descriptor stores to be lowered"
     assert "can_rotate_by_buffer_count" not in ttgir, "Expected TMA store wait rotation to be resolved"
 
+    unified_waits = re.search(
+        r"ttng\.wait_barrier[^\n]*dstTask = 3[^\n]*\n\s*"
+        r"ttng\.wait_barrier[^\n]*dstTask = 1[^\n]*\n\s*"
+        r"%[^\n]* = ttg\.local_load",
+        ttgir,
+    )
+    assert unified_waits, "Expected adjacent bias-TMA and accumulator-TMEM waits before the bias load"
+
     # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
     cvt_before_bc = re.search(r"convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32", ttgir)
     bc_before_cvt = re.search(
