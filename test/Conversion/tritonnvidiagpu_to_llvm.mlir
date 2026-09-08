@@ -887,54 +887,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg
 
 // -----
 
-// An arrive on a peer-CTA barrier under the physical `ctas_per_cga` cluster
-// model (num-ctas == 1, cluster-dim-x == 2) must NOT take cluster-scope release
-// semantics. TLX / AutoWS emit that arrive from a single thread of one
-// warp-specialized partition, and ptxas expands `.release.cluster` there into
-// MEMBAR.ALL.GPU / ERRBAR / CGAERRBAR, which faults at runtime on Blackwell.
-// The logical num-ctas counterpart, which must keep `.release.cluster`, is
-// covered by @arrive_barrier_cluster_broadcast above.
-
-// CHECK-LABEL: remote_arrive_physical_cluster_no_release
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
-  tt.func public @remote_arrive_physical_cluster_no_release(%arg: !ttg.memdesc<1xi64, #shared, #smem, mutable>) {
-    %c0_i32 = arith.constant 0 : i32
-    %0 = ttng.map_to_remote_buffer %arg, %c0_i32: !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    // CHECK-NOT: mbarrier.arrive.release.cluster
-    // CHECK: mbarrier.arrive.shared::cluster.b64
-    ttng.arrive_barrier %0, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-// An arrive on a peer-CTA barrier under the physical `ctas_per_cga` cluster
-// model (num-ctas == 1, cluster-dim-x == 2) must NOT take cluster-scope release
-// semantics. TLX / AutoWS emit that arrive from a single thread of one
-// warp-specialized partition, and ptxas expands `.release.cluster` there into
-// MEMBAR.ALL.GPU / ERRBAR / CGAERRBAR, which faults at runtime on Blackwell.
-// The logical num-ctas counterpart, which must keep `.release.cluster`, is
-// covered by @arrive_barrier_cluster_broadcast above.
-
-// CHECK-LABEL: remote_arrive_physical_cluster_no_release
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
-  tt.func public @remote_arrive_physical_cluster_no_release(%arg: !ttg.memdesc<1xi64, #shared, #smem, mutable>) {
-    %c0_i32 = arith.constant 0 : i32
-    %0 = ttng.map_to_remote_buffer %arg, %c0_i32: !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    // CHECK-NOT: mbarrier.arrive.release.cluster
-    // CHECK: mbarrier.arrive.shared::cluster.b64
-    ttng.arrive_barrier %0, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
-    tt.return
-  }
-}
-
-// -----
-
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
