@@ -52,8 +52,9 @@ other operands, such as TMEM loads, have been prepared.
 After physical AutoWS lowering, `triton-nvidia-interleave-tmem` chooses TMEM
 load locations for latency and register liveness. The immediately following
 `triton-nvidia-unify-ws-barrier-locations` pass can then co-locate a related
-TMA-ready wait and TMEM-ready wait when only load preparation, casts, and a
-broadcast separate them. See
+TMA-ready wait and TMEM-ready wait and order their operands for register
+materialization. Waiting first means the operand reorder does not move the
+TMEM acquire earlier or extend the asynchronous producer interval. See
 [WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
 For explicitly enabled dependent 2-CTA matmul graphs, the backend runs
@@ -126,7 +127,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
 | `TMemBarrierInsertion.cpp` | `triton-nvidia-gpu-tmem-barrier-insertion` | Inserts CTA barriers for TMEM reuse and elides hazards proven warp-local; see [TMEMBarrierInsertion.md](TMEMBarrierInsertion.md) |
 | `InterleaveTMem.cpp` | `triton-nvidia-interleave-tmem` | Sinks TMEM allocations and loads, then restores their WS barriers |
-| `UnifyWSBarrierLocations.cpp` | `triton-nvidia-unify-ws-barrier-locations` | Co-locates related AutoWS TMA/TMEM waits around broadcast and cast preparation |
+| `UnifyWSBarrierLocations.cpp` | `triton-nvidia-unify-ws-barrier-locations` | Co-locates related AutoWS TMA/TMEM waits, then orders TMEM before streamable SMEM broadcast operands |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
 | `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |
 
