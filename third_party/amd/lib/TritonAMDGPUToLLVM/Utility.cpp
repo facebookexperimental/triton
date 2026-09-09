@@ -754,6 +754,23 @@ unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
   return clampVecSizeForNpot(vec, tensorTy);
 }
 
+unsigned
+getVectorSizeIgnoringAlignment(Value ptr,
+                               ModuleAxisInfoAnalysis &axisAnalysisPass) {
+  auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!tensorTy)
+    return 1;
+  auto order = triton::gpu::getOrder(tensorTy);
+  unsigned contiguity = triton::gpu::getContigPerThread(tensorTy)[order[0]];
+  if (auto *axisInfo = axisAnalysisPass.getAxisInfo(ptr))
+    contiguity =
+        std::min<unsigned>(contiguity, axisInfo->getContiguity(order[0]));
+  unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth,
+                                    std::max<unsigned>(contiguity, 1));
+  return clampVecSizeForNpot(vec, tensorTy);
+}
+
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
