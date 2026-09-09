@@ -1,4 +1,7 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --triton-nvidia-interleave-tmem --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefixes=CHECK,BOTH
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefixes=CP,BOTH
+// RUN: sed '/%%qk_109, %%qk_110 = ttng.tmem_load/s/loop.cluster = 1/loop.cluster = 2/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=UNSAFE
+// RUN: sed '/%%qk_106 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 0/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=UNSAFE
 //
 // Regression test: verify that 2-buffer reuse group logic does NOT
 // incorrectly move the accumulator MMA's producer_acquire in the
@@ -33,29 +36,71 @@
 // with create_token) appears before the accumulator tmem_store with
 // tmem.start in the default partition.
 //
-// CHECK: ttg.warp_specialize
-// CHECK: default
-// CHECK: scf.for
-// CHECK: scf.for
-// CHECK: ttng.wait_barrier {{.*}}loop.cluster = 4{{.*}}loop.stage = 1
-// CHECK: ttng.tmem_store {{.*}}loop.cluster = 4{{.*}}loop.stage = 1{{.*}}tmem.start
+// BOTH: ttg.warp_specialize
+// BOTH: default
+// BOTH: scf.for
+// BOTH: scf.for
+// BOTH: ttng.wait_barrier {{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// BOTH: ttng.tmem_store {{.*}}loop.cluster = 4{{.*}}loop.stage = 1{{.*}}tmem.start
 //
 // Verify: no producer_acquire appears between qk MMA
 // (cluster 2) and the acc consumer_wait (cluster 4).
 //
-// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 2{{.*}}loop.stage = 1
-// CHECK-NOT: nvws.producer_acquire
-// CHECK: nvws.consumer_wait {{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// BOTH: ttng.tc_gen5_mma {{.*}}loop.cluster = 2{{.*}}loop.stage = 1
+// BOTH-NOT: nvws.producer_acquire
+// BOTH: nvws.consumer_wait {{.*}}loop.cluster = 4{{.*}}loop.stage = 1
 // The accumulator MMA now carries 2 distinct channel ids in tmem.start
 // (the gen5 -> tmem_load back-edge channel + the gen5 -> post-loop
 // tmem_load forward channel), in addition to tmem.end for the in-body
 // tmem_store -> gen5 forward channel.
-// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 4{{.*}}loop.stage = 1{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
+// BOTH: ttng.tc_gen5_mma {{.*}}loop.cluster = 4{{.*}}loop.stage = 1{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
 //
 // Same check for cluster 1, stage 2:
-// CHECK-NOT: nvws.producer_acquire
-// CHECK: nvws.consumer_wait {{.*}}loop.cluster = 1{{.*}}loop.stage = 2
-// CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 1{{.*}}loop.stage = 2{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
+// BOTH-NOT: nvws.producer_acquire
+// BOTH: nvws.consumer_wait {{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// BOTH: ttng.tc_gen5_mma {{.*}}loop.cluster = 1{{.*}}loop.stage = 2{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
+//
+// QK and P are distinct logical allocations folded onto the same physical
+// TMEM slot (buffer ids 7/8).  The QK MMA and PV MMA execute in task 1, while
+// each QK load and subsequent P store execute in one softmax task.  Those two
+// program-order edges plus the QK-full channel already protect P publication
+// across iterations, so no additional empty wait may be inserted between the
+// P conversion and store.  Check both immediately after code partitioning and
+// after InterleaveTMem so a later pass cannot become responsible for deleting
+// a synchronization edge that code partitioning already proved redundant.
+// CP: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CP-NOT: ttng.wait_barrier
+// CP: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CP: arith.truncf {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CP-NOT: ttng.wait_barrier
+// CP: ttng.tmem_store {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// The QK load must still precede the P store here, not just after code
+// partitioning. The elision is proved against the pre-InterleaveTMem order,
+// and InterleaveTMem sinks every tmem_load greedily toward its consumer; what
+// stops the QK load crossing the P store is that both resolve to the one
+// representative allocation, so tmemMayAlias reports may-alias. Pin the
+// surviving order so a change to reuse realization or to that alias query
+// fails here rather than silently invalidating the proof at codegen.
+// CHECK: ttng.tmem_load {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK: ttng.tmem_load {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CHECK: arith.truncf {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+//
+// The elision is schedule-sensitive.  If either same-task edge no longer
+// orders the expanded pipeline -- QK load before P store in one logical
+// iteration, or PV MMA before QK MMA in the next logical iteration -- code
+// partitioning must retain the original P-empty wait (and the matching MMA
+// completion edge produced by the same desynchronization path).
+// The task-4 PV MMA has three inline barrier operands when that completion
+// edge is present, versus two in the safely elided case above.
+// UNSAFE: ttng.tc_gen5_mma {{.*}}, %{{[^ ]+}}[{{.*}}], %{{[^ ]+}}[{{.*}}], %{{[^ ]+}}[{{.*}}] {async_task_id = array<i32: 1>, is_async, loop.cluster = 1 : i32, loop.stage = 2
+// UNSAFE: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// UNSAFE: ttng.wait_barrier {{.*}}direction = "backward"{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// UNSAFE: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
 //
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
