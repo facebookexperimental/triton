@@ -749,6 +749,18 @@ static int64_t tensorBytes(Value v) {
   return (elems * getElementBitWidth(ty) + 7) / 8;
 }
 
+// Does `op` carry no layout preference of its own -- i.e. will it accept
+// whatever encoding its neighbours settle on? Same op set
+// `canPropagateSrcEncodingThroughUsers` propagates through.
+static bool isLayoutTransparent(Operation *op) {
+  if (!op)
+    return false;
+  return op->hasTrait<OpTrait::Elementwise>() ||
+         isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp,
+             arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp,
+             arith::BitcastOp>(op);
+}
+
 // Estimate the relayout traffic from committing `value` to `encoding`: every
 // neighbour that cannot supply `encoding` needs a convert_layout.
 //
@@ -772,8 +784,17 @@ static std::pair<int64_t, int64_t> estimateRelayout(
         &candidates) {
   auto canSupply = [&](Value v) {
     auto it = candidates.find(v);
-    if (it != candidates.end())
-      return it->second.contains(encoding);
+    if (it != candidates.end()) {
+      if (it->second.contains(encoding))
+        return true;
+      // A single-candidate neighbour holds one encoding only because
+      // propagation reached it once, not because it needs that one. If it is
+      // layout-transparent it will follow whatever its neighbours settle on, so
+      // charging it is a convert that never materializes -- and, worse, it
+      // walls the chain off at an arbitrary point. An anchor (a load, a
+      // tmem_load, a dot) genuinely is fixed and must still be charged.
+      return it->second.size() == 1 && isLayoutTransparent(v.getDefiningOp());
+    }
     auto ty = dyn_cast<RankedTensorType>(v.getType());
     return ty && ty.getEncoding() == encoding;
   };
@@ -2410,10 +2431,7 @@ public:
         if (isa<LocalStoreOp>(user))
           continue;
         // Elementwise ops are layout-transparent — propagate through them.
-        if (user->hasTrait<OpTrait::Elementwise>() ||
-            isa<arith::ExtFOp, arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp,
-                arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp,
-                arith::BitcastOp>(user)) {
+        if (isLayoutTransparent(user)) {
           for (Value result : user->getResults()) {
             auto rtt = dyn_cast<RankedTensorType>(result.getType());
             if (!rtt)
