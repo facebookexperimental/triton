@@ -292,6 +292,16 @@ before the existing tmem_load sinking. Four steps:
    accepted by the same channel-graph or ordered-region safety rules. See
    [WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
+Before the multi-load interleaving steps, `InterleaveTMem` also handles a
+two-operand computation pattern where an independent SMEM load/broadcast and a
+TMEM load feed the same pure operation. Code partitioning naturally places both
+consumers immediately before that operation, which can leave the SMEM value
+live across the wide TMEM load. The pass moves the complete SMEM consumer
+channel after the TMEM channel when the WS ordered-region metadata proves that
+both its wait and release can cross the intervening barriers. Address and phase
+operations move with the channel only when all of their users move, preserving
+SSA dominance for values shared by other channels.
+
 ### `canAdvanceWSBarrier`
 
 ```cpp
