@@ -612,6 +612,38 @@ pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1
   `needExplicitReuseWait` returns `false`.
 - Action: No change. Partition-internal ordering guarantees correctness.
 
+### FA-forward P publication: schedule-proven empty-edge elision
+
+FA forward can pack the softmax probability `P` into the QK accumulator's
+physical TMEM range.  The ordinary channel construction would make the P store
+wait for the previous PV MMA and make that MMA signal completion.  That edge is
+redundant only when code partitioning proves the complete cycle
+
+```text
+PV(i) -> QK MMA(i+1) -> QK load(i+1) -> P store(i+1).
+```
+
+The structural proof requires a whole-allocation overwrite owner, overlapping
+TMEM ranges, one common inner loop, and same-task source order for both the QK
+MMA/PV MMA pair and the QK load/P store pair.  Source order alone is
+insufficient because software-pipeline expansion can interleave logical
+iterations.  For `before(i) -> after(i + d)`, code partitioning also checks the
+serialized schedule coordinates.  An operation at stage `S` executes logical
+iteration `kernelIter + maxStage - S`, so the expanded kernel-iteration distance
+is
+
+```text
+d + after.stage - before.stage.
+```
+
+A positive value proves the order.  A zero value requires
+`before.cluster < after.cluster`, or source order when the clusters are equal.
+A negative value, or a missing stage/cluster annotation, fails closed and keeps
+the original P-empty wait and matching PV completion arrival.  When both
+`QK load(i) -> P store(i)` (`d = 0`) and `PV(i) -> QK MMA(i+1)` (`d = 1`) are
+proved, `WSCodePartition` omits both endpoints; no later pass repairs or deletes
+the edge.
+
 ## N-Buffer Reuse Group Synchronization
 
 For reuse groups with more than two channels (`group->channels.size() > 2`),

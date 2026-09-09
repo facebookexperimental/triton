@@ -1,4 +1,7 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --triton-nvidia-interleave-tmem --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=CP --implicit-check-not=ttng.redundant_publication_wait
+// RUN: sed '/%%qk_109, %%qk_110 = ttng.tmem_load/s/loop.cluster = 1/loop.cluster = 2/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=UNSAFE
+// RUN: sed '/%%qk_106 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 0/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=UNSAFE
 //
 // Regression test: verify that 2-buffer reuse group logic does NOT
 // incorrectly move the accumulator MMA's producer_acquire in the
@@ -56,6 +59,39 @@
 // CHECK-NOT: nvws.producer_acquire
 // CHECK: nvws.consumer_wait {{.*}}loop.cluster = 1{{.*}}loop.stage = 2
 // CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 1{{.*}}loop.stage = 2{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
+//
+// QK and P are distinct logical allocations folded onto the same physical
+// TMEM slot (buffer ids 7/8).  The QK MMA and PV MMA execute in task 1, while
+// each QK load and subsequent P store execute in one softmax task.  Those two
+// program-order edges plus the QK-full channel already protect P publication
+// across iterations, so no additional empty wait may be inserted between the
+// P conversion and store.  Check both immediately after code partitioning and
+// after InterleaveTMem so a later pass cannot become responsible for deleting
+// a synchronization edge that code partitioning already proved redundant.
+// CP: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CP-NOT: ttng.wait_barrier
+// CP: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CP: arith.truncf {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CP-NOT: ttng.wait_barrier
+// CP: ttng.tmem_store {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CHECK: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK: arith.truncf {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+//
+// The elision is schedule-sensitive.  If either same-task edge no longer
+// orders the expanded pipeline -- QK load before P store in one logical
+// iteration, or PV MMA before QK MMA in the next logical iteration -- code
+// partitioning must retain the original P-empty wait (and the matching MMA
+// completion edge produced by the same desynchronization path).
+// The task-4 PV MMA has three inline barrier operands when that completion
+// edge is present, versus two in the safely elided case above.
+// UNSAFE: ttng.tc_gen5_mma {{.*}}, %{{[^ ]+}}[{{.*}}], %{{[^ ]+}}[{{.*}}], %{{[^ ]+}}[{{.*}}] {async_task_id = array<i32: 1>, is_async, loop.cluster = 1 : i32, loop.stage = 2
+// UNSAFE: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// UNSAFE: ttng.wait_barrier {{.*}}direction = "backward"{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// UNSAFE: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
 //
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
