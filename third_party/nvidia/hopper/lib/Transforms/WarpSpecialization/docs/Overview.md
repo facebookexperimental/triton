@@ -45,6 +45,13 @@ elementwise users. This keeps broadcasts and their value materialization, such
 as a descriptor load followed by an extend, associated with their use after
 other operands, such as TMEM loads, have been prepared.
 
+After physical AutoWS lowering, `triton-nvidia-interleave-tmem` chooses TMEM
+load locations for latency and register liveness. The immediately following
+`triton-nvidia-unify-ws-barrier-locations` pass can then co-locate a related
+TMA-ready wait and TMEM-ready wait when only load preparation, casts, and a
+broadcast separate them. See
+[WS Barrier Location Unification](WSBarrierLocationUnification.md).
+
 The TMA store wait pipeline is enabled by default and can be disabled with the
 `nvgpu-warp-specialization` pass option `tma-store-pipelining=false`. Disabling
 it skips wait annotation, annotation validation, and wait reordering; it does
@@ -98,6 +105,8 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSTMAStoreLowering.cpp` | `doTMAStoreWaitReorder` | Reschedule TMA store waits using SWP CoarseSchedule |
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
 | `TMemBarrierInsertion.cpp` | `triton-nvidia-gpu-tmem-barrier-insertion` | Inserts CTA barriers for TMEM reuse and elides hazards proven warp-local; see [TMEMBarrierInsertion.md](TMEMBarrierInsertion.md) |
+| `InterleaveTMem.cpp` | `triton-nvidia-interleave-tmem` | Sinks TMEM allocations and loads, then restores their WS barriers |
+| `UnifyWSBarrierLocations.cpp` | `triton-nvidia-unify-ws-barrier-locations` | Co-locates related AutoWS TMA/TMEM waits around broadcast and cast preparation |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
 | `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |
 
@@ -147,6 +156,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Barrier Fusion](BarrierFusion.md) — TMA fusion, tcgen05_commit combining
 - [Barrier Constraints](BarrierConstraints.md) — generic barrier constraints and WSBarrier reordering metadata
 - [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs
+- [WS Barrier Location Unification](WSBarrierLocationUnification.md) — post-interleave co-location of related TMA-ready and TMEM-ready waits
 - [Reuse Groups](ReuseGroups.md) — buffer sharing mechanics
 - [Ping-Pong Scheduling](PingPongScheduling.md) — named barrier insertion for expensive ops
 - [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities
