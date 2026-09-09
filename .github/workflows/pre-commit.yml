@@ -84,7 +84,44 @@ jobs:
         run: |
           python3 -m pip install --upgrade pre-commit
           mapfile -t FILES < /tmp/changed_files.txt
-          python3 -m pre_commit run --files "${FILES[@]}" --show-diff-on-failure --verbose
+          set -o pipefail
+          python3 -m pre_commit run --files "${FILES[@]}" --show-diff-on-failure --verbose 2>&1 | tee /tmp/precommit-strict.log
+      - name: Report strict failures
+        if: failure() && steps.precommit_strict.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          {
+            echo "### :x: Pre-commit strict — issues in PR changed files (blocking)"
+            echo ""
+            echo "Only files changed in this PR were checked. Fix locally and push, or comment \`/fix-precommit\` for autofixable hooks (ruff, yapf, clang-format)."
+            echo ""
+            echo "<details><summary>Diff of required changes</summary>"
+            echo ""
+            echo '```diff'
+            git diff
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Emit file-level annotations from ruff-style diagnostics
+          # (path:line:col: message) so failures show inline on the PR.
+          # Capped at 10: the per-step annotation limit.
+          MATCHES=$(grep -E -o -m 10 '[^:[:space:]]+\.pyi?:[0-9]+:[0-9]+: .+$' /tmp/precommit-strict.log || true)
+          if [ -n "$MATCHES" ]; then
+            echo "$MATCHES" | while IFS= read -r line; do
+              f="${line%%:*}"
+              rest="${line#*:}"
+              l="${rest%%:*}"
+              rest="${rest#*:}"
+              c="${rest%%:*}"
+              msg="${rest#*: }"
+              f="${f//%/\%25}"
+              f="${f//,/%2C}"
+              msg="${msg//%/\%25}"
+              [ -f "$f" ] || continue
+              echo "::error file=${f},line=${l},col=${c}::${msg} (pre-commit-strict)"
+            done
+          fi
       - name: Pre-commit warning
         if: steps.precommit.outcome == 'failure'
         run: |
