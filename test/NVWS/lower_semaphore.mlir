@@ -6,6 +6,11 @@
 // RUN: triton-opt %t/partition-cleanup.mlir -allow-unregistered-dialect --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --tritongpu-partition-loops | FileCheck %t/partition-cleanup.mlir
 // RUN: triton-opt %t/tma-release-stage-dominance.mlir --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore | FileCheck %t/tma-release-stage-dominance.mlir --implicit-check-not=nvws.semaphore
 // RUN: triton-opt %t/pipeline.mlir --allow-unregistered-dialect --nvws-semaphore-optimize=num-stages=3 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore | FileCheck %t/pipeline.mlir --implicit-check-not=nvws.semaphore
+// RUN: triton-opt %t/insert-completion.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore -cse | FileCheck %t/insert-completion.mlir --implicit-check-not=nvws.descriptor_load
+// RUN: triton-opt %t/insert-tma-completion.mlir -split-input-file -allow-unregistered-dialect --verify-each=false --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --triton-nvidia-tma-lowering -cse | FileCheck %t/insert-tma-completion.mlir
+// RUN: triton-opt %t/insert-post-ws-partition.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --tritongpu-partition-loops | FileCheck %t/insert-post-ws-partition.mlir
+// RUN: triton-opt %t/insert-pipeline-two-stages.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops=num-stages=2 --tritongpu-pipeline=num-stages=2 | FileCheck %t/insert-pipeline-two-stages.mlir
+// RUN: triton-opt %t/insert-pipeline-four-stages.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=4 --nvws-semaphore-optimize=num-stages=4 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=4 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops=num-stages=4 --tritongpu-pipeline=num-stages=4 | FileCheck %t/insert-pipeline-four-stages.mlir
 
 //--- lowering.mlir
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -1999,6 +2004,487 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       "use"(%v) {ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>}
     ttg.local_dealloc %buf : !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+//--- insert-completion.mlir
+// Completion and arrival counts from raw buffer accesses through semaphore lowering.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+!ty = tensor<128x128xf16, #blocked>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @async_entry_fanin
+  tt.func @async_entry_fanin(
+      %desc: !tt.tensordesc<128x128xf16, #shared>,
+      %lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.id = 1701 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+      nvws.descriptor_load %desc[%i, %i] 32768 %alloc {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      scf.for %j = %lb to %ub step %step : i32 {
+        %l2 = ttg.local_load %alloc {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ty
+        "use2"(%l2) {ttg.partition = array<i32: 2>} : (!ty) -> ()
+        %l1 = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ty
+        %corrected = "correct"(%l1) {ttg.partition = array<i32: 1>} : (!ty) -> !ty
+        ttg.local_store %corrected, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        %l0 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ty
+        "use0"(%l0) {ttg.partition = array<i32: 0>} : (!ty) -> ()
+      } {ttg.partition = array<i32: 0, 1, 2>}
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+// Insertion and lowering checks verify the count contract: the scaled release
+// carries arrive_count = 2 in emitted IR, and lowering transcribes both counts
+// into the mbarrier init/arrive.
+
+// Release arrive-multiplicity (spec section 5.2, uniform pending count):
+// a semaphore's pending count is a per-semaphore constant — every acquire
+// site sees the same count and every acquire cycle must receive exactly
+// that many arrives. Shape: producer {3} stores outside the inner loop;
+// inside, {2} and {1} read, {1} CORRECTS the buffer in place after an
+// explicit {2}->{1} WAR handoff, and {0} consumes the corrected value
+// AFTER the store. The last version's holders at the inner EXIT are
+// therefore {1} (the writer) and {0} (its reader) — a fan-in-2 regain —
+// and the outer single-source ready edge lands on the SAME semaphore.
+// The lone outer release must arrive twice: r S(2). The emitted and
+// lowered IR checks below pin that multiplicity.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+!ty = tensor<1xi32, #blocked>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @release_multiplicity_unified_fanin_regain
+  tt.func @release_multiplicity_unified_fanin_regain(%lb: i32, %ub: i32, %step: i32) {
+    // CHECK: ttng.init_barrier {{.*}}, 2
+    %alloc = ttg.local_alloc {buffer.id = 700 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    // V2 = outer ready (initially released — supplies iteration zero),
+    // V3 = {2}->{1} read handoff, V4 = {2}->{1} WAR handoff, V5 =
+    // {1}->{0} corrected-value edge, V6 = the unified full semaphore
+    // with pending_count = 2.
+    scf.for %i = %lb to %ub step %step : i32 {
+      %v = "producer"() {ttg.partition = array<i32: 3>} : () -> !ty
+      // {3}'s acquire of the outer ready semaphore sits at its point of
+      // use inside the loop body; no token is threaded through the loop.
+      ttg.local_store %v, %alloc {ttg.partition = array<i32: 3>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      // CHECK: ttng.arrive_barrier {{.*}}, 2
+      scf.for %j = %lb to %ub step %step : i32 {
+        %l2 = ttg.local_load %alloc {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        "use2"(%l2) {ttg.partition = array<i32: 2>} : (!ty) -> ()
+        %l1 = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        %c = "correct"(%l1) {ttg.partition = array<i32: 1>} : (!ty) -> !ty
+        ttg.local_store %c, %alloc {ttg.partition = array<i32: 1>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+        %l0 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+        "use0"(%l0) {ttg.partition = array<i32: 0>} : (!ty) -> ()
+      } {ttg.partition = array<i32: 0, 1, 2>}
+      // After the inner loop, {2} regains the last version — its acquire
+      // cycle absorbs the fan-in-2 arrives from {1} and {0} — and only
+      // then releases the outer ready semaphore for {3}'s next store.
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// The outer ready release by {3} carries arrive multiplicity 2 — one
+// release op, two arrives — because it shares the pending_count = 2
+// semaphore with the inner fan-in-2 regain ({1} the corrector and {0}
+// its post-store reader each arrive once into {2}'s next acquire cycle);
+// both acquire sites read the uniform pending count off the one create.
+// Every acquire sits at its point of use: neither loop threads a token,
+// and the outer ready semaphore is created initially released to supply
+// iteration zero. The stable ENTER source lets {1}'s read overlap {2}'s
+// read, so the in-loop store takes an explicit {2}->{1} WAR edge; {1}'s
+// own read is ordered by program order.
+
+// -----
+
+// Two exact-alias members are filled by one partition before either is
+// consumed by another partition.  The first fill is a TMA load and the second
+// is synchronous.  Their one ownership handoff must retain both completion
+// signals: the TMA completion and the explicit arrival after the local store.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @same_owner_mixed_completion
+  tt.func @same_owner_mixed_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+    %tma = ttg.local_alloc {buffer.id = 610 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %sync = ttg.local_alloc {buffer.id = 610 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    // CHECK: ttng.init_barrier %{{.*}}, 2
+    %value = arith.constant dense<0.000000e+00> : tensor<128x64xf16, #blocked>
+
+    scf.for %iv = %lb to %ub step %step : i32 {
+      // CHECK: ttng.barrier_expect %{{.*}}, 16384
+      // CHECK: ttng.async_tma_copy_global_to_local
+      nvws.descriptor_load %desc[%i, %i] 16384 %tma {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      ttg.local_store %value, %sync {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      // CHECK: ttng.arrive_barrier %{{.*}}, 1
+
+      %sync_value = ttg.local_load %sync {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %tma_value = ttg.local_load %tma {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume"(%sync_value, %tma_value) {ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>, tensor<128x64xf16, #blocked>) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // The same owner-token wave may fill partially overlapping members.  The
+  // later synchronous write must retain the earlier TMA completion even
+  // though the group has more than one physical piece.
+  // CHECK-LABEL: @same_owner_partial_overlap_mixed_completion
+  tt.func @same_owner_partial_overlap_mixed_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+    %tma = ttg.local_alloc {buffer.id = 611 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %sync = ttg.local_alloc {buffer.id = 611 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
+    // CHECK: ttng.init_barrier %{{.*}}, 2
+    %value = arith.constant dense<0.000000e+00> : tensor<256x64xf16, #blocked>
+
+    scf.for %iv = %lb to %ub step %step : i32 {
+      // CHECK: ttng.barrier_expect %{{.*}}, 16384
+      // CHECK: ttng.async_tma_copy_global_to_local
+      nvws.descriptor_load %desc[%i, %i] 16384 %tma {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      ttg.local_store %value, %sync {ttg.partition = array<i32: 0>} : tensor<256x64xf16, #blocked> -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
+      // CHECK: ttng.arrive_barrier %{{.*}}, 1
+
+      %sync_value = ttg.local_load %sync {ttg.partition = array<i32: 1>} : !ttg.memdesc<256x64xf16, #shared, #smem, mutable> -> tensor<256x64xf16, #blocked>
+      %tma_value = ttg.local_load %tma {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_partial"(%sync_value, %tma_value) {ttg.partition = array<i32: 1>} : (tensor<256x64xf16, #blocked>, tensor<128x64xf16, #blocked>) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 1 : i32}
+    tt.return
+  }
+}
+
+
+// -----
+
+// Preserve post-loop access ownership through this lowering pipeline.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @post_ws_tmem_read_tag
+  tt.func @post_ws_tmem_read_tag(
+      %ub: i32,
+      %lhs: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %rhs: !ttg.memdesc<64x128xf16, #shared1, #smem>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %true = arith.constant true
+    %acc, %tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    // CHECK: [[READ:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x128x128xf32
+    // CHECK: ttng.tmem_store {{.*}}, [[READ]][]
+    %init = ttng.tmem_store %cst, %acc[%tok], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // The same semaphore token remains live across the loop. Every MMA uses
+    // its buffer, and one release after the loop tracks the final MMA.
+    %loop = scf.for %iv = %c0 to %ub step %c1 iter_args(%carry = %init) -> (!ttg.async.token) : i32 {
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%carry], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield {ttg.partition = array<i32: 1>} %mma : !ttg.async.token
+    } {tt.num_stages = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>], ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    // CHECK: ttng.tc_gen5_commit {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK: ttng.wait_barrier {{.*}} :
+    // CSE reuses the initial view; the read still follows the completion wait.
+    // CHECK: [[OUT:%.*]], {{%.*}} = ttng.tmem_load [[READ]][]
+    %out, %load_tok = ttng.tmem_load %acc[%loop] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    // The post-loop read is the last access; no release of [[EMPTY]] follows it.
+    // CHECK-NEXT: "use"([[OUT]])
+    "use"(%out) : (tensor<128x128xf32, #blocked>) -> ()
+    tt.return
+  }
+}
+
+
+//--- insert-tma-completion.mlir
+// Descriptor-store completion from raw accesses through TMA lowering.
+
+// TMA lowering does not propagate partition attrs to its new helper ops, so
+// this synthetic pre-partition fixture disables per-pass verification only
+// for the cross-pass order check. The production pipeline partitions first.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @direct_descriptor_store_completion
+  tt.func @direct_descriptor_store_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.id = 600 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %first = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x64xf16, #blocked>
+      ttg.local_store %first, %alloc {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %loaded = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      // The consumer release comes AFTER the descriptor store it must cover.
+      // CHECK: ttng.async_tma_copy_local_to_global
+      // CHECK-NEXT: ttng.async_tma_store_wait
+      // CHECK: ttng.arrive_barrier
+      tt.descriptor_store %desc[%i, %i], %loaded {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared>, tensor<128x64xf16, #blocked>
+      %next = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x64xf16, #blocked>
+      ttg.local_store %next, %alloc {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @already_lowered_tma_store_handoffs(
+      %desc: !tt.tensordesc<128x64xf32, #shared>,
+      %lb: i32, %ub: i32, %step: i32) {
+    %v0 = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked>
+    %v1 = arith.constant dense<1.000000e+00> : tensor<128x64xf32, #blocked>
+    // These exact-alias members model two consecutive output slices in one
+    // depth-2 physical staging allocation.
+    %m0 = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 602 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf32, #shared, #smem, mutable>
+    %m1 = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 602 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf32, #shared, #smem, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+      ttg.local_store %v0, %m0 {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked> -> !ttg.memdesc<128x64xf32, #shared, #smem, mutable>
+      // The TMA copy is a read of slot 0. Its release must stay after the
+      // token wait and hand the next writer slot 1.
+      %copy = ttng.async_tma_copy_local_to_global %desc[%i, %i] %m0 {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared>, !ttg.memdesc<128x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %copy {ttg.partition = array<i32: 1>} : !ttg.async.token
+      ttg.local_store %v1, %m1 {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked> -> !ttg.memdesc<128x64xf32, #shared, #smem, mutable>
+      // Async reduce has the same SMEM-read lifetime and must release only
+      // after its completion wait, back to slot 0 of the next iteration.
+      %reduce = ttng.async_tma_reduce add, %desc[%i, %i] %m1 {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared>, !ttg.memdesc<128x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %reduce {ttg.partition = array<i32: 1>} : !ttg.async.token
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @converted_descriptor_store_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.id = 601 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %first = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x64xf16, #linear>
+      ttg.local_store %first, %alloc {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #linear> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %loaded = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #linear>
+      %converted = ttg.convert_layout %loaded {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #linear> -> tensor<128x64xf16, #blocked>
+      // The consumer release comes AFTER the descriptor store even with the
+      // intervening layout conversion between the load and the store.
+      tt.descriptor_store %desc[%i, %i], %converted {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared>, tensor<128x64xf16, #blocked>
+      %next = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x64xf16, #linear>
+      ttg.local_store %next, %alloc {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #linear> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+
+//--- insert-post-ws-partition.mlir
+// Preserve post-loop access ownership through this lowering pipeline.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @post_ws_tmem_read_tag
+  tt.func @post_ws_tmem_read_tag(
+      %ub: i32,
+      %lhs: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %rhs: !ttg.memdesc<64x128xf16, #shared1, #smem>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %true = arith.constant true
+    %acc, %tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %init = ttng.tmem_store %cst, %acc[%tok], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // The same semaphore token remains live across the loop. Every MMA uses
+    // its buffer, and one release after the loop tracks the final MMA.
+    // CHECK: nvws.warp_group
+    %loop = scf.for %iv = %c0 to %ub step %c1 iter_args(%carry = %init) -> (!ttg.async.token) : i32 {
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%carry], %true, %true {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield {ttg.partition = array<i32: 1>} %mma : !ttg.async.token
+    } {tt.num_stages = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>], ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    // CHECK: ttng.tc_gen5_commit {{.*}} {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK: nvws.warp_group.return
+    // CSE reuses the initial view; the read still follows the completion wait.
+    // CHECK: [[POST_READ:%.*]] = ttg.memdesc_index {{.*}} : !ttg.memdesc<1x128x128xf32
+    // CHECK: [[POST_OUT:%.*]], {{%.*}} = ttng.tmem_load [[POST_READ]][]
+    %out, %load_tok = ttng.tmem_load %acc[%loop] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    // The post-loop read is the last access; no release of [[EMPTY]] follows it.
+    // CHECK-NEXT: "use"([[POST_OUT]])
+    "use"(%out) : (tensor<128x128xf32, #blocked>) -> ()
+    tt.return
+  }
+}
+
+
+//--- insert-pipeline-two-stages.mlir
+// Scheduling and token flow through a two-stage pipeline.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // This is the one-slot Q shape from attention backward. The final read at
+  // loop.stage 1 releases the slot reused by the loop.stage 0 store in a future
+  // iteration. Because the loop-carried dependency distance is one, the final
+  // read and next store execute in the same pipelined iteration; loop.cluster
+  // must order the store and its first consumer after the final read.
+  // CHECK-LABEL: @one_slot_recurrence
+  tt.func @one_slot_recurrence(%lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 420 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+    // CHECK: partition0
+    // CHECK: ttg.local_load
+    // CHECK: "consume_first"
+    // CHECK: scf.for
+    // CHECK: ttg.local_load
+    // CHECK: ttng.arrive_barrier
+    // CHECK: ttng.wait_barrier
+    // CHECK: ttg.local_load
+    // CHECK: "consume_first"
+    // CHECK: "consume_last"
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %value = "producer"() {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : () -> tensor<128x64xf16, #blocked>
+
+      ttg.local_store %value, %alloc {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+      %first = ttg.local_load %alloc {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_first"(%first) {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+
+      %last = ttg.local_load %alloc {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_last"(%last) {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+    } {tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // This is the same ownership cycle shifted across the two partitions. The
+  // EMPTY handoff requires owner delay +1 and the FULL handoff contributes -1,
+  // so the cycle is feasible but both handoffs meet in the same retimed wave.
+  // Cluster legalization must still put the final read before the next write.
+  // CHECK-LABEL: @retimed_zero_delay_cycle
+  tt.func @retimed_zero_delay_cycle(%lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 423 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+    // CHECK: partition0
+    // CHECK: ttg.local_load
+    // CHECK: "consume_first"
+    // CHECK: scf.for
+    // CHECK: ttg.local_load
+    // CHECK: ttng.arrive_barrier
+    // CHECK: ttng.wait_barrier
+    // CHECK: ttg.local_load
+    // CHECK: "consume_first"
+    // CHECK: "consume_last"
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %value = "producer"() {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : () -> tensor<128x64xf16, #blocked>
+      ttg.local_store %value, %alloc {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+      %first = ttg.local_load %alloc {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_first"(%first) {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+
+      %last = ttg.local_load %alloc {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_last"(%last) {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+    } {tt.scheduled_max_stage = 2 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 3>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @staged_tokenless_cross_stage_pou
+  tt.func @staged_tokenless_cross_stage_pou(%lb: i32, %ub: i32, %step: i32) {
+    %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 991 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    // The cross-iteration EMPTY edge goes from stage 1 to stage 0.  POU keeps
+    // both acquires inside the inner loop; neither loop carries an async token.
+    // The consecutive checks after FULL also prove that no third semaphore or
+    // pre-loop acquire was inserted.
+    scf.for %outer = %lb to %ub step %step : i32 {
+      scf.for %inner = %lb to %ub step %step : i32 {
+        "touch0"(%alloc) {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
+        "touch1"(%alloc) {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
+        "touch2"(%alloc) {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (!ttg.memdesc<1xi32, #shared, #smem, mutable>) -> ()
+      } {tt.scheduled_max_stage = 1 : i32, ttg.partition = array<i32: 0, 1>}
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+
+//--- insert-pipeline-four-stages.mlir
+// Owner-cycle scheduling through a four-stage pipeline.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // Two fresh writes advance a four-slot physical ring on every iteration.
+  // Each logical buffer therefore reuses its slots after two iterations. Its
+  // stage-3 EMPTY release followed by a stage-0 reacquire has required owner
+  // delay +1, but the reverse FULL handoff has delay -3. The complete owner
+  // cycle has delay -2 and is legal: the producer may block while the
+  // independent consumer releases the old slot.
+  // The pass folds both logical buffers onto one physical ring alloc and gives
+  // every protocol op an explicit slot-offset operand: offset 0 rides the
+  // current fresh-write cursor, while buffer a's consumer trio sits one fresh
+  // write behind it (offset -1) because b's store advanced the cursor between
+  // a's store and a's load.
+  // CHECK-LABEL: @legal_cross_partition_backpressure
+  tt.func @legal_cross_partition_backpressure(%lb: i32, %ub: i32, %step: i32) {
+    %a = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 422 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %b = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 422 : i32, buffer.start = 1 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+    // CHECK: ttg.warp_specialize
+    // CHECK: default {
+    // CHECK: scf.for
+    // CHECK: ttng.wait_barrier
+    // CHECK: ttg.local_load
+    // CHECK: partition0
+    // CHECK: scf.for
+    // CHECK: ttng.wait_barrier
+    // CHECK: ttg.local_store
+    // CHECK: partition1
+    // CHECK: scf.for
+    // CHECK: ttng.wait_barrier
+    // CHECK: ttg.local_store
+    scf.for %iv = %lb to %ub step %step : i32 {
+      %av = "producer_a"() {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : () -> tensor<128x64xf16, #blocked>
+      ttg.local_store %av, %a {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+      %bv = "producer_b"() {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : () -> tensor<128x64xf16, #blocked>
+      ttg.local_store %bv, %b {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+
+      %br = ttg.local_load %b {loop.cluster = 2 : i32, loop.stage = 3 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_b"(%br) {loop.cluster = 2 : i32, loop.stage = 3 : i32, ttg.partition = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> ()
+      %ar = ttg.local_load %a {loop.cluster = 2 : i32, loop.stage = 3 : i32, ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      "consume_a"(%ar) {loop.cluster = 2 : i32, loop.stage = 3 : i32, ttg.partition = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> ()
+    } {tt.scheduled_max_stage = 3 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
 }
