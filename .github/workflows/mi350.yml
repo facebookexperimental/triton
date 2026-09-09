@@ -150,17 +150,28 @@ jobs:
           # Report the slowest cases so future changes can reduce the runtime
           # without relying on brittle test-name filters.
           pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
+      - name: Run TLX Flash Attention cluster regression
+        id: run_fa_cluster_regression
+        timeout-minutes: 20
+        working-directory: tritonbench
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          pytest test/test_gpu/test_flash_attention_tlx_regression.py -v \
+            --junitxml=/tmp/tlx-fa-cluster-regression.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" ||
+                "${{ steps.run_correctness_tests.outcome }}" != "success" ||
+                "${{ steps.run_fa_cluster_regression.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml /tmp/tlx-fa-cluster-regression.xml \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "mi350-tlx-test" \
             ${FAILED_FLAG}
