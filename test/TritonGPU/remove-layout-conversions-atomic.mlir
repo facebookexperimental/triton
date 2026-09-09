@@ -43,3 +43,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// The two candidate layouts do not tie: #vec4 issues four contiguous fp32
+// atomics per thread, #vec2 only two. Relayout cost points the other way --
+// staying in #vec2 only converts the value, switching to #vec4 converts the
+// pointer and the mask -- but halving the atomic's vector width costs more
+// than the extra conversion, so vectorization must win.
+
+// CHECK: #[[$VEC4:.*]] = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+// CHECK-LABEL: @atomic_vector_width_beats_relayout_cost
+// CHECK: tt.atomic_rmw fadd, relaxed, gpu, %{{.*}}, %{{.*}}, %{{.*}} : (tensor<128x32x!tt.ptr<f32>, #[[$VEC4]]>, tensor<128x32xf32, #[[$VEC4]]>, tensor<128x32xi1, #[[$VEC4]]>) -> tensor<128x32xf32, #[[$VEC4]]>
+
+#vec4 = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+#vec2 = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
+  tt.func @atomic_vector_width_beats_relayout_cost(
+      %ptr: tensor<128x32x!tt.ptr<f32>, #vec2> {tt.contiguity = dense<[128, 1]> : tensor<2xi32>, tt.divisibility = dense<[32, 4]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+      %value: tensor<128x32xf32, #vec4>,
+      %mask: tensor<128x32xi1, #vec2> {tt.constancy = dense<[128, 1]> : tensor<2xi32>}) {
+    %value_vec2 = ttg.convert_layout %value : tensor<128x32xf32, #vec4> -> tensor<128x32xf32, #vec2>
+    %result = tt.atomic_rmw fadd, relaxed, gpu, %ptr, %value_vec2, %mask : (tensor<128x32x!tt.ptr<f32>, #vec2>, tensor<128x32xf32, #vec2>, tensor<128x32xi1, #vec2>) -> tensor<128x32xf32, #vec2>
+    tt.return
+  }
+}
