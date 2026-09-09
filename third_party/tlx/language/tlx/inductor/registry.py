@@ -1620,8 +1620,9 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         ]
 
 
-# export tuple of CUDA options in TLX
+# Export backend options owned by the optional TLX integration.
 tlx_only_cuda_options = ["ctas_per_cga"]
+tlx_only_hip_options = ["matrix_instr_nonkdim", "waves_per_eu", "kpack"]
 
 
 def get_tlx_config_key_and_kwargs(

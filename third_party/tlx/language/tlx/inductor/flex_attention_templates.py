@@ -85,9 +85,8 @@ def append_tlx_flex(
     original_kernel_options,
     sparse_q_block_size,
     sparse_kv_block_size,
-    mutated_inputs=None,
 ):
-    """Add TLX flex-attention template choices to ``choices``.
+    """Add TLX forward flex-attention template choices to ``choices``.
 
     Dispatches on the target, mirroring ``mm_templates.append_tlx``: arches in
     ``_AMD_FLEX_ARCHES`` go to :func:`_append_tlx_flex_amd`, everything else to
@@ -98,30 +97,13 @@ def append_tlx_flex(
       - "allow":   add TLX candidates alongside the standard template.
       - "force":   drop the standard choices and use only TLX.
 
-    The nine-node forward and sixteen-node backward payloads share this hook;
-    backward payloads are dispatched before forward-only indexing. The standard
-    forward input list is:
+    The standard nine-node forward input list is:
     (query, key, value, logsumexp, max_scores, kv_num_blocks, kv_indices,
     full_kv_num_blocks, full_kv_indices).
     """
     from torch._inductor import config
 
     if config.triton.tlx_mode is None:
-        return choices
-
-    if _is_backward_payload(input_nodes, subgraphs):
-        if _is_eligible_amd_flex_bwd(input_nodes):
-            _append_tlx_flex_amd_backward(
-                choices,
-                configs,
-                input_nodes,
-                subgraphs,
-                layout,
-                original_kernel_options,
-                sparse_q_block_size,
-                sparse_kv_block_size,
-                mutated_inputs,
-            )
         return choices
 
     if len(input_nodes) != 9:
@@ -144,6 +126,42 @@ def append_tlx_flex(
     if force_tlx and tlx_choices:
         choices.clear()
         choices.extend(tlx_choices)
+    return choices
+
+
+def append_tlx_flex_backward(
+    choices,
+    configs,
+    input_nodes,
+    subgraphs,
+    layout,
+    original_kernel_options,
+    sparse_q_block_size,
+    sparse_kv_block_size,
+    *,
+    mutated_inputs,
+):
+    """Add TLX backward flex-attention template choices to ``choices``."""
+    from torch._inductor import config
+
+    if config.triton.tlx_mode is None:
+        return choices
+
+    if not _is_backward_payload(input_nodes, subgraphs):
+        return choices
+
+    if _is_eligible_amd_flex_bwd(input_nodes):
+        _append_tlx_flex_amd_backward(
+            choices,
+            configs,
+            input_nodes,
+            subgraphs,
+            layout,
+            original_kernel_options,
+            sparse_q_block_size,
+            sparse_kv_block_size,
+            mutated_inputs,
+        )
     return choices
 
 

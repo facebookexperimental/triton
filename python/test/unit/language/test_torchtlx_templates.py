@@ -62,9 +62,10 @@ def flex_backward_choices_hook_available() -> bool:
     try:
         from torch._inductor.choices import InductorChoices
 
-        parameters = inspect.signature(InductorChoices.append_flex_attention_choices).parameters
-        return "mutated_inputs" in parameters
-    except (AttributeError, ImportError, TypeError, ValueError):
+        hook = InductorChoices.append_flex_attention_backward_choices
+        mutated_inputs = inspect.signature(hook).parameters["mutated_inputs"]
+        return mutated_inputs.kind is inspect.Parameter.KEYWORD_ONLY
+    except (AttributeError, ImportError, KeyError, TypeError, ValueError):
         return False
 
 
@@ -1779,6 +1780,66 @@ class TestFlexAttentionChoiceRegistration(TestCase):
             },
         )()
 
+    def test_flex_choices_use_separate_forward_and_backward_hooks(self):
+        """TLX must implement PyTorch's independent FlexAttention hooks."""
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        handler = TLXInductorChoices()
+        args = ([], [], [], object(), {}, 128, 128)
+        forward_choices = []
+        backward_choices = []
+        mutated_inputs = [object()]
+
+        with (
+                mock.patch.object(
+                    flex_attention_templates,
+                    "append_tlx_flex",
+                    return_value=forward_choices,
+                ) as append_forward,
+                mock.patch.object(
+                    flex_attention_templates,
+                    "append_tlx_flex_backward",
+                    return_value=backward_choices,
+                ) as append_backward,
+        ):
+            self.assertIs(
+                handler.append_flex_attention_choices(forward_choices, *args),
+                forward_choices,
+            )
+            self.assertIs(
+                handler.append_flex_attention_backward_choices(
+                    backward_choices,
+                    *args,
+                    mutated_inputs=mutated_inputs,
+                ),
+                backward_choices,
+            )
+
+        append_forward.assert_called_once_with(forward_choices, *args)
+        append_backward.assert_called_once_with(
+            backward_choices,
+            *args,
+            mutated_inputs=mutated_inputs,
+        )
+
+        forward_parameters = inspect.signature(TLXInductorChoices.append_flex_attention_choices).parameters
+        backward_parameters = inspect.signature(TLXInductorChoices.append_flex_attention_backward_choices).parameters
+        self.assertNotIn("mutated_inputs", forward_parameters)
+        self.assertIs(
+            backward_parameters["mutated_inputs"].kind,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+
+    def test_flex_backward_hip_options_are_exported_by_tlx(self):
+        """PyTorch discovers the backend kwargs from the optional TLX registry."""
+        from triton.language.extra.tlx.inductor import registry
+
+        self.assertEqual(
+            ["matrix_instr_nonkdim", "waves_per_eu", "kpack"],
+            registry.tlx_only_hip_options,
+        )
+
     def test_flex_backward_registration_does_not_depend_on_stock_config(self):
         """The reviewed TLX tile must be offered without PyTorch config support."""
         from triton.language.extra.tlx.inductor import flex_attention_templates
@@ -1797,7 +1858,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     self._Template(),
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._stock_backward_config()],
                 self._backward_inputs(),
@@ -1896,7 +1957,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     self._Template(),
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._stock_backward_config()],
                 self._backward_inputs(),
@@ -1935,7 +1996,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     self._Template(),
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._backward_config()],
                 self._backward_inputs(),
@@ -1974,7 +2035,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     create=True,
                 ),
         ):
-            result = flex_attention_templates.append_tlx_flex(
+            result = flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._backward_config(), self._backward_config()],
                 inputs,
@@ -2024,7 +2085,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     self._Template(),
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._backward_config()],
                 self._backward_inputs(),
@@ -2085,7 +2146,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             create=True,
                         ),
                 ):
-                    result = (flex_attention_templates.append_tlx_flex(
+                    result = (flex_attention_templates.append_tlx_flex_backward(
                         choices,
                         [self._backward_config()],
                         self._backward_inputs(dtype, head_dim),
@@ -2117,7 +2178,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     self._Template(),
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._stock_backward_config()],
                 self._backward_inputs(),
@@ -2131,8 +2192,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
 
         self.assertEqual(["stock"], choices)
 
-    def test_flex_backward_empty_configs_never_fall_through_to_forward(self):
-        """A malformed backward payload must retain the stock fallback."""
+    def test_flex_backward_empty_configs_keep_stock_fallback(self):
+        """An empty backward config list must retain the stock fallback."""
         from triton.language.extra.tlx.inductor import flex_attention_templates
 
         choices = ["stock"]
@@ -2144,7 +2205,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     return_value=True,
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [],
                 self._backward_inputs(),
@@ -2184,7 +2245,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             template,
                         ),
                 ):
-                    flex_attention_templates.append_tlx_flex(
+                    flex_attention_templates.append_tlx_flex_backward(
                         choices,
                         [self._backward_config()],
                         self._backward_inputs(),
@@ -2216,7 +2277,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     self._Template(),
                 ),
         ):
-            flex_attention_templates.append_tlx_flex(
+            flex_attention_templates.append_tlx_flex_backward(
                 choices,
                 [self._stock_backward_config()],
                 self._backward_inputs(),
