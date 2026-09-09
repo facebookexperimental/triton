@@ -615,34 +615,6 @@ void LayoutPropagation::propagateLayout() {
   }
 }
 
-// Compute the base shared memory usage from all existing local_alloc ops in the
-// function. This accounts for explicit buffers (data tiles, mbarriers) but not
-// scratch buffers from convert_layout ops, which are what we're trying to
-// eliminate.
-static unsigned computeBaseSmem(FuncOp funcOp) {
-  unsigned total = 0;
-  funcOp->walk([&](LocalAllocOp alloc) {
-    if (!alloc.isSharedMemoryAlloc())
-      return;
-    auto allocType = alloc.getType();
-    int64_t numElems;
-    if (auto paddedEnc =
-            dyn_cast<PaddedSharedEncodingAttr>(allocType.getEncoding())) {
-      SmallVector<int64_t> unpaddedShape = getShapePerCTA(allocType);
-      numElems = paddedEnc.getPaddedSize(unpaddedShape);
-    } else {
-      auto shapePerCTA = getAllocationShapePerCTA(allocType);
-      numElems = product<int64_t>(shapePerCTA);
-    }
-    total += numElems * allocType.getElementTypeBitWidth() / 8;
-  });
-  return total;
-}
-
-// Estimate the scratch buffer cost (in bytes) that would result from choosing
-// `encoding` for `value`. This checks each operand of value's defining op: if
-// an operand is an anchor with a different layout, a convert_layout will be
-// needed, and we estimate its scratch size.
 static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
   Operation *op = value.getDefiningOp();
   if (!op)
@@ -831,6 +803,7 @@ static std::pair<int64_t, int64_t> estimateRelayout(
 
 void LayoutPropagation::resolveConflicts() {
   std::unique_ptr<ModuleAxisInfoAnalysis> axisInfoAnalysis;
+  std::optional<size_t> smemFootprint;
   // Snapshot: the loop below collapses each entry to a single encoding.
   llvm::DenseMap<Value, llvm::SmallSetVector<Attribute, 8>> candidates;
   for (auto &it : layouts)
@@ -909,27 +882,28 @@ void LayoutPropagation::resolveConflicts() {
     // Budget-aware override: if the chosen encoding would introduce a
     // convert_layout whose scratch buffer pushes SMEM over budget, pick the
     // candidate with the lowest scratch cost instead.
-    if (smemBudget > 0) {
-      unsigned baseCost = computeBaseSmem(funcOp);
+    if (smemBudget > 0 && !smemFootprint)
+      smemFootprint =
+          ModuleAllocation(funcOp->getParentOfType<ModuleOp>())
+              .getSharedMemorySize(cast<FunctionOpInterface>(*funcOp));
+    if (smemBudget > 0 && *smemFootprint > smemBudget) {
       unsigned scratchCost = estimateConvertScratchCost(it.first, encoding);
-      if (baseCost + scratchCost > smemBudget) {
-        LDBG("Budget override: base=" << baseCost << " scratch=" << scratchCost
-                                      << " total=" << (baseCost + scratchCost)
-                                      << " budget=" << smemBudget);
-        // Try each candidate and pick the one with lowest scratch cost.
-        Attribute bestEncoding = encoding;
-        unsigned bestScratchCost = scratchCost;
-        for (Attribute e : info.encodings) {
-          unsigned cost = estimateConvertScratchCost(it.first, e);
-          if (cost < bestScratchCost) {
-            bestScratchCost = cost;
-            bestEncoding = e;
-          }
+      LDBG("Budget override: footprint=" << *smemFootprint
+                                         << " scratch=" << scratchCost
+                                         << " budget=" << smemBudget);
+      // Try each candidate and pick the one with lowest scratch cost.
+      Attribute bestEncoding = encoding;
+      unsigned bestScratchCost = scratchCost;
+      for (Attribute e : info.encodings) {
+        unsigned cost = estimateConvertScratchCost(it.first, e);
+        if (cost < bestScratchCost) {
+          bestScratchCost = cost;
+          bestEncoding = e;
         }
-        if (bestEncoding != encoding) {
-          LDBG("  Overriding to encoding with scratch=" << bestScratchCost);
-          encoding = bestEncoding;
-        }
+      }
+      if (bestEncoding != encoding) {
+        LDBG("  Overriding to encoding with scratch=" << bestScratchCost);
+        encoding = bestEncoding;
       }
     }
 
@@ -2381,8 +2355,10 @@ public:
   // through the convert's users and erase the convert.
   DenseSet<Operation *> eliminateOverBudgetConverts(ModuleOp m) {
     DenseSet<Operation *> forcedHoists;
-    m.walk([this, &forcedHoists](FuncOp funcOp) {
-      unsigned baseSmem = computeBaseSmem(funcOp);
+    ModuleAllocation allocation(m);
+    m.walk([&](FuncOp funcOp) {
+      if (allocation.getSharedMemorySize(funcOp) <= smemBudget)
+        return;
 
       // Collect converts whose scratch would push SMEM over budget.
       SmallVector<ConvertLayoutOp> candidates;
@@ -2394,11 +2370,7 @@ public:
           return;
         if (!cvtNeedsSharedMemory(srcTy, dstTy))
           return;
-        unsigned scratchBytes = getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
-                                getElementBitWidth(srcTy) / 8;
-        if (baseSmem + scratchBytes > smemBudget) {
-          candidates.push_back(cvt);
-        }
+        candidates.push_back(cvt);
       });
 
       for (ConvertLayoutOp cvt : candidates) {
