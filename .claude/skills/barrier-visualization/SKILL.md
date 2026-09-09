@@ -1,7 +1,8 @@
 ---
 name: barrier-visualization
 description: >
-  Produce a structured barrier report for AutoWS (automatic warp specialization) IR.
+  Produce a structured barrier report for AutoWS (automatic warp specialization) IR,
+  including focused reuse-group timelines and symbolic barrier-phase formulas.
   Use when the user wants to visualize, audit, or debug barrier usage across
   warp-specialized partitions, or when debugging a GPU kernel hang (deadlock).
   For hangs, first dump IR using the ir-debugging skill, then run this barrier
@@ -100,6 +101,64 @@ For each arrow, annotate:
 - What data flows across (buffer name or tensor shape)
 - The direction: **forward** (producer → consumer) or **backward** (consumer →
   producer, signaling resource reuse)
+
+#### Focused Reuse-Group Timeline
+
+When the user selects a reuse group, or when one reuse group is implicated in a
+race or deadlock, include a timeline for every related partition. Preserve final
+TTGIR operation order and split each partition into:
+
+- **Prologue**: operations before the expanded steady-state loop.
+- **Steady state**: operations inside the expanded loop body.
+- **Epilogue**: operations after the expanded loop, including conditional
+  epilogues.
+
+Include only the selected group's relevant MMAs, loads/stores, waits, arrives,
+commits, and arithmetic computing their predicates, indices, and phases. Do not
+reorder operations for presentation.
+
+Name each barrier by both semantic role and actual SSA allocation root. Debug
+names such as `dq` may be reused for distinct FULL and EMPTY barriers. Trace
+aliases through `ttg.warp_specialize` operands, partition block arguments, loop
+iter_args, and `ttg.memdesc_index`, for example:
+
+```
+dQ_FULL  : %dq -> %arg77 -> %dq_full_slot
+dQ_EMPTY : %dq_49 -> %arg134 -> %dq_empty_slot
+```
+
+Normalize phase arithmetic into symbolic expressions. Define the relevant
+counters first, for example:
+
+```
+O       = outer-loop accumulated count
+A       = inner accumulated count carried into the outer iteration
+A_exit  = accumulated count entering the epilogue
+empty_phase(x) = NOT(x & 1)              # depth 1
+slot(x, D)     = x % D                   # depth D
+phase(x, D)    = (x / D) & 1             # depth D
+```
+
+Show the original SSA expression beside the normalized form. Trace any inner
+accumulated count through the enclosing outer loop's iter_args and yield values.
+In particular, make differences such as `phase(A_exit)` versus
+`phase(A_exit + 1)` explicit.
+
+For every `arrive_barrier`, state that it has no phase operand and identify the
+phase transition it enables for a subsequent wait. Pair every wait with the
+arrive, commit, or implicit TMA/MMA completion that can satisfy it. If two waits
+use the same barrier, state whether their phase expressions are equal or
+opposite; never infer a deadlock from raw wait/arrive counts.
+
+When comparing two IRs, finish with a boundary table:
+
+```
+| Region       | Old wait/phase | New wait/phase | Effect |
+|--------------|----------------|----------------|--------|
+| Prologue     | ...            | ...            | ...    |
+| Steady state | ...            | ...            | ...    |
+| Epilogue     | ...            | ...            | ...    |
+```
 
 #### Backwards-Direction Barriers
 
@@ -486,10 +545,14 @@ Include:
     an extra cross-partition channel. This is NOT caught by arrive/wait-count
     balancing — the extra channel's barriers are individually balanced; it is a
     channel that should not exist. Emit the coverage row even when clean.
+12. **For a focused reuse group, emit the expanded timeline.** Identify every
+    related partition, preserve final TTGIR operation order, split it into
+    prologue/steady-state/epilogue, and print actual barrier roots and aliases
+    together with normalized slot, phase, and predicate expressions.
 
 ## Example Reports
 
-See `EXAMPLES.md` in this skill directory for two fully worked example reports:
+See `EXAMPLES.md` in this skill directory for worked example reports:
 1. **Blackwell GEMM with merged barriers** -- `@matmul_kernel_tma_persistent` from
    `ws_code_partition_merged_barrier.mlir`. Demonstrates merged `buffer.id`,
    TMEM token chains, and `tc_gen5_mma` barrier patterns.
@@ -497,6 +560,9 @@ See `EXAMPLES.md` in this skill directory for two fully worked example reports:
    `ws_code_partition.mlir`. Demonstrates legacy producer/consumer barriers,
    shared SMEM buffers consumed by multiple partitions, and pre-code-partition
    `async_task_id` analysis.
+3. **Focused reuse-group timeline template** -- demonstrates actual barrier SSA
+   names, per-partition prologue/steady/epilogue ordering, and symbolic phase
+   formulas derived from nested-loop accumulated counts.
 
 ## Reference Files
 
