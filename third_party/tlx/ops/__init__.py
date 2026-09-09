@@ -33,7 +33,8 @@ from __future__ import annotations
 
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
-__all__ = ["mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
+__all__ = ["mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+           "UnsupportedOp", "InvalidInput"]
 
 
 def mm(a, b, *, arch=None, space="heuristic"):
@@ -88,3 +89,23 @@ def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seq
     fn, spec = impl_for("kimi_delta_attention", arch)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     return fn(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space)
+
+
+def kda_paged_prefill(q, k, v, g, beta, *, scale=1.0, initial_state, cu_seqlens, arch=None):
+    """Prepared-input chunked KDA prefill for packed `[1, T, H, 128]` tensors.
+
+    `g` contains per-channel log decays and `beta` is sigmoid-applied.
+    State is FP32 and V-major: `[N, H, 128, 128]`.
+    """
+    fn, spec = impl_for("kda_paged_prefill", arch)
+    check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
+    return fn(q, k, v, g, beta, scale=scale, initial_state=initial_state, cu_seqlens=cu_seqlens)
+
+
+def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indices, write_indices, cu_seqlens,
+                         arch=None):
+    """Prepared-input indexed KDA recurrence over an FP32 V-major state pool."""
+    fn, spec = impl_for("kda_recurrent_decode", arch)
+    check_inputs(spec, dtype=q.dtype, KEY_DIM=q.shape[-1], VALUE_DIM=v.shape[-1])
+    return fn(q, k, v, g, beta, scale=scale, state_pool=state_pool, read_indices=read_indices,
+              write_indices=write_indices, cu_seqlens=cu_seqlens)

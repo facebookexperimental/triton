@@ -33,6 +33,7 @@ class OpSpec:
 
 
 _FP16 = frozenset({"float16", "bfloat16"})
+_BF16 = frozenset({"bfloat16"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -95,6 +96,22 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="kda_paged_prefill",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.kda.gfx950_prefill:kda_paged_prefill",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("KEY_DIM") == 128 and d.get("VALUE_DIM") == 128,
+    ),
+    OpSpec(
+        op="kda_recurrent_decode",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.kda.gfx950_decode:kda_recurrent_decode",
+        dtypes=_BF16,
+        accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
 )
 

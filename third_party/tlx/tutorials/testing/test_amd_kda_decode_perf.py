@@ -1,4 +1,4 @@
-"""Performance harness for the generic gfx950 TLX KDA decode tutorial."""
+"""Performance harness for the gfx950 TLX KDA recurrent decode operator."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import time
 
 import torch
 import triton
-from triton.language.extra.tlx.tutorials.amd_kda_decode import kda_recurrent_decode_tlx
+from triton.tlx.ops import kda_recurrent_decode
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 DIM = 128
@@ -58,7 +58,7 @@ def make_decode_runner(provider: str, inputs):
         return None
 
     def run():
-        return kda_recurrent_decode_tlx(
+        return kda_recurrent_decode(
             q,
             k,
             v,

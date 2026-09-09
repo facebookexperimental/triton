@@ -17,6 +17,8 @@ TLX local-memory async copies stage the shared WY and causal matrices.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import torch
 import triton
 import triton.language as tl
@@ -28,25 +30,51 @@ _KEY_DIM = 128
 _VALUE_DIM = 128
 
 
+def _chunk_pairs(boundaries: list[int], chunk_size: int) -> list[tuple[int, int]]:
+    return [
+        (sequence, local_chunk)
+        for sequence, (begin, end) in enumerate(pairwise(boundaries))
+        for local_chunk in range((end - begin + chunk_size - 1) // chunk_size)
+    ]
+
+
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int = CHUNK_SIZE) -> torch.Tensor:
-    """Map packed global chunks to ``(sequence, local_chunk)`` on-device."""
+    """Map packed global chunks to ``(sequence, local_chunk)``."""
     if cu_seqlens.ndim != 1:
         raise ValueError("cu_seqlens must be a vector")
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    chunk_counts = torch.div(lengths + chunk_size - 1, chunk_size, rounding_mode="floor")
-    offsets = torch.zeros(
-        chunk_counts.numel() + 1,
-        dtype=cu_seqlens.dtype,
-        device=cu_seqlens.device,
-    )
-    torch.cumsum(chunk_counts, dim=0, out=offsets[1:])
-    total_chunks = int(offsets[-1].item())
-    if total_chunks == 0:
-        return torch.empty((0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
-    global_chunks = torch.arange(total_chunks, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
-    sequence_ids = torch.searchsorted(offsets[1:], global_chunks, right=True)
-    local_chunks = global_chunks - offsets[sequence_ids]
-    return torch.stack((sequence_ids, local_chunks), dim=1)
+    boundaries = cu_seqlens.detach().to(device="cpu", dtype=torch.int64).tolist()
+    pairs = _chunk_pairs(boundaries, chunk_size)
+    if not pairs:
+        return torch.empty((0, 2), dtype=torch.int32, device=cu_seqlens.device)
+    return torch.tensor(pairs, dtype=torch.int32, device=cu_seqlens.device)
+
+
+_PREFILL_METADATA_CACHE = []
+
+
+def _prepare_prefill_metadata(cu_seqlens: torch.Tensor, device: torch.device, total_tokens: int):
+    """Cache the latest packed schedule by tensor identity and version."""
+    version = cu_seqlens._version
+    if _PREFILL_METADATA_CACHE:
+        source, cached_version, cached_device, cached_tokens, value = _PREFILL_METADATA_CACHE
+        if source is cu_seqlens and (cached_version, cached_device, cached_tokens) == (version, device, total_tokens):
+            return value
+
+    boundaries = cu_seqlens.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if not boundaries or boundaries[0] != 0 or boundaries[-1] != total_tokens:
+        raise ValueError("cu_seqlens must start at zero and end at the packed token count")
+    if any(end < begin for begin, end in pairwise(boundaries)):
+        raise ValueError("cu_seqlens must be nondecreasing")
+
+    cu_device = cu_seqlens
+    if cu_device.device != device or cu_device.dtype != torch.int32 or not cu_device.is_contiguous():
+        cu_device = cu_device.to(device=device, dtype=torch.int32).contiguous()
+    pairs = _chunk_pairs(boundaries, CHUNK_SIZE)
+    chunk_indices = (torch.tensor(pairs, dtype=torch.int32, device=device) if pairs else
+                     torch.empty((0, 2), dtype=torch.int32, device=device))
+    value = (cu_device, chunk_indices)
+    _PREFILL_METADATA_CACHE[:] = [cu_seqlens, version, device, total_tokens, value]
+    return value
 
 
 @triton.jit
@@ -700,7 +728,7 @@ def _validate_prefill_inputs(
     return total_tokens, heads, key_dim, value_dim
 
 
-def kda_paged_prefill_tlx(
+def kda_paged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -727,11 +755,7 @@ def kda_paged_prefill_tlx(
     g = g[0].contiguous()
     beta = beta[0].to(dtype=torch.float32).contiguous()
     initial_state = initial_state.contiguous()
-    cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
-    if int(cu_seqlens[0].item()) != 0 or int(cu_seqlens[-1].item()) != total_tokens:
-        raise ValueError("cu_seqlens must start at zero and end at the packed token count")
-
-    chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+    cu_seqlens, chunk_indices = _prepare_prefill_metadata(cu_seqlens, q.device, total_tokens)
     num_chunks = chunk_indices.shape[0]
     num_sequences = cu_seqlens.numel() - 1
     if num_chunks == 0:
@@ -821,7 +845,8 @@ def kda_paged_prefill_tlx(
     v_new = torch.empty_like(v)
     output = torch.empty_like(v)
     final_state = torch.empty_like(initial_state)
-    state_block_value = 16
+    state_block_value = 32 if heads >= 12 and num_sequences >= 4 else 16
+    state_waves_per_eu = 1 if heads >= 12 and num_sequences >= 8 else 2
     _state_scan_kernel[(triton.cdiv(value_dim, state_block_value), num_sequences * heads)](
         w,
         u,
@@ -840,7 +865,7 @@ def kda_paged_prefill_tlx(
         BV=state_block_value,
         num_warps=4,
         num_stages=2,
-        waves_per_eu=2,
+        waves_per_eu=state_waves_per_eu,
     )
     _output_tail_kernel[(num_chunks, heads, 2)](
         aqk,
@@ -862,6 +887,6 @@ def kda_paged_prefill_tlx(
 __all__ = [
     "CHUNK_SIZE",
     "SUBCHUNK_SIZE",
-    "kda_paged_prefill_tlx",
+    "kda_paged_prefill",
     "prepare_chunk_indices",
 ]

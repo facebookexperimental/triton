@@ -192,7 +192,7 @@ def _validate_decode_inputs(
     return batch, heads, key_dim
 
 
-def kda_recurrent_decode_tlx(
+def kda_recurrent_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -217,14 +217,16 @@ def kda_recurrent_decode_tlx(
         write_indices,
         cu_seqlens,
     )
-    value_dim = v.shape[-1]
     g = g.contiguous()
     beta = beta.to(dtype=torch.float32).contiguous()
-    read_indices = read_indices.to(device=q.device, dtype=torch.int32).contiguous()
-    write_indices = write_indices.to(device=q.device, dtype=torch.int32).contiguous()
-    cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
-
-    output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    metadata = []
+    for tensor in (read_indices, write_indices, cu_seqlens):
+        if tensor.device != q.device or tensor.dtype != torch.int32 or not tensor.is_contiguous():
+            tensor = tensor.to(device=q.device, dtype=torch.int32).contiguous()
+        metadata.append(tensor)
+    read_indices, write_indices, cu_seqlens = metadata
+    output = torch.empty_like(v)
+    value_dim = v.shape[-1]
     block_key = max(8, triton.next_power_of_2(key_dim))
     # Narrow value panels expose enough independent programs at small H/batch.
     block_value = 8
@@ -260,5 +262,5 @@ def kda_recurrent_decode_tlx(
 
 
 __all__ = [
-    "kda_recurrent_decode_tlx",
+    "kda_recurrent_decode",
 ]
