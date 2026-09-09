@@ -331,13 +331,18 @@ def _issue_qdo_bm32_async(
     qdo_base = (q_start * HQ + q_head.to(tl.int64)) * D
     offsets = (rows[:, :, None] * HQ * D + dims[None, None, :]).to(tl.int32)
     offsets = tlx.require_layout(offsets, ASYNC_LAYOUT, pin=False)
-    other = tlx.zeros((1, BLOCK_M, D), tl.bfloat16, layout=ASYNC_LAYOUT)
+    if (outer_block + 1) * BLOCK_M > q_len:
+        # Masked direct-to-LDS copies leave OOB rows untouched. Clear the tail
+        # tile first so those rows remain zero without materializing an OOB
+        # buffer offset for every lane in each async load.
+        tlx.local_store(q_dst, tl.zeros((1, BLOCK_M, D), tl.bfloat16))
+        tlx.local_store(do_dst, tl.zeros((1, BLOCK_M, D), tl.bfloat16))
+        tl.debug_barrier()
     q_token = tlx.buffer_load_to_local(
         q_dst,
         tl.multiple_of(Q + qdo_base, 16),
         offsets,
         mask=valid,
-        other=other,
     )
     tlx.async_load_commit_group([q_token])
     do_token = tlx.buffer_load_to_local(
@@ -345,7 +350,6 @@ def _issue_qdo_bm32_async(
         tl.multiple_of(DO + qdo_base, 16),
         offsets,
         mask=valid,
-        other=other,
     )
     tlx.async_load_commit_group([do_token])
 
