@@ -97,6 +97,12 @@ unsigned getContiguity(Value ptr, Value offset,
 // Determine the vector size of a tensor of pointers
 unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass);
 
+// Determine the vector size from per-thread and analyzed contiguity without
+// requiring the pointer base to have the vector's natural alignment.
+unsigned
+getVectorSizeIgnoringAlignment(Value ptr,
+                               ModuleAxisInfoAnalysis &axisAnalysisPass);
+
 // Given a scalar pointer and a tensor of offsets, determine the vector size
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass);
