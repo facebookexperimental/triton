@@ -1,6 +1,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "mlir/IR/DialectImplementation.h" // required by `Types.cpp.inc`
 #include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -96,19 +97,56 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (shape.empty()) {
     return emitError() << "rank 0 memdesc is not allowed";
   }
-  // Every dimension but the first (to allow for pipelining) must be a power of
-  // 2
-  if (!llvm::all_of(shape.drop_front(1), [](int64_t dim) {
-        return llvm::isPowerOf2_64(dim) && dim > 0;
-      }))
-    return emitError()
-           << "shape must have power-of-2 and non-zero dimensions; got "
-           << shape;
-  if (shape.front() == 0)
+  unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elementType);
+  if (bitwidth != 1 && bitwidth < 8)
+    return emitError() << "element type bit width must be 1 or at least 8; got "
+                       << bitwidth;
+  if (llvm::is_contained(shape, 0))
     return emitError() << "shape has 0 dimension";
+  if (llvm::is_contained(allocShape, 0))
+    return emitError() << "alloc shape has 0 dimension";
   if (allocShape.size() < shape.size())
     return emitError()
            << "alloc shape must have at least as many dimensions as shape";
+  bool isDummyTMEM = isa<triton::tlx::DummyTMEMLayoutAttr>(encoding);
+  auto layoutEncoding = dyn_cast_if_present<LayoutEncodingTrait>(encoding);
+  if (!layoutEncoding && !isDummyTMEM)
+    return emitError() << encoding << " is not a valid encoding";
+  if (!isDummyTMEM) {
+    auto rank = layoutEncoding.getRank();
+    if (isa<nvidia_gpu::TensorMemoryEncodingAttr>(encoding)) {
+      if (shape.size() != 2 && shape.size() != 3)
+        return emitError() << "rank must be 2 or 3";
+    } else if (isa<SharedEncodingTrait>(encoding)) {
+      if (!(rank == shape.size() || rank == shape.size() - 1))
+        return emitError() << "rank must be equal to or one less than "
+                           << "the shape size. Got " << rank << " and "
+                           << shape.size();
+    } else if (isa<nvidia_gpu::TensorMemoryScalesEncodingAttr>(encoding)) {
+      if (shape.size() != 2 && shape.size() != 3)
+        return emitError() << "tensor-memory scale descriptors must have rank "
+                              "2 or 3; got "
+                           << shape.size();
+    }
+    // Every layout dimension must be a power of 2; only a leading pipeline
+    // dimension and a shared buffer's first dimension may have another
+    // positive size.
+    ArrayRef<int64_t> layoutShape = dropPipeliningDim(shape, encoding);
+    ArrayRef<int64_t> layoutAllocShape =
+        dropPipeliningDim(allocShape, encoding);
+    bool isShared = isa<SharedEncodingTrait>(encoding);
+    auto shapeToCheck = isShared ? layoutShape.drop_front() : layoutShape;
+    auto allocShapeToCheck =
+        isShared ? layoutAllocShape.drop_front() : layoutAllocShape;
+    if (!llvm::all_of(shapeToCheck, llvm::isPowerOf2_64))
+      return emitError()
+             << "shape must have power-of-2 and non-zero dimensions; got "
+             << shape;
+    if (!llvm::all_of(allocShapeToCheck, llvm::isPowerOf2_64))
+      return emitError()
+             << "alloc shape must have power-of-2 and non-zero dimensions; got "
+             << allocShape;
+  }
   if (llvm::any_of(
           llvm::zip(shape, allocShape.take_back(shape.size())),
           [](auto pair) { return std::get<0>(pair) > std::get<1>(pair); }))
@@ -120,23 +158,11 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
       return emitError() << "memorySpace must be TensorMemorySpace";
     }
-    if (shape.size() != 2 && shape.size() != 3) {
-      return emitError() << "rank must be 2 or 3";
-    }
-    auto isPowerOfTwo = [](int64_t dim) {
-      return llvm::isPowerOf2_64(dim) && dim > 0;
-    };
-    if (!llvm::all_of(shape.take_back(2), isPowerOfTwo)) {
-      return emitError()
-             << "shape must have power-of-2 and non-zero dimensions; got "
-             << shape;
-    }
-    if (!llvm::all_of(allocShape.take_back(2), isPowerOfTwo)) {
-      return emitError()
-             << "alloc shape must have power-of-2 and non-zero dimensions; got "
-             << allocShape;
-    }
     unsigned bitwidth = elementType.getIntOrFloatBitWidth();
+    if (bitwidth < 8)
+      return emitError()
+             << "tensor-memory element type bit width must be at least 8; got "
+             << bitwidth;
     if (bitwidth * enc.getColStride() > 32) {
       return emitError()
              << "bitwidth * colStride must be less than or equal to 32. Got "
@@ -144,7 +170,7 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
     // Takes subslices into account and figures out whether we can construct
     // the linear layout at all
-    allocShape = allocShape.take_back(2);
+    allocShape = dropPipeliningDim(allocShape, enc);
     auto ctaSplit = enc.getCGALayout().getCTASplitNum();
     auto blockN = std::min<int32_t>(enc.getBlockN(), shape.back());
     if (shape[shape.size() - 2] < enc.getBlockM() * ctaSplit[0] ||
@@ -170,12 +196,6 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
                             "SharedClusterMemorySpace for shared encoding. "
                          << "Got " << memorySpace;
     }
-    auto rank = cast<LayoutEncodingTrait>(enc).getRank();
-    if (!(rank == shape.size() || rank == shape.size() - 1)) {
-      return emitError() << "rank must be equal to or one less than "
-                         << "the shape size. Got " << rank << " and "
-                         << shape.size();
-    }
   } else if (auto enc = dyn_cast<nvidia_gpu::TensorMemoryScalesEncodingAttr>(
                  encoding)) {
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
@@ -195,8 +215,6 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (memorySpace != nvidia_gpu::TensorMemorySpaceAttr::get(ctx)) {
       return emitError() << "memorySpace must be TensorMemorySpace";
     }
-  } else {
-    return emitError() << encoding << " is not a valid encoding";
   }
 
   // PaddedSharedEncodingAttr is also a SharedEncodingTrait but we have some
@@ -207,9 +225,7 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     // pipelining dimension
     auto outDims = standardOutDimNames(ctx, rank);
     const auto &ll = enc.getLinearComponent();
-    auto expectedShape = allocShape;
-    if (rank == allocShape.size() - 1)
-      expectedShape = expectedShape.drop_front(1);
+    auto expectedShape = dropPipeliningDim(allocShape, enc);
 
     for (auto d = 0; d < rank; d++) {
       if (ll.getOutDimSize(outDims[d]) != expectedShape[d]) {
@@ -220,14 +236,14 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     }
   } else if (auto enc = dyn_cast<NVMMASharedEncodingAttr>(encoding)) {
     SmallVector<int64_t> shapePerCTA(getShapePerCTA(enc, allocShape));
-    auto blockShape = ArrayRef(shapePerCTA).take_back(enc.getRank());
+    auto blockShape = dropPipeliningDim(ArrayRef(shapePerCTA), enc);
     if (failed(getTMABlockShape(blockShape, enc.getElementBitWidth(),
                                 enc.getSwizzlingByteWidth(), enc.getFp4Padded(),
                                 enc.getTransposed(), /*packedSize=*/false,
                                 emitError, TMAMode::Tiled)))
       return failure();
   } else if (auto enc = dyn_cast<SharedLinearEncodingAttr>(encoding)) {
-    auto blockShape = ArrayRef(allocShape).take_back(enc.getRank());
+    auto blockShape = dropPipeliningDim(allocShape, enc);
     const LinearLayout &ll = enc.getLinearLayout();
     for (auto [dim, size, llSize] :
          llvm::enumerate(blockShape, ll.getOutDimSizes())) {

@@ -853,3 +853,62 @@ class TestCtasPerCgaAutotunerSteadyState(TestCase):
         add_kernel_2cta[grid](x2, y2, o2, n)
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(o2, x2 + y2))
+
+    @unittest.skipUnless(is_hopper_or_newer(), "ctas_per_cga is NVIDIA-only and requires Hopper (sm90) or newer")
+    def test_new_key_does_not_inherit_previous_cluster_config(self):
+
+        def prune_configs(configs, named_args, **kwargs):
+            n_elements = named_args["n_elements"]
+            num_ctas = 2 if n_elements == 256 else 1
+            return [config for config in configs if config.kwargs["NUM_CTAS"] == num_ctas]
+
+        @triton.autotune(
+            configs=[
+                triton.Config(
+                    {"BLOCK_SIZE": 128, "NUM_CTAS": 2},
+                    num_warps=4,
+                    num_stages=1,
+                    ctas_per_cga=(2, 1, 1),
+                ),
+                triton.Config(
+                    {"BLOCK_SIZE": 128, "NUM_CTAS": 1},
+                    num_warps=4,
+                    num_stages=1,
+                ),
+            ],
+            key=["n_elements"],
+            prune_configs_by={"early_config_prune": prune_configs},
+        )
+        @triton.jit
+        def add_kernel_mixed_ctas(
+            x_ptr,
+            y_ptr,
+            out_ptr,
+            n_elements,
+            BLOCK_SIZE: tl.constexpr,
+            NUM_CTAS: tl.constexpr,
+        ):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offs < n_elements
+            x = tl.load(x_ptr + offs, mask=mask)
+            y = tl.load(y_ptr + offs, mask=mask)
+            tl.store(out_ptr + offs, x + y, mask=mask)
+
+        device = _get_device()
+
+        def run(n):
+            def grid(meta):
+                num_ctas = meta["NUM_CTAS"]
+                tiles = triton.cdiv(n, meta["BLOCK_SIZE"])
+                return (triton.cdiv(tiles, num_ctas) * num_ctas, )
+
+            x = torch.randn(n, device=device, dtype=torch.float32)
+            y = torch.randn(n, device=device, dtype=torch.float32)
+            out = torch.empty(n, device=device, dtype=torch.float32)
+            add_kernel_mixed_ctas[grid](x, y, out, n)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.allclose(out, x + y))
+
+        run(256)
+        run(384)

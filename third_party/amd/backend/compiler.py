@@ -114,6 +114,7 @@ class HIPOptions:
     max_num_imprecise_acc_default: int = 0
     backend_name: str = "hip"
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -445,7 +446,7 @@ class HIPBackend(BaseBackend):
             )
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
         tlx.tlx_passes.add_tlx_dump_layout(pm)
@@ -471,7 +472,7 @@ class HIPBackend(BaseBackend):
 
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
 
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

@@ -153,6 +153,7 @@ class CudaUtils(object):
         self.get_current_device = mod.get_current_device
         self.set_current_device = mod.set_current_device
         self.get_default_stream = mod.get_default_stream
+        self.is_stream_capturing = mod.is_stream_capturing
         self.get_device_capability = mod.get_device_capability
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
@@ -444,19 +445,6 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
     return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
 
 
-def wrap_handle_gsan(launcher):
-
-    def inner(*args):
-        import triton.experimental.gsan._allocator as gsan_allocator
-
-        device = triton.runtime.driver.active.get_current_device()
-        device_rank = gsan_allocator.get_device_rank(device)
-        gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
-        return launcher(*args[:-1], (*args[-1], gsan_state_ptr))
-
-    return inner
-
-
 class CudaLauncher(object):
 
     def __init__(self, src, metadata):
@@ -465,6 +453,11 @@ class CudaLauncher(object):
         constants = {arg_idx(idx): value for idx, value in constants.items()}
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
+        self.gsan_enabled = "gsan" in getattr(metadata, "instrumentation_mode", "")
+        if self.gsan_enabled:
+            signature["_gsan_globals_ptr"] = "*i8"
+            signature["_gsan_stream_clock_ptr"] = "*i32"
+            signature["_gsan_kernel_id"] = "i64"
 
         launcher = triton.runtime.driver.active.utils.launch
 
@@ -480,14 +473,9 @@ class CudaLauncher(object):
         # the old schema path (asserted by
         # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
         expanded_signature = expand_signature(signature.values(), tensordesc_meta)
-        gsan_enabled = "gsan" in metadata.instrumentation_mode
-        if gsan_enabled:
-            expanded_signature.append("*i8")
         self.kernel_signature = make_kernel_signature(expanded_signature)
         self.arg_annotations = annotate_arguments(expanded_signature)
 
-        if gsan_enabled:
-            launcher = wrap_handle_gsan(launcher)
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
         # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
         # launcher builds each CUtensorMap host-side from existing scalar args
@@ -552,6 +540,20 @@ class CudaLauncher(object):
         else:
             profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
+        kernel_args = args
+        if self.gsan_enabled:
+            if active_driver.utils.is_stream_capturing(stream):
+                raise RuntimeError("GSan does not support CUDA graph capture")
+
+            import triton.experimental.gsan._allocator as gsan_allocator
+            import triton.experimental.gsan._stream_sync as gsan_stream_sync
+
+            device = active_driver.get_current_device()
+            device_rank = gsan_allocator.get_device_rank(device)
+            gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
+            stream_clock, kernel_id = gsan_stream_sync.get_launch_stream_clock(device, stream)
+            kernel_args = (*args, gsan_state_ptr, stream_clock, kernel_id)
+
         self.launch(
             gridX,
             gridY,
@@ -569,7 +571,7 @@ class CudaLauncher(object):
             self.arg_annotations,
             self.kernel_signature,
             self.auto_tma_recipes,
-            args,
+            kernel_args,
         )
 
 

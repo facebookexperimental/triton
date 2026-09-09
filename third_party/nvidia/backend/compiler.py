@@ -229,6 +229,8 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
+
     early_tma_store_lowering: Optional[None] = None
     tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
@@ -1083,7 +1085,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
         if "fpsan" in opt.instrumentation_mode:
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, opt.fpsan_homomorphic_casts)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
@@ -1150,7 +1152,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         if "fpsan" in options.instrumentation_mode:
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
             passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
@@ -1170,6 +1172,7 @@ class CUDABackend(BaseBackend):
 
         if "gsan" in options.instrumentation_mode:
             # GSan introduces layout conversions, so must come before shared memory allocation
+            mod.set_attr("tti.gsan_launch_pdl", ir.builder(mod.context).get_int32_attr(int(options.launch_pdl)))
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)

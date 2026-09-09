@@ -244,7 +244,6 @@ struct AuxDataMap {
   // cases for each memdesc.
   triton::BufferStatePlan bufferStatePlans[numMemTypes];
   DenseMap<Value, BufferStateCandidates> bufferCandidates[numMemTypes];
-  DenseMap<Operation *, BufferStateCandidates> scratchBufferCandidates;
 
   // Beta compatibility: legacy FunctionBuilder entry points still consume
   // packed descriptors and an optional alias expansion matrix.
@@ -273,10 +272,6 @@ struct AuxDataMap {
   // it, set bits denote base threads that have not yet reached their
   // terminator.
   RegionToValueMap activeMasks;
-
-  // True when a memory type has cross-buffer aliasing and therefore requires
-  // aliasMatrices to make visibility and commit checks conservative.
-  std::array<bool, numMemTypes> hasNonTrivialAliasing{};
 
   // Dense logical-thread numbering for this module. Base threads are always
   // present; TMA/TC/CLC peer ranges are added only when the module uses them.
