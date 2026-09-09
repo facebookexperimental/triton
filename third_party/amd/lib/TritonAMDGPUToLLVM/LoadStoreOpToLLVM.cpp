@@ -1245,8 +1245,13 @@ struct AsyncCopyLocalToGlobalOpConversion
 
 // TDM operates on base pointers, whereas a memdesc subslice keeps its logical
 // offsets separately. Materialize the view origin, including padding, for
-// every partition. Slice offsets are tile-aligned, so their physical bits are
-// disjoint from the tile offsets that TDMUtility adds (and pads) later.
+// every partition. The subslice contract requires tile-aligned origins:
+// MemDescSubsliceOp verifies static alignment; MemDescDynamicSubsliceOp
+// requires callers to guarantee runtime alignment and bounds (violations are
+// UB, with no runtime check). TDM's supported layouts preserve the disjoint
+// bits of the origin and intra-tile offsets. Thus padding can be applied
+// separately here and in TDMUtility: P(origin + tileOffset) = P(origin) +
+// P(tileOffset).
 static SmallVector<Value>
 getTDMSharedBases(Location loc, ConversionPatternRewriter &rewriter,
                   const LLVM::SharedMemoryObject &smemObj,
