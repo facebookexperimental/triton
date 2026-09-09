@@ -787,7 +787,7 @@ LogicalResult RegisterResidentOp::verify() {
       getRegistersPerGroup(), /*allowUnencoded=*/false);
 }
 
-LogicalResult RegisterHandoffOp::verify() {
+LogicalResult RegisterClassAnchorOp::verify() {
   return verifyRegisterAllocationContract(
       getOperation(), getInput().getType(), getRegisterClass(),
       /*registersPerGroup=*/1, /*allowUnencoded=*/true);

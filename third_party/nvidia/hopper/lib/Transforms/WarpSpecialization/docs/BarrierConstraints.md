@@ -244,7 +244,8 @@ attribute directly (as currently defined). The two approaches can coexist:
 
 **Files:**
 - `nvidia/hopper/include/Transforms/WSBarrierReorder.h` — `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations`
-- `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp` — consumer of the above
+- `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp` — liveness-oriented consumer of the above
+- `lib/Dialect/TritonNvidiaGPU/Transforms/UnifyWSBarrierLocations.cpp` — codegen-oriented wait co-location
 
 ### Motivation
 
@@ -283,6 +284,13 @@ before the existing tmem_load sinking. Four steps:
 4. **`optimizeWSBarrierLocations`** — After sinking, relocate each barrier
    back to an optimal position right next to its associated memory op
    (arrives after, waits before), respecting SSA dominance.
+
+5. **`triton-nvidia-unify-ws-barrier-locations`** — In the following pass,
+   identify AutoWS TMA-ready and TMEM-ready waits whose load chains meet at the
+   same consumer. Raise the later wait beside the earlier wait only when the
+   crossed range contains load preparation, broadcast/cast work, and barriers
+   accepted by the same channel-graph or ordered-region safety rules. See
+   [WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
 ### `canAdvanceWSBarrier`
 
