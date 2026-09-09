@@ -21,6 +21,8 @@ from . import tlx_config
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
+    from torch._inductor.codegen.triton import TritonKernel
     from torch._inductor.codegen.common import KernelTemplate
     from torch._inductor.ir import ChoiceCaller
     from torch._inductor.kernel_inputs import KernelInputs
@@ -64,6 +66,19 @@ class TLXInductorChoices(InductorChoices):
         from .fusion import maybe_add_tlx_prefix
 
         return maybe_add_tlx_prefix(fused_name, src_code)
+
+    def get_extra_triton_kernel_choices(
+        self,
+        kernel_cls: type[TritonKernel],
+        features: SIMDKernelFeatures,
+        kernel_args: list[Any],
+        kernel_kwargs: dict[str, Any],
+    ) -> list[TritonKernel]:
+        from .local_buffer_retention_gfx950 import get_extra_kernel_choices
+
+        return get_extra_kernel_choices(
+            kernel_cls, features, kernel_args, kernel_kwargs
+        )
 
     def override_best_choice(
         self,
