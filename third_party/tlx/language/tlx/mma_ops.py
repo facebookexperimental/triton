@@ -79,10 +79,16 @@ def amd_register_resident(
     registers_per_group: tl.constexpr = 1,
     _semantic=None,
 ):
-    """Keep a distributed tensor in native AGPR or VGPR tuples.
+    """Constrain a distributed tensor's native register groups at one point.
 
-    ``registers_per_group`` is the power-of-two number of consecutive 32-bit
-    registers exposed to the allocator as one tuple.
+    Returns ``value`` unchanged while making all of its packed per-thread
+    groups visible to the allocator together. ``register_class`` is ``"agpr"``
+    or ``"vgpr"``. ``registers_per_group`` is the power-of-two number of
+    consecutive 32-bit registers in each group, from 1 through 32; separate
+    groups need not be adjacent.
+
+    This does not select physical register numbers, prevent spills, reserve the
+    registers for the value's entire lifetime, or guarantee an occupancy level.
     """
     register_class = tl._unwrap_if_constexpr(register_class)
     registers_per_group = tl._unwrap_if_constexpr(registers_per_group)
@@ -97,25 +103,30 @@ def amd_register_resident(
 
 
 @tl.builtin
-def amd_register_handoff(
+def amd_register_class_anchor(
     value,
     register_class: tl.constexpr = "vgpr",
     _semantic=None,
 ):
-    """Start a new AMD register-allocation interval for a tensor value.
+    """Anchor each native AMD value in a requested register class.
 
-    Each 32-bit native register value is passed unchanged through an independent
-    tied register constraint, so this expresses a local allocation/scheduling
-    handoff without requiring the complete tensor to be resident at one point.
-    Use :func:`amd_register_resident` when simultaneous whole-tensor residency
-    is the intended software-pipeline contract.
+    Returns ``value`` unchanged. Each packed 32-bit register value crosses an
+    independent, side-effecting tied ``"agpr"`` or ``"vgpr"`` constraint, so
+    the operation is an allocator and scheduling anchor without a whole-tensor
+    residency requirement.
+
+    LLVM may coalesce a tied input and output. This operation therefore does
+    not guarantee a new physical live interval, a copy, a shorter live range,
+    spill avoidance, or a particular occupancy. Use
+    :func:`amd_register_resident` when all groups must be allocatable at one
+    common point, and always consume the value returned by this operation.
     """
     register_class = tl._unwrap_if_constexpr(register_class)
     assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
     assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
     assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
     assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
-    handle = _semantic.builder.create_amd_register_handoff(value.handle, register_class)
+    handle = _semantic.builder.create_amd_register_class_anchor(value.handle, register_class)
     return tl.tensor(handle, value.type)
 
 
@@ -130,27 +141,32 @@ def amd_scheduled_mfma(
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
-    """Update native CDNA3/CDNA4 MFMA fragments with source scheduling.
+    """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
 
-    Unlike ``tl.dot``, which represents one logical matrix product and carries
-    no accumulator-lifetime or register-class contract, this operation exposes
-    independent native fragment chains in source order. A ``tl.dot`` result can
-    still remain live across phases through ordinary SSA uses; its backend
-    lowering infers that lifetime instead of receiving an explicit role.
+    With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
+    The operation keeps one SSA chain per output fragment and creates updates
+    in K-major, N-major, M-minor order. LLVM may reschedule independent updates
+    on the transient intrinsic path. With ``initialize=True``, the first native
+    K update starts from zero and the result is ``a @ b``; the supplied
+    accumulator value is ignored.
 
-    ``accumulator_role`` controls the lowering contract, not the numerical
-    operation. ``"transient"`` describes a phase-local chain: default storage
-    selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
-    instruction latency and hazards. ``"persistent"`` describes a chain
-    carried across phases and lowering uses register-constrained inline
-    assembly; default storage selects AGPRs on every target. An explicit
-    ``accumulator_register_class`` overrides that default, allowing two
-    persistent accumulator sets to occupy complementary register files.
+    ``accumulator_role`` changes lowering, not the numerical operation.
+    ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
+    intrinsics. ``"persistent"`` describes a chain carried across phases and
+    uses register-constrained inline assembly. Because LLVM cannot model an
+    MFMA hidden in inline assembly, that path adds target-specific input and
+    result wait padding. On the persistent path,
+    ``resident_operand=0`` or ``1`` selects the left or right input for AGPR
+    placement, and ``accumulator_register_class`` may select ``"agpr"`` or
+    ``"vgpr"``. Persistent ``auto`` selects AGPRs. The transient intrinsic path
+    does not apply these class constraints and leaves physical placement to
+    LLVM; use :func:`amd_register_resident` for a hard source residency point.
 
-    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
-    drain, so AGPR accumulators are rejected there and a ``"persistent"`` chain
-    must pass ``accumulator_register_class="vgpr"``; the default is an error
-    rather than a silent downgrade.
+    CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
+    ``accumulator_register_class="vgpr"``. The inputs must be matching rank-two
+    BF16 or F16 dot operands with ``kWidth`` 4 or 8, the accumulator must be
+    rank-two F32 with the corresponding unit-tile MFMA layout, and all active
+    lanes of a wave must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
@@ -181,12 +197,19 @@ def amd_scheduled_mfma(
 
 @tl.builtin
 def amd_mfma_commit(value, preserve=None, _semantic=None):
-    """Commit MFMA results and optionally thread a live dot operand.
+    """Apply an MFMA completion boundary and return every value unchanged.
 
-    ``value`` may be one tensor or a tuple of independent transient
-    ``amd_scheduled_mfma`` results. The returned copy of ``preserve`` can be
-    consumed by the next source stage to make its residency explicit. With no
-    ``preserve``, the values form one persistent-AGPR epilogue boundary.
+    ``value`` is one F32 MFMA-layout tensor or a nonempty tuple of independent
+    results. An optional BF16 or F16 dot-operand ``preserve`` is threaded
+    through the same boundary. To carry that dependency forward, consume its
+    returned copy. A single value is returned directly; tuples keep the same
+    arity; supplying ``preserve`` appends its returned copy to the result.
+
+    With ``preserve``, F32 results cross the boundary in VGPRs and the preserved
+    operand in AGPRs; without it, results cross in AGPRs. An AGPR-resident
+    scheduled-MFMA result therefore cannot be committed together with
+    ``preserve``. This is a target-specific wave-local hazard and liveness
+    boundary, not a memory fence, workgroup barrier, or cross-wave wait.
     """
     single_value = isinstance(value, tl.tensor)
     values = (value, ) if single_value else value
