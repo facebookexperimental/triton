@@ -1248,3 +1248,158 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// The async-copy group ops take their tokens as a list, and async_wait carries
+// its outstanding-group count in the `num` attribute rather than an operand.
+// Printed positionally, the second token binds to async_load_commit_group's
+// `_semantic` and async_load_wait_group loses its required `pendings` argument,
+// so neither survives recompilation.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def async_copy_groups(
+  // CHECK: [[T0:[a-z0-9_]+]] = tlx.async_load(
+  // CHECK: [[T1:[a-z0-9_]+]] = tlx.async_load(
+  // Capture the commit result so the wait is pinned to the token that commit
+  // actually produced, not merely to some identifier.
+  // CHECK: [[G:[a-z0-9_]+]] = tlx.async_load_commit_group([[[T0]], [[T1]]])
+  // The leading pendings count comes from the `num` attribute, not an operand.
+  // CHECK: tlx.async_load_wait_group(1, [[[G]]])
+  tt.func public @async_copy_groups(%ptr: !tt.ptr<f16>, %offs: tensor<64x64xi32, #blocked>,
+                                    %mask: tensor<64x64xi1, #blocked>) attributes {noinline = false} {
+    %d0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %d1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %t0 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d0 : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    %t1 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d1 : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    %g = ttg.async_commit_group tokens %t0, %t1
+    %w = ttg.async_wait %g {num = 1 : i32}
+    tt.return
+  }
+
+  // A token-less commit group is valid IR -- the assembly format makes the
+  // token list optional -- so the empty-list and omitted-list branches are
+  // both reachable.
+  // CHECK-LABEL: def async_groups_no_tokens(
+  // CHECK: tlx.async_load_commit_group([])
+  // CHECK: tlx.async_load_wait_group(0)
+  tt.func public @async_groups_no_tokens() attributes {noinline = false} {
+    %g = ttg.async_commit_group
+    %w = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+// An element-type cast is what the source kernel wrote as `x.to(dtype)`. The
+// printer erases layout- and shape-only casts as transparent; erasing this one
+// too leaves a later tl.dot seeing mismatched operand dtypes, which is a hard
+// error on recompile rather than a silent difference.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def element_type_cast(
+  // The truncf must survive as .to(), or its consumer sees an f32 operand.
+  // CHECK: arg0.to(tl.bfloat16) * arg1
+  tt.func public @element_type_cast(%p: tensor<64x64xf32, #blocked>,
+                                    %v: tensor<64x64xbf16, #blocked>) attributes {noinline = false} {
+    %pt = arith.truncf %p : tensor<64x64xf32, #blocked> to tensor<64x64xbf16, #blocked>
+    %r = arith.mulf %pt, %v : tensor<64x64xbf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// Edge cases of re-emitting a cast: `.to` binds to the operand text, the dtype
+// has to be one TLX can name, and a store must not append a second cast on top
+// of one the operand name already carries.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // `.to` is a tensor method, so an inlined constant cannot carry it --
+  // `(0).to(tl.float32)` raises AttributeError at kernel compile time. tl.cast
+  // accepts the same value as a plain call.
+  // CHECK-LABEL: def cast_of_constant(
+  // CHECK: tl.cast(0, tl.float32)
+  // CHECK-NOT: 0.to(
+  tt.func public @cast_of_constant() attributes {noinline = false} {
+    %c = arith.constant 0 : i32
+    %f = arith.sitofp %c : i32 to f32
+    %m = arith.mulf %f, %f : f32
+    tt.return
+  }
+
+  // fp8 does have a TLX spelling, so the cast survives rather than being erased.
+  // CHECK-LABEL: def cast_to_fp8(
+  // CHECK: arg0.to(tl.float8e4nv) * arg0.to(tl.float8e4nv)
+  tt.func public @cast_to_fp8(%x: tensor<64x64xf32, #blocked>) attributes {noinline = false} {
+    %t = arith.truncf %x : tensor<64x64xf32, #blocked> to tensor<64x64xf8E4M3FN, #blocked>
+    %m = arith.mulf %t, %t : tensor<64x64xf8E4M3FN, #blocked>
+    tt.return
+  }
+
+  // Keyword literals lex as identifiers but are not tensors, so they take the
+  // tl.cast path; ub.poison prints as `None`, which tl.cast rejects, so its
+  // cast is erased instead.
+  // CHECK-LABEL: def cast_of_keyword_literals(
+  // CHECK: tl.cast(True, tl.float32)
+  // CHECK-NOT: True.to(
+  tt.func public @cast_of_keyword_literals() attributes {noinline = false} {
+    %c = arith.constant true
+    %f = arith.uitofp %c : i1 to f32
+    %m = arith.mulf %f, %f : f32
+    tt.return
+  }
+
+  // CHECK-LABEL: def cast_of_poison(
+  // CHECK-NOT: None.to(
+  // CHECK-NOT: tl.cast(None
+  tt.func public @cast_of_poison() attributes {noinline = false} {
+    %p = ub.poison : i64
+    %f = arith.sitofp %p : i64 to f32
+    %m = arith.mulf %f, %f : f32
+    tt.return
+  }
+
+  // A float type TLX cannot name still falls back to erasing the cast, rather
+  // than emitting a dtype that will not compile.
+  // CHECK-LABEL: def cast_to_unnameable_dtype(
+  // CHECK: arg0 * arg0
+  // CHECK-NOT: .to(f8
+  tt.func public @cast_to_unnameable_dtype(%x: tensor<64x64xf32, #blocked>) attributes {noinline = false} {
+    %t = arith.truncf %x : tensor<64x64xf32, #blocked> to tensor<64x64xf8E4M3B11FNUZ, #blocked>
+    %m = arith.mulf %t, %t : tensor<64x64xf8E4M3B11FNUZ, #blocked>
+    tt.return
+  }
+
+  // The store must not re-cast a source whose name already spells the cast.
+  // CHECK-LABEL: def store_of_cast(
+  // CHECK: tlx.local_store({{.*}}, arg0.to(tl.bfloat16))
+  // CHECK-NOT: .to(tl.bfloat16).to(tl.bfloat16)
+  tt.func public @store_of_cast(%x: tensor<64x64xf32, #blocked>) attributes {noinline = false} {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+    %t = arith.truncf %x : tensor<64x64xf32, #blocked> to tensor<64x64xbf16, #blocked>
+    ttg.local_store %t, %buf : tensor<64x64xbf16, #blocked> -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // Same for a dtype whose cast the name already carries: exactly one
+  // conversion, and it must not be dropped just because the store path and
+  // getValueName disagree about where the cast lives.
+  // CHECK-LABEL: def store_of_fp8_cast(
+  // CHECK: tlx.local_store({{.*}}, arg0.to(tl.float8e4nv))
+  // CHECK-NOT: tlx.local_store({{.*}}, arg0)
+  tt.func public @store_of_fp8_cast(%x: tensor<64x64xf32, #blocked>) attributes {noinline = false} {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<64x64xf8E4M3FN, #shared, #smem, mutable>
+    %t = arith.truncf %x : tensor<64x64xf32, #blocked> to tensor<64x64xf8E4M3FN, #blocked>
+    ttg.local_store %t, %buf : tensor<64x64xf8E4M3FN, #blocked> -> !ttg.memdesc<64x64xf8E4M3FN, #shared, #smem, mutable>
+    tt.return
+  }
+}
