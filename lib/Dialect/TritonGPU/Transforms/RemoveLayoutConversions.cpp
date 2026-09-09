@@ -763,8 +763,78 @@ getLayoutScore(Value value, Attribute encoding,
   return {elementsPerThread, 0};
 }
 
+// Bytes of a tensor value, or 0 if it is not a tensor. getElementBitWidth, not
+// getElementTypeBitWidth: !tt.ptr is neither int nor float, so asking a pointer
+// tensor for its element bit width is UB. Rounds up so a sub-byte tensor is
+// never mistaken for one that needs no relayout at all.
+static int64_t tensorBytes(Value v) {
+  auto ty = dyn_cast<RankedTensorType>(v.getType());
+  if (!ty)
+    return 0;
+  int64_t elems = 1;
+  for (int64_t d : ty.getShape())
+    elems *= d;
+  return (elems * getElementBitWidth(ty) + 7) / 8;
+}
+
+// Estimate the relayout traffic from committing `value` to `encoding`: every
+// neighbour that cannot supply `encoding` needs a convert_layout.
+//
+// Returns {peak, total}. Peak distinguishes one oversized relayout (an f32
+// accumulator held live across a convert, which spills) from many small ones,
+// which total alone cannot.
+//
+// `candidates` must be a snapshot taken before any conflict is resolved.
+// Neighbour types still carry the anchor layout mid-propagation, and the live
+// map collapses to a singleton as each value is resolved, so reading either
+// would make the result depend on iteration order.
+//
+// A user is judged to accept `encoding` when one of its results can supply it.
+// That is exact for elementwise chains and approximate elsewhere -- notably a
+// user with no tensor results always charges `value`. That charge does not vary
+// with `encoding`, so it can push a peak comparison into a tie but cannot
+// reorder candidates.
+static std::pair<int64_t, int64_t> estimateRelayout(
+    Value value, Attribute encoding,
+    const llvm::DenseMap<Value, llvm::SmallSetVector<Attribute, 8>>
+        &candidates) {
+  auto canSupply = [&](Value v) {
+    auto it = candidates.find(v);
+    if (it != candidates.end())
+      return it->second.contains(encoding);
+    auto ty = dyn_cast<RankedTensorType>(v.getType());
+    return ty && ty.getEncoding() == encoding;
+  };
+
+  int64_t peak = 0, total = 0;
+  auto account = [&](Value v) {
+    int64_t b = tensorBytes(v);
+    peak = std::max(peak, b);
+    total += b;
+  };
+
+  if (Operation *def = value.getDefiningOp())
+    for (Value operand : def->getOperands())
+      if (isa<RankedTensorType>(operand.getType()) && !canSupply(operand))
+        account(operand);
+
+  // One convert of `value` serves every user that wants a different layout.
+  for (Operation *user : value.getUsers()) {
+    if (llvm::any_of(user->getResults(),
+                     [&](Value r) { return canSupply(r); }))
+      continue;
+    account(value);
+    break;
+  }
+  return {peak, total};
+}
+
 void LayoutPropagation::resolveConflicts() {
   std::unique_ptr<ModuleAxisInfoAnalysis> axisInfoAnalysis;
+  // Snapshot: the loop below collapses each entry to a single encoding.
+  llvm::DenseMap<Value, llvm::SmallSetVector<Attribute, 8>> candidates;
+  for (auto &it : layouts)
+    candidates[it.first] = it.second.encodings;
   for (auto &it : layouts) {
     Operation *op = it.first.getDefiningOp();
     LayoutInfo &info = it.second;
@@ -781,30 +851,53 @@ void LayoutPropagation::resolveConflicts() {
       info.encodings.insert(originalType.getEncoding());
       continue;
     }
-    // Hacky resolve, prefer block encoding.
-    // TODO: add a proper heuristic.
     Attribute encoding = *info.encodings.begin();
     bool isLoadOrStore =
         op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
     if (op && isa<AtomicRMWOp, AtomicCASOp>(op) && !axisInfoAnalysis)
       axisInfoAnalysis = std::make_unique<ModuleAxisInfoAnalysis>(
           funcOp->getParentOfType<ModuleOp>());
-    // Pick the layout with maximum score.
-    // This prefers layouts with larger sizePerThread values for better
-    // vectorized memory access. Both blocked and linear encodings are scored,
-    // so e.g. a linear layout from TMEMLoadOp (sizePerThread=[1,32]) beats
-    // a blocked layout from local_load (sizePerThread=[1,8]).
-    auto bestScore = getLayoutScore(it.first, encoding, axisInfoAnalysis.get());
-    for (Attribute e : info.encodings) {
-      auto score = getLayoutScore(it.first, e, axisInfoAnalysis.get());
-      if (score > bestScore) {
-        bestScore = score;
+    // Rank lexicographically: widest single relayout, then total relayout
+    // bytes, then the vectorization score. Score alone rates a candidate in
+    // isolation and so always prefers the widest layout, which drags whole
+    // elementwise chains -- and the loads feeding them -- into a TMEM layout.
+    // The cost terms bound that; score still decides when nothing has to move.
+    //
+    // Cost only ranks where the layout is a free choice. MMA, dot-operand and
+    // slice encodings are structural requirements of the ops around them.
+    // Atomics are excluded for a different reason: score.first is the vector
+    // width the hardware will actually issue, and cost will trade it away --
+    // see @atomic_vector_width_beats_relayout_cost.
+    bool costRankable =
+        !(op && isa<AtomicRMWOp, AtomicCASOp>(op)) &&
+        llvm::none_of(info.encodings, [](Attribute e) {
+          return isa<MmaEncodingTrait, DotOperandEncodingAttr,
+                     SliceEncodingAttr>(e);
+        });
+    auto rank = [&](Attribute e, std::pair<int64_t, int64_t> score) {
+      if (!costRankable)
+        return std::make_tuple(int64_t{0}, int64_t{0}, -score.first,
+                               -score.second);
+      auto [peak, total] = estimateRelayout(it.first, e, candidates);
+      return std::make_tuple(peak, total, -score.first, -score.second);
+    };
+    const std::pair<int64_t, int64_t> unvectorized{0, 0};
+    auto score = getLayoutScore(it.first, encoding, axisInfoAnalysis.get());
+    auto bestRank = rank(encoding, score);
+    bool anyVectorized = score != unvectorized;
+    for (Attribute e : llvm::drop_begin(info.encodings)) {
+      score = getLayoutScore(it.first, e, axisInfoAnalysis.get());
+      anyVectorized |= score != unvectorized;
+      if (auto r = rank(e, score); r < bestRank) {
+        bestRank = r;
         encoding = e;
       }
     }
-    // If no layout with vectorization found, fall back to the original
-    // heuristic (prefer blocked for load/store, MMA for compute).
-    if (bestScore == std::pair<int64_t, int64_t>{0, 0}) {
+    // Keyed on the whole candidate set, not on the winner: cost is ranked ahead
+    // of score, so the winner can score zero while a vectorizable candidate
+    // exists, and this fallback must not undo that choice. Under the old
+    // score-only ranking the two were equivalent.
+    if (!anyVectorized) {
       for (Attribute e : info.encodings) {
         if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
             (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
