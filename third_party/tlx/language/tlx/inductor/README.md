@@ -32,9 +32,11 @@ warps; it uses LDS async loads and scheduled CDNA4 MFMA for dQ.
 
 `TORCHINDUCTOR_TLX_MODE=allow` adds the eligible candidate beside stock choices;
 `force` uses it only when eligible, otherwise retains the stock choice. The
-PyTorch backward lowering must call `append_flex_attention_choices` and provide
-the complete `mutated_inputs` list; without that hook contract, no backward TLX
-candidate is registered.
+PyTorch backward lowering must call `append_flex_attention_backward_choices`
+and provide the complete `mutated_inputs` list; without that hook contract, no
+backward TLX candidate is registered. TLX also declares its required HIP
+template options (`matrix_instr_nonkdim`, `waves_per_eu`, and `kpack`) through
+the optional `tlx_only_hip_options` integration hook.
 
 ## Naming Conventions
 
