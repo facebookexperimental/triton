@@ -1,5 +1,60 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+// Matching padding alone does not make a transposed view TDM-compatible.
+#desc_layout = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
+#view_layout = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_load_incompatible_transpose(%desc: !tt.tensordesc<128x64xf16, #desc_layout>, %buf: !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable>) {
+    // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %buf : !tt.tensordesc<128x64xf16, #desc_layout> -> !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Matching padding alone does not make a transposed view TDM-compatible.
+#desc_layout = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
+#view_layout = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_fused_incompatible_transpose(%desc: !tt.tensordesc<128x64xf16, #desc_layout>, %buf: !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable>) {
+    // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
+    %token = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %buf, %buf {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<128x64xf16, #desc_layout>, !tt.tensordesc<128x64xf16, #desc_layout> -> !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable>, !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Matching padding alone does not make a transposed view TDM-compatible.
+#desc_layout = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [128, 64]}>
+#view_layout = #ttg.padded_shared<[64:+8] {order = [0, 1], shape = [128, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_store_incompatible_transpose(%desc: !tt.tensordesc<128x64xf16, #desc_layout>, %buf: !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable>) {
+    // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
+    amdg.async_tdm_copy_local_to_global %desc from %buf : !ttg.memdesc<128x64xf16, #view_layout, #smem, mutable> -> !tt.tensordesc<128x64xf16, #desc_layout>
+    tt.return
+  }
+}
+
+// -----
+
+// An unpadded inner slice still has the allocation's wider physical row pitch.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_unpadded_incompatible_row_pitch(%desc: !tt.tensordesc<64x64xf16, #shared>, %buf: !ttg.memdesc<64x64xf16, #shared, #smem, mutable, 64x128>) {
+    // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %buf : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable, 64x128>
+    tt.return
+  }
+}
+
+// -----
+
 // A pinned layout is still subject to the physical TDM layout constraints.
 #tdm_bad_swizzle = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>
 #tdm_bad_pinned = #tlx.user_layout<#tdm_bad_swizzle>

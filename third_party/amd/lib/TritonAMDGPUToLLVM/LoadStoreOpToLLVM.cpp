@@ -1243,6 +1243,34 @@ struct AsyncCopyLocalToGlobalOpConversion
   }
 };
 
+// TDM operates on base pointers, whereas a memdesc subslice keeps its logical
+// offsets separately. Materialize the view origin, including padding, for
+// every partition. The subslice contract requires tile-aligned origins:
+// MemDescSubsliceOp verifies static alignment; MemDescDynamicSubsliceOp
+// requires callers to guarantee runtime alignment and bounds (violations are
+// UB, with no runtime check). TDM's supported layouts preserve the disjoint
+// bits of the origin and intra-tile offsets. Thus padding can be applied
+// separately here and in TDMUtility: P(origin + tileOffset) = P(origin) +
+// P(tileOffset).
+static SmallVector<Value>
+getTDMSharedBases(Location loc, ConversionPatternRewriter &rewriter,
+                  const LLVM::SharedMemoryObject &smemObj,
+                  triton::gpu::MemDescType type) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto offset = smemObj.getShmemOffset(loc, rewriter, type);
+  if (isPaddedEncoding(type.getEncoding()))
+    offset = applyPadding(
+        loc, rewriter, offset,
+        getPaddedSharedShifts(type.getEncoding(),
+                              type.getElementType().getIntOrFloatBitWidth(),
+                              /*offsetInBytes=*/false));
+  SmallVector<Value> bases;
+  for (Value base : smemObj.getBases())
+    bases.push_back(
+        b.gep(base.getType(), smemObj.getBaseElemType(), base, offset));
+  return bases;
+}
+
 struct AsyncTDMCopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>,
@@ -1300,7 +1328,8 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getResult(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
-    SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
+    SmallVector<Value> dstPtrs =
+        getTDMSharedBases(loc, rewriter, dstMemObj, op.getResult().getType());
     // Positioning lives in the descriptor; the copy only does per-warp
     // distribution, so the user offset is zero.
     SmallVector<Value> offset(blockShape.size(), b.i32_val(0));
@@ -1393,7 +1422,9 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
 
       auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
           loc, adaptor.getDests()[i], member.elementType, rewriter);
-      member.dstPtrs = llvm::to_vector(dstMemObj.getBases());
+      member.dstPtrs = getTDMSharedBases(
+          loc, rewriter, dstMemObj,
+          cast<triton::gpu::MemDescType>(op.getDests()[i].getType()));
       member.pred = Value();
       memberHints.push_back(static_cast<uint32_t>(op.getWarpUsedHints()[i]));
     }
@@ -1442,7 +1473,8 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
-    SmallVector<Value> srcPtrs = llvm::to_vector(dstMemObj.getBases());
+    SmallVector<Value> srcPtrs =
+        getTDMSharedBases(loc, rewriter, dstMemObj, smemTy);
     // Positioning lives in the descriptor; the copy only does per-warp
     // distribution, so the user offset is zero.
     SmallVector<Value> offset(blockShape.size(), b.i32_val(0));

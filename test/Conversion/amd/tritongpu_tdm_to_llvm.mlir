@@ -1,5 +1,41 @@
 // RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm | FileCheck %s
 
+// All three TDM copy paths must use the padded origin of a shared-memory view.
+#base = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
+#tile = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_sliced_copy_bases
+  tt.func @tdm_sliced_copy_bases(%desc: !tt.tensordesc<32x128xf16, #tile>, %row: i32) {
+    %zero = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #base, #smem, mutable>
+    %static = ttg.memdesc_subslice %alloc[32, 0] : !ttg.memdesc<64x128xf16, #base, #smem, mutable> -> !ttg.memdesc<32x128xf16, #base, #smem, mutable, 64x128>
+    %dynamic = ttg.memdesc_dynamic_subslice %alloc[%row, %zero] : !ttg.memdesc<64x128xf16, #base, #smem, mutable> -> !ttg.memdesc<32x128xf16, #base, #smem, mutable, 64x128>
+    // The first GEP applies the slice origin; the second adds the warp tile.
+    // CHECK: %[[LOAD_BASE:.*]] = llvm.getelementptr %{{.*}}[%{{.*}}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, f16
+    // CHECK: %[[LOAD_TILE:.*]] = llvm.getelementptr %[[LOAD_BASE]][%{{.*}}]
+    // CHECK: llvm.ptrtoint %[[LOAD_TILE]]
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %load = amdg.async_tdm_copy_global_to_local %desc into %static : !tt.tensordesc<32x128xf16, #tile> -> !ttg.memdesc<32x128xf16, #base, #smem, mutable, 64x128>
+    // CHECK: %[[FUSED_STATIC:.*]] = llvm.getelementptr %{{.*}}[%{{.*}}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, f16
+    // CHECK: %[[FUSED_DYNAMIC:.*]] = llvm.getelementptr %{{.*}}[%{{.*}}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, f16
+    // CHECK: %[[FUSED_TILE0:.*]] = llvm.getelementptr %[[FUSED_STATIC]][%{{.*}}]
+    // CHECK: llvm.ptrtoint %[[FUSED_TILE0]]
+    // CHECK: %[[FUSED_TILE1:.*]] = llvm.getelementptr %[[FUSED_DYNAMIC]][%{{.*}}]
+    // CHECK: llvm.ptrtoint %[[FUSED_TILE1]]
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %fused = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %static, %dynamic {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<32x128xf16, #tile>, !tt.tensordesc<32x128xf16, #tile> -> !ttg.memdesc<32x128xf16, #base, #smem, mutable, 64x128>, !ttg.memdesc<32x128xf16, #base, #smem, mutable, 64x128>
+    // CHECK: %[[STORE_BASE:.*]] = llvm.getelementptr %{{.*}}[%{{.*}}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, f16
+    // CHECK: %[[STORE_TILE:.*]] = llvm.getelementptr %[[STORE_BASE]][%{{.*}}]
+    // CHECK: llvm.ptrtoint %[[STORE_TILE]]
+    // CHECK: "llvm.amdgcn.tensor.store.from.lds"
+    amdg.async_tdm_copy_local_to_global %desc from %static : !ttg.memdesc<32x128xf16, #base, #smem, mutable, 64x128> -> !tt.tensordesc<32x128xf16, #tile>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
 #smem = #ttg.shared_memory
