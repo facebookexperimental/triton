@@ -1069,6 +1069,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
+        if knobs.nvidia.enable_unify_ws_barrier_locations:
+            nvidia.passes.ttnvgpuir.add_unify_ws_barrier_locations(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
         passes.ttir.add_loop_aware_cse(pm)

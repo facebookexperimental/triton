@@ -101,21 +101,35 @@ and is blind to the durational pressure and latency exposure this pass targets;
 an integral over the liveness curve would subsume the old metric rather than
 trade against it.
 
-## Out of Scope: Reshaping Barriers for Codegen
+## Follow-up Barrier Placement
 
-The barrier movement described above is in scope. It exists to unblock legal
-TMEM movement, and every barrier still ends up near the memory operation it
-guards.
+After this pass restores each wait beside its guarded load,
+`triton-nvidia-unify-ws-barrier-locations` may raise a related AutoWS wait to a
+common location when only load preparation, casts, and broadcast work separate
+the waits. See
+[WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
-What is out of scope is reshaping barrier placement to unlock a downstream
-codegen optimization. The motivating example is hoisting several
-`ttng.wait_barrier` ops to a common program point so that a value broadcast to
-their consumers becomes optimizable in PTX. That is driven by codegen quality
-rather than by TMEM liveness or MMA latency, and on a given block the two
-objectives can pull in opposite directions: the placement that best exposes a
-broadcast is not generally the placement that best distances a load from its
-producer. Handle it in future work on barrier placement rather than adding
-cases here.
+An earlier revision of this document declared that reshaping barriers for
+codegen was out of scope, on the grounds that the placement which best exposes
+a broadcast to ptxas is not generally the placement which best distances a load
+from its producer. The observation stands: on a block where both apply, the two
+objectives really can want different placements. What has changed is that there
+is now a basis for deciding between them.
+
+Running the unification pass second does not by itself resolve anything — it
+just means the codegen objective always wins where it applies. The resolution
+is that "where it applies" is now narrow. Unification requires a broadcast
+whose result is register-heavy, because that is the only case where the
+register relief it buys outweighs the MMA-latency overlap it gives up. On the
+`addmm` epilogue that motivated it, that trade removed a 23 KB spill, which is
+a larger effect than the scheduling distance this pass gives up on the same
+block. Where the broadcast is small, unification declines and this pass's
+placement stands.
+
+So the conflict is decided in favor of codegen only on measured evidence, and
+only for the shape of block where that evidence applies. If a case turns up
+where the distance mattered more despite a large broadcast, the floor in
+unification is the knob to revisit — not the ordering of the two passes.
 
 ## Testing
 
