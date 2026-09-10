@@ -1722,7 +1722,7 @@ def test_tlx_wave_converter_boundary_is_structurally_guarded():
         statement.value.func.id for statement in analyze_facts.body if isinstance(statement, ast.Expr)
         and isinstance(statement.value, ast.Call) and isinstance(statement.value.func, ast.Name)
     ]
-    assert fact_analysis_calls.index("_add_derived_range_facts") < fact_analysis_calls.index("_add_assume_facts")
+    assert fact_analysis_calls.index("_add_assume_facts") < fact_analysis_calls.index("_add_derived_range_facts")
     op_conversion_tree = ast.parse(op_conversion_source)
     private_layout_references = sorted({
         node.attr
@@ -3149,6 +3149,59 @@ def test_tlx_wave_converter_fact_stage_extracts_provenance_facts(tmp_path):
         fact.kind == "range" and fact.predicate == "sge" and fact.lower == 0 and fact.upper is None and fact.width == 32
         and fact.provenance == "llvm.intr.assume" and fact.source_op_index == assume_op.index for fact in stride_facts)
     assert not hasattr(fact_program, "target_ops")
+    del ctx
+
+
+def test_tlx_wave_converter_fact_stage_propagates_dominating_assume_through_splat(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_assumed_splat(%x: i32) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %nonnegative = arith.cmpi sge, %x, %zero : i32
+    llvm.intr.assume %nonnegative : i1
+    %splat = tt.splat %x : i32 -> tensor<64xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    fact_program = converter_facts.analyze_facts(source, converted)
+
+    splat_op = next(op for op in source.ops if op.name == "tt.splat")
+    splat_facts = converter_facts.facts_for_value(fact_program, splat_op.results[0])
+    assert any(fact.kind == "range" and fact.lower == 0 and fact.upper == (1 << 31) -
+               1 and fact.width == 32 and fact.provenance == "derived:tt.splat" for fact in splat_facts)
+    del ctx
+
+
+def test_tlx_wave_converter_fact_stage_rejects_overflowing_tensor_add(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_no_tensor_add_fact() attributes {noinline = false} {
+    %max = arith.constant 2147483647 : i32
+    %base = tt.splat %max : i32 -> tensor<64xi32, #blocked>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %sum = arith.addi %base, %range : tensor<64xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    fact_program = converter_facts.analyze_facts(source, converted)
+
+    add_op = next(op for op in source.ops if op.name == "arith.addi")
+    add_facts = converter_facts.facts_for_value(fact_program, add_op.results[0])
+    assert [(fact.lower, fact.upper, fact.width) for fact in add_facts] == [
+        (-(1 << 31), (1 << 31) - 1, 32),
+    ]
     del ctx
 
 
