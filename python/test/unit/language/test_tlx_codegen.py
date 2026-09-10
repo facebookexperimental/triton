@@ -3346,7 +3346,8 @@ def test_varlen_d128_address_space_requires_i32_offsets():
         total_q=max_tokens - 15,
         total_kv=max_tokens,
         batch=1,
-        heads=1,
+        q_heads=1,
+        kv_heads=1,
     )
 
     with pytest.raises(ValueError, match="KV tensor size exceeds the signed 32-bit byte-offset range"):
@@ -3354,14 +3355,16 @@ def test_varlen_d128_address_space_requires_i32_offsets():
             total_q=1,
             total_kv=max_tokens + 1,
             batch=1,
-            heads=1,
+            q_heads=1,
+            kv_heads=1,
         )
     with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
         amd_fa_varlen_bwd._validate_i32_buffer_offsets(
             total_q=max_tokens - 14,
             total_kv=1,
             batch=1,
-            heads=1,
+            q_heads=1,
+            kv_heads=1,
         )
 
 

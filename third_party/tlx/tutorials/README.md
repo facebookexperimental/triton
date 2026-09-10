@@ -33,9 +33,9 @@ correctness/performance driver.
 ## Packed variable-length FlashAttention backward
 
 [`amd_fa_varlen_bwd.py`](amd_fa_varlen_bwd.py) provides a gfx950 specialization
-for packed BF16 THD, non-causal MHA backward with head dimension 128.  Prepare a
-plan once for immutable cumulative sequence offsets, then reuse it for every
-backward invocation with the same packing:
+for packed BF16 THD, non-causal MHA/GQA backward with head dimension 128 and
+`Hq % Hkv == 0`.  Prepare a plan once for immutable cumulative sequence
+offsets, then reuse it for every backward invocation with the same packing:
 
 ```python
 from triton.language.extra.tlx.tutorials.amd_fa_varlen_bwd import (
@@ -48,9 +48,14 @@ dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale)
 ```
 
 Plan preparation validates and copies `cu_seqlens_q` and `cu_seqlens_k` to the
-host once to build compact BM16/BN128 schedules, then owns cloned device
-offsets.  The frozen plan prevents field rebinding, but its PyTorch tensors are
-still mutable; treat every plan-owned offset and schedule tensor as immutable
-after preparation.  Keep plan construction outside the timed or repeated
-execution path.  Every sequence must have at least one query and one key/value
-token.  `lse` is contiguous FP32 with shape `(heads, total_q)`.
+host once to build compact BM16/BN128 schedules plus a masked BM32/BN256
+schedule for long non-causal split-GQA, then owns cloned device offsets.  The
+frozen plan prevents field rebinding, but its PyTorch tensors are still mutable;
+treat every plan-owned offset and schedule tensor as immutable after
+preparation.  Keep plan construction outside the timed or repeated execution
+path.  Every sequence must have at least one query and one key/value token.
+`lse` is contiguous FP32 with shape `(query_heads, total_q)`.
+
+The Q and KV offsets are independent.  To model an extend-attention workload,
+pack only the extend tokens in Q and pack the full context in K/V, using
+`q_len = extend_len` and `kv_len = prefix_len + extend_len` for each request.
