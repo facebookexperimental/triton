@@ -47,9 +47,9 @@ def analyze_facts(source_program, type_layout_program):
     _add_type_width_facts(source_program, facts)
     _add_divisibility_facts(source_program, facts)
     _add_pointer_range_facts(source_program, facts)
+    _add_assume_facts(source_program, facts)
     _add_derived_range_facts(source_program, facts)
     _add_derived_pointer_range_facts(source_program, facts)
-    _add_assume_facts(source_program, facts)
     by_value = {}
     for fact in facts:
         by_value.setdefault(fact.subject_value_id, []).append(fact.fact_id)
@@ -66,7 +66,7 @@ def facts_for_value(fact_program, value_id):
 
 def _add_type_width_facts(source_program, facts):
     for value in source_program.values.values():
-        width = _integer_width(value.type.raw)
+        width = _integer_width(value.type)
         if width is None:
             continue
         lower = -(1 << (width - 1))
@@ -224,7 +224,12 @@ def _derived_ranges_for_op(source_program, facts, op):
             yield op.results[0], start, end - 1, "derived:tt.make_range"
         return
     if (len(op.operands) == 1 and len(op.results) == 1 and op.name in _RANGE_PRESERVING_OPS):
-        value_range = _combined_range(facts, op.operands[0])
+        value_range = _combined_range(
+            facts,
+            op.operands[0],
+            source_program=source_program,
+            use_op_index=op.index,
+        )
         if value_range is not None:
             yield (
                 op.results[0],
@@ -256,11 +261,21 @@ def _derived_ranges_for_op(source_program, facts, op):
             "arith.minsi",
     }:
         return
-    lhs = _combined_range(facts, op.operands[0])
-    rhs = _combined_range(facts, op.operands[1])
+    lhs = _combined_range(
+        facts,
+        op.operands[0],
+        source_program=source_program,
+        use_op_index=op.index,
+    )
+    rhs = _combined_range(
+        facts,
+        op.operands[1],
+        source_program=source_program,
+        use_op_index=op.index,
+    )
     if lhs is None or rhs is None:
         return
-    bounds = _signed_bounds(_integer_width(source_program.values[op.results[0]].type.raw))
+    bounds = _signed_bounds(_integer_width(source_program.values[op.results[0]].type))
     lower = upper = None
     if op.name == "arith.addi":
         if _has_bounds(lhs) and _has_bounds(rhs):
@@ -310,9 +325,24 @@ def _derive_for_ranges(source_program, facts, op):
     region = source_program.regions[op.region_ids[0]]
     if not region.block_arg_ids:
         return
-    lower = _combined_range(facts, op.operands[0])
-    upper = _combined_range(facts, op.operands[1])
-    step = _combined_range(facts, op.operands[2])
+    lower = _combined_range(
+        facts,
+        op.operands[0],
+        source_program=source_program,
+        use_op_index=op.index,
+    )
+    upper = _combined_range(
+        facts,
+        op.operands[1],
+        source_program=source_program,
+        use_op_index=op.index,
+    )
+    step = _combined_range(
+        facts,
+        op.operands[2],
+        source_program=source_program,
+        use_op_index=op.index,
+    )
     if lower is None or step is None or lower[0] is None or step[0] is None:
         return
     if step[0] <= 0:
@@ -336,7 +366,14 @@ def _derive_if_ranges(source_program, facts, op):
             return
         region_yields.append((yield_op.index, yield_op.operands))
     for result_index, result_id in enumerate(op.results):
-        ranges = [_combined_range(facts, yielded[result_index]) for yield_op_index, yielded in region_yields]
+        ranges = [
+            _combined_range(
+                facts,
+                yielded[result_index],
+                source_program=source_program,
+                use_op_index=yield_op_index,
+            ) for yield_op_index, yielded in region_yields
+        ]
         if any(value_range is None for value_range in ranges):
             continue
         lowers = [value_range[0] for value_range in ranges if value_range[0] is not None]
@@ -364,7 +401,7 @@ def _append_improving_range_fact(
         improves_upper = upper is not None and (current_upper is None or upper < current_upper)
         if not improves_lower and not improves_upper:
             return False
-    width = _integer_width(source_program.values[value_id].type.raw)
+    width = _integer_width(source_program.values[value_id].type)
     _append_fact(
         facts,
         "range",
@@ -410,12 +447,15 @@ def _append_improving_pointer_byte_range_fact(
     return True
 
 
-def _combined_range(facts, value_id):
+def _combined_range(facts, value_id, *, source_program=None, use_op_index=None):
     lower = None
     upper = None
     found = False
     for fact in facts:
         if fact.kind != "range" or fact.subject_value_id != value_id:
+            continue
+        if (fact.provenance == "llvm.intr.assume" and use_op_index is not None
+                and not _assumption_dominates_op(source_program, fact.source_op_index, use_op_index)):
             continue
         found = True
         if fact.lower is not None:
@@ -423,6 +463,20 @@ def _combined_range(facts, value_id):
         if fact.upper is not None:
             upper = fact.upper if upper is None else min(upper, fact.upper)
     return None if not found else (lower, upper)
+
+
+def _assumption_dominates_op(source_program, assumption_op_index, use_op_index):
+    if source_program is None or assumption_op_index is None:
+        return False
+    assumption = source_program.ops[assumption_op_index]
+    anchor = source_program.ops[use_op_index]
+    while True:
+        if assumption.parent_region_id == anchor.parent_region_id:
+            return assumption.index < anchor.index
+        region = source_program.regions[anchor.parent_region_id]
+        if region.parent_op_index is None:
+            return False
+        anchor = source_program.ops[region.parent_op_index]
 
 
 def _combined_pointer_byte_range(facts, value_id):
@@ -491,7 +545,7 @@ def _assume_compare_fact(source_program, op_by_result, predicate_id, assume_op_i
 
 
 def _compare_bound_fact(source_program, value_id, predicate, constant, assume_op_index):
-    width = _integer_width(source_program.values[value_id].type.raw)
+    width = _integer_width(source_program.values[value_id].type)
     if predicate == "eq":
         lower = upper = int(constant)
     elif predicate == "sge":
@@ -622,7 +676,8 @@ def _invert_predicate(predicate):
     }.get(predicate)
 
 
-def _integer_width(raw_type):
+def _integer_width(source_type):
+    raw_type = source_type.element_type if source_type.kind == "tensor" else source_type.raw
     if raw_type == "index":
         return None
     match = re.fullmatch(r"i([0-9]+)", str(raw_type))
