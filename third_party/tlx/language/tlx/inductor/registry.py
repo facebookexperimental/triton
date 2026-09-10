@@ -18,6 +18,7 @@ Both live outside this subpackage so the standalone tutorial kernels can share
 them without importing torch._inductor.
 """
 
+import contextlib
 import dataclasses
 import logging
 import os
@@ -71,6 +72,7 @@ def _sizevar_hint(sizevars, expr, fallback):
 
 from . import tlx_config
 from .mm_templates import (
+    amd_bmm_shared_a_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_addmm_warppipe_template,
     gfx950_bmm_warppipe_template,
@@ -1507,6 +1509,148 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
 
 
 @register_template_heuristic(
+    amd_bmm_shared_a_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
+)
+class ROCmBMMSharedATemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Validated gfx950 shared-LHS BMM configs.
+
+    This is deliberately a separate candidate from the general BMM warp-pipe.
+    It is only offered for row-major fp16 inputs whose mat1 batch stride is
+    zero, which is the shared-A contract the launch ordering relies on.
+    """
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        import sympy
+        from torch._inductor.virtualized import V
+
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            raise AssertionError(f"{self.__class__.__name__} requires MMKernelInputs")
+        if not _is_gfx950():
+            return
+        if (
+            kernel_inputs.dtype(kernel_inputs._mat1_idx) != torch.float16
+            or kernel_inputs.dtype(kernel_inputs._mat2_idx) != torch.float16
+            or kernel_inputs.out_dtype() != torch.float16
+        ):
+            return
+
+        symbolic_shapes = kernel_inputs.shapes_symbolic()
+        symbolic_strides = kernel_inputs.strides_symbolic()
+        a_strides = symbolic_strides[kernel_inputs._mat1_idx]
+        b_strides = symbolic_strides[kernel_inputs._mat2_idx]
+        if (
+            len(a_strides) != 3
+            or len(b_strides) != 3
+        ):
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        out_dtype = kernel_inputs.out_dtype()
+        sizevars = V.graph.sizevars
+        dense_shared_a_b = sympy.And(
+            sympy.Eq(a_strides[0], 0),
+            sympy.Eq(a_strides[1], k),
+            sympy.Eq(a_strides[2], 1),
+            sympy.Eq(b_strides[0], k * n),
+            sympy.Eq(b_strides[1], n),
+            sympy.Eq(b_strides[2], 1),
+        )
+        if not sizevars.statically_known_true(dense_shared_a_b):
+            return
+
+        # `tt.pointer_range=32` is what lets AMD lowering use buffer operations
+        # for the non-affine chip mapping below.  Match Inductor's own 32-bit
+        # indexing contract before adding that specialization: every logical
+        # input span and the contiguous output must fit in signed 32-bit bytes.
+        # Requiring a static proof also keeps dynamic/very-large batches on the
+        # generic BMM path rather than speculating from an example-size hint.
+        def storage_span(shape, stride):
+            if len(shape) != len(stride):
+                return None
+            return 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
+
+        a_shape = symbolic_shapes[kernel_inputs._mat1_idx]
+        b_shape = symbolic_shapes[kernel_inputs._mat2_idx]
+        a_stride = a_strides
+        b_stride = b_strides
+        a_span = storage_span(a_shape, a_stride)
+        b_span = storage_span(b_shape, b_stride)
+        if a_span is None or b_span is None:
+            return
+        batch = a_shape[0]
+        int32_max = torch.iinfo(torch.int32).max
+        pointer_range_is_32bit = sympy.And(
+            *(sympy.Ge(step, 0) for step in (*a_stride, *b_stride)),
+            sympy.Le(2 * a_span, int32_max),
+            sympy.Le(2 * b_span, int32_max),
+            sympy.Le(2 * batch * m * n, int32_max),
+        )
+        if not sizevars.statically_known_true(pointer_range_is_32bit):
+            return
+
+        configs = (
+            # kind, M, N, K, BM, BN, BK, batch group, warps, MI non-K dim,
+            # scheduling enabled, dwordx4 cover, required region count,
+            # reverse local assignment, disable high-RP reschedule
+            # Inductor specializes sizes and strides into the template IR.
+            # Preserve the schedules measured on that shorter dependency graph
+            # instead of copying the standalone JIT schedules mechanically.
+            (40, 40, 256, 1956, 64, 256, 32, 64, 4, 32, False, 4, 0, False, False),
+            (262, 262, 256, 294, 144, 256, 32, 256, 4, 16, True, 6, 0, False, False),
+            (448, 448, 160, 931, 224, 160, 32, 256, 4, 16, True, 2, 0, False, False),
+            (1195, 1195, 256, 2309, 256, 256, 64, 64, 4, 16, True, 4, 4, True, True),
+        )
+        for (
+            kind,
+            expected_m,
+            expected_n,
+            expected_k,
+            block_m,
+            block_n,
+            block_k,
+            batch_group,
+            num_warps,
+            matrix_instr_nonkdim,
+            enable_schedule,
+            cover,
+            required_regions,
+            reverse_local_assignment,
+            disable_high_rp_reschedule,
+        ) in configs:
+            matches = sympy.And(
+                sympy.Eq(m, expected_m),
+                sympy.Eq(n, expected_n),
+                sympy.Eq(k, expected_k),
+            )
+            if not sizevars.statically_known_true(matches):
+                continue
+            triton_config = self.triton_config(
+                1,
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                BATCH_GROUP=batch_group,
+                KERNEL_KIND=kind,
+                matrix_instr_nonkdim=matrix_instr_nonkdim,
+                waves_per_eu=0,
+                kpack=get_default_kpack(block_k),
+                enable_sched_group_barrier_scheduler=enable_schedule,
+                sched_group_barrier_mfma_per_dwordx4=cover,
+                sched_group_barrier_required_region_count=required_regions,
+                reverse_local_assignment=reverse_local_assignment,
+                sink_insts_to_avoid_spills=kind == 1195,
+                regclass_priority_trumps_globalness=kind == 1195,
+                disable_unclustered_high_rp_reschedule=disable_high_rp_reschedule,
+                inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config, m, n, k, out_dtype
+            )
+            return
+
+
+@register_template_heuristic(
     gfx950_addmm_persistent_warppipe_template.uid,
     "cuda",
     register=IS_ROCM,
@@ -1693,7 +1837,78 @@ from torch._inductor.select_algorithm import (
     TritonTemplateCaller,
     TritonTemplateKernel,
 )
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from torch._inductor.virtualized import V
+
+# TritonTemplate renders every config kwarg as a source-level constexpr, but
+# these AMD controls are also backend options consumed by triton.compile.  They
+# therefore do not appear in the runtime Config.kwargs that upstream's generic
+# backend-option extraction sees.  Copy the values from Inductor's preserved
+# template config into the dedicated backend_options dictionary.
+_TLX_AMD_BACKEND_OPTIONS = (
+    "matrix_instr_nonkdim",
+    "waves_per_eu",
+    "kpack",
+    "enable_sched_group_barrier_scheduler",
+    "sched_group_barrier_mfma_per_dwordx4",
+    "sched_group_barrier_required_region_count",
+    "reverse_local_assignment",
+    "sink_insts_to_avoid_spills",
+    "regclass_priority_trumps_globalness",
+    "disable_unclustered_high_rp_reschedule",
+)
+
+
+def _update_tlx_amd_compile_meta(compile_meta, config_args, device_type):
+    backend_options = dict(compile_meta.get("backend_options", {}))
+    for name in _TLX_AMD_BACKEND_OPTIONS:
+        if name in config_args:
+            backend_options[name] = config_args[name]
+
+    pointer_range_args = config_args.get("inductor_32bit_pointer_range", ())
+    backend_options.pop("inductor_32bit_pointer_range", None)
+    compile_meta["backend_options"] = backend_options
+    if device_type != "hip" or not pointer_range_args:
+        return compile_meta
+
+    signature = compile_meta["signature"]
+    pointer_range_names = set()
+    for arg_pattern in pointer_range_args:
+        matches = (
+            [name for name in signature if name.startswith(arg_pattern[:-1])]
+            if arg_pattern.endswith("*")
+            else [arg_pattern] if arg_pattern in signature else []
+        )
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected one signature argument for {arg_pattern}, got {matches}"
+            )
+        pointer_range_names.add(matches[0])
+
+    specialization = compile_meta["configs"][0]
+    for index, (name, ty) in enumerate(signature.items()):
+        if name not in pointer_range_names:
+            continue
+        if not isinstance(ty, str) or not ty.startswith("*"):
+            raise AssertionError(f"{name} must be a pointer argument, got {ty}")
+        attrs = specialization.setdefault((index,), [])
+        if ["tt.pointer_range", 32] not in attrs:
+            attrs.append(["tt.pointer_range", 32])
+    return compile_meta
+
+
+if not hasattr(CachingAutotuner, "_tlx_amd_backend_options"):
+    _orig_create_compile_meta = CachingAutotuner._create_compile_meta
+
+    def _tlx_create_compile_meta(self, cfg):  # type: ignore[no-untyped-def]
+        compile_meta = _orig_create_compile_meta(self, cfg)
+        config_args = self.inductor_meta.get("config_args", {})
+        return _update_tlx_amd_compile_meta(
+            compile_meta, config_args, self.device_props.type
+        )
+
+    CachingAutotuner._create_compile_meta = _tlx_create_compile_meta
+    CachingAutotuner._tlx_amd_backend_options = True
 
 # -- generate: inject split-K workspace_arg via the standard mechanism ------
 # The workspace_arg must flow through generate() so the autotuning benchmark
@@ -1809,10 +2024,48 @@ TritonTemplateKernel.__init__ = _tlx_ttk_init  # type: ignore[method-assign]
 
 # -- store_output: accept async_tma_store_buf_idx, set mode="async_tma" -----
 _orig_store_output = TritonTemplateKernel.store_output
+_orig_set_subgraph_body = TritonTemplateKernel.set_subgraph_body
+
+
+@contextlib.contextmanager
+def _tlx_set_subgraph_body(self, body_name):  # type: ignore[no-untyped-def]
+    """Restore TLX-specific state for one deferred store subgraph."""
+    previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    layouts = getattr(self, "_tlx_output_layout_by_subgraph", {})
+    if body_name in layouts:
+        self._tlx_output_layout = layouts[body_name]
+    try:
+        with _orig_set_subgraph_body(self, body_name):
+            # TritonTemplate's range tree is shared by store_output hooks. Keep
+            # the fix local to TLX stores carrying an explicit output layout:
+            # restore the coordinate names captured for this fragment before
+            # Inductor lowers its fused epilogue.
+            index_states = getattr(
+                self, "_tlx_output_indices_by_subgraph", {}
+            )
+            if body_name in index_states:
+                names, lengths = index_states[body_name]
+                entries = self.range_trees[0].construct_entries(lengths)
+                if len(entries) != len(names):
+                    raise AssertionError(
+                        "TLX output index rank does not match output rank"
+                    )
+                for name, entry in zip(names, entries):
+                    old_symbol = entry.symbol()
+                    entry.set_name(name)
+                    if self.range_tree_nodes.get(old_symbol) is entry:
+                        del self.range_tree_nodes[old_symbol]
+                    self.range_tree_nodes[entry.symbol()] = entry
+            yield
+    finally:
+        self._tlx_output_layout = previous_output_layout
+
+
+TritonTemplateKernel.set_subgraph_body = _tlx_set_subgraph_body  # type: ignore[method-assign]
 
 
 def _tlx_store_output(  # type: ignore[no-untyped-def]
-    self, *args, async_tma_store_buf_idx=None, **kwargs
+    self, *args, async_tma_store_buf_idx=None, output_layout=None, **kwargs
 ):
     if getattr(self, "async_tma_store", False):
         if async_tma_store_buf_idx is not None:
@@ -1820,6 +2073,8 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
         # Signal the store override to use async TMA mode instead of
         # the regular TMA mode that OSS store_output will select.
         self._tlx_async_tma_store_active = True
+    previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    self._tlx_output_layout = output_layout
     try:
         if not hasattr(V.interpreter, "current_node") and hasattr(
             V.graph, "current_node"
@@ -1828,10 +2083,34 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
             # the separate interpreter virtual is installed. CSEProxy still
             # needs the active FX node while rendering the addmm epilogue.
             with V.set_interpreter_handler(V.graph):
-                return _orig_store_output(self, *args, **kwargs)
-        return _orig_store_output(self, *args, **kwargs)
+                result = _orig_store_output(self, *args, **kwargs)
+        else:
+            result = _orig_store_output(self, *args, **kwargs)
+        if output_layout is not None:
+            layouts = getattr(self, "_tlx_output_layout_by_subgraph", None)
+            if layouts is None:
+                layouts = self._tlx_output_layout_by_subgraph = {}
+            layouts[result] = output_layout
+            block_indexing = kwargs.get(
+                "block_indexing", args[5] if len(args) > 5 else False
+            )
+            if not block_indexing:
+                index_states = getattr(
+                    self, "_tlx_output_indices_by_subgraph", None
+                )
+                if index_states is None:
+                    index_states = self._tlx_output_indices_by_subgraph = {}
+                index_states[result] = (
+                    tuple(self.template_indices),
+                    tuple(
+                        V.graph.sizevars.simplify(s)
+                        for s in self.output_node.get_size()
+                    ),
+                )
+        return result
     finally:
         self._tlx_async_tma_store_active = False
+        self._tlx_output_layout = previous_output_layout
 
 
 # Jinja template_env uses fn.__name__ to build the dict key — preserve it.
@@ -1843,6 +2122,42 @@ _orig_tk_store = TritonTemplateKernel.store
 
 
 def _tlx_store(self, name, index, value, mode=None):  # type: ignore[no-untyped-def]
+    output_layout = getattr(self, "_tlx_output_layout", None)
+    if mode is None and output_layout is not None:
+        # Explicitly laid-out TLX accumulators (for example an AMD MFMA
+        # accumulator) cannot be stored through Inductor's default blocked
+        # pointer encoding.  Keep the normal store_output epilogue generation,
+        # then align its final pointer, value, and mask at the store boundary.
+        var = self.args.output(name)
+        indexing = self.indexing(
+            index,
+            dense_indexing=True,
+            block_ptr=False,
+            tma_compatibility_checker=None,
+        )
+        if not hasattr(indexing, "index_str"):
+            raise AssertionError("output_layout requires tensor indexing")
+        if self._has_stride1_on_rdim(indexing.index):
+            self.stores_with_contiguous_rdim.append(name)
+        if name in self.args.inplace_buffers and self.is_broadcasted(index):
+            self.stores.writeline(DeferredLine(name, "tl.debug_barrier()"))
+
+        ptr = (
+            f"tlx.require_layout({var} + ({indexing.index_str}), "
+            f"{output_layout}, pin=False)"
+        )
+        stored_value = (
+            f"tlx.require_layout({value}, {output_layout}, pin=False)"
+        )
+        mask = indexing.mask_str
+        if mask != "None":
+            mask = f"tlx.require_layout({mask}, {output_layout}, pin=False)"
+        self.stores.writeline(
+            DeferredLine(name, f"tl.store({ptr}, {stored_value}, {mask})")
+        )
+        if not self.inside_reduction:
+            self.outside_loop_vars.add(value)
+        return
     if mode == "tma" and getattr(self, "_tlx_async_tma_store_active", False):
         # Redirect from regular TMA store to async TMA store.
         var = self.args.output(name)

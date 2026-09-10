@@ -552,7 +552,10 @@ def create_kernel_choices(
     if is_scan:
         kernel_kwargs["override_cooperative_reduction"] = False
 
-    kernel_type.apply_feature_required_overrides(kernel_features, kernel_kwargs)
+    # The pinned TritonBench torch wheel can predate this hook. On those
+    # versions, TritonKernel construction retains the legacy override behavior.
+    if hasattr(kernel_type, "apply_feature_required_overrides"):
+        kernel_type.apply_feature_required_overrides(kernel_features, kernel_kwargs)
 
     kernel_kwargs = V.choices.triton_kernel_kwargs(
         kernel_type, kernel_features, kernel_args, kernel_kwargs
