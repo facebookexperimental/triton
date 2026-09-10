@@ -633,6 +633,12 @@ def ScaledUpcastFp4Op
         `:` type($input) `,` type($scale) `->` type($output)
   }];
 
+  let extraClassDeclaration = [{
+    static std::optional<mlir::triton::LinearLayout>
+    computeScaleLayout(const mlir::triton::LinearLayout &outputLayout,
+                       int64_t axis, int64_t elementsPerScale);
+  }];
+
   let hasVerifier = 1;
 }
 

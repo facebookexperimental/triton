@@ -35,6 +35,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @predicate_descriptor_reduce
+  // CHECK: scf.if %{{.*}} {
+  // CHECK-NEXT: tt.descriptor_reduce
+  tt.func @predicate_descriptor_reduce(
+      %ub: i32, %desc: !tt.tensordesc<128x32xf32, #shared>,
+      %src: tensor<128x32x!tt.ptr<f32>, #blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %iv = %c0 to %ub step %c1 : i32 {
+      %value = tt.load %src {loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x32x!tt.ptr<f32>, #blocked>
+      tt.descriptor_reduce add, %desc[%c0, %c0], %value {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x32xf32, #shared>, tensor<128x32xf32, #blocked>
+      %unused = arith.addf %value, %value {loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x32xf32, #blocked>
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
 #s = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @expand_loop_without_results
