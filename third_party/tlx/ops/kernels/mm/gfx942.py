@@ -1,4 +1,4 @@
-"""MI300X (gfx942/CDNA3) ``tlx.ops.mm`` and ``addmm`` implementation.
+"""Shared MI300X (gfx942/CDNA3) GEMM implementation for ``mm`` and ``addmm``.
 
 One direct-load kernel serves both fundamental operations. Five BF16
 row-major-A/column-major-B shapes have frozen configurations; other supported
@@ -19,6 +19,13 @@ _CACHE_DEFAULT = 0
 _CACHE_CA_EVICT_LAST = 2
 _CACHE_CA_EVICT_FIRST = 3
 _CACHE_EVICT_LAST = 5
+
+# Repack row-major operands whose leading stride prevents vectorized loads.
+_STRIDE_ALIGN = 16
+_ALIGN_ROWS = True
+
+# Keep the steady-state K loop unmasked and handle an uneven final tile once.
+_PEEL_K_TAIL = True
 
 
 @triton.jit
@@ -61,6 +68,7 @@ def matmul_kernel_gfx942(
     ADD_BIAS: tl.constexpr,
     A_POLICY: tl.constexpr,
     B_POLICY: tl.constexpr,
+    PEEL_K_TAIL: tl.constexpr,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
     pid = tl.program_id(0).to(tl.int32)
@@ -92,13 +100,30 @@ def matmul_kernel_gfx942(
     reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-        k = k_idx * BLOCK_K
-        a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-        b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-        a = _policy_load(a_ptrs, offs_k[None, :] < K - k, K % BLOCK_K == 0, A_POLICY)
-        b = _policy_load(b_ptrs, offs_k[:, None] < K - k, K % BLOCK_K == 0, B_POLICY)
-        acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+    even_k = K % BLOCK_K == 0
+    if PEEL_K_TAIL:
+        k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
+        for k in range(0, k_main, BLOCK_K):
+            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            a = _policy_load(a_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
+            b = _policy_load(b_ptrs, offs_k[:, None] < K - k, True, B_POLICY)
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        if not even_k:
+            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
+            b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            tail = offs_k < K - k_main
+            a = _policy_load(a_ptrs, tail[None, :], False, A_POLICY)
+            b = _policy_load(b_ptrs, tail[:, None], False, B_POLICY)
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+    else:
+        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+            k = k_idx * BLOCK_K
+            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            a = _policy_load(a_ptrs, offs_k[None, :] < K - k, even_k, A_POLICY)
+            b = _policy_load(b_ptrs, offs_k[:, None] < K - k, even_k, B_POLICY)
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
@@ -275,7 +300,13 @@ def _launch_config(a, b, bias, bias_strides, out, selected):
         out.stride(1),
     )
     grid = (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]), )
-    matmul_kernel_gfx942[grid](*args, ADD_BIAS=bias is not None, **meta, **backend)
+    matmul_kernel_gfx942[grid](
+        *args,
+        ADD_BIAS=bias is not None,
+        PEEL_K_TAIL=_PEEL_K_TAIL,
+        **meta,
+        **backend,
+    )
 
 
 def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1):
@@ -345,7 +376,18 @@ def _tuned(space, shape=None):
         configs = heuristic_config(*shape)
     else:
         configs = {"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space]()
-    return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS"])(matmul_kernel_gfx942)
+    return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS", "PEEL_K_TAIL"])(matmul_kernel_gfx942)
+
+
+def _align_rows(t):
+    """Repack a row-major operand whose leading stride defeats vectorized loads."""
+    if t.stride(1) != 1 or t.stride(0) % _STRIDE_ALIGN == 0:
+        return t
+    rows, cols = t.shape
+    padded_cols = triton.cdiv(cols, _STRIDE_ALIGN) * _STRIDE_ALIGN
+    padded = torch.empty((rows, padded_cols), device=t.device, dtype=t.dtype)
+    padded[:, :cols] = t
+    return padded[:, :cols]
 
 
 def _validate_operands(a, b, out):
@@ -388,6 +430,9 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         _launch_config(a, b, bias, bias_strides, out, selected)
         return out
 
+    if _ALIGN_ROWS:
+        a, b = _align_rows(a), _align_rows(b)
+
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )  # noqa: E731
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
     bias_ptr = bias if bias is not None else out
@@ -408,6 +453,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         out.stride(0),
         out.stride(1),
         ADD_BIAS=bias is not None,
+        PEEL_K_TAIL=_PEEL_K_TAIL,
         matrix_instr_nonkdim=16,
     )
     return out
@@ -416,15 +462,6 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
 def mm(a, b, *, out=None, space="heuristic"):
     """Compute ``a @ b`` using the gfx942 direct-load GEMM kernel."""
     return _gemm(a, b, out=out, space=space)
-
-
-def addmm(input, a, b, *, out=None, space="heuristic"):
-    """Compute ``input + a @ b`` with a fused broadcast epilogue.
-
-    ``input`` may be ``(N,)`` or a two-dimensional tensor broadcastable to
-    ``(M, N)``. Matrix and input scale factors are both one.
-    """
-    return _gemm(a, b, input, out=out, space=space)
 
 
 # Compatibility entry point used by the kernel-optimization agent.
