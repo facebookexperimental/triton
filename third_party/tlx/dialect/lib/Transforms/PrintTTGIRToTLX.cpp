@@ -1651,6 +1651,53 @@ void printSimplifiedOp(
 
   // === Special-case handlers for ops needing custom printing ===
 
+  // tt.elementwise_inline_asm carries the asm text, constraints, purity and
+  // packing as attributes, so the generic printer emits only the operands and the
+  // call is missing four of its six arguments.
+  if (opName == "tt.elementwise_inline_asm") {
+    unsigned nres = op->getNumResults();
+    for (unsigned i = 0; i < nres; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getResult(i), argSubstitutionMap);
+    if (nres > 0)
+      os << " = ";
+    os << "tl.inline_asm_elementwise(";
+    auto asmAttr = op->getAttrOfType<StringAttr>("asm_string");
+    printPythonStringLiteral(asmAttr ? asmAttr.getValue() : "", os);
+    os << ", ";
+    auto consAttr = op->getAttrOfType<StringAttr>("constraints");
+    printPythonStringLiteral(consAttr ? consAttr.getValue() : "", os);
+    // `args` is a sequence parameter, not varargs.
+    os << ", [";
+    for (unsigned i = 0; i < op->getNumOperands(); ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
+    os << "], ";
+    // dtype is the result element type, and a list of them when the asm returns
+    // more than one value.
+    auto elemName = [&](Type t) {
+      if (auto rt = dyn_cast<RankedTensorType>(t))
+        return getElementTypeName(rt.getElementType());
+      return getElementTypeName(t);
+    };
+    if (nres == 1) {
+      os << elemName(op->getResult(0).getType());
+    } else {
+      os << "[";
+      for (unsigned i = 0; i < nres; ++i)
+        os << (i ? ", " : "") << elemName(op->getResult(i).getType());
+      os << "]";
+    }
+    // Default to impure when the attribute is missing: marking side-effecting
+    // asm pure would let the recompiled kernel hoist or delete it.
+    auto pureAttr = op->getAttrOfType<BoolAttr>("pure");
+    auto packAttr = op->getAttrOfType<IntegerAttr>("packed_element");
+    os << ", " << ((pureAttr && pureAttr.getValue()) ? "True" : "False") << ", "
+       << (packAttr ? packAttr.getInt() : 1) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is a
   // syntax error rather than an undefined name, and it drops the message.
   if (opName == "tt.assert") {
