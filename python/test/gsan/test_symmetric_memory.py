@@ -11,11 +11,12 @@ import triton
 import triton.language as tl
 
 from triton._internal_testing import is_cuda
-from triton.experimental.gsan import symmetric_memory
-from triton.experimental.gsan._allocator import get_runtime_state_layout
-from triton.experimental.gsan._testing_utils import (SHADOW_GRANULARITY_BYTES, shadow_cell_from_address,
-                                                     shadow_tensor_for)
-from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
+from triton.experimental.gsan import _stream_sync, symmetric_memory
+from triton.experimental.gsan._testing_utils import (
+    shadow_cell_from_address,
+    shadow_tensor_for,
+    SHADOW_GRANULARITY_BYTES,
+)
 
 pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
 
@@ -26,25 +27,33 @@ def _get_free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _vector_clocks(runtime_state_device: int, access_device: int) -> tuple[torch.Tensor, dict[str, int]]:
-    layout = get_runtime_state_layout(runtime_state_device)
-    region_size = layout["thread_state_stride_bytes"] * layout["num_sms"]
-    region = uint8_cuda_tensor_from_ptr(layout["thread_state_base_ptr"], region_size, access_device)
-    clocks = torch.as_strided(
-        region.view(torch.uint16)[layout["thread_state_header_size_bytes"] // 2:],
-        size=(layout["num_sms"], layout["num_threads"]),
-        stride=(layout["thread_state_stride_bytes"] // 2, 1),
-    )
-    return clocks, layout
+def _assert_barrier_synchronizes_stream_clocks(hdl, device_index: int, group: dist.ProcessGroup) -> None:
+    stream = torch.cuda.current_stream(device_index)
+    stream_state = _stream_sync._launch_stream_state(device_index, stream.cuda_stream)
+    kernel_id = stream_state.next_kernel_id
+    assert kernel_id > 0
 
+    previous_clock = stream_state.clocks[(kernel_id - 1) % 3].cpu()
+    peer_clocks = [None] * hdl.world_size
+    dist.all_gather_object(peer_clocks, previous_clock, group=group)
 
-def _local_vector_clocks(device_index: int) -> tuple[torch.Tensor, dict[str, int]]:
-    return _vector_clocks(device_index, device_index)
+    hdl.barrier(channel=0)
+
+    assert stream_state.next_kernel_id == kernel_id + 1
+    synced_clock = stream_state.clocks[kernel_id % 3].cpu()
+    expected_clock = torch.stack(peer_clocks).amax(dim=0)
+    assert torch.all(synced_clock >= expected_clock).item()
 
 
 @triton.jit
 def _store_scalar_kernel(peer_buf, byte_offset, value):
     tl.store(peer_buf + byte_offset, value)
+
+
+@triton.jit
+def _load_scalar_kernel(buf, byte_offset, out):
+    value = tl.load(buf + byte_offset)
+    tl.store(out, value)
 
 
 def _run_symmetric_memory_checks(rank: int, world_size: int) -> None:
@@ -85,15 +94,7 @@ def _run_symmetric_memory_checks(rank: int, world_size: int) -> None:
     if rank == 1:
         assert torch.all(local_shadow == 29).item()
 
-    local_clocks, layout = _local_vector_clocks(rank)
-    local_clocks.zero_()
-    local_tid = rank * layout["num_sms"]
-    peer_tid = peer * layout["num_sms"]
-    local_clocks[0, local_tid] = rank + 11
-    hdl.barrier(channel=0)
-    synced_clocks, _ = _local_vector_clocks(rank)
-    assert torch.all(synced_clocks[:, local_tid] == (rank + 11)).item()
-    assert torch.all(synced_clocks[:, peer_tid] == (peer + 11)).item()
+    _assert_barrier_synchronizes_stream_clocks(hdl, rank, dist.group.WORLD)
 
     del peer_buf
     del local_shadow
@@ -196,6 +197,8 @@ def _distributed_worker(rank: int, world_size: int, master_port: int, run_subgro
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
 def test_gsan_symmetric_memory_rendezvous():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires 2 CUDA devices")
@@ -208,6 +211,8 @@ def test_gsan_symmetric_memory_rendezvous():
         nprocs=world_size,
         join=True,
     )
+
+
 def test_gsan_symmetric_memory_rendezvous_subgroup_without_global_zero():
     if torch.cuda.device_count() < 3:
         pytest.skip("requires 3 CUDA devices")
@@ -254,10 +259,16 @@ def _run_multi_node_simulated_symmetric_memory_checks(rank: int, world_size: int
     untouched_shadow_before = shadow_cell_from_address(buf.data_ptr() + untouched_shadow_offset,
                                                        device_index=device_index)
 
-    _store_scalar_kernel[(1, )](peer_buf, outgoing_shadow_offset, rank + 151, num_warps=1)
-    torch.cuda.synchronize()
-    hdl.barrier(channel=0)
-    dist.barrier()
+    stream = torch.cuda.Stream(device=dev)
+    seen_after_barrier = torch.empty((1, ), dtype=torch.uint8, device=dev)
+    with torch.cuda.stream(stream):
+        _store_scalar_kernel[(1, )](peer_buf, outgoing_shadow_offset, rank + 151, num_warps=1)
+        torch.cuda.synchronize()
+        hdl.barrier(channel=0)
+        dist.barrier()
+        _load_scalar_kernel[(1, )](buf, incoming_shadow_offset, seen_after_barrier, num_warps=1)
+        torch.cuda.synchronize()
+    assert int(seen_after_barrier.item()) == prev + 151
 
     incoming_shadow_after = shadow_cell_from_address(buf.data_ptr() + incoming_shadow_offset, device_index=device_index)
     untouched_shadow_after = shadow_cell_from_address(buf.data_ptr() + untouched_shadow_offset,
@@ -268,16 +279,7 @@ def _run_multi_node_simulated_symmetric_memory_checks(rank: int, world_size: int
     assert incoming_shadow_after.write_clock.epoch != 0
     assert untouched_shadow_after == untouched_shadow_before
 
-    local_clocks, layout = _vector_clocks(rank, device_index)
-    local_clocks.zero_()
-    local_tid = rank * layout["num_sms"]
-    local_clocks[0, local_tid] = rank + 211
-    hdl.barrier(channel=0)
-
-    synced_clocks, _ = _vector_clocks(rank, device_index)
-    for global_rank in range(world_size):
-        tid = global_rank * layout["num_sms"]
-        assert torch.all(synced_clocks[:, tid] == (global_rank + 211)).item()
+    _assert_barrier_synchronizes_stream_clocks(hdl, device_index, dist.group.WORLD)
 
     del peer_buf
     torch.cuda.synchronize()
@@ -398,6 +400,8 @@ def _distributed_worker_triton_kernels_convert_dp_to_ep(rank: int, world_size: i
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
 def test_gsan_symmetric_memory_rendezvous_multi_node_simulated():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires 2 CUDA devices")
@@ -410,6 +414,8 @@ def test_gsan_symmetric_memory_rendezvous_multi_node_simulated():
         nprocs=world_size,
         join=True,
     )
+
+
 def test_gsan_symmetric_memory_with_triton_kernels_convert_dp_to_ep():
     pytest.importorskip("triton_kernels.distributed")
     if torch.cuda.device_count() < 2:

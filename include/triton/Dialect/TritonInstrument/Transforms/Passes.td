@@ -57,6 +57,11 @@ def TritonInstrumentFpSanitizer
                            "mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",
                            "mlir::triton::instrument::TritonInstrumentDialect"];
+
+  let options = [
+    Option<"homomorphicCasts", "homomorphic-casts", "bool", /*default*/"false",
+           "Use truncating FPSan payload downcasts">
+  ];
 }
 
 #endif // TRITON_INSTRUMENT_PASSES

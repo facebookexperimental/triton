@@ -1290,8 +1290,9 @@ def _attn_bwd_gqa_front(
     QT_LAYOUT: tl.constexpr,
     P_ND_LAYOUT: tl.constexpr,
     Q_OUT_LAYOUT: tl.constexpr,
+    UPDATE_DV_FIRST_HALF: tl.constexpr = True,
 ):
-    """Apply the optional causal scaled-score mask, then publish current dS to LDS."""
+    """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
     k_nm = tlx.local_load(
@@ -1407,15 +1408,16 @@ def _attn_bwd_gqa_front(
     p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
     p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
     p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
-    dv = _attn_bwd_gqa_dv_fragmented_half(
-        p_nd,
-        do_out,
-        dv,
-        MMA_ND,
-        P_ND_LAYOUT,
-        Q_OUT_LAYOUT,
-        True,
-    )
+    if UPDATE_DV_FIRST_HALF:
+        dv = _attn_bwd_gqa_dv_fragmented_half(
+            p_nd,
+            do_out,
+            dv,
+            MMA_ND,
+            P_ND_LAYOUT,
+            Q_OUT_LAYOUT,
+            True,
+        )
 
     ds_bf16 = ds.to(tl.bfloat16)
     tlx.local_store(ds_stage, tl.trans(ds_bf16))
@@ -6274,8 +6276,8 @@ def _attn_bwd_dq_d64_causal_step(
     scores = scores + row_lse_full
     scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
     if BLOCK_N == 64:
-        # End the score-MFMA allocation interval before the exp tail.
-        scores = tlx.amd_register_handoff(scores, register_class="vgpr")
+        # Anchor the score value in VGPRs before the exp tail.
+        scores = tlx.amd_register_class_anchor(scores, register_class="vgpr")
         scores = tlx.require_layout(scores, mma_mn, pin=False)
 
     # Match the independent MFMA cadence used by the tuned reference: issue
@@ -6311,7 +6313,7 @@ def _attn_bwd_dq_d64_causal_step(
         )
         scores = tl.where(valid, scores, negative_inf)
     p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         p * dp,
         register_class="vgpr",
     )
@@ -6375,7 +6377,7 @@ def _attn_bwd_dq_d64_causal_finish32(
     dp = tlx.require_layout(dp, mma_mn, pin=False)
     k_nd = tlx.require_layout(k_nd, k_op1_md, pin=False)
     p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         p * dp,
         register_class="vgpr",
     )
@@ -8034,7 +8036,7 @@ def _d64_gqa8_signed_front(
         do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
     ds = p * dp
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         ds,
         register_class="vgpr",
     )
@@ -8105,7 +8107,7 @@ def _d64_gqa8_signed_front_loaded_stats(
     )
     do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         p * dp,
         register_class="vgpr",
     )

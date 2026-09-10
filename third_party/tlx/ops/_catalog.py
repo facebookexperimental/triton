@@ -63,6 +63,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm",
+        arch="gfx950",
+        variant="local_split_u",
+        impl="kernels.mm.gfx950:mm",
+        # Deliberately not `_FP16`: that shared set also contains bfloat16,
+        # while this first gfx950 implementation has only been validated for
+        # IEEE fp16 operands.
+        dtypes=frozenset({"float16"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
@@ -145,6 +156,16 @@ def _load(impl: str) -> Callable[..., Any]:
 
 def _arches_for(op: str) -> list[str]:
     return sorted(s.arch for s in CATALOG if s.op == op)
+
+
+def has_impl(op: str, arch: str) -> bool:
+    """Is there a catalog entry for this pair, without importing the kernel?
+
+    A table lookup, not a capability check: the benchmark suite uses it to skip
+    an op cleanly on an arch it was never written for, rather than running every
+    shape and reporting each one as an error.
+    """
+    return (op, arch) in _BY_KEY
 
 
 def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:

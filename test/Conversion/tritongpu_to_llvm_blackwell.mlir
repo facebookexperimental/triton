@@ -902,73 +902,10 @@ tt.func @tc_gen5_commit_elect_cse(%bar0: !ttg.memdesc<1xi64, #shared, #smem, mut
 
 // -----
 
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
-#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
-  // CHECK-LABEL: @tc_gen5_commit_multicast
-  // CHECK: tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
-  // CHECK: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
-  tt.func @tc_gen5_commit_multicast(%barrier: !ttg.memdesc<2xi64, #barrier, #smem, mutable>, %desc: !ttg.memdesc<128x128xf16, #shared, #smem>, %pred: i1, %phase: i32) {
-    ttng.tc_gen5_commit %barrier, %pred descs %desc : !ttg.memdesc<2xi64, #barrier, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem>
-    ttng.wait_barrier %barrier, %phase : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
-#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
-#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[0, 0]]>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
-  // CHECK-LABEL: @tc_gen5_mma_multicast
-  // CHECK: tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
-  // CHECK: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
-  tt.func @tc_gen5_mma_multicast(%a: !ttg.memdesc<128x128xf16, #shared, #smem>, %b: !ttg.memdesc<128x128xf16, #shared, #smem>, %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %barrier: !ttg.memdesc<2xi64, #barrier, #smem, mutable>, %pred: i1, %phase: i32) {
-    %false = arith.constant false
-    ttng.tc_gen5_mma %a, %b, %acc, %false, %pred, %barrier[%pred] {is_async, multicast} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2xi64, #barrier, #smem, mutable>
-    ttng.wait_barrier %barrier, %phase : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
-#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
-  // CHECK-LABEL: @tc_gen5_commit_without_multicast
-  // CHECK: tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64
-  // CHECK: mbarrier.try_wait.parity.shared::cta.b64
-  tt.func @tc_gen5_commit_without_multicast(%barrier: !ttg.memdesc<2xi64, #barrier, #smem, mutable>, %desc: !ttg.memdesc<128x128xf16, #shared, #smem>, %pred: i1, %phase: i32) {
-    ttng.tc_gen5_commit %barrier, %pred descs %desc : !ttg.memdesc<2xi64, #barrier, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem>
-    ttng.wait_barrier %barrier, %phase : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
-#smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.two-ctas" = true} {
-  // CHECK-LABEL: @tc_gen5_commit_two_ctas
-  // CHECK: tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
-  // CHECK: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
-  tt.func @tc_gen5_commit_two_ctas(%barrier: !ttg.memdesc<2xi64, #barrier, #smem, mutable>, %pred: i1, %phase: i32) {
-    ttng.tc_gen5_commit %barrier, %pred : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
-    ttng.wait_barrier %barrier, %phase : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
 #tmem_f32 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 16, colStride = 1>
 #tmem_f16 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 16, colStride = 2>
+#tmem_window = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 module attributes {"ttg.num-warps" = 4 : i32} {
 
@@ -979,6 +916,29 @@ tt.func private @reinterpret(%arg0: !ttg.memdesc<128x32xf32, #tmem_f32, #ttng.te
   tt.return %0 : !ttg.memdesc<128x32xf16, #tmem_f16, #ttng.tensor_memory>
 }
 
+// CHECK-LABEL: @tmem_subslice_reinterpret_scales
+tt.func private @tmem_subslice_reinterpret_scales(%arg0: !ttg.memdesc<128x512xf32, #tmem_window, #ttng.tensor_memory, mutable>) -> !ttg.memdesc<64x16xi8, #tmem_scales, #ttng.tensor_memory, mutable> {
+  // CHECK-NEXT: [[OFFSET:%.*]] = llvm.mlir.constant(480 : i32)
+  // CHECK-NEXT: [[BASE:%.*]] = llvm.ptrtoint %arg0 : !llvm.ptr<3> to i32
+  // CHECK-NEXT: [[NEW_BASE:%.*]] = llvm.add [[BASE]], [[OFFSET]] : i32
+  // CHECK-NEXT: [[TMEM:%.*]] = llvm.inttoptr [[NEW_BASE]] : i32 to !llvm.ptr<3>
+  %0 = ttng.tmem_subslice %arg0 {offset = 480 : i32} : !ttg.memdesc<128x512xf32, #tmem_window, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x32xf32, #tmem_window, #ttng.tensor_memory, mutable, 128x512>
+  %1 = ttg.memdesc_reinterpret %0 : !ttg.memdesc<128x32xf32, #tmem_window, #ttng.tensor_memory, mutable, 128x512> -> !ttg.memdesc<64x16xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+  // CHECK-NEXT: llvm.return [[TMEM]] : !llvm.ptr<3>
+  tt.return %1 : !ttg.memdesc<64x16xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+}
+
+// CHECK-LABEL: @tmem_subslice_source_layout_contiguous
+tt.func private @tmem_subslice_source_layout_contiguous(%arg0: !ttg.memdesc<128x512xf32, #tmem_window, #ttng.tensor_memory, mutable>) -> !ttg.memdesc<128x256xf32, #tmem_window, #ttng.tensor_memory, mutable, 128x512> {
+  // CHECK-NEXT: [[OFFSET:%.*]] = llvm.mlir.constant(208 : i32)
+  // CHECK-NEXT: [[BASE:%.*]] = llvm.ptrtoint %arg0 : !llvm.ptr<3> to i32
+  // CHECK-NEXT: [[NEW_BASE:%.*]] = llvm.add [[BASE]], [[OFFSET]] : i32
+  // CHECK-NEXT: [[TMEM:%.*]] = llvm.inttoptr [[NEW_BASE]] : i32 to !llvm.ptr<3>
+  %0 = ttng.tmem_subslice %arg0 {offset = 208 : i32} : !ttg.memdesc<128x512xf32, #tmem_window, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x256xf32, #tmem_window, #ttng.tensor_memory, mutable, 128x512>
+  // CHECK-NEXT: llvm.return [[TMEM]] : !llvm.ptr<3>
+  tt.return %0 : !ttg.memdesc<128x256xf32, #tmem_window, #ttng.tensor_memory, mutable, 128x512>
+}
+
 }
 
 // -----
@@ -987,6 +947,7 @@ tt.func private @reinterpret(%arg0: !ttg.memdesc<128x32xf32, #tmem_f32, #ttng.te
 #tmem_unpacked = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
 #tmem_x1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 2, colStride = 1>
 #tmem_x1_unpacked = #ttng.tensor_memory_encoding<blockM = 128, blockN = 2, colStride = 2>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 #blocked_x1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 
@@ -1009,6 +970,16 @@ tt.func private @subslice_packed(%arg0: !ttg.memdesc<128x128xf16, #tmem, #ttng.t
   // CHECK: llvm.add [[PTR]], [[OFFSET]] : i32
   %0 = ttng.tmem_subslice %arg0 {offset = 64 : i32} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory> -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, 128x128>
   tt.return %0 : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, 128x128>
+}
+
+// CHECK-LABEL: @subslice_scales
+tt.func private @subslice_scales(%arg0: !ttg.memdesc<256x4xi8, #tmem_scales, #ttng.tensor_memory>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, 128x8> {
+  // CHECK: [[OFFSET:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK: [[PTR:%.*]] = llvm.ptrtoint
+  // CHECK: llvm.add [[PTR]], [[OFFSET]] : i32
+  %view = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<256x4xi8, #tmem_scales, #ttng.tensor_memory> -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
+  %0 = ttng.tmem_subslice %view {offset = 4 : i32} : !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory> -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, 128x8>
+  tt.return %0 : !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory, 128x8>
 }
 
 // CHECK-LABEL: @subslice_row_then_column

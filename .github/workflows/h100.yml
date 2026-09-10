@@ -3,47 +3,118 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - 'third_party/amd/**'
-      - 'third_party/tlx/tutorials/blackwell-*/**'
-      - 'third_party/tlx/tutorials/blackwell-*'
-      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - 'third_party/tlx/tutorials/gfx9_gemm/**'
-      - 'third_party/amd/python/test/**'
-      - 'python/test/unit/language/test_tlx_amd.py'
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!website/**'
+      - '!python/test/unit/language/test_tlx_codegen.py'
+      - '!third_party/amd/**'
+      - '!third_party/tlx/tutorials/blackwell-*/**'
+      - '!third_party/tlx/tutorials/blackwell-*'
+      - '!third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - '!third_party/tlx/tutorials/gfx9_gemm/**'
+      - '!third_party/amd/python/test/**'
+      - '!python/test/unit/language/test_tlx_*_gfx942.py'
+      - '!python/test/unit/language/test_tlx_*_gfx950.py'
+      - '!python/test/unit/language/test_tlx_*_gfx1250.py'
+      - '!python/test/unit/language/test_tlx_*_hip.py'
+      - '!python/test/unit/tlx_ops/*_gfx950.py'
+      - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/language/test_tlx_*_sm100.py'
+      - '!python/test/unit/tlx_ops/*_sm100.py'
   pull_request:
-    paths-ignore:
-      - 'third_party/amd/**'
-      - 'third_party/tlx/tutorials/blackwell-*/**'
-      - 'third_party/tlx/tutorials/blackwell-*'
-      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - 'third_party/tlx/tutorials/gfx9_gemm/**'
-      - 'third_party/amd/python/test/**'
-      - 'python/test/unit/language/test_tlx_amd.py'
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!website/**'
+      - '!python/test/unit/language/test_tlx_codegen.py'
+      - '!third_party/amd/**'
+      - '!third_party/tlx/tutorials/blackwell-*/**'
+      - '!third_party/tlx/tutorials/blackwell-*'
+      - '!third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - '!third_party/tlx/tutorials/gfx9_gemm/**'
+      - '!third_party/amd/python/test/**'
+      - '!python/test/unit/language/test_tlx_*_gfx942.py'
+      - '!python/test/unit/language/test_tlx_*_gfx950.py'
+      - '!python/test/unit/language/test_tlx_*_gfx1250.py'
+      - '!python/test/unit/language/test_tlx_*_hip.py'
+      - '!python/test/unit/tlx_ops/*_gfx950.py'
+      - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/language/test_tlx_*_sm100.py'
+      - '!python/test/unit/tlx_ops/*_sm100.py'
   schedule:
-    # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
 
-# torchTLX (TLX-as-Inductor-backend) is Blackwell-focused and is exercised by the
-# dedicated torchtlx.yml workflow. Keep it disabled on Hopper: only "allow"/"force"
-# enable it, so an empty value forces it off regardless of any environment default.
 env:
   TORCHINDUCTOR_TLX_MODE: ""
+  CCACHE_DIR: /tmp/fbtriton-ccache
+  CCACHE_MAXSIZE: 2G
 
 jobs:
-  h100-meta-triton-test:
+  h100-build:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: linux-gcp-h100
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 240
+    timeout-minutes: 60
     permissions:
       id-token: write
       contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fbtriton-ccache
+          key: ccache-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-
+            ccache-
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          install_triton $PWD
+      - name: Build wheel
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv build --wheel --no-build-isolation --out-dir dist/
+          ls -la dist/
+          python3 -c "import glob,sys,zipfile; w=glob.glob('dist/*.whl'); sys.exit('no wheel built') if len(w)!=1 else None; zipfile.ZipFile(w[0]).testzip(); print('wheel ok:', w[0])"
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-wheel-h100-${{ github.sha }}
+          path: dist/*.whl
+          retention-days: 1
+
+  h100-meta-triton-test:
+    needs: h100-build
+    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    runs-on: linux-gcp-h100
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
     outputs:
       failures: ${{ steps.collect.outputs.failures }}
     steps:
+      - name: Fail if the build job did not succeed
+        if: needs.h100-build.result != 'success'
+        run: |
+          echo "h100-build result: ${{ needs.h100-build.result }}"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v3
         with:
@@ -53,18 +124,23 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Compile Triton
+      - name: Download prebuilt Triton wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-wheel-h100-${{ github.sha }}
+          path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
-          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
-          install_triton $PWD
+          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+      - name: Export TritonBench env
+        run: |
+          . "${SETUP_SCRIPT}"
           set -x
           TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
           TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
           TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
           TRITONBENCH_INSTALL_DIR=${PWD}
-          # If the current conda env matches the env we just created
-          # then export all Triton related envs to shell env
           cat <<EOF >> "${SETUP_SCRIPT}"
           if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
               export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
@@ -87,34 +163,37 @@ jobs:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
         run: |
           . "${SETUP_SCRIPT}"
-          # Use the TritonBench checked out for a linked PR if present, else the
-          # pre-provisioned copy on the runner.
           export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
           bash ./.ci/tritonbench/test-gpu.sh
       - name: Collect nightly failure (TritonBench)
         id: collect
         if: always() && github.event_name == 'schedule' && failure()
         run: |
-          # TritonBench output is not a stable per-test format, so fall back to a
-          # stable logical bucket identity for this job.
           BUCKET="h100-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-meta-triton-test / ${BUCKET}"
           FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   h100-tlx-test:
-    if: github.repository_owner == 'facebookexperimental'
+    needs: h100-build
+    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-gcp-h100
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 120
+    timeout-minutes: 90
     permissions:
       id-token: write
       contents: read
+      actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
+      - name: Fail if the build job did not succeed
+        if: needs.h100-build.result != 'success'
+        run: |
+          echo "h100-build result: ${{ needs.h100-build.result }}"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v3
         with:
@@ -124,55 +203,120 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Compile Triton
+      - name: Download prebuilt Triton wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-wheel-h100-${{ github.sha }}
+          path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
-          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
-          install_triton $PWD
+          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
           uv pip install pytest
-      - name: Install torchao from source
+      - name: Install torchao
+        timeout-minutes: 10
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
+          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
-      - name: Run TLX unit tests
-        id: run_unit_tests
-        timeout-minutes: 15
+      - name: Run TLX core tests
+        id: run_core_tests
+        timeout-minutes: 30
         run: |
           . "${SETUP_SCRIPT}"
-          # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
-          # and structurally excludes the autoWS suites (test_autows_*.py,
-          # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
-          # which are never collected here and are tested separately.
-          python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
+          shopt -s nullglob
+          FILES=(
+            python/test/unit/language/test_tlx_*_any.py
+            python/test/unit/language/test_tlx_*sm90up*.py
+            python/test/unit/language/test_tlx_*sm90.py
+            python/test/unit/tlx_ops/test_*sm90.py
+          )
+          [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
+          echo "h100 collects:" "${FILES[@]}"
+          python -m pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
-      - name: Run runtime unit tests
-        id: run_runtime_tests
-        timeout-minutes: 5
-        run: |
-          . "${SETUP_SCRIPT}"
-          python -m pytest python/test/unit/runtime/test_fast_cache_edge_cases.py python/test/unit/runtime/test_tensordesc_cache.py python/test/unit/runtime/test_triton_dispatcher_factory.py -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket h100-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml /tmp/runtime-unit.xml \
+            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml \
+            --budget /tmp/tlx-core.xml=30 --budget /tmp/tlx-correctness.xml=30 \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "h100-tlx-test" \
             ${FAILED_FLAG}
 
-  # ----- Nightly issue filing (schedule only) -----
+  h100-runtime-test:
+    needs: h100-build
+    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    runs-on: linux-gcp-h100
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Fail if the build job did not succeed
+        if: needs.h100-build.result != 'success'
+        run: |
+          echo "h100-build result: ${{ needs.h100-build.result }}"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Download prebuilt Triton wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-wheel-h100-${{ github.sha }}
+          path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Install Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+          uv pip install pytest
+      - name: Run runtime unit tests
+        id: run_runtime_tests
+        timeout-minutes: 30
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest python/test/unit/runtime/ -v --junitxml=/tmp/runtime-unit.xml
+      - name: Collect nightly failures (runtime)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket h100-runtime-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/runtime-unit.xml \
+            --budget /tmp/runtime-unit.xml=30 \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "h100-runtime-test" \
+            ${FAILED_FLAG}
+
   report-h100-tritonbench:
     needs: h100-meta-triton-test
     if: always() && github.event_name == 'schedule' && needs.h100-meta-triton-test.outputs.failures != '' && needs.h100-meta-triton-test.outputs.failures != '[]'
@@ -231,7 +375,35 @@ jobs:
       external_dep_reason: ${{ matrix.item.external_dep_reason }}
       platform: h100
 
-  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  report-h100-runtime:
+    needs: h100-runtime-test
+    if: always() && github.event_name == 'schedule' && needs.h100-runtime-test.outputs.failures != '' && needs.h100-runtime-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.h100-runtime-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: h100
+
   reconcile-h100-tritonbench:
     needs: h100-meta-triton-test
     if: always() && github.event_name == 'schedule' && (needs.h100-meta-triton-test.result == 'success' || needs.h100-meta-triton-test.result == 'failure')
@@ -256,6 +428,19 @@ jobs:
       workflow_name: ${{ github.workflow }}
       job_name: h100-tlx-test
       failures: ${{ needs.h100-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-h100-runtime:
+    needs: h100-runtime-test
+    if: always() && github.event_name == 'schedule' && (needs.h100-runtime-test.result == 'success' || needs.h100-runtime-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: h100-runtime-test
+      failures: ${{ needs.h100-runtime-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:

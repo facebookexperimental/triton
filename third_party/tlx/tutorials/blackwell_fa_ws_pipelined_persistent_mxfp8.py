@@ -1357,7 +1357,7 @@ def _attn_bwd_preprocess(
     o = tl.load(O + o_offsets, mask=o_mask, other=0.0)
     do = tl.load(DO + o_offsets, mask=o_mask, other=0.0).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
-    tl.store(DQ + o_offsets, 0.0, mask=o_mask)
+    tl.store(DQ + o_offsets, 0.0, mask=o_mask, eviction_policy="evict_first")
     tl.store(Delta + base + off_m, delta, mask=off_m < N_CTX)
 
 
@@ -2813,15 +2813,7 @@ def _attn_bwd_mxf8_ws(
                     do_scale_smem[do_buf_id],
                     [sf_off_seq_h, do_scale_m, 0, 0, 0],
                     do_fulls[do_buf_id],
-                )
-                d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-                tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
-                tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-                tlx.async_descriptor_load(
-                    desc_delta,
-                    sD_tiles[d_buf_id],
-                    [(base_q + curr_m).to(tl.int32)],
-                    d_fulls[d_buf_id],
+                    eviction_policy="evict_last",
                 )
                 tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
                 tlx.barrier_expect_bytes(
@@ -2839,6 +2831,16 @@ def _attn_bwd_mxf8_ws(
                     do_scale_dv_smem[do_buf_id],
                     [sf_off_seq_h, 0, do_scale_m, 0, 0],
                     do_dv_fulls[do_buf_id],
+                    eviction_policy="evict_last",
+                )
+                d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
+                tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
+                tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+                tlx.async_descriptor_load(
+                    desc_delta,
+                    sD_tiles[d_buf_id],
+                    [(base_q + curr_m).to(tl.int32)],
+                    d_fulls[d_buf_id],
                 )
                 tlx.barrier_wait(k_dq_empties[kv_buf_id], kv_phase ^ 1)
                 tlx.barrier_expect_bytes(
@@ -2893,6 +2895,55 @@ def _attn_bwd_mxf8_ws(
                         [(base_q + curr_m).to(tl.int32)],
                         m_fulls[m_buf_id],
                     )
+                    tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
+                    tlx.barrier_expect_bytes(
+                        do_fulls[do_buf_id],
+                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do,
+                        do_smem[do_buf_id],
+                        [off_z, off_h, curr_m, 0],
+                        do_fulls[do_buf_id],
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do_scale,
+                        do_scale_smem[do_buf_id],
+                        [sf_off_seq_h, do_scale_m, 0, 0, 0],
+                        do_fulls[do_buf_id],
+                        eviction_policy="evict_last",
+                    )
+                    tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
+                    tlx.barrier_expect_bytes(
+                        do_dv_fulls[do_buf_id],
+                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do_dv,
+                        do_dv_smem[do_buf_id],
+                        [off_z, off_h, curr_m, 0],
+                        do_dv_fulls[do_buf_id],
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do_dv_scale,
+                        do_scale_dv_smem[do_buf_id],
+                        [sf_off_seq_h, 0, do_scale_m, 0, 0],
+                        do_dv_fulls[do_buf_id],
+                        eviction_policy="evict_last",
+                    )
+                    d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
+                    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
+                    tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+                    tlx.async_descriptor_load(
+                        desc_delta,
+                        sD_tiles[d_buf_id],
+                        [(base_q + curr_m).to(tl.int32)],
+                        d_fulls[d_buf_id],
+                    )
+                    # Q-for-dK is consumed after the current Q, dO, and Delta
+                    # paths. Defer its reuse wait so it cannot prevent those
+                    # critical-path TMA requests from being issued. The same
+                    # empty/full phase still protects the single staging slot.
                     tlx.barrier_wait(q_dk_empties[prev_q_buf_id], prev_q_phase ^ 1)
                     tlx.barrier_expect_bytes(
                         q_dk_fulls[prev_q_buf_id],
@@ -2911,50 +2962,6 @@ def _attn_bwd_mxf8_ws(
                         q_dk_scale_smem[prev_q_buf_id],
                         [sf_off_seq_h, 0, (prev_m // 128) * REP_M, 0, 0],
                         q_dk_fulls[prev_q_buf_id],
-                    )
-
-                    tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
-                    tlx.barrier_expect_bytes(
-                        do_fulls[do_buf_id],
-                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do,
-                        do_smem[do_buf_id],
-                        [off_z, off_h, curr_m, 0],
-                        do_fulls[do_buf_id],
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do_scale,
-                        do_scale_smem[do_buf_id],
-                        [sf_off_seq_h, do_scale_m, 0, 0, 0],
-                        do_fulls[do_buf_id],
-                    )
-                    d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-                    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
-                    tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-                    tlx.async_descriptor_load(
-                        desc_delta,
-                        sD_tiles[d_buf_id],
-                        [(base_q + curr_m).to(tl.int32)],
-                        d_fulls[d_buf_id],
-                    )
-                    tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
-                    tlx.barrier_expect_bytes(
-                        do_dv_fulls[do_buf_id],
-                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do_dv,
-                        do_dv_smem[do_buf_id],
-                        [off_z, off_h, curr_m, 0],
-                        do_dv_fulls[do_buf_id],
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do_dv_scale,
-                        do_scale_dv_smem[do_buf_id],
-                        [sf_off_seq_h, 0, do_scale_m, 0, 0],
-                        do_dv_fulls[do_buf_id],
                     )
                     curr_m += BLOCK_M1
                     blk_idx += 1

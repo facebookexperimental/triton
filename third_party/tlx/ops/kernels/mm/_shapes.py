@@ -26,6 +26,13 @@ SYNTHETIC: list[list] = [
     [1000, 1000, 200, (200, 1), (1000, 1), "bf16"],
     [256, 256, 16384, (16384, 1), (256, 1), "bf16"],
     [64, 4096, 4096, (4096, 1), (4096, 1), "bf16"],
+    # Two geometry classes the rest of this list does not reach, kept when the
+    # tutorial's 115-shape sweep was retired in favour of this one: K far larger
+    # than M and N, and N far larger than M and K. One representative each
+    # rather than the whole sweep -- they differ in tile/split-K selection, not
+    # in kind.
+    [384, 3072, 64512, (64512, 1), (3072, 1), "bf16"],
+    [384, 64512, 3072, (3072, 1), (64512, 1), "bf16"],
 ]
 
 # The compute-bound shapes the perf suite gates on for this arch.
@@ -65,7 +72,14 @@ GFX942_FOCUS: list[list] = [
     [1024, 6144, 4096, (4096, 1), (6144, 1), "fp16"],
 ]
 
-ALL: list[list] = _union(SYNTHETIC, SM100_FOCUS, GFX942_FOCUS)
+GFX950_FOCUS: list[list] = [
+    [7, 8192, 2048, (2048, 1), (1, 2048), "fp16"],
+    [7, 2048, 4096, (4096, 1), (1, 4096), "fp16"],
+]
+
+ALL: list[list] = _union(
+    SYNTHETIC, SM100_FOCUS, GFX942_FOCUS, GFX950_FOCUS
+)
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):

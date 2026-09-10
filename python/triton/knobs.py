@@ -438,6 +438,7 @@ class compilation_knobs(base_knobs):
     # Instrumentation mode is checked on every run, which is expensive.
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
+    fpsan_homomorphic_casts: env_bool = env_bool("TRITON_FPSAN_HOMOMORPHIC_CASTS")
     listener: Union[CompilationListener, None] = None
 
 
@@ -650,6 +651,8 @@ class nvidia_knobs(base_knobs):
     # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
     # testing against the operand-D back-edge channel fix.
     enable_interleave_tmem: env_bool = env_bool("TRITON_ENABLE_INTERLEAVE_TMEM", True)
+    # Default ON; opt out with TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS=0.
+    enable_unify_ws_barrier_locations: env_bool = env_bool("TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS", True)
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
     disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
     # Gate opt-in perf-benchmark tests (do_bench sweeps) so unit-test runs do

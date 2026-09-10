@@ -1461,13 +1461,18 @@ unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask) {
   auto tensorTy = dyn_cast<RankedTensorType>(mask.getType());
   if (!tensorTy)
     return 1;
+  return getMaskAlignment(mask, gpu::getOrder(tensorTy)[0]);
+}
+
+unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask, unsigned axis) {
+  auto tensorTy = dyn_cast<RankedTensorType>(mask.getType());
+  if (!tensorTy || axis >= tensorTy.getRank())
+    return 1;
   auto *axisInfo = getAxisInfo(mask);
   if (!axisInfo)
     return 1;
-  auto maskOrder = gpu::getOrder(tensorTy);
-  auto alignment = std::max<unsigned>(axisInfo->getConstancy(maskOrder[0]), 1);
-  LDBG("getMaskAlignment maskOrder[0] " << maskOrder[0] << " alignment "
-                                        << alignment);
+  auto alignment = std::max<unsigned>(axisInfo->getConstancy(axis), 1);
+  LDBG("getMaskAlignment axis " << axis << " alignment " << alignment);
   LLVM_DEBUG({
     std::string axisStr;
     llvm::raw_string_ostream os(axisStr);

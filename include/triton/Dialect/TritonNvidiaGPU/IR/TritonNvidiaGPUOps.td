@@ -551,8 +551,8 @@ def TTNG_WaitBarrierOp
     Blocks the program progress until the mbarrier object in `alloc` completes
     its current phase.
 
-    This lowers a waitloop using the PTX instruction
-    mbarrier.try_wait.parity{.acquire.cluster}.shared::cta.b64.
+    This lowers a waitloop using PTX instruction
+    mbarrier.try_wait.parity.shared::cta.b64.
 
     Accepts an optional list of memory dependencies. If present, it is assumed
     that any of the dependencies may be accessed until the barrier completes.
@@ -1462,8 +1462,9 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a
     new descriptor containing the address and a view of the subslice.
-    This is similar to ttg.memdesc_subslice and can slice either of the trailing
-    two tensor-memory dimensions, including non-contiguous views within a CTA.
+    This is similar to ttg.memdesc_subslice and can slice either physical-layout
+    dimension or the leading pipeline dimension of an ordinary descriptor. Scale
+    descriptors support their two physical-layout dimensions.
   }];
   let arguments = (ins TTG_MemDescType:$src, I32Attr:$offset,
                        DefaultValuedAttr<I32Attr, "1">:$dim);

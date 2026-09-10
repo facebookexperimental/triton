@@ -60,8 +60,10 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
   int numElems = product<int64_t>(shapePerCTA);
   int numThreads = numWarps * threadsPerWarp;
 
-  unsigned perThread = getNumElementsPerThread(op, order, axisInfoAnalysis,
-                                               shapePerCTA, maxVecBits);
+  unsigned opPerThread = getNumElementsPerThread(op, order, axisInfoAnalysis,
+                                                 shapePerCTA, maxVecBits);
+  unsigned perThread = opPerThread;
+  bool hasRelatedUnalignedVectorizedLoad = false;
   LDBG("perThread for op: " << perThread);
 
   for (Operation *opSameOrder : memAccessesSameOrder) {
@@ -71,21 +73,24 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
         opSameOrder, order, axisInfoAnalysis, shapePerCTA, maxVecBits);
     LDBG("perThread for opSameOrder: " << currPerThread);
     perThread = std::max(perThread, currPerThread);
+    hasRelatedUnalignedVectorizedLoad |=
+        canUseUnalignedVectorizedLoad(opSameOrder);
   }
 
   perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));
   LDBG("perThread: " << perThread);
 
-  if (!dyn_cast<triton::LoadOp>(op)) {
+  auto load = dyn_cast<triton::LoadOp>(op);
+  if (!load || (hasRelatedUnalignedVectorizedLoad &&
+                (load.getIsVolatile() || load.getMask()))) {
     // For ops that can result in a global memory write, we should enforce
     // that each thread handles at most maxVecBits bits, which is the widest
     // available vectorized store op; otherwise, the store will have "gaps"
     // in the memory write at the warp level, resulting in worse performance.
     // For loads, we can expect that the gaps won't matter due to the L1
-    // cache.
-    perThread = std::min<int>(
-        perThread, getNumElementsPerThread(op, order, axisInfoAnalysis,
-                                           shapePerCTA, maxVecBits));
+    // cache. Masked and volatile loads must retain their own safe transaction
+    // width when a related unaligned load selects a wider layout.
+    perThread = std::min(perThread, opPerThread);
   }
   SmallVector<unsigned> sizePerThread(refTensorType.getRank(), 1);
   sizePerThread[order[0]] = perThread;

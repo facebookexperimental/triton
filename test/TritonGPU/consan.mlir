@@ -11,8 +11,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
   // CHECK-DAG: #[[BUFS_BARS_L:.*]] = #ttg.linear<{register = [], lane = {{\[}}[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [], block = []}>
   // CHECK: @single_local_alloc
   tt.func public @single_local_alloc() {
-    // CHECK-DAG: %[[BUFFERS:.*]] = tti.experimental_buffer_descriptors [0], [{{.*}}], shared_mem : tensor<1xi64, #{{.*}}>
-
     // CHECK: %[[WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 8 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[WRITE_VISIBILITY_GLOB]], %c0_i64
 
@@ -42,7 +40,6 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
   // CHECK: tti.experimental_cluster_cta_id : i32
   // CHECK-LABEL: @single_local_alloc_multi_cta
   tt.func public @single_local_alloc_multi_cta() {
-    // CHECK-DAG: %[[BUFFERS:.*]] = tti.experimental_buffer_descriptors [0], [{{.*}}], shared_mem : tensor<1xi64
     // CHECK: %[[WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 32 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[WRITE_VISIBILITY_GLOB]], %c0_i64
     // CHECK: %[[READ_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 64 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
@@ -167,8 +164,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 528 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   // CHECK-LABEL: @local_gather_scatter_effects
   tt.func public @local_gather_scatter_effects(%out: !tt.tensordesc<8x32xi32, #local_gather_scatter_shared>) {
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 16], [512, 512], shared_mem : tensor<2xi64
-    // CHECK-DAG: arith.constant dense<true> : tensor<2x2xi1
     %c0 = arith.constant 0 : i32
     %indices = arith.constant dense<0> : tensor<8x32xi32, #local_gather_scatter_blocked>
     %values = arith.constant dense<1> : tensor<8x32xi32, #local_gather_scatter_blocked>
@@ -177,6 +172,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
     // Indexing the sharded axis can target either CTA row.
     // CHECK: %[[GATHER_CTAS:.*]] = arith.constant 3 : i32
+    // CHECK: arith.constant dense<[true, true, false, false]> : tensor<4xi1
     // CHECK: tt.call @__triton_consan_set_proxy_access{{.*}}({{.*}}%[[GATHER_CTAS]]{{.*}})
     // CHECK: tt.call @__triton_consan_verify_write_visibility{{.*}}({{.*}}%[[GATHER_CTAS]]{{.*}})
     // CHECK: tt.call @__triton_consan_set_read_visibility{{.*}}({{.*}}%[[GATHER_CTAS]]{{.*}})
@@ -185,6 +181,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
     // Indexing the unsharded axis leaves the scatter local to the issuing CTA.
     // CHECK: %[[SCATTER_CTAS:.*]] = arith.shli {{.*}} : i32
+    // CHECK: arith.constant dense<[false, true, true, false]> : tensor<4xi1
     // CHECK: tt.call @__triton_consan_set_proxy_access{{.*}}({{.*}}%[[SCATTER_CTAS]]{{.*}})
     // CHECK: tt.call @__triton_consan_verify_write_visibility{{.*}}({{.*}}%[[SCATTER_CTAS]]{{.*}})
     // CHECK: tt.call @__triton_consan_verify_read_visibility{{.*}}({{.*}}%[[SCATTER_CTAS]]{{.*}})
@@ -207,15 +204,13 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #local_atomic_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1]]}>
 #local_atomic_tma_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 32, CGALayout = [[0, 1]]}>
 #local_atomic_smem = #ttg.shared_memory
-#local_atomic_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 4], order = [1, 0], CGALayout = [[0, 1]]}>
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, ttg.shared = 1536 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 8 : i32} {
+#local_atomic_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 1]]}>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   // CHECK-LABEL: @local_atomic_scatter_rmw_effects
-  tt.func public @local_atomic_scatter_rmw_effects(
-      %out: !tt.tensordesc<8x32xi32, #local_atomic_tma_shared>,
-      %result: tensor<8x32x!tt.ptr<i32>, #local_atomic_blocked>) {
+  tt.func public @local_atomic_scatter_rmw_effects(%out: !tt.tensordesc<8x32xi32, #local_atomic_tma_shared>) {
     // The atomic is the allocation's only user, so this descriptor proves
     // BufferRegion discovers its full destination.
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 512, 1024, 0], [512, 512, 512, 0], shared_mem : tensor<4xi64
+    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 512], [512, 512], shared_mem : tensor<2xi64
     %c0 = arith.constant 0 : i32
     %indices = arith.constant dense<0> : tensor<8x32xi32, #local_atomic_blocked>
     %values = arith.constant dense<1> : tensor<8x32xi32, #local_atomic_blocked>
@@ -225,79 +220,15 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, ttg.shar
 
     // Runtime indices along the sharded axis can target either CTA row.
     // CHECK: %[[ATOMIC_CTAS:.*]] = arith.constant 3 : i32
-    // CHECK: %[[ATOMIC_EFFECT_CTAS:.*]] = arith.ori %[[ATOMIC_CTAS]], {{.*}} : i32
-    // CHECK: tt.call @__triton_consan_set_proxy_access{{.*}}({{.*}}%[[ATOMIC_EFFECT_CTAS]])
+    // CHECK: tt.call @__triton_consan_set_proxy_access{{.*}}({{.*}}%[[ATOMIC_CTAS]])
     // CHECK: tt.call @__triton_consan_verify_write_visibility
     // CHECK: tt.call @__triton_consan_verify_read_visibility
     // CHECK: tt.call @__triton_consan_set_write_visibility
     // CHECK: tt.call @__triton_consan_clear_read_visibility
-    // CHECK: Operand: Scratch
     // CHECK: ttg.local_atomic_scatter_rmw
-    %old = ttg.local_atomic_scatter_rmw add, %dst[%indices], %values {allocation.offset = 1024 : i32, allocation.size = 512 : i32, axis = 1 : i32} : (!ttg.memdesc<8x32xi32, #local_atomic_shared, #local_atomic_smem, mutable>, tensor<8x32xi32, #local_atomic_blocked>, tensor<8x32xi32, #local_atomic_blocked>) -> tensor<8x32xi32, #local_atomic_blocked>
-    tt.store %result, %old : tensor<8x32x!tt.ptr<i32>, #local_atomic_blocked>
+    %old = ttg.local_atomic_scatter_rmw add, %dst[%indices], %values {axis = 1 : i32} : (!ttg.memdesc<8x32xi32, #local_atomic_shared, #local_atomic_smem, mutable>, tensor<8x32xi32, #local_atomic_blocked>, tensor<8x32xi32, #local_atomic_blocked>) -> tensor<8x32xi32, #local_atomic_blocked>
     // Enable proxy tracking without giving the atomic destination another user.
     ttng.async_tma_copy_local_to_global %out[%c0, %c0] %proxy : !tt.tensordesc<8x32xi32, #local_atomic_tma_shared>, !ttg.memdesc<8x32xi32, #local_atomic_tma_shared, #local_atomic_smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#append_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#append_smem = #ttg.shared_memory
-#append_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 132 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @local_atomic_preserves_destination_effect
-  tt.func public @local_atomic_preserves_destination_effect(
-      %indices: tensor<1xi32, #append_blocked>,
-      %values: tensor<1xi32, #append_blocked>,
-      %out: tensor<1x!tt.ptr<i32>, #append_blocked>) {
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 128], [4, 4], shared_mem
-    // CHECK: %[[APPEND_DST:.*]] = ttg.local_alloc {allocation.offset = 0 : i32}
-    %dst = ttg.local_alloc {allocation.offset = 0 : i32}
-        : () -> !ttg.memdesc<1xi32, #append_shared, #append_smem, mutable>
-
-    // The destination memdesc and compiler scratch must both survive effect
-    // construction for the same operation.
-    // CHECK: arith.constant dense<[true, false]>
-    // CHECK: arith.constant dense<[false, true]>
-    // CHECK: Operand: Scratch
-    // CHECK: ttg.local_atomic_scatter_rmw
-    %old = ttg.local_atomic_scatter_rmw add, %dst[%indices], %values {
-        allocation.offset = 128 : i32, allocation.size = 4 : i32, axis = 0 : i32}
-        : (!ttg.memdesc<1xi32, #append_shared, #append_smem, mutable>,
-           tensor<1xi32, #append_blocked>, tensor<1xi32, #append_blocked>)
-        -> tensor<1xi32, #append_blocked>
-    tt.store %out, %old : tensor<1x!tt.ptr<i32>, #append_blocked>
-    tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 4 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
-  // CHECK-LABEL: @scalar_atomic_scratch_broadcast
-  tt.func public @scalar_atomic_scratch_broadcast(
-      %ptr: !tt.ptr<i32>, %out: !tt.ptr<i32>) {
-    %one = arith.constant 1 : i32
-    // Only CTA 0 produces the scalar result; both CTAs consume its scratch.
-    // CHECK: tti.experimental_lock_acquire
-    // CHECK: %[[SCALAR_CTA:.*]] = tti.experimental_cluster_cta_id
-    // CHECK: %[[SCALAR_ALL_CTAS:.*]] = arith.constant 3 : i32
-    // CHECK: %[[SCALAR_SHIFTED_RECIPIENTS:.*]] = arith.shli %[[SCALAR_ALL_CTAS]], {{.*}} : i32
-    // CHECK: %[[SCALAR_RECIPIENTS:.*]] = arith.ori {{.*}}, %[[SCALAR_SHIFTED_RECIPIENTS]] : i32
-    // CHECK: arith.constant dense<true>
-    // CHECK: tt.call @__triton_consan_verify_write_visibility
-    // CHECK: Operand: Scratch
-    // CHECK: tt.call @__triton_consan_verify_read_visibility
-    // CHECK: tt.call @__triton_consan_set_write_visibility
-    // CHECK: tt.atomic_rmw
-    %old = tt.atomic_rmw add, relaxed, gpu, %ptr, %one {
-        allocation.offset = 0 : i32, allocation.size = 4 : i32}
-        : (!tt.ptr<i32>, i32) -> i32
-    tt.store %out, %old : !tt.ptr<i32>
-    // Keep the NVIDIA dialect loaded in this standalone split module.
-    ttng.cluster_barrier {relaxed = true}
     tt.return
   }
 }
@@ -338,68 +269,24 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
-#convert_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 32, rank = 1}>
-#convert_smem = #ttg.shared_memory
-#convert_src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#convert_dst_parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
-#convert_dst = #ttg.slice<{dim = 1, parent = #convert_dst_parent}>
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @convert_layout_shared_scratch
-  tt.func public @convert_layout_shared_scratch(
-      %desc: !tt.tensordesc<256xi32, #convert_shared>) {
-    // The conversion's 512-byte scratch range aliases the first half of the
-    // outstanding TMA store's 1024-byte source range.
-    // CHECK-DAG: %[[BUFS:.*]] = tti.experimental_buffer_descriptors [0, 0], [512, 1024], shared_mem
-    // CHECK-DAG: %[[ALIASES:.*]] = arith.constant dense<true> : tensor<2x2xi1, #{{.*}}>
-    %c0 = arith.constant 0 : i32
-    %buf = ttg.local_alloc {allocation.offset = 0 : i32}
-        : () -> !ttg.memdesc<256xi32, #convert_shared, #convert_smem, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%c0] %buf
-        : !tt.tensordesc<256xi32, #convert_shared>,
-          !ttg.memdesc<256xi32, #convert_shared, #convert_smem, mutable>
-    ttg.local_dealloc %buf
-        : !ttg.memdesc<256xi32, #convert_shared, #convert_smem, mutable>
-
-    %value = arith.constant dense<0> : tensor<128xi32, #convert_src>
-    // CHECK: arith.constant dense<[true, false]>
-    // CHECK: tt.call @__triton_consan_set_proxy_access
-    // CHECK: tt.call @__triton_consan_verify_write_visibility
-    // CHECK: tt.call @__triton_consan_verify_read_visibility
-    // CHECK: Operand: Scratch
-    // CHECK: tt.call @__triton_consan_check_outstanding_commits
-    // CHECK: ttg.convert_layout
-    %converted = ttg.convert_layout %value {allocation.offset = 0 : i32, allocation.size = 512 : i32}
-        : tensor<128xi32, #convert_src> -> tensor<128xi32, #convert_dst>
-
-    ttng.async_tma_store_wait {pendings = 0 : i32}
-    tt.return
-  }
-
-}
-
-// -----
-
 #frontier_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 32, rank = 1}>
 #frontier_barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #frontier_smem = #ttg.shared_memory
 #frontier_src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#frontier_dst_parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
-#frontier_dst = #ttg.slice<{dim = 1, parent = #frontier_dst_parent}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 8200 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   // CHECK-LABEL: @tma_completion_tracks_contained_proxy_frontier
   tt.func public @tma_completion_tracks_contained_proxy_frontier(
       %desc: !tt.tensordesc<1024xi32, #frontier_shared>) {
-    // The conversion scratch is contained in the TMA destination. The third
-    // descriptor only partially overlaps it, while the fourth is disjoint;
-    // neither may be published by TMA completion.
-    // CHECK-DAG: %[[FRONTIER_BUFS:.*]] = tti.experimental_buffer_descriptors [0, 0, 3840, 4608], [512, 4096, 512, 512], shared_mem
+    // The first explicit region is contained in the TMA destination. The third
+    // region only partially overlaps it, so only its overlapping atom may be
+    // published by TMA completion. Its remainder and the fourth, disjoint
+    // region must remain unpublished.
     %c0 = arith.constant 0 : i32
     %true = arith.constant true
     %value = arith.constant dense<0> : tensor<128xi32, #frontier_src>
-    %converted = ttg.convert_layout %value {allocation.offset = 0 : i32, allocation.size = 512 : i32}
-        : tensor<128xi32, #frontier_src> -> tensor<128xi32, #frontier_dst>
+    %contained = ttg.local_alloc %value {allocation.offset = 0 : i32}
+        : (tensor<128xi32, #frontier_src>) -> !ttg.memdesc<128xi32, #frontier_shared, #frontier_smem, mutable>
     %partial = ttg.local_alloc %value {allocation.offset = 3840 : i32}
         : (tensor<128xi32, #frontier_src>) -> !ttg.memdesc<128xi32, #frontier_shared, #frontier_smem, mutable>
     %dst = ttg.local_alloc {allocation.offset = 0 : i32}
@@ -416,78 +303,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     %unrelated = ttg.local_alloc %value {allocation.offset = 4608 : i32}
         : (tensor<128xi32, #frontier_src>) -> !ttg.memdesc<128xi32, #frontier_shared, #frontier_smem, mutable>
 
-    // CHECK: arith.constant dense<[true, true, true, false, false, false, false, false]>
+    // CHECK: arith.constant dense<[true, true, true, false, false, false, false, false]> : tensor<8xi1
     // CHECK: tt.call @__triton_consan_track_barrier_write_for_buffer
     // CHECK: ttng.async_tma_copy_global_to_local
     ttng.async_tma_copy_global_to_local %desc[%c0] %dst, %bar, %true
         : !tt.tensordesc<1024xi32, #frontier_shared>,
           !ttg.memdesc<1xi64, #frontier_barrier, #frontier_smem, mutable>
           -> !ttg.memdesc<1024xi32, #frontier_shared, #frontier_smem, mutable>
-    tt.return
-  }
-}
-
-// -----
-
-#reduce_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 32, rank = 1}>
-#reduce_smem = #ttg.shared_memory
-#reduce_layout = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // Reduce lowering synthesizes its scratch-backed convert_layout operations
-  // after ConSan, so the parent reduction carries the static scratch effect.
-  // CHECK-LABEL: @reduce_shared_scratch
-  tt.func public @reduce_shared_scratch(
-      %desc: !tt.tensordesc<256xi32, #reduce_shared>) {
-    // Regions sort by (base, length): the explicit source is [0, 1024] and
-    // reduction scratch is [256, 272).
-    // CHECK-DAG: %[[REDUCE_BUFS:.*]] = tti.experimental_buffer_descriptors [0, 256], [1024, 16], shared_mem
-    // CHECK-DAG: %[[REDUCE_ALIASES:.*]] = arith.constant dense<true> : tensor<2x2xi1, #{{.*}}>
-    %c0 = arith.constant 0 : i32
-    %buf = ttg.local_alloc {allocation.offset = 0 : i32}
-        : () -> !ttg.memdesc<256xi32, #reduce_shared, #reduce_smem, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%c0] %buf
-        : !tt.tensordesc<256xi32, #reduce_shared>,
-          !ttg.memdesc<256xi32, #reduce_shared, #reduce_smem, mutable>
-    ttg.local_dealloc %buf
-        : !ttg.memdesc<256xi32, #reduce_shared, #reduce_smem, mutable>
-
-    %value = arith.constant dense<0.000000e+00> : tensor<1x256xf32, #reduce_layout>
-    // CHECK: arith.constant dense<[false, true]>
-    // CHECK: tt.call @__triton_consan_verify_read_visibility
-    // CHECK: Operand: Scratch
-    // CHECK: tt.call @__triton_consan_check_outstanding_commits
-    // CHECK: "tt.reduce"
-    %reduced = "tt.reduce"(%value) <{axis = 1 : i32}> ({
-    ^bb0(%lhs: f32, %rhs: f32):
-      %sum = arith.addf %lhs, %rhs : f32
-      tt.reduce.return %sum : f32
-    }) {allocation.offset = 256 : i32, allocation.size = 16 : i32}
-        : (tensor<1x256xf32, #reduce_layout>) -> tensor<1xf32, #ttg.slice<{dim = 1, parent = #reduce_layout}>>
-
-    ttng.async_tma_store_wait {pendings = 0 : i32}
-    tt.return
-  }
-}
-
-// -----
-
-#cross_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[1, 0]]}>
-#cross_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 1]]}>
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 512 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @convert_layout_cross_cta_scratch
-  tt.func public @convert_layout_cross_cta_scratch(
-      %value: tensor<8x32xi32, #cross_src>) {
-    // Every issuer stores to its own scratch and loads from both CTA rows.
-    // CHECK: %[[PEER_CTAS:.*]] = arith.constant 3 : i32
-    // CHECK: %[[CONVERT_CTAS:.*]] = arith.ori {{.*}}, %[[PEER_CTAS]] : i32
-    // CHECK: tt.call @__triton_consan_set_write_visibility{{.*}}({{.*}}%[[CONVERT_CTAS]]{{.*}})
-    // CHECK: ttg.convert_layout
-    %converted = ttg.convert_layout %value {allocation.offset = 0 : i32, allocation.size = 512 : i32}
-        : tensor<8x32xi32, #cross_src> -> tensor<8x32xi32, #cross_dst>
-    // Keep the NVIDIA dialect loaded in this standalone split module.
-    ttng.cluster_barrier {relaxed = true}
     tt.return
   }
 }
@@ -501,8 +323,6 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @two_local_alloc
   tt.func public @two_local_alloc() {
-    // CHECK-DAG: %[[BUFFERS:.*]] = tti.experimental_buffer_descriptors [0, 4096], [{{.*}}], shared_mem : tensor<2xi64,
-
     // CHECK: %[[WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 16 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[WRITE_VISIBILITY_GLOB]], %c0_i64
 
@@ -533,8 +353,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @three_local_alloc
   tt.func public @three_local_alloc() {
-    // CHECK-DAG: %[[BUFFERS:.*]] = tti.experimental_buffer_descriptors [0, 4096, 8192, 0], [{{.*}}], shared_mem : tensor<4xi64,
-
     // CHECK: %[[WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 32 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[WRITE_VISIBILITY_GLOB]], %c0_i64
 
@@ -621,7 +439,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
   // CHECK: #[[BUFS_L:.*]] = #ttg.linear<{register = [], lane = {{\[}}[0], [0], [0], [0], [0]], warp = [], block = []}>
   // CHECK: @tmem_alloc
   tt.func public @tmem_alloc() {
-    // CHECK-DAG: %[[TMEM_BUFS:.*]] = tti.experimental_buffer_descriptors [0], [{{.*}}], tensor_mem : tensor<1xi64, #{{.*}}>
     // CHECK-DAG: %[[BARRIERS:.*]] = tti.experimental_buffer_descriptors [4096], [{{.*}}], shared_mem : tensor<1xi64, #{{.*}}>
     %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %bar = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
@@ -639,8 +456,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @async_tma_copy_global_to_local
   tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<32x32xf32, #shared>) {
-    // CHECK-DAG: %[[BUFFERS:.*]] = tti.experimental_buffer_descriptors [0], [{{.*}}], shared_mem : tensor<1xi64
-
     // CHECK-DAG: %[[WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 8 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[WRITE_VISIBILITY_GLOB]], %c0_i64
 
@@ -1045,8 +860,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @wait_barrier
   tt.func public @wait_barrier(%arg0: !tt.tensordesc<32x32xf32, #shared>) {
-    // CHECK-DAG: %[[BUFFERS:.*]] = tti.experimental_buffer_descriptors [0], [{{.*}}], shared_mem : tensor<1xi64, #linear{{[0-9]*}}>
-
     // CHECK-DAG: %[[WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 8 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[WRITE_VISIBILITY_GLOB]], %c0_i64
 
@@ -1155,10 +968,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @tcgen5_mma
   tt.func public @tcgen5_mma(%arg0: !tt.tensordesc<32x32xf32, #shared>) {
-    // CHECK-DAG: %[[SM_BUFS:.*]] = tti.experimental_buffer_descriptors [0, 32768], [{{.*}}], shared_mem : tensor<2xi64
     // CHECK-DAG: %[[SM_WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 16 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK-DAG: %[[SM_READ_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 32 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
-    // CHECK-DAG: %[[TM_BUFS:.*]] = tti.experimental_buffer_descriptors [0], [{{.*}}], tensor_mem : tensor<1xi64
     // CHECK-DAG: %[[TM_WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 8 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK-DAG: tt.call @__triton_consan_fill_global_tensor{{.*}}T1x1x1x2x1xI64(%[[TM_READ_VISIBILITY_GLOB:[^,]+]],
     // CHECK-DAG: %[[BARRIERS:.*]] = tti.experimental_buffer_descriptors [65536], [{{.*}}], shared_mem : tensor<1xi64
@@ -1223,10 +1034,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @tcgen5_mma_lhs_in_tmem
   tt.func public @tcgen5_mma_lhs_in_tmem(%arg0: !tt.tensordesc<32x32xf32, #shared>) {
-    // CHECK-DAG: %[[SM_BUFS:.*]] = tti.experimental_buffer_descriptors [32768], [{{.*}}], shared_mem : tensor<1xi64
     // CHECK-DAG: %[[SM_WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 8 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK-DAG: %[[SM_READ_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 16 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
-    // CHECK-DAG: %[[TM_BUFS:.*]] = tti.experimental_buffer_descriptors [0, 128], [{{.*}}], tensor_mem : tensor<2xi64
     // CHECK-DAG: %[[TM_WRITE_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 16 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK-DAG: %[[TM_READ_VISIBILITY_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 32 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i64>
     // CHECK-DAG: %[[BARRIERS:.*]] = tti.experimental_buffer_descriptors [65536], [{{.*}}], shared_mem : tensor<1xi64
@@ -1422,12 +1231,14 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     // CHECK-NEXT: tti.experimental_lock_release %{{.*}}, %[[WAIT_PRED]]
     ttng.wait_barrier %bar, %c0_i32, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     // CHECK: tti.experimental_lock_acquire
+    // CHECK: ttg.barrier global_read
     // CHECK: tt.call @__triton_consan_check_all_active_waiting
     // CHECK-NEXT: tti.experimental_lock_release
     // CHECK-NEXT: tti.experimental_assert_uniform {{.*}}, "Deadlock detected at a cluster barrier"
     // CHECK-NEXT: cf.br ^[[POLL:bb[0-9]+]]
     // CHECK: ^[[POLL]]:
     // CHECK: tti.experimental_lock_acquire
+    // CHECK: ttg.barrier global_read
     // CHECK: tt.call @__triton_consan_check_all_active_waiting
     // CHECK-NEXT: tti.experimental_lock_release
     // CHECK-NEXT: tti.experimental_assert_uniform {{.*}}, "Deadlock detected at a cluster barrier"
@@ -1504,8 +1315,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @warp_group_dot
   tt.func public @warp_group_dot(%acc: tensor<128x128xf16, #mma>) {
-    // CHECK-DAG: %[[SM_BUFS:.*]] = tti.experimental_buffer_descriptors [0, 32768], [{{.*}}], shared_mem : tensor<2xi64
-
     // CHECK-DAG: %[[SM_WGMMA_WRITES_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 2 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i8>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[SM_WGMMA_WRITES_GLOB]], %c0_i8
 
@@ -1535,8 +1344,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @warp_group_dot_sync
   tt.func public @warp_group_dot_sync(%acc: tensor<128x128xf16, #mma>) {
-    // CHECK-DAG: %[[SM_BUFS:.*]] = tti.experimental_buffer_descriptors [0, 32768], [{{.*}}], shared_mem : tensor<2xi64
-
     // CHECK-DAG: %[[SM_WGMMA_WRITES_GLOB:.*]] = ttg.global_scratch_alloc {alignment = 16 : i32, nbytes = 2 : i32, shared_cluster_state, third_party_allocation, tt.divisibility = 16 : i64} : !tt.ptr<i8>
     // CHECK: call {{.*}}fill_global_tensor{{.*}}(%[[SM_WGMMA_WRITES_GLOB]], %c0_i8
 
@@ -1621,11 +1428,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @local_load_barriers
   tt.func public @local_load_barriers() {
-    // CHECK: tti.experimental_buffer_descriptors
     %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %bar = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     // CHECK: tti.experimental_lock_acquire
+    // CHECK: arith.constant dense<true> : tensor<1xi1
     // CHECK: tt.call @__triton_consan_verify_write_visibility
     // CHECK: tt.call @__triton_consan_set_read_visibility
     // CHECK: tti.experimental_lock_release
@@ -1643,7 +1450,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @local_load_barriers
   tt.func public @local_load_barriers_cp_async(%ptr: tensor<128x128x!tt.ptr<f16>, #blocked>) {
-    // CHECK: tti.experimental_buffer_descriptors
     %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %shmem = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %bar = ttg.local_alloc {allocation.offset = 8192 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
@@ -1673,7 +1479,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @local_store_barriers_cp_async_wgmma
   tt.func public @local_store_barriers_cp_async_wgmma(%ptr: tensor<128x128x!tt.ptr<f16>, #blocked>, %acc: tensor<128x128xf16, #mma>) {
-    // CHECK: tti.experimental_buffer_descriptors
     %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %shmem = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %bar = ttg.local_alloc {allocation.offset = 8192 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
@@ -1708,7 +1513,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // CHECK-LABEL: @ws_allocation
   tt.func public @ws_allocation(%arg0: !tt.tensordesc<32x32xf32, #shared>) {
     // CHECK-DAG: tti.experimental_buffer_descriptors [65536], [{{.*}}], shared_mem : tensor<1xi64,
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0], [{{.*}}], shared_mem : tensor<1xi64
     %smem = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %bar = ttg.local_alloc {allocation.offset = 65536 : i32} : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
@@ -1730,7 +1534,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     partition0(%arg1: !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, %arg2: !ttg.memdesc<1xi64, #shared1, #smem, mutable>) num_warps(4) {
       // CHECK: partition0
       // CHECK-DAG: tti.experimental_buffer_descriptors [65536], [{{.*}}], shared_mem : tensor<1xi64,
-      // CHECK-DAG: tti.experimental_buffer_descriptors [0], [{{.*}}], shared_mem : tensor<1xi64
       // CHECK: tti.experimental_lock_acquire
       // CHECK: tt.call @__triton_consan_verify_write_visibility
       // CHECK: tt.call @__triton_consan_set_read_visibility
@@ -1858,14 +1661,91 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @alias_matrix_shared
   tt.func public @alias_matrix_shared() {
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 16], [128, 128], shared_mem : tensor<2xi64
-    // CHECK-DAG: arith.constant dense<true> : tensor<2x2xi1
+    // CHECK-DAG: arith.constant dense<[true, true, false, false]> : tensor<4xi1
+    // CHECK-DAG: arith.constant dense<[false, true, true, false]> : tensor<4xi1
     %buf0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %buf1 = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %bar = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttg.local_load %buf0 : !ttg.memdesc<32xf32, #shared, #smem, mutable> -> tensor<32xf32>
     ttg.local_load %buf1 : !ttg.memdesc<32xf32, #shared, #smem, mutable> -> tensor<32xf32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  // CHECK-LABEL: @dynamic_shared_index
+  tt.func public @dynamic_shared_index(%idx: i32) {
+    // CHECK: %[[RUNTIME_BASE:.*]] = tti.experimental_memdesc_to_i32
+    // CHECK-DAG: %[[PAGE0:.*]] = tti.experimental_memory_offset_to_i32 0, shared_mem
+    // CHECK-DAG: %[[PAGE1:.*]] = tti.experimental_memory_offset_to_i32 128, shared_mem
+    // CHECK-DAG: arith.cmpi eq, %[[RUNTIME_BASE]], %[[PAGE0]]
+    // CHECK-DAG: arith.cmpi eq, %[[RUNTIME_BASE]], %[[PAGE1]]
+    %smem = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x32xf32, #shared, #smem, mutable>
+    %buf = ttg.memdesc_index %smem[%idx] : !ttg.memdesc<2x32xf32, #shared, #smem, mutable> -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
+    %0 = ttg.local_load %buf : !ttg.memdesc<32xf32, #shared, #smem, mutable> -> tensor<32xf32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [16, 16]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 4096 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  // CHECK-LABEL: @padded_dynamic_nested_subslice
+  tt.func public @padded_dynamic_nested_subslice(%idx: i32, %cond: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %multi = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x16x16xf32, #shared, #smem, mutable>
+    %dynamic = ttg.memdesc_index %multi[%idx] : !ttg.memdesc<2x16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
+    %page0 = ttg.memdesc_index %multi[%c0] : !ttg.memdesc<2x16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
+    %page1 = ttg.memdesc_index %multi[%c1] : !ttg.memdesc<2x16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
+    %dynamic_row = ttg.memdesc_subslice %dynamic [8, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16>
+    %dynamic_nested = ttg.memdesc_subslice %dynamic_row [0, 8] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    %row0 = ttg.memdesc_subslice %page0 [8, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16>
+    %nested0 = ttg.memdesc_subslice %row0 [0, 8] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    %row1 = ttg.memdesc_subslice %page1 [8, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16>
+    %nested1 = ttg.memdesc_subslice %row1 [0, 8] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    %complement1 = ttg.memdesc_subslice %row1 [0, 0] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    %selected = arith.select %cond, %dynamic_nested, %nested1 : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+
+    // The full pages contain their slices, and complementary page-one slices
+    // remain disjoint in the exact five-lane plan.
+    // CHECK-DAG: arith.constant dense<[true, true, false, false, false, false, false, false]> : tensor<8xi1
+    // CHECK-DAG: arith.constant dense<[false, false, true, true, true, false, false, false]> : tensor<8xi1
+    // CHECK-DAG: arith.constant dense<[false, true, false, false, false, false, false, false]> : tensor<8xi1
+    // CHECK-DAG: arith.constant dense<[false, false, false, false, true, false, false, false]> : tensor<8xi1
+    // CHECK-DAG: arith.constant dense<[false, false, false, true, false, false, false, false]> : tensor<8xi1
+    %0 = ttg.local_load %page0 : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> tensor<16x16xf32>
+    %1 = ttg.local_load %page1 : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> tensor<16x16xf32>
+    %2 = ttg.local_load %nested0 : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+    %3 = ttg.local_load %nested1 : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+    %4 = ttg.local_load %complement1 : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+
+    // The padded page stride is 1152 bytes, and the nested affine offset of
+    // 544 bytes maps to the physical runtime candidates 608 and 1760.
+    // CHECK: %[[DYNAMIC_BASE:.*]] = tti.experimental_memdesc_to_i32
+    // CHECK-DAG: %[[DYNAMIC_0:.*]] = tti.experimental_memory_offset_to_i32 608, shared_mem
+    // CHECK-DAG: %[[DYNAMIC_1:.*]] = tti.experimental_memory_offset_to_i32 1760, shared_mem
+    // CHECK-DAG: arith.cmpi eq, %[[DYNAMIC_BASE]], %[[DYNAMIC_0]]
+    // CHECK-DAG: arith.cmpi eq, %[[DYNAMIC_BASE]], %[[DYNAMIC_1]]
+    // CHECK: tti.experimental_assert_uniform {{.*}}, "internal ConSan error: active memdesc resolved to no buffer state"
+    %5 = ttg.local_load %dynamic_nested : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+
+    // CHECK: %[[SELECT_BASE:.*]] = tti.experimental_memdesc_to_i32
+    // CHECK-DAG: %[[SELECT_0:.*]] = tti.experimental_memory_offset_to_i32 608, shared_mem
+    // CHECK-DAG: %[[SELECT_1:.*]] = tti.experimental_memory_offset_to_i32 1760, shared_mem
+    // CHECK-DAG: arith.cmpi eq, %[[SELECT_BASE]], %[[SELECT_0]]
+    // CHECK-DAG: arith.cmpi eq, %[[SELECT_BASE]], %[[SELECT_1]]
+    // CHECK: tti.experimental_assert_uniform {{.*}}, "internal ConSan error: active memdesc resolved to no buffer state"
+    %6 = ttg.local_load %selected : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
     tt.return
   }
 }
@@ -1881,8 +1761,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
   tt.func public @alias_matrix_shared_indexed() {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 128], [128, 128], shared_mem : tensor<2xi64
-    // CHECK-NOT: arith.constant dense<{{\[\[true, false\], \[false, true\]\]}}> : tensor<2x2xi1
+    // CHECK-DAG: arith.constant dense<[true, false]> : tensor<2xi1
+    // CHECK-DAG: arith.constant dense<[false, true]> : tensor<2xi1
+    // CHECK: tt.call @__triton_consan_verify_write_visibility
     %smem = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x32xf32, #shared, #smem, mutable>
     %buf0 = ttg.memdesc_index %smem[%c0_i32] : !ttg.memdesc<2x32xf32, #shared, #smem, mutable> -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %buf1 = ttg.memdesc_index %smem[%c1_i32] : !ttg.memdesc<2x32xf32, #shared, #smem, mutable> -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
@@ -1903,14 +1784,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @alias_matrix_shared_subslice
   tt.func public @alias_matrix_shared_subslice() {
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 128], [256, 128], shared_mem : tensor<2xi64
-    // CHECK-DAG: arith.constant dense<true> : tensor<2x2xi1
+    // CHECK-DAG: arith.constant dense<true> : tensor<2xi1
+    // CHECK-DAG: arith.constant dense<[false, true]> : tensor<2xi1
     %buf0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<64xf32, #shared, #smem, mutable>
-    %buf1 = ttg.memdesc_subslice %buf0 [32] : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
+    %buf1 = ttg.memdesc_subslice %buf0 [32] : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> !ttg.memdesc<32xf32, #shared, #smem, mutable, 64>
     %bar = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttg.local_load %buf0 : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> tensor<64xf32>
-    ttg.local_load %buf1 : !ttg.memdesc<32xf32, #shared, #smem, mutable> -> tensor<32xf32>
+    ttg.local_load %buf1 : !ttg.memdesc<32xf32, #shared, #smem, mutable, 64> -> tensor<32xf32>
     tt.return
   }
 }
@@ -1923,8 +1804,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @alias_matrix_tensor
   tt.func public @alias_matrix_tensor() {
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 32, 64, 0], [64, 32, 64, 0], tensor_mem : tensor<4xi64
-    // CHECK-DAG: arith.constant dense<{{\[\[true, true, false, false\], \[true, true, false, false\], \[false, false, true, false\], \[false, false, false, false\]\]}}> : tensor<4x4xi1
+    // CHECK-DAG: arith.constant dense<[true, true, false, false]> : tensor<4xi1
+    // CHECK-DAG: arith.constant dense<[false, false, true, false]> : tensor<4xi1
+    // CHECK-DAG: arith.constant dense<[false, true, false, false]> : tensor<4xi1
     %buf0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>
     %buf1 = ttng.tmem_alloc {tensor_memory_col_offset = 64 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>
     %buf3 = ttng.tmem_subslice %buf0 {offset = 32 : i32} : !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x32xf32, #tmem, #ttng.tensor_memory, mutable, 64x64>
@@ -1944,9 +1826,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
   // CHECK-LABEL: @alias_matrix_mixed
   tt.func public @alias_matrix_mixed() {
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0, 16], [128, 128], shared_mem : tensor<2xi64
-    // CHECK-DAG: arith.constant dense<true> : tensor<2x2xi1
-    // CHECK-DAG: tti.experimental_buffer_descriptors [0], [64], tensor_mem : tensor<1xi64
+    // CHECK-DAG: arith.constant dense<true> : tensor<1xi1
+    // CHECK-DAG: arith.constant dense<[true, true, false, false]> : tensor<4xi1
+    // CHECK-DAG: arith.constant dense<[false, true, true, false]> : tensor<4xi1
     %smem0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %smem1 = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %tmem0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -1965,9 +1847,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
   // CHECK-LABEL: @ws_alias_matrix
   tt.func public @ws_alias_matrix() {
-    // We expect the alias matrix constant to appear once for the default region
-    // and once for partition0 when we lower warp_specialize.
-    // CHECK-DAG: arith.constant dense<true> : tensor<2x2xi1
+    // We expect exact overlapping-atom masks in the default region and
+    // partition0 after lowering warp_specialize.
+    // CHECK-DAG: arith.constant dense<[true, true, false, false]> : tensor<4xi1
+    // CHECK-DAG: arith.constant dense<[false, true, true, false]> : tensor<4xi1
     %smem0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %smem1 = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<32xf32, #shared, #smem, mutable>
     %bar = ttg.local_alloc {allocation.offset = 4096 : i32} : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -1981,7 +1864,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
       ttg.warp_yield
     }
     partition0(%arg0: !ttg.memdesc<32xf32, #shared, #smem, mutable>, %arg1: !ttg.memdesc<32xf32, #shared, #smem, mutable>, %arg2: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(1) {
-      // CHECK: arith.constant dense<true> : tensor<2x2xi1
+      // CHECK: arith.constant dense<[true, true, false, false]> : tensor<4xi1
+      // CHECK: arith.constant dense<[false, true, true, false]> : tensor<4xi1
       %c0 = arith.constant 0 : i32
       ttg.local_load %arg0 : !ttg.memdesc<32xf32, #shared, #smem, mutable> -> tensor<32xf32>
       ttg.local_load %arg1 : !ttg.memdesc<32xf32, #shared, #smem, mutable> -> tensor<32xf32>
@@ -2151,6 +2035,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     // CHECK: tt.call @__triton_consan_verify_write_visibility
     // CHECK: ttg.local_load %[[WAITED]]
     %value = ttg.local_load %waited : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 64 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  // CHECK-LABEL: @shared_shrinking_reinterpret
+  tt.func public @shared_shrinking_reinterpret() {
+    // CHECK-DAG: arith.constant dense<[true, false]> : tensor<2xi1
+    // CHECK-DAG: arith.constant dense<[false, true]> : tensor<2xi1
+    %parent = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
+    %smaller = ttg.memdesc_reinterpret %parent : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> !ttg.memdesc<8xi32, #shared, #smem, mutable>
+    %upper = ttg.memdesc_subslice %parent [8] : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> !ttg.memdesc<8xi32, #shared, #smem, mutable, 16>
+    ttg.local_load %smaller : !ttg.memdesc<8xi32, #shared, #smem, mutable> -> tensor<8xi32>
+    ttg.local_load %upper : !ttg.memdesc<8xi32, #shared, #smem, mutable, 16> -> tensor<8xi32>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 0 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  // CHECK-LABEL: @tensor_shrinking_reinterpret
+  tt.func public @tensor_shrinking_reinterpret() {
+    // CHECK-DAG: arith.constant dense<[true, false]> : tensor<2xi1
+    // CHECK-DAG: arith.constant dense<[false, true]> : tensor<2xi1
+    %parent = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %smaller = ttg.memdesc_reinterpret %parent : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+    %upper = ttng.tmem_subslice %parent {offset = 64 : i32, dim = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+    ttng.tmem_load %smaller : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf16>
+    ttng.tmem_load %upper : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32>
     tt.return
   }
 }

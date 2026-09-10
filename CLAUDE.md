@@ -59,10 +59,17 @@ Always validate correctness before anything else.
 - Run all tests: `pytest third_party/tlx/tutorials/testing/test_correctness.py`
 - Run a single kernel: `pytest third_party/tlx/tutorials/testing/test_correctness.py::test_<kernel_name>`
 
-Available kernels: `blackwell_gemm_ws`, `blackwell_gemm_clc`, `blackwell_gemm_pipelined`, `blackwell_gemm_2cta`,
-`blackwell_fa_ws`, `blackwell_fa_ws_persistent`, `blackwell_fa_ws_pipelined`, `blackwell_fa_ws_pipelined_persistent`,
+Available kernels: `blackwell_gemm_clc`, `blackwell_gemm_pipelined`, `blackwell_gemm_2cta`,
+`blackwell_fa_ws`, `blackwell_fa_ws_persistent`, `blackwell_fa_ws_pipelined`, `blackwell_fa_clc`,
 `hopper_gemm_pipelined`, `hopper_gemm_ws`, `hopper_fa_ws`, `hopper_fa_ws_pipelined`, `hopper_fa_ws_pipelined_pingpong`,
 `hopper_fa_ws_pipelined_pingpong_persistent`
+
+This suite is a sanity check: one smoke case per kernel. It is not where an op's
+correctness is established. For example, `blackwell_gemm_ws` and
+`blackwell_fa_ws_pipelined_persistent` were promoted into `tlx.ops` and are
+tested authoritatively in `python/test/unit/tlx_ops/`, over the full shape list
+in `triton/tlx/ops/kernels/mm/_shapes.py`; their frozen tutorial copies are no
+longer tested here.
 
 - For other kernels: `pytest third_party/tlx/tutorials/<KERNEL.py>`
 

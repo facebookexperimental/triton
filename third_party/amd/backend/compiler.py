@@ -114,6 +114,7 @@ class HIPOptions:
     max_num_imprecise_acc_default: int = 0
     backend_name: str = "hip"
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -230,7 +231,23 @@ class HIPBackend(BaseBackend):
         )
 
     def get_codegen_implementation(self, options):
-        return {"min_dot_size": get_min_dot_size(self.target)}
+        def post_ast_lowering(mod):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            tlx.tlx_passes.add_triton_tlx_fixup(
+                pm,
+                f"hip:{options.arch}",
+                options.num_warps,
+                64,
+                options.num_ctas,
+                [1, 1, 1],
+            )
+            pm.run(mod, "post_ast_lowering")
+
+        return {
+            "min_dot_size": get_min_dot_size(self.target),
+            "post_ast_lowering": post_ast_lowering,
+        }
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.hip import libdevice
@@ -290,14 +307,6 @@ class HIPBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm,
-            f"hip:{options.arch}",
-            options.num_warps,
-            64,
-            options.num_ctas,
-            list((1, 1, 1)),
-        )
         passes.common.add_inliner(pm)
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -445,7 +454,7 @@ class HIPBackend(BaseBackend):
             )
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
         tlx.tlx_passes.add_tlx_dump_layout(pm)
@@ -471,7 +480,7 @@ class HIPBackend(BaseBackend):
 
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
 
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

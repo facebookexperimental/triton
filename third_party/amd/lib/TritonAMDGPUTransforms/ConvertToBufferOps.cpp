@@ -28,6 +28,7 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 using ::mlir::LLVM::AMD::getVectorSize;
+using ::mlir::LLVM::AMD::getVectorSizeIgnoringAlignment;
 using mlir::triton::amdgpu::TargetFeatures;
 
 namespace ttg = mlir::triton::gpu;
@@ -504,10 +505,12 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       mlir::MLIRContext *context,
       DenseMap<Value, SetVector<Operation *>> &assumptions,
       ModuleAxisInfoAnalysis &axisAnalysisPass,
-      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_)
+      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_,
+      StringRef targetArch_)
       : mlir::OpRewritePattern<SourceOp>(context), assumptions(assumptions),
         axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
-        analyzeSmallTensorOfst(analyzeSmallTensorOfst_) {}
+        analyzeSmallTensorOfst(analyzeSmallTensorOfst_),
+        targetArch(targetArch_) {}
   mlir::LogicalResult
   matchAndRewrite(SourceOp op, PatternRewriter &rewriter) const override {
     LDBG("Try to convert: " << op);
@@ -534,9 +537,19 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       auto bufferLoadOp = [&]() {
         if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
           unsigned contig = getVectorSize(ptr, axisAnalysisPass);
-          if (maybeMask)
+          if (canUseUnalignedVectorizedLoad(op, targetArch)) {
+            contig = std::max(
+                contig, getVectorSizeIgnoringAlignment(ptr, axisAnalysisPass));
+            if (maybeMask) {
+              auto ptrTy = cast<RankedTensorType>(ptr.getType());
+              contig = std::min<unsigned>(
+                  contig, axisAnalysisPass.getMaskAlignment(
+                              maybeMask, ttg::getOrder(ptrTy)[0]));
+            }
+          } else if (maybeMask) {
             contig = std::min<unsigned>(
                 contig, axisAnalysisPass.getMaskAlignment(maybeMask));
+          }
           return triton::amdgpu::BufferLoadOp::create(
               rewriter, op->getLoc(), op.getType(), basePtr, tensorOffset,
               blockStride, op.getCache(), maybeMask, maybeOther, contig);
@@ -569,6 +582,7 @@ private:
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   bool analyzeSmallTensorOfst;
+  std::string targetArch;
 };
 
 struct ConvertTritonStoreToBufferStore
@@ -638,7 +652,10 @@ struct TritonAMDGPUConvertToBufferOpsPass
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     ModuleOp mod = getOperation();
-    TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
+    StringRef targetArch = gfxArch;
+    if (auto moduleArch = getAMDArch(mod))
+      targetArch = moduleArch->split(':').first;
+    TargetFeatures targetFeatures{targetArch};
 
     // Collect assumptions in the function
     DenseMap<Value, SetVector<Operation *>> assumptions =
@@ -653,15 +670,17 @@ struct TritonAMDGPUConvertToBufferOpsPass
       return signalPassFailure();
 
     AMD::ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
-    patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>,
-                 ConvertTritonStoreToBufferStore>(context, assumptions,
+    patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>>(
+        context, assumptions, axisInfoAnalysis, solver,
+        this->analyzeSmallTensorOfst, targetArch);
+    patterns.add<ConvertTritonStoreToBufferStore>(context, assumptions,
                                                   axisInfoAnalysis, solver,
                                                   this->analyzeSmallTensorOfst);
     if (targetFeatures.supportsBufferLoadToLocal()) {
       patterns
           .add<ConvertTritonLoadToBufferLoad<ttg::AsyncCopyGlobalToLocalOp>>(
               context, assumptions, axisInfoAnalysis, solver,
-              this->analyzeSmallTensorOfst);
+              this->analyzeSmallTensorOfst, targetArch);
     }
 
     if (this->allowBufferAtomics && targetFeatures.supportsBufferAtomicRMW())

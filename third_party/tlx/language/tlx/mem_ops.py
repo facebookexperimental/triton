@@ -1323,18 +1323,23 @@ def local_reinterpret(
     dtype: tl.dtype,
     shape: list[tl.constexpr] = None,
     layout: tl.constexpr = None,
+    pin: tl.constexpr = True,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
     Reinterpret the dtype and shape of a buffered tensor.
 
     When ``layout`` is supplied, the descriptor is also viewed through that
-    explicit shared-memory layout.  This is a zero-copy descriptor change used
+    explicit shared-memory layout. This is a zero-copy descriptor change used
     by the Gluon CDNA4 transpose-read path: a row-major rank-3 physical image
     is loaded by direct-to-LDS and then reinterpreted as a bank-aware rank-2 K
-    tile.  Without ``layout`` the source layout is preserved for compatibility.
+    tile. With ``pin=False``, the view remains optimizer-flexible instead of
+    becoming a hard ``#tlx.user_layout`` anchor. Without ``layout`` the source
+    layout is preserved for compatibility.
     """
     layout = tl._unwrap_if_constexpr(layout)
+    pin = tl._unwrap_if_constexpr(pin)
+    assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     if shape is None:
         shape = src.type.shape
     else:
@@ -1351,7 +1356,7 @@ def local_reinterpret(
         # reinterpret view as inferred, and padded sources then fail the
         # MemDescReinterpret verifier before placeholder layouts are
         # finalized (user-wrapped padded source versus raw padded result).
-        if not getattr(layout, "_tlx_default", False):
+        if pin and not getattr(layout, "_tlx_default", False):
             layout._tlx_user_pinned = True
             encoding = _semantic.builder.make_user_layout_attr(encoding)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
