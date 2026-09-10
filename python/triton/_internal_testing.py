@@ -246,6 +246,41 @@ def unwrap_tensor(t: Union[torch.Tensor, triton.runtime.jit.TensorWrapper]) -> t
     return t
 
 
+def swizzle_scale_to_5d(scale, outer_chunks, k_chunks):
+    """Convert raw E8M0 scales to swizzled 5D format for TMA/async_dot_scaled.
+
+    Applies the cuBLAS block scaling layout within each 128x4 block.
+    dest[row%32 * 16 + row//32 * 4 + col] = src[row, col]
+
+    Args:
+        scale: Raw scale tensor of shape (batch, rows, K//32) in uint8.
+        outer_chunks: Number of 128-row chunks (rows // 128).
+        k_chunks: Number of 4-column chunks (K // 32 // 4).
+
+    Returns:
+        Swizzled 5D tensor of shape (batch, outer_chunks, k_chunks, 2, 256).
+    """
+    batch = scale.shape[0]
+    cols = scale.shape[2]
+    padded_cols = k_chunks * 4
+
+    if cols < padded_cols:
+        scale = torch.nn.functional.pad(scale, (0, padded_cols - cols))
+
+    blocks = (scale.reshape(batch, outer_chunks, 128, k_chunks,
+                            4).permute(0, 1, 3, 2, 4).reshape(batch, outer_chunks, k_chunks, 512))
+
+    _r = torch.arange(128)
+    _c = torch.arange(4)
+    _rg, _cg = torch.meshgrid(_r, _c, indexing="ij")
+    idx = ((_rg % 32) * 16 + (_rg // 32) * 4 + _cg).reshape(-1)
+    idx = idx.to(scale.device).expand_as(blocks)
+    output = torch.empty_like(blocks)
+    output.scatter_(-1, idx, blocks)
+
+    return output.reshape(batch, outer_chunks, k_chunks, 2, 256)
+
+
 @dataclass
 class ProcessResult:
     exc: None | BaseException

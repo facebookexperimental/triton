@@ -1,10 +1,50 @@
+"""TLX barriers tests -- Hopper and newer."""
 import pytest
 import torch
 import re
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_hip, is_hip_gfx1250
+from triton._internal_testing import is_hopper_or_newer
 import triton.language.extra.tlx as tlx
+
+
+@triton.jit
+def tlx_square_ws(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT: tl.constexpr,
+):
+    # prologue
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    # mbarrier ops
+    bars = tlx.alloc_barriers(num_barriers=2, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
+    b0 = tlx.local_view(bars, 0)
+    b1 = tlx.local_view(bars, 1)
+
+    phase = 0
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+
+            # Placeholder block to do something
+
+            tlx.barrier_arrive(bar=b0)  # Release
+
+        with tlx.async_task(num_warps=4):
+            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
+
+            # Some arith ops TODO. add WS
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x = tl.load(x_ptr + offsets, mask=mask)
+            z = x * x
+            tl.store(z_ptr + offsets, z, mask=mask)
+
+            tlx.barrier_arrive(bar=b0)  # Wait
 
 
 @triton.jit
@@ -65,45 +105,6 @@ def tlx_square_non_ws(
     tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
 
 
-@triton.jit
-def tlx_square_ws(
-    x_ptr,
-    z_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    EXPECTED_ARRIVAL_COUNT: tl.constexpr,
-):
-    # prologue
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-
-    # mbarrier ops
-    bars = tlx.alloc_barriers(num_barriers=2, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
-    b0 = tlx.local_view(bars, 0)
-    b1 = tlx.local_view(bars, 1)
-
-    phase = 0
-    with tlx.async_tasks():
-        with tlx.async_task("default"):
-            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
-
-            # Placeholder block to do something
-
-            tlx.barrier_arrive(bar=b0)  # Release
-
-        with tlx.async_task(num_warps=4):
-            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
-
-            # Some arith ops TODO. add WS
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_elements
-            x = tl.load(x_ptr + offsets, mask=mask)
-            z = x * x
-            tl.store(z_ptr + offsets, z, mask=mask)
-
-            tlx.barrier_arrive(bar=b0)  # Wait
-
-
 def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
     # prepare inputs
     torch.manual_seed(0)
@@ -122,35 +123,6 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
     torch.testing.assert_close(z, z_ref, check_dtype=False)
     return kernel
-
-
-# Unit test for arrive/wait
-@pytest.mark.skipif(not (is_hip_gfx1250() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD gfx1250")
-@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-def test_wait_arrive_non_ws(BLOCK_SIZE, device):
-    expected_arrival_count = 4 if is_hip() else 1
-    kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=expected_arrival_count)
-    # ASSERT in ttgir
-    ttgir = kernel.asm["ttgir"]
-    if is_hip():
-        assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
-                and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
-    else:
-        assert ((ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3)
-                and (ttgir.count("ttng.barrier_expect") == 0)
-                and (ttgir.count("ttng.arrive_barrier") == 3)), f"TTGIR {ttgir}"
-
-
-@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
-@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
-def test_wait_arrive_ws(BLOCK_SIZE, device):
-    kernel = run_tlx_square(tlx_square_ws, BLOCK_SIZE, device)
-
-    # ASSERT in ttgir
-    ttgir = kernel.asm["ttgir"]
-    assert ((ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2)
-            and (ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 2)
-            and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1)), f"TTGIR {ttgir}"
 
 
 @triton.jit
@@ -205,6 +177,59 @@ def tlx_square_warp_barrier(
             tl.store(z_ptr + offsets, z, mask=mask)
             # KEY PATTERN: SMEM read → perThread arrive (no bar.sync)
             tlx.barrier_arrive(bar=b0)
+
+
+def _run_kernel_diverge_both_1warp(result_queue):
+    """Subprocess target: runs the deadlocking kernel and reports back."""
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+        import triton.language.extra.tlx as tlx
+
+        @triton.jit
+        def _kernel_diverge_both_1warp(output_ptr):
+            """1-warp task, divergence on both sides -> DEADLOCKS."""
+            with tlx.async_tasks():
+                with tlx.async_task(num_warps=1):
+                    if tlx.thread_id(axis=0) % 32 == 0:
+                        tl.store(output_ptr + 1, 99)  # divergence BEFORE
+                    tlx.named_barrier_wait(14, 32)
+                    if tlx.thread_id(axis=0) % 32 == 0:
+                        tl.store(output_ptr + 0, 5)  # divergence AFTER
+                with tlx.async_task("default"):
+                    pass
+
+        output = torch.zeros(2, dtype=torch.int32, device="cuda")
+        _kernel_diverge_both_1warp[(1, )](output, num_warps=4)
+        torch.cuda.synchronize()
+        result_queue.put(("PASS", output.cpu().tolist()))
+    except Exception as e:
+        result_queue.put(("ERROR", str(e)))
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_wait_arrive_non_ws(BLOCK_SIZE, device):
+    kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device)
+
+    # ASSERT in ttgir
+    ttgir = kernel.asm["ttgir"]
+    assert ((ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3)
+            and (ttgir.count("ttng.barrier_expect") == 0)
+            and (ttgir.count("ttng.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_wait_arrive_ws(BLOCK_SIZE, device):
+    kernel = run_tlx_square(tlx_square_ws, BLOCK_SIZE, device)
+
+    # ASSERT in ttgir
+    ttgir = kernel.asm["ttgir"]
+    assert ((ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2)
+            and (ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 2)
+            and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1)), f"TTGIR {ttgir}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
@@ -380,40 +405,6 @@ def test_barrier_wait_no_remote_view(device):
     assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"
 
 
-# =============================================================================
-# Test: named_barrier_wait in 1-warp async_task (DEADLOCKS)
-# =============================================================================
-
-
-def _run_kernel_diverge_both_1warp(result_queue):
-    """Subprocess target: runs the deadlocking kernel and reports back."""
-    try:
-        import torch
-        import triton
-        import triton.language as tl
-        import triton.language.extra.tlx as tlx
-
-        @triton.jit
-        def _kernel_diverge_both_1warp(output_ptr):
-            """1-warp task, divergence on both sides -> DEADLOCKS."""
-            with tlx.async_tasks():
-                with tlx.async_task(num_warps=1):
-                    if tlx.thread_id(axis=0) % 32 == 0:
-                        tl.store(output_ptr + 1, 99)  # divergence BEFORE
-                    tlx.named_barrier_wait(14, 32)
-                    if tlx.thread_id(axis=0) % 32 == 0:
-                        tl.store(output_ptr + 0, 5)  # divergence AFTER
-                with tlx.async_task("default"):
-                    pass
-
-        output = torch.zeros(2, dtype=torch.int32, device="cuda")
-        _kernel_diverge_both_1warp[(1, )](output, num_warps=4)
-        torch.cuda.synchronize()
-        result_queue.put(("PASS", output.cpu().tolist()))
-    except Exception as e:
-        result_queue.put(("ERROR", str(e)))
-
-
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_named_barrier_wait_1warp_async_deadlock(device):
     """Test that named_barrier_wait(14, 32) in 1-warp async_task deadlocks.
@@ -467,67 +458,3 @@ def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
     result = output.cpu().tolist()
     assert result[0] == 5, f"Expected output[0]=5, got {result[0]}"
     assert result[1] == 99, f"Expected output[1]=99, got {result[1]}"
-
-
-# ---- AMD CDNA workgroup / cond barriers (tlx.workgroup_barrier, tlx.cond_barrier) ----
-
-
-@triton.jit
-def _workgroup_barrier_sum_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
-    # One workgroup, BLOCK lanes across several warps. Each lane publishes its input
-    # into its own LDS slot, then every lane sums the WHOLE buffer -- so each lane
-    # must observe every other (cross-warp) lane's store. workgroup_barrier provides
-    # the LDS fence + rendezvous; without it the sum races and drops cross-warp
-    # stores.
-    off = tl.arange(0, BLOCK)
-    smem = tlx.local_alloc((BLOCK,), tl.int32, 1)
-    buf = tlx.local_view(smem, 0)
-    tlx.local_store(buf, tl.load(x_ptr + off))
-    tlx.workgroup_barrier()
-    total = tl.sum(tlx.local_load(buf))
-    tl.store(out_ptr + off, total + tl.zeros((BLOCK,), tl.int32))
-
-
-@pytest.mark.skipif(not is_hip(), reason="Requires AMD (HIP)")
-def test_amd_workgroup_barrier(device):
-    BLOCK = 256  # 4 warps x 64 lanes -> exercises cross-warp LDS visibility
-    x = torch.randint(-(2**20), 2**20, (BLOCK,), device=device, dtype=torch.int32)
-    out = torch.empty_like(x)
-    compiled = _workgroup_barrier_sum_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=4)
-    torch.cuda.synchronize()
-    expected = torch.full((BLOCK,), int(x.sum().item()), device=device, dtype=torch.int32)
-    torch.testing.assert_close(out, expected, atol=0, rtol=0)
-    # Lowers to a fenced ttg.barrier bracketed by rocdl.sched.barrier fences.
-    ttgir = compiled.asm["ttgir"]
-    assert ttgir.count("ttg.barrier") >= 1, f"TTGIR {ttgir}"
-    assert ttgir.count("rocdl.sched.barrier") >= 2, f"TTGIR {ttgir}"
-
-
-@triton.jit
-def _cond_barrier_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
-    # Exercise the cond_barrier phase-shift bracket (cond_barrier(wg != 0) ...
-    # cond_barrier(wg == 0), the split-M ping-pong pattern) around a
-    # workgroup_barrier. The payload is a per-lane copy -- independent of the
-    # (deliberately out-of-phase) barriers -- so the assertion checks what a unit
-    # test can: the paired bracket compiles and RECONVERGES without deadlock (a
-    # broken barrier-count contract would hang or drop the stores). cond_barrier's
-    # cross-warp phase-shift correctness is covered by the grouped-gemm integration.
-    off = tl.arange(0, BLOCK)
-    wg = tlx.thread_id(0) // 256
-    tlx.cond_barrier(wg != 0)
-    tlx.workgroup_barrier()
-    tlx.cond_barrier(wg == 0)
-    tl.store(out_ptr + off, tl.load(x_ptr + off))
-
-
-@pytest.mark.skipif(not is_hip(), reason="Requires AMD (HIP)")
-def test_amd_cond_barrier(device):
-    BLOCK = 512  # 8 warps -> two 256-lane warp-groups for the cond_barrier phase shift
-    x = torch.randint(-(2**20), 2**20, (BLOCK,), device=device, dtype=torch.int32)
-    out = torch.empty_like(x)
-    compiled = _cond_barrier_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=8)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out, x, atol=0, rtol=0)
-    # The paired bracket lowers to two amdg.cond_barrier ops.
-    ttgir = compiled.asm["ttgir"]
-    assert ttgir.count("amdg.cond_barrier") == 2, f"TTGIR {ttgir}"

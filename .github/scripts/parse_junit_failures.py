@@ -13,6 +13,10 @@ collapse into a single issue, e.g.
     foo/test_tlx.py::test_bar[param_b]
         => foo/test_tlx.py::test_bar
 
+A still-passing step whose runtime is closing on its ``timeout-minutes`` is also
+reported, as a ``slow-step:<name>`` item, so it can be fixed before it starts
+failing outright. Pass ``--budget <xml>=<minutes>`` to enable it.
+
 The result is written to ``$GITHUB_OUTPUT`` as ``failures=<json>`` (a JSON array
 of objects), defaulting to ``[]`` when there are no failures. Each object has:
     normalized_failure_id, raw_failure_ids, issue_title, job_name, summary
@@ -29,6 +33,9 @@ from classify_failure import classify
 
 # Matches a single trailing bracketed parametrization suffix: test_x[a-b] -> test_x
 PARAM_SUFFIX = re.compile(r"\[.*\]$")
+
+# Fraction of a step's timeout budget at which a still-passing suite is reported.
+SLOW_THRESHOLD = 0.8
 
 
 def normalize(node_id: str) -> str:
@@ -139,6 +146,75 @@ def build_missing_junit_item(missing_paths, workflow, job):
     }
 
 
+def parse_budget(spec):
+    """Parse a ``--budget`` pair, ``<junit-xml-path>=<timeout-minutes>``."""
+    path, sep, minutes = spec.rpartition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"expected <path>=<minutes>, got {spec!r}")
+    try:
+        return path, float(minutes)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad minutes in {spec!r}") from None
+
+
+def suite_seconds(path):
+    """Total test-session seconds recorded in a JUnit XML, or None if unusable."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = list(root.iter("testsuite"))
+    if not suites:
+        return None
+    total = 0.0
+    for suite in suites:
+        try:
+            total += float(suite.get("time") or 0.0)
+        except ValueError:
+            continue
+    return total
+
+
+def build_slow_items(budgets, threshold, workflow, job):
+    """Report each still-passing step whose runtime is closing on its timeout."""
+    items = []
+    for path, budget_min in budgets:
+        seconds = suite_seconds(path)
+        if seconds is None or budget_min <= 0:
+            continue
+        used_min = seconds / 60.0
+        frac = used_min / budget_min
+        if frac < threshold:
+            continue
+        name = os.path.basename(path)
+        norm = f"slow-step:{name[:-4] if name.endswith('.xml') else name}"
+        items.append({
+            "normalized_failure_id":
+            norm,
+            "raw_failure_ids":
+            "",
+            "issue_title":
+            f"[nightly] {workflow} / {job} / {norm}",
+            "job_name":
+            job,
+            "summary": (f"{name}: {used_min:.1f} min of a {budget_min:g} min budget ({frac:.0%}). This is "
+                        f"test-session time only, excluding collection, so the step is slower still. "
+                        f"Speed the suite up or raise timeout-minutes before it starts timing out."),
+            # No repro: this is a whole suite, not one test. An empty repro also
+            # tells report-nightly-failure.yml to skip deep bisection.
+            "repro":
+            "",
+            # Real, per-step signal: safe for reconcile to close once it speeds up.
+            "fallback":
+            False,
+            "external_dep":
+            False,
+            "external_dep_reason":
+            "",
+        })
+    return items
+
+
 def build_bucket_item(bucket, workflow, job):
     """Build a stable job-level fallback item when the job failed but no test failures can be parsed."""
     return {
@@ -173,6 +249,20 @@ def main():
         default="job-failed-no-parseable-failures",
         help="Stable bucket id for the fallback item emitted when --failed is set.",
     )
+    parser.add_argument(
+        "--budget",
+        action="append",
+        default=[],
+        metavar="XML=MINUTES",
+        help=("Step timeout budget for a JUnit XML, e.g. /tmp/tlx-core.xml=30. "
+              "Repeatable. Enables near-timeout reporting for that file."),
+    )
+    parser.add_argument(
+        "--slow-threshold",
+        type=float,
+        default=SLOW_THRESHOLD,
+        help="Fraction of the budget at which a passing-but-slow step is reported.",
+    )
     args = parser.parse_args()
 
     failures, missing_paths = collect_failures(args.junit)
@@ -181,6 +271,9 @@ def main():
         items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
     if not items and args.failed:
         items.append(build_bucket_item(args.bucket, args.workflow, args.job))
+    # Appended after the fallback guards: a slow-step item must not suppress the
+    # job-level fallback that a genuine failure needs.
+    items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure

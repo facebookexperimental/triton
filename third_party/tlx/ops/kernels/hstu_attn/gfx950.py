@@ -678,6 +678,7 @@ def triton_hstu_attention_fwd(
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
 
+    sort_by_length_indices = None
     if sort_by_length:
         seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
         _, sort_by_length_indices = torch.sort(seq_lengths, descending=True, stable=False)
