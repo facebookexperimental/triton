@@ -23,6 +23,7 @@ and one line of wiring:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import functools
 import os
@@ -127,6 +128,64 @@ def close_enough(out, ref, rel: float) -> tuple:
     return True, ""
 
 
+#: Kwarg-name prefixes worth dropping from the reported config: the kernels
+#: spell the tile either BLOCK_M or BLOCK_SIZE_M, and neither prefix carries
+#: information once the column is called "best config".
+_CONFIG_ABBREV = (("BLOCK_SIZE_", "B"), ("BLOCK_", "B"))
+
+
+def _fmt_config(config) -> str:
+    parts = []
+    for key, value in config.kwargs.items():
+        for long, short in _CONFIG_ABBREV:
+            if key.startswith(long):
+                key = short + key[len(long):]
+                break
+        parts.append(f"{key}={value}")
+    return " ".join(parts + [f"w{config.num_warps}", f"s{config.num_stages}"])
+
+
+@contextlib.contextmanager
+def _record_configs(into: dict):
+    """Record the config every autotuned kernel launched in this block ran with.
+
+    Wraps `Autotuner.run` rather than using `knobs.autotuning.listener`: the
+    listener only fires for a multi-config space, and a single-config one --
+    what an op with a `heuristic_config` uses by default -- is the case most
+    worth labelling. Doing it here rather than in a bench module is what makes
+    the column op-agnostic: an op that launches several autotuned kernels (a
+    flash_attn backward) contributes one entry per kernel, keyed by name.
+    """
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:  # nothing to record; not a reason to fail a measurement
+        yield
+        return
+
+    original = Autotuner.run
+
+    def run(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        config = getattr(self, "best_config", None)
+        if config is not None:
+            into[self.base_fn.__name__] = _fmt_config(config)
+        return out
+
+    Autotuner.run = run
+    try:
+        yield
+    finally:
+        Autotuner.run = original
+
+
+def _render_configs(configs: dict) -> Optional[str]:
+    if not configs:
+        return None  # the op's kernels are not autotuned
+    if len(configs) == 1:
+        return next(iter(configs.values()))
+    return " | ".join(f"{name}: {config}" for name, config in configs.items())
+
+
 def supported(bench) -> bool:
     # Both halves matter. No GPU means no arch; an arch the catalog has no entry
     # for means every case would raise UnsupportedOp, and N error rows read like
@@ -154,7 +213,9 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     # `resolve_cold_compile` for why that is the default on some ops.
     compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s) if cold else None
 
-    prep.tlx_fn()  # tune and compile outside the measured window
+    configs: dict = {}
+    with _record_configs(configs):
+        prep.tlx_fn()  # tune and compile outside the measured window
     if prep.ref_fn is not None:
         prep.ref_fn()
     torch.cuda.synchronize()
@@ -175,6 +236,7 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
                            accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
     result.flop_count = prep.flop_count
     result.extra = dict(prep.extra)
+    result.best_config = _render_configs(configs)
 
     # Optional adapter hook, for an op-specific metric that can only be computed
     # from the measurement -- `prepare` runs before there is one. Mutates in
