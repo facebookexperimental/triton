@@ -46,9 +46,12 @@ jobs:
           # scripts/build-llvm-project.sh and the llvm-build.yml producer.
           HASH=$(sed -n 's/.*"llvm_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' cmake/llvm-info.json)
           BUILD=$(sed -n 's/.*"build_number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' cmake/llvm-info.json)
+          BASE_URL=$(sed -n 's/.*"release_base_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' cmake/llvm-info.json)
+          BASE_URL=${BASE_URL:-"https://oaitriton.blob.core.windows.net/public/llvm-builds"}
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
           echo "short=${HASH:0:8}" >> "$GITHUB_OUTPUT"
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "base-url=$BASE_URL" >> "$GITHUB_OUTPUT"
 
       - name: Cache LLVM
         id: cache-llvm
@@ -63,7 +66,7 @@ jobs:
           # Artifact name must include the build number (get_llvm_package_info, setup.py:241).
           DIR="llvm-${{ steps.llvm-hash.outputs.short }}-ubuntu-x64-${{ steps.llvm-hash.outputs.build }}"
           TARBALL="${DIR}.tar.gz"
-          curl -fsSLO "https://oaitriton.blob.core.windows.net/public/llvm-builds/${TARBALL}"
+          curl -fsSLO "${{ steps.llvm-hash.outputs.base-url }}/${TARBALL}"
           tar xzf "${TARBALL}"
           mv "${DIR}" llvm-install
           rm "${TARBALL}"
