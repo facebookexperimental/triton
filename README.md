@@ -1475,8 +1475,8 @@ AMD tutorial kernels are exercised by `.github/workflows/mi350.yml` on a gfx950
 - **`mi350-meta-triton-test`** — TritonBench performance coverage (the AMD perf
   scripts above are for local runs; perf-regression tracking lives in TritonBench).
 
-Both run on push, PR, and the nightly schedule; nightly failures are filed as
-issues via `report-nightly-failure.yml`.
+Both run on pushes to `main`, pull requests not targeting `release/3.8.x`, and the nightly schedule;
+nightly failures are filed as issues via `report-nightly-failure.yml`.
 
 ## More reading materials
 
