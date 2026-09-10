@@ -853,3 +853,92 @@ class TestCtasPerCgaAutotunerSteadyState(TestCase):
         add_kernel_2cta[grid](x2, y2, o2, n)
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(o2, x2 + y2))
+
+    def _run_new_key_cluster_config_sequence(self, check_best_config):
+        def select_cta_count(configs, named_args, **kwargs):
+            if named_args["n_elements"] == 256:
+                return [config for config in configs if config.kwargs["USE_2CTA"]]
+            return configs
+
+        benchmark_index = 0
+
+        def do_bench(fn, quantiles):
+            nonlocal benchmark_index
+            fn()
+            benchmark_index += 1
+            return [float(benchmark_index)] * len(quantiles)
+
+        @triton.autotune(
+            configs=[
+                triton.Config(
+                    {"BLOCK_SIZE": 128, "USE_2CTA": False},
+                    num_warps=4,
+                    num_stages=1,
+                ),
+                triton.Config(
+                    {"BLOCK_SIZE": 128, "USE_2CTA": False},
+                    num_warps=8,
+                    num_stages=1,
+                ),
+                triton.Config(
+                    {"BLOCK_SIZE": 128, "USE_2CTA": True},
+                    num_warps=4,
+                    num_stages=1,
+                    ctas_per_cga=(2, 1, 1),
+                ),
+            ],
+            key=["n_elements"],
+            prune_configs_by={"early_config_prune": select_cta_count},
+            do_bench=do_bench,
+        )
+        @triton.jit
+        def add_kernel_switching_ctas(
+            x_ptr,
+            y_ptr,
+            out_ptr,
+            n_elements,
+            BLOCK_SIZE: tl.constexpr,
+            USE_2CTA: tl.constexpr,
+            DEFAULT_VALUE: tl.constexpr = 0,
+        ):
+            scale = _CLUSTER_SCALE
+            pid = tl.program_id(0)
+            offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offs < n_elements
+            x = tl.load(x_ptr + offs, mask=mask)
+            y = tl.load(y_ptr + offs, mask=mask)
+            tl.store(
+                out_ptr + offs,
+                ((x + y) * scale).to(tl.float32),
+                mask=mask,
+            )
+
+        device = _get_device()
+        # The final 256 revisits an already-seeded key after the 1-CTA key has
+        # replaced the active fast-cache metadata. The defaulted constexpr
+        # forces _try_fast_path to use its Python fallback.
+        for n in (256, 384, 256):
+            x = torch.randn(n, device=device, dtype=torch.float32)
+            y = torch.randn(n, device=device, dtype=torch.float32)
+            out = torch.empty(n, device=device, dtype=torch.float32)
+            def grid(meta):
+                num_ctas = 2 if meta["USE_2CTA"] else 1
+                num_blocks = triton.cdiv(n, 128)
+                return (triton.cdiv(num_blocks, num_ctas) * num_ctas, )
+
+            add_kernel_switching_ctas[grid](x, y, out, n)
+            torch.cuda.synchronize()
+            if check_best_config:
+                self.assertEqual(add_kernel_switching_ctas.best_config.kwargs["USE_2CTA"], n == 256)
+            self.assertTrue(torch.allclose(out, x + y))
+
+    @unittest.skipUnless(is_hopper_or_newer(), "ctas_per_cga is NVIDIA-only and requires Hopper (sm90) or newer")
+    @patch.dict(os.environ, {"TRITON_AUTOTUNE_USE_C_CACHE": "1"})
+    def test_new_key_dispatches_correct_cluster_config_with_c_proxy(self):
+        # Native proxy hits bypass Autotuner.run(), so output is the behavioral oracle.
+        self._run_new_key_cluster_config_sequence(check_best_config=False)
+
+    @unittest.skipUnless(is_hopper_or_newer(), "ctas_per_cga is NVIDIA-only and requires Hopper (sm90) or newer")
+    @patch.dict(os.environ, {"TRITON_AUTOTUNE_USE_C_CACHE": "0"})
+    def test_new_key_replaces_previous_cluster_config(self):
+        self._run_new_key_cluster_config_sequence(check_best_config=True)

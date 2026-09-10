@@ -517,7 +517,9 @@ class Autotuner(KernelInterface):
             raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
-        current = dict(meta, **config.all_kwargs())
+        config_kwargs = config.all_kwargs()
+        current = dict(meta, **config_kwargs)
+        self._set_fast_cache_meta(config_kwargs)
         full_nargs = {**self.nargs, **current}
 
         # Capture the CompiledKernel the launch returns (run(...) returns it even on a normal
@@ -709,6 +711,18 @@ class Autotuner(KernelInterface):
         native_autotune_proxy_insert(proxy, key_vals, constexpr_vals, constexpr_positions, options_hash,
                                      config.pre_hook)
 
+    def _set_fast_cache_meta(self, config_kwargs):
+        """Install one config's compilation options before launching it."""
+        if not getattr(self.fn, 'c_cache', False):
+            return
+        meta = {k: v for k, v in config_kwargs.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
+        if getattr(self.fn, '_fc_meta_kwargs', None) == meta:
+            return
+        options_hash = _hash_fc_opts(meta) if meta else 0
+        self.fn._fc_options_hash = options_hash
+        self.fn._fc_meta_kwargs = meta
+        self.fn._jit_proxy_cache = {}
+
     def _try_fast_path(self, args, kwargs, config):
         """Attempt C fast cache dispatch; return kernel or None to fall back.
 
@@ -770,18 +784,6 @@ class Autotuner(KernelInterface):
             except (ImportError, AttributeError):
                 native_fast_dispatch_insert = None
             kernel = self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
-            # Update _fc_options_hash so C proxy and JIT.run fast path lookups
-            # use the same hash that JIT.run's insertion used (includes meta-params
-            # like ctas_per_cga that affect compilation options).
-            if _meta:
-                _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
-                if _meta_opts:
-                    self.fn._fc_options_hash = _hash_fc_opts(_meta_opts)
-                # Store meta kwargs for C proxy fallback forwarding.
-                self.fn._fc_meta_kwargs = _meta
-                # Invalidate proxy cache so next __getitem__ creates a new proxy
-                # with the updated options_hash and meta_kwargs.
-                self.fn._jit_proxy_cache = {}
             if native_fast_dispatch_insert is not None:
                 _disp = getattr(kernel, '_dispatcher', None)
                 if _disp is not None:
@@ -922,6 +924,9 @@ class Autotuner(KernelInterface):
                 self._at_proxy_seeded.add(key)
         else:
             config = self.configs[0]
+        # Restore the winner before every launch path, including Python
+        # fallbacks and dump_best_config_ir recompilation.
+        self._set_fast_cache_meta(config.all_kwargs())
         self.best_config = config
         if knobs.autotuning.print and not used_cached_result:
             print(f"Triton autotuning for function {self.base_fn.__name__},\nwith key as {key},\n"
