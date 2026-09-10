@@ -3,11 +3,13 @@
 No compile-time cap as in test_mm.py: this kernel has no shape heuristic, so the
 correctness caller autotunes a small space and wall-clock says nothing about
 compile time.
-"""
 
+TODO: cover the config variants dropped with the tutorial copy of this kernel --
+RESCALE_OPT/USE_WHERE, the FAST_FIXED opt-out, NUM_CTAS=2, USE_WARP_BARRIER, and
+the backward HEAD_DIM x NUM_CTAS matrix. Nothing tests them today.
+"""
 import pytest
 import torch
-
 from triton._internal_testing import is_blackwell
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.flash_attn is sm100-only today")
@@ -16,7 +18,6 @@ torch.manual_seed(0)
 
 ARCH = "sm100"
 
-#  Hardware agnostic testsuite ``[Z, H, N_CTX, HEAD_DIM, causal]``
 SHAPES = [
     [1, 1, 256, 64, False],
     [1, 2, 512, 64, True],
@@ -33,8 +34,6 @@ SHAPES = [
     [1, 1, 8192, 128, True],
 ]
 
-# atol tracks the magnitude of the result, not of the element compared; see
-# test_mm.py.
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 
 

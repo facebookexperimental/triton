@@ -1,9 +1,7 @@
 """L1 correctness for `tlx.ops.kimi_delta_attention`."""
-
 import pytest
 import torch
 import torch.nn.functional as F
-
 from triton._internal_testing import is_blackwell
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.kimi_delta_attention is sm100-only today")
@@ -11,6 +9,7 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.kimi_delta_a
 torch.manual_seed(0)
 
 ARCH = "sm100"
+
 REL_PRECISION = {torch.bfloat16: 8e-3}
 
 

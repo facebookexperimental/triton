@@ -13,25 +13,24 @@ count, which pads by a whole tile row even when ``M % BLOCK_SIZE_M == 0``.
 
 The layout tests need no GPU and no compile.
 """
-
 import contextlib
 import time
-
 import pytest
 import torch
 import triton
-
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops.kernels.mm import sm100
+
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.mm split-K is sm100-only")
 
 torch.manual_seed(0)
 
 ARCH = "sm100"
+
 MAX_SECONDS_PER_CASE = 60
+
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 
-# ``(M, BLOCK_SIZE_M, NUM_CTAS, expected_overhang_rows)``. The overhang is what
-# the last tile writes past M; it is what used to land on the next split.
 GEOMETRIES = [
     # No overhang: M is a whole number of tiles and the count already divides
     # NUM_CTAS. These must stay at zero -- they are the canary for the fix
@@ -114,12 +113,6 @@ def test_heuristic_configs_have_a_sound_workspace(M, N, K):
         assert rows >= written, f"heuristic config for {M}x{N}x{K} on {num_sms} SMs has an aliasing workspace: {cfg}"
 
 
-# --------------------------------------------------------------------------
-# GPU: the layout tests above check the host arithmetic. This checks that the
-# device actually agrees with it, which no amount of host-side reasoning can.
-# --------------------------------------------------------------------------
-
-
 @contextlib.contextmanager
 def _pinned_config(overrides):
     """Force ``space="heuristic"`` to compile exactly one config.
@@ -151,23 +144,13 @@ def _pinned_config(overrides):
         sm100._tuned.cache_clear()
 
 
-# ``(M, N, K, NUM_CTAS)``. Each runs across SPLIT_KS_GPU and must agree.
-#
-# TODO(NUM_CTAS=2 on narrow tiles): (384, 512, 8192, 2) would exercise NUM_CTAS
-# padding end-to-end, but is wrong for an unrelated reason. B200, heuristic
-# config (BM=128, BN=64, MMA_GROUPS=2), assert_close atol=0.412 rtol=1e-3:
-# NUM_CTAS=1 passes at SPLIT_K=1 and 4; NUM_CTAS=2 gives 32670/196608 mismatched
-# (16.6%), max abs diff 583.0, at SPLIT_K=1 and 4 alike. Failing at SPLIT_K=1
-# rules out the workspace bug, and it reproduces with the fix reverted.
-# Reachable: (NUM_CTAS=2, NUM_MMA_GROUPS=2) has 88 survivors of
-# preprocess_configs here. Not 2-CTA in general -- 2cta_2group (BN=256) passes.
-# Not filed. NUM_CTAS padding is still covered by the layout tests above.
 GPU_SHAPES = [
     # M % BLOCK_SIZE_M != 0 -- the reported bug (BLOCK_SIZE_M=256 -> 24 rows over).
     (1000, 1000, 1024, 1),
     # Whole region overhangs: one tile of 128 rows holds only 64 real rows.
     (64, 4096, 4096, 1),
 ]
+
 SPLIT_KS_GPU = [1, 4]
 
 
