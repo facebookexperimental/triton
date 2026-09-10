@@ -429,6 +429,18 @@ analyzeCombinedSemaphoreGroup(ArrayRef<SemaphoreAcquireOp> acquireGroup) {
 
     if (!info.prodAcquireOp || !info.prodBufferOp || !info.prodReleaseOp)
       return {};
+
+    // Only combine pairs whose users are covered by this rewrite.
+    for (Operation *user : fullSema->getUsers())
+      if (user != consAcquire && user != info.consBufferOp &&
+          user != info.prodReleaseOp)
+        return {};
+
+    for (Operation *user : emptySema->getUsers())
+      if (user != info.prodAcquireOp && user != info.prodBufferOp &&
+          user != info.consReleaseOp)
+        return {};
+
     combinedInfos.push_back(info);
   }
 
