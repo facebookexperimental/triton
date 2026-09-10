@@ -33,10 +33,10 @@ _WIDE_BLOCK_N = 256
 _HEAD_DIM = 128
 _I32_BUFFER_BF16_ELEMENTS = 1 << 30
 _I32_BUFFER_FP32_ELEMENTS = _I32_BUFFER_BF16_ELEMENTS // 2
-# Local gfx950 sweeps found that the BM32/BN256 split kernel's wider tiles and
-# dK/dV reduction amortize their overhead at roughly 1024 query-head/BM16-block
-# phases per KV head.  This keeps max-Q 300/400 workloads on BM16/BN128 while
-# the max-Q 5662 SGLang-like GQA3/GQA8 workloads use the split path.
+# This is an empirical gfx950 crossover, not a hardware limit.  The work metric
+# is group_size * ceil(max_q / 16), the BM16 query-block phases per KV head.
+# Local sweeps kept max-Q 300/400 on BM16/BN128, while max-Q 5662 GQA3/GQA8
+# amortized the BM32/BN256 split kernel and its dK/dV reduction overhead.
 _VARLEN_GQA_SPLIT_WORK_THRESHOLD = 1024
 
 
@@ -1127,6 +1127,9 @@ def _varlen_dkdv_reduce_kernel(
         dk += tl.load(DK_PART + partial_base + split * D, mask=valid, other=0.0).to(tl.float32)
         dv += tl.load(DV_PART + partial_base + split * D, mask=valid, other=0.0).to(tl.float32)
     output_offsets = (offs_n[:, None] * HKV + kv_head) * D + offs_d[None, :]
+    # Match the FP32 load layout so the BF16 stores do not introduce a
+    # whole-tile cross-warp conversion through LDS.
+    output_offsets = tl.max_contiguous(output_offsets, [1, 4])
     tl.store(DK + output_offsets, dk.to(tl.bfloat16), mask=valid)
     tl.store(DV + output_offsets, dv.to(tl.bfloat16), mask=valid)
 

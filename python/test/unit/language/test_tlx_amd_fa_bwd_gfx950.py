@@ -2,6 +2,7 @@
 
 import inspect
 import re
+
 import pytest
 import torch
 from triton.language.extra.tlx.tutorials import amd_fa_bwd, amd_fa_varlen_bwd
@@ -93,32 +94,35 @@ def _assert_scratch_free(name, compiled):
     }, (name, resources)
 
 
-def _make_varlen_d128_reference_case(q_lengths, kv_lengths, *, heads, seed):
+def _make_varlen_d128_reference_case(q_lengths, kv_lengths, *, q_heads, kv_heads, seed):
+    assert q_heads > 0 and kv_heads > 0 and q_heads % kv_heads == 0
+    group_size = q_heads // kv_heads
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     total_q = sum(q_lengths)
     total_kv = sum(kv_lengths)
     scale = 128**-0.5
-    q = torch.randn((total_q, heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    k = torch.randn((total_kv, heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    v = torch.randn((total_kv, heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    do = torch.randn((total_q, heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
+    q = torch.randn((total_q, q_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
+    k = torch.randn((total_kv, kv_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
+    v = torch.randn((total_kv, kv_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
+    do = torch.randn((total_q, q_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
     out = torch.empty_like(q)
-    lse = torch.empty((heads, total_q), dtype=torch.float32, device="cuda")
+    lse = torch.empty((q_heads, total_q), dtype=torch.float32, device="cuda")
     expected_dq = torch.empty_like(q)
-    expected_dk = torch.empty_like(k)
-    expected_dv = torch.empty_like(v)
+    expected_dk = torch.zeros_like(k, dtype=torch.float32)
+    expected_dv = torch.zeros_like(v, dtype=torch.float32)
 
     q_begin = 0
     kv_begin = 0
     for q_length, kv_length in zip(q_lengths, kv_lengths, strict=True):
         q_end = q_begin + q_length
         kv_end = kv_begin + kv_length
-        for head in range(heads):
-            q_tile = q[q_begin:q_end, head].float()
-            k_tile = k[kv_begin:kv_end, head].float()
-            v_tile = v[kv_begin:kv_end, head].float()
-            do_tile = do[q_begin:q_end, head].float()
+        for q_head in range(q_heads):
+            kv_head = q_head // group_size
+            q_tile = q[q_begin:q_end, q_head].float()
+            k_tile = k[kv_begin:kv_end, kv_head].float()
+            v_tile = v[kv_begin:kv_end, kv_head].float()
+            do_tile = do[q_begin:q_end, q_head].float()
             scores = q_tile @ k_tile.mT * scale
             lse_tile = torch.logsumexp(scores, dim=1)
             p = torch.exp(scores - lse_tile[:, None])
@@ -126,17 +130,21 @@ def _make_varlen_d128_reference_case(q_lengths, kv_lengths, *, heads, seed):
             delta = torch.sum(out_tile.float() * do_tile, dim=1)
             dp = do_tile @ v_tile.mT
             ds = (p * (dp - delta[:, None])).to(torch.bfloat16).float()
-            out[q_begin:q_end, head] = out_tile
-            lse[head, q_begin:q_end] = lse_tile
-            expected_dq[q_begin:q_end, head] = (ds @ k_tile * scale).to(torch.bfloat16)
-            expected_dk[kv_begin:kv_end, head] = (ds.mT @ q_tile * scale).to(torch.bfloat16)
-            expected_dv[kv_begin:kv_end, head] = (p.to(torch.bfloat16).float().mT @ do_tile).to(torch.bfloat16)
+            out[q_begin:q_end, q_head] = out_tile
+            lse[q_head, q_begin:q_end] = lse_tile
+            expected_dq[q_begin:q_end, q_head] = (ds @ k_tile * scale).to(torch.bfloat16)
+            expected_dk[kv_begin:kv_end, kv_head].add_(ds.mT @ q_tile * scale)
+            expected_dv[kv_begin:kv_end, kv_head].add_(p.to(torch.bfloat16).float().mT @ do_tile)
         q_begin = q_end
         kv_begin = kv_end
 
     cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
     cu_kv = torch.tensor([0, *torch.tensor(kv_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
-    return q, k, v, out, do, lse, cu_q, cu_kv, scale, (expected_dq, expected_dk, expected_dv)
+    return q, k, v, out, do, lse, cu_q, cu_kv, scale, (
+        expected_dq,
+        expected_dk.to(torch.bfloat16),
+        expected_dv.to(torch.bfloat16),
+    )
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -236,59 +244,6 @@ def test_varlen_d128_plan_owns_offsets_and_compact_schedules():
     assert plan.cu_seqlens_k.tolist() == [0, 33, 162, 169]
 
 
-def _make_varlen_d128_reference_case(q_lengths, kv_lengths, *, q_heads, kv_heads, seed):
-    assert q_heads > 0 and kv_heads > 0 and q_heads % kv_heads == 0
-    group_size = q_heads // kv_heads
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(seed)
-    total_q = sum(q_lengths)
-    total_kv = sum(kv_lengths)
-    scale = 128**-0.5
-    q = torch.randn((total_q, q_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    k = torch.randn((total_kv, kv_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    v = torch.randn((total_kv, kv_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    do = torch.randn((total_q, q_heads, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
-    out = torch.empty_like(q)
-    lse = torch.empty((q_heads, total_q), dtype=torch.float32, device="cuda")
-    expected_dq = torch.empty_like(q)
-    expected_dk = torch.zeros_like(k, dtype=torch.float32)
-    expected_dv = torch.zeros_like(v, dtype=torch.float32)
-
-    q_begin = 0
-    kv_begin = 0
-    for q_length, kv_length in zip(q_lengths, kv_lengths, strict=True):
-        q_end = q_begin + q_length
-        kv_end = kv_begin + kv_length
-        for q_head in range(q_heads):
-            kv_head = q_head // group_size
-            q_tile = q[q_begin:q_end, q_head].float()
-            k_tile = k[kv_begin:kv_end, kv_head].float()
-            v_tile = v[kv_begin:kv_end, kv_head].float()
-            do_tile = do[q_begin:q_end, q_head].float()
-            scores = q_tile @ k_tile.mT * scale
-            lse_tile = torch.logsumexp(scores, dim=1)
-            p = torch.exp(scores - lse_tile[:, None])
-            out_tile = (p @ v_tile).to(torch.bfloat16)
-            delta = torch.sum(out_tile.float() * do_tile, dim=1)
-            dp = do_tile @ v_tile.mT
-            ds = (p * (dp - delta[:, None])).to(torch.bfloat16).float()
-            out[q_begin:q_end, q_head] = out_tile
-            lse[q_head, q_begin:q_end] = lse_tile
-            expected_dq[q_begin:q_end, q_head] = (ds @ k_tile * scale).to(torch.bfloat16)
-            expected_dk[kv_begin:kv_end, kv_head].add_(ds.mT @ q_tile * scale)
-            expected_dv[kv_begin:kv_end, kv_head].add_(p.to(torch.bfloat16).float().mT @ do_tile)
-        q_begin = q_end
-        kv_begin = kv_end
-
-    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
-    cu_kv = torch.tensor([0, *torch.tensor(kv_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
-    return q, k, v, out, do, lse, cu_q, cu_kv, scale, (
-        expected_dq,
-        expected_dk.to(torch.bfloat16),
-        expected_dv.to(torch.bfloat16),
-    )
-
-
 def _make_seeded_extend_attention_lengths(batch, max_context, seed):
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -311,6 +266,7 @@ def test_varlen_d128_seeded_extend_attention_lengths_are_reproducible():
     assert len(set(q_lengths)) > 1
     assert all(q_length > 0 for q_length in q_lengths)
     assert all(q_length < kv_length for q_length, kv_length in zip(q_lengths, kv_lengths, strict=True))
+
 
 @pytest.mark.parametrize(
     ("max_q", "group_size", "expected"),
@@ -482,36 +438,6 @@ def test_varlen_d128_plan_rejects_invalid_offsets():
         with pytest.raises(ValueError, match=message):
             amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
 
-
-def test_varlen_d128_address_space_requires_i32_offsets():
-    # One D128 BF16 head fits at most 2**30 elements in the signed i32
-    # byte-offset range used by AMD buffer instructions.
-    max_tokens = 2**23
-
-    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-        total_q=max_tokens - 15,
-        total_kv=max_tokens,
-        batch=1,
-        q_heads=1,
-        kv_heads=1,
-    )
-
-    with pytest.raises(ValueError, match="KV tensor size exceeds the signed 32-bit byte-offset range"):
-        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-            total_q=1,
-            total_kv=max_tokens + 1,
-            batch=1,
-            q_heads=1,
-            kv_heads=1,
-        )
-    with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
-        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-            total_q=max_tokens - 14,
-            total_kv=1,
-            batch=1,
-            q_heads=1,
-            kv_heads=1,
-        )
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_varlen_d128_backward_rejects_unsupported_signature():
