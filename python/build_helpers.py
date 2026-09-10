@@ -355,8 +355,12 @@ def get_llvm_package_info(helper_args: BuildHelperArgs):
     name = f"llvm-{rev}-{system_suffix}-{build_number}"
     # Create a stable symlink that doesn't include revision
     sym_name = f"llvm-{system_suffix}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
-    sha256sum = llvm_info["sha256sum"][system_suffix]
+    release_base_url = llvm_info.get("release_base_url", "https://oaitriton.blob.core.windows.net/public/llvm-builds")
+    url = f"{release_base_url.rstrip('/')}/{name}.tar.gz"
+    try:
+        sha256sum = llvm_info["sha256sum"][system_suffix]
+    except KeyError as error:
+        raise RuntimeError(f"LLVM pre-compiled image is not available for {system_suffix}") from error
     return Package(
         "llvm",
         name,

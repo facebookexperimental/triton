@@ -10,7 +10,8 @@ LLVM_COMMIT_HASH=${LLVM_COMMIT_HASH:-$(sed -n 's/.*"llvm_hash"[[:space:]]*:[[:sp
 LLVM_PROJECT_PATH=${LLVM_PROJECT_PATH:-"$REPO_ROOT/llvm-project"}
 LLVM_BUILD_PATH=${LLVM_BUILD_PATH:-"$LLVM_PROJECT_PATH/build"}
 LLVM_INSTALL_PATH=${LLVM_INSTALL_PATH:-"$LLVM_PROJECT_PATH/install"}
-LLVM_PROJECT_URL=${LLVM_PROJECT_URL:-"https://github.com/llvm/llvm-project"}
+LLVM_INFO_PROJECT_URL=$(sed -n 's/.*"llvm_repository"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO_ROOT/cmake/llvm-info.json")
+LLVM_PROJECT_URL=${LLVM_PROJECT_URL:-${LLVM_INFO_PROJECT_URL:-"https://github.com/llvm/llvm-project"}}
 
 # Build+link with clang+lld only when explicitly requested (the macOS toolchain
 # does not ship lld). Otherwise fall back to the default compiler and linker.

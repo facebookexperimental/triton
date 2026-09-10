@@ -117,6 +117,7 @@ class DownloadAndExtractTest(unittest.TestCase):
                 json.dumps({
                     "llvm_hash": "abcdef0123456789",
                     "build_number": 7,
+                    "release_base_url": "https://github.com/example/llvm/releases/download/llvm-abcdef01-7",
                     "sha256sum": {"test-platform": "expected-checksum"},
                 }))
             helper_args = build_helpers.BuildHelperArgs(
@@ -139,4 +140,8 @@ class DownloadAndExtractTest(unittest.TestCase):
                 package = build_helpers.get_llvm_package_info(helper_args)
 
             self.assertEqual("llvm-abcdef01-test-platform-7", package.name)
+            self.assertEqual(
+                "https://github.com/example/llvm/releases/download/llvm-abcdef01-7/llvm-abcdef01-test-platform-7.tar.gz",
+                package.url,
+            )
             self.assertEqual("expected-checksum", package.sha256sum)
