@@ -49,6 +49,7 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::nvidia_gpu;
 using namespace mlir::triton::nvws;
+using namespace mlir::triton::nvws::semaphore;
 
 #define DEBUG_TYPE "nvws-lower-semaphore"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -65,34 +66,6 @@ namespace {
 // Lowering contract and the egx/nvws-semaphore delta:
 // sema-docs/assign-stage-phase-and-lower-semaphores.md.
 // ----------------------------------------------------------------------------
-
-struct PartitionWsTagIds {
-  std::optional<int> wsTag;
-  SetVector<int> partitionIds;
-};
-std::optional<PartitionWsTagIds> getPartitionWsTagIds(Operation *op) {
-  std::optional<PartitionWsTagIds> partitionWsTagIds;
-  if (hasPartition(op)) {
-    partitionWsTagIds =
-        PartitionWsTagIds{std::nullopt, triton::gpu::getPartitionIds(op)};
-    if (auto wsTag = getWarpSpecializeTag(op)) {
-      partitionWsTagIds->wsTag = *wsTag;
-    }
-  }
-  return partitionWsTagIds;
-}
-
-void assignStageCluster(Operation *op,
-                        std::optional<PartitionWsTagIds> partitionWsTagIds,
-                        StageCluster stageCluster, OpBuilder &builder) {
-  if (partitionWsTagIds) {
-    setPartition(op, partitionWsTagIds->partitionIds);
-    if (auto wsTag = partitionWsTagIds->wsTag) {
-      setWarpSpecializeTag(op, *wsTag);
-    }
-    setStageCluster(builder, op, stageCluster);
-  }
-}
 
 bool isOperandPipelineable(Value v, scf::ForOp forOp) {
   auto isPipelineable = [](Operation *op) {
@@ -157,14 +130,6 @@ FailureOr<Value> createAndInitMbar(SemaphoreCreateOp op,
   }
 
   return mbars;
-}
-
-SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs) {
-  SmallVector<AsyncOp> kinds;
-  for (auto asyncKind : opAttrs) {
-    kinds.push_back(cast<AsyncOpAttr>(asyncKind).getValue());
-  }
-  return kinds;
 }
 
 void createTMALoad(triton::nvws::DescriptorLoadOp op, PatternRewriter &rewriter,

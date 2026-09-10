@@ -3,8 +3,29 @@
 
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "llvm/ADT/SetVector.h"
+#include <optional>
 
 namespace mlir::triton::nvws {
+
+namespace semaphore {
+
+struct PartitionWsTagIds {
+  std::optional<int> wsTag;
+  SetVector<int> partitionIds;
+};
+
+std::optional<PartitionWsTagIds> getPartitionWsTagIds(Operation *op);
+
+void assignStageCluster(Operation *op,
+                        std::optional<PartitionWsTagIds> partitionWsTagIds,
+                        gpu::StageCluster stageCluster, OpBuilder &builder);
+
+SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs);
+
+} // namespace semaphore
 
 Operation *createAlloc(OpBuilder &builder, Location loc,
                        gpu::MemDescType memDescType, Value src);
