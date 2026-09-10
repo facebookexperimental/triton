@@ -1,5 +1,6 @@
 import math
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -33,6 +34,13 @@ from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
 from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     addmm as _amd_addmm,
     available_paths as _amd_addmm_paths,
+)
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    _MT64X256_MI32_KERNEL_SPEC,
+    _MT224X160_MI16_KERNEL_SPEC,
+    _RESIDENT_OPERAND_B,
+    bmm as _shared_a_bmm,
+    bmm_register_staged_template,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16 import (
     matmul_kernel as _amd_gemm, )
@@ -1479,6 +1487,78 @@ def test_amd_bmm(dtype):
         out = _amd_bmm(a, b)
         ref = torch.bmm(a, b)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "dtype,m,n,k,kernel_spec",
+    [
+        (torch.float16, 40, 160, 64, _MT64X256_MI32_KERNEL_SPEC),
+        (
+            torch.bfloat16,
+            224,
+            160,
+            65,
+            replace(
+                _MT224X160_MI16_KERNEL_SPEC,
+                resident_operand_policy=_RESIDENT_OPERAND_B,
+            ),
+        ),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_register_staged_bmm_resident_operand_policies(
+    dtype, m, n, k, kernel_spec
+):
+    """Exercise both dot orders, input dtypes, and partial output tiles."""
+    batch = 2
+    torch.manual_seed(0)
+    a_storage = torch.randn((1, m, k), device=DEVICE, dtype=dtype)
+    a = a_storage.expand(batch, -1, -1)
+    b = torch.randn((batch, k, n), device=DEVICE, dtype=dtype)
+
+    actual = bmm_register_staged_template(a, b, kernel_spec)
+    expected = torch.bmm(a, b)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "m,n,k,error",
+    [
+        (64, 256, 31, "K must be >= BLOCK_K=32"),
+        (31, 256, 64, "BLOCK_M=64 requires M >= 32"),
+        (64, 127, 64, "BLOCK_N=256 requires N >= 128"),
+    ],
+)
+def test_register_staged_bmm_rejects_unsupported_wrap_contracts(m, n, k, error):
+    a = torch.empty((1, m, k), dtype=torch.float16)
+    b = torch.empty((1, k, n), dtype=torch.float16)
+
+    with pytest.raises(AssertionError, match=error):
+        bmm_register_staged_template(a, b, _MT64X256_MI32_KERNEL_SPEC)
+
+
+@pytest.mark.parametrize(
+    "batch,m,n,k,dtype",
+    [
+        (63, 40, 256, 1956, torch.float16),
+        (255, 262, 256, 294, torch.float16),
+        (256, 448, 160, 931, torch.float16),
+        (64, 1195, 256, 2309, torch.bfloat16),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_shared_a_bmm_production_dispatches_at_group_boundaries(
+    batch, m, n, k, dtype
+):
+    """Cover every tuned dispatch at the batch size that enables grouping."""
+    torch.manual_seed(0)
+    a = torch.randn((1, m, k), device=DEVICE, dtype=dtype).expand(batch, -1, -1)
+    b = torch.randn((batch, k, n), device=DEVICE, dtype=dtype)
+
+    actual = _shared_a_bmm(a, b)
+    expected = torch.bmm(a, b)
+    atol = 5e-1 if dtype == torch.bfloat16 else 2e-2
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=2e-2)
 
 
 # =============================================================================
