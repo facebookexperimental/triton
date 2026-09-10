@@ -13,6 +13,7 @@
 #A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 #A_SHARED_1D = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0]}>
 #A_SHARED_T = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0, 1]}>
+#A_SHARED_HOLEY = #ttg.shared_linear<{offset = [[0, 1], [0, 0], [1, 0], [2, 0]], block = []}, alignment = 16>
 #B_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 #C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
 #A_DOT = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth = 2}>
@@ -1008,23 +1009,37 @@ tt.func @tightly_packed_captures(%arg0: i8, %arg1: i64) {
   } : (i8, i64) -> ()
   tt.return
 }
-// expected-remark @below {{nvmma_alignment}}
-// expected-remark @below {{size = 1088}}
-tt.func @nvmma_alignment(%lb : index, %ub : index, %step : index, %A : !tt.ptr<f16>, %B : !tt.ptr<f16>) {
-  // expected-remark @below {{offset = 0, size = 256}}
-  %fp4 = ttg.local_alloc : () -> !ttg.memdesc<1x128xi8, #NVMMA_SHARED_FP4PADDED, #ttg.shared_memory, mutable>
-  // expected-remark @below {{offset = 0, size = 64}}
-  %a = ttg.local_alloc : () -> !ttg.memdesc<32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
-  // expected-remark @below {{offset = 128, size = 64}}
-  %b = ttg.local_alloc : () -> !ttg.memdesc<8x8xi8, #NVMMA_SHARED_0, #ttg.shared_memory, mutable>
-  // expected-remark @below {{offset = 256, size = 64}}
-  %c = ttg.local_alloc : () -> !ttg.memdesc<4x16xi8, #NVMMA_SHARED_32, #ttg.shared_memory, mutable>
-  // expected-remark @below {{offset = 512, size = 64}}
-  %d = ttg.local_alloc : () -> !ttg.memdesc<2x32xi8, #NVMMA_SHARED_64, #ttg.shared_memory, mutable>
-  // expected-remark @below {{offset = 1024, size = 64}}
-  %e = ttg.local_alloc : () -> !ttg.memdesc<1x64xi8, #NVMMA_SHARED_128, #ttg.shared_memory, mutable>
+// expected-remark @below {{fp4_padded_shared_allocation}}
+// expected-remark @below {{size = 1024}}
+tt.func @fp4_padded_shared_allocation() {
+  // expected-remark @below {{offset = 0, size = 1024}}
+  %fp4 = ttg.local_alloc : () -> !ttg.memdesc<8x64xi8, #NVMMA_SHARED_FP4PADDED, #ttg.shared_memory, mutable>
+  tt.return
+}
 
-  ttg.local_dealloc %a : !ttg.memdesc<32xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
+// expected-remark @below {{nvmma_alignment}}
+// expected-remark @below {{size = 1536}}
+tt.func @nvmma_alignment(%lb : index, %ub : index, %step : index, %A : !tt.ptr<f16>, %B : !tt.ptr<f16>) {
+  // expected-remark @below {{offset = 0, size = 640}}
+  %a = ttg.local_alloc : () -> !ttg.memdesc<5x64xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
+  // expected-remark @below {{offset = 640, size = 64}}
+  %b = ttg.local_alloc : () -> !ttg.memdesc<8x8xi8, #NVMMA_SHARED_0, #ttg.shared_memory, mutable>
+  // expected-remark @below {{offset = 768, size = 128}}
+  %c = ttg.local_alloc : () -> !ttg.memdesc<8x16xi8, #NVMMA_SHARED_32, #ttg.shared_memory, mutable>
+  // expected-remark @below {{offset = 1024, size = 256}}
+  %d = ttg.local_alloc : () -> !ttg.memdesc<8x32xi8, #NVMMA_SHARED_64, #ttg.shared_memory, mutable>
+  // expected-remark @below {{offset = 1024, size = 512}}
+  %e = ttg.local_alloc : () -> !ttg.memdesc<8x64xi8, #NVMMA_SHARED_128, #ttg.shared_memory, mutable>
+
+  ttg.local_dealloc %a : !ttg.memdesc<5x64xf16, #A_SHARED_1D, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// expected-remark @below {{holey_shared_allocation}}
+// expected-remark @below {{size = 64}}
+tt.func @holey_shared_allocation() {
+  // expected-remark @below {{offset = 0, size = 64}}
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<4x2xi32, #A_SHARED_HOLEY, #ttg.shared_memory, mutable>
   tt.return
 }
 
@@ -1078,15 +1093,15 @@ tt.func @padded_shared_layout_multi_tier() {
 // expected-remark @below {{size = 8}}
 tt.func public @no_remote_shmem_store_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: tensor<1xf32>) {
   // expected-remark @below {{offset = 0, size = 8}}
-  %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED_1D, #smem, mutable>
   %1 = nvg.cluster_id
   %c1_i32 = arith.constant 1 : i32
   %c1_i32_0 = arith.constant 1 : i32
   %2 = arith.xori %1, %c1_i32_0 : i32
-  %3 = ttg.memdesc_index %0[%2] : !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable> -> !ttg.memdesc<1xf32, #A_SHARED_1D, #smem, mutable>
+  %3 = ttg.memdesc_index %0[%2] : !ttg.memdesc<2x1xf32, #A_SHARED_1D, #smem, mutable> -> !ttg.memdesc<1xf32, #A_SHARED_1D, #smem, mutable>
   %c1_i32_1 = arith.constant 1 : i32
   // expected-remark @below {{offset = 0, size = 8}}
-  %4 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  %4 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED_1D, #smem, mutable>
   tt.return
 }
 
@@ -1094,13 +1109,13 @@ tt.func public @no_remote_shmem_store_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr
 // expected-remark @below {{size = 24}}
 tt.func public @remote_shmem_store_kernel(%store_val: tensor<1xf32>) {
   // expected-remark @below {{offset = 0, size = 8}}
-  %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED_1D, #smem, mutable>
   %c1_i32 = arith.constant 1 : i32
-  %remote_store_view_2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable> -> !ttg.memdesc<1xf32, #A_SHARED_1D, #smem, mutable>
+  %remote_store_view_2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2x1xf32, #A_SHARED_1D, #smem, mutable> -> !ttg.memdesc<1xf32, #A_SHARED_1D, #smem, mutable>
   %cta_rank = arith.constant 1 : i32
   ttg.remote_shmem_store %store_val, rank %cta_rank, %remote_store_view_2 : tensor<1xf32> -> !ttg.memdesc<1xf32, #A_SHARED_1D, #smem, mutable>
   // expected-remark @below {{offset = 16, size = 8}}
-  %4 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED, #smem, mutable>
+  %4 = ttg.local_alloc : () -> !ttg.memdesc<2x1xf32, #A_SHARED_1D, #smem, mutable>
   tt.return
 }
 

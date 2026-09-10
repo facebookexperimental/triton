@@ -176,11 +176,6 @@ places that ordinary read visibility is transported:
 - A frontier-tracked mbarrier arrive copies the issuing base thread's current
   proxy frontier into the barrier tracking row. The local copy remains live, so
   an arrive does not make a later async access by the arriving thread legal.
-- An async-proxy write that signals an mbarrier snapshots the issuing base
-  thread's frontier at launch time, after its proxy-ordering check, but only for
-  tracked shared-memory regions fully contained in the write destination. This
-  lets the completion wait transport a fence immediately preceding a TMA load
-  without publishing unrelated or only partially overwritten regions.
 - A successful mbarrier wait merges the selected barrier row into the waiting
   base thread's row. A fence before the wait cannot cover accesses learned only
   by that wait; a fence after the wait can.
@@ -193,12 +188,11 @@ places that ordinary read visibility is transported:
   partition base-thread rows.
 
 Before an async-proxy shared-memory effect, ConSan checks only the issuing base
-thread's row, restricted to the effect-recipient CTA rows and expanded through
-the shared-memory alias matrix. The access is legal when every visible generic
-source bit has corresponding fence coverage. This current-thread check is what
-allows a producer to fence before publishing through an mbarrier, or a consumer
-to wait and then fence, without treating a fence in an unrelated thread as
-sufficient.
+thread's row, restricted to the effect-recipient CTA rows and the access's exact
+overlap mask. The access is legal when every visible generic source bit has
+corresponding fence coverage. This current-thread check is what allows a
+producer to fence before publishing through an mbarrier, or a consumer to wait
+and then fence, without treating a fence in an unrelated thread as sufficient.
 
 When ConSan initializes an otherwise uninitialized shared allocation with a
 poison pattern, it emits a CTA-scoped async-shared fence after the poison store
@@ -265,11 +259,6 @@ The common hook implementation covers these TritonGPU operations:
   and atomic scatter RMW conservatively cover their full destination
   descriptors because their indices are runtime values.
 - `ttg.local_alloc` with a source: barrier-tracked shared-memory write.
-- Any operation with allocator-provided operation-local shared scratch: a
-  synchronous generic-proxy write over its allocated byte interval. Forced
-  warp-shuffle conversions publish no scratch metadata because allocation
-  reserves no scratch for them; convert, reduce, and scratch-backed atomic
-  broadcasts use CTA-aware routing.
 
 These shared-memory effects are generic-proxy accesses for the proxy-ordering
 model.

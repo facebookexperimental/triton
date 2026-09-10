@@ -48,6 +48,7 @@
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/SourceMgr.h"
+#include <memory>
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
@@ -493,11 +494,29 @@ void init_triton_ir(py::module_ &m) {
   py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag")
       .def(py::init<llvm::SourceMgr &, MLIRContext *>());
 
+  static std::vector<mlir::triton::plugin::TritonPlugin> plugins;
+  m.def(
+      "extend_dialects_with",
+      [](const std::string &libPath) {
+        // Load the plugin library.
+        auto pluginOrErr = mlir::triton::plugin::TritonPlugin::load(libPath);
+        if (!pluginOrErr) {
+          std::string errMsg = llvm::toString(pluginOrErr.takeError());
+          throw std::runtime_error(errMsg);
+        }
+        auto plugin = std::move(*pluginOrErr);
+
+        // Store the plugin for later (i.e., `load_dialects`)
+        plugins.push_back(std::move(plugin));
+      },
+      "Given a path to a Triton extension, register any dialects to be loaded "
+      "in `load_dialects`.");
+
   m.def("load_dialects", [](MLIRContext &context) {
     DialectRegistry registry;
 
     // Register plugin dialects.
-    for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
+    for (const auto &plugin : plugins) {
       plugin.registerDialects(registry);
     }
 
@@ -2125,6 +2144,12 @@ void init_triton_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value src, Value indices, int axis)
                -> Value { return self.create<GatherOp>(src, indices, axis); })
       // Force GPU barrier
+      .def("create_grid_dependency_wait",
+           [](TritonOpBuilder &self) { self.create<GridDependencyWaitOp>(); })
+      .def("create_grid_dependency_launch_dependents",
+           [](TritonOpBuilder &self) {
+             self.create<GridDependencyLaunchDependentsOp>();
+           })
       .def("create_barrier",
            [](TritonOpBuilder &self) {
              self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All);
@@ -2153,19 +2178,35 @@ void init_triton_ir(py::module_ &m) {
                                                   paddingOption);
            });
 
-  // Add custom operations.
-  for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
-    for (const auto &op : plugin.listOps()) {
-      std::string wrapped = std::string("create_") + op.name;
-      TritonOpBuilderBinding.def(
-          wrapped.c_str(),
-          [op](TritonOpBuilder &self, std::vector<Value> args) {
-            args.insert(args.begin(), Value());
-            op.addOp(self, args);
-            return args[0];
-          });
-    }
-  }
+  // Add an `extend_with` static method that dynamically loads a plugin and
+  // registers its custom operations as builder methods.
+  auto builderPtr =
+      std::make_shared<py::class_<TritonOpBuilder>>(TritonOpBuilderBinding);
+  TritonOpBuilderBinding.def_static(
+      "extend_with",
+      [builderPtr](const std::string &path) {
+        // Load the plugin library.
+        auto pluginOrErr = mlir::triton::plugin::TritonPlugin::load(path);
+        if (!pluginOrErr) {
+          std::string errMsg = llvm::toString(pluginOrErr.takeError());
+          throw std::runtime_error(errMsg);
+        }
+        auto plugin = std::move(*pluginOrErr);
+
+        // Extend the builder class with the ops defined in the plugin.
+        py::gil_scoped_acquire acquire;
+        for (const auto &op : plugin.listOps()) {
+          std::string wrapped = std::string("create_") + op.name;
+          builderPtr->def(wrapped.c_str(),
+                          [op](TritonOpBuilder &self, std::vector<Value> args) {
+                            args.insert(args.begin(), Value());
+                            op.addOp(self, args);
+                            return args[0];
+                          });
+        }
+      },
+      "Given a path to a Triton extension, load it and create builder methods "
+      "for each operation.");
 
   py::class_<PassManager>(m, "pass_manager")
       .def(py::init<MLIRContext *>())

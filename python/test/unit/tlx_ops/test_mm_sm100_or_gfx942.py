@@ -6,13 +6,13 @@ disabled for a correctness bug is automatically not benchmarked either.
 
 A shape the op declines (sm100 requires 16-byte-aligned TMA strides; gfx942 has
 no such constraint) is reported as a skip with the reason, never as a pass.
+
+TODO: cover the config variants dropped with the tutorial copy of this kernel --
+USE_WARP_BARRIER and NUM_CTAS=2. Only the heuristic-selected config runs today.
 """
-
 import time
-
 import pytest
 import torch
-
 from triton._internal_testing import is_blackwell, is_hip_cdna3
 from triton.tlx.ops import InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, operand
@@ -60,8 +60,6 @@ pytestmark = pytest.mark.skipif(ARCH is None, reason="tlx.ops.mm has no implemen
 
 torch.manual_seed(0)
 
-# The heuristic space builds exactly one config per shape, so exceeding this is
-# a compile-time regression rather than a slow test.
 MAX_SECONDS_PER_CASE = 60
 
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}

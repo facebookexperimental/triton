@@ -412,13 +412,9 @@ def TTG_MemDescReinterpretOp
 
   let description = [{
     The `ttg.memdesc_reinterpret` operation reinterprets a memory descriptor
-    as one with a different shape and element type. For shared-memory
-    descriptors, the logical storage size of the result must not exceed that of
-    the source. Because memory descriptors
-    lack strides, this operation is only valid if the original memory descriptor
-    is contiguous. Shared-memory reinterpretation of subviews is not allowed;
-    reinterpret the parent descriptor and then take a subview of the reinterpreted descriptor
-    instead.
+    as one with a different shape and element type. Every physical byte,
+    tensor-memory row, and pipeline stage accessed by the result must belong to
+    the source view. The result must not itself be a layout subview.
   }];
 
   let arguments = (ins TTG_MemDescType:$src);

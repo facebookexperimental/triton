@@ -229,6 +229,8 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
+
     early_tma_store_lowering: Optional[None] = None
     tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
@@ -751,11 +753,27 @@ class CUDABackend(BaseBackend):
         import triton.language.extra.cuda as cuda
 
         capability = int(self._parse_arch(options.arch))
+
+        def post_ast_lowering(mod):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            tlx.tlx_passes.add_triton_tlx_fixup(
+                pm,
+                f"cuda:{capability}",
+                options.num_warps,
+                32,
+                options.num_ctas,
+                list(options.cluster_dims),
+            )
+            pm.run(mod, "post_ast_lowering")
+
         codegen_fns = {
             "convert_custom_types":
             (cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70),
             "min_dot_size":
             min_dot_size(self.target),
+            "post_ast_lowering":
+            post_ast_lowering,
         }
         return codegen_fns
 
@@ -780,15 +798,6 @@ class CUDABackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        # Pass cluster_dims as a list
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm,
-            f"cuda:{capability}",
-            opt.num_warps,
-            32,
-            opt.num_ctas,
-            list(opt.cluster_dims),
-        )
         passes.common.add_inliner(pm)
         # Storage alias lowering moved to make_ttgir (after layout propagation)
         # so the backing TMEM allocation is materialized with the resolved
@@ -1069,6 +1078,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
+        if knobs.nvidia.enable_unify_ws_barrier_locations:
+            nvidia.passes.ttnvgpuir.add_unify_ws_barrier_locations(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -1083,7 +1094,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
         if "fpsan" in opt.instrumentation_mode:
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, opt.fpsan_homomorphic_casts)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
@@ -1150,7 +1161,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         if "fpsan" in options.instrumentation_mode:
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
             passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
@@ -1170,6 +1181,7 @@ class CUDABackend(BaseBackend):
 
         if "gsan" in options.instrumentation_mode:
             # GSan introduces layout conversions, so must come before shared memory allocation
+            mod.set_attr("tti.gsan_launch_pdl", ir.builder(mod.context).get_int32_attr(int(options.launch_pdl)))
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)

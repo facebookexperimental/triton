@@ -144,25 +144,72 @@
     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
     tl.store(C_ptrs, acc)</code></pre>
 <h2 id="explicit-mfma-scheduling">Explicit MFMA scheduling</h2>
-<blockquote><p><strong>[gfx950]</strong> — the source-scheduled operations are restricted to CDNA4 (<code>gfx950</code>) native BF16 MFMA layouts.</p></blockquote>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tl.dot(a, b, acc)</code> preserves a TLX-pinned accumulator layout, so whole dots</div></div>
-<p>need no AMD-specific wrapper.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.extract_slice(source, shape, offsets)</code> selects an aligned register</div></div>
-<p>fragment without cross-thread movement.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.rematerialized_range(start, end, anchor, placement=None)</code> recreates</div></div>
-<p>inexpensive distributed coordinates near a use instead of carrying them through a long software pipeline.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_register_resident(value, register_class=&quot;agpr&quot;, registers_per_group=1)</code></div></div>
-<p>keeps every native-register group in one allocator-visible whole-tensor residency interval.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_register_handoff(value, register_class=&quot;vgpr&quot;)</code> starts an</div></div>
-<p>independent allocation interval for each 32-bit native register value, shortening a local live range without requiring simultaneous whole-tensor residency. Both register-boundary operations accept <code>&quot;vgpr&quot;</code> or <code>&quot;agpr&quot;</code>; <code>amd_register_resident</code> additionally accepts a power-of-two <code>registers_per_group</code> from 1 through 32.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_scheduled_mfma(...)</code> exposes independent native MFMA accumulator</div></div>
-<p>chains in deterministic N-major, M-minor, K-reduction source order.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_mfma_commit(value, preserve)</code> applies the CDNA4 MFMA result hazard</div></div>
-<p>boundary while threading a live dot-operand dependency.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_sched_barrier(mask=0)</code> prevents selected AMD machine-instruction</div></div>
-<p>classes from crossing a source boundary. It is a scheduling marker, not a workgroup barrier or memory fence.</p>
-<p>These primitives describe fragments, lifetimes, and ordering without assigning physical registers. Their verifiers reject unsupported targets, layouts, element types, and native fragment widths before lowering.</p>
-<p>Unlike <code>tl.dot</code>, <code>amd_scheduled_mfma</code> carries an explicit <code>accumulator_role</code>. <code>transient</code> selects the latency-aware intrinsic path for phase-local work; <code>persistent</code> selects register-constrained lowering for a chain carried across phases. Neither role changes the numerical matrix operation.</p>
+<blockquote><p><code>amd_scheduled_mfma</code> and <code>amd_mfma_commit</code> support <strong>[gfx942, gfx950]</strong> native BF16/F16 MFMA layouts. The register-class constraint operations are AMD-only and currently verified on <strong>[gfx950]</strong>.</p></blockquote>
+<p>These are low-level backend-tuning controls. Prefer <code>tl.dot</code> unless a kernel needs explicit native accumulator chains, register-class constraints, or an MFMA completion boundary. Inspect the generated code and benchmark any use; the register allocator still chooses physical registers.</p>
+<table><thead><tr><th>API</th><th>Verified targets</th><th>Purpose</th></tr></thead><tbody><tr><td><code>tlx.amd_scheduled_mfma</code></td><td>gfx942, gfx950</td><td>Update explicitly ordered native MFMA accumulator chains.</td></tr><tr><td><code>tlx.amd_mfma_commit</code></td><td>gfx942, gfx950</td><td>Join one or more chains at an MFMA completion and liveness boundary.</td></tr><tr><td><code>tlx.amd_register_class_anchor</code></td><td>gfx950</td><td>Add a separate local register-class anchor for each native 32-bit value.</td></tr><tr><td><code>tlx.amd_register_resident</code></td><td>gfx950</td><td>Require every tensor group to be allocatable together in native register tuples.</td></tr></tbody></table>
+<p>Related operations are <code>tlx.extract_slice</code>, which selects an aligned register fragment without cross-thread movement; <code>tlx.rematerialized_range</code>, which recreates inexpensive coordinates near a use; and <code>tlx.amd_sched_barrier</code>, which prevents selected AMD instruction classes from crossing a source boundary. None of these operations is a workgroup barrier or memory fence.</p>
+<h3 id="tlx-amd-register-resident"><code>tlx.amd_register_resident</code></h3>
+<pre><code class="language-python">value = tlx.amd_register_resident(
+    value,
+    register_class=&quot;agpr&quot;,
+    registers_per_group=1,
+)</code></pre>
+<p>Returns <code>value</code> unchanged, with the same shape, element type, and distributed layout. At one allocator-visible point, every packed per-thread group must be available in the requested <code>&quot;agpr&quot;</code> or <code>&quot;vgpr&quot;</code> class.</p>
+<p><code>registers_per_group</code> is the number of consecutive 32-bit registers in each group, not the number of groups. It must be one of <code>1</code>, <code>2</code>, <code>4</code>, <code>8</code>, <code>16</code>, or <code>32</code>. A group of width <code>R</code> contains <code>R</code> 32-bit elements or <code>2 * R</code> 16-bit elements, and the per-thread element count must divide evenly into groups. Registers are consecutive within one group; different groups need not be adjacent.</p>
+<p>This constraint does not select physical register numbers, reserve registers for the value's full lifetime, prevent copies or spills, or guarantee a particular occupancy. Wider groups strengthen the tuple constraint and can reduce allocator flexibility. Always use the returned value.</p>
+<h3 id="tlx-amd-register-class-anchor"><code>tlx.amd_register_class_anchor</code></h3>
+<pre><code class="language-python">value = tlx.amd_register_class_anchor(value, register_class=&quot;vgpr&quot;)</code></pre>
+<p>Returns <code>value</code> unchanged after passing each packed 32-bit register value through a separate, side-effecting tied <code>&quot;agpr&quot;</code> or <code>&quot;vgpr&quot;</code> constraint. This provides a source-local allocation and scheduling anchor without requiring all tensor groups to meet at one point.</p>
+<p>A tied input and output may be coalesced by LLVM. The operation does not guarantee a distinct physical register or live interval, emit a copy, shorten a live range, prevent spills, or improve occupancy. Use <code>amd_register_resident</code> when simultaneous all-group allocation is required, and use the value returned by <code>amd_register_class_anchor</code> for downstream work.</p>
+<p>Both register-class operations accept distributed integer or floating-point tensors with 16-bit or 32-bit elements. They constrain allocation at a source point; they do not wait for MFMA completion or synchronize lanes, waves, or memory.</p>
+<h3 id="tlx-amd-scheduled-mfma"><code>tlx.amd_scheduled_mfma</code></h3>
+<pre><code class="language-python">acc = tlx.amd_scheduled_mfma(
+    a,
+    b,
+    acc,
+    accumulator_role=&quot;transient&quot;,
+    resident_operand=None,
+    accumulator_register_class=None,
+    initialize=False,
+)</code></pre>
+<p>With <code>initialize=False</code>, the operation computes the native-fragment equivalent of <code>acc + a @ b</code>. It keeps one SSA chain per output fragment and creates updates in K-major, N-major, M-minor order:</p>
+<pre><code class="language-python">for k in native_k_fragments:
+    for n in output_n_fragments:
+        for m in output_m_fragments:
+            acc[m, n] = mfma(a[m, k], b[k, n], acc[m, n])</code></pre>
+<p>This source order round-robins a K slice over independent accumulators before returning to the same dependency chain. LLVM may still reschedule independent instructions on the transient intrinsic path.</p>
+<p><code>a</code> and <code>b</code> must be matching rank-two BF16 or F16 tensors with dot-operand layouts using <code>kWidth=4</code> or <code>8</code>. <code>acc</code> must be rank-two F32 with the corresponding unit-tile MFMA layout. Matrix shapes and per-wave native fragments must match.</p>
+<table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>accumulator_role=&quot;transient&quot;</code></td><td>Phase-local chain lowered through LLVM-visible MFMA intrinsics, so LLVM models latency and hazards.</td></tr><tr><td><code>accumulator_role=&quot;persistent&quot;</code></td><td>Chain carried across phases and lowered through register-constrained, side-effecting inline assembly.</td></tr><tr><td><code>resident_operand=None</code></td><td>No persistent source operand is selected for AGPR placement.</td></tr><tr><td><code>resident_operand=0</code> / <code>1</code></td><td>On the persistent path, select <code>a</code> / <code>b</code> for AGPR placement; the other source uses VGPRs.</td></tr><tr><td><code>accumulator_register_class=None</code></td><td><code>auto</code>: persistent work uses AGPR; transient placement is left to LLVM.</td></tr><tr><td><code>accumulator_register_class=&quot;vgpr&quot;</code> / <code>&quot;agpr&quot;</code></td><td>Select the persistent accumulator class explicitly.</td></tr><tr><td><code>initialize=True</code></td><td>Start each output chain's first native K update from zero, ignoring the supplied accumulator.</td></tr></tbody></table>
+<p><code>resident_operand</code> and an explicit accumulator class impose hard class constraints only on the current persistent lowering. The transient intrinsic path leaves physical placement to LLVM; use <code>amd_register_resident</code> separately when a transient source needs an explicit allocation point. Set <code>initialize=True</code> only for the first band of a multi-band accumulation, or the earlier accumulated value will be discarded.</p>
+<p>Because LLVM cannot model the latency or hazards of an MFMA hidden in inline assembly, persistent lowering currently adds target-specific input wait padding and a result drain. Those waits and the inline-assembly representation are implementation details and should be included when comparing the two roles.</p>
+<table><thead><tr><th>Target</th><th>MFMA layout</th><th>Native instruction shapes</th><th>Persistent accumulator</th></tr></thead><tbody><tr><td>gfx942 / CDNA3</td><td>version 3</td><td><code>32x32x8</code>, <code>16x16x16</code></td><td>Must explicitly use <code>accumulator_register_class=&quot;vgpr&quot;</code>.</td></tr><tr><td>gfx950 / CDNA4</td><td>version 4</td><td><code>32x32x16</code>, <code>16x16x32</code></td><td><code>auto</code> selects AGPR; explicit VGPR or AGPR is supported.</td></tr></tbody></table>
+<p>gfx942 rejects every explicit <code>accumulator_register_class=&quot;agpr&quot;</code> request. Because persistent <code>auto</code> also resolves to AGPR, persistent gfx942 calls must select <code>&quot;vgpr&quot;</code> explicitly.</p>
+<p>All active lanes of a wave must execute <code>amd_scheduled_mfma</code> uniformly.</p>
+<h3 id="tlx-amd-mfma-commit"><code>tlx.amd_mfma_commit</code></h3>
+<pre><code class="language-python">committed = tlx.amd_mfma_commit(acc)
+committed, live = tlx.amd_mfma_commit(acc, preserve=live)</code></pre>
+<p>Applies the target-specific MFMA result-readiness boundary and returns every input numerically unchanged. <code>value</code> may be one F32 MFMA-layout tensor or a nonempty tuple of independent results. Optional <code>preserve</code> is one BF16 or F16 dot-operand tensor threaded through the same liveness and allocation boundary; it is not another numerical MFMA operand.</p>
+<table><thead><tr><th>Call</th><th>Return value</th></tr></thead><tbody><tr><td><code>amd_mfma_commit(acc)</code></td><td><code>committed_acc</code></td></tr><tr><td><code>amd_mfma_commit((acc0, acc1))</code></td><td><code>(committed0, committed1)</code></td></tr><tr><td><code>amd_mfma_commit(acc, live)</code></td><td><code>(committed_acc, live_out)</code></td></tr><tr><td><code>amd_mfma_commit((acc0, acc1), live)</code></td><td><code>(committed0, committed1, live_out)</code></td></tr></tbody></table>
+<p>Each F32 input must be consumed only by this boundary, and downstream code must use the returned result. When a <code>preserve</code> dependency remains live after the boundary, its downstream uses must similarly use the returned <code>live_out</code>; the returned dependency may be discarded when it is no longer needed.</p>
+<p>The current lowering constrains a results-only boundary to AGPRs. A boundary with <code>preserve</code> constrains its F32 results to VGPRs and the preserved dot operand to AGPRs; directly committing an AGPR-resident scheduled-MFMA result with <code>preserve</code> is rejected. These placement choices and the exact wait padding are implementation details, not portable synchronization semantics.</p>
+<p><code>amd_mfma_commit</code> is not an MFMA queue instruction, <code>s_waitcnt</code>, hardware memory fence, workgroup barrier, or cross-wave synchronization operation.</p>
+<h3 id="transient-chain-example">Transient-chain example</h3>
+<p>Assume <code>a</code>, <code>b</code>, and <code>acc</code> already carry matching dot-operand and MFMA layouts:</p>
+<pre><code class="language-python">b_live = tlx.amd_register_resident(
+    b,
+    register_class=&quot;agpr&quot;,
+    registers_per_group=4,
+)
+acc = tlx.amd_scheduled_mfma(
+    a,
+    b_live,
+    acc,
+    accumulator_role=&quot;transient&quot;,
+    initialize=True,
+)
+acc, _ = tlx.amd_mfma_commit(acc, b_live)
+tl.store(output_ptrs, acc)</code></pre>
+<p>For later accumulation bands, pass <code>initialize=False</code>. Here, <code>amd_register_resident</code> creates a common allocation point for <code>b_live</code>, while <code>preserve</code> keeps it live through the commit boundary. If later code needs that operand, consume the returned value instead of <code>_</code>. <code>resident_operand</code> controls only persistent lowering.</p>
 <h2 id="scaled-dot">Scaled dot</h2>
 <p><code>tlx.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, *, fast_math=False, lhs_k_pack=True, rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp=None)</code> is a thin wrapper around <code>tl.dot_scaled</code>. Without <code>tiles_per_warp</code> it is exactly equivalent to <code>tl.dot_scaled</code> — pass it only when you need the AMD-specific WMMA scheduling hint described below.</p>
 <h3 id="tiles-per-warp-what-it-controls"><code>tiles_per_warp</code> — what it controls</h3>

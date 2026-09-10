@@ -57,13 +57,41 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
 }
 
 unsigned getMemDescSize(ttg::MemDescType ty) {
+  auto encoding = ty.getEncoding();
+  auto shape = ttg::dropPipeliningDim(ty.getShape(), encoding);
+  auto allocShape = ttg::dropPipeliningDim(ty.getAllocShape(), encoding);
+  uint64_t stages = product(ty.getShape().drop_back(shape.size()));
+
   if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
-    return ttng::getTmemAllocSizes(ty).numCols;
+    if (stages == 1)
+      return ttng::getTmemAllocSizes(ty).numCols;
+    uint32_t stageCols =
+        ttng::getTMemSubSliceOffset(ty, /*offset=*/1, /*dim=*/0);
+    return (stages - 1) * stageCols +
+           ttng::getTmemAllocSizes(ty).numCols / stages;
   }
   assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
          "Unsupported memory space");
   unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
-  return product(ttg::getShapePerCTA(ty)) * elSize;
+  if (auto padded = ttg::getPaddedEncoding(encoding)) {
+    uint64_t logicalElements = product(ttg::getShapePerCTA(ty));
+    return padded.getPaddedSize({static_cast<int64_t>(logicalElements)}) *
+           elSize;
+  }
+
+  auto allocation = ttg::toLinearLayout(allocShape, encoding);
+  auto view = allocation.pseudoinvert();
+  auto logicalDims = llvm::to_vector(view.getInDimNames());
+  for (auto [dim, size] : llvm::zip_equal(logicalDims, shape))
+    view = view.resizeInDim(dim, size);
+  auto offsetDim = StringAttr::get(ty.getContext(), "offset");
+  // Zero physical bases are still owned by the allocation and its subviews.
+  uint64_t zeroMask = (allocation.getInDimSize(offsetDim) - 1) &
+                      ~getInputBasisMask(allocation, offsetDim, logicalDims);
+  uint64_t viewSpan =
+      (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
+  return ((stages - 1) * allocation.getInDimSize(offsetDim) + viewSpan) *
+         elSize;
 }
 
 uint32_t applySharedPadding(uint32_t byteOffset, ttg::MemDescType ty) {
@@ -247,8 +275,13 @@ triton::BufferRegionView getMemDescView(
 uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
   if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace()))
     return index * ttng::getTmemAllocSizes(ty).numCols;
-  uint64_t offset = static_cast<uint64_t>(index) * getMemDescSize(ty);
-  assert(offset <= std::numeric_limits<uint32_t>::max());
+  uint64_t stageElems = ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
+                                                ty.getAllocShape());
+  uint64_t elementSize = ty.getElementTypeBitWidth() / 8;
+  uint64_t byteOffset = static_cast<uint64_t>(index) * stageElems * elementSize;
+  uint64_t offset = applySharedPadding(byteOffset, ty);
+  assert(offset <= std::numeric_limits<uint32_t>::max() &&
+         "memdesc index offset exceeds 32-bit range");
   return static_cast<uint32_t>(offset);
 }
 
@@ -273,19 +306,18 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
     return MemDescSubsliceOffsets{};
 
   Attribute encoding = srcTy.getEncoding();
-  // Beta's MemDescSubsliceOp offsets and layouts retain the pipelining
-  // dimension; the upstream dropPipeliningDim helper is not present here.
-  auto layoutRank = offsets.size();
+  auto layoutOffsets = ttg::dropPipeliningDim(offsets, encoding);
+  auto layoutRank = layoutOffsets.size();
   mlir::triton::LinearLayout layout = ttg::isPaddedEncoding(encoding)
                                           ? ttg::paddedLinearLayout(srcTy)
                                           : ttg::toLinearLayout(srcTy);
 
   MLIRContext *ctx = op->getContext();
   SmallVector<StringAttr> dimNames =
-      mlir::triton::standardOutDimNames(ctx, srcTy.getRank());
+      mlir::triton::standardOutDimNames(ctx, layoutRank);
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
-  logicalOffsets.reserve(offsets.size());
-  for (auto &&[dimName, offset] : llvm::zip_equal(dimNames, offsets)) {
+  logicalOffsets.reserve(layoutRank);
+  for (auto &&[dimName, offset] : llvm::zip_equal(dimNames, layoutOffsets)) {
     logicalOffsets.push_back({dimName, static_cast<int32_t>(offset)});
   }
 
@@ -305,30 +337,16 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
     else if (dim == partitionDim)
       partitionOffset = static_cast<uint32_t>(offset);
   }
+  if (offsets.size() != layoutRank) {
+    uint64_t stride = ttg::getAllocationElems(
+        encoding, ttg::dropPipeliningDim(srcTy.getAllocShape(), encoding));
+    elementOffset += static_cast<uint64_t>(offsets.front()) * stride;
+  }
+
   uint64_t elementSizeBytes =
       srcTy.getElementType().getIntOrFloatBitWidth() / 8;
   assert(elementSizeBytes > 0 && "element size must be non-zero");
   uint64_t byteOffset = elementOffset * elementSizeBytes;
-
-  if (auto padded = dyn_cast<ttg::PaddedSharedEncodingAttr>(encoding)) {
-    uint64_t padBytes = 0;
-    for (auto &&[interval, padding] :
-         llvm::zip_equal(padded.getIntervals(), padded.getPaddings())) {
-      if (interval == 0 || padding == 0)
-        continue;
-      uint64_t intervalScaled =
-          static_cast<uint64_t>(interval) * elementSizeBytes;
-      uint64_t paddingScaled =
-          static_cast<uint64_t>(padding) * elementSizeBytes;
-      assert(llvm::isPowerOf2_64(intervalScaled) &&
-             llvm::isPowerOf2_64(paddingScaled) &&
-             "interval and padding must be powers of two in bytes");
-      unsigned intervalLog2 = llvm::Log2_64(intervalScaled);
-      unsigned paddingLog2 = llvm::Log2_64(paddingScaled);
-      padBytes += (byteOffset >> intervalLog2) << paddingLog2;
-    }
-    byteOffset += padBytes;
-  }
 
   assert(byteOffset <= std::numeric_limits<uint32_t>::max() &&
          "memdesc_subslice offset exceeds 32-bit range");

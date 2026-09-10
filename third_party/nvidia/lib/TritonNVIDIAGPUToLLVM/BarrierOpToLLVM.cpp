@@ -34,6 +34,7 @@
 #include "triton/Tools/Sys/GetEnv.h"
 
 #include "Utility.h"
+#include <type_traits>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -72,6 +73,24 @@ PhysicalClusterInfo getPhysicalClusterInfo(Operation *op) {
     return {std::move(dims), explicitSize, numCTAs == 1};
   return {{numCTAs, 1, 1}, numCTAs, false};
 }
+
+template <typename OpTy>
+struct GridDependencyOpConversion : public ConvertOpToLLVMPattern<OpTy> {
+  using ConvertOpToLLVMPattern<OpTy>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    PTXBuilder ptxBuilder;
+    if constexpr (std::is_same_v<OpTy, triton::GridDependencyWaitOp>)
+      (*ptxBuilder.create("griddepcontrol.wait"))();
+    else
+      (*ptxBuilder.create("griddepcontrol.launch_dependents"))();
+    ptxBuilder.launch(rewriter, op.getLoc(), void_ty(rewriter.getContext()));
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
 
 Value getElectWarp0OrThread0(const NVIDIA::TargetInfo &targetInfo,
                              TritonLLVMOpBuilder &b) {
@@ -235,11 +254,7 @@ struct InvalBarrierOpConversion
 
 struct BarrierExpectConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::BarrierExpectOp> {
-  bool isCrossCluster;
-  BarrierExpectConversion(LLVMTypeConverter &typeConverter,
-                          PatternBenefit benefit, bool isCrossCluster)
-      : ConvertOpToLLVMPattern(typeConverter, benefit),
-        isCrossCluster(isCrossCluster) {}
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::BarrierExpectOp op, OpAdaptor adaptor,
@@ -259,17 +274,14 @@ struct BarrierExpectConversion
     Value id = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(id, b.i32_val(0));
     pred = b.and_(pred, adaptor.getPred());
-    bool isCrossClusterBarrier =
-        LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
+    bool crossCluster = LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
     Value leaderBarrierPtr = LLVM::NVIDIA::getLeaderAddress(
         loc, rewriter, smemObj.getBase(), barrierTy);
 
     ::mlir::triton::PTXBuilder expectPtxBuilder;
     const std::string expectPtx =
         "@$0 mbarrier.arrive.expect_tx." +
-        std::string(isCrossCluster || isCrossClusterBarrier ? "release.cluster."
-                                                            : "") +
-        std::string(isCrossClusterBarrier ? "shared::cluster" : "shared::cta") +
+        std::string(crossCluster ? "shared::cluster" : "shared::cta") +
         ".b64 _, [$1], " + std::to_string(op.getSize()) + ";";
     auto &expectOp = *expectPtxBuilder.create(expectPtx);
     expectOp({expectPtxBuilder.newOperand(pred, "b"),
@@ -286,12 +298,11 @@ struct BarrierExpectConversion
 struct WaitBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::WaitBarrierOp> {
   const NVIDIA::TargetInfo *targetInfo;
-  bool isCrossCluster;
   WaitBarrierOpConversion(LLVMTypeConverter &typeConverter,
                           PatternBenefit benefit,
-                          NVIDIA::TargetInfo &targetInfo, bool isCrossCluster)
-      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(&targetInfo),
-        isCrossCluster(isCrossCluster) {}
+                          NVIDIA::TargetInfo &targetInfo)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        targetInfo(&targetInfo) {}
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::WaitBarrierOp op, OpAdaptor adaptor,
@@ -308,10 +319,6 @@ struct WaitBarrierOpConversion
             LLVM::NVIDIA::getLeaderCTAPredicate(loc, rewriter, barrierTy))
       pred = pred ? b.and_(pred, *leaderPred) : *leaderPred;
 
-    bool isCrossClusterBarrier =
-        LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
-    std::string acquire =
-        isCrossCluster || isCrossClusterBarrier ? ".acquire.cluster" : "";
     bool predicated = pred && !matchPattern(pred, m_NonZero());
     int suspendNs = 0;
     if (targetInfo->getComputeCapability() >= 100) {
@@ -328,8 +335,7 @@ struct WaitBarrierOpConversion
 {
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.test_wait.parity)" +
-              acquire + R"(.shared::cta.b64 complete, [$0], $1;
+	mbarrier.test_wait.parity.shared::cta.b64 complete, [$0], $1;
 	@!complete nanosleep.u32 20;
 	@!complete bra.uni waitLoop;
 }
@@ -340,8 +346,7 @@ struct WaitBarrierOpConversion
 	@!$2 bra.uni skipWait;
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.test_wait.parity)" +
-              acquire + R"(.shared::cta.b64 complete, [$0], $1;
+	mbarrier.test_wait.parity.shared::cta.b64 complete, [$0], $1;
 	@!complete nanosleep.u32 20;
 	@!complete bra.uni waitLoop;
 	skipWait:
@@ -351,8 +356,8 @@ struct WaitBarrierOpConversion
     } else {
       // SM90+ polls with try_wait in a spin loop. Blackwell can opt into the
       // four-operand form, whose suspend hint lowers to NANOSLEEP.SYNCS.
-      std::string tryWait = "\tmbarrier.try_wait.parity" + acquire +
-                            ".shared::cta.b64 complete, [$0], $1";
+      std::string tryWait =
+          "\tmbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1";
       if (useSuspendHint)
         tryWait += ", $2";
       tryWait += ";\n";
@@ -398,14 +403,12 @@ struct WaitBarrierOpConversion
 struct ArriveBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ArriveBarrierOp> {
   const NVIDIA::TargetInfo *targetInfo;
-  bool isCrossCluster;
 
   ArriveBarrierOpConversion(LLVMTypeConverter &typeConverter,
                             PatternBenefit benefit,
-                            const NVIDIA::TargetInfo &targetInfo,
-                            bool isCrossCluster)
-      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(&targetInfo),
-        isCrossCluster(isCrossCluster) {}
+                            const NVIDIA::TargetInfo &targetInfo)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        targetInfo(&targetInfo) {}
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
@@ -487,9 +490,6 @@ struct ArriveBarrierOpConversion
       auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
         std::stringstream ptxAsm;
         ptxAsm << "@$0 mbarrier.arrive.";
-        if (isCrossCluster || isCrossClusterBarrier || isRemoteBarrier ||
-            op.isMulticast())
-          ptxAsm << "release.cluster.";
         ptxAsm << (isRemoteBarrier || isCrossClusterBarrier || op.isMulticast()
                        ? "shared::cluster"
                        : "shared::cta");
@@ -926,19 +926,20 @@ struct CLCGetProgramIdOpConversion
 
 void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit, NVIDIA::TargetInfo &targetInfo,
-    bool isCrossCluster) {
+    PatternBenefit benefit, NVIDIA::TargetInfo &targetInfo) {
   patterns.add<FenceAsyncSharedOpConversion>(typeConverter, benefit);
   patterns.add<FenceOpConversion>(typeConverter, benefit);
+  patterns.add<
+      GridDependencyOpConversion<triton::GridDependencyWaitOp>,
+      GridDependencyOpConversion<triton::GridDependencyLaunchDependentsOp>>(
+      typeConverter, benefit);
   patterns.add<FenceMBarrierInitReleaseClusterOpConversion>(typeConverter,
                                                             benefit);
   patterns.add<InitBarrierOpConversion, InvalBarrierOpConversion>(
       typeConverter, benefit, targetInfo);
-  patterns.add<WaitBarrierOpConversion>(typeConverter, benefit, targetInfo,
-                                        isCrossCluster);
-  patterns.add<BarrierExpectConversion>(typeConverter, benefit, isCrossCluster);
-  patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit, targetInfo,
-                                          isCrossCluster);
+  patterns.add<WaitBarrierOpConversion>(typeConverter, benefit, targetInfo);
+  patterns.add<BarrierExpectConversion>(typeConverter, benefit);
+  patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit, targetInfo);
   // Meta Triton CLC + named-barrier + vote-ballot patterns
   patterns.add<NamedBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);

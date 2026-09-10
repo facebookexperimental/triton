@@ -523,8 +523,6 @@ struct DotConversion {
     unsigned K;
   } shape;
   int mmaSizeK;
-  SmallVector<int64_t> shapeA;
-  SmallVector<int64_t> shapeB;
   int numBitsPerElementA;
   int numBitsPerElementB;
   GetAccAddressFn getAccAddress;
@@ -609,8 +607,6 @@ LogicalResult convertDotImpl(
          "grep for [Note: numRepN > 1 and two_ctas]");
   int numRepK = ceil<unsigned>(K, mmaSizeK);
 
-  SmallVector<int64_t> shapeA = op.shapeA;
-  SmallVector<int64_t> shapeB = op.shapeB;
   // In A * B = C
   // For M=64 twoCTAs, B and C have the same split and A has a split half of C
   // along M.
@@ -751,8 +747,6 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
     dot.mmaSizeK = 64;
   }
 
-  dot.shapeA = getShapePerCTA(aTensorTy);
-  dot.shapeB = getShapePerCTA(bTensorTy);
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
 
@@ -823,6 +817,9 @@ int getScaleFactorColsPerSet(mxfpKind kind, ttng::TCGen5MMAScaledOp op,
 };
 
 bool isFp4Padded(MemDescType operand) {
+  if (auto tmemLayout =
+          dyn_cast<ttng::TensorMemoryEncodingAttr>(operand.getEncoding()))
+    return tmemLayout.getFp4Padded();
   auto encoding = operand.getEncoding();
   if (auto shared = dyn_cast<NVMMASharedEncodingAttr>(encoding))
     return shared.getFp4Padded();
@@ -879,13 +876,6 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   dot.shape.M = dstPerCTA[0];
   dot.shape.N = dstPerCTA[1];
   dot.shape.K = blockK; // K is not split across CTAs
-
-  dot.shapeA = triton::gpu::getAllocationShapePerCTA(aTensorTy);
-  dot.shapeB = triton::gpu::getAllocationShapePerCTA(bTensorTy);
-  if (opKindIsMXFP4) {
-    dot.shapeA[1] *= 2;
-    dot.shapeB[0] *= 2;
-  }
 
   bool hasFp4PaddedOperand = isFp4Padded(aTensorTy) || isFp4Padded(bTensorTy);
 
