@@ -195,10 +195,9 @@ void multiBufferSemaphore(
                                     newBuffers, releasedMask);
       newSema->setAttrs(semaOp->getAttrs());
       if (releasedMask)
-        newSema->setAttr("released_mask",
-                         semaBuilder.getI32IntegerAttr(releasedMask));
+        newSema.setReleasedMaskAttr(semaBuilder.getI32IntegerAttr(releasedMask));
       else
-        newSema->removeAttr("released_mask");
+        newSema.removeReleasedMaskAttr();
       semaOp.getResult().replaceAllUsesWith(newSema.getResult());
       semaOp.erase();
     }
