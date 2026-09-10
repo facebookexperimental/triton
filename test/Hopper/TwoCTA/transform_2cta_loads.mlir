@@ -403,3 +403,96 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// -----
+
+// Scaled (MXFP8) 2-CTA MMA. The B *operand* descriptor is halved exactly like
+// the plain case, but the B-*scale* descriptor must keep its full width:
+// tcgen05.mma.cta_group::2.block_scale addresses each CTA's N-half out of the
+// full scale, so halving it silently produces wrong results.
+
+// CHECK-LABEL: @matmul_2cta_scaled_transform_loads
+// PERCTA-LABEL: @matmul_2cta_scaled_transform_loads
+// A operand descriptor is untouched.
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<i8>, !tt.tensordesc<128x64xi8>
+// B operand descriptor is cloned at half width: 64x128 -> 64x64.
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<i8>, !tt.tensordesc<64x64xi8>
+// Both scale descriptors keep their full 128x2 shape -- never halved.
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<i8>, !tt.tensordesc<128x2xi8>
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<i8>, !tt.tensordesc<128x2xi8>
+// CHECK-NOT: !tt.tensordesc<64x2xi8>
+// CTA-based offset for the halved B.
+// CHECK: nvg.cluster_id
+// CHECK: arith.remsi
+// Only the B operand load is marked as split; scale loads are cooperative-only.
+// CHECK: tt.descriptor_load %{{.*}} {two_cta_b, two_cta_load} : !tt.tensordesc<64x64xi8>
+// CHECK: tt.descriptor_load %{{.*}} {two_cta_load} : !tt.tensordesc<128x2xi8>
+// CHECK: ttng.tc_gen5_mma_scaled
+// CHECK-SAME: two_ctas
+// With cooperative loads disabled the B split still happens; only the
+// cooperative marking is dropped.
+// PERCTA: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<i8>, !tt.tensordesc<64x64xi8>
+// PERCTA: tt.descriptor_load %{{.*}} {two_cta_b} : !tt.tensordesc<64x64xi8>
+// PERCTA-NOT: two_cta_load
+
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#scale_ll = #ttg.linear<{register = [[0, 1], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, twoCTAs = true>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_2cta_scaled_transform_loads(
+      %a_ptr: !tt.ptr<i8>,
+      %b_ptr: !tt.ptr<i8>,
+      %sa_ptr: !tt.ptr<i8>,
+      %sb_ptr: !tt.ptr<i8>,
+      %M: i32 {tt.divisibility = 16 : i32},
+      %N: i32 {tt.divisibility = 16 : i32},
+      %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %true = arith.constant true
+    %c128_i32 = arith.constant 128 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %cN_i64 = arith.extsi %N : i32 to i64
+    %c1_i64 = arith.constant 1 : i64
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked3>
+
+    %pid = tt.get_program_id x : i32
+    %offs_am = arith.muli %pid, %c128_i32 : i32
+    %offs_bn = arith.muli %pid, %c128_i32 : i32
+
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%cN_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<128x64xi8>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%cN_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<64x128xi8>
+    %sa_desc = tt.make_tensor_descriptor %sa_ptr, [%M, %K], [%cN_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<128x2xi8>
+    %sb_desc = tt.make_tensor_descriptor %sb_ptr, [%N, %K], [%cN_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<128x2xi8>
+
+    %accumulator = scf.for %k = %c0_i32 to %c1_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked3>) : i32 {
+      %offs_k = arith.muli %k, %c64_i32 : i32
+
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<128x64xi8> -> tensor<128x64xi8, #blocked1>
+      %a_smem = ttg.local_alloc %a : (tensor<128x64xi8, #blocked1>) -> !ttg.memdesc<128x64xi8, #shared, #smem>
+
+      %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<64x128xi8> -> tensor<64x128xi8, #blocked1>
+      %b_smem = ttg.local_alloc %b : (tensor<64x128xi8, #blocked1>) -> !ttg.memdesc<64x128xi8, #shared, #smem>
+
+      %sa = tt.descriptor_load %sa_desc[%offs_am, %c0_i32] : !tt.tensordesc<128x2xi8> -> tensor<128x2xi8, #scale_ll>
+      %sb = tt.descriptor_load %sb_desc[%offs_bn, %c0_i32] : !tt.tensordesc<128x2xi8> -> tensor<128x2xi8, #scale_ll>
+      %sa_tmem = ttng.tmem_alloc %sa : (tensor<128x2xi8, #scale_ll>) -> !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>
+      %sb_tmem = ttng.tmem_alloc %sb : (tensor<128x2xi8, #scale_ll>) -> !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>
+
+      %acc_tmem, %token = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked3>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+      %mma_token = ttng.tc_gen5_mma_scaled %a_smem, %b_smem, %acc_tmem[%token], %sa_tmem, %sb_tmem, %true, %true lhs = e4m3 rhs = e4m3 {two_ctas} : !ttg.memdesc<128x64xi8, #shared, #smem>, !ttg.memdesc<64x128xi8, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>, !ttg.memdesc<128x2xi8, #tmem_scales, #ttng.tensor_memory>
+
+      %result, %load_token = ttng.tmem_load %acc_tmem[%mma_token] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked3>
+
+      scf.yield %result : tensor<128x128xf32, #blocked3>
+    }
+
+    tt.return
+  }
+}
