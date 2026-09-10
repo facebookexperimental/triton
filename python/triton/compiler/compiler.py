@@ -90,8 +90,11 @@ class ASTSource:
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         from .code_generator import ast_to_ttir
-        return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
-                           module_map=module_map)
+        module = ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+                             module_map=module_map)
+        if post_ast_lowering := codegen_fns.get("post_ast_lowering"):
+            post_ast_lowering(module)
+        return module
 
     def parse_options(self):
         return dict()

@@ -753,11 +753,27 @@ class CUDABackend(BaseBackend):
         import triton.language.extra.cuda as cuda
 
         capability = int(self._parse_arch(options.arch))
+
+        def post_ast_lowering(mod):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            tlx.tlx_passes.add_triton_tlx_fixup(
+                pm,
+                f"cuda:{capability}",
+                options.num_warps,
+                32,
+                options.num_ctas,
+                list(options.cluster_dims),
+            )
+            pm.run(mod, "post_ast_lowering")
+
         codegen_fns = {
             "convert_custom_types":
             (cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70),
             "min_dot_size":
             min_dot_size(self.target),
+            "post_ast_lowering":
+            post_ast_lowering,
         }
         return codegen_fns
 
@@ -782,15 +798,6 @@ class CUDABackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        # Pass cluster_dims as a list
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm,
-            f"cuda:{capability}",
-            opt.num_warps,
-            32,
-            opt.num_ctas,
-            list(opt.cluster_dims),
-        )
         passes.common.add_inliner(pm)
         # Storage alias lowering moved to make_ttgir (after layout propagation)
         # so the backing TMEM allocation is materialized with the resolved
