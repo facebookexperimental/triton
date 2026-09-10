@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
@@ -151,8 +152,11 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("do not print source code or a patch", prompt)
         self.assertIn("candidate_metadata.json", prompt)
         self.assertIn("schema_version", prompt)
+        self.assertIn("source_sha256", prompt)
+        self.assertIn("original.py", prompt)
+        self.assertIn("final unified diff", prompt)
         self.assertIn("commit_title", prompt)
-        self.assertIn("actual source change", prompt)
+        self.assertIn("precisely describes the actual", prompt)
         self.assertIn("commit_summary", prompt)
         self.assertIn("Change summary:", prompt)
         self.assertIn("Why:", prompt)
@@ -162,8 +166,12 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Trusted built-in target optimization skills", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
+        self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
+        self.assertIn("## Build A Barrier Ledger", prompt)
+        self.assertIn("tlx.alloc_warp_barrier", prompt)
+        self.assertIn("num_warps * 32 * num_arrivals", prompt)
         self.assertIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertIn("# Blackwell Persistent Pipeline Efficiency", prompt)
+        self.assertIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertIn("optimize data movement and scheduling", prompt)
         self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
         self.assertLess(
@@ -171,16 +179,70 @@ class ScoringTest(unittest.TestCase):
             prompt.index("# NVIDIA Async TMA Output Publication"),
         )
         self.assertLess(
+            prompt.index("# NVIDIA Async TMA Output Publication"),
+            prompt.index("# NVIDIA Warp Barrier Efficiency"),
+        )
+        self.assertLess(
+            prompt.index("# NVIDIA Warp Barrier Efficiency"),
+            prompt.index("# Blackwell Persistent CLC Scheduling"),
+        )
+        self.assertLess(
+            prompt.index("# Blackwell Persistent CLC Scheduling"),
+            prompt.index("# NVIDIA Persistent Pipeline Efficiency"),
+        )
+        self.assertLess(
             prompt.index("Trusted built-in target optimization skills"),
             prompt.index("Frozen target-specific optimization guidance"),
         )
 
-    def test_codex_prompt_selects_nvidia_non_blackwell_skill(self) -> None:
+    def test_codex_prompt_selects_hopper_persistent_pipeline_without_clc(self) -> None:
+        for architecture in ("hopper", "h100", "sm90", "sm_90"):
+            with self.subTest(architecture=architecture):
+                request = KernelOptimizationRequest(
+                    kernel_source="VALUE = 1\n",
+                    harness_path=Path(__file__),
+                    cases=(InputCase("target", {}),),
+                    target=KernelTarget("nvidia", architecture),
+                    output_dir=Path("/tmp/tlx-agent-test"),
+                )
+                prompt = _build_prompt(
+                    request,
+                    CandidateContext(
+                        1,
+                        0,
+                        request.kernel_source,
+                        _performance(("target", 100.0)),
+                        (),
+                    ),
+                )
+                self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+                self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
+                self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
+                self.assertIn("## Build A Barrier Ledger", prompt)
+                self.assertIn("tlx.alloc_warp_barrier", prompt)
+                self.assertIn("num_warps * 32 * num_arrivals", prompt)
+                self.assertIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
+                self.assertLess(
+                    prompt.index("# TLX Layout Conversion Efficiency"),
+                    prompt.index("# NVIDIA Async TMA Output Publication"),
+                )
+                self.assertLess(
+                    prompt.index("# NVIDIA Async TMA Output Publication"),
+                    prompt.index("# NVIDIA Warp Barrier Efficiency"),
+                )
+                self.assertLess(
+                    prompt.index("# NVIDIA Warp Barrier Efficiency"),
+                    prompt.index("# NVIDIA Persistent Pipeline Efficiency"),
+                )
+                self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+                self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+
+    def test_codex_prompt_does_not_inject_persistence_for_unknown_nvidia(self) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
             cases=(InputCase("target", {}),),
-            target=KernelTarget("nvidia", "hopper"),
+            target=KernelTarget("nvidia", "sm89"),
             output_dir=Path("/tmp/tlx-agent-test"),
         )
         prompt = _build_prompt(
@@ -195,13 +257,12 @@ class ScoringTest(unittest.TestCase):
         )
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
-        self.assertLess(
-            prompt.index("# TLX Layout Conversion Efficiency"),
-            prompt.index("# NVIDIA Async TMA Output Publication"),
-        )
+        self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
+        self.assertIn("## Build A Barrier Ledger", prompt)
+        self.assertIn("tlx.alloc_warp_barrier", prompt)
+        self.assertIn("num_warps * 32 * num_arrivals", prompt)
+        self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertNotIn("# Blackwell Persistent Pipeline Efficiency", prompt)
-        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
 
     def test_codex_prompt_selects_common_skill_only_for_amd(self) -> None:
         guidance = "Preserve runtime scale behavior."
@@ -230,8 +291,11 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Trusted built-in target optimization skills", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
+        self.assertNotIn("# NVIDIA Warp Barrier Efficiency", prompt)
+        self.assertNotIn("## Build A Barrier Ledger", prompt)
+        self.assertNotIn("tlx.alloc_warp_barrier", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertNotIn("# Blackwell Persistent Pipeline Efficiency", prompt)
+        self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
         self.assertLess(
             prompt.index("# TLX Layout Conversion Efficiency"),
@@ -278,32 +342,89 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("speedup=0.9500x", prompt)
         self.assertNotIn(prior_source.strip(), prompt)
 
-    def test_candidate_metadata_reads_summary_and_builds_fallback(self) -> None:
+    def test_candidate_metadata_is_bound_to_changed_source_scope(self) -> None:
+        original = "def kernel():\n    return 1\n"
+        source = "def kernel():\n    return 2\n"
+        payload = {
+            "schema_version": 2,
+            "hypothesis": "Reduce repeated work.",
+            "evidence": "The profile attributes time to the repeated operation.",
+            "change": "Fold the repeated operation in kernel.",
+            "expected_effect": "Reduce instruction count.",
+            "risk": "Preserve the existing return type.",
+            "commit_title": "Fold repeated work in kernel",
+            "commit_summary": (
+                "Change summary:\nUpdate kernel to fold the repeated operation while "
+                "preserving its return contract.\n\nWhy:\nThe profile attributes time "
+                "to the repeated operation."
+            ),
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "candidate_metadata.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "hypothesis": "  reduce   work ",
-                        "change": "Fold a constant scale.",
-                        "commit_title": "Fold half scale into dS encoding",
-                        "commit_summary": "Change summary:\nFold the scale into the encoded exponent.\n\nWhy:\nReduce repeated arithmetic while preserving the generic fallback.",
-                    }
-                )
+            path.write_text(json.dumps(payload))
+            metadata = _read_candidate_metadata(
+                path,
+                source=source,
+                original_source=original,
             )
-            metadata = _read_candidate_metadata(path)
-            self.assertEqual(metadata["hypothesis"], "reduce work")
-            self.assertEqual(metadata["commit_title"], "Fold half scale into dS encoding")
-            self.assertIn("encoded exponent", metadata["commit_summary"])
-            self.assertIn("generic fallback", metadata["commit_summary"])
+            self.assertEqual(metadata["hypothesis"], "Reduce repeated work.")
+            self.assertEqual(metadata["commit_title"], "Fold repeated work in kernel")
+            self.assertIn("Update kernel", metadata["commit_summary"])
 
-            path.write_text(json.dumps({"change": "Fold a constant scale."}))
-            fallback = _read_candidate_metadata(path)
-            self.assertEqual(fallback["commit_title"], "Fold a constant scale")
-            self.assertIn("Change summary:", fallback["commit_summary"])
-            self.assertIn("Fold a constant scale.", fallback["commit_summary"])
-            self.assertIn("Why:", fallback["commit_summary"])
+            stale = dict(payload, source_sha256="0" * 64)
+            path.write_text(json.dumps(stale))
+            with self.assertRaisesRegex(ValueError, "source_sha256"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            unrelated = dict(
+                payload,
+                commit_summary=(
+                    "Change summary:\nUpdate helper behavior.\n\n"
+                    "Why:\nReduce repeated work."
+                ),
+            )
+            path.write_text(json.dumps(unrelated))
+            with self.assertRaisesRegex(ValueError, "changed top-level scope: kernel"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            generic = dict(payload, commit_title="Optimize kernel")
+            path.write_text(json.dumps(generic))
+            with self.assertRaisesRegex(ValueError, "too generic"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            unrelated_title = dict(payload, commit_title="Pipeline descriptor stores")
+            path.write_text(json.dumps(unrelated_title))
+            with self.assertRaisesRegex(ValueError, "does not describe"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            malformed = dict(
+                payload,
+                commit_summary="Change summary:\nUpdate kernel without a rationale.",
+            )
+            path.write_text(json.dumps(malformed))
+            with self.assertRaisesRegex(ValueError, "exactly.*sections"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
 
     def test_codex_prompt_compacts_profile_and_preserves_scope_boundaries(self) -> None:
         request = KernelOptimizationRequest(
