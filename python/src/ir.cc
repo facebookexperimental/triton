@@ -447,6 +447,8 @@ py::object attributeToPython(Attribute attr) {
   }
   if (auto floatAttr = dyn_cast<FloatAttr>(attr))
     return py::float_(floatAttr.getValueAsDouble());
+  if (auto schedMaskAttr = dyn_cast<ROCDL::SchedGroupMaskAttr>(attr))
+    return py::int_(static_cast<uint32_t>(schedMaskAttr.getValue()));
   if (auto arrayAttr = dyn_cast<ArrayAttr>(attr)) {
     py::list values;
     for (Attribute value : arrayAttr)
@@ -908,8 +910,8 @@ void init_triton_ir(py::module_ &m) {
              if (auto wrapper =
                      dyn_cast<::mlir::triton::tlx::UserLayoutAttr>(self))
                return py::cast(wrapper.getLayout());
-              return py::none();
-            })
+             return py::none();
+           })
       .def("is_dot_operand_encoding",
            [](Attribute &self) {
              return isa<ttg::DotOperandEncodingAttr>(self);
@@ -1114,12 +1116,13 @@ void init_triton_ir(py::module_ &m) {
                return py::cast(LinearLayout(padded.getLinearComponent()));
              return py::none();
            })
-      .def("__str__", [](Attribute &self) {
-        std::string str;
-        llvm::raw_string_ostream os(str);
-        self.print(os);
-        return os.str();
-      })
+      .def("__str__",
+           [](Attribute &self) {
+             std::string str;
+             llvm::raw_string_ostream os(str);
+             self.print(os);
+             return os.str();
+           })
       .def("__eq__",
            [](Attribute &self, Attribute &other) { return self == other; });
   py::class_<IntegerAttr, Attribute>(m, "integer_attr");
@@ -2577,7 +2580,9 @@ void init_triton_ir(py::module_ &m) {
            })
       // Scheduling barrier (AMD)
       .def("create_sched_barrier",
-           [](TritonOpBuilder &self) { self.create<ROCDL::SchedBarrier>(0); })
+           [](TritonOpBuilder &self) {
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+           })
       // Warp pipeline border marker (AMD)
       .def("create_warp_pipeline_border",
            [](TritonOpBuilder &self, const std::string &marker, int priority) {

@@ -362,36 +362,38 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
-      .def("create_layout_preserving_cast",
-           [](TritonOpBuilder &self, Value &src, Type &dstType,
-              std::optional<tt::RoundingMode> roundingMode,
-              bool bitcast) -> Value {
-             auto resultType = getLayoutPreservingType(src, dstType);
-             auto srcElementType = getElementType(src.getType());
-             auto dstElementType = getElementType(resultType);
-             if (srcElementType == dstElementType)
-               return src;
-             if (bitcast)
-               return self.create<tt::BitcastOp>(resultType, src);
-             if (isa<FloatType>(srcElementType) &&
-                 isa<FloatType>(dstElementType)) {
-               if (roundingMode.has_value()) {
-                 auto roundingAttr = tt::RoundingModeAttr::get(
-                     self.getContext(), roundingMode.value());
-                 return self.create<tt::FpToFpOp>(resultType, src,
-                                                  roundingAttr);
-               }
-               unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
-               unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
-               if (srcWidth > dstWidth)
-                 return self.create<arith::TruncFOp>(resultType, src);
-               if (srcWidth < dstWidth)
-                 return self.create<arith::ExtFOp>(resultType, src);
-               return self.create<tt::BitcastOp>(resultType, src);
-             }
-             throw std::runtime_error(
-                 "Unsupported layout-preserving cast element types");
-           })
+      .def(
+          "create_layout_preserving_cast",
+          [](TritonOpBuilder &self, Value &src, Type &dstType,
+             std::optional<tt::RoundingMode> roundingMode,
+             bool bitcast) -> Value {
+            auto resultType = getLayoutPreservingType(src, dstType);
+            auto srcElementType = getElementType(src.getType());
+            auto dstElementType = getElementType(resultType);
+            if (srcElementType == dstElementType)
+              return src;
+            if (bitcast)
+              return self.create<tt::BitcastOp>(resultType, src);
+            if (isa<FloatType>(srcElementType) &&
+                isa<FloatType>(dstElementType)) {
+              if (roundingMode.has_value()) {
+                auto roundingAttr = tt::RoundingModeAttr::get(
+                    self.getContext(), roundingMode.value());
+                return self.create<tt::FpToFpOp>(resultType, src, roundingAttr);
+              }
+              unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
+              unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
+              if (srcWidth > dstWidth)
+                return self.create<arith::TruncFOp>(resultType, src);
+              if (srcWidth < dstWidth)
+                return self.create<arith::ExtFOp>(resultType, src);
+              return self.create<tt::BitcastOp>(resultType, src);
+            }
+            throw std::runtime_error(
+                "Unsupported layout-preserving cast element types");
+          },
+          py::arg("src"), py::arg("dstType"), py::arg("roundingMode").none(),
+          py::arg("bitcast"))
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
@@ -1649,18 +1651,39 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpReturnOp>();
            })
-      .def("create_async_load",
-           [](TritonOpBuilder &self, Value ptrTensor, Value result,
-              std::optional<Value> mask, std::optional<Value> other,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile, std::optional<Value> bulkSize,
-              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
-             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
-                 ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), bulkSize.value_or(Value()),
-                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile, useBulk);
+      .def(
+          "create_warp_predicate_op",
+          [](TritonOpBuilder &self, std::vector<Type> &resultTypes,
+             Value predicate, std::vector<Value> &inits,
+             bool waveUniform) -> Operation * {
+            UnitAttr waveUniformAttr =
+                waveUniform ? self.getBuilder().getUnitAttr() : UnitAttr();
+            return self.create<ttg::WarpPredicateOp>(resultTypes, predicate,
+                                                     inits, waveUniformAttr);
+          },
+          py::rv_policy::reference)
+      .def("create_predicate_yield_op",
+           [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
+             self.create<ttg::PredicateYieldOp>(values);
            })
+      .def(
+          "create_async_load",
+          [](TritonOpBuilder &self, Value ptrTensor, Value result,
+             std::optional<Value> mask, std::optional<Value> other,
+             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+             bool isVolatile, std::optional<Value> bulkSize,
+             std::optional<Value> barrier, bool useBulk) -> mlir::Value {
+            return self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                ptrTensor, result, mask.value_or(Value()),
+                other.value_or(Value()), bulkSize.value_or(Value()),
+                barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                isVolatile, useBulk);
+          },
+          py::arg("ptrTensor"), py::arg("result"), py::arg("mask").none(),
+          py::arg("other").none(), py::arg("cacheModifier"),
+          py::arg("evictionPolicy"), py::arg("isVolatile"),
+          py::arg("bulkSize").none(), py::arg("barrier").none(),
+          py::arg("useBulk"))
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
              return self.create<triton::gpu::Clock64Op>(
@@ -1676,6 +1699,23 @@ void init_triton_tlx_ir(py::module_ &m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_cond_barrier",
+           [](TritonOpBuilder &self, Value pred) -> void {
+             // Conditional s_barrier: only lanes with pred==true participate.
+             // Deliberately diverges the two warp-halves to phase-shift a
+             // hand-rolled ping-pong; caller must pair cond_barrier(pred) with
+             // cond_barrier(~pred) so all threads cross the same barrier count.
+             self.create<amdgpu::CondBarrierOp>(pred);
+           })
+      .def("create_workgroup_barrier",
+           [](TritonOpBuilder &self) -> void {
+             // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
+             // bracketed by SchedBarrier(0) guards so the scheduler cannot
+             // hoist ops across the ping-pong cluster border.
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+             self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
            })
       .def("create_sched_barrier",
            [](TritonOpBuilder &self) {
@@ -1750,48 +1790,60 @@ void init_triton_tlx_ir(py::module_ &m) {
                  paddingOption);
            })
       // AMD buffer ops
-      .def("create_buffer_load",
-           [](TritonOpBuilder &self, Value ptr, Value offsets,
-              std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache, uint32_t contiguity) -> Value {
-             auto offsetsType = cast<RankedTensorType>(offsets.getType());
-             auto ptrType = cast<tt::PointerType>(ptr.getType());
-             auto resultType = RankedTensorType::get(offsetsType.getShape(),
-                                                     ptrType.getPointeeType(),
-                                                     offsetsType.getEncoding());
-             auto op = self.create<ttag::BufferLoadOp>(
-                 resultType, ptr, offsets, Value() /*stride*/, cache,
-                 mask.value_or(Value()), other.value_or(Value()), contiguity);
-             op->setAttr(tlx::AttrLayoutIsExplicitName,
-                         self.getBuilder().getUnitAttr());
-             return op.getResult();
-           })
-      .def("create_buffer_store",
-           [](TritonOpBuilder &self, Value storedValue, Value ptr,
-              Value offsets, std::optional<Value> mask,
-              tt::CacheModifier cache) {
-             auto op = self.create<ttag::BufferStoreOp>(
-                 storedValue, ptr, offsets, Value() /*stride*/, cache,
-                 mask.value_or(Value()));
-             op->setAttr(tlx::AttrLayoutIsExplicitName,
-                         self.getBuilder().getUnitAttr());
-           })
-      .def("create_buffer_atomic_rmw",
-           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
-              Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-              std::optional<Value> mask, uint32_t contiguity) -> Value {
-             return self.create<ttag::BufferAtomicRMWOp>(
-                 value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                 sem, scope, mask.value_or(Value()), contiguity);
-           })
-      .def("create_buffer_load_to_local",
-           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
-              std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
-             return self.create<ttag::BufferLoadToLocalOp>(
-                 dest, ptr, offsets, mask.value_or(Value()),
-                 other.value_or(Value()), Value() /*stride*/, cache);
-           })
+      .def(
+          "create_buffer_load",
+          [](TritonOpBuilder &self, Value ptr, Value offsets,
+             std::optional<Value> mask, std::optional<Value> other,
+             tt::CacheModifier cache, uint32_t contiguity) -> Value {
+            auto offsetsType = cast<RankedTensorType>(offsets.getType());
+            auto ptrType = cast<tt::PointerType>(ptr.getType());
+            auto resultType = RankedTensorType::get(offsetsType.getShape(),
+                                                    ptrType.getPointeeType(),
+                                                    offsetsType.getEncoding());
+            auto op = self.create<ttag::BufferLoadOp>(
+                resultType, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), other.value_or(Value()), contiguity);
+            op->setAttr(tlx::AttrLayoutIsExplicitName,
+                        self.getBuilder().getUnitAttr());
+            return op.getResult();
+          },
+          py::arg("ptr"), py::arg("offsets"), py::arg("mask").none(),
+          py::arg("other").none(), py::arg("cache"), py::arg("contiguity"))
+      .def(
+          "create_buffer_store",
+          [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
+             std::optional<Value> mask, tt::CacheModifier cache) {
+            auto op = self.create<ttag::BufferStoreOp>(
+                storedValue, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()));
+            op->setAttr(tlx::AttrLayoutIsExplicitName,
+                        self.getBuilder().getUnitAttr());
+          },
+          py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("cache"))
+      .def(
+          "create_buffer_atomic_rmw",
+          [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
+             Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
+             std::optional<Value> mask, uint32_t contiguity) -> Value {
+            return self.create<ttag::BufferAtomicRMWOp>(
+                value.getType(), op, ptr, offsets, value, Value() /*stride*/,
+                sem, scope, mask.value_or(Value()), contiguity);
+          },
+          py::arg("op"), py::arg("ptr"), py::arg("offsets"), py::arg("value"),
+          py::arg("sem"), py::arg("scope"), py::arg("mask").none(),
+          py::arg("contiguity"))
+      .def(
+          "create_buffer_load_to_local",
+          [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
+             std::optional<Value> mask, std::optional<Value> other,
+             tt::CacheModifier cache) -> Value {
+            return self.create<ttag::BufferLoadToLocalOp>(
+                dest, ptr, offsets, mask.value_or(Value()),
+                other.value_or(Value()), Value() /*stride*/, cache);
+          },
+          py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"))
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);

@@ -2573,6 +2573,78 @@ def test_tlx_wave_local_memory_relation_composes_npot_layout_to_bit_offsets():
     ]
 
 
+@pytest.mark.parametrize(
+    "shape,contiguous_dim,outer_dim,remaining_outer_bases",
+    (
+        ((1, 2, 1, 8, 16, 32), 5, 4, (4, 8)),
+        ((1, 2, 1, 8, 4, 32), 5, 4, ()),
+        ((1, 2, 1, 8, 32, 16), 4, 5, (4, 8)),
+        ((1, 2, 1, 8, 32, 4), 4, 5, ()),
+    ),
+)
+def test_tlx_wave_direct_to_lds_packet_uses_padded_destination_ownership(
+    shape,
+    contiguous_dim,
+    outer_dim,
+    remaining_outer_bases,
+):
+    allocation_shape = list(shape)
+    allocation_shape[0] = 2
+    allocation_shape[2] = 2
+    allocation_shape[outer_dim] = 16
+    allocation_shape = tuple(allocation_shape)
+    order = (contiguous_dim, 1, 3, outer_dim, 2, 0)
+    offset_bases = []
+    for dim in order:
+        for bit in range(int(allocation_shape[dim]).bit_length() - 1):
+            basis = [0] * len(shape)
+            basis[dim] = 1 << bit
+            offset_bases.append(basis)
+    shared_linear = LinearLayout.from_bases(
+        (("offset", offset_bases), ("block", ())),
+        tuple(f"dim{dim}" for dim in range(len(shape))),
+        allocation_shape,
+        False,
+    )
+    distributed = _fake_layout(
+        0,
+        1,
+        shape=shape,
+        component_count=math.prod(shape) // 256,
+    )
+    shared = _fake_layout(
+        1,
+        2,
+        kind="padded_shared",
+        shape=shape,
+        element_type="f16",
+        properties={"linear_component": shared_linear},
+    )
+
+    packet = converter_layouts.direct_to_lds_packet_layout(
+        distributed,
+        shared,
+        element_contiguity=8,
+        lane_width=64,
+        warp_count=4,
+    )
+
+    assert packet is not None
+    assert packet.component_count == 128
+    register = converter_layouts.linear_layout_bases(packet.linear_layout, "register")
+    lane = converter_layouts.linear_layout_bases(packet.linear_layout, "lane")
+    warp = converter_layouts.linear_layout_bases(packet.linear_layout, "warp")
+    assert tuple(basis[contiguous_dim] for basis in register[:3]) == (1, 2, 4)
+    assert tuple(basis[contiguous_dim] for basis in lane[:2]) == (8, 16)
+    assert tuple(basis[1] for basis in lane[2:3]) == (1, )
+    assert tuple(basis[3] for basis in lane[3:]) == (1, 2, 4)
+    assert tuple(basis[outer_dim] for basis in warp) == (1, 2)
+    if remaining_outer_bases:
+        assert tuple(basis[outer_dim] for basis in register[3:5]) == remaining_outer_bases
+    else:
+        assert all(not any(basis) for basis in register[3:])
+
+
 @pytest.mark.parametrize("shape", ((4, 8), (3, 5)))
 def test_tlx_wave_dense_local_memory_relation_uses_one_row_major_formula(shape):
     register_bases = [[0, 1], [0, 2], [0, 4], [1, 0], [2, 0]]
@@ -4752,7 +4824,7 @@ def test_tlx_wave_converter_pipeline_preserves_explicit_float_fastmath(tmp_path)
 def test_tlx_wave_converter_pipeline_lowers_sched_barrier(tmp_path):
     local_func = """
   tt.func public @converter_sched_barrier() attributes {noinline = false} {
-    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "stage0", triton.warp_pipeline.priority = 0 : i32}
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "stage0", triton.warp_pipeline.priority = 0 : i32}
     tt.return
   }
 """
@@ -4773,7 +4845,7 @@ def test_tlx_wave_converter_pipeline_lowers_sched_barrier(tmp_path):
 def test_tlx_wave_converter_pipeline_lowers_partial_sched_barrier(tmp_path):
     local_func = """
   tt.func public @converter_partial_sched_barrier() attributes {noinline = false} {
-    rocdl.sched.barrier 2
+    rocdl.sched.barrier valu
     tt.return
   }
 """
@@ -4797,7 +4869,7 @@ def test_tlx_wave_converter_lowers_converted_warp_pipeline_primitives(tmp_path):
     %high = arith.cmpi ne, %wave, %c0 : i32
     amdg.cond_barrier %high
     rocdl.s.setprio 2
-    rocdl.sched.barrier 0
+    rocdl.sched.barrier none
     rocdl.s.barrier
     tt.return
   }
@@ -6369,6 +6441,7 @@ def _dense_f32_dma_attrs():
         "lane_width": 64,
         "mask_mode": "none",
         "mode": "symbolic_copy",
+        "offset_component_count": 1,
         "range_bytes": 256,
     }
 
@@ -6390,6 +6463,7 @@ def _dense_f16_symbolic_copy_attrs():
         "lane_width": 64,
         "mask_mode": "none",
         "mode": "symbolic_copy",
+        "offset_component_count": 1,
         "range_bytes": 1024,
     }
 
@@ -10445,13 +10519,13 @@ def _circular_refill_ttgir(
     refill_base = "%refill_phase" if independent_refill else "%next_phase"
     protocol_head = """
       rocdl.s.setprio 1
-      rocdl.sched.barrier 0
+      rocdl.sched.barrier none
 """ if explicit_warp_pipeline_protocol else ""
     protocol_tail = """
       rocdl.s.setprio 0
-      rocdl.sched.barrier 0
+      rocdl.sched.barrier none
       rocdl.s.barrier
-      rocdl.sched.barrier 0
+      rocdl.sched.barrier none
 """ if explicit_warp_pipeline_protocol else ""
     return f"""
   tt.func public @converter_circular_refill(
@@ -12626,7 +12700,7 @@ def test_tlx_wave_converter_lowers_scalarized_swizzled_vec4_layout(tmp_path, ):
     del ctx
 
 
-def test_tlx_wave_converter_rejects_buffer_load_to_local_other_fallback(tmp_path):
+def test_tlx_wave_converter_lowers_buffer_load_to_local_other_fallback(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -12646,12 +12720,15 @@ def test_tlx_wave_converter_rejects_buffer_load_to_local_other_fallback(tmp_path
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC"
-    assert "other fallback is not converted yet" in str(diagnostic)
+    (copy_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
+    attrs = converter_target_ir.attrs_dict(copy_op)
+    assert attrs["has_mask"] is True
+    assert attrs["has_other"] is True
+    assert output.emitted_module.text.count("wave.gather") == 1
+    assert output.emitted_module.text.count("wave.scatter") == 1
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -18378,7 +18455,7 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     %dot = tt.dot %lhs, %rhs, %acc : tensor<64x32xf16, #dot0> * tensor<32x128xf16, #dot1> -> tensor<64x128xf32, #mma>
     %out_offset = arith.constant dense<0> : tensor<64x128xi32, #mma>
     amdg.buffer_store %dot, %out[%out_offset] {contiguity = 1 : i32} : tensor<64x128xf32, #mma>
-    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "mfma", triton.warp_pipeline.priority = 0 : i32}
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "mfma", triton.warp_pipeline.priority = 0 : i32}
     ttg.barrier all
     %refill = amdg.buffer_load_to_local %arg0[%offset] mask = %mask_b stride = %stride into %a_alloc {contiguity = 2 : i32} : <f16>[tensor<64x32xi32, #linear>] -> <64x32xf16, #shared_a, #smem, mutable>
     %refill_group = ttg.async_commit_group tokens %refill

@@ -132,6 +132,92 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width, warp_coun
     )
 
 
+def direct_to_lds_packet_layout(
+    distributed_layout,
+    shared_layout,
+    *,
+    element_contiguity,
+    lane_width,
+    warp_count,
+):
+    """Derive direct-to-LDS packet ownership from a padded LDS layout.
+
+    A padded shared encoding is the copy destination's physical ownership
+    contract.  Consume its ordered offset bases in hardware packet order:
+    contiguous register bits, lane bits, warp bits, then the remaining
+    register bits.  Bases outside a logical subview become broadcasts, just
+    as restricting the allocation layout to that subview requires.
+
+    Return ``None`` when the destination does not provide this exact contract;
+    callers then preserve the source distributed layout.
+    """
+    if (distributed_layout is None or shared_layout is None or shared_layout.kind != "padded_shared"):
+        return None
+    shape = tuple(int(extent) for extent in distributed_layout.shape)
+    if (not shape or any(not _is_power_of_two(extent) for extent in shape)):
+        return None
+    element_contiguity = int(element_contiguity)
+    lane_width = int(lane_width)
+    warp_count = int(warp_count)
+    if (not _is_power_of_two(element_contiguity) or not _is_power_of_two(lane_width)
+            or not _is_power_of_two(warp_count)):
+        return None
+    component = shared_layout.properties.get("linear_component")
+    if component is None:
+        return None
+    offset_bases = list(linear_layout_bases(component, "offset"))
+    register_bits = element_contiguity.bit_length() - 1
+    lane_bits = lane_width.bit_length() - 1
+    warp_bits = warp_count.bit_length() - 1
+    if len(offset_bases) < register_bits + lane_bits:
+        return None
+
+    def take(count):
+        result = offset_bases[:count]
+        del offset_bases[:count]
+        return result
+
+    register_bases = take(register_bits)
+    lane_bases = take(lane_bits)
+    warp_bases = take(warp_bits)
+    warp_bases.extend([(0, ) * len(shape)] * (warp_bits - len(warp_bases)))
+    register_bases.extend(offset_bases)
+
+    def restrict_to_shape(bases):
+        return tuple(
+            tuple(int(component) if int(component) < shape[dim] else 0
+                  for dim, component in enumerate(basis))
+            for basis in bases)
+
+    register_bases = restrict_to_shape(register_bases)
+    lane_bases = restrict_to_shape(lane_bases)
+    warp_bases = restrict_to_shape(warp_bases)
+    linear = LinearLayout.from_bases(
+        (
+            ("register", register_bases),
+            ("lane", lane_bases),
+            ("warp", warp_bases),
+            ("block", ()),
+        ),
+        tuple(f"dim{dim}" for dim in range(len(shape))),
+        shape,
+        False,
+    )
+    if not linear.is_surjective():
+        return None
+    return LayoutMap(
+        distributed_layout.layout_map_id,
+        distributed_layout.value_id,
+        "linear",
+        shape,
+        distributed_layout.element_type,
+        linear_layout_in_dim_size(linear, "register"),
+        lane_width,
+        {"direct_to_lds_packet": True},
+        linear,
+    )
+
+
 def _layout_kind_and_properties(attr, value_id, *, encoding=None):
     if attr is None:
         return "none", {}

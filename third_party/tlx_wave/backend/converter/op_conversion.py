@@ -197,12 +197,42 @@ def _memory_relation(builder, offset_target_id, element_byte_width, element_cont
     }, tuple(target_id for _name, target_id in relation.bindings)
 
 
+def _memory_relation_for_layout(
+    builder,
+    offset_target_id,
+    layout,
+    element_byte_width,
+    element_contiguity,
+):
+    relation = _value_relation(builder, offset_target_id)
+    if relation is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory offset has no exact forward value relation",
+            target_value_id=int(offset_target_id),
+        )
+    bit_offset = layouts.global_memory_bit_offset_relation(
+        layout,
+        relation.expr,
+        element_byte_width=int(element_byte_width),
+        element_contiguity=int(element_contiguity),
+    )
+    return {
+        "bit_offset_relation": bit_offset,
+        "index_binding_count": len(relation.bindings),
+        "index_binding_names": tuple(name for name, _target_id in relation.bindings),
+    }, tuple(target_id for _name, target_id in relation.bindings)
+
+
 def _buffer_memory_relation(
     builder,
     base_target_id,
     offset_target_id,
     element_byte_width,
     element_contiguity,
+    *,
+    layout=None,
 ):
     """Compose a uniform pointer displacement into a buffer index relation.
 
@@ -215,6 +245,14 @@ def _buffer_memory_relation(
     """
     pointer = builder.pointer_relations.get(int(base_target_id))
     if pointer is None:
+        if layout is not None:
+            return int(base_target_id), *_memory_relation_for_layout(
+                builder,
+                offset_target_id,
+                layout,
+                element_byte_width,
+                element_contiguity,
+            )
         attrs, bindings = _memory_relation(
             builder,
             offset_target_id,
@@ -232,7 +270,7 @@ def _buffer_memory_relation(
             target_value_id=int(offset_target_id),
         )
     value = builder.values[int(offset_target_id)]
-    if value.layout_map_id is None:
+    if layout is None and value.layout_map_id is None:
         fail(
             "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
             STAGE,
@@ -244,7 +282,7 @@ def _buffer_memory_relation(
         _merge_relation_bindings(pointer.offset, offset),
     )
     bit_offset = layouts.global_memory_bit_offset_relation(
-        builder.layouts[int(value.layout_map_id)],
+        (builder.layouts[int(value.layout_map_id)] if layout is None else layout),
         combined.expr,
         element_byte_width=int(element_byte_width),
         element_contiguity=int(element_contiguity),
@@ -2722,11 +2760,11 @@ def _convert_buffer_load_to_local(
     DMA transactions or require the ordinary gather/scatter fallback.
     """
     fields = _buffer_load_to_local_fields(op)
-    if fields["other_value_id"] is not None:
+    if fields["other_value_id"] is not None and fields["mask_value_id"] is None:
         fail(
-            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            "TLXW_OP_BUFFER_ASYNC",
             STAGE,
-            "amdg.buffer_load_to_local other fallback is not converted yet",
+            "amdg.buffer_load_to_local other operand requires a mask operand",
             source_op_index=op.index,
         )
     _require_default_cache(fields["cache"], op)
@@ -2800,6 +2838,48 @@ def _convert_buffer_load_to_local(
             "amdg.buffer_load_to_local mask",
             op,
         )
+    has_other = fields["other_value_id"] is not None
+    if has_other:
+        other = type_layout_program.values[fields["other_value_id"]]
+        if int(other.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_BUFFER_ASYNC",
+                STAGE,
+                "amdg.buffer_load_to_local other must be scalar or match "
+                "offset components",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        if other.layout_map_id is not None:
+            _require_same_layout_except_element_type(
+                type_layout_program,
+                other,
+                offsets,
+                "amdg.buffer_load_to_local other and offsets",
+                op,
+            )
+
+    offset_layout = _require_layout(
+        type_layout_program,
+        offsets.layout_map_id,
+        op,
+    )
+    memdesc_layout = _require_layout(
+        type_layout_program,
+        type_layout_program.values[fields["memdesc_value_id"]].layout_map_id,
+        op,
+    )
+    dma_packet_layout = None
+    if not has_mask and not has_other and contiguity > 1:
+        dma_packet_layout = layouts.direct_to_lds_packet_layout(
+            offset_layout,
+            memdesc_layout,
+            element_contiguity=contiguity,
+            lane_width=lane_width,
+            warp_count=conversion_input.num_warps,
+        )
+    if dma_packet_layout is not None:
+        component_count = int(dma_packet_layout.component_count)
 
     destination_plan = _local_component_store_plan(
         conversion_input,
@@ -2809,6 +2889,7 @@ def _convert_buffer_load_to_local(
         component_count,
         lane_width,
         op,
+        distributed_layout=dma_packet_layout,
     )
     range_fact = _pointer_byte_range_fact(
         fact_program,
@@ -2858,20 +2939,36 @@ def _convert_buffer_load_to_local(
             offset_target_id,
             memdesc.element_byte_width,
             contiguity,
+            layout=dma_packet_layout,
         )
     else:
         base_target_id = source_base_target_id
-        relation_attrs, relation_bindings = _memory_relation(
-            builder,
-            offset_target_id,
-            memdesc.element_byte_width,
-            contiguity,
-        )
+        if dma_packet_layout is None:
+            relation_attrs, relation_bindings = _memory_relation(
+                builder,
+                offset_target_id,
+                memdesc.element_byte_width,
+                contiguity,
+            )
+        else:
+            relation_attrs, relation_bindings = _memory_relation_for_layout(
+                builder,
+                offset_target_id,
+                dma_packet_layout,
+                memdesc.element_byte_width,
+                contiguity,
+            )
     operands = [destination_target_id, base_target_id, offset_target_id]
     if has_mask:
         operands.append(_single_source_target(
             builder,
             fields["mask_value_id"],
+            op,
+        ))
+    if has_other:
+        operands.append(_single_source_target(
+            builder,
+            fields["other_value_id"],
             op,
         ))
     operands.extend(relation_bindings)
@@ -2889,12 +2986,14 @@ def _convert_buffer_load_to_local(
             "element_byte_width": int(memdesc.element_byte_width),
             "element_type": memdesc.element_type,
             "has_mask": has_mask,
+            "has_other": has_other,
             "has_stride_operand": fields["stride_value_id"] is not None,
             "issue_dependency_count": len(source_issue_dependency_target_ids),
             "lane_width": lane_width,
             "mask_component_count": mask_component_count,
             "mask_mode": "exec_where" if has_mask else "none",
             "mode": "symbolic_copy",
+            "offset_component_count": int(offsets.type.component_count),
             "range_bytes": int(range_fact.upper),
             **relation_attrs,
             "source_issue_dependency_count": len(source_issue_dependency_target_ids),
@@ -5911,6 +6010,8 @@ def _local_component_store_plan(
     component_count,
     lane_width,
     op,
+    *,
+    distributed_layout=None,
 ):
     memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
     view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
@@ -5919,7 +6020,8 @@ def _local_component_store_plan(
     memdesc_layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
     memdesc_layout = (None if memdesc_layout_id is None else type_layout_program.layouts[int(memdesc_layout_id)])
     offset_layout_id = type_layout_program.values[offset_value_id].layout_map_id
-    offset_layout = (None if offset_layout_id is None else type_layout_program.layouts[int(offset_layout_id)])
+    offset_layout = (distributed_layout if distributed_layout is not None else
+                     (None if offset_layout_id is None else type_layout_program.layouts[int(offset_layout_id)]))
     if (offset_layout is None or offset_layout.linear_layout is None or len(offset_layout.shape) != len(shape)):
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",

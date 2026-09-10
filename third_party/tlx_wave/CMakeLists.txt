@@ -47,7 +47,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonTLXWave ${CMAKE_CURRENT_SOURCE_DIR}/triton_tlx_wave.cc)
-  target_link_libraries(TritonTLXWave PRIVATE Python3::Module pybind11::headers)
+  target_link_libraries(TritonTLXWave PRIVATE Python3::Module nanobind-static)
 endif()
 
 set(TLX_WAVE_BUILD_JOBS "" CACHE STRING

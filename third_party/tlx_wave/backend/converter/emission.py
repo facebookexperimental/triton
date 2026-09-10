@@ -910,23 +910,26 @@ def _emit_make_range(state, op):
         item: workitem,
         block: block_id,
     }
-    index_type = state.dsl.simd_type(state.dsl.index_type(), width)
     value_type = state.dsl.simd_type(element_type, width)
-    components = tuple(
-        state.builder.intconvert(
-            state.builder.index_expr(
-                state.dsl.ixs_check(
-                    (expression, ),
-                    (state.dsl.ixs_eq(
-                        slot,
-                        state.dsl.ixs_int(component),
-                    ), ),
-                )[1][0],
-                bindings,
-                result_type=index_type,
-            ),
-            value_type,
-        ) for component in range(_component_count(state, result_id)))
+
+    def emit_component(component):
+        component_expr = state.dsl.ixs_check(
+            (expression, ),
+            (state.dsl.ixs_eq(
+                slot,
+                state.dsl.ixs_int(component),
+            ), ),
+        )[1][0]
+        value = state.builder.index_expr(component_expr, bindings)
+        if not _is_simd_value(state.dsl, value):
+            value = state.builder.splat(
+                value,
+                state.dsl.index_type(),
+                width,
+            )
+        return state.builder.intconvert(value, value_type)
+
+    components = tuple(emit_component(component) for component in range(_component_count(state, result_id)))
     state.values[result_id] = _pack_components(tuple(components))
 
 
@@ -2368,7 +2371,6 @@ def _layout_active_conditions(state, relation, component_count, lane_width, op):
             value = state.builder.index_expr(
                 active_key,
                 {item: state.execution_item},
-                result_type=index_type,
             )
             condition = _cmpi(
                 state,
@@ -2376,6 +2378,12 @@ def _layout_active_conditions(state, relation, component_count, lane_width, op):
                 value,
                 state.builder.constant(state.dsl.index_type(), 0),
             )
+            if _is_scalar_i1_value(state, condition):
+                condition = state.builder.splat(
+                    condition,
+                    state.dsl.i1(),
+                    int(lane_width),
+                )
             emitted[key] = condition
         conditions.append(condition)
     return tuple(conditions)
@@ -2567,7 +2575,8 @@ def _emit_buffer_load_to_local(state, op):
     barrier_order_dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
     issue_dependency_count = (source_issue_dependency_count + barrier_order_dependency_count)
     has_mask = bool(attrs.get("has_mask", False))
-    ordinary_operand_count = 3 + int(has_mask)
+    has_other = bool(attrs.get("has_other", False))
+    ordinary_operand_count = 3 + int(has_mask) + int(has_other)
     binding_count = int(attrs.get("index_binding_count", 0))
     expected_operand_count = (ordinary_operand_count + binding_count + issue_dependency_count)
     if len(op.operands) != expected_operand_count:
@@ -2581,21 +2590,22 @@ def _emit_buffer_load_to_local(state, op):
 
     dest_base = _require_value(state, op.operands[0], op)
     source_base = _require_value(state, op.operands[1], op)
-    offsets = _require_value(state, op.operands[2], op)
     operand_index = 3
     masks = _require_value(state, op.operands[operand_index], op) if has_mask else None
-    operand_index += int(has_mask) + binding_count
+    operand_index += int(has_mask)
+    other = _require_value(state, op.operands[operand_index], op) if has_other else None
+    operand_index += int(has_other) + binding_count
     issue_dependencies = tuple(_require_value(state, operand_id, op) for operand_id in op.operands[operand_index:])
     component_count = int(attrs["component_count"])
     lane_width = int(attrs["lane_width"])
     element_type = _scalar_type(state.dsl, attrs["element_type"])
-    offset_components = _as_components(offsets)
-    if len(offset_components) != component_count:
+    offset_type = state.target_program.values[int(op.operands[2])].type
+    if int(offset_type.component_count or 0) != int(attrs["offset_component_count"]):
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
             "amdg.buffer_load_to_local offset component count does not "
-            "match its symbolic packet",
+            "match its source packet",
             target_op_id=op.target_op_id,
         )
     mask_components = (None if masks is None else _as_mask_components(
@@ -2611,6 +2621,19 @@ def _emit_buffer_load_to_local(state, op):
             f"{attrs.get('mask_mode')}",
             target_op_id=op.target_op_id,
         )
+    other_components = None
+    if other is not None:
+        other_components = _broadcast_component(state, other, component_count, op)
+        splat_cache = []
+        other_components = tuple(
+            _memory_simd_component(
+                state,
+                component,
+                attrs["element_type"],
+                lane_width,
+                op,
+                splat_cache,
+            ) for component in other_components)
 
     # Direct-to-LDS completion is represented only by the explicit async
     # protocol.  Destination aliasing and prior LDS accesses must not invent
@@ -2641,7 +2664,7 @@ def _emit_buffer_load_to_local(state, op):
     )
     gather = _prepare_symbolic_indexed_gather(
         state,
-        offset_components,
+        (None, ) * component_count,
         source_base,
         element_type,
         lane_width,
@@ -2666,7 +2689,7 @@ def _emit_buffer_load_to_local(state, op):
         )
         inactive_packet = state.dsl.wave.PackOp(
             packet_type,
-            [inactive_component] * component_count,
+            ([inactive_component] * component_count if other_components is None else other_components),
         ).result
         packet, load_token = _emit_masked_memory_value_region(
             state,
