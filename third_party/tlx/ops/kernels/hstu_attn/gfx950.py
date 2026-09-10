@@ -8,6 +8,12 @@ import triton.language.extra.tlx as tlx
 import torch
 import torch.nn.functional as F
 
+from ._shapes import GFX950_FOCUS
+
+#: The shapes `bench_hstu_attn.py` gates on for this arch -- empty today, see
+#: `_shapes.py`.
+PERF_SHAPES = GFX950_FOCUS
+
 try:
     from triton.language.extra.libdevice import (
         fast_dividef,

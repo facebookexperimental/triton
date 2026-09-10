@@ -19,6 +19,11 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ._shapes import SM100_FOCUS
+
+#: The shapes `bench_flash_attn.py` gates on for this arch.
+PERF_SHAPES = SM100_FOCUS
+
 
 class Policy(IntEnum):
     DENSE = 0
@@ -4139,6 +4144,21 @@ def _select_forward_plan(q, k, v, causal):
         max(int(Policy.CAUSAL_64K),
             n_ctx.bit_length() - CAUSAL_POLICY_BIT_OFFSET),
     )
+    # TODO: this num_ctas=2 branch is a ~4.8x PESSIMIZATION on GB200
+    # (devgpu036.nao2). At Z=4 H=32 N_CTX=4096 HEAD_DIM=128 bf16 non-causal it
+    # reads 246 TF/s against 1186 with num_ctas forced to 1. The cause is the
+    # 2-CTA path itself, not the dtype: forcing num_ctas=2 on the same shape in
+    # fp16 also gives exactly 246, and forcing 1 recovers full speed in both.
+    # Config-independent (smoke and full spaces agree) and numerically correct,
+    # so it is slow rather than wrong. Landing on the same 246 for both dtypes
+    # looks more like serialization than mistuning, and the fp16 backward at the
+    # same shape fails outright with cluster misconfiguration (912) -- likely
+    # the same 2-CTA fault.
+    #
+    # NOT changed here: this was only measured on GB200, and the branch was
+    # presumably tuned on B200, which shares sm100. Run
+    # `python/test/tlx_benchmark/bench_flash_attn.py --fwd-only` on a B200 to
+    # decide between narrowing this to B200 and dropping it.
     return ForwardPlan(
         stage=3 if causal else 1,
         pipelined=pipelined,
