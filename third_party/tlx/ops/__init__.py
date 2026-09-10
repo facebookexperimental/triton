@@ -3,13 +3,17 @@
     from triton.tlx.ops import mm as tlx_mm
     c = tlx_mm(a, b)
 
+    from triton.tlx.ops import linear as tlx_linear
+    c = tlx_linear(a, weight, bias)
+
 This module is the API contract; everything under it is private -- reaching into
 `triton.tlx.ops.kernels.*` is not supported. Exactly one implementation ships
 per (op, arch), so there is no `variant=` argument, and architecture never
 appears in caller code.
 
-Two keyword-only overrides exist for testing and benchmarking: `arch=` pins an
-entry instead of detecting one, and `space=` selects the autotune search space.
+Keyword-only overrides support testing and benchmarking: `arch=` pins an entry
+instead of detecting one, `space=` selects an autotune search space where the
+op has one, and shape-specialized `linear` accepts a preallocated `out=`.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
 any op that offers one, so that a first call stays interactive. Measured on
@@ -33,7 +37,7 @@ from __future__ import annotations
 
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
-__all__ = ["mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
+__all__ = ["mm", "linear", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
 
 
 def mm(a, b, *, arch=None, space="heuristic"):
@@ -50,6 +54,18 @@ def mm(a, b, *, arch=None, space="heuristic"):
     check_inputs(spec, dtype=a.dtype, row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]),
                  elem_bytes=a.element_size())
     return fn(a, b, space=space)
+
+
+def linear(a, weight, bias=None, *, out=None, arch=None):
+    """Shape-specialized `a @ weight.T + bias` for production gfx942 BF16 inputs.
+
+    The five supported shapes use frozen configurations rather than an
+    autotune space. Four require a contiguous `(N,)` bias; one is bias-free.
+    `out`, when supplied, must be a contiguous `(M, N)` BF16 tensor.
+    """
+    fn, spec = impl_for("linear", arch)
+    check_inputs(spec, dtype=a.dtype)
+    return fn(a, weight, bias, out=out)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full"):

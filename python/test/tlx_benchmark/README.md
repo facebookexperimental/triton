@@ -11,6 +11,10 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
+For the five frozen MI300X Linear shapes:
+
+python python/test/tlx_benchmark/bench_linear.py
+
 ```
 options:
   -h, --help            show this help message and exit
