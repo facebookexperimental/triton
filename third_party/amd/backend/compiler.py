@@ -231,7 +231,23 @@ class HIPBackend(BaseBackend):
         )
 
     def get_codegen_implementation(self, options):
-        return {"min_dot_size": get_min_dot_size(self.target)}
+        def post_ast_lowering(mod):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            tlx.tlx_passes.add_triton_tlx_fixup(
+                pm,
+                f"hip:{options.arch}",
+                options.num_warps,
+                64,
+                options.num_ctas,
+                [1, 1, 1],
+            )
+            pm.run(mod, "post_ast_lowering")
+
+        return {
+            "min_dot_size": get_min_dot_size(self.target),
+            "post_ast_lowering": post_ast_lowering,
+        }
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.hip import libdevice
@@ -291,14 +307,6 @@ class HIPBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm,
-            f"hip:{options.arch}",
-            options.num_warps,
-            64,
-            options.num_ctas,
-            list((1, 1, 1)),
-        )
         passes.common.add_inliner(pm)
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
