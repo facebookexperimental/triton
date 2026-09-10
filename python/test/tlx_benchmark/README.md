@@ -11,9 +11,12 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-For the five frozen MI300X Linear shapes:
+For the four tuned MI300X addmm shapes:
 
-python python/test/tlx_benchmark/bench_linear.py
+python python/test/tlx_benchmark/bench_addmm.py
+
+The fifth, bias-free production shape is part of the gfx942 focus list in
+`bench_mm.py`; that benchmark also exercises all five shapes as plain `mm`.
 
 ```
 options:

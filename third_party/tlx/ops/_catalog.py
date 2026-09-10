@@ -33,7 +33,6 @@ class OpSpec:
 
 
 _FP16 = frozenset({"float16", "bfloat16"})
-_BF16 = frozenset({"bfloat16"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -63,11 +62,11 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
-        op="linear",
+        op="addmm",
         arch="gfx942",
-        variant="shape_specialized",
-        impl="kernels.linear.gfx942:linear",
-        dtypes=_BF16,
+        variant="fused_gemm",
+        impl="kernels.mm.gfx942:addmm",
+        dtypes=_FP16,
         requires=frozenset(),
     ),
     OpSpec(

@@ -34,6 +34,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 from ._shapes import GFX942_FOCUS
+from .gfx942_tuned import launch_tuned, tuned_config
 
 #: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
 #: of every arch's list; perf runs only its own.
@@ -91,6 +92,7 @@ def _xcd_remap(pid, grid_mn, num_xcds: tl.constexpr):
 def matmul_kernel_gfx942(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M,
     N,
@@ -99,6 +101,8 @@ def matmul_kernel_gfx942(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_bias_m,
+    stride_bias_n,
     stride_cm,
     stride_cn,
     BLOCK_M: tl.constexpr,
@@ -107,6 +111,7 @@ def matmul_kernel_gfx942(
     GROUP_M: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """C = A @ B, staging global -> VGPR -> LDS (the fastest operand path on CDNA3)."""
     tl.assume(stride_am > 0)
@@ -190,11 +195,20 @@ def matmul_kernel_gfx942(
         b_tile = tlx.local_load(tlx.local_view(smem_b, buf))
         acc = tl.dot(a_tile, b_tile, acc)
 
-    c = acc.to(tlx.dtype_of(c_ptr))
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if ADD_BIAS:
+        bias = tl.load(
+            bias_ptr + stride_bias_m * offs_cm[:, None] + stride_bias_n * offs_cn[None, :],
+            mask=mask_c,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        acc += bias.to(tl.float32)
+    c = acc.to(tlx.dtype_of(c_ptr))
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+    tl.store(c_ptrs, c, mask=mask_c)
 
 
 def lds_bytes(block_m, block_n, block_k, num_buffers, elem_bytes=2):
@@ -376,33 +390,61 @@ def _tuned(space, shape=None):
         configs = {"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space]()
     return triton.autotune(
         configs=configs,
-        key=["M", "N", "K"],
+        key=["M", "N", "K", "ADD_BIAS"],
         prune_configs_by={"early_config_prune": _prune_configs},
     )(matmul_kernel_gfx942)
 
 
-def mm(a, b, *, space="heuristic"):
-    """Matrix multiply ``a @ b`` on MI300X.
-
-    `space` selects the search space -- "full" for perf, "heuristic" (one
-    config) for a first call that stays interactive, "smoke" for path coverage.
-    Not exposed on `tlx.ops.mm`.
-
-    Either operand may be column-major: the kernel indexes through explicit
-    strides, so a transposed view costs nothing and needs no copy.
-    """
-    assert a.shape[1] == b.shape[0], f"K mismatch: A={tuple(a.shape)}, B={tuple(b.shape)}"
-    assert a.dtype == b.dtype, "A and B must have the same dtype"
+def _validate_operands(a, b, out):
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Expected A[M, K] and B[K, N], got {tuple(a.shape)} and {tuple(b.shape)}")
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(f"K mismatch: A={tuple(a.shape)}, B={tuple(b.shape)}")
+    if a.device.type != "cuda" or b.device != a.device:
+        raise ValueError("A and B must be on the same GPU")
+    if a.dtype != b.dtype:
+        raise ValueError("A and B must have the same dtype")
     M, K = a.shape
-    K, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    N = b.shape[1]
+    if out is not None:
+        if out.shape != (M, N) or out.device != a.device or out.dtype != a.dtype or not out.is_contiguous():
+            raise ValueError(f"out must be a contiguous {a.dtype} tensor with shape ({M}, {N}) on A's device")
+    return M, N, K
+
+
+def _bias_strides(bias, M, N, a):
+    if bias.device != a.device or bias.dtype != a.dtype:
+        raise ValueError("input must match A's device and dtype")
+    if bias.ndim == 1:
+        if bias.shape[0] != N:
+            raise ValueError(f"1-D addmm input must have shape ({N},), got {tuple(bias.shape)}")
+        return 0, bias.stride(0)
+    if bias.ndim == 2 and bias.shape[0] in (1, M) and bias.shape[1] in (1, N):
+        return (0 if bias.shape[0] == 1 else bias.stride(0), 0 if bias.shape[1] == 1 else bias.stride(1))
+    raise ValueError(f"addmm input with shape {tuple(bias.shape)} is not broadcastable to ({M}, {N})")
+
+
+def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
+    M, N, K = _validate_operands(a, b, out)
+    bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
+    if out is None:
+        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    # These exact BF16/layout matches bypass runtime autotuning. Other shapes,
+    # dtypes and layouts continue through the pre-existing generic path.
+    selected = tuned_config(a, b)
+    if selected is not None:
+        launch_tuned(a, b, bias, bias_strides, out, selected)
+        return out
 
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )  # noqa: E731
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
+    bias_ptr = bias if bias is not None else out
     kernel[grid](
         a,
         b,
-        c,
+        bias_ptr,
+        out,
         M,
         N,
         K,
@@ -410,12 +452,33 @@ def mm(a, b, *, space="heuristic"):
         a.stride(1),
         b.stride(0),
         b.stride(1),
-        c.stride(0),
-        c.stride(1),
+        bias_strides[0],
+        bias_strides[1],
+        out.stride(0),
+        out.stride(1),
+        ADD_BIAS=bias is not None,
         # 16x16x16 MFMA on gfx942 fp16.
         matrix_instr_nonkdim=16,
     )
-    return c
+    return out
+
+
+def mm(a, b, *, out=None, space="heuristic"):
+    """Matrix multiply ``a @ b`` on MI300X.
+
+    Either operand may be column-major. Exact production shapes use frozen
+    fast paths; all other supported inputs use the generic search space.
+    """
+    return _gemm(a, b, out=out, space=space)
+
+
+def addmm(input, a, b, *, out=None, space="heuristic"):
+    """Compute ``input + a @ b`` with a fused broadcast epilogue on MI300X.
+
+    ``input`` may be ``(N,)`` or a two-dimensional tensor broadcastable to
+    ``(M, N)``. This initial primitive has unit matrix and input scale factors.
+    """
+    return _gemm(a, b, input, out=out, space=space)
 
 
 #: The kernel-optimization agent loads a source file and calls `matmul(a, b)`.

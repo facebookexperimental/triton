@@ -1588,7 +1588,7 @@ def _tuned(space, shape=None):
     )(matmul_kernel_tma_ws_blackwell)
 
 
-def mm(a, b, *, space="full"):
+def mm(a, b, *, out=None, space="full"):
     """Matrix multiply ``a @ b`` on Blackwell.
 
     `space` selects the search space -- "full" for perf, "heuristic" (one
@@ -1598,7 +1598,12 @@ def mm(a, b, *, space="full"):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    if out is not None:
+        if out.shape != (M, N) or out.device != a.device or out.dtype != a.dtype or not out.is_contiguous():
+            raise ValueError(f"out must be a contiguous {a.dtype} tensor with shape ({M}, {N}) on A's device")
+        c = out
+    else:
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only

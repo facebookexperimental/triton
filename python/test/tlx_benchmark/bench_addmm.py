@@ -1,10 +1,9 @@
-"""Benchmark the five frozen gfx942 ``tlx.ops.linear`` shapes against aten.
+"""Benchmark the four tuned gfx942 ``tlx.ops.addmm`` shapes against aten.
 
-Both providers consume the same contiguous BF16 ``input[M, K]`` and
-``weight[N, K]`` tensors and write to preallocated outputs. Four shapes
-include a vector bias; one is bias-free. Run on MI300X with:
+Both providers consume the same BF16 ``A[M, K]``, column-major ``B[K, N]`` and
+vector bias tensors and write to preallocated outputs. Run on MI300X with:
 
-    python python/test/tlx_benchmark/bench_linear.py
+    python python/test/tlx_benchmark/bench_addmm.py
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import sys
 
 import torch
 
-from triton.tlx.ops.kernels.linear.gfx942 import LINEAR_CONFIGS
+from triton.tlx.ops.kernels.mm.gfx942_tuned import TUNED_CONFIGS
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
@@ -25,9 +24,10 @@ from _harness import report as report_mod  # noqa: E402
 from _harness import verdict  # noqa: E402
 from _harness.denoise import Governor, list_devices, select_device  # noqa: E402
 
-OP = "linear"
+OP = "addmm"
 DTYPE = torch.bfloat16
 REL_PRECISION = 0.05
+ADDMM_SHAPES = tuple(shape for shape in TUNED_CONFIGS if shape != (2048, 25408, 10240))
 
 
 @functools.lru_cache(maxsize=1)
@@ -41,22 +41,22 @@ def default_json() -> str:
 
 
 def cases(head: int | None = None) -> list[Case]:
-    out = []
-    for (M, N, K), config in LINEAR_CONFIGS.items():
-        bias = config["bias"]
-        label = f"{M}x{N}x{K} weight:NK bias:{'yes' if bias else 'no'}"
-        out.append(Case(op=OP, arch="gfx942", dtype="bfloat16", shape=(M, N, K, bias), label=label))
+    out = [
+        Case(op=OP, arch="gfx942", dtype="bfloat16", shape=(M, N, K),
+             label=f"{M}x{N}x{K} A:row-major B:column-major bias:N") for M, N, K in ADDMM_SHAPES
+    ]
     return out[:head] if head else out
 
 
 def _operands(case: Case):
-    M, N, K, has_bias = case.shape
+    M, N, K = case.shape
     a = torch.randn((M, K), device="cuda", dtype=DTYPE)
     weight = torch.randn((N, K), device="cuda", dtype=DTYPE)
-    bias = torch.randn((N, ), device="cuda", dtype=DTYPE) if has_bias else None
+    b = weight.T
+    bias = torch.randn((N, ), device="cuda", dtype=DTYPE)
     tlx_out = torch.empty((M, N), device="cuda", dtype=DTYPE)
     ref_out = torch.empty_like(tlx_out)
-    return a, weight, bias, tlx_out, ref_out
+    return a, b, bias, tlx_out, ref_out
 
 
 def _accuracy(out, ref_out) -> tuple[bool, str]:
@@ -68,16 +68,12 @@ def _accuracy(out, ref_out) -> tuple[bool, str]:
 
 
 def run_case(case: Case):
-    from triton.tlx.ops import linear as tlx_linear
+    from triton.tlx.ops import addmm as tlx_addmm
 
-    M, N, K, has_bias = case.shape
-    a, weight, bias, tlx_out, ref_out = _operands(case)
-    b = weight.T
-    tlx_fn = lambda: tlx_linear(a, weight, bias, out=tlx_out, arch="gfx942")  # noqa: E731
-    if has_bias:
-        ref_fn = lambda: torch.addmm(bias, a, b, out=ref_out)  # noqa: E731
-    else:
-        ref_fn = lambda: torch.mm(a, b, out=ref_out)  # noqa: E731
+    M, N, K = case.shape
+    a, b, bias, tlx_out, ref_out = _operands(case)
+    tlx_fn = lambda: tlx_addmm(bias, a, b, out=tlx_out, arch="gfx942")  # noqa: E731
+    ref_fn = lambda: torch.addmm(bias, a, b, out=ref_out)  # noqa: E731
 
     compile_stat = cold_compile(tlx_fn)
     out = tlx_fn()
@@ -108,7 +104,7 @@ def supported() -> bool:
 
 
 def run(*, space=None, head=None, synthetic=False, governor=None):
-    del space, synthetic  # The five configurations are frozen; there is no search space.
+    del space, synthetic  # Focus cases select frozen configurations.
     env = capture_env()
     if governor is not None:
         env["governed"] = governor.to_dict()
@@ -120,11 +116,11 @@ def run(*, space=None, head=None, synthetic=False, governor=None):
             except Exception as exc:
                 results.append(_errored(case, exc))
             torch.cuda.empty_cache()
-    env["space"] = "frozen"
+    env["space"] = "tuned-fast-path"
     env["replicates"] = DEFAULT_REPLICATES
     if head:
         env["head"] = head
-    env["shapes"] = "gfx942-linear-focus"
+    env["shapes"] = "gfx942-addmm-focus"
     env["run"] = {key: info[key] for key in ("problems", "clock_trace", "elapsed_s") if key in info}
     return results, env
 
@@ -138,7 +134,7 @@ def main(argv=None) -> int:
 
     device = select_device(args.device)
     if device is None or device.arch != "gfx942":
-        print("tlx.ops.linear requires a gfx942 GPU")
+        print("tlx.ops.addmm requires a gfx942 GPU")
         return 1
     os.environ[device.visibility_env] = str(device.index)
     print(f"device: gpu{device.index} {device.name} "
