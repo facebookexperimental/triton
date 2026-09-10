@@ -56,12 +56,6 @@ NUM_CUS = 304
 #: 2048^3 and 4096^3 by one rung.
 _MIN_WORKGROUPS = 256
 
-# A long-running grid just over one full device wave leaves only a handful of
-# CUs working through its tail.  For those extreme-K shapes, prefer the
-# single-buffer specialization of the next ladder rung so the work decomposes
-# into several better-filled waves without consuming the full LDS budget.
-_LONG_K_TAIL_THRESHOLD = 16 * 1024
-
 # Per-workgroup LDS on CDNA3. Configs are checked against this so an oversized
 # tile is dropped before compilation instead of failing out-of-resources.
 CDNA3_LDS_BYTES = 64 * 1024
@@ -293,13 +287,6 @@ _TILE_LADDER = [
 #: GROUP_M swizzle has too little to work with to keep B resident in L2.
 _NARROW_TILE = (128, 128, 32, 8, 1, 4)
 
-# The long-K tail fallback keeps the same tile geometry as the next ladder
-# rung, but uses one LDS buffer.  Its 128x128x64 two-buffer form consumes the
-# entire LDS budget; the fallback already has several device waves available,
-# so test whether freeing half of that per-workgroup LDS is worth giving up one
-# tile of prefetch distance.
-_LONG_K_TAIL_TILE = (128, 128, 64, 8, 1, 8)
-
 #: A shape is "narrow" when one side is this small while the other is large.
 _NARROW_SIDE = 1024
 _WIDE_SIDE = 4096
@@ -313,9 +300,7 @@ def heuristic_config(M, N, K):
     1. A narrow shape -- one side <= 1024 while the other is >= 4096 -- takes
        `_NARROW_TILE` regardless of how many workgroups a wider tile would make.
     2. Otherwise take the widest tile that still produces at least
-       `_MIN_WORKGROUPS`, except that an extreme-K grid between one and two
-       full device waves takes the single-buffer specialization of the next
-       rung to avoid a long under-filled tail. Fall back to the narrowest tile.
+       `_MIN_WORKGROUPS`, falling back to the narrowest tile in the ladder.
 
     Returns None when nothing in the ladder fits the LDS budget at this K, which
     sends the caller to the smoke space rather than off a cliff.
@@ -323,18 +308,7 @@ def heuristic_config(M, N, K):
     if min(M, N) <= _NARROW_SIDE <= _WIDE_SIDE <= max(M, N):
         candidates = [_NARROW_TILE]
     else:
-        candidates = []
-        long_k_tail = False
-        for tile in _TILE_LADDER:
-            workgroups = triton.cdiv(M, tile[0]) * triton.cdiv(N, tile[1])
-            if workgroups < _MIN_WORKGROUPS:
-                continue
-            if K >= _LONG_K_TAIL_THRESHOLD and NUM_CUS < workgroups < 2 * NUM_CUS:
-                long_k_tail = True
-                continue
-            candidates.append(tile)
-        if long_k_tail:
-            candidates = [_LONG_K_TAIL_TILE]
+        candidates = [t for t in _TILE_LADDER if triton.cdiv(M, t[0]) * triton.cdiv(N, t[1]) >= _MIN_WORKGROUPS]
         candidates = candidates or [_TILE_LADDER[-1]]
 
     for block_m, block_n, block_k, group_m, num_buffers, num_warps in candidates:

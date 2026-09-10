@@ -62,6 +62,25 @@ invariants, synchronization and aliasing contracts, exact measurement scopes,
 known failed configurations, and evidence-to-action rules. Do not put such
 knowledge into the generic candidate provider.
 
+When the knowledge is longer than a paragraph, put it in the bundle as markdown
+instead of inlining it. The CLI concatenates these ahead of the inline string,
+widest scope first, and delivers the result as the same `optimization_guidance`
+field:
+
+```text
+harnesses/<arch>/knowledge.md                              # architecture-wide
+harnesses/<arch>/targets/<kernel>/optimization_guidance.md # this target
+```
+
+Both are optional. Prefer mechanism, method and search-space structure over
+measurements: cite where a figure lives rather than reproducing it, since a
+pasted number goes stale silently and invites pattern-matching on the value
+instead of the mechanism. In particular, do not restate a hardware quantity that
+`third_party/tlx/language/tlx/hw/resources.py` already declares — cite the arch
+class attribute and record the consequence. Keep established-on-this-arch and
+ported-from-another-arch claims in separate sections; the candidate prompt tells
+the model to weigh them differently. The resolved block is capped at 16 KB.
+
 The harness is a Python module with this API:
 
 ```python
@@ -174,9 +193,9 @@ async-task or warp mapping files, and the exact commands that generated them.
 Large payloads are spilled into the agent artifact directory automatically.
 
 Generic Proton guidance lives in
-`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/proton.md`.
+`third_party/tlx/tools/agents/profiler/docs/proton.md`.
 CUDA/NVIDIA bundles must follow
-`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
+`third_party/tlx/tools/agents/profiler/docs/nvidia-ncu.md`.
 Other targets must not fabricate
 NVIDIA fields. Unsupported counters are omitted or represented as `null` with
 diagnostics, never silently converted to zero.
@@ -288,9 +307,11 @@ heavily, but keep representative correctness/tail cases protected.
 }
 ```
 
-Valid architecture aliases include `blackwell`, `B200`, `sm_100`, `hopper`,
-`H100`, and `sm_90`. The CLI validates the visible CUDA device against the
-selected architecture.
+`backend` is `cuda`, `hip`, or `cpu`. Valid architecture aliases on CUDA include
+`blackwell`, `B200`, `sm_100`, `hopper`, `H100`, and `sm_90`; on HIP they are
+`gfx942`/`mi300`/`mi300x`/`cdna3`, `gfx950`/`mi350`/`mi355`/`cdna4`, and
+`gfx1250`. The CLI validates the visible device against the selected
+architecture — compute capability on CUDA, `gcnArchName` on HIP.
 
 Put required runtime knobs in `environment`, for example compiler feature flags,
 cache directories, or Triton dump controls. Do not put shape parameters here;
@@ -320,7 +341,7 @@ raise it only when the harness documents unavoidable variance.
 ```bash
 cd /home/hoy/triton-fb
 PYTHONPATH=/home/hoy/triton-fb \
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.manager.cli \
   --kernel /absolute/path/to/kernel.py \
   --reference-kernel /absolute/path/to/reference_kernel.py \
   --harness /absolute/path/to/target-bundle/harness.py \

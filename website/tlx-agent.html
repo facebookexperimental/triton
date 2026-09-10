@@ -77,7 +77,7 @@ def profile(build_artifact, case: dict, request: dict | None = None): ...</code>
 <p>Candidate generation must not edit the frozen bundle. This prevents the search from improving its score by weakening correctness or changing the workload.</p>
 <h2 id="run-the-cli">Run the CLI</h2>
 <p>From the repository root:</p>
-<pre><code class="language-bash">PYTHONPATH=&lt;repo-root&gt; python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+<pre><code class="language-bash">PYTHONPATH=&lt;repo-root&gt; python -m third_party.tlx.tools.agents.manager.cli \
   --kernel &lt;absolute-kernel.py&gt; \
   --harness &lt;absolute-bundle/harness.py&gt; \
   --cases &lt;absolute-bundle/cases.json&gt; \
@@ -116,7 +116,8 @@ def profile(build_artifact, case: dict, request: dict | None = None): ...</code>
 <p>A candidate is promotable only when every protected case passes, weighted speedup reaches the configured threshold, variance stays within budget, and hardware profiling shows no material main-kernel regression. It must also beat the current best candidate.</p>
 <p>The finalist is rebuilt and revalidated with the frozen bundle. A generated <code>best_kernel.py</code> without final revalidation is not a completed run.</p>
 <h2 id="version-control-behavior">Version-control behavior</h2>
-<p>After successful final validation, TLX Agent creates a local winner commit by default. It detects Git or Mercurial from the kernel path, commits only the baseline-to-winner delta, preserves unrelated staged and dirty work, and adds <code>TLX agent authored</code> to the commit body.</p>
+<p>Each candidate that passes the promotion gates is checkpointed in a local commit before the next candidate is generated. The agent detects Git or Mercurial from the kernel path, preserves unrelated staged and dirty work, and records the change, rationale, correctness, per-shape performance, and <code>Kernel optimization agent authored</code> in each promotion commit.</p>
+<p>If final revalidation fails after promotions, the agent creates a forward rollback commit while retaining the checkpoint history for diagnosis.</p>
 <p>If the live kernel changed during the run or edits overlap unsafely, the Agent keeps the winner artifact and reports a commit failure instead of overwriting user work. Submitting, landing, or pushing the commit is always a separate explicit action.</p></article>
 <footer class="pager"><a href="tooling.html">← Tooling</a></footer>
     </main>
