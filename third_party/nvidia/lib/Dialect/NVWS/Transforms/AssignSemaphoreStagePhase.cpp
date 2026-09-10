@@ -1626,6 +1626,26 @@ struct AssignStagePhase {
   // Docs: assign-stage-phase-and-lower-semaphores.md#updating-statestage
   //       assign-stage-phase-and-lower-semaphores.md#updating-statephases
   State assignStateInBlock(Block *block, State state) {
+    auto applyStageOffset = [&](Value baseStage, Value offset,
+                                auto &createIntoStage) -> Value {
+      APInt constant;
+      if (matchPattern(offset, m_ConstantInt(&constant)) && constant.isZero())
+        return baseStage;
+      if (matchPattern(offset, m_ConstantInt(&constant)))
+        offset = createIntoStage(arith::ConstantIntOp{},
+                                 constant.getSExtValue(),
+                                 constant.getBitWidth());
+      auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
+      auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
+      auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
+      auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
+      auto isNegative = createIntoStage(
+          arith::CmpIOp{}, arith::CmpIPredicate::slt, remStage, zero);
+      auto wrappedStage = createIntoStage(arith::AddIOp{}, remStage, depth);
+      return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
+                             remStage);
+    };
+
     for (auto &op : llvm::make_early_inc_range(*block)) {
       if (auto acquireOp = getAcquireOp(&op)) {
         ImplicitLocOpBuilder b(acquireOp.getLoc(), acquireOp);
@@ -1693,26 +1713,6 @@ struct AssignStagePhase {
             return;
           phaseShiftUses.push_back(PhaseShiftUse{op, shiftAmount, key.stageLane});
         };
-        auto applyStageOffset = [&](Value baseStage, Value offset) -> Value {
-          APInt constant;
-          if (matchPattern(offset, m_ConstantInt(&constant)) &&
-              constant.isZero())
-            return baseStage;
-          if (matchPattern(offset, m_ConstantInt(&constant)))
-            offset = createIntoStage(arith::ConstantIntOp{},
-                                     constant.getSExtValue(),
-                                     constant.getBitWidth());
-          auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
-          auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
-          auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
-          auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
-          auto isNegative = createIntoStage(arith::CmpIOp{},
-                                            arith::CmpIPredicate::slt, remStage,
-                                            zero);
-          auto wrappedStage = createIntoStage(arith::AddIOp{}, remStage, depth);
-          return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
-                                 remStage);
-        };
 
         // Keep the scalar cursor unchanged.  When analysis found a backward
         // consumer, replay the same pure advances at that consumer's schedule.
@@ -1749,7 +1749,8 @@ struct AssignStagePhase {
         Value authoredOffset =
             acquireOp.getPhase() ? Value() : acquireOp.getStage();
         Value acquireStage =
-            authoredOffset ? applyStageOffset(baseStage, authoredOffset)
+            authoredOffset ? applyStageOffset(baseStage, authoredOffset,
+                                             createIntoStage)
                            : baseStage;
         acquireOp.getStageMutable().assign(acquireStage);
         state.token = acquireOp.getToken();
@@ -1798,29 +1799,10 @@ struct AssignStagePhase {
             setWarpSpecializeTag(newOp, *wsTag);
           return newOp;
         };
-        auto applyStageOffset = [&](Value baseStage, Value offset) -> Value {
-          APInt constant;
-          if (matchPattern(offset, m_ConstantInt(&constant)) &&
-              constant.isZero())
-            return baseStage;
-          if (matchPattern(offset, m_ConstantInt(&constant)))
-            offset = createIntoStage(arith::ConstantIntOp{},
-                                     constant.getSExtValue(),
-                                     constant.getBitWidth());
-          auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
-          auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
-          auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
-          auto zero = createIntoStage(arith::ConstantIntOp{}, 0, 32);
-          auto isNegative = createIntoStage(arith::CmpIOp{},
-                                            arith::CmpIPredicate::slt, remStage,
-                                            zero);
-          auto wrappedStage = createIntoStage(arith::AddIOp{}, remStage, depth);
-          return createIntoStage(arith::SelectOp{}, isNegative, wrappedStage,
-                                 remStage);
-        };
         Value baseStage = getStageForOp(state, &op);
         widenStageBlockArgUse(stageOp, baseStage);
-        stageOp.setStage(applyStageOffset(baseStage, stageOp.getStage()));
+        stageOp.setStage(
+            applyStageOffset(baseStage, stageOp.getStage(), createIntoStage));
       } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         assignStateInForOp(forOp, state);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
