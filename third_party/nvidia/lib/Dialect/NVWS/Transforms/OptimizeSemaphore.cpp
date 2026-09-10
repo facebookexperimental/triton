@@ -404,7 +404,12 @@ analyzeCombinedSemaphoreGroup(ArrayRef<SemaphoreAcquireOp> acquireGroup) {
       auto prodAcquire = dyn_cast<SemaphoreAcquireOp>(user);
       if (!prodAcquire)
         continue;
-      producerPartitionIds.push_back(getPartitionIds(prodAcquire).front());
+      if (!hasPartition(prodAcquire))
+        return {};
+      auto partitionIds = getPartitionIds(prodAcquire);
+      if (partitionIds.size() != 1)
+        return {};
+      producerPartitionIds.push_back(partitionIds.front());
       if (info.prodAcquireOp)
         return {};
       info.prodAcquireOp = prodAcquire;
