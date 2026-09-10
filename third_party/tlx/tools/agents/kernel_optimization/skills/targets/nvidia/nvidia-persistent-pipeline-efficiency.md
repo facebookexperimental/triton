@@ -1,6 +1,6 @@
-# Blackwell Persistent Pipeline Efficiency
+# NVIDIA Persistent Pipeline Efficiency
 
-Apply this guidance to NVIDIA Blackwell kernels with persistent workers, preprocessing launches, asynchronous task pipelines, or staged output publication. Preserve the kernel's numerical and synchronization contracts; optimize data movement and scheduling without assuming a particular algorithm.
+Apply this guidance to NVIDIA Hopper and Blackwell kernels with persistent workers, preprocessing launches, asynchronous task pipelines, or staged output publication. Preserve the kernel's numerical and synchronization contracts; optimize data movement and scheduling without assuming a particular algorithm.
 
 ## Amortize Launch And Scheduling Overhead
 
@@ -28,7 +28,7 @@ Packed native arithmetic can reduce conversions and instruction count when opera
 
 Order pipeline stages by producer/consumer readiness rather than source order. Defer a load or barrier wait until immediately before first use when doing so creates useful overlap, but never move it past a dependency.
 
-TMEM and SMEM reuse require explicit lifetime proofs. Before aliasing storage:
+Reusable storage and synchronization state require explicit lifetime proofs. Before aliasing storage:
 
 - prove every compute operation and local load completed its final read;
 - prove every asynchronous store drained before its staging slot is overwritten;

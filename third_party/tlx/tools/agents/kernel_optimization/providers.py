@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -16,13 +19,18 @@ _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 _LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
 _NVIDIA_TARGET_SKILLS = _SKILLS_ROOT / "targets/nvidia"
 _ASYNC_TMA_OUTPUT_SKILL = _NVIDIA_TARGET_SKILLS / "async-tma-output-publication.md"
+_NVIDIA_WARP_BARRIER_SKILL = (
+    _NVIDIA_TARGET_SKILLS / "nvidia-warp-barrier-efficiency.md"
+)
 _BLACKWELL_CLC_SKILL = _NVIDIA_TARGET_SKILLS / "blackwell-persistent-clc-scheduling.md"
-_BLACKWELL_PIPELINE_SKILL = (
-    _NVIDIA_TARGET_SKILLS / "blackwell-persistent-pipeline-efficiency.md"
+_NVIDIA_PERSISTENT_PIPELINE_SKILL = (
+    _NVIDIA_TARGET_SKILLS / "nvidia-persistent-pipeline-efficiency.md"
 )
 _BLACKWELL_ARCHITECTURES = frozenset(
     {"blackwell", "sm100", "sm_100", "b200", "b200a", "gb200", "gb300"}
 )
+_HOPPER_ARCHITECTURES = frozenset({"hopper", "h100", "sm90", "sm_90"})
+_PERSISTENT_PIPELINE_ARCHITECTURES = _BLACKWELL_ARCHITECTURES | _HOPPER_ARCHITECTURES
 
 
 TLX_PROMPT_PREAMBLE = """You are optimizing one Triton or TLX kernel against an external deterministic harness.
@@ -53,17 +61,23 @@ TLX API guidance:
 
 The complete current source is available as `candidate.py` in your writable working
 directory. Edit that file directly and leave it as the complete replacement source. Also
-write `candidate_metadata.json` with integer `schema_version` set to 1 and these string
+write `candidate_metadata.json` with integer `schema_version` set to 2 and these string
 fields: `hypothesis`, `evidence`, `change`, `expected_effect`, `risk`, `commit_title`,
-and `commit_summary`. The first five fields must each be one line and under 240 characters.
-`commit_title` must be an imperative, one-line title under 80 characters that describes the
-actual source change, without performance claims or attribution. `commit_summary` must be
-under 4000 characters and contain exactly two clearly labeled
-sections: `Change summary:` explains what changed, its affected scope, and preserved
-invariants or fallback paths; `Why:` explains the measured evidence and optimization
-rationale. Do not include a commit subject, a `Performance:` section, `TLX agent authored`,
-or any unverified performance or correctness claim. The external harness adds a formatted
-`Performance:` section with authoritative numbers after final revalidation.
+`commit_summary`, and `source_sha256`. `original.py` is an immutable copy of the source you
+started from. After the final edit, inspect the final unified diff from `original.py` to `candidate.py`
+and base all metadata only on that diff. Set `source_sha256` to the lowercase SHA-256 digest
+of the final `candidate.py` bytes so stale metadata from an earlier edit is rejected.
+The first five fields must each be one line and under 240 characters. `commit_title` must be
+an imperative, one-line title under 80 characters that precisely describes the actual
+source change, without performance claims, vague labels such as "Optimize kernel", or
+attribution. `commit_summary` must be under 4000 characters and contain exactly two clearly
+labeled sections: `Change summary:` explains what changed, names at least one changed
+top-level function, class, or module variable exactly as spelled in the source, and states
+preserved invariants or fallback paths; `Why:` explains the measured evidence and
+optimization rationale. Do not describe edits absent from the final diff. Do not include a
+commit subject, a `Performance:` section, `TLX agent authored`, or any unverified
+performance or correctness claim. The external harness adds a formatted `Performance:`
+section with authoritative numbers after final revalidation.
 Do not modify any other file. Keep the final response to one short plain-text summary;
 do not print source code or a patch.
 """
@@ -136,6 +150,36 @@ class MockLLMProvider:
         return CandidateProposal(source=context.current_source, summary="mock-echo")
 
 
+_METADATA_SCHEMA_VERSION = 2
+_COMMIT_SUMMARY_RE = re.compile(
+    r"\AChange summary:[ \t]*\n?(?P<change>.+?)\n\nWhy:[ \t]*\n?(?P<why>.+)\Z",
+    re.DOTALL,
+)
+_GENERIC_COMMIT_TITLES = frozenset(
+    {
+        "improve performance",
+        "optimize candidate",
+        "optimize kernel",
+        "optimize performance",
+        "update kernel",
+    }
+)
+_COMMIT_METADATA_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "for",
+        "in",
+        "of",
+        "on",
+        "the",
+        "to",
+        "use",
+        "with",
+    }
+)
+
 _SHORT_METADATA_FIELDS = (
     "hypothesis",
     "evidence",
@@ -156,54 +200,119 @@ def _clean_commit_title(value: object) -> str:
 def _clean_commit_summary(value: object) -> str:
     text = str(value or "").replace("\x00", "")
     paragraphs = [" ".join(part.split()) for part in text.split("\n\n")]
-    return "\n\n".join(part for part in paragraphs if part)[:4000].strip()
+    return "\n\n".join(part for part in paragraphs if part).strip()
 
 
-def _fallback_commit_summary(metadata: dict[str, str]) -> str:
-    change = metadata.get("change", "") or (
-        "Apply the source change selected by TLX Agent against the frozen harness."
-    )
-    risk = metadata.get("risk", "")
-    if risk:
-        change = f"{change} Preserved behavior and risk: {risk}"
-    why = " ".join(
-        part
-        for part in (
-            metadata.get("hypothesis", ""),
-            f"Evidence: {metadata['evidence']}" if metadata.get("evidence") else "",
-            (
-                f"Expected effect: {metadata['expected_effect']}"
-                if metadata.get("expected_effect")
-                else ""
-            ),
+def _top_level_nodes(source: str) -> dict[str, ast.AST]:
+    nodes: dict[str, ast.AST] = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            nodes[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    nodes[target.id] = node
+    return nodes
+
+
+def _commit_words(text: str) -> frozenset[str]:
+    words = set()
+    for token in re.findall(
+        r"[A-Za-z][A-Za-z0-9]*", text.casefold().replace("_", " ")
+    ):
+        word = token[:-1] if token.endswith("s") and len(token) > 4 else token
+        if word not in _COMMIT_METADATA_STOP_WORDS:
+            words.add(word)
+    return frozenset(words)
+
+
+def _changed_top_level_names(before: str, after: str) -> tuple[str, ...]:
+    before_nodes = _top_level_nodes(before)
+    after_nodes = _top_level_nodes(after)
+    names = set(before_nodes) | set(after_nodes)
+
+    def node_dump(node: ast.AST | None) -> str | None:
+        return ast.dump(node, include_attributes=False) if node is not None else None
+
+    return tuple(
+        sorted(
+            name
+            for name in names
+            if node_dump(before_nodes.get(name)) != node_dump(after_nodes.get(name))
         )
-        if part
-    ) or "TLX Agent selected this candidate for external correctness and performance evaluation."
-    return _clean_commit_summary(f"Change summary:\n{change}\n\nWhy:\n{why}")
+    )
 
 
-def _read_candidate_metadata(path: Path) -> dict[str, str]:
-    metadata = {field: "" for field in _SHORT_METADATA_FIELDS}
-    metadata["commit_title"] = ""
-    metadata["commit_summary"] = ""
-    if path.exists():
-        try:
-            payload = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            payload = {}
-        if isinstance(payload, dict):
-            for field in _SHORT_METADATA_FIELDS:
-                metadata[field] = _clean_short_metadata(payload.get(field, ""))
-            metadata["commit_title"] = _clean_commit_title(
-                payload.get("commit_title", "")
-            )
-            metadata["commit_summary"] = _clean_commit_summary(
-                payload.get("commit_summary", "")
-            )
-    if not metadata["commit_title"]:
-        metadata["commit_title"] = _clean_commit_title(metadata.get("change", ""))
-    if not metadata["commit_summary"]:
-        metadata["commit_summary"] = _fallback_commit_summary(metadata)
+def _read_candidate_metadata(
+    path: Path,
+    *,
+    source: str,
+    original_source: str,
+) -> dict[str, str]:
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError as error:
+        raise ValueError("candidate_metadata.json was not created") from error
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"candidate metadata is not valid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("candidate metadata must be a JSON object")
+    if payload.get("schema_version") != _METADATA_SCHEMA_VERSION:
+        raise ValueError(
+            f"candidate metadata schema_version must be {_METADATA_SCHEMA_VERSION}"
+        )
+
+    metadata: dict[str, str] = {}
+    for field in (*_SHORT_METADATA_FIELDS, "commit_title", "commit_summary"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"candidate metadata field {field!r} must be non-empty")
+        metadata[field] = value.strip()
+    for field in _SHORT_METADATA_FIELDS:
+        if "\n" in metadata[field] or len(metadata[field]) > 240:
+            raise ValueError(f"candidate metadata field {field!r} must be one line under 240 characters")
+        metadata[field] = _clean_short_metadata(metadata[field])
+
+    title = metadata["commit_title"]
+    if "\n" in title or len(title) >= 80:
+        raise ValueError("commit_title must be one line under 80 characters")
+    title = _clean_commit_title(title)
+    if title.casefold() in _GENERIC_COMMIT_TITLES:
+        raise ValueError("commit_title is too generic to describe the candidate diff")
+    metadata["commit_title"] = title
+
+    summary = metadata["commit_summary"]
+    if len(summary) >= 4000:
+        raise ValueError("commit_summary must be under 4000 characters")
+    match = _COMMIT_SUMMARY_RE.fullmatch(summary)
+    if match is None:
+        raise ValueError(
+            "commit_summary must contain exactly 'Change summary:' and 'Why:' sections"
+        )
+    if "Performance:" in summary or "tlx agent authored" in summary.casefold():
+        raise ValueError("commit_summary contains content reserved for the external harness")
+    changed_names = _changed_top_level_names(original_source, source)
+    if not changed_names:
+        raise ValueError("candidate source does not change a top-level scope")
+    if not any(name in match.group("change") for name in changed_names):
+        names = ", ".join(changed_names[:8])
+        raise ValueError(
+            "commit_summary must name at least one changed top-level scope: " + names
+        )
+    if not (_commit_words(title) & _commit_words(match.group("change"))):
+        raise ValueError("commit_title does not describe the commit_summary change")
+    change_summary = " ".join(match.group("change").split())
+    why = " ".join(match.group("why").split())
+    metadata["commit_summary"] = (
+        f"Change summary:\n{change_summary}\n\nWhy:\n{why}"
+    )
+
+    digest = payload.get("source_sha256")
+    expected_digest = hashlib.sha256(source.encode()).hexdigest()
+    if digest != expected_digest:
+        raise ValueError("candidate metadata source_sha256 does not match candidate.py")
+    metadata["source_sha256"] = expected_digest
     return metadata
 
 
@@ -225,9 +334,11 @@ class CodexCandidateProvider:
             with tempfile.TemporaryDirectory(prefix="tlx-agent-candidate-") as directory:
                 workspace = Path(directory)
                 candidate_path = workspace / "candidate.py"
+                original_path = workspace / "original.py"
                 output_path = workspace / "last-message.txt"
                 metadata_path = workspace / "candidate_metadata.json"
                 candidate_path.write_text(context.current_source)
+                original_path.write_text(context.current_source)
                 command = [
                     "codex",
                     "exec",
@@ -257,7 +368,13 @@ class CodexCandidateProvider:
                         + " | ".join(diagnostics[-8:])
                     )
                 source = candidate_path.read_text()
-                metadata = _read_candidate_metadata(metadata_path)
+                if original_path.read_text() != context.current_source:
+                    raise RuntimeError("candidate generator modified immutable original.py")
+                metadata = _read_candidate_metadata(
+                    metadata_path,
+                    source=source,
+                    original_source=context.current_source,
+                )
         except FileNotFoundError as error:
             raise RuntimeError(
                 "codex binary not found; install it or use --provider mock"
@@ -291,9 +408,11 @@ def _target_skill_paths(target: KernelTarget) -> tuple[Path, ...]:
     if backend not in {"cuda", "nvidia"}:
         return tuple(skills)
     architecture = target.architecture.strip().lower()
-    skills.append(_ASYNC_TMA_OUTPUT_SKILL)
+    skills.extend((_ASYNC_TMA_OUTPUT_SKILL, _NVIDIA_WARP_BARRIER_SKILL))
     if architecture in _BLACKWELL_ARCHITECTURES:
-        skills.extend((_BLACKWELL_CLC_SKILL, _BLACKWELL_PIPELINE_SKILL))
+        skills.append(_BLACKWELL_CLC_SKILL)
+    if architecture in _PERSISTENT_PIPELINE_ARCHITECTURES:
+        skills.append(_NVIDIA_PERSISTENT_PIPELINE_SKILL)
     return tuple(skills)
 
 
