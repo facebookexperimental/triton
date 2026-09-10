@@ -62,6 +62,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm",
+        arch="gfx950",
+        variant="local_split_u",
+        impl="kernels.mm.gfx950:mm",
+        # Deliberately not `_FP16`: that shared set also contains bfloat16,
+        # while this first gfx950 implementation has only been validated for
+        # IEEE fp16 operands.
+        dtypes=frozenset({"float16"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",

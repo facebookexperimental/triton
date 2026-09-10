@@ -72,7 +72,14 @@ GFX942_FOCUS: list[list] = [
     [1024, 6144, 4096, (4096, 1), (6144, 1), "fp16"],
 ]
 
-ALL: list[list] = _union(SYNTHETIC, SM100_FOCUS, GFX942_FOCUS)
+GFX950_FOCUS: list[list] = [
+    [7, 8192, 2048, (2048, 1), (1, 2048), "fp16"],
+    [7, 2048, 4096, (4096, 1), (1, 4096), "fp16"],
+]
+
+ALL: list[list] = _union(
+    SYNTHETIC, SM100_FOCUS, GFX942_FOCUS, GFX950_FOCUS
+)
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):
