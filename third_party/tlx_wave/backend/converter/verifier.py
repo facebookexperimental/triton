@@ -1464,6 +1464,8 @@ def _verify_memory_edges(op, target_program):
             )
         ordinary_count = (2 + int(bool(attrs.get("has_mask", False))) +
                           int(bool(attrs.get("has_other", False))) if op.kind == "buffer_load" else 3 +
+                          int(bool(attrs.get("has_mask", False))) +
+                          int(bool(attrs.get("has_other", False))) if op.kind == "buffer_load_to_local" else 3 +
                           int(bool(attrs.get("has_mask", False))))
         dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
         if op.kind == "buffer_load_to_local":
