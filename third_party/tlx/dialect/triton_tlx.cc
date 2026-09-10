@@ -145,9 +145,9 @@ static Value createRequireLayout(TritonOpBuilder &self, Value value,
     SmallVector<int64_t> allocShape(type.getAllocShape());
     if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
       allocShape.assign(type.getShape().begin(), type.getShape().end());
-    newType = ttg::MemDescType::get(
-        type.getShape(), type.getElementType(), encoding,
-        type.getMemorySpace(), type.getMutableMemory(), allocShape);
+    newType = ttg::MemDescType::get(type.getShape(), type.getElementType(),
+                                    encoding, type.getMemorySpace(),
+                                    type.getMutableMemory(), allocShape);
   } else if (auto type = dyn_cast<RankedTensorType>(value.getType())) {
     Attribute tensorEncoding = encoding;
     if (pin)
@@ -531,32 +531,31 @@ void init_triton_tlx_ir(py::module_ &m) {
              // treats it as a user-pinned (do-not-retag) buffer layout.
              return tlx::wrapUserLayout(inner);
            })
-      .def("make_padded_shared_encoding_attr",
-           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
-              std::vector<unsigned> paddings, std::vector<unsigned> order,
-              std::vector<int64_t> shape, std::vector<unsigned> CTAsPerCGA,
-              std::vector<unsigned> CTASplitNum,
-              std::vector<unsigned> CTAOrder) {
-             assert(intervals.size() == paddings.size() &&
-                    "intervals/paddings size mismatch");
-             assert(order.size() == shape.size() &&
-                    "order/shape rank mismatch");
-             assert(order.size() == CTAsPerCGA.size() &&
-                    "CTAsPerCGA rank mismatch");
-             assert(order.size() == CTASplitNum.size() &&
-                    "CTASplitNum rank mismatch");
-             assert(order.size() == CTAOrder.size() &&
-                    "CTAOrder rank mismatch");
-             auto context = self.getBuilder().getContext();
-             llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
-             intervalPads.reserve(intervals.size());
-             for (auto [i, p] : llvm::zip(intervals, paddings))
-               intervalPads.emplace_back(i, p);
-             auto CTALayout =
-                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
-                 context, intervalPads, order, shape, CTALayout));
-           })
+      .def(
+          "make_padded_shared_encoding_attr",
+          [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+             std::vector<unsigned> paddings, std::vector<unsigned> order,
+             std::vector<int64_t> shape, std::vector<unsigned> CTAsPerCGA,
+             std::vector<unsigned> CTASplitNum,
+             std::vector<unsigned> CTAOrder) {
+            assert(intervals.size() == paddings.size() &&
+                   "intervals/paddings size mismatch");
+            assert(order.size() == shape.size() && "order/shape rank mismatch");
+            assert(order.size() == CTAsPerCGA.size() &&
+                   "CTAsPerCGA rank mismatch");
+            assert(order.size() == CTASplitNum.size() &&
+                   "CTASplitNum rank mismatch");
+            assert(order.size() == CTAOrder.size() && "CTAOrder rank mismatch");
+            auto context = self.getBuilder().getContext();
+            llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+            intervalPads.reserve(intervals.size());
+            for (auto [i, p] : llvm::zip(intervals, paddings))
+              intervalPads.emplace_back(i, p);
+            auto CTALayout =
+                makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+            return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                context, intervalPads, order, shape, CTALayout));
+          })
       .def("make_padded_shared_encoding_attr_with_bases",
            [](TritonOpBuilder &self, std::vector<unsigned> intervals,
               std::vector<unsigned> paddings,
@@ -648,8 +647,7 @@ void init_triton_tlx_ir(py::module_ &m) {
                  ttg::SliceEncodingAttr::get(ctx, dim, parent));
            })
       .def("make_distributed_linear_encoding_attr",
-           [](TritonOpBuilder &self,
-              std::vector<std::vector<int32_t>> regBases,
+           [](TritonOpBuilder &self, std::vector<std::vector<int32_t>> regBases,
               std::vector<std::vector<int32_t>> laneBases,
               std::vector<std::vector<int32_t>> warpBases,
               std::vector<std::vector<int32_t>> blockBases,
@@ -672,25 +670,24 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(
                  ttg::GenericLinearEncodingAttr::get(ctx, std::move(ll)));
            })
-      .def(
-          "make_padded_shared_encoding_attr_from_offsets",
-          [](TritonOpBuilder &self, std::vector<unsigned> intervals,
-             std::vector<unsigned> paddings,
-             std::vector<std::vector<int32_t>> offsetBases,
-             std::vector<std::vector<int32_t>> blockBases,
-             std::vector<int64_t> shape) -> Attribute {
-            assert(intervals.size() == paddings.size() &&
-                   "intervals/paddings size mismatch");
-            auto ctx = self.getBuilder().getContext();
-            auto rank = shape.size();
-            auto kOffset = mlir::StringAttr::get(ctx, "offset");
-            auto kBlock = mlir::StringAttr::get(ctx, "block");
-            auto outDims = tt::standardOutDimNames(ctx, rank);
-            auto ll = tt::LinearLayout({{kOffset, offsetBases}}, outDims) *
-                      tt::LinearLayout({{kBlock, blockBases}}, outDims);
-            return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
-                ctx, intervals, paddings, std::move(ll)));
-          })
+      .def("make_padded_shared_encoding_attr_from_offsets",
+           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases,
+              std::vector<int64_t> shape) -> Attribute {
+             assert(intervals.size() == paddings.size() &&
+                    "intervals/paddings size mismatch");
+             auto ctx = self.getBuilder().getContext();
+             auto rank = shape.size();
+             auto kOffset = mlir::StringAttr::get(ctx, "offset");
+             auto kBlock = mlir::StringAttr::get(ctx, "block");
+             auto outDims = tt::standardOutDimNames(ctx, rank);
+             auto ll = tt::LinearLayout({{kOffset, offsetBases}}, outDims) *
+                       tt::LinearLayout({{kBlock, blockBases}}, outDims);
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 ctx, intervals, paddings, std::move(ll)));
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
@@ -1651,21 +1648,6 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_warp_return_op",
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpReturnOp>();
-           })
-      .def(
-          "create_warp_predicate_op",
-          [](TritonOpBuilder &self, std::vector<Type> &resultTypes,
-             Value predicate, std::vector<Value> &inits,
-             bool waveUniform) -> Operation * {
-            UnitAttr waveUniformAttr =
-                waveUniform ? self.getBuilder().getUnitAttr() : UnitAttr();
-            return self.create<ttg::WarpPredicateOp>(resultTypes, predicate,
-                                                     inits, waveUniformAttr);
-          },
-          py::rv_policy::reference)
-      .def("create_predicate_yield_op",
-           [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
-             self.create<ttg::PredicateYieldOp>(values);
            })
       .def("create_async_load",
            [](TritonOpBuilder &self, Value ptrTensor, Value result,
