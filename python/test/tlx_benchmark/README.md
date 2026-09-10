@@ -74,6 +74,12 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
 3. Additional stats: samples, CV%, p50, p95, p99 (all based on TFLOP/s)
 4. Op-specific columns, if the op declared any (see below)
 5. status: ok/pip/noisy/error/...
+6. best config: the config each autotuned kernel the case launched actually ran,
+   abbreviated (`BM=` for `BLOCK_M`/`BLOCK_SIZE_M`, `w`/`s` for warps/stages).
+   With a single-config space that is the shape-picked config; otherwise it is
+   the autotune winner. An op launching several autotuned kernels gets one entry
+   per kernel, `name: config` separated by `|`; a kernel that is not autotuned
+   reports `-`. Recorded by the harness, so every op has the column.
 
 ### Common vs op-specific metrics
 

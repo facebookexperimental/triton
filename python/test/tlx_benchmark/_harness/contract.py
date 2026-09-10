@@ -137,6 +137,10 @@ class Result:
     t_cold_s: Optional[float] = None
     t_compile_single_s: Optional[float] = None
     n_configs: Optional[int] = None
+    #: The config the launch actually ran, as a compact string. Without it a
+    #: number cannot be reproduced or attributed: two runs of the same shape at
+    #: `space="full"` may land on different tiles.
+    best_config: Optional[str] = None
     #: Free-text, carried into the failure message and the artifact.
     notes: list = dataclasses.field(default_factory=list)
     #: Op-specific derived metrics, JSON-serializable. The dividing line against
@@ -160,6 +164,7 @@ class Result:
             "t_cold_s": self.t_cold_s,
             "t_compile_single_s": self.t_compile_single_s,
             "n_configs": self.n_configs,
+            "best_config": self.best_config,
             "notes": list(self.notes),
             "extra": dict(self.extra),
         }
