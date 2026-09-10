@@ -440,6 +440,46 @@ static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
   return cache;
 }
 
+std::string getElementTypeName(Type type);
+
+// Casts that change a value's element type. These are user-visible in TLX --
+// the kernel wrote `x.to(dtype)` -- unlike the width/index casts below.
+static const llvm::StringSet<> elementTypeCastOps = {
+    "arith.extf",   "arith.truncf", "arith.sitofp",
+    "arith.uitofp", "arith.fptosi", "arith.fptoui",
+};
+
+
+// Element types getElementTypeName can spell as a TLX dtype. Anything else it
+// renders as raw MLIR, which is not usable in emitted Python.
+static bool isNameableElementType(Type type) {
+  return type.isF32() || type.isF16() || type.isBF16() || type.isF64() ||
+         type.isInteger(1) || type.isInteger(8) || type.isInteger(16) ||
+         type.isInteger(32) || type.isInteger(64) ||
+         isa<Float8E4M3FNType, Float8E4M3FNUZType, Float8E5M2Type,
+             Float8E5M2FNUZType>(type);
+}
+
+// Element type of a tensor, or the type itself for a scalar.
+static Type getElementType(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    return tensorType.getElementType();
+  return type;
+}
+
+// Whether an emitted expression names a value `.to(...)` can be called on.
+// The keyword literals lex as identifiers but are not tensors, so they take
+// the tl.cast path with the other inlined constants.
+static bool isPythonIdentifier(StringRef s) {
+  if (s.empty() || isdigit(static_cast<unsigned char>(s[0])))
+    return false;
+  if (s == "True" || s == "False" || s == "None")
+    return false;
+  return llvm::all_of(s, [](char c) {
+    return isalnum(static_cast<unsigned char>(c)) || c == '_';
+  });
+}
+
 // Get simplified name for a value (just the SSA name)
 // If argSubstitutionMap is provided, substitute block args with their mapped
 // values
@@ -487,6 +527,41 @@ getValueName(Value v,
       return "None";
     }
 
+    // An element-type cast is user-visible -- the kernel wrote `x.to(dtype)` --
+    // so unlike the layout-only casts below it is re-emitted, inline at each use.
+    if (elementTypeCastOps.contains(defOp->getName().getStringRef()) &&
+        defOp->getNumOperands() > 0) {
+      Type resultType = v.getType();
+      if (auto tensorType = dyn_cast<RankedTensorType>(resultType))
+        resultType = tensorType.getElementType();
+      // Only spell the cast when the dtype has a TLX name. getElementTypeName
+      // otherwise falls back to raw MLIR (`f8E4M3FN`), which is not a Triton
+      // dtype; leave those to the transparent list below rather than emit a
+      // call that cannot compile.
+      if (isNameableElementType(resultType)) {
+        std::string operand = getValueName(defOp->getOperand(0),
+                                           argSubstitutionMap, inlineConstants);
+        std::string dtype = getElementTypeName(resultType);
+        // `.to` is a method on a tensor, so it only works when the operand
+        // names one: an inlined constant reaches here as a Python literal and
+        // `(0).to(tl.float32)` raises AttributeError at kernel compile time.
+        // tl.cast accepts those, with one exception -- ub.poison prints as
+        // `None`, which tl.cast rejects outright. That value is undefined, so
+        // erasing its cast (below) costs nothing.
+        if (operand == "None") {
+          // fall through to the transparent list
+        } else if (!isPythonIdentifier(operand)) {
+          return "tl.cast(" + operand + ", " + dtype + ")";
+        } else {
+          return operand + ".to(" + dtype + ")";
+        }
+      }
+    }
+
+    // Layout- and shape-only ops, plus the width/index casts Triton leaves
+    // implicit. The float element-type casts are still listed: the block above
+    // intercepts them whenever their dtype is nameable, so reaching one here
+    // means it is not, and erasing it beats emitting an uncompilable dtype.
     static const llvm::StringSet<> transparentOps = {
         "ttg.convert_layout", "arith.extui",   "arith.extsi",
         "arith.extf",         "arith.trunci",  "arith.truncf",
@@ -639,6 +714,15 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
 
 // Get element type name as a simple string
 std::string getElementTypeName(Type type) {
+  // Mirrors the builder types in python/src/ir.cc (get_fp8e4nv_ty etc).
+  if (isa<Float8E4M3FNType>(type))
+    return "tl.float8e4nv";
+  if (isa<Float8E4M3FNUZType>(type))
+    return "tl.float8e4b8";
+  if (isa<Float8E5M2Type>(type))
+    return "tl.float8e5";
+  if (isa<Float8E5M2FNUZType>(type))
+    return "tl.float8e5b16";
   if (type.isF32())
     return "tl.float32";
   if (type.isF16())
@@ -868,6 +952,26 @@ static Value resolveThroughCasts(Value v) {
       v = op->getOperand(0);
     else
       break;
+  }
+  return v;
+}
+
+// As above, but stops at an element-type cast. The store paths use this to
+// decide whether to append a dtype cast: getValueName already spells those
+// casts, so walking past one reports the pre-cast dtype and the store appends
+// a second, redundant `.to(...)`.
+static Value resolveThroughNonElementCasts(Value v) {
+  while (auto *op = v.getDefiningOp()) {
+    StringRef name = op->getName().getStringRef();
+    if (!castOpsSet.contains(name) || op->getNumOperands() == 0)
+      break;
+    // Stop only where getValueName actually spells the cast. An element cast
+    // to a dtype TLX cannot name is erased there, so walking past it here
+    // keeps the two in agreement and lets the store re-add the conversion.
+    if (elementTypeCastOps.contains(name) &&
+        isNameableElementType(getElementType(v.getType())))
+      break;
+    v = op->getOperand(0);
   }
   return v;
 }
@@ -1575,7 +1679,7 @@ void printSimplifiedOp(
 
     // Check if transparent ops resolve the source name to a different-dtype
     // value. Resolve through casts to find the actual Python-level type.
-    Value resolvedSrc = resolveThroughCasts(src);
+    Value resolvedSrc = resolveThroughNonElementCasts(src);
     Type dstElemType;
     Type resolvedSrcElemType;
     if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
@@ -1600,7 +1704,7 @@ void printSimplifiedOp(
     Value src = op->getOperand(1);
     std::string srcName = getValueName(src, argSubstitutionMap);
 
-    Value resolvedSrc = resolveThroughCasts(src);
+    Value resolvedSrc = resolveThroughNonElementCasts(src);
     Type dstElemType;
     Type resolvedSrcElemType;
     if (auto dstMemType = dyn_cast<ttg::MemDescType>(dst.getType()))
