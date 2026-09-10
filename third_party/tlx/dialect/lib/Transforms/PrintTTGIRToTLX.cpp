@@ -2060,6 +2060,35 @@ void printSimplifiedOp(
     return;
   }
 
+  // Both take their tokens as a list, and async_wait carries its outstanding-
+  // group count in the `num` attribute rather than as an operand.
+  if (opName == "ttg.async_commit_group" || opName == "ttg.async_wait") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    bool isWait = opName == "ttg.async_wait";
+    os << (isWait ? "tlx.async_load_wait_group("
+                  : "tlx.async_load_commit_group(");
+    if (isWait) {
+      auto num = op->getAttrOfType<IntegerAttr>("num");
+      os << (num ? num.getInt() : 0);
+      // The tokens list is optional; omit it entirely when there are none.
+      if (op->getNumOperands() > 0)
+        os << ", ";
+    }
+    if (!isWait || op->getNumOperands() > 0) {
+      os << "[";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        if (i > 0)
+          os << ", ";
+        os << getValueName(op->getOperand(i), argSubstitutionMap);
+      }
+      os << "]";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // llvm.intr.assume is a tl.assume from the source kernel.
   if (opName == "llvm.intr.assume" && op->getNumOperands() == 1) {
     os << "tl.assume(" << getValueName(op->getOperand(0), argSubstitutionMap)
