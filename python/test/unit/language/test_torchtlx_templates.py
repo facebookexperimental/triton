@@ -611,6 +611,132 @@ class TestWarpPipeSplitKCodegen(TestCase):
         self.assertIn("store_output", nosplit)
 
 
+class TestWarpPipeLDSBudget(TestCase):
+    """LDS-budget validation for the AMD warp-pipe tile pools.
+
+    The ROCm heuristics register for all of ROCm but ship gfx950-sized tiles,
+    so every candidate is checked against the live target's LDS budget and
+    gfx942 gets its own pool. These tests pin the budget (and the arch probe)
+    via mock instead of reading a GPU, so they run on any host.
+    """
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_estimate_matches_documented_budgets(self):
+        """Cross-check against the hand-verified figures on WARPPIPE_CONFIGS."""
+        from triton.language.extra.tlx.inductor.registry import (
+            _warppipe_tile_lds_estimate, )
+
+        for block_m, block_n, block_k, num_buffers, want_kb in (
+            (128, 256, 64, 2, 96),
+            (128, 256, 32, 3, 72),
+            (128, 256, 64, 3, 144),
+        ):
+            self.assertEqual(
+                _warppipe_tile_lds_estimate(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_buffers,
+                    elem_bytes=2,
+                    use_async=True,
+                ),
+                want_kb * 1024,
+                f"({block_m}x{block_n}x{block_k}, NB{num_buffers})",
+            )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_register_path_allocates_no_lds(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            _warppipe_tile_lds_estimate, )
+
+        self.assertEqual(
+            _warppipe_tile_lds_estimate(
+                128, 256, 64, 3, elem_bytes=2, use_async=False
+            ),
+            0,
+        )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_gfx942_pools_fit_64kb_with_margin(self):
+        """Every gfx942-pool entry fits the 64KB budget once the margin is charged."""
+        from triton.language.extra.tlx.inductor import registry
+        from triton.language.extra.tlx.inductor.registry import (
+            ADDMM_WARPPIPE_CONFIGS_BY_ARCH,
+            BMM_WARPPIPE_CONFIGS_BY_ARCH,
+            _warppipe_tile_fits,
+        )
+
+        pools = (
+            ADDMM_WARPPIPE_CONFIGS_BY_ARCH["gfx942"],
+            BMM_WARPPIPE_CONFIGS_BY_ARCH["gfx942"],
+        )
+        self.assertTrue(all(pools), "gfx942 pools must be non-empty")
+        with mock.patch.object(registry, "_amd_lds_budget_bytes", return_value=65536):
+            for pool in pools:
+                for block_m, block_n, block_k, _gm, _nw, num_buffers in pool:
+                    self.assertTrue(
+                        _warppipe_tile_fits(
+                            block_m,
+                            block_n,
+                            block_k,
+                            num_buffers,
+                            elem_bytes=2,
+                            use_async=True,
+                        ),
+                        f"gfx942 tile ({block_m}x{block_n}x{block_k}, "
+                        f"NB{num_buffers}) exceeds the 64KB LDS budget",
+                    )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_oversized_default_tiles_rejected_on_64kb(self):
+        """gfx950-sized tiles needing 72-144KB are dropped on a 64KB budget."""
+        from triton.language.extra.tlx.inductor import registry
+        from triton.language.extra.tlx.inductor.registry import _warppipe_tile_fits
+
+        with mock.patch.object(registry, "_amd_lds_budget_bytes", return_value=65536):
+            for block_m, block_n, block_k, num_buffers in (
+                (128, 256, 32, 3),  # 72KB
+                (128, 256, 64, 2),  # 96KB
+                (128, 256, 64, 3),  # 144KB
+            ):
+                self.assertFalse(
+                    _warppipe_tile_fits(
+                        block_m,
+                        block_n,
+                        block_k,
+                        num_buffers,
+                        elem_bytes=2,
+                        use_async=True,
+                    ),
+                    f"({block_m}x{block_n}x{block_k}, NB{num_buffers}) "
+                    "should not fit a 64KB LDS budget",
+                )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_configs_for_selects_pool_per_target(self):
+        from triton.language.extra.tlx.inductor import registry
+        from triton.language.extra.tlx.inductor.registry import (
+            ROCmAddMMWarpPipeTemplateConfigHeuristic as AddMMH,
+            ROCmBMMWarpPipeTemplateConfigHeuristic as BMMH,
+            _warppipe_configs_for,
+        )
+
+        for heuristic in (AddMMH, BMMH):
+            with mock.patch.object(registry, "_amd_arch_key", return_value="gfx942"):
+                self.assertIs(
+                    _warppipe_configs_for(heuristic),
+                    heuristic.WARPPIPE_CONFIGS_BY_ARCH["gfx942"],
+                )
+            # An arch absent from the table (or no visible GPU) falls back to
+            # the default pool; _warppipe_tile_fits then narrows it per tile.
+            for key in ("gfx950", ""):
+                with mock.patch.object(registry, "_amd_arch_key", return_value=key):
+                    self.assertIs(
+                        _warppipe_configs_for(heuristic),
+                        heuristic.WARPPIPE_CONFIGS,
+                    )
+
+
 class TestInterleaveEpilogue(TestCase):
     """Test that INTERLEAVE_EPILOGUE produces correct results and interleaved stores."""
 
