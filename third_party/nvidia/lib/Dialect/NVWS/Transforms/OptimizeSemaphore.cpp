@@ -553,22 +553,17 @@ void combineProducerSide(ArrayRef<SemaToCombineInfo> infos,
 
 void eraseSemaToCombineGroup(ArrayRef<SemaphoreAcquireOp> acquireGroup,
                              ArrayRef<SemaToCombineInfo> infos) {
-  for (auto info : infos)
+  // Erase token users before acquires, and semaphore users before creates.
+  for (auto [acquireOp, info] : llvm::zip_equal(acquireGroup, infos)) {
     info.consReleaseOp->erase();
-  for (auto info : infos)
     info.consBufferOp->erase();
-  for (auto acquireOp : acquireGroup)
     acquireOp->erase();
-  for (auto info : infos)
     info.prodReleaseOp->erase();
-  for (auto info : infos)
     info.prodBufferOp->erase();
-  for (auto info : infos)
     info.prodAcquireOp->erase();
-  for (auto info : infos)
     info.fullSema->erase();
-  for (auto info : infos)
     info.emptySema->erase();
+  }
 }
 
 LogicalResult combineSemaphores(scf::ForOp loop) {
