@@ -505,8 +505,8 @@ def test_arch_matches_the_part():
     # "GB200" contains "B200"; both map to sm100, but the longer key must win so
     # the table stays correct if they ever diverge.
     assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
-    # No entry yet -- None, not a guess. bench_mm turns this into a skip.
-    assert Device(AMD, 0, "MI350X").arch is None
+    assert Device(AMD, 0, "MI350X").arch == "gfx950"
+    assert Device(AMD, 0, "MI355X").arch == "gfx950"
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):

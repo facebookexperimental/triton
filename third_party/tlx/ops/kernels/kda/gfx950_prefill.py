@@ -24,6 +24,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import tlx
 
+from ._shapes import GFX950_PREFILL_FOCUS
+
+#: Shapes reported by ``bench_kda_prefill.py`` for this architecture.
+PERF_SHAPES = GFX950_PREFILL_FOCUS
+
 CHUNK_SIZE = 64
 SUBCHUNK_SIZE = 16
 _KEY_DIM = 128

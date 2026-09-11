@@ -11,7 +11,8 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `mm`, `flash_attn`, `hstu_attn`, `kda`.
+`{op}` is one of `mm`, `flash_attn`, `hstu_attn`, `kda`, `kda_prefill`,
+`kda_decode`.
 
 ```
 options:
@@ -47,6 +48,8 @@ options:
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
+| `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
+| `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
 
 Only `mm` has a `heuristic_config`, so it is the only op whose default is a
 single analytically chosen config. The rest autotune a full space on their first

@@ -19,6 +19,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import tlx
 
+from ._shapes import GFX950_DECODE_FOCUS
+
+#: Shapes reported by ``bench_kda_decode.py`` for this architecture.
+PERF_SHAPES = GFX950_DECODE_FOCUS
+
 
 @triton.jit
 def _kda_recurrent_decode_kernel(

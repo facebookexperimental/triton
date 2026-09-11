@@ -18,6 +18,33 @@ SM100_FOCUS: list[list] = [
     [8, 2048, 8, 128, "bf16"],
 ]
 
+#: Prepared-input gfx950 prefill shapes: total tokens, sequences, H, K, V, dtype.
+GFX950_PREFILL_SYNTHETIC: list[list] = [
+    [64, 1, 4, 128, 128, "bf16"],
+]
+
+GFX950_PREFILL_FOCUS: list[list] = [
+    [4096, 1, 4, 128, 128, "bf16"],
+    [4096, 4, 4, 128, 128, "bf16"],
+    [131072, 1, 4, 128, 128, "bf16"],
+    [131072, 8, 4, 128, 128, "bf16"],
+    [4096, 1, 12, 128, 128, "bf16"],
+    [4096, 4, 12, 128, 128, "bf16"],
+    [131072, 1, 12, 128, 128, "bf16"],
+    [131072, 8, 12, 128, 128, "bf16"],
+]
+
+#: Indexed one-token gfx950 decode shapes: batch, H, K, V, dtype.
+GFX950_DECODE_SYNTHETIC: list[list] = [
+    [1, 4, 128, 128, "bf16"],
+]
+
+GFX950_DECODE_FOCUS: list[list] = [
+    [batch, heads, 128, 128, "bf16"]
+    for heads in (4, 12)
+    for batch in (1, 2, 4, 8, 16, 32)
+]
+
 #: Chunk length the kernel works in. Used only by `flops`.
 CHUNK = 64
 
