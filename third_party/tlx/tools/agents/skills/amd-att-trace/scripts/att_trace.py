@@ -323,6 +323,8 @@ def package_bundle(root: Path, archive: Path | None) -> dict[str, Any]:
     root = root.resolve()
     validation = validate_bundle(root)
     destination = (archive.expanduser().resolve() if archive is not None else root.with_name(root.name + ".tar.gz"))
+    if destination == root or root in destination.parents:
+        raise AttError(f"archive must be outside trace root: {destination}")
     if destination.exists():
         raise AttError(f"refusing to overwrite archive: {destination}")
     with tarfile.open(destination, "w:gz") as output:
