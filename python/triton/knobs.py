@@ -745,3 +745,9 @@ def refresh_knobs():
     runtime.debug = env_bool("TRITON_DEBUG").get()
     runtime.sanitize_overflow = env_bool("TRITON_SANITIZE_OVERFLOW").get()
     compilation.instrumentation_mode = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
+
+
+# TEST-ONLY (@no-commit): intentional pre-commit violations to exercise the strict workflow.
+def _test_precommit_violation():
+    unused_test_variable = 1  
+    return None
