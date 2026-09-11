@@ -1,5 +1,5 @@
-"""MI300X (gfx942 / CDNA3) GEMM -- the `tlx.ops.mm` implementation.
-"""
+"""MI300X (gfx942 / CDNA3) GEMM -- the `tlx.ops.mm` implementation."""
+
 import functools
 import os
 
@@ -13,7 +13,7 @@ from ._shapes import GFX942_FOCUS
 #: of every arch's list; perf runs only its own.
 PERF_SHAPES = GFX942_FOCUS
 
-# MI300X: 8 XCDs, 304 CUs. Consecutive program ids are dispatched round-robin
+# MI300X has 8 XCDs. Consecutive program ids are dispatched round-robin
 # across the XCDs, so the remap below undoes that to restore tile locality.
 NUM_XCDS = 8
 
@@ -29,8 +29,7 @@ CDNA3_LDS_BYTES = 64 * 1024
 
 @triton.jit
 def _xcd_remap(pid, grid_mn, num_xcds: tl.constexpr):
-    """Undo the hardware's round-robin XCD dispatch of consecutive program ids.
-    """
+    """Undo the hardware's round-robin XCD dispatch of consecutive program ids."""
     pids_per_xcd = (grid_mn + num_xcds - 1) // num_xcds
     tall_xcds = grid_mn % num_xcds
     tall_xcds = num_xcds if tall_xcds == 0 else tall_xcds
@@ -43,8 +42,7 @@ def _xcd_remap(pid, grid_mn, num_xcds: tl.constexpr):
 
 @triton.jit
 def _xcd_chunk_remap(pid, grid_mn, num_xcds: tl.constexpr, chunk: tl.constexpr):
-    """`_xcd_remap`, but striping `chunk` tiles at a time instead of one slice each.
-    """
+    """`_xcd_remap`, but striping `chunk` tiles at a time instead of one slice each."""
     aligned = (grid_mn // (num_xcds * chunk)) * (num_xcds * chunk)
     if pid < aligned:
         xcd = pid % num_xcds
@@ -76,18 +74,33 @@ def matmul_kernel_gfx942(
     EVEN_K: tl.constexpr,
     PEEL_K_TAIL: tl.constexpr,
     ALIGN_ROWS: tl.constexpr,
+    SPLIT_M_SIZE: tl.constexpr,
+    SPLIT_N_SIZE: tl.constexpr,
+    SPLIT_K_SIZE: tl.constexpr,
+    SPLIT_STRIDE_AM: tl.constexpr,
+    SPLIT_STRIDE_AK: tl.constexpr,
+    SPLIT_STRIDE_BK: tl.constexpr,
+    SPLIT_STRIDE_BN: tl.constexpr,
+    SPLIT_STRIDE_CM: tl.constexpr,
+    SPLIT_STRIDE_CN: tl.constexpr,
+    SPLIT_M_128_32: tl.constexpr = False,
 ):
     """C = A @ B, register-staged; the compiler pipelines global -> LDS -> MFMA."""
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
+    if not SPLIT_M_128_32:
+        tl.assume(stride_am > 0)
+        tl.assume(stride_ak > 0)
+        tl.assume(stride_bk > 0)
+        tl.assume(stride_bn > 0)
+        tl.assume(stride_cm > 0)
+        tl.assume(stride_cn > 0)
 
     pid = tl.program_id(0).to(tl.int32)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    if SPLIT_M_128_32:
+        num_pid_m: tl.constexpr = tl.cdiv(SPLIT_M_SIZE, BLOCK_M)
+        num_pid_n: tl.constexpr = tl.cdiv(SPLIT_N_SIZE, BLOCK_N)
+    else:
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
     if NUM_XCDS != 1:
         pid = _xcd_chunk_remap(pid, num_pid_m * num_pid_n, NUM_XCDS, XCD_CHUNK)
 
@@ -97,52 +110,88 @@ def matmul_kernel_gfx942(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
+    if not SPLIT_M_128_32:
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
 
-    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
-    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
-    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
-    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
-    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+    if SPLIT_M_128_32:
+        # Triton tensor dimensions must be powers of two.  Represent BM=160 as
+        # two compile-time panels while sharing the same B tile and K loop.
+        tl.static_assert(BLOCK_M == 160)
+        tl.static_assert(EVEN_K)
+        base_m = pid_m * BLOCK_M
+        base_n = pid_n * BLOCK_N
+        offs_m0 = (base_m + tl.arange(0, 128).to(tl.int32)) % SPLIT_M_SIZE
+        offs_m1 = (base_m + 128 + tl.arange(0, 32).to(tl.int32)) % SPLIT_M_SIZE
+        offs_n = (base_n + tl.arange(0, BLOCK_N).to(tl.int32)) % SPLIT_N_SIZE
+        offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc0 = tl.zeros((128, BLOCK_N), dtype=tl.float32)
+        acc1 = tl.zeros((32, BLOCK_N), dtype=tl.float32)
+        for k in range(0, SPLIT_K_SIZE, BLOCK_K):
+            b = tl.load(b_ptr + (k + offs_k[:, None]) * SPLIT_STRIDE_BK + offs_n[None, :] * SPLIT_STRIDE_BN)
+            a0 = tl.load(a_ptr + offs_m0[:, None] * SPLIT_STRIDE_AM + (k + offs_k[None, :]) * SPLIT_STRIDE_AK)
+            a1 = tl.load(a_ptr + offs_m1[:, None] * SPLIT_STRIDE_AM + (k + offs_k[None, :]) * SPLIT_STRIDE_AK)
+            acc0 = tl.dot(a0, b, acc0, out_dtype=tl.float32)
+            acc1 = tl.dot(a1, b, acc1, out_dtype=tl.float32)
 
-    if PEEL_K_TAIL:
-        # Apply mask on tail K tile only
-        k_main = K if EVEN_K else (K // BLOCK_K) * BLOCK_K
-        for k in range(0, k_main, BLOCK_K):
-            a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
-            acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc, out_dtype=tl.float32)
-
-        if not EVEN_K:
-            a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
-            tail = offs_k < K - k_main
-            a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
-            b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
-            acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+        rows0 = base_m + tl.arange(0, 128).to(tl.int32)
+        rows1 = base_m + 128 + tl.arange(0, 32).to(tl.int32)
+        cols = base_n + tl.arange(0, BLOCK_N).to(tl.int32)
+        tl.store(
+            c_ptr + rows0[:, None] * SPLIT_STRIDE_CM + cols[None, :] * SPLIT_STRIDE_CN,
+            acc0.to(c_ptr.dtype.element_ty),
+            mask=(rows0[:, None] < SPLIT_M_SIZE) & (cols[None, :] < SPLIT_N_SIZE),
+        )
+        tl.store(
+            c_ptr + rows1[:, None] * SPLIT_STRIDE_CM + cols[None, :] * SPLIT_STRIDE_CN,
+            acc1.to(c_ptr.dtype.element_ty),
+            mask=(rows1[:, None] < SPLIT_M_SIZE) & (cols[None, :] < SPLIT_N_SIZE),
+        )
     else:
-        # This else-branch is just for illustration purposes and should NEVER be invoked
-        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-            k = k_idx * BLOCK_K
-            a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
-            if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs)
-            else:
-                tail = offs_k < K - k
+        offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
+        offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
+        offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+        offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+        offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        if PEEL_K_TAIL:
+            # Apply mask on tail K tile only
+            k_main = K if EVEN_K else (K // BLOCK_K) * BLOCK_K
+            for k in range(0, k_main, BLOCK_K):
+                a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+                b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+                acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc, out_dtype=tl.float32)
+
+            if not EVEN_K:
+                a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
+                b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+                tail = offs_k < K - k_main
                 a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
                 b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
-            acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+                acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+        else:
+            # This else-branch is just for illustration purposes and should NEVER be invoked
+            for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+                k = k_idx * BLOCK_K
+                a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+                b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+                if EVEN_K:
+                    a = tl.load(a_ptrs)
+                    b = tl.load(b_ptrs)
+                else:
+                    tail = offs_k < K - k
+                    a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
+                    b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
+                acc = tl.dot(a, b, acc, out_dtype=tl.float32)
 
-    c = acc.to(c_ptr.dtype.element_ty)
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+        c = acc.to(c_ptr.dtype.element_ty)
+        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
 def lds_bytes(block_m, block_n, block_k, num_buffers, elem_bytes=2):
@@ -157,17 +206,20 @@ K tile with MFMA on the current tile
 _NUM_STAGES = 2
 
 
-def _config(block_m, block_n, block_k, group_m, num_warps):
+def _config(block_m, block_n, block_k, group_m, num_warps, xcd_chunk=XCD_CHUNK, split_m_128_32=False):
+    meta = {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "GROUP_M": group_m,
+        "NUM_XCDS": NUM_XCDS,
+        "XCD_CHUNK": xcd_chunk,
+        "waves_per_eu": 0,
+    }
+    if split_m_128_32:
+        meta["SPLIT_M_128_32"] = True
     return triton.Config(
-        {
-            "BLOCK_M": block_m,
-            "BLOCK_N": block_n,
-            "BLOCK_K": block_k,
-            "GROUP_M": group_m,
-            "NUM_XCDS": NUM_XCDS,
-            "XCD_CHUNK": XCD_CHUNK,
-            "waves_per_eu": 0,
-        },
+        meta,
         num_warps=num_warps,
         num_stages=_NUM_STAGES,
     )
@@ -235,7 +287,7 @@ def heuristic_config(M, N, K):
     elif shape in [
         (2048, 10240, 25408),
     ]:
-        return [_config(128, 128, 32, 16, 4)]
+        return [_config(160, 512, 32, 8, 8, xcd_chunk=8, split_m_128_32=True)]
     elif shape in [
         (1024, 6144, 4096),
     ]:
@@ -323,8 +375,10 @@ def mm(a, b, *, space="heuristic"):
     M, K = a.shape
     K, N = b.shape
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    split_m_128_32 = space == "heuristic" and (M, N, K) == (2048, 10240, 25408)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )  # noqa: E731
+    total_tiles = lambda META: triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"])
+    grid = lambda META: (total_tiles(META), )
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
     kernel[grid](
         a,
@@ -343,6 +397,17 @@ def mm(a, b, *, space="heuristic"):
         # Host-side only, but carried as constexpr metadata so autotuning keys
         # aligned and unaligned experiments independently.
         ALIGN_ROWS=_ALIGN_ROWS,
+        # Retain the old BM160 kernel's constant propagation while ordinary
+        # shapes keep runtime dimensions and strides in this shared kernel.
+        SPLIT_M_SIZE=M if split_m_128_32 else 0,
+        SPLIT_N_SIZE=N if split_m_128_32 else 0,
+        SPLIT_K_SIZE=K if split_m_128_32 else 0,
+        SPLIT_STRIDE_AM=a.stride(0) if split_m_128_32 else 0,
+        SPLIT_STRIDE_AK=a.stride(1) if split_m_128_32 else 0,
+        SPLIT_STRIDE_BK=b.stride(0) if split_m_128_32 else 0,
+        SPLIT_STRIDE_BN=b.stride(1) if split_m_128_32 else 0,
+        SPLIT_STRIDE_CM=c.stride(0) if split_m_128_32 else 0,
+        SPLIT_STRIDE_CN=c.stride(1) if split_m_128_32 else 0,
         # 16x16x16 MFMA on gfx942 fp16. kpack stays at its default of 1 -- see
         # the module docstring for the miscompile that follows from raising it.
         matrix_instr_nonkdim=16,

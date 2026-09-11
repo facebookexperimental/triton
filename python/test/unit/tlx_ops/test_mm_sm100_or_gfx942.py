@@ -10,6 +10,7 @@ no such constraint) is reported as a skip with the reason, never as a pass.
 TODO: cover the config variants dropped with the tutorial copy of this kernel --
 USE_WARP_BARRIER and NUM_CTAS=2. Only the heuristic-selected config runs today.
 """
+
 import time
 import pytest
 import torch
@@ -65,6 +66,21 @@ MAX_SECONDS_PER_CASE = 60
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 
 
+@pytest.mark.skipif(ARCH != "gfx942", reason="Requires the gfx942 configuration")
+def test_gfx942_wide_heuristic_config():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    (config, ) = gfx942.heuristic_config(2048, 10240, 25408)
+    assert config.kwargs["BLOCK_M"] == 160
+    assert config.kwargs["BLOCK_N"] == 512
+    assert config.kwargs["BLOCK_K"] == 32
+    assert config.kwargs["GROUP_M"] == 8
+    assert config.kwargs["XCD_CHUNK"] == 8
+    assert config.kwargs["SPLIT_M_128_32"]
+    assert config.num_warps == 8
+    assert config.num_stages == 2
+
+
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _shapes())
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
@@ -86,8 +102,8 @@ def test_mm(M, N, K, a_strides, b_strides, dtype_name):
         pytest.skip(f"{ARCH} declines this shape: {declined}")
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
-    assert elapsed < MAX_SECONDS_PER_CASE, (f"mm({M}x{N}x{K}, {dtype}) took {elapsed:.1f}s, "
-                                            f"over the {MAX_SECONDS_PER_CASE}s budget")
+    assert elapsed < MAX_SECONDS_PER_CASE, (
+        f"mm({M}x{N}x{K}, {dtype}) took {elapsed:.1f}s, over the {MAX_SECONDS_PER_CASE}s budget")
 
     ref = torch.matmul(a, b)
     precision = REL_PRECISION[dtype]
