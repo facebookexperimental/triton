@@ -1,14 +1,12 @@
-from .harness import (
-    BuildError,
-    HarnessExecutionError,
-    HarnessTimeoutError,
-    KernelHarness,
-    StandaloneHarness,
-    SubprocessHarness,
-)
-from .models import (
+from .contracts import (
     BuildResult,
+    CandidateChange,
+    CandidateSubmission,
     CaseEvaluation,
+    ChangeScope,
+    Decision,
+    DecisionStatus,
+    ExperimentKind,
     ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
@@ -19,29 +17,46 @@ from .models import (
     TimingSamples,
     VALID_STRATEGIES,
     VerificationResult,
-    per_case_speedups,
-    weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer
-from .providers import (
+from .decision_maker import (
+    BuildError,
+    DecisionMaker,
+    HarnessExecutionError,
+    HarnessTimeoutError,
+    KernelHarness,
+    StandaloneHarness,
+    SubprocessHarness,
+    KernelOptimizer,
+)
+from .decision_maker.policy import per_case_speedups, weighted_geometric_speedup
+from .optimizer import (
     CandidateContext,
     CandidateProposal,
     CandidateProvider,
     CodexCandidateProvider,
     FixedCandidateProvider,
     MockLLMProvider,
+    OPTIMIZATION_STRATEGY,
+    Optimizer,
     TLX_PROMPT_PREAMBLE,
 )
 
 __all__ = [
     "BuildError",
     "BuildResult",
+    "CandidateChange",
     "CandidateContext",
     "CandidateProposal",
     "CandidateProvider",
+    "CandidateSubmission",
     "CaseEvaluation",
+    "ChangeScope",
     "CodexCandidateProvider",
+    "Decision",
+    "DecisionMaker",
+    "DecisionStatus",
     "ExperimentSummary",
+    "ExperimentKind",
     "FixedCandidateProvider",
     "HarnessExecutionError",
     "HarnessTimeoutError",
@@ -53,6 +68,8 @@ __all__ = [
     "KernelTarget",
     "MockLLMProvider",
     "OptimizationBudget",
+    "OPTIMIZATION_STRATEGY",
+    "Optimizer",
     "PerformanceSummary",
     "StandaloneHarness",
     "SubprocessHarness",
