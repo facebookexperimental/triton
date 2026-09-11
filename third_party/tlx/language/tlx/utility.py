@@ -142,6 +142,12 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
 
 
 @tl.builtin
+def warp_id(_semantic=None):
+    """Return the uniform warp ID within the current CTA."""
+    return tl.tensor(_semantic.builder.create_warp_id(), tl.int32)
+
+
+@tl.builtin
 def async_task_replica_id(_semantic=None):
     from triton.language.extra.tlx.compiler.code_generator import _get_region_replica_id_stack
 

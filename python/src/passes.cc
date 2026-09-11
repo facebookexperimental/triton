@@ -1,13 +1,20 @@
-#include "mlir/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "passes.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Gluon/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
@@ -17,11 +24,48 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <stdexcept>
 #include <string>
 
 namespace py = nanobind;
 
 namespace {
+
+mlir::FailureOr<bool> liftTritonControlFlowToSCF(mlir::ModuleOp module) {
+  mlir::MLIRContext *context = module.getContext();
+  context->getOrLoadDialect<mlir::arith::ArithDialect>();
+  context->getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+  context->getOrLoadDialect<mlir::scf::SCFDialect>();
+  context->getOrLoadDialect<mlir::ub::UBDialect>();
+
+  mlir::ControlFlowToSCFTransformation transformation;
+  bool changed = false;
+
+  mlir::WalkResult result = module.walk([&](mlir::triton::FuncOp funcOp) {
+    if (funcOp.getBody().empty())
+      return mlir::WalkResult::advance();
+
+    mlir::DominanceInfo domInfo(funcOp.getOperation());
+    auto visitor = [&](mlir::Operation *innerOp) -> mlir::WalkResult {
+      for (mlir::Region &region : innerOp->getRegions()) {
+        mlir::FailureOr<bool> changedRegion =
+            mlir::transformCFGToSCF(region, transformation, domInfo);
+        if (mlir::failed(changedRegion))
+          return mlir::WalkResult::interrupt();
+        changed |= *changedRegion;
+      }
+      return mlir::WalkResult::advance();
+    };
+
+    if (funcOp->walk<mlir::WalkOrder::PostOrder>(visitor).wasInterrupted())
+      return mlir::WalkResult::interrupt();
+    return mlir::WalkResult::advance();
+  });
+
+  if (result.wasInterrupted())
+    return mlir::failure();
+  return changed;
+}
 
 void init_triton_analysis(py::module_ &m) {
   py::class_<mlir::ModuleAllocation>(m, "allocation")
@@ -162,6 +206,12 @@ void init_plugin_passes(py::module_ &m) {
 
 void init_triton_passes_convert(py::module_ &m) {
   using namespace mlir;
+  m.def("triton_lift_cf_to_scf", [](ModuleOp &mod) {
+    FailureOr<bool> changed = liftTritonControlFlowToSCF(mod);
+    if (failed(changed))
+      throw std::runtime_error("failed to lift Triton control flow to SCF");
+    return *changed;
+  });
   ADD_PASS_WRAPPER_0("add_scf_to_cf", createSCFToControlFlowPass);
   ADD_PASS_WRAPPER_0("add_cf_to_llvmir", createConvertControlFlowToLLVMPass);
   ADD_PASS_WRAPPER_0("add_index_to_llvmir", createConvertIndexToLLVMPass);

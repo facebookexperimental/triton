@@ -106,12 +106,15 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
   // - baseIncrement is a scalar which will be added to base pointer
   // - offsetInitializer is a value of offset on first loop iteration
   // - incrementOp is an operation that advances offset tensor
+  // - advanceBasePointer selects the existing pointer rewrite; otherwise the
+  //   buffer offset is reconstructed directly from the induction variable
   struct BufferOpInfo {
     amdttg::BufferOpInterface op;
     Value offsetIncrement;
     Value baseIncrement;
     Value offsetInitializer;
     Operation *incrementOp;
+    bool advanceBasePointer;
   };
 
   static std::optional<ConstantIntRanges>
@@ -402,20 +405,64 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
     auto elemBitwidth = ptrType.getPointeeType().getIntOrFloatBitWidth();
     auto dtypeByteWidth = elemBitwidth / 8;
     assert(dtypeByteWidth > 0);
-    if (!isTransformationEquivalent(dtypeByteWidth, offsetLoopArgument,
-                                    advanceStep, solver)) {
-      LDBG("Rejected: it is arithmetically unsafe to split offset computation");
-      return {};
-    }
-
-    LDBG("Buffer op is suitable for offset pointer optimization");
-
     int offsetInitNo =
         offsetLoopArgument.getArgNumber() - targetFor.getNumInductionVars();
     auto offsetInitializer = targetFor.getInitArgs()[offsetInitNo];
-    BufferOpInfo info{op, advanceStep, nullptr, offsetInitializer, addOp};
+    bool advanceBasePointer = isTransformationEquivalent(
+        dtypeByteWidth, offsetLoopArgument, advanceStep, solver);
+    if (!advanceBasePointer) {
+      auto offsetType = dyn_cast<RankedTensorType>(offsetInitializer.getType());
+      if (!offsetType || !offsetType.getElementType().isInteger(32) ||
+          !targetFor.getInductionVar().getType().isInteger(32) ||
+          !isInvariantForLoop(advanceStep, targetFor)) {
+        LDBG("Rejected: it is arithmetically unsafe to split offset "
+             "computation and the recurrence cannot be reconstructed");
+        return {};
+      }
+      LDBG("Buffer op is suitable for closed offset reconstruction");
+    } else {
+      LDBG("Buffer op is suitable for offset pointer optimization");
+    }
+
+    BufferOpInfo info{op,    advanceStep,       nullptr, offsetInitializer,
+                      addOp, advanceBasePointer};
 
     return info;
+  }
+
+  // Reconstruct an i32 additive recurrence without moving it into the base
+  // pointer. This preserves the offset's modular i32 arithmetic when the
+  // pointer rewrite cannot prove that converting the offset to bytes has the
+  // same overflow behavior.
+  static void reconstructOffsets(PatternRewriter &rewriter, scf::ForOp forOp,
+                                 ArrayRef<BufferOpInfo> infoList) {
+    for (auto info : infoList) {
+      if (info.advanceBasePointer)
+        continue;
+
+      rewriter.setInsertionPoint(info.op);
+      Location loc = info.op.getLoc();
+      Value iterationOffset = arith::SubIOp::create(
+          rewriter, loc, forOp.getInductionVar(), forOp.getLowerBound());
+      Value iteration = arith::DivUIOp::create(rewriter, loc, iterationOffset,
+                                               forOp.getStep());
+      if (isAddFirst(info.op)) {
+        Value one = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+        iteration = arith::AddIOp::create(rewriter, loc, iteration, one);
+      }
+
+      auto offsetType =
+          cast<RankedTensorType>(info.offsetInitializer.getType());
+      Value iterationSplat =
+          triton::SplatOp::create(rewriter, loc, offsetType, iteration);
+      Value totalIncrement = arith::MulIOp::create(
+          rewriter, loc, iterationSplat, info.offsetIncrement);
+      Value offset = arith::AddIOp::create(
+          rewriter, loc, info.offsetInitializer, totalIncrement);
+      rewriter.modifyOpInPlace(info.op.getOperation(), [&] {
+        info.op.getOffsetsMutable().assign(offset);
+      });
+    }
   }
 
   // Create scalar values which will increment buffer op base ptr
@@ -519,11 +566,24 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
       return rewriter.notifyMatchFailure(forOp,
                                          "no suitable buffer operations");
 
-    // Perform IR transformation
-    createScalarIncrements(rewriter, infoList);
-    auto newForOp = cloneLoopWithBasePtrIncrements(rewriter, forOp, infoList);
+    reconstructOffsets(rewriter, forOp, infoList);
+
+    SmallVector<BufferOpInfo> basePointerInfo;
+    for (const auto &info : infoList)
+      if (info.advanceBasePointer)
+        basePointerInfo.push_back(info);
+
+    if (basePointerInfo.empty())
+      return success();
+
+    // Perform the existing base pointer transformation for the candidates
+    // whose byte-offset overflow behavior is proven equivalent.
+    createScalarIncrements(rewriter, basePointerInfo);
+    auto newForOp =
+        cloneLoopWithBasePtrIncrements(rewriter, forOp, basePointerInfo);
     rewriter.replaceAllUsesWith(
-        forOp.getResults(), newForOp.getResults().drop_back(infoList.size()));
+        forOp.getResults(),
+        newForOp.getResults().drop_back(basePointerInfo.size()));
     rewriter.eraseOp(forOp);
     return success();
   }

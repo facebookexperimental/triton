@@ -108,18 +108,11 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     return false;
   });
 
-  addDynamicallyLegalOp<WarpPredicateOp>([&](WarpPredicateOp op) -> bool {
-    return typeConverter.isLegal(&op.getRegion()) && typeConverter.isLegal(op);
-  });
-  addDynamicallyLegalOp<PredicateYieldOp>(
-      [&](PredicateYieldOp op) -> bool { return typeConverter.isLegal(op); });
-
   addDynamicallyLegalOp<
       triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
       triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,
       triton::gpu::LocalGatherOp, triton::gpu::LocalScatterOp,
       triton::gpu::AsyncRemoteShmemStoreOp, triton::nvidia_gpu::PrefetchOp,
-      triton::nvidia_gpu::TwoCTAPeerGatherOp,
       triton::nvidia_gpu::WarpGroupDotWaitOp,
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
