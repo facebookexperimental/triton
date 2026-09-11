@@ -447,6 +447,63 @@ class TestLocalBufferRetention(TestCase):
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_shared_a_rejects_non_gfx950(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        class _KernelInputs:
+            pass
+
+        with (
+            mock.patch.object(_tlx_registry, "MMKernelInputs", _KernelInputs),
+            mock.patch.object(_tlx_registry, "_is_gfx950", return_value=False),
+        ):
+            configs = list(
+                _tlx_registry.ROCmBMMSharedATemplateConfigHeuristic._get_template_configs_impl(
+                    object(), _KernelInputs(), "bmm"
+                )
+            )
+
+        self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_compile_meta_marks_only_proven_pointer_ranges(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        compile_meta = {
+            "backend_options": {},
+            "configs": [{}],
+            "signature": {
+                "arg_A": "*fp16",
+                "arg_B": "*fp16",
+                "in_ptr2": "*fp16",
+                "out_ptr3": "*fp16",
+                "xnumel": "i32",
+            },
+        }
+        config_args = {
+            "matrix_instr_nonkdim": 16,
+            "inductor_32bit_pointer_range": (
+                "arg_A",
+                "arg_B",
+                "out_ptr*",
+            ),
+        }
+
+        result = _tlx_registry._update_tlx_amd_compile_meta(
+            compile_meta, config_args, "hip"
+        )
+
+        self.assertEqual(result["backend_options"], {"matrix_instr_nonkdim": 16})
+        self.assertEqual(
+            result["configs"][0],
+            {
+                (0,): [["tt.pointer_range", 32]],
+                (1,): [["tt.pointer_range", 32]],
+                (3,): [["tt.pointer_range", 32]],
+            },
+        )
+
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
         "Need Blackwell with device-side TMA support in Triton",
@@ -1062,6 +1119,113 @@ class TestTLXTemplates(TestCase):
 
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX shared-A bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize(
+        "shape",
+        (
+            (40, 1956, 256),
+            (262, 294, 256),
+            (448, 931, 160),
+            (1195, 2309, 256),
+        ),
+    )
+    def test_tlx_bmm_shared_a(self, shape: tuple[int, int, int]):
+        """The specialized shared-LHS BMMs lower through their Inductor template."""
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        from triton.language.extra.tlx.inductor import (
+            registry as _tlx_registry,  # noqa: F401
+        )
+
+        batch = 2
+        M, K, N = shape
+        base = torch.randn(M, K, device=GPU_TYPE, dtype=torch.float16)
+        a = base.unsqueeze(0).expand(batch, -1, -1)
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=torch.float16)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        def _only_shared_a(templates, op_name="mm"):
+            from torch._inductor.kernel.bmm import bmm_template
+
+            uids = {getattr(template, "uid", None) for template in templates}
+            if op_name == "bmm" and bmm_template.uid in uids:
+                templates.append(_tlx_mm.amd_bmm_shared_a_template)
+            return templates
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _only_shared_a),
+            config.patch(
+                {
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }
+            ),
+        ):
+            actual, code = run_and_get_code(torch.compile(bmm), a, b)
+
+        expected = torch.bmm(a.float(), b.float()).to(torch.float16)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertEqual(a.stride(0), 0)
+        code_str = "\n".join(code)
+        self.assertIn("gfx950 shared-LHS BMM candidates", code_str)
+        self.assertIn("tlx.local_alloc", code_str)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX shared-A bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_shared_a_fused_row_bias(self):
+        """Inductor injects a broadcast row bias into the TLX output hook."""
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        from triton.language.extra.tlx.inductor import (
+            registry as _tlx_registry,  # noqa: F401
+        )
+
+        batch, m, k, n = 2, 448, 931, 160
+        base = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16)
+        a = base.unsqueeze(0).expand(batch, -1, -1)
+        b = torch.randn(batch, k, n, device=GPU_TYPE, dtype=torch.float16)
+        bias = torch.randn(m, 1, device=GPU_TYPE, dtype=torch.float16)
+
+        def bmm_bias(a, b, bias):
+            return torch.bmm(a, b) + bias
+
+        def _only_shared_a(templates, op_name="mm"):
+            if op_name == "bmm":
+                templates[:] = [_tlx_mm.amd_bmm_shared_a_template]
+            return templates
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _only_shared_a),
+            config.patch(
+                {
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }
+            ),
+        ):
+            actual, code = run_and_get_code(torch.compile(bmm_bias), a, b, bias)
+
+        expected = torch.bmm(a, b) + bias
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        code_str = "\n".join(code)
+        self.assertIn("gfx950 shared-LHS BMM candidates", code_str)
+        self.assertIn("tl.load(in_ptr2", code_str)
+        self.assertIn("tl.store(tlx.require_layout(out_ptr", code_str)
+        self.assertEqual(code_str.count(".run("), 1)
 
     @unittest.skipIf(
         not is_gfx950(),
