@@ -158,6 +158,66 @@ jobs:
               echo "::error file=${ef},line=${l},col=${c}::${emsg} (pre-commit-strict)"
             done
           fi
+      - name: Generate GitHub App token
+        id: app-token
+        if: failure() && steps.precommit_strict.outcome == 'failure'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - name: Post inline review comments
+        if: failure() && steps.precommit_strict.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_SHA" ]; then
+            echo "No PR context; skipping review comments."
+            exit 0
+          fi
+          # Inline review comments (unlike issue comments or check
+          # annotations) are imported onto the linked internal diff, so post
+          # each diagnostic where reviewers on both sides will see it.
+          MATCHES=$(grep -E -o -m 10 '[^:[:space:]]+\.pyi?:[0-9]+:[0-9]+: ?.*$' /tmp/precommit-strict.log || true)
+          if [ -z "$MATCHES" ]; then
+            echo "No file diagnostics to post."
+            exit 0
+          fi
+          # Already-posted bot comments, keyed by head SHA plus the
+          # backticked file:line:col footer embedded in the comment body,
+          # so re-runs on the same head don't spam duplicates. Keyed on
+          # the body — not the API's .line, which is null for outdated
+          # or remapped comments — so dedup cannot miss. Best-effort:
+          # proceed without dedup rather than fail the report.
+          if ! gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.body | contains("<!-- precommit-strict-lint -->")) | "\(.commit_id) \(.body | split("\n") | map(select(length > 0)) | last)"' \
+            > /tmp/existing.txt; then
+            echo "::warning::Could not list existing review comments; proceeding without dedup."
+            : > /tmp/existing.txt
+          fi
+          echo "$MATCHES" | while IFS= read -r line; do
+            # Single anchored capture so colons in the message cannot
+            # corrupt the file/line/col split; the space after the
+            # column colon is optional (some tools omit it).
+            if ! [[ "$line" =~ ^([^:]+):([0-9]+):([0-9]+):\ ?(.*)$ ]]; then
+              continue
+            fi
+            f="${BASH_REMATCH[1]}"
+            l="${BASH_REMATCH[2]}"
+            c="${BASH_REMATCH[3]}"
+            msg="${BASH_REMATCH[4]}"
+            [ -f "$f" ] || continue
+            grep -qxF "${HEAD_SHA} \`$f:$l:$c\`" /tmp/existing.txt && continue
+            BODY=$(printf '<!-- precommit-strict-lint -->\n**pre-commit-strict** (blocking): %s\n`%s:%s:%s`' "$msg" "$f" "$l" "$c")
+            # Per-comment posts: a diagnostic on a line outside the PR diff
+            # 422s for that comment only instead of failing the whole batch.
+            if ! gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" \
+              -f body="$BODY" -f commit_id="$HEAD_SHA" -f path="$f" -F line="$l" -f side="RIGHT" --silent; then
+              echo "::warning::Could not post inline comment for ${f}:${l} (line may be outside the PR diff)."
+            fi
+          done
       - name: Pre-commit warning
         if: steps.precommit.outcome == 'failure'
         run: |
