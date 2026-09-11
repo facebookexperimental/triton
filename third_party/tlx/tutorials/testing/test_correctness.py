@@ -1,5 +1,6 @@
 import math
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -33,6 +34,13 @@ from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
 from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     addmm as _amd_addmm,
     available_paths as _amd_addmm_paths,
+)
+from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
+    _MT64X256_MI32_KERNEL_SPEC,
+    _MT224X160_MI16_KERNEL_SPEC,
+    _RESIDENT_OPERAND_B,
+    bmm as _shared_a_bmm,
+    bmm_register_staged_template,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16 import (
     matmul_kernel as _amd_gemm, )
@@ -1134,35 +1142,47 @@ def test_hopper_fa_ws_pipelined():
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined_pingpong():
+@pytest.mark.parametrize("causal", [False, True])
+def test_hopper_fa_ws_pipelined_pingpong(causal):
     config = FlashAttention.CONFIGS["hopper_fa_ws_pipelined_pingpong"]
     sm_scale = 0.5
-    causal = False
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws_pipelined_pingpong(q, k, v, sm_scale, config=config)
+        tri_out = _hopper_fa_ws_pipelined_pingpong(
+            q,
+            k,
+            v,
+            sm_scale,
+            causal=causal,
+            config=config,
+        )
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined_pingpong_bwd():
-    # Backward-only coverage for the Hopper pingpong kernel: the fwd tests
-    # above do not exercise _attn_bwd_tlx, so bwd regressions (e.g. MMA
-    # reorder, dsT/dQ shared-path changes) would otherwise go uncaught.
-    # Non-causal only: the Hopper kernel does not support causal attention.
+@pytest.mark.parametrize("causal", [False, True])
+def test_hopper_fa_ws_pipelined_pingpong_bwd(causal):
+    # The forward-only tests above do not exercise _attn_bwd_tlx, so compare
+    # both dense and causal gradients against SDPA independently.
     shape = (1, 1, 1024, 128)
     torch.manual_seed(20)
     q0, k0, v0 = [torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5) for _ in range(3)]
     do = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5)
 
     ref_q, ref_k, ref_v = [tensor.detach().clone().requires_grad_() for tensor in (q0, k0, v0)]
-    ref_o = torch.nn.functional.scaled_dot_product_attention(ref_q, ref_k, ref_v, scale=0.5, is_causal=False)
+    ref_o = torch.nn.functional.scaled_dot_product_attention(
+        ref_q,
+        ref_k,
+        ref_v,
+        scale=0.5,
+        is_causal=causal,
+    )
     ref_o.backward(do)
     reference = (ref_q.grad, ref_k.grad, ref_v.grad)
 
     q, k, v = [tensor.detach().clone().requires_grad_() for tensor in (q0, k0, v0)]
-    out = _hopper_fa_ws_pipelined_pingpong(q, k, v, 0.5)
+    out = _hopper_fa_ws_pipelined_pingpong(q, k, v, 0.5, causal=causal)
     out.backward(do)
     result = (q.grad, k.grad, v.grad)
     assert all(torch.isfinite(grad).all() for grad in result)
@@ -1479,6 +1499,78 @@ def test_amd_bmm(dtype):
         out = _amd_bmm(a, b)
         ref = torch.bmm(a, b)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "dtype,m,n,k,kernel_spec",
+    [
+        (torch.float16, 40, 160, 64, _MT64X256_MI32_KERNEL_SPEC),
+        (
+            torch.bfloat16,
+            224,
+            160,
+            65,
+            replace(
+                _MT224X160_MI16_KERNEL_SPEC,
+                resident_operand_policy=_RESIDENT_OPERAND_B,
+            ),
+        ),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_register_staged_bmm_resident_operand_policies(
+    dtype, m, n, k, kernel_spec
+):
+    """Exercise both dot orders, input dtypes, and partial output tiles."""
+    batch = 2
+    torch.manual_seed(0)
+    a_storage = torch.randn((1, m, k), device=DEVICE, dtype=dtype)
+    a = a_storage.expand(batch, -1, -1)
+    b = torch.randn((batch, k, n), device=DEVICE, dtype=dtype)
+
+    actual = bmm_register_staged_template(a, b, kernel_spec)
+    expected = torch.bmm(a, b)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "m,n,k,error",
+    [
+        (64, 256, 31, "K must be >= BLOCK_K=32"),
+        (31, 256, 64, "BLOCK_M=64 requires M >= 32"),
+        (64, 127, 64, "BLOCK_N=256 requires N >= 128"),
+    ],
+)
+def test_register_staged_bmm_rejects_unsupported_wrap_contracts(m, n, k, error):
+    a = torch.empty((1, m, k), dtype=torch.float16)
+    b = torch.empty((1, k, n), dtype=torch.float16)
+
+    with pytest.raises(AssertionError, match=error):
+        bmm_register_staged_template(a, b, _MT64X256_MI32_KERNEL_SPEC)
+
+
+@pytest.mark.parametrize(
+    "batch,m,n,k,dtype",
+    [
+        (63, 40, 256, 1956, torch.float16),
+        (255, 262, 256, 294, torch.float16),
+        (256, 448, 160, 931, torch.float16),
+        (64, 1195, 256, 2309, torch.bfloat16),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_shared_a_bmm_production_dispatches_at_group_boundaries(
+    batch, m, n, k, dtype
+):
+    """Cover every tuned dispatch at the batch size that enables grouping."""
+    torch.manual_seed(0)
+    a = torch.randn((1, m, k), device=DEVICE, dtype=dtype).expand(batch, -1, -1)
+    b = torch.randn((batch, k, n), device=DEVICE, dtype=dtype)
+
+    actual = _shared_a_bmm(a, b)
+    expected = torch.bmm(a, b)
+    atol = 5e-1 if dtype == torch.bfloat16 else 2e-2
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=2e-2)
 
 
 # =============================================================================
