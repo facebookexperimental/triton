@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import importlib.util
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
+from unittest.mock import patch
 
+from . import rocm_profiler as rocm_profiler_module
+from .amd_att import collect_fb_att
 from .profiling import (
-    ProfileRequest,
     compact_profile_summary,
     export_ncu_report_details,
+    extract_native_profiler_duration_us,
     extract_ncu_duration_us,
+    native_profiler_regression_diagnostic,
     ncu_regression_diagnostic,
     normalize_ncu_metrics,
     normalize_profile_request,
@@ -18,9 +25,17 @@ from .profiling import (
     parse_ncu_query_metrics,
     parse_proton_launch_attribution,
     per_case_profile_request,
+    ProfileRequest,
     resolve_profile_request_for_target,
     resolve_profile_tools,
     select_ncu_metric_names,
+)
+from .rocm_profiler import (
+    collect_rocprofv3,
+    filter_extreme_timing_outliers,
+    find_rocprofv3,
+    parse_rocprof_counter_collection,
+    parse_rocprof_kernel_trace,
 )
 
 
@@ -96,8 +111,22 @@ class ProfileRequestTest(unittest.TestCase):
         assert amd is not None
         self.assertEqual(
             amd["tools"],
-            ["proton_launch", "native_profiler", "ncu"],
+            ["rocprofv3", "ncu"],
         )
+
+        hip = resolve_profile_request_for_target(payload, {"backend": "hip"})
+        assert hip is not None
+        self.assertEqual(hip["tools"], ["rocprofv3", "ncu"])
+
+        deep = resolve_profile_request_for_target(
+            ProfileRequest(
+                level="deep",
+                tools=("proton_launch", "native_profiler"),
+            ).to_json(),
+            {"backend": "hip"},
+        )
+        assert deep is not None
+        self.assertEqual(deep["tools"], ["fb_att", "rocprofv3"])
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -194,12 +223,14 @@ class ProfileParsingTest(unittest.TestCase):
 
     def test_parse_ncu_csv_and_metric_selection(self) -> None:
         csv_text = (
-            'ID,Metric Name,Metric Unit,Metric Value\n'
+            "ID,Metric Name,Metric Unit,Metric Value\n"
             '0,gpu__time_duration.sum,ns,"2,000"\n'
-            '1,sm__throughput.avg.pct_of_peak_sustained_elapsed,%,75.5\n'
+            "1,sm__throughput.avg.pct_of_peak_sustained_elapsed,%,75.5\n"
         )
         metrics = parse_ncu_csv(csv_text)
-        self.assertEqual(metrics["gpu__time_duration.sum"], {"value": 2000.0, "unit": "ns"})
+        self.assertEqual(
+            metrics["gpu__time_duration.sum"], {"value": 2000.0, "unit": "ns"}
+        )
         selected = select_ncu_metric_names(metrics.keys(), "summary")
         self.assertEqual(selected["metrics"]["duration_us"], "gpu__time_duration.sum")
         self.assertIsNone(selected["metrics"]["dram_throughput_pct"])
@@ -472,13 +503,266 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertIn("regressed", ncu_regression_diagnostic(old_flat, normalized))
         self.assertEqual(ncu_regression_diagnostic(normalized, old_flat), "")
 
+        rocprof_baseline = {"rocprofv3": {"summary": {"duration_us": 10.0}}}
+        rocprof_candidate = {"rocprofv3": {"summary": {"duration_us": 10.2}}}
+        self.assertEqual(
+            extract_native_profiler_duration_us(rocprof_baseline),
+            ("rocprofv3", 10.0),
+        )
+        self.assertIn(
+            "rocprofv3 duration regressed",
+            native_profiler_regression_diagnostic(rocprof_baseline, rocprof_candidate),
+        )
+        self.assertEqual(
+            native_profiler_regression_diagnostic(old_flat, rocprof_candidate),
+            "",
+        )
+        self.assertEqual(
+            extract_native_profiler_duration_us(
+                {"rocprofv3": {"summary": {"duration_us": "invalid"}}}
+            ),
+            (None, None),
+        )
+
+    def test_parses_rocprof_kernel_trace_and_resources(self) -> None:
+        trace = (
+            "Kernel_Name,Start_Timestamp,End_Timestamp,Workgroup_Size,"
+            "LDS_Block_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count\n"
+            "helper,0,1000,64,0,8,0,16\n"
+            "gemm,1000,5000,256,32768,64,16,32\n"
+            "gemm,5000,9200,256,32768,64,16,32\n"
+            "gemm,9200,13000,256,32768,64,16,32\n"
+        )
+        profile = parse_rocprof_kernel_trace(trace, sample_count=2)
+        self.assertEqual(profile["summary"]["dominant_kernel"], "gemm")
+        self.assertEqual(profile["summary"]["duration_us"], 4.0)
+        self.assertEqual(profile["summary"]["scope"], "dominant_kernel")
+        self.assertEqual(profile["kernels"][0]["dispatches"], 3)
+        self.assertEqual(profile["kernels"][0]["resources"]["lds_bytes"], 32768.0)
+
+    def test_parses_rocprof_counter_collection(self) -> None:
+        counters = (
+            "Kernel_Name,Counter_Name,Counter_Value\n"
+            "gemm,SQ_WAVES,100\n"
+            "gemm,SQ_WAVES,120\n"
+            "gemm,SQ_INSTS_MFMA,40\n"
+            "helper,SQ_WAVES,2\n"
+        )
+        parsed = parse_rocprof_counter_collection(counters)
+        self.assertEqual(parsed["gemm"]["SQ_WAVES"], 110.0)
+        self.assertEqual(parsed["gemm"]["SQ_INSTS_MFMA"], 40.0)
+        self.assertEqual(parsed["helper"]["SQ_WAVES"], 2.0)
+
+    def test_filters_only_extreme_rocprof_timing_outliers(self) -> None:
+        samples = [100.0, 101.0, 99.0, 102.0, 98.0, 1000.0]
+
+        self.assertEqual(
+            filter_extreme_timing_outliers(samples),
+            [100.0, 101.0, 99.0, 102.0, 98.0],
+        )
+        self.assertEqual(
+            filter_extreme_timing_outliers([100.0, 100.0, 100.0, 100.0]),
+            [100.0, 100.0, 100.0, 100.0],
+        )
+
+    def test_finds_newest_internal_rocprof_by_numeric_version(self) -> None:
+        candidates = (
+            Path("/usr/local/fbcode/platform010/lib/rocm-6.9/bin/rocprofv3"),
+            Path("/usr/local/fbcode/platform010/lib/rocm-6.10/bin/rocprofv3"),
+        )
+
+        with (
+            patch.object(
+                rocm_profiler_module.shutil,
+                "which",
+                return_value=None,
+            ),
+            patch.object(Path, "is_dir", autospec=True, return_value=True),
+            patch.object(Path, "glob", autospec=True, return_value=iter(candidates)),
+            patch.object(
+                Path,
+                "is_file",
+                autospec=True,
+                side_effect=lambda path: path in candidates,
+            ),
+            patch.object(
+                rocm_profiler_module.os,
+                "access",
+                return_value=True,
+            ),
+        ):
+            profiler = find_rocprofv3({"PATH": ""})
+
+        self.assertEqual(profiler, candidates[1])
+
+    def test_collects_rocprof_trace_and_counters_from_external_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiler = root / "rocprofv3"
+            profiler.write_text(
+                "#!/usr/bin/python3\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "assert os.environ['LD_PRELOAD'] == '/usr/lib64/libzstd.so.1'\n"
+                "assert args[args.index('--mangled-kernels') + 1] == 'true'\n"
+                "output_dir = Path(args[args.index('--output-directory') + 1])\n"
+                "output_file = args[args.index('--output-file') + 1]\n"
+                "output_dir.mkdir(parents=True, exist_ok=True)\n"
+                "(Path.cwd() / '.rocprofv3').mkdir()\n"
+                "if '--kernel-trace' in args:\n"
+                "    (output_dir / f'{output_file}_kernel_trace.csv').write_text(\n"
+                "        'Kernel_Name,Start_Timestamp,End_Timestamp,VGPR_Count\\n'\n"
+                "        'gemm,0,4000,64\\n'\n"
+                "        'gemm,4000,8200,64\\n'\n"
+                "        'gemm,8200,12000,64\\n'\n"
+                "    )\n"
+                "else:\n"
+                "    counters = args[args.index('--pmc') + 1].split(',')\n"
+                "    rows = ''.join(f'gemm,{counter},100\\n' for counter in counters)\n"
+                "    (output_dir / f'{output_file}_counter_collection.csv').write_text(\n"
+                "        'Kernel_Name,Counter_Name,Counter_Value\\n' + rows\n"
+                "    )\n"
+                "print('fake rocprofv3')\n"
+            )
+            profiler.chmod(0o755)
+
+            profile = collect_rocprofv3(
+                ("/usr/bin/python3", "-c", "pass"),
+                root / "artifacts",
+                environment={
+                    "TLX_ROCPROFV3": str(profiler),
+                    "LD_PRELOAD": (
+                        "/tmp/librocprofiler-sdk-tool.so:/usr/lib64/libzstd.so.1"
+                    ),
+                },
+            )
+
+            self.assertEqual(profile["tool"], "rocprofv3")
+            self.assertEqual(profile["summary"]["dominant_kernel"], "gemm")
+            self.assertEqual(profile["summary"]["duration_us"], 4.0)
+            self.assertEqual(profile["counters"]["MfmaUtil"], 100.0)
+            self.assertEqual(profile["kernels"][0]["samples_us"], [4.0, 4.2, 3.8])
+            self.assertTrue(Path(profile["artifacts"]["kernel_trace_csv"]).exists())
+            self.assertTrue(
+                (
+                    Path(profile["artifacts"]["kernel_trace_csv"]).parent / ".rocprofv3"
+                ).is_dir()
+            )
+
+    def test_collect_rocprof_returns_error_for_unreadable_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiler = root / "rocprofv3"
+            profiler.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "output_dir = Path(args[args.index('--output-directory') + 1])\n"
+                "output_file = args[args.index('--output-file') + 1]\n"
+                "output_dir.mkdir(parents=True, exist_ok=True)\n"
+                "(output_dir / f'{output_file}_kernel_trace.csv').write_bytes(b'\\xff')\n"
+            )
+            profiler.chmod(0o755)
+
+            profile = collect_rocprofv3(
+                ("/usr/bin/python3", "-c", "pass"),
+                root / "artifacts",
+                level="timing",
+                environment={"TLX_ROCPROFV3": str(profiler)},
+            )
+
+            self.assertIn("failed to read rocprofv3 kernel trace", profile["error"])
+            self.assertTrue(Path(profile["artifacts"]["command"]).exists())
+
+    def test_gfx950_benchmark_surfaces_rocprof_error(self) -> None:
+        harness_path = (
+            Path(__file__).with_name("harnesses")
+            / "gfx950"
+            / "targets"
+            / "gemm"
+            / "harness.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "test_gfx950_harness", harness_path
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertIsNotNone(spec.loader)
+        assert spec.loader is not None
+        harness = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"torch": ModuleType("torch")}):
+            spec.loader.exec_module(harness)
+
+        with (
+            patch.object(
+                harness,
+                "collect_rocprofv3",
+                return_value={
+                    "error": "rocprofv3 was not found; set TLX_ROCPROFV3 or PATH"
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "set TLX_ROCPROFV3 or PATH"),
+        ):
+            harness.benchmark(
+                (None, None, Path("/tmp/candidate.py"), "cuda"),
+                {"case_id": "square"},
+                repetitions=3,
+            )
+
+    def test_collects_fb_att_without_rocprof_separator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiler = root / "fb_att"
+            profiler.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "assert '--' not in args\n"
+                "assert args[args.index('--att-perfcounter-ctrl') + 1] == '3'\n"
+                "output_dir = Path(args[args.index('--fb-output-directory') + 1])\n"
+                "ui_dir = output_dir / 'fbrocrof_1' / 'gemm_0_ui'\n"
+                "ui_dir.mkdir(parents=True)\n"
+                "(ui_dir / 'wstates0.json').write_text('{}')\n"
+            )
+            profiler.chmod(0o755)
+
+            profile = collect_fb_att(
+                ("/usr/bin/python3", "-c", "pass"),
+                root / "artifacts",
+                kernel_filter="gemm",
+                counters=("SQ_LDS_BANK_CONFLICT",),
+                environment={"TLX_FB_ATT": str(profiler)},
+            )
+
+            self.assertTrue(profile["valid"])
+            self.assertEqual(profile["kernel_filter"], "gemm")
+            self.assertEqual(profile["iteration_range"], "[4-4]")
+            self.assertEqual(profile["perfcounter_control"], 3)
+            self.assertEqual(len(profile["artifacts"]["ui_directories"]), 1)
+            self.assertTrue(Path(profile["artifacts"]["wstates"][0]).exists())
+
     def test_compact_profile_summary_omits_raw_blobs(self) -> None:
         compact = compact_profile_summary(
             {
                 "level": "summary",
                 "summary": {"duration_us": 1.0},
                 "raw": "x" * 5000,
-                "ncu": {"raw_metrics": {"huge": "blob"}, "summary": {"duration_us": 1.0}},
+                "ncu": {
+                    "raw_metrics": {"huge": "blob"},
+                    "summary": {"duration_us": 1.0},
+                },
+                "rocprofv3": {
+                    "summary": {"duration_us": 2.0},
+                    "raw_metrics": {"huge": "blob"},
+                },
+                "fb_att": {
+                    "valid": True,
+                    "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
+                },
                 "native_profiler": {
                     "raw": "x" * 5000,
                     "summary": {"duration_us": 1.0},
@@ -494,6 +778,9 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertEqual(compact["level"], "summary")
         self.assertNotIn("raw", compact)
         self.assertNotIn("raw_metrics", compact["ncu"])
+        self.assertEqual(compact["rocprofv3"]["summary"]["duration_us"], 2.0)
+        self.assertNotIn("raw_metrics", compact["rocprofv3"])
+        self.assertTrue(compact["fb_att"]["valid"])
         self.assertIn("native_profiler", compact)
         self.assertNotIn("raw", compact["native_profiler"])
         diagnostic = compact["diagnostic_proton_intra_kernel"]

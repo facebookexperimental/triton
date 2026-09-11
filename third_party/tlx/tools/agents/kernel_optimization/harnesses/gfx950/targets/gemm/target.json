@@ -1,0 +1,7 @@
+{
+  "backend": "hip",
+  "architecture": "gfx950",
+  "device": "cuda:0",
+  "environment": {},
+  "optimization_guidance": "Target AMD CDNA4/gfx950. Preserve wavefront, LDS, waitcnt, and warp-pipeline synchronization invariants. Prefer existing gfx9 TLX GEMM patterns and measured changes to MFMA shape, occupancy, LDS layout, prefetch depth, and wave pipelining. Do not introduce NVIDIA-only TMA, TMEM, mbarrier, or warp-specialization APIs."
+}
