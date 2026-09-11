@@ -69,6 +69,7 @@ def matmul_kernel_gfx942(
     A_POLICY: tl.constexpr,
     B_POLICY: tl.constexpr,
     PEEL_K_TAIL: tl.constexpr,
+    SPLIT_M_128_32: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
     pid = tl.program_id(0).to(tl.int32)
@@ -93,51 +94,99 @@ def matmul_kernel_gfx942(
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
 
-    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
-    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
-    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
-    reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
-    reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+    if SPLIT_M_128_32:
+        # Triton tensor dimensions must be powers of two. Represent BM=160 as
+        # two panels while sharing the B tile and K loop.
+        tl.static_assert(BLOCK_M == 160)
+        tl.static_assert(K % BLOCK_K == 0)
+        base_m = pid_m * BLOCK_M
+        base_n = pid_n * BLOCK_N
+        offs_m0 = (base_m + tl.arange(0, 128).to(tl.int32)) % M
+        offs_m1 = (base_m + 128 + tl.arange(0, 32).to(tl.int32)) % M
+        offs_n = (base_n + tl.arange(0, BLOCK_N).to(tl.int32)) % N
+        offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-    even_k = K % BLOCK_K == 0
-    if PEEL_K_TAIL:
-        k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
-        for k in range(0, k_main, BLOCK_K):
-            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-            a = _policy_load(a_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
+        acc0 = tl.zeros((128, BLOCK_N), tl.float32)
+        acc1 = tl.zeros((32, BLOCK_N), tl.float32)
+        for k in range(0, K, BLOCK_K):
+            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+            a0_ptrs = a_ptr + offs_m0[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            a1_ptrs = a_ptr + offs_m1[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
             b = _policy_load(b_ptrs, offs_k[:, None] < K - k, True, B_POLICY)
-            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
-        if not even_k:
-            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-            tail = offs_k < K - k_main
-            a = _policy_load(a_ptrs, tail[None, :], False, A_POLICY)
-            b = _policy_load(b_ptrs, tail[:, None], False, B_POLICY)
-            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
-    else:
-        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-            k = k_idx * BLOCK_K
-            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-            a = _policy_load(a_ptrs, offs_k[None, :] < K - k, even_k, A_POLICY)
-            b = _policy_load(b_ptrs, offs_k[:, None] < K - k, even_k, B_POLICY)
-            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+            a0 = _policy_load(a0_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
+            a1 = _policy_load(a1_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
+            acc0 = tl.dot(a0, b, acc0, allow_tf32=False, out_dtype=tl.float32)
+            acc1 = tl.dot(a1, b, acc1, allow_tf32=False, out_dtype=tl.float32)
 
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
-    idx_m = rows[:, None]
-    idx_n = cols[None, :]
-    mask = (idx_m < M) & (idx_n < N)
-    if ADD_BIAS:
-        bias = tl.load(
-            bias_ptr + idx_m * stride_bias_m + idx_n * stride_bias_n,
-            mask=mask,
-            eviction_policy="evict_last",
-        )
-        acc += bias.to(tl.float32)
-    tl.store(c_ptr + idx_m * stride_cm + idx_n * stride_cn, acc, mask=mask)
+        rows0 = base_m + tl.arange(0, 128).to(tl.int32)
+        rows1 = base_m + 128 + tl.arange(0, 32).to(tl.int32)
+        cols = base_n + tl.arange(0, BLOCK_N).to(tl.int32)
+        idx_n = cols[None, :]
+        idx_m0 = rows0[:, None]
+        idx_m1 = rows1[:, None]
+        mask0 = (idx_m0 < M) & (idx_n < N)
+        mask1 = (idx_m1 < M) & (idx_n < N)
+        if ADD_BIAS:
+            bias0 = tl.load(
+                bias_ptr + idx_m0 * stride_bias_m + idx_n * stride_bias_n,
+                mask=mask0,
+                eviction_policy="evict_last",
+            )
+            bias1 = tl.load(
+                bias_ptr + idx_m1 * stride_bias_m + idx_n * stride_bias_n,
+                mask=mask1,
+                eviction_policy="evict_last",
+            )
+            acc0 += bias0.to(tl.float32)
+            acc1 += bias1.to(tl.float32)
+        tl.store(c_ptr + idx_m0 * stride_cm + idx_n * stride_cn, acc0, mask=mask0)
+        tl.store(c_ptr + idx_m1 * stride_cm + idx_n * stride_cn, acc1, mask=mask1)
+    else:
+        offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
+        offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
+        offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+        reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+        reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        even_k = K % BLOCK_K == 0
+        if PEEL_K_TAIL:
+            k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
+            for k in range(0, k_main, BLOCK_K):
+                a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+                b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+                a = _policy_load(a_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
+                b = _policy_load(b_ptrs, offs_k[:, None] < K - k, True, B_POLICY)
+                acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+            if not even_k:
+                a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
+                b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+                tail = offs_k < K - k_main
+                a = _policy_load(a_ptrs, tail[None, :], False, A_POLICY)
+                b = _policy_load(b_ptrs, tail[:, None], False, B_POLICY)
+                acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        else:
+            for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+                k = k_idx * BLOCK_K
+                a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+                b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+                a = _policy_load(a_ptrs, offs_k[None, :] < K - k, even_k, A_POLICY)
+                b = _policy_load(b_ptrs, offs_k[:, None] < K - k, even_k, B_POLICY)
+                acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+        cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+        idx_m = rows[:, None]
+        idx_n = cols[None, :]
+        mask = (idx_m < M) & (idx_n < N)
+        if ADD_BIAS:
+            bias = tl.load(
+                bias_ptr + idx_m * stride_bias_m + idx_n * stride_bias_n,
+                mask=mask,
+                eviction_policy="evict_last",
+            )
+            acc += bias.to(tl.float32)
+        tl.store(c_ptr + idx_m * stride_cm + idx_n * stride_cn, acc, mask=mask)
 
 
 # Public, reviewable record of the five selected configurations. The keys are
@@ -309,23 +358,22 @@ def _launch_config(a, b, bias, bias_strides, out, selected):
     )
 
 
-def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1):
-    return triton.Config(
-        {
-            "BLOCK_M": block_m,
-            "BLOCK_N": block_n,
-            "BLOCK_K": block_k,
-            "GROUP_M": group_m,
-            "NUM_XCDS": 8,
-            "XCD_CHUNK": 8,
-            "A_POLICY": _CACHE_DEFAULT,
-            "B_POLICY": _CACHE_DEFAULT,
-            "waves_per_eu": waves_per_eu,
-            "kpack": kpack,
-        },
-        num_warps=num_warps,
-        num_stages=2,
-    )
+def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1, split_m_128_32=False):
+    meta = {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "GROUP_M": group_m,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 8,
+        "A_POLICY": _CACHE_DEFAULT,
+        "B_POLICY": _CACHE_DEFAULT,
+        "waves_per_eu": waves_per_eu,
+        "kpack": kpack,
+    }
+    if split_m_128_32:
+        meta["SPLIT_M_128_32"] = True
+    return triton.Config(meta, num_warps=num_warps, num_stages=2)
 
 
 def _configs():
@@ -355,6 +403,8 @@ SMOKE_CONFIGS = _smoke_configs
 
 def heuristic_config(M, N, K):
     """Choose one direct-load configuration without runtime autotuning."""
+    if (M, N, K) == (2048, 10240, 25408):
+        return [_config(160, 512, 32, 8, 8, split_m_128_32=True)]
     if min(M, N) <= 64:
         return [_config(64, 64, 64, 4, 4)]
     if K <= 256:
