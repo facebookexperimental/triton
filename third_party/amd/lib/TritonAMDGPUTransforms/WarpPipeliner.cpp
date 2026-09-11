@@ -54,16 +54,23 @@ static bool isLoopOp(Operation *op) {
 //                  built; an error has been emitted at the offending op.
 enum class PipelineResult { NotApplicable, Created, Malformed };
 
-// Read (cluster-name, priority) from a border marker op.  Priority defaults
-// to -1 when the marker doesn't carry the optional priority attribute.
-static std::pair<StringAttr, int> readBorderMarker(Operation *op) {
+struct BorderMarker {
+  StringAttr cluster;
+  int priority;
+  bool allowMemoryReorder;
+};
+
+// Read the per-stage policy from a border marker op. Priority defaults to -1
+// when the marker doesn't carry the optional priority attribute.
+static BorderMarker readBorderMarker(Operation *op) {
   StringAttr clusterStr =
       op->getAttrOfType<StringAttr>("triton.warp_pipeline.border");
   int priority = -1;
   if (auto intAttr =
           op->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority"))
     priority = intAttr.getInt();
-  return {clusterStr, priority};
+  return {clusterStr, priority,
+          op->hasAttr("triton.warp_pipeline.allow_memory_reorder")};
 }
 
 // If `cluster` is empty, materialize a dummy SchedBarrier so the cluster is
@@ -84,7 +91,7 @@ static void addDummyOpIfEmptyCluster(OpBuilder &b, Location loc,
 // Create a scf.execute_region op representing a pipeline cluster.
 static void createClusterOp(OpBuilder &b, Location loc,
                             SmallVector<Operation *> &ops,
-                            std::pair<StringAttr, int> marker) {
+                            BorderMarker marker) {
   assert(!ops.empty() && "empty stage");
 
   // Insert the execute_region before the first op in the cluster.
@@ -153,11 +160,13 @@ static void createClusterOp(OpBuilder &b, Location loc,
 
   // Keep the region structured for later conversion.
   exec.setNoInline(true);
-  exec->setAttr("triton.warp_pipeline.stage", marker.first);
-  if (marker.second > -1) {
+  exec->setAttr("triton.warp_pipeline.stage", marker.cluster);
+  if (marker.priority > -1) {
     exec->setAttr("triton.warp_pipeline.priority",
-                  b.getI32IntegerAttr(marker.second));
+                  b.getI32IntegerAttr(marker.priority));
   }
+  if (marker.allowMemoryReorder)
+    exec->setAttr("triton.warp_pipeline.allow_memory_reorder", b.getUnitAttr());
 
   LLVM_DEBUG(llvm::dbgs() << "[warp-pipeline] created stage with " << ops.size()
                           << " ops and " << yieldedTypes.size() << " yields\n");
@@ -219,7 +228,7 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
     return PipelineResult::NotApplicable;
 
   SmallVector<Operation *> cluster;
-  SmallVector<std::pair<StringAttr, int>> clusterMarkers;
+  SmallVector<BorderMarker> clusterMarkers;
   SmallVector<SmallVector<Operation *>> clusters;
   auto ctx = forOp.getContext();
 
@@ -263,7 +272,7 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   if (!cluster.empty()) { // Create the last cluster if needed.
     clusters.push_back(std::move(cluster));
     auto clusterStr = StringAttr::get(ctx, "last_cluster");
-    clusterMarkers.push_back({clusterStr, -1});
+    clusterMarkers.push_back({clusterStr, -1, false});
   }
 
   // We only reach here when at least one border existed; a single cluster
@@ -339,7 +348,7 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
   //    border.  Mirrors createPipeline's main loop, but bounded by lastBorder
   //    instead of scf.yield.
   SmallVector<Operation *> cluster;
-  SmallVector<std::pair<StringAttr, int>> clusterMarkers;
+  SmallVector<BorderMarker> clusterMarkers;
   SmallVector<SmallVector<Operation *>> clusters;
 
   for (auto it = Block::iterator(regionStart); it != block.end();) {

@@ -478,15 +478,18 @@ public:
     // Inline region.
     Block *block = &reg.front();
 
-    // Emit a scheduling barrier after every memory op in the stage so the
-    // backend scheduler keeps them in program order.
-    for (Operation &op : llvm::make_early_inc_range(*block))
-      if (readsOrWritesMemory(&op)) {
+    // Preserve the existing source-order policy unless the frontend explicitly
+    // allows the backend scheduler to reorder a stage's memory operations.
+    if (!exec->hasAttr("triton.warp_pipeline.allow_memory_reorder")) {
+      for (Operation &op : llvm::make_early_inc_range(*block)) {
+        if (!readsOrWritesMemory(&op))
+          continue;
         rewriter.setInsertionPointAfter(&op);
         ROCDL::SchedBarrier::create(
             rewriter, op.getLoc(),
             ROCDL::SchedGroupMask::non_mem_non_sideeffect);
       }
+    }
 
     Operation *terminator = block->getTerminator();
     ValueRange results = terminator->getOperands();

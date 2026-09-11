@@ -133,6 +133,7 @@ def test_warp_pipeline_ir():
     assert '"stage1"' in ir_str
     assert 'triton.warp_pipeline.priority = 1' in ir_str
     assert 'triton.warp_pipeline.priority = 0' in ir_str
+    assert "triton.warp_pipeline.allow_memory_reorder" in ir_str
 
 
 # --- IR test: verify warp pipeline lowering forms execute_region clusters ---
