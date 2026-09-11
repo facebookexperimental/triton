@@ -1313,6 +1313,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
     ),
     pytest.param(tl.StaticPersistent1DScheduler, 128, 256, 4, 1, 2, True, True, 1, True,
                  id="static-2cta-epilogue-subtile-4"),
+    pytest.param(tl.StaticPersistent1DScheduler, 128, 256, 2, 1, 1, True, True, 1, True,
+                 id="static-bundle-aware-input-reuse"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="dynamic-subtile-1"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="dynamic-subtile-2"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="dynamic-subtile-4"),
@@ -1476,6 +1478,14 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
                 assert output_staging, "Expected ordinary TMA output staging"
                 assert all("buffer.copy = 1" in line for line in output_staging), (
                     "2CTA ordinary TMA output staging must not use an unsafe multi-copy ring")
+        if (SCHEDULE is tl.StaticPersistent1DScheduler and NUM_CTAS == 1 and BLOCK_SIZE_M == 128
+                and BLOCK_SIZE_N == 256 and EPILOGUE_SUBTILE == 2):
+            operand_staging = [
+                line for line in ttgir.splitlines()
+                if "ttg.local_alloc {buffer.copy = 3" in line and "x64xf16" in line
+                and "buffer.tmaStaging" not in line
+            ]
+            assert len(operand_staging) >= 2, "Expected a complete three-deep A/B operand bundle"
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
