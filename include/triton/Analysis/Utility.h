@@ -434,9 +434,11 @@ private:
   void doWalk(FunctionOpInterface funcOp,
               DenseSet<FunctionOpInterface> &visited, UpdateEdgeFn updateEdgeFn,
               UpdateNodeFn updateNodeFn) {
-    if (visited.count(funcOp)) {
+    auto [_, inserted] = visited.insert(funcOp);
+    if (!inserted) {
       llvm::report_fatal_error("Cycle detected in call graph");
     }
+
     if constexpr (UpdateNodeOrder == WalkOrder::PreOrder) {
       updateNodeFn(funcOp);
     }
