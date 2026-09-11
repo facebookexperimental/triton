@@ -115,7 +115,7 @@ def test_mm_rejects_unsupported_operands():
     assert not supports(unsupported_a, b)
     assert not supports(a.to(torch.float32), b.to(torch.float32))
     assert not supports(a, b.contiguous())
-    with pytest.raises(InvalidInput, match="no legal plan"):
+    with pytest.raises(InvalidInput, match="does not support"):
         mm(unsupported_a, b)
     with pytest.raises(InvalidInput, match="does not support"):
         matmul(unsupported_a, b)
