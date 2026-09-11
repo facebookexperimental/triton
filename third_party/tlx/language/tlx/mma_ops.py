@@ -143,6 +143,10 @@ def amd_scheduled_mfma(
 ):
     """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
 
+    Unlike ``tl.dot``, which represents one logical matrix product and carries
+    no accumulator-lifetime or register-class contract, this operation exposes
+    independent native fragment chains in source order.
+
     With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
     The operation keeps one SSA chain per output fragment and creates updates
     in K-major, N-major, M-minor order. LLVM may reschedule independent updates
@@ -161,6 +165,12 @@ def amd_scheduled_mfma(
     ``"vgpr"``. Persistent ``auto`` selects AGPRs. The transient intrinsic path
     does not apply these class constraints and leaves physical placement to
     LLVM; use :func:`amd_register_resident` for a hard source residency point.
+
+    The compiler recognizes eligible persistent AGPR accumulator chains ending
+    at ``amd_mfma_commit``. After scheduling and physical register assignment,
+    it repairs source and EXEC hazards and drains outstanding results before
+    any physical AGPR read or overwrite. Unknown dataflow and VGPR accumulators
+    retain conservative waits.
 
     CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
     ``accumulator_register_class="vgpr"``. The inputs must be matching rank-two

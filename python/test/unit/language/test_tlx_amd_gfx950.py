@@ -331,6 +331,7 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     b_ptr,
     output_ptr,
     USE_VGPR: tl.constexpr,
+    COMMIT: tl.constexpr,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -367,13 +368,122 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
         accumulator_role="persistent",
         accumulator_register_class="vgpr" if USE_VGPR else None,
     )
+    if COMMIT:
+        acc = tlx.amd_mfma_commit(acc)
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, acc)
 
 
 @triton.jit
-def _amd_scheduled_mfma_32x32_kernel(a_ptr, b_ptr, output_ptr):
+def _amd_scheduled_mfma_forked_chain_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 128)
+    cols = tl.arange(0, 64)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 128 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    a0 = tlx.extract_slice(a, [16, 32], [0, 0])
+    a1 = tlx.extract_slice(a, [16, 32], [0, 32])
+    a2 = tlx.extract_slice(a, [16, 32], [0, 64])
+    b0 = tlx.extract_slice(b, [32, 64], [0, 0])
+    b1 = tlx.extract_slice(b, [32, 64], [32, 0])
+    b2 = tlx.extract_slice(b, [32, 64], [64, 0])
+    zero = tlx.zeros((16, 64), tl.float32, layout=mma)
+    root = tlx.amd_scheduled_mfma(
+        a0,
+        b0,
+        zero,
+        accumulator_role="persistent",
+        initialize=True,
+    )
+    left = tlx.amd_scheduled_mfma(
+        a1,
+        b1,
+        root,
+        accumulator_role="persistent",
+    )
+    right = tlx.amd_scheduled_mfma(
+        a2,
+        b2,
+        root,
+        accumulator_role="persistent",
+    )
+    left, right = tlx.amd_mfma_commit((left, right))
+    output_offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 64 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_offsets, left)
+    tl.store(output_offsets + 16 * 64, right)
+
+
+@triton.jit
+def _amd_scheduled_mfma_lds_loop_kernel(
+    a_ptr, b_ptr, output_ptr, iterations
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a_local = tlx.local_alloc((16, 32), tl.bfloat16, 1)
+    b_local = tlx.local_alloc((32, 64), tl.bfloat16, 1)
+    tlx.local_store(tlx.local_view(a_local, 0), a)
+    tlx.local_store(tlx.local_view(b_local, 0), b)
+    tl.debug_barrier()
+    a = tlx.local_load(tlx.local_view(a_local, 0), layout=dot0)
+    b = tlx.local_load(tlx.local_view(b_local, 0), layout=dot1)
+    acc = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for _ in tl.range(0, iterations, num_stages=1):
+        acc = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+        )
+    acc = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="persistent",
+    )
+    acc = tlx.amd_mfma_commit(acc)
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_persistent_32x32_kernel(a_ptr, b_ptr, output_ptr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[32, 32, 16],
@@ -400,10 +510,10 @@ def _amd_scheduled_mfma_32x32_kernel(a_ptr, b_ptr, output_ptr):
         a,
         b,
         acc,
-        accumulator_role="transient",
+        accumulator_role="persistent",
         initialize=True,
     )
-    result, _ = tlx.amd_mfma_commit(result, b)
+    result = tlx.amd_mfma_commit(result)
     offsets = tlx.require_layout(
         output_ptr + rows[:, None] * 32 + cols[None, :],
         mma,
@@ -1421,24 +1531,68 @@ def test_amd_scheduled_mfma_persistent_acc_correct_gfx950():
     actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
     expected = a.float() @ b.float()
     for use_vgpr in (False, True):
-        _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
-            a,
-            b,
-            actual,
-            USE_VGPR=use_vgpr,
-            num_warps=4,
-            matrix_instr_nonkdim=16,
-        )
-        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+        for commit in (False, True):
+            _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
+                a,
+                b,
+                actual,
+                USE_VGPR=use_vgpr,
+                COMMIT=commit,
+                num_warps=4,
+                matrix_instr_nonkdim=16,
+            )
+            torch.testing.assert_close(
+                actual, expected, atol=2e-4, rtol=2e-4
+            )
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_scheduled_mfma_32x32_correct_gfx950():
+def test_amd_scheduled_mfma_forked_chain_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 128), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((2, 16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_forked_chain_kernel[(1, )](
+        a,
+        b,
+        actual,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    common = a[:, :32].float() @ b[:32, :].float()
+    expected = torch.stack((
+        common + a[:, 32:64].float() @ b[32:64, :].float(),
+        common + a[:, 64:96].float() @ b[64:96, :].float(),
+    ))
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_inferred_lds_loop_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_lds_loop_kernel[(1, )](
+        a,
+        b,
+        actual,
+        2,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(
+        actual, 3.0 * (a.float() @ b.float()), atol=6e-4, rtol=6e-4
+    )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_persistent_32x32_correct_gfx950():
     torch.manual_seed(0)
     a = torch.randn((128, 16), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
     actual = torch.empty((128, 32), device="cuda", dtype=torch.float32)
-    _amd_scheduled_mfma_32x32_kernel[(1, )](
+    compiled = _amd_scheduled_mfma_persistent_32x32_kernel[(1, )](
         a,
         b,
         actual,
@@ -1446,6 +1600,10 @@ def test_amd_scheduled_mfma_32x32_correct_gfx950():
         matrix_instr_nonkdim=16,
     )
     torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-4, rtol=2e-4)
+    amdgcn = "\n".join(
+        line.strip() for line in compiled.asm["amdgcn"].splitlines()
+    )
+    assert "s_nop 15\ns_nop 3" in amdgcn
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
