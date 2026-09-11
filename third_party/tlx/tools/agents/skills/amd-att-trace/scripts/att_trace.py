@@ -190,8 +190,9 @@ def validate_bundle(root: Path) -> dict[str, Any]:
     for ui_dir in ui_dirs:
         required = ("code.json", "filenames.json", "occupancy.json")
         for filename in required:
-            if not (ui_dir / filename).is_file():
-                errors.append(f"missing {filename} in {ui_dir}")
+            required_path = ui_dir / filename
+            if not required_path.is_file() or required_path.stat().st_size == 0:
+                errors.append(f"missing non-empty {filename} in {ui_dir}")
         wstates = _nonempty(ui_dir.glob("wstates*.json"))
         waves = _nonempty(ui_dir.glob("se*_sm*_sl*_wv*.json"))
         if not wstates:
