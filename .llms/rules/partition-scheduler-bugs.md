@@ -250,6 +250,12 @@
 - **Regression**: tut09 244 passed / 0 failed (was 230 / 14). `test_correctness_autows.py` 72 passed / 24 skipped, `test_self_attention_autows.py` 8 passed, `fused_attention_ws_device_tma.py` 2 failed / 48 passed — all identical to baseline. #3301's own `pipeline_bwd_bm128_gemm_only.mlir` and `ws_remove_redundant_tmem_zero_bwd_bm128_inner.mlir` still pass; Hopper WarpSpecialization + TwoCTA lit clean.
 - **Note**: `llvm-lit` run locally reports the `TRITON_USE_META_WS=1 triton-opt` tests as failing with exit 127 (`command not found`) — its internal shell does not support RUN-line `VAR=val` prefixes. Re-run those with the variable exported before believing a failure.
 
+### 34. FA-forward P publication carries a redundant empty edge across passes (2026-08-31, fixed)
+- **Symptom**: The P-publication producer-acquire generated for the packed QK/P TMEM reuse group is redundant, and keeping it costs ~10% latency on the 2-CTA persistent FA-forward shape.
+- **Root cause**: The P store and QK load execute in one softmax task, while the QK MMA and PV MMA execute in one GEMM task. With the QK-full channel, those same-task program-order edges already close the reuse cycle: `PV(i) -> QK MMA(i+1) -> QK load(i+1) -> P store(i+1)`.
+- **Fix**: Prove that cycle in `WSCodePartition` and, when it holds, omit both the P producer-acquire and the matching PV completion arrival. The proof is schedule-aware: for `before(i) -> after(i+d)` it needs `d + after.stage - before.stage > 0`, or equality plus increasing cluster/source order. **It fails closed** — a missing stage/cluster annotation or a reversed order keeps the original edge. Two preconditions it does not prove and must therefore guard: the cycle's middle edge is the sibling's own forward channel (asserted non-elidable, and rejected when a same-task pair is in reverse order), and the reuse group shares one `CommChannel`, so a later reuse-sync pairing that would wait on the elided arrival is a hard error rather than a hang.
+- **Key insight**: the elision is proved pre-`InterleaveTMem` but must survive it. What prevents the QK load sinking past the P store is that `replaceBufferReuse` makes both views of one allocation, so `tmemMayAlias` reports may-alias. `reuse_group_2buffer_fwd.mlir` pins that surviving order.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
