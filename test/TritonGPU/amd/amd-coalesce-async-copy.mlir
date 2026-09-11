@@ -380,3 +380,29 @@ tt.func @annotate_buffer_load_to_local_redundant_waves(
   tt.return
 }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.padded_shared<[64:+4] {order = [0], shape = [256]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// Native buffer-to-LDS loads need the same packet ownership derived for a
+// padded async-copy destination. Convert every shape-matched tensor operand.
+// CHECK: #[[$BUFFER_PACKET:.*]] = #ttg.linear
+// CHECK-SAME{LITERAL}: register = [[64], [128]], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []
+// CHECK-LABEL: coalesce_padded_buffer_load_to_local
+tt.func @coalesce_padded_buffer_load_to_local(
+    %ptr: !tt.ptr<f32>,
+    %offsets: tensor<256xi32, #blocked>,
+    %mask: tensor<256xi1, #blocked>,
+    %other: tensor<256xf32, #blocked>,
+    %dst: !ttg.memdesc<256xf32, #shared, #smem, mutable>) {
+  // CHECK-DAG: %[[OFFSETS:.*]] = ttg.convert_layout %{{.*}} : tensor<256xi32, #blocked> -> tensor<256xi32, #[[$BUFFER_PACKET]]>
+  // CHECK-DAG: %[[MASK:.*]] = ttg.convert_layout %{{.*}} : tensor<256xi1, #blocked> -> tensor<256xi1, #[[$BUFFER_PACKET]]>
+  // CHECK-DAG: %[[OTHER:.*]] = ttg.convert_layout %{{.*}} : tensor<256xf32, #blocked> -> tensor<256xf32, #[[$BUFFER_PACKET]]>
+  // CHECK: amdg.buffer_load_to_local %{{.*}}[%[[OFFSETS]]] mask = %[[MASK]] other = %[[OTHER]] into %{{.*}} : <f32>[tensor<256xi32, #[[$BUFFER_PACKET]]>] tensor<256xf32, #[[$BUFFER_PACKET]]>
+  %token = amdg.buffer_load_to_local %ptr[%offsets] mask = %mask other = %other into %dst {contiguity = 4 : i32} : <f32>[tensor<256xi32, #blocked>] tensor<256xf32, #blocked> -> <256xf32, #shared, #smem, mutable>
+  tt.return
+}
+}
