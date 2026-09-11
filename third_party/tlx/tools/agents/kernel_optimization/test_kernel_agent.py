@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -22,27 +23,27 @@ from .models import (
     AutoCommitResult,
     CaseEvaluation,
     InputCase,
+    is_promotable,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
+    per_case_speedups,
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
     TimingSamples,
     VerificationResult,
-    is_promotable,
-    per_case_speedups,
     weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer, _profile_log_parts
+from .optimizer import _profile_log_parts, KernelOptimizer
 from .profiling import ProfileRequest
 from .providers import (
+    _build_prompt,
+    _read_candidate_metadata,
     CandidateContext,
     CandidateProposal,
     FixedCandidateProvider,
     MockLLMProvider,
-    _build_prompt,
-    _read_candidate_metadata,
 )
 from .source import (
     apply_candidate_diff,
@@ -497,7 +498,9 @@ class ScoringTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty"):
             validate_kernel_source("   \n")
 
-    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(self) -> None:
+    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(
+        self,
+    ) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
@@ -680,6 +683,32 @@ class HarnessTest(unittest.TestCase):
 
         _validate_host_matches_target(target, "host", capability_probe=fail_probe)
 
+    def test_rocm_arch_validation_rejects_mismatched_host(self) -> None:
+        target = KernelTarget("hip", "gfx950", device="cuda:0")
+        with self.assertRaisesRegex(SystemExit, "expects gfx950.*is gfx942"):
+            _validate_host_matches_target(
+                target,
+                "gfx950",
+                rocm_arch_probe=lambda device: "gfx942",
+            )
+
+    def test_rocm_arch_validation_accepts_matching_host(self) -> None:
+        target = KernelTarget("hip", "gfx950", device="cuda:0")
+        _validate_host_matches_target(
+            target,
+            "gfx950",
+            rocm_arch_probe=lambda device: "gfx950:sramecc+:xnack-",
+        )
+
+    def test_rocm_arch_validation_rejects_prefix_match(self) -> None:
+        target = KernelTarget("hip", "gfx90", device="cuda:0")
+        with self.assertRaisesRegex(SystemExit, "expects gfx90.*is gfx900"):
+            _validate_host_matches_target(
+                target,
+                "gfx90",
+                rocm_arch_probe=lambda device: "gfx900:sramecc+:xnack-",
+            )
+
     def test_resolves_arch_first_harness_layout(self) -> None:
         kernel = Path("gemm.py")
         harness, cases, target = _resolve_harness_paths(
@@ -696,11 +725,23 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
 
+    def test_resolves_gfx950_gemm_harness(self) -> None:
+        harness, cases, target = _resolve_harness_paths(
+            Path("amd_gemm_warp_pipeline.py"),
+            None,
+            None,
+            None,
+            "gfx950",
+            "gemm",
+        )
+        expected = Path(__file__).with_name("harnesses") / "gfx950" / "targets" / "gemm"
+        self.assertEqual(harness, expected / "harness.py")
+        self.assertEqual(cases, expected / "cases.json")
+        self.assertEqual(target, expected / "target.json")
+
     def test_default_arch_only_uses_arches_with_matching_target(self) -> None:
         kernel = Path("vector_add.py")
-        harness, cases, target = _resolve_harness_paths(
-            kernel, None, None, None, None
-        )
+        harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
             Path(__file__).with_name("harnesses")
@@ -743,7 +784,9 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(performance.cases[0].profile.get("bottleneck"), "synthetic")
 
-    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(self) -> None:
+    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "three_arg_harness.py"
             harness_path.write_text(
@@ -803,7 +846,9 @@ class HarnessTest(unittest.TestCase):
                 "    return {'case_id': case['case_id'], 'request': request, 'exists': Path(request['artifacts_dir']).exists()}\n"
             )
             artifacts_dir = Path(tmp) / "profiles"
-            performance = SubprocessHarness(harness_path, timeout_seconds=30.0).evaluate(
+            performance = SubprocessHarness(
+                harness_path, timeout_seconds=30.0
+            ).evaluate(
                 "source",
                 (InputCase("case a", {}),),
                 KernelTarget("cuda", "blackwell"),
@@ -823,7 +868,9 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual(request["tools"], ["proton_launch", "ncu"])
             self.assertEqual(Path(str(request["artifacts_dir"])).parent, artifacts_dir)
 
-    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(self) -> None:
+    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "big_profile_harness.py"
             harness_path.write_text(
@@ -1121,7 +1168,7 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertIn("[tlx-agent] r001-c001 status=promoted", output)
             self.assertIn("speedup=1.2500x", output)
             self.assertIn("decision=correct and exceeded speedup threshold", output)
-            self.assertIn("ncu=unavailable", output)
+            self.assertIn("native_profiler=unavailable", output)
             self.assertIn("[tlx-agent] final status=revalidated", output)
             self.assertEqual(result.winner_experiment_id, "r001-c001")
             self.assertEqual(result.winner_commit_title, "Use faster latency path")
@@ -1214,7 +1261,7 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertIn("median=120.000us", feedback)
         self.assertIn("cv=0.0000", feedback)
         self.assertIn("speedup=0.8333x", feedback)
-        self.assertIn("ncu=unavailable", feedback)
+        self.assertIn("native_profiler=unavailable", feedback)
 
     def test_continues_after_round_without_promotion(self) -> None:
         provider = FixedCandidateProvider(
@@ -1354,13 +1401,19 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertEqual(result.stopping_reason, "finalist_revalidation_failed")
             self.assertEqual(result.best_kernel, baseline_source)
             self.assertEqual(result.final.cases[0].profile["marker"], "baseline")
-            self.assertEqual((output_dir / "best_kernel.py").read_text(), baseline_source)
+            self.assertEqual(
+                (output_dir / "best_kernel.py").read_text(), baseline_source
+            )
             self.assertEqual(best_profile, baseline_profile)
             self.assertEqual(final_profile, baseline_profile)
 
     def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = _write_policy_harness(Path(tmp))
@@ -1382,7 +1435,9 @@ class KernelOptimizerTest(unittest.TestCase):
             )
 
         baseline_request = result.baseline.cases[0].profile["request"]
-        candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
+        candidate_request = (
+            result.experiments[1].performance.cases[0].profile["request"]
+        )  # type: ignore[union-attr]
         final_request = result.final.cases[0].profile["request"]
         self.assertEqual(baseline_request["level"], "deep")
         expected_tools = ["proton_launch", "native_profiler"]
@@ -1436,7 +1491,9 @@ class KernelOptimizerTest(unittest.TestCase):
                     output_dir=Path(tmp) / "out",
                 )
             )
-        candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
+        candidate_request = (
+            result.experiments[1].performance.cases[0].profile["request"]
+        )  # type: ignore[union-attr]
         self.assertEqual(candidate_request["level"], "deep")
         self.assertEqual(
             candidate_request["tools"],
@@ -1447,7 +1504,11 @@ class KernelOptimizerTest(unittest.TestCase):
 
     def test_ncu_regression_diagnostic_vetoes_candidate(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             stderr = io.StringIO()
@@ -1470,6 +1531,125 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.experiments[1].status, "rejected")
         self.assertIn("NCU duration regressed", stderr.getvalue())
+
+    def test_rocprof_regression_diagnostic_vetoes_candidate(self) -> None:
+        baseline = _performance(("a", 100.0))
+        baseline = PerformanceSummary(
+            cases=(
+                replace(
+                    baseline.cases[0],
+                    profile={"rocprofv3": {"summary": {"duration_us": 100.0}}},
+                ),
+            )
+        )
+        candidate = _performance(("a", 80.0))
+        candidate = PerformanceSummary(
+            cases=(
+                replace(
+                    candidate.cases[0],
+                    profile={"rocprofv3": {"summary": {"duration_us": 102.0}}},
+                ),
+            )
+        )
+        harness = Mock()
+        harness.evaluate.side_effect = [baseline, candidate, baseline]
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "fast-wrapper")]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    optimizer_module,
+                    "SubprocessHarness",
+                    return_value=harness,
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = KernelOptimizer(provider).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                        harness_path=Path(directory) / "unused_harness.py",
+                        cases=(InputCase("a", {}),),
+                        target=KernelTarget("hip", "gfx950"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=1,
+                            min_speedup=1.01,
+                            benchmark_repetitions=2,
+                        ),
+                        output_dir=Path(directory) / "out",
+                    )
+                )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.experiments[1].status, "rejected")
+        self.assertIn("rocprofv3 duration regressed", stderr.getvalue())
+
+    def test_rocprof_profile_does_not_veto_rocprof_benchmark(self) -> None:
+        baseline = _performance(("a", 100.0))
+        baseline_timing = baseline.cases[0].timing
+        assert baseline_timing is not None
+        baseline = PerformanceSummary(
+            cases=(
+                replace(
+                    baseline.cases[0],
+                    timing=replace(
+                        baseline_timing,
+                        cache_policy="steady_state_20s_rocprofv3_iqr3",
+                    ),
+                    profile={"rocprofv3": {"summary": {"duration_us": 100.0}}},
+                ),
+            )
+        )
+        candidate = _performance(("a", 80.0))
+        candidate_timing = candidate.cases[0].timing
+        assert candidate_timing is not None
+        candidate = PerformanceSummary(
+            cases=(
+                replace(
+                    candidate.cases[0],
+                    timing=replace(
+                        candidate_timing,
+                        cache_policy="steady_state_20s_rocprofv3_iqr3",
+                    ),
+                    profile={"rocprofv3": {"summary": {"duration_us": 102.0}}},
+                ),
+            )
+        )
+        harness = Mock()
+        harness.evaluate.side_effect = [baseline, candidate, candidate]
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster")]
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                optimizer_module,
+                "SubprocessHarness",
+                return_value=harness,
+            ),
+        ):
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=Path(directory) / "unused_harness.py",
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("hip", "gfx950"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory) / "out",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.experiments[1].status, "promoted")
 
     def test_missing_ncu_does_not_veto_candidate(self) -> None:
         provider = FixedCandidateProvider(
@@ -1523,16 +1703,33 @@ class KernelOptimizerTest(unittest.TestCase):
             "proton.intra.tile=start_n:3840/logical_block:31/curr_m:3968/mma_producer_j:32/load_input_j:31",
             parts,
         )
-        self.assertIn(
-            "proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts
-        )
+        self.assertIn("proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts)
         self.assertIn(f"proton.intra.trace={trace_path}", parts)
 
-    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(self) -> None:
+    def test_profile_log_includes_fb_att_artifact(self) -> None:
+        parts = _profile_log_parts(
+            {
+                "fb_att": {
+                    "valid": True,
+                    "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
+                }
+            }
+        )
+
+        self.assertIn("fb_att.valid=true", parts)
+        self.assertIn("fb_att.ui=/tmp/gemm_0_ui", parts)
+
+    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(
+        self,
+    ) -> None:
         provider = FixedCandidateProvider(
             [
-                CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"),
-                CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"),
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"
+                ),
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                ),
             ]
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -1564,7 +1761,10 @@ class KernelOptimizerTest(unittest.TestCase):
             if request["tools"] == ["proton_intra_kernel"]
         ]
         self.assertEqual(
-            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [
+                (request["experiment_id"], request["reason"])
+                for request in diagnostic_requests
+            ],
             [("baseline", "baseline_diagnostic"), ("final", "final_winner_diagnostic")],
         )
         candidate_diagnostics = [
@@ -1577,7 +1777,9 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "rejected")
         self.assertEqual(result.experiments[2].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
-        self.assertIn("diagnostic_proton_intra_kernel", result.baseline.cases[0].profile)
+        self.assertIn(
+            "diagnostic_proton_intra_kernel", result.baseline.cases[0].profile
+        )
         self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
         self.assertNotIn(
             "diagnostic_proton_intra_kernel",
@@ -1587,11 +1789,22 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(baseline_diag["tools"], ["proton_intra_kernel"])
         self.assertEqual(baseline_diag["artifacts"]["trace"], "/tmp/proton.trace")
         self.assertNotIn("trace_events", baseline_diag)
-        self.assertEqual(best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"]["granularity"], "warp")
+        self.assertEqual(
+            best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"][
+                "granularity"
+            ],
+            "warp",
+        )
 
-    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(self) -> None:
+    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(
+        self,
+    ) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1620,14 +1833,21 @@ class KernelOptimizerTest(unittest.TestCase):
         ]
         self.assertFalse(result.success)
         self.assertEqual(
-            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [
+                (request["experiment_id"], request["reason"])
+                for request in diagnostic_requests
+            ],
             [("baseline", "baseline_diagnostic")],
         )
         self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
 
     def test_diagnostic_proton_is_promotion_neutral(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1652,7 +1872,9 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
         self.assertEqual(
-            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"]["summary"]["duration_us"],
+            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"][
+                "summary"
+            ]["duration_us"],
             999999.0,
         )
 

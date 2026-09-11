@@ -1,3 +1,4 @@
+from .amd_att import collect_fb_att, find_fb_att
 from .harness import (
     BuildError,
     HarnessExecutionError,
@@ -15,11 +16,11 @@ from .models import (
     KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
+    per_case_speedups,
     PerformanceSummary,
     TimingSamples,
     VALID_STRATEGIES,
     VerificationResult,
-    per_case_speedups,
     weighted_geometric_speedup,
 )
 from .optimizer import KernelOptimizer
@@ -32,6 +33,7 @@ from .providers import (
     MockLLMProvider,
     TLX_PROMPT_PREAMBLE,
 )
+from .rocm_profiler import collect_rocprofv3, find_rocprofv3
 
 __all__ = [
     "BuildError",
@@ -41,7 +43,11 @@ __all__ = [
     "CandidateProvider",
     "CaseEvaluation",
     "CodexCandidateProvider",
+    "collect_fb_att",
+    "collect_rocprofv3",
     "ExperimentSummary",
+    "find_fb_att",
+    "find_rocprofv3",
     "FixedCandidateProvider",
     "HarnessExecutionError",
     "HarnessTimeoutError",
