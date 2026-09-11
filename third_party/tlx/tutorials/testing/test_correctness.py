@@ -1639,6 +1639,62 @@ def test_amd_gemm_offset_width_selection():
     assert _amd_gemm._needs_i64_offsets(beyond_i32)
 
 
+def test_amd_gemm_output_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["USE_I64_C_OFFSETS"]))
+
+            return launch
+
+    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
+    for M, N in [(256, 256), (925210, 4096)]:
+        a = torch.empty((M, 128), device="meta", dtype=torch.float16)
+        b = torch.empty((128, N), device="meta", dtype=torch.float16)
+        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert [use_i64_c_offsets for _, use_i64_c_offsets in launches] == [False, True]
+
+
+def test_amd_gemm_input_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                launches.append(
+                    (
+                        kwargs["USE_I64_A_OFFSETS"],
+                        kwargs["USE_I64_B_OFFSETS"],
+                        kwargs["HAS_M_TAIL"],
+                        kwargs["HAS_N_TAIL"],
+                    )
+                )
+
+            return launch
+
+    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
+    cases = [
+        ((256, 256, 4096), (False, False, False, False)),
+        ((257, 256, 4096), (False, False, True, False)),
+        ((256, 257, 4096), (False, False, False, True)),
+        ((262400, 256, 4096), (True, False, False, False)),
+        ((256, 262400, 4096), (False, True, False, False)),
+    ]
+    for (M, N, K), _ in cases:
+        a = torch.empty((M, K), device="meta", dtype=torch.float16)
+        b = torch.empty((K, N), device="meta", dtype=torch.float16)
+        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert launches == [expected for _, expected in cases]
+
+
 @pytest.mark.parametrize(
     "split_k,defer_epilogue",
     [(2, False)],
