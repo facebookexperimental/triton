@@ -1134,35 +1134,47 @@ def test_hopper_fa_ws_pipelined():
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined_pingpong():
+@pytest.mark.parametrize("causal", [False, True])
+def test_hopper_fa_ws_pipelined_pingpong(causal):
     config = FlashAttention.CONFIGS["hopper_fa_ws_pipelined_pingpong"]
     sm_scale = 0.5
-    causal = False
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws_pipelined_pingpong(q, k, v, sm_scale, config=config)
+        tri_out = _hopper_fa_ws_pipelined_pingpong(
+            q,
+            k,
+            v,
+            sm_scale,
+            causal=causal,
+            config=config,
+        )
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined_pingpong_bwd():
-    # Backward-only coverage for the Hopper pingpong kernel: the fwd tests
-    # above do not exercise _attn_bwd_tlx, so bwd regressions (e.g. MMA
-    # reorder, dsT/dQ shared-path changes) would otherwise go uncaught.
-    # Non-causal only: the Hopper kernel does not support causal attention.
+@pytest.mark.parametrize("causal", [False, True])
+def test_hopper_fa_ws_pipelined_pingpong_bwd(causal):
+    # The forward-only tests above do not exercise _attn_bwd_tlx, so compare
+    # both dense and causal gradients against SDPA independently.
     shape = (1, 1, 1024, 128)
     torch.manual_seed(20)
     q0, k0, v0 = [torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5) for _ in range(3)]
     do = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5)
 
     ref_q, ref_k, ref_v = [tensor.detach().clone().requires_grad_() for tensor in (q0, k0, v0)]
-    ref_o = torch.nn.functional.scaled_dot_product_attention(ref_q, ref_k, ref_v, scale=0.5, is_causal=False)
+    ref_o = torch.nn.functional.scaled_dot_product_attention(
+        ref_q,
+        ref_k,
+        ref_v,
+        scale=0.5,
+        is_causal=causal,
+    )
     ref_o.backward(do)
     reference = (ref_q.grad, ref_k.grad, ref_v.grad)
 
     q, k, v = [tensor.detach().clone().requires_grad_() for tensor in (q0, k0, v0)]
-    out = _hopper_fa_ws_pipelined_pingpong(q, k, v, 0.5)
+    out = _hopper_fa_ws_pipelined_pingpong(q, k, v, 0.5, causal=causal)
     out.backward(do)
     result = (q.grad, k.grad, v.grad)
     assert all(torch.isfinite(grad).all() for grad in result)
