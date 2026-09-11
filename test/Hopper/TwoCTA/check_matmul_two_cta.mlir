@@ -32,6 +32,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// This pass runs before tt.dot_scaled is lowered to tc_gen5_mma_scaled, so it
+// must match the scaled op too. Without it the module attribute stays false for
+// the scaled 2-CTA path and every downstream tcgen05 lowering -- including the
+// cluster mbarrier-init fence -- sees false, deadlocking the cross-CTA barrier.
+// CHECK-LABEL: module
+// CHECK-SAME: "ttng.two-ctas" = true
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @two_cta_dot_scaled(
+      %a: tensor<128x64xi8>,
+      %scale_a: tensor<128x2xi8>,
+      %b: tensor<64x128xi8>,
+      %scale_b: tensor<128x2xi8>,
+      %acc: tensor<128x128xf32>) {
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %acc lhs = e4m3 rhs = e4m3 {fastMath = false, two_ctas} : tensor<128x64xi8>, tensor<128x2xi8> * tensor<64x128xi8>, tensor<128x2xi8> -> tensor<128x128xf32>
+    tt.return
+  }
+}
+
+// -----
+
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
   tt.func @dependent_two_cta_dot_chain(
       %q: tensor<128x64xf16>,
