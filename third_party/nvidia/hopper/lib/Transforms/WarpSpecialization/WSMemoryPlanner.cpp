@@ -4,6 +4,7 @@
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -1532,23 +1533,23 @@ static unsigned getStagingCopiesCap() {
   return n < 1 ? 0u : static_cast<unsigned>(n);
 }
 
-static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
-                                        SmallVector<Channel *> &channels,
-                                        triton::FuncOp funcOp,
-                                        unsigned numBuffers,
-                                        unsigned smemBudget) {
+static void increaseFusedEpilogueCopies(
+    SmallVector<WSBuffer> &wsBuffers, SmallVector<Channel *> &channels,
+    triton::FuncOp funcOp, unsigned numBuffers, unsigned smemBudget,
+    ArrayRef<WSBufferPriority> priorities, bool includeStoreStaging,
+    bool includeReduceStaging, bool includeOther) {
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
   if (unsigned cap = getStagingCopiesCap())
     numBuffers = std::min(numBuffers, cap);
-  // Eligible priority tiers, in the order Phase 3.7 should try to bump them.
-  static const WSBufferPriority kPhase45Order[] = {
-      WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
-      WSBufferPriority::P3_OuterTMAStaging, // dk / dv
-      WSBufferPriority::P4_Other,           // regular epilogue / non-innermost
-  };
-  auto isEligible = [&](WSBufferPriority p) {
-    for (auto q : kPhase45Order)
-      if (p == q)
+  auto isEligible = [&](const WSBuffer &buf) {
+    if (buf.tmaStaging == 1 && !includeStoreStaging)
+      return false;
+    if (buf.tmaStaging == 2 && !includeReduceStaging)
+      return false;
+    if (buf.tmaStaging == 0 && !includeOther)
+      return false;
+    for (auto q : priorities)
+      if (buf.priority == q)
         return true;
     return false;
   };
@@ -1575,7 +1576,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
            << buf.numCopies << ", tmaStaging=" << buf.tmaStaging << ")");
       continue;
     }
-    if (!isEligible(buf.priority)) {
+    if (!isEligible(buf)) {
       ++skippedPriority;
       LDBG("Phase 3.7: skip WSBuffer["
            << i << "] bufferId=" << buf.bufferId << " \u2014 priority="
@@ -1593,7 +1594,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 
   // Walk tiers in priority order, and within each tier sort by bufferId for
   // determinism (DenseMap iteration is otherwise non-deterministic).
-  for (auto pri : kPhase45Order) {
+  for (auto pri : priorities) {
     SmallVector<unsigned> ids;
     for (auto &kv : epilogueGroups)
       if (groupPriority.lookup(kv.first) == pri)
@@ -2089,6 +2090,260 @@ static void relaxCopySafetyFloorToBudget(
       relaxed = true;
     }
   }
+}
+
+static bool isMMAOperandBuffer(const WSBuffer &buf,
+                               SmallVector<Channel *> &channels) {
+  Channel *ch = findChannelForOp(buf.allocOp, channels);
+  if (!ch)
+    return false;
+  DenseSet<Operation *> consumers;
+  (void)getAllAcutalUsersForChannel(ch, consumers, buf.allocOp);
+  return llvm::any_of(consumers, [](Operation *consumer) {
+    return isa<ttng::MMAv5OpInterface>(consumer);
+  });
+}
+
+static std::optional<int64_t> getConstantIndexValue(Value value) {
+  if (auto constant = mlir::getConstantIntValue(getAsOpFoldResult(value)))
+    return *constant;
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  auto attr = dyn_cast<IntegerAttr>(constant.getValue());
+  if (!attr)
+    return std::nullopt;
+  return attr.getInt();
+}
+
+static unsigned getMMAOperandReuse(const WSBuffer &buf,
+                                   SmallVector<Channel *> &channels,
+                                   unsigned configuredDepth) {
+  Channel *ch = findChannelForOp(buf.allocOp, channels);
+  if (!ch)
+    return 1;
+  DenseSet<Operation *> consumers;
+  (void)getAllAcutalUsersForChannel(ch, consumers, buf.allocOp);
+
+  bool sawDynamicReductionLoop = false;
+  for (Operation *consumer : consumers) {
+    if (!isa<ttng::MMAv5OpInterface>(consumer))
+      continue;
+    // The closest non-persistent loop enclosing the MMA is the reduction loop.
+    // Starting from a TMA producer is ambiguous after pipelining: its closest
+    // loop can instead be a generated prefetch loop whose trip count is the
+    // configured stage depth.
+    for (Operation *parent = consumer->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      auto loop = dyn_cast<scf::ForOp>(parent);
+      if (!loop)
+        continue;
+      if (loop.getLowerBound().getDefiningOp<tt::GetProgramIdOp>())
+        continue;
+      auto lower = getConstantIndexValue(loop.getLowerBound());
+      auto upper = getConstantIndexValue(loop.getUpperBound());
+      auto step = getConstantIndexValue(loop.getStep());
+      if (lower && upper && step && *step > 0 && *upper > *lower)
+        return static_cast<unsigned>((*upper - *lower + *step - 1) / *step);
+      sawDynamicReductionLoop = true;
+    }
+  }
+  return sawDynamicReductionLoop ? std::max(configuredDepth, 1u) : 1u;
+}
+
+struct OutputRingGroup {
+  SmallVector<unsigned> indices;
+  bool sameTask = false;
+  bool twoCTAs = false;
+};
+
+static bool isLegalOutputRingDepth(const OutputRingGroup &group,
+                                   ArrayRef<WSBuffer> wsBuffers,
+                                   unsigned copies) {
+  if (copies == 0 || group.indices.empty())
+    return false;
+  for (unsigned idx : group.indices)
+    if (copies < wsBuffers[idx].minCopies)
+      return false;
+  if (group.twoCTAs && copies > 1)
+    return false;
+  return !group.sameTask || copies == 1 || group.indices.size() % copies == 0;
+}
+
+/// Balance complete A/B operand bundles against ordinary output rings. TMA
+/// reductions are allocated separately before this function.
+static bool allocateMMAAndOutputBundles(SmallVector<WSBuffer> &wsBuffers,
+                                        SmallVector<Channel *> &channels,
+                                        triton::FuncOp funcOp,
+                                        unsigned numBuffers,
+                                        unsigned smemBudget,
+                                        bool smemCircularReuse) {
+  if (smemCircularReuse || numBuffers < 2)
+    return false;
+
+  SmallVector<unsigned> operands;
+  for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+    const auto &buf = wsBuffers[i];
+    if (!buf.isPinned && buf.tmaStaging == 0 && buf.isInnermost &&
+        isMMAOperandBuffer(buf, channels))
+      operands.push_back(i);
+  }
+
+  DenseMap<unsigned, OutputRingGroup> groupMap;
+  for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+    const auto &buf = wsBuffers[i];
+    if (!buf.isPinned && buf.tmaStaging == 1)
+      groupMap[buf.bufferId].indices.push_back(i);
+  }
+
+  bool twoCTAs = false;
+  if (auto module = funcOp->getParentOfType<ModuleOp>())
+    if (auto attr = module->getAttrOfType<BoolAttr>("ttng.two-ctas"))
+      twoCTAs = attr.getValue();
+
+  SmallVector<OutputRingGroup> outputs;
+  for (auto &[id, group] : groupMap) {
+    if (group.indices.size() < 2)
+      continue;
+    Channel *ch =
+        findChannelForOp(wsBuffers[group.indices.front()].allocOp, channels);
+    if (ch && ch->getSrcOp() && ch->getDstOp())
+      group.sameTask =
+          getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp());
+    group.twoCTAs = twoCTAs;
+    outputs.push_back(std::move(group));
+  }
+  if (operands.size() < 2 || outputs.empty())
+    return false;
+
+  for (const OutputRingGroup &group : outputs) {
+    unsigned current = 1;
+    for (unsigned idx : group.indices)
+      current = std::max(current, wsBuffers[idx].numCopies);
+    if (isLegalOutputRingDepth(group, wsBuffers, current))
+      continue;
+    funcOp->setAttr("ttg.ws_memory_plan_invalid",
+                    UnitAttr::get(funcOp.getContext()));
+    funcOp.emitError() << "illegal ordinary TMA output-ring depth " << current
+                       << " for " << group.indices.size() << " subtiles";
+    return true;
+  }
+
+  unsigned reuse = 1;
+  for (unsigned idx : operands)
+    reuse = std::max(reuse,
+                     getMMAOperandReuse(wsBuffers[idx], channels, numBuffers));
+  // A one- or two-trip reduction has no steady-state interval in which
+  // rebalancing the whole A/B bundle can amortize its pipeline fill and drain.
+  // Keep the legacy allocation order for these short loops; in particular,
+  // persistent kernels may still benefit from its asymmetric input depths
+  // across successive output tiles.
+  if (reuse <= 2)
+    return false;
+
+  // More operand slots than reduction-loop iterations cannot carry useful
+  // in-flight work. Dynamic loops conservatively report configuredDepth above.
+  unsigned maxOperandDepth = std::min(numBuffers, reuse);
+
+  llvm::sort(operands);
+  llvm::sort(outputs, [](const OutputRingGroup &a, const OutputRingGroup &b) {
+    return a.indices.front() < b.indices.front();
+  });
+
+  auto tryOperandDepth = [&](unsigned depth, bool commit) {
+    SmallVector<unsigned> saved;
+    saved.reserve(operands.size());
+    for (unsigned idx : operands) {
+      saved.push_back(wsBuffers[idx].numCopies);
+      wsBuffers[idx].numCopies = std::max(wsBuffers[idx].numCopies, depth);
+    }
+    unsigned total = computeTotalSmem(wsBuffers);
+    if (!commit || total > smemBudget)
+      for (unsigned i = 0; i < operands.size(); ++i)
+        wsBuffers[operands[i]].numCopies = saved[i];
+    return total;
+  };
+
+  // Two generations are the minimum needed to overlap the next operand load
+  // with the current MMA. Apply that floor atomically to the complete bundle.
+  unsigned minimumDepth = std::min(2u, numBuffers);
+  if (tryOperandDepth(minimumDepth, false) <= smemBudget)
+    (void)tryOperandDepth(minimumDepth, true);
+
+  enum class CandidateKind { None, OperandBundle, OutputRing };
+  while (true) {
+    CandidateKind bestKind = CandidateKind::None;
+    unsigned bestOutput = 0;
+    unsigned bestDepth = 0;
+    double bestScore = -1.0;
+
+    unsigned operandDepth = 1;
+    for (unsigned idx : operands)
+      operandDepth = std::max(operandDepth, wsBuffers[idx].numCopies);
+    if (operandDepth < maxOperandDepth) {
+      unsigned next = operandDepth + 1;
+      unsigned before = computeTotalSmem(wsBuffers);
+      unsigned after = tryOperandDepth(next, false);
+      if (after <= smemBudget) {
+        unsigned bytes = std::max(after - before, 1u);
+        bestKind = CandidateKind::OperandBundle;
+        bestDepth = next;
+        bestScore = static_cast<double>(reuse) /
+                    (static_cast<double>(operandDepth) * next * bytes);
+      }
+    }
+
+    for (unsigned g = 0; g < outputs.size(); ++g) {
+      auto &group = outputs[g];
+      unsigned current = 1;
+      for (unsigned idx : group.indices)
+        current = std::max(current, wsBuffers[idx].numCopies);
+      unsigned next = current + 1;
+      while (next <= numBuffers &&
+             !isLegalOutputRingDepth(group, wsBuffers, next))
+        ++next;
+      if (next > numBuffers)
+        continue;
+
+      SmallVector<unsigned> saved;
+      unsigned before = computeTotalSmem(wsBuffers);
+      for (unsigned idx : group.indices) {
+        saved.push_back(wsBuffers[idx].numCopies);
+        wsBuffers[idx].numCopies = next;
+      }
+      unsigned after = computeTotalSmem(wsBuffers);
+      for (unsigned i = 0; i < group.indices.size(); ++i)
+        wsBuffers[group.indices[i]].numCopies = saved[i];
+      if (after > smemBudget)
+        continue;
+
+      unsigned bytes = std::max(after - before, 1u);
+      double score = static_cast<double>(group.indices.size()) /
+                     (static_cast<double>(current) * next * bytes);
+      if (score > bestScore) {
+        bestKind = CandidateKind::OutputRing;
+        bestOutput = g;
+        bestDepth = next;
+        bestScore = score;
+      }
+    }
+
+    if (bestKind == CandidateKind::None)
+      break;
+    if (bestKind == CandidateKind::OperandBundle) {
+      (void)tryOperandDepth(bestDepth, true);
+      LDBG("Bundle planner: A/B depth=" << bestDepth << " reuse=" << reuse
+                                        << " totalSmem="
+                                        << computeTotalSmem(wsBuffers));
+    } else {
+      for (unsigned idx : outputs[bestOutput].indices)
+        wsBuffers[idx].numCopies = bestDepth;
+      LDBG("Bundle planner: output ring depth="
+           << bestDepth << " subtiles=" << outputs[bestOutput].indices.size()
+           << " totalSmem=" << computeTotalSmem(wsBuffers));
+    }
+  }
+  return true;
 }
 
 /// New SMEM allocation: Phases 1–5.
@@ -2758,15 +3013,40 @@ static unsigned allocateSmemBuffers(
                                      << " - preserving correctness floors");
   }
 
-  // ── Phase 3.7: Reserve fused epilogue staging depth ─────────────────
-  // TMA store/reduce staging is on the output critical path. Reserve its
-  // legal copy depth before discretionary P0/P1 operand buffering consumes
-  // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
-  increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
-                              smemBudget);
+  static const WSBufferPriority kStagingOrder[] = {
+      WSBufferPriority::P2_InnerTMAStaging,
+      WSBufferPriority::P3_OuterTMAStaging,
+      WSBufferPriority::P4_Other,
+  };
+
+  // ── Phase 3.7: Reserve loop-carried TMA reduction staging ───────────
+  // Reductions participate in every reduction iteration and retain their
+  // existing priority. Ordinary output stores compete with MMA operands below.
+  increaseFusedEpilogueCopies(
+      wsBuffers, channels, funcOp, numBuffers, smemBudget, kStagingOrder,
+      /*includeStoreStaging=*/false, /*includeReduceStaging=*/true,
+      /*includeOther=*/false);
 
   LDBG("Phase 3.7 epilogue copies complete: totalSmem="
        << computeTotalSmem(wsBuffers));
+
+  // ── Phase 3.8: Balance complete MMA operand bundles and output rings ─
+  bool usedBundlePlanner = allocateMMAAndOutputBundles(
+      wsBuffers, channels, funcOp, numBuffers, smemBudget, smemCircularReuse);
+  if (!usedBundlePlanner) {
+    // Preserve output-first behavior for non-GEMM kernels and one-trip K loops.
+    increaseFusedEpilogueCopies(
+        wsBuffers, channels, funcOp, numBuffers, smemBudget, kStagingOrder,
+        /*includeStoreStaging=*/true, /*includeReduceStaging=*/false,
+        /*includeOther=*/true);
+  } else {
+    // Non-TMA epilogue groups were not candidates in the bundle comparison.
+    // Let them consume only budget left after the selected complete plan.
+    increaseFusedEpilogueCopies(
+        wsBuffers, channels, funcOp, numBuffers, smemBudget, kStagingOrder,
+        /*includeStoreStaging=*/false, /*includeReduceStaging=*/false,
+        /*includeOther=*/true);
+  }
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
@@ -2776,6 +3056,8 @@ static unsigned allocateSmemBuffers(
     SmallVector<unsigned> candidateIndices;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
       if (wsBuffers[i].isPinned)
+        continue;
+      if (usedBundlePlanner && isMMAOperandBuffer(wsBuffers[i], channels))
         continue;
       if (wsBuffers[i].priority == priority)
         candidateIndices.push_back(i);
