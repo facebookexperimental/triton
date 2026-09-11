@@ -24,10 +24,21 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm import (
+    _pick_grouped_gemm_config,
+    _remap_program_id_reference,
+    grouped_gemm_tdm_kernel,
+)
+from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import (
+    attn_fwd_tdm_pipelined_kernel as _amd_fa_tdm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+    _validate_split_pipeline_depth as _validate_amd_mxfp_split_pipeline_depth,
+    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
-    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
+    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel as _amd_tdm_single_warp_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     _validate_cluster_inputs as _validate_amd_fa_cluster_inputs,
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
@@ -2906,7 +2917,8 @@ def test_require_amd_wmma_layout_compiles_gfx1250():
     assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
 
 
-def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
+@pytest.mark.parametrize("TDM_FUSION", ["none", "2way", "4way", "partial"])
+def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(
         _amd_mxfp_gemm_kernel,
@@ -2937,14 +2949,105 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
             "NUM_BUFFERS": 2,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "baseline",
+            "TDM_FUSION": TDM_FUSION,
+            "L2_PREFETCH_DISTANCE": 2,
+            "TDM_SPLIT": False,
         },
     )
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    if TDM_FUSION == "none":
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    else:
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_copy_global_to_local" not in ttgir
+    if TDM_FUSION == "2way":
+        assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    elif TDM_FUSION == "4way":
+        assert "warp_used_hints = array<i32: 1, 2, 4, 8>" in ttgir
+    elif TDM_FUSION == "partial":
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+    # Match the gfx1250 prologue/body load counts from tlx-amd-meta.
+    tensor_loads = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    assert tensor_loads == {"none": 8, "2way": 4, "4way": 2, "partial": 4}[TDM_FUSION]
+
+
+@pytest.mark.parametrize(
+    "block_mn,dtype_a,dtype_b,a_ptr_type,b_ptr_type,tdm_fusion",
+    [
+        pytest.param(128, "e4m3", "e4m3", "*fp8e4nv", "*fp8e4nv", "none", id="m16-scale-64x4"),
+        pytest.param(256, "e4m3", "e2m1", "*fp8e4nv", "*u8", "partial", id="m16-scale-128x4"),
+        pytest.param(256, "e2m1", "e2m1", "*u8", "*u8", "partial", id="m32-scale-128x4"),
+    ],
+)
+def test_mxgemm_tdm_split_compiles_gfx1250(block_mn, dtype_a, dtype_b, a_ptr_type, b_ptr_type, tdm_fusion):
+    src = ASTSource(
+        fn=_amd_mxfp_gemm_kernel,
+        signature={
+            "a_ptr": a_ptr_type,
+            "b_ptr": b_ptr_type,
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": dtype_a,
+            "DTYPE_B": dtype_b,
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": block_mn,
+            "BLOCK_N": block_mn,
+            "BLOCK_K": 256,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 3,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": tdm_fusion,
+            "L2_PREFETCH_DISTANCE": -1,
+            "TDM_SPLIT": True,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    if tdm_fusion == "partial":
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    else:
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "ttg.convert_layout" not in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn
+
+
+def test_mxgemm_tdm_split_pipeline_depth_validation_gfx1250():
+    with pytest.raises(ValueError, match="NUM_BUFFERS must be at least 2"):
+        _validate_amd_mxfp_split_pipeline_depth(K=512, block_k=256, num_buffers=1)
+    with pytest.raises(ValueError, match="does not provide the 3 pipeline tiles required"):
+        _validate_amd_mxfp_split_pipeline_depth(K=512, block_k=256, num_buffers=3)
+    _validate_amd_mxfp_split_pipeline_depth(K=768, block_k=256, num_buffers=3)
 
 
 def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
@@ -4025,10 +4128,129 @@ def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
     assert "amdg.tdm_prefetch" in ttgir
     assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding"
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+
+
+def _grouped_gemm_compile_signature():
+    return {
+        "a_packed": "*fp16",
+        "b_t": "*fp16",
+        "c_packed": "*fp16",
+        "group_offsets": "*i32",
+        "group_size": "i32",
+        "N": "i32",
+        "stride_am": "i32",
+        "stride_bg": "i32",
+        "stride_bn": "i32",
+        "stride_cm": "i32",
+    }
+
+
+def _grouped_gemm_compile_attrs():
+    names = grouped_gemm_tdm_kernel.arg_names
+    attrs = {}
+    for name in ("a_packed", "b_t", "c_packed", "group_offsets"):
+        attrs[(names.index(name), )] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+    for name in ("N", "stride_am", "stride_bg", "stride_bn", "stride_cm"):
+        attrs[(names.index(name), )] = [["tt.divisibility", 16]]
+    return attrs
+
+
+def _grouped_gemm_compile_config(**overrides):
+    config = {
+        "NUM_PROGRAMS": 8,
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
+        "GROUP_M": 4,
+        "NUM_BUFFERS": 2,
+        "L2_PREFETCH_DISTANCE": 0,
+        "C_STAGING_MODE": 0,
+        "CROSS_TILE_PREFETCH": False,
+        "XCD_REMAP_MODE": 0,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 2,
+        "K": 2048,
+    }
+    config.update(overrides)
+    return config
+
+
+_GROUPED_GEMM_COMPILE_CASES = [
+    pytest.param(_grouped_gemm_compile_config(NUM_BUFFERS=depth), id=f"depth-{depth}") for depth in (2, 3, 4)
+] + [
+    pytest.param(
+        _grouped_gemm_compile_config(BLOCK_N=256, NUM_BUFFERS=3),
+        id="128x256-depth3-alias",
+    ),
+    pytest.param(
+        _grouped_gemm_compile_config(NUM_PROGRAMS=4, BLOCK_N=256, C_STAGING_MODE=1),
+        id="128x256-depth2-dedicated",
+    ),
+    pytest.param(
+        _grouped_gemm_compile_config(NUM_PROGRAMS=4, BLOCK_M=256, C_STAGING_MODE=1),
+        id="256x128-depth2-dedicated",
+    ),
+] + [
+    pytest.param(
+        _grouped_gemm_compile_config(
+            NUM_PROGRAMS=32,
+            BLOCK_N=256,
+            C_STAGING_MODE=1,
+            CROSS_TILE_PREFETCH=True,
+            XCD_REMAP_MODE=mode,
+        ),
+        id=f"cross-prefetch-remap-{mode}",
+    ) for mode in (0, 1, 2)
+]
+
+
+@pytest.mark.parametrize("config", _GROUPED_GEMM_COMPILE_CASES)
+def test_grouped_gemm_tdm_compiles_gfx1250(config):
+    compiled = triton_compile(
+        ASTSource(
+            fn=grouped_gemm_tdm_kernel,
+            signature=_grouped_gemm_compile_signature(),
+            constexprs=config,
+            attrs=_grouped_gemm_compile_attrs(),
+        ),
+        target=GFX1250,
+        options={"num_warps": 4},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+    assert amdgcn.count("v_wmma_f32_16x16x32_f16") >= 64
+
+    if config["C_STAGING_MODE"] == 1:
+        assert compiled.metadata.shared < 320 * 1024
+    if config["CROSS_TILE_PREFETCH"]:
+        assert ttgir.count("amdg.async_tdm_fused_copy_global_to_local") >= 4
+
+
+@pytest.mark.parametrize("mode", ["none", "balanced", "chunked"])
+@pytest.mark.parametrize("num_programs", [4, 10, 32, 37])
+def test_grouped_gemm_xcd_remap_is_permutation(mode, num_programs):
+    mapped = [
+        _remap_program_id_reference(pid, num_programs, mode, num_xcds=8, chunk_size=2) for pid in range(num_programs)
+    ]
+    assert sorted(mapped) == list(range(num_programs))
+
+
+def test_grouped_gemm_cost_model_selects_expected_tiles():
+    large = _pick_grouped_gemm_config([4096] * 16, n=4096, k=4096, num_sms=256)
+    small = _pick_grouped_gemm_config([128] * 16, n=4096, k=4096, num_sms=256)
+    assert (large["block_m"], large["block_n"]) == (256, 256)
+    assert (small["block_m"], small["block_n"]) == (128, 256)
 
 
 def test_assume_uniform_compiles_gfx950(device):
@@ -4077,3 +4299,86 @@ def test_assume_uniform_rejects_narrow_type_gfx950(device):
             signature={"in_ptr": "*i8", "out_ptr": "*fp32"},
             constexprs={"BLOCK": 64},
         )
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_compiles_gfx1250(TRANSPOSE_B):
+    compiled = compile_for_gfx1250(
+        _amd_tdm_single_warp_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*bf16",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+        },
+        constexprs={
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "TRANSPOSE_B": TRANSPOSE_B,
+            "L2_PREFETCH_DISTANCE": 2,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    tensor_loads = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    tensor_stores = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
+    assert tensor_loads == 3
+    assert tensor_stores == 1
+
+
+def test_amd_fa_tdm_pipelined_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_fa_tdm_kernel,
+        signature={
+            "q_ptr": "*bf16",
+            "k_ptr": "*bf16",
+            "v_ptr": "*bf16",
+            "o_ptr": "*fp32",
+            "stride_qz": "i64",
+            "stride_qh": "i64",
+            "stride_qm": "i64",
+            "stride_qk": "i64",
+            "stride_kz": "i64",
+            "stride_kh": "i64",
+            "stride_kn": "i64",
+            "stride_kk": "i64",
+            "stride_vz": "i64",
+            "stride_vh": "i64",
+            "stride_vn": "i64",
+            "stride_vk": "i64",
+            "stride_oz": "i64",
+            "stride_oh": "i64",
+            "stride_om": "i64",
+            "stride_on": "i64",
+        },
+        constexprs={
+            "SM_SCALE": 1.0 / (128**0.5),
+            "SEQLEN_Q": 1024,
+            "SEQLEN_K": 1024,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "HEAD_SZ": 128,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn

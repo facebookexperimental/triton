@@ -5,6 +5,20 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_hip_gfx1250
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    matmul as _amd_mxfp_matmul,
+    pack_scale as _amd_mxfp_pack_scale,
+)
+from triton.tools.mxfp import MXScaleTensor
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm import (
+    grouped_gemm_phase0,
+    grouped_gemm_tdm,
+)
+from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import attention as _amd_fa_tdm_attention
+from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
+    matmul as _amd_tdm_matmul,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule as _amd_tdm_single_warp_matmul,
+)
 
 
 @triton.jit
@@ -231,5 +245,181 @@ def test_wait_arrive_non_ws_gfx1250(BLOCK_SIZE, device):
     kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=4)
 
     ttgir = kernel.asm["ttgir"]
-    assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
-            and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    assert ((ttgir.count("amdg.init_barrier") == 1) and (ttgir.count("amdg.read_barrier_phase") == 3)
+            and (ttgir.count("amdg.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    assert "s_wait_dscnt" in kernel.asm["amdgcn"]
+    assert "s_waitcnt" not in kernel.asm["amdgcn"]
+
+
+def _mxfp_e8m0_to_float32(scale):
+    bits = scale.view(torch.uint8).to(torch.int32) << 23
+    return bits.view(torch.float32)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("tdm_split,tdm_fusion", [(False, "none"), (False, "2way"), (False, "4way"), (False, "partial"),
+                                                  (True, "none"), (True, "partial")])
+def test_mxgemm_tdm_correctness_gfx1250(device, tdm_split, tdm_fusion):
+    torch.manual_seed(0)
+    M = N = 128
+    K = 1536
+    scale_block = 32
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
+
+    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
+    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
+    expected = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+    actual = _amd_mxfp_matmul(
+        a.contiguous().to(device),
+        b.T.contiguous().to(device),
+        _amd_mxfp_pack_scale(a_scale).to(device),
+        _amd_mxfp_pack_scale(b_scale).to(device),
+        config={
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 256,
+            "SCALE_BLOCK": 32,
+            "NUM_BUFFERS": 3,
+            "DTYPE_A": "e4m3",
+            "DTYPE_B": "e4m3",
+            "SCHEDULE": "sliceMNK" if tdm_split else "baseline",
+            "TDM_FUSION": tdm_fusion,
+            "TDM_SPLIT": tdm_split,
+            "TRANSPOSE_B": True,
+            "num_warps": 4,
+            "waves_per_eu": 1,
+        },
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_tdm_gemm_pipelined_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a = torch.randn((128, 64), device=device, dtype=torch.float16)
+    b = torch.randn((64, 128), device=device, dtype=torch.float16)
+    actual = _amd_tdm_matmul(a, b)
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_correctness_gfx1250(device, TRANSPOSE_B):
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    b_input = b.T.contiguous() if TRANSPOSE_B else b
+    actual = _amd_tdm_single_warp_matmul(a, b_input, TRANSPOSE_B=TRANSPOSE_B)
+    expected = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("SEQLEN", [640, 896])
+def test_amd_fa_tdm_pipelined_correctness_gfx1250(device, SEQLEN):
+    torch.manual_seed(0)
+    q = torch.randn((1, 1, SEQLEN, 128), device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    actual = _amd_fa_tdm_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def _make_grouped_packed_inputs(m_list, n, k, device):
+    groups = [torch.randn((m, k), device=device, dtype=torch.float16) for m in m_list]
+    b_t = torch.randn((len(m_list), n, k), device=device, dtype=torch.float16)
+    offsets = [0]
+    for m in m_list:
+        offsets.append(offsets[-1] + m)
+    return (
+        torch.cat(groups, dim=0).contiguous(),
+        b_t,
+        torch.tensor(offsets, device=device, dtype=torch.int32),
+        groups,
+    )
+
+
+def _check_grouped_packed_result(actual, groups, b_t):
+    start = 0
+    for i, a in enumerate(groups):
+        end = start + a.shape[0]
+        torch.testing.assert_close(actual[start:end], a @ b_t[i].T, atol=1e-2, rtol=1e-2)
+        start = end
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_phase0_ragged_gfx1250(device):
+    torch.manual_seed(0)
+    shapes = [(17, 33, 31), (64, 70, 64), (95, 128, 96), (128, 65, 129)]
+    group_a = [torch.randn((m, k), device=device, dtype=torch.float16) for m, _, k in shapes]
+    group_b = [torch.randn((k, n), device=device, dtype=torch.float16) for _, n, k in shapes]
+    actual = grouped_gemm_phase0(group_a, group_b, block_m=32, block_n=32, block_k=32)
+    for out, a, b in zip(actual, group_a, group_b):
+        torch.testing.assert_close(out, a @ b, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_grouped_gemm_tdm_packed_correctness_gfx1250(device, depth):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([128, 256, 384], 256, 512, device)
+    actual = grouped_gemm_tdm(a, b_t, offsets, tdm_pipeline_depth=depth)
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_tdm_asymmetric_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([128, 256], 512, 384, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        tdm_pipeline_depth=3,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_tdm_cross_prefetch_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([256, 128], 512, 512, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        num_programs=2,
+        c_staging_mode=1,
+        cross_tile_prefetch=True,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("mode", ["balanced", "chunked"])
+def test_grouped_gemm_tdm_xcd_remap_correctness_gfx1250(device, mode):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([1024], 512, 512, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        num_programs=16,
+        c_staging_mode=1,
+        xcd_remap_mode=mode,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
