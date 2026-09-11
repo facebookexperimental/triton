@@ -309,9 +309,9 @@ def _tdm_issue_loads(
     a_dest = a_buf[slot]
     b_dest = b_buf[slot]
     a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], pred=pred,
-                                               clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                               clamp_bounds=True)
     b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], pred=pred,
-                                               clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                               clamp_bounds=True)
     tlx.async_amd_descriptor_load_fused([
         (a_load_desc, a_dest, 0b0011),
         (b_load_desc, b_dest, 0b1100),
@@ -335,9 +335,9 @@ def _tdm_issue_loads_unpredicated(
     a_dest = a_buf[slot]
     b_dest = b_buf[slot]
     a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], pred=True,
-                                               clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                               clamp_bounds=True)
     b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], pred=True,
-                                               clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                               clamp_bounds=True)
     tlx.async_amd_descriptor_load_fused([
         (a_load_desc, a_dest, 0b0011),
         (b_load_desc, b_dest, 0b1100),

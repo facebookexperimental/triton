@@ -245,8 +245,10 @@ def test_wait_arrive_non_ws_gfx1250(BLOCK_SIZE, device):
     kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=4)
 
     ttgir = kernel.asm["ttgir"]
-    assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
-            and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    assert ((ttgir.count("amdg.init_barrier") == 1) and (ttgir.count("amdg.read_barrier_phase") == 3)
+            and (ttgir.count("amdg.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    assert "s_wait_dscnt" in kernel.asm["amdgcn"]
+    assert "s_waitcnt" not in kernel.asm["amdgcn"]
 
 
 def _mxfp_e8m0_to_float32(scale):
@@ -255,8 +257,9 @@ def _mxfp_e8m0_to_float32(scale):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-@pytest.mark.parametrize("tdm_fusion", ["none", "partial"])
-def test_mxgemm_tdm_split_correctness_gfx1250(device, tdm_fusion):
+@pytest.mark.parametrize("tdm_split,tdm_fusion", [(False, "none"), (False, "2way"), (False, "4way"), (False, "partial"),
+                                                  (True, "none"), (True, "partial")])
+def test_mxgemm_tdm_correctness_gfx1250(device, tdm_split, tdm_fusion):
     torch.manual_seed(0)
     M = N = 128
     K = 1536
@@ -283,9 +286,9 @@ def test_mxgemm_tdm_split_correctness_gfx1250(device, tdm_fusion):
             "NUM_BUFFERS": 3,
             "DTYPE_A": "e4m3",
             "DTYPE_B": "e4m3",
-            "SCHEDULE": "sliceMNK",
+            "SCHEDULE": "sliceMNK" if tdm_split else "baseline",
             "TDM_FUSION": tdm_fusion,
-            "TDM_SPLIT": True,
+            "TDM_SPLIT": tdm_split,
             "TRANSPOSE_B": True,
             "num_warps": 4,
             "waves_per_eu": 1,

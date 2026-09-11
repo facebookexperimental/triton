@@ -149,13 +149,12 @@ def _mxgemm_issue_loads(
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE, "4-way TDM fusion requires WITH_A_SCALE")
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, load_idx * BLOCK_K_PACKED_A], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
-        b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, pred=pred, clamp_bounds=True,
-                                                   _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
+        b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, pred=pred, clamp_bounds=True)
         a_scale_load_desc = tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets, pred=pred,
-                                                         clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                         clamp_bounds=True)
         b_scale_load_desc = tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets, pred=pred,
-                                                         clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                         clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0001),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b0010),
@@ -164,18 +163,17 @@ def _mxgemm_issue_loads(
         ])
     elif TDM_FUSION == "2way":
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, load_idx * BLOCK_K_PACKED_A], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
-        b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, pred=pred, clamp_bounds=True,
-                                                   _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
+        b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, pred=pred, clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
         ])
         if WITH_A_SCALE:
             a_scale_load_desc = tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets, pred=pred,
-                                                             clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                             clamp_bounds=True)
             b_scale_load_desc = tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets, pred=pred,
-                                                             clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                             clamp_bounds=True)
             tlx.async_amd_descriptor_load_fused([
                 (a_scale_load_desc, tlx.local_view(a_scale_buf, slot), 0b0011),
                 (b_scale_load_desc, tlx.local_view(b_scale_buf, slot), 0b1100),
@@ -186,17 +184,16 @@ def _mxgemm_issue_loads(
     elif TDM_FUSION == "partial":
         tl.static_assert(WITH_A_SCALE, "partial TDM fusion requires WITH_A_SCALE")
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, load_idx * BLOCK_K_PACKED_A], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
-        b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, pred=pred, clamp_bounds=True,
-                                                   _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
+        b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, pred=pred, clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0101),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b1010),
         ])
         a_scale_load_desc = tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets, pred=pred,
-                                                         clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                         clamp_bounds=True)
         b_scale_load_desc = tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets, pred=pred,
-                                                         clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                         clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_scale_load_desc, tlx.local_view(a_scale_buf, slot), 0b0101),
             (b_scale_load_desc, tlx.local_view(b_scale_buf, slot), 0b1010),

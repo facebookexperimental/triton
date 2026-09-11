@@ -62,18 +62,18 @@ def _single_warp_per_simd_issue_loads(
     slot = producer % NUM_BUFFERS
     if not TRANSPOSE_B:
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[producer * BLOCK_K, off_n], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
         ])
     else:
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], pred=pred,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
@@ -97,18 +97,18 @@ def _single_warp_per_simd_issue_loads_unpredicated(
     slot = producer % NUM_BUFFERS
     if not TRANSPOSE_B:
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], pred=True,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[producer * BLOCK_K, off_n], pred=True,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
         ])
     else:
         a_load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], pred=True,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         b_load_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], pred=True,
-                                                   clamp_bounds=True, _fused_tdm_explicit_offset=True)
+                                                   clamp_bounds=True)
         tlx.async_amd_descriptor_load_fused([
             (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
             (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),

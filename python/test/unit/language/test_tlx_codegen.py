@@ -30,11 +30,11 @@ from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm i
     grouped_gemm_tdm_kernel,
 )
 from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import (
-    attn_fwd_tdm_pipelined_kernel as _amd_fa_tdm_kernel,
-)
+    attn_fwd_tdm_pipelined_kernel as _amd_fa_tdm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     _validate_split_pipeline_depth as _validate_amd_mxfp_split_pipeline_depth,
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel,
     matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel as _amd_tdm_single_warp_kernel,
@@ -2975,6 +2975,9 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+    # Match the gfx1250 prologue/body load counts from tlx-amd-meta.
+    tensor_loads = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    assert tensor_loads == {"none": 8, "2way": 4, "4way": 2, "partial": 4}[TDM_FUSION]
 
 
 @pytest.mark.parametrize(
