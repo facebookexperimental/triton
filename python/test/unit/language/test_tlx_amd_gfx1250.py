@@ -231,5 +231,7 @@ def test_wait_arrive_non_ws_gfx1250(BLOCK_SIZE, device):
     kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=4)
 
     ttgir = kernel.asm["ttgir"]
-    assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
-            and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    assert ((ttgir.count("amdg.init_barrier") == 1) and (ttgir.count("amdg.read_barrier_phase") == 3)
+            and (ttgir.count("amdg.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    assert "s_wait_dscnt" in kernel.asm["amdgcn"]
+    assert "s_waitcnt" not in kernel.asm["amdgcn"]
