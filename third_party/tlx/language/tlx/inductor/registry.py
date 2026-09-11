@@ -125,6 +125,100 @@ def _is_gfx950() -> bool:
         return False
 
 
+#: Per-arch warp-pipe tile pools, keyed by ``current_target().key``. An arch
+#: absent here falls back to the heuristic's own ``WARPPIPE_CONFIGS`` (tuned on
+#: gfx950), which is safe rather than merely permissive: every tile still goes
+#: through :func:`_warppipe_tile_fits` against the live LDS budget, so an
+#: unlisted arch offers the subset that fits instead of emitting candidates the
+#: backend will reject. Adding a tuned pool for a new arch -- gfx1250 next -- is
+#: a row here, not a change to the selector or to either heuristic.
+#:
+#: gfx942 (MI300X) has 64KB of LDS against gfx950's 160KB, and the generated
+#: kernel allocates more than the operand tiles alone (see
+#: _AMD_LDS_SAFETY_MARGIN_BY_ARCH), so none of the gfx950 tiles are usable. These are
+#: BLOCK_K=32-dominant tiles whose estimate stays at or under 32KB, i.e. inside
+#: the budget once the margin is charged. Sized for feasibility, not perf-tuned.
+ADDMM_WARPPIPE_CONFIGS_BY_ARCH: dict[str, list[tuple[int, int, int, int, int, int]]] = {
+    "gfx942": [
+        (64, 64, 32, 8, 8, 2),
+        (64, 64, 32, 8, 8, 3),
+        (128, 64, 32, 8, 8, 2),
+        (64, 128, 32, 8, 8, 2),
+        (128, 128, 32, 8, 8, 2),
+        (64, 64, 64, 8, 8, 2),
+    ],
+}
+
+#: bmm equivalent. Without a pool of its own gfx942 would drop to zero async
+#: candidates -- the smallest gfx950 bmm tile is 48KB, which the margin pushes
+#: over budget -- leaving only the register path.
+BMM_WARPPIPE_CONFIGS_BY_ARCH: dict[str, list[tuple[int, int, int, int, int, int]]] = {
+    "gfx942": [
+        (256, 256, 16, 8, 8, 2),
+        (256, 128, 16, 8, 8, 2),
+        (128, 128, 32, 8, 8, 2),
+        (128, 64, 32, 8, 8, 2),
+        (64, 128, 32, 8, 8, 2),
+        (64, 64, 32, 8, 8, 2),
+        (64, 64, 32, 8, 8, 3),
+    ],
+}
+
+
+def _warppipe_configs_for(heuristic) -> list[tuple[int, int, int, int, int, int]]:
+    """Tile pool for the live target.
+
+    Shared by the addmm and bmm heuristics so a new arch pool cannot be wired
+    into one loop and missed in the other.
+    """
+    return heuristic.WARPPIPE_CONFIGS_BY_ARCH.get(
+        current_target().key, heuristic.WARPPIPE_CONFIGS
+    )
+
+
+#: AMD_WARP_PIPE.estimate_smem charges only the two multi-buffered operand
+#: tiles. The generated kernel also stages the epilogue (and, for the persistent
+#: variant, loop state), which on gfx942 was measured to push a 48KB tile to an
+#: 81920-byte allocation -- so the tile estimate alone lets configs through that
+#: the backend then rejects. Mirrors _SMEM_SAFETY_MARGIN on the Blackwell path,
+#: sized from the largest measured gap on MI300X.
+#:
+#: Charged per arch, and only where that gap was actually measured. gfx950 is
+#: deliberately absent: its pool is the tuned production pool, validated on
+#: MI350 hardware, and charging gfx942's margin against gfx950's 160KB budget
+#: drops five (tile, dtype) combinations that estimate 147456B -- inside the
+#: raw budget and demonstrably runnable. An arch with no entry is still checked
+#: against its raw budget, which is what removes tiles the backend cannot run.
+_AMD_LDS_SAFETY_MARGIN_BY_ARCH: dict[str, int] = {"gfx942": 32768}
+
+
+def _warppipe_tile_fits(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_buffers: int,
+    *,
+    elem_bytes: int,
+    use_async: bool,
+) -> bool:
+    """Whether a warp-pipe tile fits the *live* target's LDS budget.
+
+    The gfx950_* heuristics register for all of ROCm (``register=IS_ROCM``), so a
+    tile sized for gfx950's 160KB reaches gfx942's 64KB unchanged. Without this
+    check the oversized candidates are still emitted and the Triton backend then
+    rejects them with "out of resource: shared memory", which silently drops TLX
+    out of autotune altogether instead of narrowing it to the tiles that fit.
+    """
+    cfg = resources.AmdWarpPipeConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        use_async=use_async,
+        elem_bytes=elem_bytes,
+    )
+    margin = _AMD_LDS_SAFETY_MARGIN_BY_ARCH.get(current_target().key, 0)
+    return resources.AMD_WARP_PIPE.validate(cfg, smem_margin=margin)
 def _select_group_size_m(M: int, N: int, block_m: int) -> int:
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
@@ -1240,6 +1334,8 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
         (128, 256, 32, 8, 8, 3),
     ]
 
+    WARPPIPE_CONFIGS_BY_ARCH = ADDMM_WARPPIPE_CONFIGS_BY_ARCH
+
     def adjust_kernel_inputs(
         self, kernel_inputs: KernelInputs, op_name: str
     ) -> KernelInputs:
@@ -1334,9 +1430,18 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
             group_m,
             num_warps,
             num_buffers,
-        ) in self.WARPPIPE_CONFIGS:
+        ) in _warppipe_configs_for(self):
             # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
             if block_m % 16 != 0 or block_n % 16 != 0:
+                continue
+            if not _warppipe_tile_fits(
+                block_m,
+                block_n,
+                block_k,
+                num_buffers,
+                elem_bytes=itemsize,
+                use_async=use_async,
+            ):
                 continue
             if use_async:
                 # async warp-pipeline correctness guard: K_ITERS > NUM_BUFFERS (well-formed
@@ -1437,6 +1542,8 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         (16, 256, 128, 4, 4, 3),
     ]
 
+    WARPPIPE_CONFIGS_BY_ARCH = BMM_WARPPIPE_CONFIGS_BY_ARCH
+
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         import sympy
         from torch._inductor.virtualized import V
@@ -1477,9 +1584,18 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             group_m,
             num_warps,
             num_buffers,
-        ) in self.WARPPIPE_CONFIGS:
+        ) in _warppipe_configs_for(self):
             # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
             if block_m % 16 != 0 or block_n % 16 != 0:
+                continue
+            if not _warppipe_tile_fits(
+                block_m,
+                block_n,
+                block_k,
+                num_buffers,
+                elem_bytes=itemsize,
+                use_async=use_async,
+            ):
                 continue
             # async path only: its prologue prefetches NUM_BUFFERS full K-tiles, so require
             # K_ITERS = K // BLOCK_K >= NB. The register path has no prologue -> it takes any K.
