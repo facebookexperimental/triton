@@ -1,4 +1,4 @@
-"""gfx950 correctness coverage for ``tlx.ops.mm`` LocalSplitU GEMM."""
+"""gfx950 correctness coverage for ``tlx.ops.mm``."""
 
 import time
 
@@ -55,6 +55,30 @@ def test_mm(m, n, k, a_strides, b_strides, dtype_name):
         expected,
         atol=1e-3 * expected.abs().max().item(),
         rtol=1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "m,n,k,dtype",
+    [
+        (279, 256, 4096, torch.float16),
+        (1024, 4096, 800, torch.bfloat16),
+    ],
+    ids=["intermediate-fp16", "full-grid-bf16"],
+)
+def test_mm_register_fallback(m, n, k, dtype):
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype)
+    b = torch.randn((n, k), device="cuda", dtype=dtype).T
+
+    out = tlx_mm(a, b, arch="gfx950", space="heuristic")
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(
+        out,
+        expected,
+        atol=1e-2 * expected.abs().max().item(),
+        rtol=1e-2,
     )
 
 
@@ -115,7 +139,7 @@ def test_mm_rejects_unsupported_operands():
     assert not supports(unsupported_a, b)
     assert not supports(a.to(torch.float32), b.to(torch.float32))
     assert not supports(a, b.contiguous())
-    with pytest.raises(InvalidInput, match="no legal plan"):
+    with pytest.raises(InvalidInput, match="does not support"):
         mm(unsupported_a, b)
     with pytest.raises(InvalidInput, match="does not support"):
         matmul(unsupported_a, b)

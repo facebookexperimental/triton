@@ -64,12 +64,11 @@ CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
         op="mm",
         arch="gfx950",
-        variant="local_split_u",
+        variant="heuristic",
         impl="kernels.mm.gfx950:mm",
-        # Deliberately not `_FP16`: that shared set also contains bfloat16,
-        # while this first gfx950 implementation has only been validated for
-        # IEEE fp16 operands.
-        dtypes=frozenset({"float16"}),
+        # LocalSplitU remains FP16-only; the register fallback also supports
+        # BF16 and performs the narrower per-plan validation.
+        dtypes=_FP16,
         requires=frozenset(),
     ),
     OpSpec(

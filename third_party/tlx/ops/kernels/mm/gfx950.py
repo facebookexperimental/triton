@@ -1,9 +1,8 @@
-"""gfx950 small-M GEMM implementation for :func:`triton.tlx.ops.mm`.
+"""gfx950 GEMM implementation for :func:`triton.tlx.ops.mm`.
 
-The logical M dimension is too small to expose enough output tiles. Each wave
-therefore computes one block-cyclic K partition of the same output tile. The
-FP32 partials are reduced in wave order inside the workgroup before the logical
-result is stored.
+Small-M shapes use LocalSplitU: each wave computes one block-cyclic K partition
+of the same output tile, then the FP32 partials are reduced in wave order.
+Irregular intermediate-M shapes use the geometry-selected register pipeline.
 """
 
 from functools import lru_cache
@@ -16,15 +15,16 @@ import triton.language.extra.tlx as tlx
 
 from ..._catalog import InvalidInput
 from ._shapes import GFX950_FOCUS
+from .gfx950_register import launch as _launch_register_pipeline
+from .gfx950_register import plan_for as _register_plan_for_shape
 
 __all__ = ["mm", "matmul", "supports"]
 
 PERF_SHAPES = GFX950_FOCUS
 
 
-# The initial implementation deliberately exposes only measured plans. A
-# follow-up change adds bounded plan generation for neighboring shapes without
-# changing this register-staged execution mechanism.
+# Exact entries are a tuning cache, not the supported-shape list. Unseen shapes
+# use the bounded plan generator below and benchmark at most four candidates.
 class _Plan(NamedTuple):
     tile_m: int
     tile_n: int
@@ -46,7 +46,6 @@ _KNOWN_PLANS = {
         k_width=8,
     ),
 }
-
 
 @lru_cache(maxsize=None)
 def _device_arch(device):
@@ -96,6 +95,67 @@ def _load_dot_operands(
     return a, b
 
 
+_NUM_CU = 256
+_TILE_N_CANDIDATES = (8, 16, 32)
+_SPLIT_U_CANDIDATES = (2, 4, 8, 16)
+_WAVE_K_CANDIDATES = (32, 64, 128, 256, 512, 1024)
+_TARGET_SPLIT_U = {8: 2, 16: 8, 32: 16}
+_TARGET_MACRO_K = {8: 2048, 16: 1024, 32: 512}
+_MAX_AUTOTUNE_CONFIGS = 4
+
+
+def _pow2_distance(lhs, rhs):
+    return abs(lhs.bit_length() - rhs.bit_length())
+
+
+@lru_cache(maxsize=128)
+def _generate_plans(m, n, k):
+    """Generate at most four legal, high-value LocalSplitU plans.
+
+    First choose output widths that put the N grid near one workgroup per CU.
+    Within each width, prefer 2--4 macro-K iterations and stay near the measured
+    split/reduction balance for that width. The final choice is measured by a
+    bounded host-side tuner rather than hard-coded by the cost model.
+    """
+    if not (0 < m <= 16 and n >= 512 and k >= 1024):
+        return ()
+
+    tile_ns = sorted(
+        _TILE_N_CANDIDATES,
+        key=lambda tile_n: (
+            abs(triton.cdiv(n, tile_n) - _NUM_CU),
+            tile_n,
+        ),
+    )[:2]
+    closest_grid = triton.cdiv(n, tile_ns[0])
+    if not _NUM_CU // 2 <= closest_grid <= 2 * _NUM_CU:
+        return ()
+    plans = []
+    for tile_n in tile_ns:
+        legal = []
+        for split_u in _SPLIT_U_CANDIDATES:
+            for wave_k in _WAVE_K_CANDIDATES:
+                macro_k = split_u * wave_k
+                if k % macro_k != 0:
+                    continue
+                macro_iterations = k // macro_k
+                if not 2 <= macro_iterations <= 8:
+                    continue
+                score = (
+                    _pow2_distance(macro_k, _TARGET_MACRO_K[tile_n]),
+                    _pow2_distance(split_u, _TARGET_SPLIT_U[tile_n]),
+                    min(
+                        abs(macro_iterations - 2),
+                        abs(macro_iterations - 4),
+                    ),
+                    -wave_k,
+                )
+                legal.append((score, _Plan(16, tile_n, split_u, wave_k, 4)))
+        legal.sort()
+        plans.extend(spec for _, spec in legal[:2])
+    return tuple(plans[:_MAX_AUTOTUNE_CONFIGS])
+
+
 @triton.jit
 def _local_split_u_kernel(
     a_ptr,
@@ -124,7 +184,12 @@ def _local_split_u_kernel(
     split_ids = tl.arange(0, LOCAL_SPLIT_U).to(tl.int32)
     rows = tl.arange(0, TILE_M).to(tl.int32)
     # Padded rows may read any valid A row because their results are discarded.
-    global_rows = tl.where(rows < M, rows, 0)
+    # Generated K1024 plans benefit from the shorter clamp instruction; the
+    # measured exact plans preserve their row-zero duplication and load map.
+    if WAVE_K == 1024:
+        global_rows = tl.minimum(rows, M - 1)
+    else:
+        global_rows = tl.where(rows < M, rows, 0)
     local_cols = tl.arange(0, TILE_N).to(tl.int32)
     output_cols = pid_n * TILE_N + local_cols
     global_cols = tl.where(output_cols < N, output_cols, 0)
@@ -248,15 +313,121 @@ def _local_split_u_kernel(
     )
 
 
-def _plan_for(a, b):
-    """Return the measured plan for supported operands, otherwise ``None``."""
-    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
-        return None
+_PLAN_CACHE = {}
+
+
+# This helper is used only during first-call tuning. Keep the steady-state
+# launch inline in matmul(): another Python frame is measurable for a ~10 us
+# kernel because host dispatch falls between the timing events.
+def _launch_plan_for_tuning(a, b, out, plan):
+    tile_m, tile_n, local_split_u, wave_k, k_width = plan
+    launch_options = {"sink_insts_to_avoid_spills": True}
+    if wave_k >= 512:
+        # Iterative ILP controls register pressure for long operand windows;
+        # keep the later generic high-RP pass from replacing its schedule.
+        launch_options.update(
+            llvm_fn_attrs=(
+                ("amdgpu-sched-strategy", "iterative-ilp"),
+            ),
+            disable_unclustered_high_rp_reschedule=True,
+        )
     m, k = a.shape
     _, n = b.shape
+    _local_split_u_kernel[(triton.cdiv(n, tile_n), )](
+        a,
+        b,
+        out,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        out.stride(0),
+        out.stride(1),
+        TILE_M=tile_m,
+        TILE_N=tile_n,
+        K_WIDTH=k_width,
+        WAVE_K=wave_k,
+        LOCAL_SPLIT_U=local_split_u,
+        num_warps=local_split_u,
+        num_stages=1,
+        matrix_instr_nonkdim=16,
+        waves_per_eu=0,
+        **launch_options,
+    )
+
+
+def _plan_cache_key(a, b, out):
+    return (
+        a.device.type,
+        a.device.index,
+        a.dtype,
+        tuple(a.shape),
+        tuple(a.stride()),
+        tuple(b.shape),
+        tuple(b.stride()),
+        tuple(out.stride()),
+    )
+
+
+def _select_plan(a, b, out):
+    m, k = a.shape
+    _, n = b.shape
+    known = _KNOWN_PLANS.get((m, n, k))
+    if known is not None:
+        return known
+
+    key = _plan_cache_key(a, b, out)
+    cached = _PLAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    candidates = _generate_plans(m, n, k)
+    assert candidates
+    timings = [
+        (
+            triton.testing.do_bench(
+                lambda plan=plan: _launch_plan_for_tuning(a, b, out, plan),
+                warmup=25,
+                rep=100,
+            ),
+            plan,
+        )
+        for plan in candidates
+    ]
+    selected = min(timings, key=lambda item: item[0])[1]
+    _PLAN_CACHE[key] = selected
+    return selected
+
+
+def _supports_local_split_u(a, b):
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        return False
+    m, k = a.shape
+    _, n = b.shape
+    if (
+        a.dtype != torch.float16
+        or b.dtype != torch.float16
+        or not a.is_cuda
+        or a.device != b.device
+        or _device_arch(a.device) != "gfx950"
+        or a.stride(1) != 1
+        or b.stride(0) != 1
+    ):
+        return False
+    if (m, n, k) in _KNOWN_PLANS:
+        return True
+    return bool(_generate_plans(m, n, k))
+
+
+def _register_plan_for(a, b):
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        return None
     if not (
-        a.dtype == torch.float16
-        and b.dtype == torch.float16
+        a.dtype in (torch.float16, torch.bfloat16)
+        and b.dtype == a.dtype
         and a.is_cuda
         and a.device == b.device
         and _device_arch(a.device) == "gfx950"
@@ -264,24 +435,79 @@ def _plan_for(a, b):
         and b.stride(0) == 1
     ):
         return None
-    return _KNOWN_PLANS.get((m, n, k))
+    m, k = a.shape
+    _, n = b.shape
+    if min(m, n, k) <= 0:
+        return None
+    return _register_plan_for_shape(m, n, k)
 
 
 def supports(a, b):
-    """Return whether a and b select a measured LocalSplitU plan."""
-    return _plan_for(a, b) is not None
+    """Return whether a and b select a validated gfx950 GEMM plan."""
+    return (
+        _supports_local_split_u(a, b)
+        or _register_plan_for(a, b) is not None
+    )
 
 
-def _launch_validated(a, b, out, plan):
-    """Launch a plan after operand and output validation has completed."""
+def matmul(a, b, out=None):
+    """Run the selected gfx950 GEMM specialization."""
+    local_split_u = _supports_local_split_u(a, b)
+    register_plan = None if local_split_u else _register_plan_for(a, b)
+    if not local_split_u and register_plan is None:
+        raise InvalidInput(
+            "gfx950 mm does not support "
+            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
+        )
     m, k = a.shape
     _, n = b.shape
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    elif not isinstance(out, torch.Tensor):
+        raise InvalidInput(
+            "gfx950 mm output must be a torch.Tensor; "
+            f"got {type(out).__name__}"
+        )
+    elif out.shape != (m, n):
+        raise InvalidInput(
+            f"gfx950 mm output shape must be {(m, n)}; "
+            f"got {tuple(out.shape)}"
+        )
+    elif out.dtype != a.dtype:
+        raise InvalidInput(
+            f"gfx950 mm output dtype must be {a.dtype}; "
+            f"got {out.dtype}"
+        )
+    elif out.device != a.device:
+        raise InvalidInput(
+            f"gfx950 mm output device must be {a.device}; "
+            f"got {out.device}"
+        )
+
+    if register_plan is not None:
+        return _launch_register_pipeline(
+            a,
+            b,
+            config=register_plan,
+            out=out,
+        )
+
+    plan = _select_plan(a, b, out)
     tile_m, tile_n, local_split_u, wave_k, k_width = plan
     if m > tile_m:
         raise InvalidInput(
             f"gfx950 LocalSplitU plan covers at most {tile_m} rows; got M={m}"
         )
     launch_options = {"sink_insts_to_avoid_spills": True}
+    if wave_k >= 512:
+        # Generated long-window plans require the same register-pressure
+        # controls used while timing their candidates.
+        launch_options.update(
+            llvm_fn_attrs=(
+                ("amdgpu-sched-strategy", "iterative-ilp"),
+            ),
+            disable_unclustered_high_rp_reschedule=True,
+        )
     _local_split_u_kernel[(triton.cdiv(n, tile_n), )](
         a,
         b,
@@ -309,59 +535,10 @@ def _launch_validated(a, b, out, plan):
     return out
 
 
-def matmul(a, b, out=None):
-    """Run a tuned gfx950 LocalSplitU GEMM specialization."""
-    plan = _plan_for(a, b)
-    if plan is None:
-        raise InvalidInput(
-            "gfx950 LocalSplitU matmul does not support "
-            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
-        )
-    m, k = a.shape
-    _, n = b.shape
-    if out is None:
-        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    elif not isinstance(out, torch.Tensor):
-        raise InvalidInput(
-            "gfx950 LocalSplitU output must be a torch.Tensor; "
-            f"got {type(out).__name__}"
-        )
-    elif out.shape != (m, n):
-        raise InvalidInput(
-            f"gfx950 LocalSplitU output shape must be {(m, n)}; "
-            f"got {tuple(out.shape)}"
-        )
-    elif out.dtype != a.dtype:
-        raise InvalidInput(
-            f"gfx950 LocalSplitU output dtype must be {a.dtype}; "
-            f"got {out.dtype}"
-        )
-    elif out.device != a.device:
-        raise InvalidInput(
-            f"gfx950 LocalSplitU output device must be {a.device}; "
-            f"got {out.device}"
-        )
-
-    return _launch_validated(a, b, out, plan)
-
-
 def mm(a, b, *, space="heuristic"):
-    """Run the gfx950 implementation selected by ``tlx.ops.mm``.
-
-    The initial implementation has one measured plan per supported shape;
-    the next stack revision broadens this into a bounded plan generator.
-    """
+    """Run the heuristic gfx950 implementation selected by ``tlx.ops.mm``."""
     if space != "heuristic":
         raise InvalidInput(
-            "gfx950 LocalSplitU mm currently supports space='heuristic' only"
+            "gfx950 mm currently supports space='heuristic' only"
         )
-    plan = _plan_for(a, b)
-    if plan is None:
-        raise InvalidInput(
-            "gfx950 LocalSplitU mm has no legal plan for "
-            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
-        )
-    m, _ = a.shape
-    _, n = b.shape
-    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    return _launch_validated(a, b, out, plan)
+    return matmul(a, b)
