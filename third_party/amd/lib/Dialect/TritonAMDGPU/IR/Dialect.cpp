@@ -1031,7 +1031,10 @@ LogicalResult MfmaCommitOp::verify() {
       if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
                                             "input " + Twine(index) + " ")))
         return failure();
-      if (!input.hasOneUse())
+      // SCF-to-CF turns a runtime loop's yielded accumulator into a loop-header
+      // block argument used by the mutually exclusive body and exit blocks.
+      // This remains one dynamic chain; reject all ordinary SSA forks.
+      if (!input.hasOneUse() && !AMD::hasMutuallyExclusiveSuccessorUses(input))
         return emitOpError()
                << "input " << index
                << " must be consumed only by this completion boundary";
