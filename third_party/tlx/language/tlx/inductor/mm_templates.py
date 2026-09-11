@@ -105,6 +105,16 @@ gfx950_bmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_bmm_warppipe"),
 )
 
+# Shared-LHS gfx950 BMM candidate.  Unlike the general warp-pipe template,
+# this preserves the regime-specific macro tiles, LDS layouts, batch ordering,
+# and scheduling options validated by amd_bmm_shared_a.py.  Its heuristic only
+# yields configs for the validated shapes, a dense shared A, and dense batched B.
+amd_bmm_shared_a_template = TritonTemplate(
+    name="tlx_amd_bmm_shared_a",
+    grid=_bmm_grid_warppipe,
+    source=load_tlx_template("amd_bmm_shared_a"),
+)
+
 # Persistent variant of the gfx950 warp-pipe addmm: same warp-pipe body, but the grid
 # is capped at NUM_SMS (_persistent_mm_grid_split_k) and the kernel loops over output
 # tiles. Competes as an additional addmm candidate so per-template selection can be
@@ -153,8 +163,11 @@ def _append_tlx_amd(templates, op_name):
         from torch._inductor.kernel.bmm import bmm_template
 
         uids = {getattr(t, "uid", None) for t in templates}
-        if bmm_template.uid in uids and gfx950_bmm_warppipe_template.uid not in uids:
-            templates.append(gfx950_bmm_warppipe_template)
+        if bmm_template.uid in uids:
+            if gfx950_bmm_warppipe_template.uid not in uids:
+                templates.append(gfx950_bmm_warppipe_template)
+            if amd_bmm_shared_a_template.uid not in uids:
+                templates.append(amd_bmm_shared_a_template)
     # else: no AMD TLX template for plain mm (or any other op) yet. Proposing
     # the Blackwell one here is the bug reported in P2462423082: it cannot be
     # selected on gfx9xx and only produces log noise.

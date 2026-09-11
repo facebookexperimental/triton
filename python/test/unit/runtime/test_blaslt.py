@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 import torch
 from triton._internal_testing import is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4
@@ -6,6 +8,33 @@ from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 
 def supports_block_scaling():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
+
+
+def handle_or_skip(factory):
+    """Build a vendor BLAS handle, skipping if the library is not installed.
+
+    The bindings dlopen libcublas / libhipblaslt when the handle is constructed,
+    so a runner that has CUDA or HIP but no vendor BLAS fails here rather than at
+    import. The other guards in this file cover device capability and dtype
+    support, not library availability. Narrow on purpose: only the "could not
+    find" case skips, so a BLAS that is present but broken still fails.
+
+    Warns before skipping so the lost coverage shows up in pytest's warnings
+    summary. A bare skip is too quiet for this: a CI job whose whole purpose is
+    to exercise the vendor BLAS bindings would otherwise report green while
+    testing none of them.
+    """
+    try:
+        return factory()
+    except RuntimeError as exc:
+        if "could not find" not in str(exc).lower():
+            raise
+        warnings.warn(
+            f"Vendor BLAS library is unavailable, so this test is not running: {exc} "
+            "Install it or add it to LD_LIBRARY_PATH to restore coverage.",
+            stacklevel=2,
+        )
+        pytest.skip(str(exc))
 
 
 @pytest.mark.parametrize("m, n, k", [(16, 16, 16), (32, 16, 16), (16, 32, 16), (16, 16, 32)])
@@ -49,7 +78,7 @@ def test_blaslt(m, n, k, dtype_str, device):
     b = b.T.contiguous()
 
     workspace = torch.empty(workspace_size, dtype=torch.int8, device=device)
-    handle = make_handle(workspace)
+    handle = handle_or_skip(lambda: make_handle(workspace))
 
     handle.matmul(a, b, c)
 
@@ -85,7 +114,7 @@ def test_block_scaled_matmul_mxfp8(m, n, k, device):
     # Create workspace and cuBLAS handle
     workspace_size = 32 * 1024 * 1024
     workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
-    handle = nvidia.cublas.CublasLt(workspace)
+    handle = handle_or_skip(lambda: nvidia.cublas.CublasLt(workspace))
 
     # Generate random FP8 inputs
     a_fp32 = torch.randn(m, k, device=device, dtype=torch.float32)
@@ -156,7 +185,7 @@ def test_block_scaled_matmul_nvfp4(m, n, k, device):
     # Create workspace and cuBLAS handle
     workspace_size = 32 * 1024 * 1024
     workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
-    handle = nvidia.cublas.CublasLt(workspace)
+    handle = handle_or_skip(lambda: nvidia.cublas.CublasLt(workspace))
 
     # Generate random MXFP4 tensors
     a_ref = MXFP4Tensor(size=(m, k), device=device).random()
