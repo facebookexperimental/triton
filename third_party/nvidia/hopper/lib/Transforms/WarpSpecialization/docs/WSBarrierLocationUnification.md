@@ -89,6 +89,9 @@ frees, while the overlap it costs is unconditional. Requiring a register-heavy
 result means the pass fires on the case it was measured on and declines the
 ones where it would only serialize. The `128x128xf32` bias tile that motivated
 the pass sits at 128 elements per thread, so the floor leaves a wide margin.
+The threshold and broadcast classifier are shared with `InterleaveTMem`'s
+operand-priority rule so both register-pressure transformations use the same
+definition of a register-heavy broadcast.
 
 After moving one wait, the pass rescans the block. This continues until no
 consecutive pair can be unified, allowing a sequence of compatible regions to

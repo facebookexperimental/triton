@@ -4,6 +4,8 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -11,6 +13,22 @@
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+// Register-pressure transformations in InterleaveTMem and
+// UnifyWSBarrierLocations use the same conservative lower bound. The measured
+// addmm and FA cases are both comfortably above it.
+inline constexpr unsigned kMinRegisterHeavyBroadcastElemsPerThread = 32;
+
+inline bool isRegisterHeavyBroadcast(Operation *op) {
+  auto broadcast = dyn_cast<BroadcastOp>(op);
+  if (!broadcast)
+    return false;
+  auto type = dyn_cast<RankedTensorType>(broadcast.getResult().getType());
+  if (!type || !type.getEncoding())
+    return false;
+  return gpu::getTotalElemsPerThread(type) >=
+         kMinRegisterHeavyBroadcastElemsPerThread;
+}
 
 inline DictionaryAttr
 getWSBarrierConstraints(std::optional<DictionaryAttr> constraints) {

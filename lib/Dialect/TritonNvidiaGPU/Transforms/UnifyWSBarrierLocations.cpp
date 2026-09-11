@@ -30,34 +30,11 @@ bool isBarrierBookkeepingOp(Operation *op) {
           ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
           ttg::MemDescReshapeOp>(op))
     return true;
-  if (!isa<arith::ConstantOp, arith::ExtUIOp, arith::TruncIOp,
-           arith::XOrIOp, arith::AndIOp>(op) ||
+  if (!isa<arith::ConstantOp, arith::ExtUIOp, arith::TruncIOp, arith::XOrIOp,
+           arith::AndIOp>(op) ||
       op->getNumResults() != 1)
     return false;
   return isa<IntegerType, IndexType>(op->getResult(0).getType());
-}
-
-// Unification trades away overlap to buy register relief, and only one side of
-// that trade scales with size. The relief comes from materializing a broadcast
-// value after the awaited MMA lands instead of holding it live across the wait,
-// so it is proportional to the registers that value occupies. The cost -- the
-// preparation chain feeding the broadcast no longer overlaps MMA latency -- is
-// paid whatever the value's size. Below this threshold the pass would spend the
-// serialization and get nothing back, so a small broadcast does not qualify.
-//
-// The addmm epilogue this pass was measured on carries a 128x128xf32 bias tile
-// at 128 elements per thread, so the threshold sits well under the case that
-// motivated the pass while still excluding incidental broadcasts.
-constexpr unsigned kMinBroadcastElemsPerThread = 32;
-
-bool isRegisterHeavyBroadcast(Operation *op) {
-  auto broadcast = dyn_cast<tt::BroadcastOp>(op);
-  if (!broadcast)
-    return false;
-  auto type = dyn_cast<RankedTensorType>(broadcast.getResult().getType());
-  if (!type || !type.getEncoding())
-    return false;
-  return ttg::getTotalElemsPerThread(type) >= kMinBroadcastElemsPerThread;
 }
 
 bool canUnifyWaitLocations(WaitBarrierOp earlier, WaitBarrierOp later) {

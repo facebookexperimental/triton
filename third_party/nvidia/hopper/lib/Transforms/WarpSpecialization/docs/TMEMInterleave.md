@@ -81,6 +81,17 @@ themselves. They wait for a TMA store to finish reading SMEM, but do not carry
 WS barrier semantics unless they include attached barrier operands. Barrier-
 bearing token waits still block movement like other arrive-like operations.
 
+## TMEM Operand Priority
+
+When an independent SMEM operand and a TMEM operand meet at the same pure
+operation, the pass may move the complete SMEM consumer channel after the TMEM
+channel. This is restricted to cheap SMEM preparation chains made of
+shape/layout changes and floating-point extensions or truncations. The chain
+must contain a broadcast carrying at least 32 elements per thread. The shared
+threshold is the same one used by `UnifyWSBarrierLocations`; it prevents the
+rewrite from swapping ordinary wide operands when no register-heavy broadcast
+can benefit from the new order.
+
 ## No Rollback
 
 The pass applies its transformation unconditionally. It does not snapshot the

@@ -20,7 +20,7 @@ the `WSCodePartition.cpp` / `CodePartitionUtility.cpp` comments:
 | **A3** | N-buffer SMEM epilogue | SMEM | ≥2 single-copy channels sharing one circular buffer, stored/loaded sequentially, all producers in one block (epilogue subtiling) | `verifyReuseGroupN` + inline chain |
 | **A4** | TMEM column packing | TMEM | same `buffer.id`, **disjoint** columns (`buffer.offset`) — spatial packing, no cross-channel sync; materialized by `replaceBufferReuse`'s column slice | none (`tmemReuseGroupOverlaps` false) |
 | **A5** | Cross-partition reuse | TMEM | single-copy ≥3-channel group whose producers span >1 partition AND admit a unique **dependency-chain** order; synced like A2 on the chain **endpoints** | `verifyReuseGroupCrossPartition` |
-| **A6** | Whole-allocation-overwrite hub | TMEM | a `useC=false` owner overwrites the **whole** allocation, clobbering spatially-packed (distinct-`buffer.offset`) siblings; emits back-edges to those siblings | `isWholeAllocationOverwriteReuseOwner` |
+| **A6** | Whole-allocation-overwrite hub | TMEM | a `useC=false` owner overwrites the **whole** allocation in a spatial-packing group; emits outer-cadence back-edges for packed siblings and an inner-cadence EMPTY acquire for a narrower sibling at the owner's starting column | `isWholeAllocationOverwriteReuseOwner` |
 
 A1 uses temporal slot staggering (multi-buffered). A2/A3/A5/A6 are single-copy
 (`buffer.copy = 1`) and get explicit reuse barriers. A4 needs no synchronization
@@ -612,6 +612,38 @@ pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1
   `needExplicitReuseWait` returns `false`.
 - Action: No change. Partition-internal ordering guarantees correctness.
 
+### FA-forward P publication: schedule-proven empty-edge elision
+
+FA forward can pack the softmax probability `P` into the QK accumulator's
+physical TMEM range.  The ordinary channel construction would make the P store
+wait for the previous PV MMA and make that MMA signal completion.  That edge is
+redundant only when code partitioning proves the complete cycle
+
+```text
+PV(i) -> QK MMA(i+1) -> QK load(i+1) -> P store(i+1).
+```
+
+The structural proof requires a whole-allocation overwrite owner, overlapping
+TMEM ranges, one common inner loop, and same-task source order for both the QK
+MMA/PV MMA pair and the QK load/P store pair.  Source order alone is
+insufficient because software-pipeline expansion can interleave logical
+iterations.  For `before(i) -> after(i + d)`, code partitioning also checks the
+serialized schedule coordinates.  An operation at stage `S` executes logical
+iteration `kernelIter + maxStage - S`, so the expanded kernel-iteration distance
+is
+
+```text
+d + after.stage - before.stage.
+```
+
+A positive value proves the order.  A zero value requires
+`before.cluster < after.cluster`, or source order when the clusters are equal.
+A negative value, or a missing stage/cluster annotation, fails closed and keeps
+the original P-empty wait and matching PV completion arrival.  When both
+`QK load(i) -> P store(i)` (`d = 0`) and `PV(i) -> QK MMA(i+1)` (`d = 1`) are
+proved, `WSCodePartition` omits both endpoints; no later pass repairs or deletes
+the edge.
+
 ## N-Buffer Reuse Group Synchronization
 
 For reuse groups with more than two channels (`group->channels.size() > 2`),
@@ -649,9 +681,32 @@ The fix: when the representative satisfies
 siblings - but **cadence matters**, and getting it wrong
 deadlocks:
 
-- **Inner-cadence siblings** (produced *inside* the owner's inner loop, e.g.
-  `alpha`): produced and consumed within the same inner iteration, already ordered
-  by their own per-iteration channel barriers. **No extra edge is added.**
+- **Inner-cadence, disjoint siblings** (produced *inside* the owner's inner loop
+  at a different starting column, e.g. `alpha` at column 64): produced and
+  consumed within the same inner iteration, already ordered by their own
+  per-iteration channel barriers. **No extra edge is added.**
+- **Inner-cadence, same-start narrower siblings** (e.g. FA-bwd `dQ` sharing
+  column 0 with the whole-allocation `qK` owner): the sibling's ordinary EMPTY
+  acquire occurs at its later producer, so it cannot protect the previous
+  sibling value from the earlier owner overwrite. `WSCodePartition` emits the
+  missing acquire immediately before the owner with the owner's `loop.stage`
+  and `loop.cluster`. The phase is also computed entirely at the owner stage.
+  Let `A` be the accumulation count visible to that stage and `useD` the
+  loop-carried MMA `useAccumulator` flag, initialized false and yielded true:
+
+  ```text
+  S = useD ? A - 1 : A
+  emptyPhase = (S & 1) ^ 1
+  ```
+
+  Standard software-pipeline expansion maps the first owner copy to
+  `useD=false, A=C_t`, so the prologue uses `S=C_t`. In steady state it maps the
+  owner to `useD=true, A=C_t+j`, so the wait uses `S=C_t+j-1`, matching the
+  previous dQ generation. The wait remains before any later 2-CTA issue
+  handshake and does not gain a sibling-stage epilogue copy. The rule is based
+  on the TMEM range, not cluster size, and applies to 1-CTA kernels if they use
+  the same layout. The current form requires dQ to be exactly one pipeline
+  stage after qK.
 - **Outer-cadence siblings** (produced *outside* the inner loop, e.g.
   `m_ij`/`l_i0`, read once per tile in the epilogue): these are the ones the next
   tile's first inner MMA clobbers. For each such sibling whose consumer is in a
@@ -674,7 +729,7 @@ Two details are essential and were the source of an initial deadlock:
    producer_acquire/consumer_release use.
 
 Siblings consumed within the owner producer's own partition (e.g. the `P` matrix at
-`buffer.offset = 0`, consumed by the PV MMA in the same gemm partition) are skipped
+`buffer.offset = 64`, consumed by the PV MMA in the same gemm partition) are skipped
 — program order already orders those.
 
 ```
@@ -691,12 +746,16 @@ Without the fix (race):              With the fix (per outer tile):
 `isWholeAllocationOverwriteReuseOwner(ownerCh)` returns true when `ownerCh` is the
 representative (its alloc has no `buffer.offset`) and is a `TmemAllocChannel`
 with `isOperandDNoAcc == true` (set in `createAllocChannel` when the producer MMA's
-`useAccumulator()` is constant-false). The outer-cadence siblings are collected in
-`fullOverwriteOuterSiblings`; a debug-only assert in the emission step guards
-against silently dropping a required sibling back-edge (the bug class reappearing).
+`useAccumulator()` is constant-false). Same-start inner siblings are emitted as
+ordinary owner-stage acquires with the phase formula above. Outer-cadence
+siblings are collected in `wholeOverwriteBackedgeSiblings`; a
+debug-only assert in the emission step guards against silently dropping a
+required outer sibling back-edge (the bug class reappearing).
 Regression test:
 `test/Hopper/WarpSpecialization/ws_code_partition_tmem_packed_reuse_backward.mlir`;
-runtime validation is the FA-fwd-persistent dp kernel determinism check.
+`test/Hopper/TwoCTA/pipeline_bwd_bm128_gemm_only.mlir` checks the post-expansion
+phase/placement pairing. Runtime validation includes the FA-fwd-persistent DP
+determinism check and the BM128 2-CTA FA-bwd packed-dQ tests.
 
 ### A6 applies only to spatial packing (distinct `buffer.offset`)
 
