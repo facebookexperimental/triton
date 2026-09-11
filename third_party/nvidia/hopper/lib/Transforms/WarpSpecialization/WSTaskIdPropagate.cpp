@@ -280,11 +280,12 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
     }
     // TODO(Arda): Ideally front-end should not allow constant ops to be
     // annotated. Anchor constants cause problems.
-    bool isScalarArithOrMath =
-        isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
+    bool isScalarReplicable =
+        (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
+         isa<triton::AddPtrOp, triton::LoadOp>(op)) &&
         llvm::none_of(op->getResultTypes(),
                       [](Type t) { return isa<RankedTensorType>(t); });
-    bool isAnchor = !isScalarArithOrMath && op->hasAttr("async_task_id");
+    bool isAnchor = !isScalarReplicable && op->hasAttr("async_task_id");
     if (!taskIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !isAnchor)) {
       // For non-anchor ops with existing annotations, merge the lattice
