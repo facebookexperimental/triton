@@ -402,7 +402,6 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
   if (barrierStages.beforeMemoryEffects) {
     // Model a leading local barrier before handling the operation's effects.
     blockInfo->sync();
-    return;
   }
 
   // If the current op is an (async) memory wait and there is no later sync
