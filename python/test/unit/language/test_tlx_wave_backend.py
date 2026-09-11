@@ -1146,6 +1146,37 @@ def test_tlx_fa_precompile_reuses_runtime_launch_configuration(monkeypatch):
     assert 1 <= bench.DEFAULT_COMPILE_WORKERS <= 8
 
 
+@pytest.mark.parametrize(
+    "backend,simple_waves,prefetch_waves",
+    [("hip", 0, 1), ("tlx_wave", 2, 0)],
+)
+def test_tlx_fa_d64_causal_occupancy_is_backend_specific(monkeypatch, backend, simple_waves, prefetch_waves):
+    pytest.importorskip("torch")
+    bench = _load_tlx_fa_bench_module(f"_tlx_wave_test_fa_occupancy_{backend}")
+    calls = {}
+
+    monkeypatch.setattr(
+        bench.triton.runtime.driver.active,
+        "get_current_target",
+        lambda: SimpleNamespace(backend=backend),
+    )
+    for name, kernel in (
+        ("async_simple", bench._attn_fwd_async_simple),
+        ("async_prefetch", bench._attn_fwd_async_prefetch),
+    ):
+        monkeypatch.setattr(
+            kernel,
+            "warmup",
+            lambda *args, _name=name, **kwargs: calls.__setitem__(_name, kwargs),
+        )
+
+    bench.compile_kernel_config(("async_simple", 1, 64, 4096, 64, True, "bf16"), num_sms=304)
+    bench.compile_kernel_config(("async_prefetch", 1, 64, 4096, 64, True, "bf16"), num_sms=304)
+
+    assert calls["async_simple"]["waves_per_eu"] == simple_waves
+    assert calls["async_prefetch"]["waves_per_eu"] == prefetch_waves
+
+
 def test_tlx_glu_parallel_precompile_defers_device_query_to_worker(monkeypatch):
     pytest.importorskip("torch")
     bench = _load_tlx_glu_bench_module("_tlx_wave_test_glu_bench_worker_device")
