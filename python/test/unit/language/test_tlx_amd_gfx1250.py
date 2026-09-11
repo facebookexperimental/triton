@@ -134,6 +134,36 @@ def test_async_amd_desc_load_correctness_gfx1250(device, M, N):
     torch.testing.assert_close(x, output)
 
 
+@triton.jit
+def _async_amd_desc_warp_token_wait_kernel(src, dst, n):
+    desc = tl.make_tensor_descriptor(src, [64, 32], [32, 1], [32, 32])
+    buffers = tlx.local_alloc((32, 32), tl.float16, 2)
+    for i in tl.range(0, n, num_stages=1):
+        with tlx.warp_pipeline_stage("load", priority=1):
+            token0 = tlx.async_amd_descriptor_load(desc, tlx.local_view(buffers, 0), [0, 0])
+            token1 = tlx.async_amd_descriptor_load(desc, tlx.local_view(buffers, 1), [32, 0])
+        tlx.async_amd_descriptor_wait(tokens=[token0])
+        with tlx.warp_pipeline_stage("store", priority=0):
+            value = tlx.local_load(tlx.local_view(buffers, 0))
+            offsets = tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
+            tl.store(dst + i * 1024 + offsets, value)
+        tlx.async_amd_descriptor_wait(tokens=[token1])
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("iterations", [1, 3])
+def test_async_amd_desc_token_wait_warp_pipeline_gfx1250(device, iterations):
+    import re
+
+    src = torch.randn((64, 32), dtype=torch.float16, device=device)
+    dst = torch.empty((iterations, 32, 32), dtype=torch.float16, device=device)
+    compiled = _async_amd_desc_warp_token_wait_kernel[(1, )](src, dst, iterations, num_stages=1)
+    # Wait for the first load while allowing the second load to remain in flight.
+    assert re.search(r"s_wait_tensorcnt\s+(?:0x)?1\b", compiled.asm["amdgcn"])
+    assert re.search(r"s_wait_tensorcnt\s+(?:0x)?0\b", compiled.asm["amdgcn"])
+    torch.testing.assert_close(dst, src[:32].expand(iterations, -1, -1))
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_async_amd_desc_load_fused_correctness_gfx1250(device):
     rows, cols = 16, 32
