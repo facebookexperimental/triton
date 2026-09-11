@@ -59,6 +59,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A useAccumulator=false MMA produces per-iteration scratch. With two
+  // software-pipeline stages, it needs two TMEM slices even when its producer
+  // and consumer occupy the same coarse stage.
+  // CHECK-LABEL: @multibuffer_overwrite_only_tmem
+  // CHECK: scf.for
+  // CHECK:   %[[SCRATCH:.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32
+  // CHECK:   %[[SLICE:.*]] = ttg.memdesc_index %[[SCRATCH]]{{.*}} : !ttg.memdesc<2x128x128xf32
+  // CHECK:   ttng.tc_gen5_mma {{.*}}, {{.*}}, %[[SLICE]], %false
+  tt.func public @multibuffer_overwrite_only_tmem(
+      %a: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
+      %b: !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>,
+      %init: tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>,
+      %iters: index) -> tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>> {
+    %false = arith.constant false
+    %true = arith.constant true
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %out = scf.for %i = %c0 to %iters step %c1 iter_args(%unused = %init) -> (tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>) {
+      %scratch, %alloc_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %mma_tok = ttng.tc_gen5_mma %a, %b, %scratch[%alloc_tok], %false, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %result, %load_tok = ttng.tmem_load %scratch[%mma_tok] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>
+      scf.yield %result : tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    } {tt.num_stages = 2 : i32}
+    tt.return %out : tensor<128x128xf32, #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

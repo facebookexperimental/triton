@@ -63,7 +63,17 @@ after-region arguments, `scf.condition` forwarded values, and after-region
 #### `SpecializeIfOp`
 
 Similarly, `scf::IfOp` regions are cloned with reduced result sets — only
-results used by the partition are kept.
+results used by the partition are kept. Both the then and else regions and
+their trimmed yields are cloned.
+
+Non-trivial else regions are eligible only when task-ID propagation proves the
+complete `scf.if` is contained in one task. The top-level warp-specialization
+pass therefore performs this check after `doTaskIdPropagate`: a singleton union
+from `getNestedAsyncTaskIds(ifOp)` is accepted, while a multi-task else region
+still causes a graceful AutoWS bailout because code partitioning does not yet
+support communication channels in both sides of an `scf.if`. An else region
+containing only `scf.yield` retains the pre-existing behavior and does not need
+the singleton restriction.
 
 ### Step 4: Handle Captures
 
