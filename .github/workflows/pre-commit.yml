@@ -2,6 +2,12 @@ name: Pre-Commit Check
 
 on:
   workflow_call:
+    inputs:
+      strict:
+        description: 'true: blocking check scoped to PR changed files; false: advisory check on all files'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   pre-commit:
@@ -27,8 +33,61 @@ jobs:
           path: |
             ~/.cache/pre-commit
           key: ${{ runner.os }}-${{ steps.cache-key.outputs.pre_commit_hash }}
+      - name: Get PR changed files
+        id: changed
+        if: inputs.strict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+            echo "Not a pull_request event — nothing to check." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # List files via the API so no extra git history is needed.
+          # Fail closed: an API error must fail the check, never silently
+          # produce an empty file list that would skip the blocking step.
+          # Filenames arrive base64-encoded (one per line) so paths with
+          # whitespace or embedded newlines survive the line-based
+          # transport intact; they are stored NUL-delimited below.
+          if ! gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" --paginate \
+            --jq '.[] | select(.status != "removed") | .filename | @base64' > /tmp/changed_b64.txt; then
+            echo "::error::Failed to list PR changed files via the GitHub API."
+            exit 1
+          fi
+          # Deleted files are excluded: pre-commit errors on paths that
+          # don't exist in the checkout.
+          : > /tmp/changed_files.txt
+          while IFS= read -r b; do
+            if ! f=$(printf '%s' "$b" | base64 --decode); then
+              echo "::error::Failed to decode a PR changed-file name."
+              exit 1
+            fi
+            [ -f "$f" ] && printf '%s\0' "$f" >> /tmp/changed_files.txt
+          done < /tmp/changed_b64.txt
+          mapfile -d '' -t FILES_PRESENT < /tmp/changed_files.txt
+          COUNT=${#FILES_PRESENT[@]}
+          echo "Changed files present in checkout: ${COUNT}"
+          if [ "$COUNT" -gt 0 ]; then
+            printf '%s\n' "${FILES_PRESENT[@]}"
+          fi
+          if [ "$COUNT" -eq 0 ]; then
+            # Fail closed: a non-empty API response that yields zero
+            # checkout files (e.g. submodule pointers) must not
+            # silently skip the blocking check.
+            if [ -s /tmp/changed_b64.txt ]; then
+              echo "::error::PR changed files were reported but none exist in the checkout; failing closed."
+              exit 1
+            fi
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Check pre-commit
         id: precommit
+        if: inputs.strict == false
         # Formatting issues are reported as a warning, not a hard failure, so
         # they never block a PR. The "Pre-commit warning" step below is the
         # marker other workflows key off of (see pre-commit-autofix.yml).
@@ -36,6 +95,69 @@ jobs:
         run: |
           python3 -m pip install --upgrade pre-commit
           python3 -m pre_commit run --all-files --verbose
+      - name: Check pre-commit (strict)
+        id: precommit_strict
+        if: inputs.strict && steps.changed.outputs.has_files == 'true'
+        run: |
+          python3 -m pip install --upgrade pre-commit
+          mapfile -d '' -t FILES < /tmp/changed_files.txt
+          set -o pipefail
+          python3 -m pre_commit run --files "${FILES[@]}" --show-diff-on-failure --verbose 2>&1 | tee /tmp/precommit-strict.log
+      - name: Report strict failures
+        if: failure() && steps.precommit_strict.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          {
+            echo "### :x: Pre-commit strict — issues in PR changed files (blocking)"
+            echo ""
+            echo "Only files changed in this PR were checked. Fix locally and push, or comment \`/fix-precommit\` for autofixable hooks (ruff, yapf, clang-format)."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Only render the diff block when a hook actually modified the
+          # tree: report-only diagnostics fail without producing a diff,
+          # and an empty block would imply nothing needs fixing.
+          DIFF=$(git diff)
+          if [ -n "$DIFF" ]; then
+            {
+              echo "<details><summary>Diff of required changes</summary>"
+              echo ""
+              echo '```diff'
+              printf '%s\n' "$DIFF"
+              echo '```'
+              echo ""
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No autofixable changes; see inline annotations for required fixes._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Emit file-level annotations from ruff-style diagnostics
+          # (path:line:col: message) so failures show inline on the PR.
+          # Capped at 10: the per-step annotation limit.
+          MATCHES=$(grep -E -o -m 10 '[^:[:space:]]+\.pyi?:[0-9]+:[0-9]+: ?.*$' /tmp/precommit-strict.log || true)
+          if [ -n "$MATCHES" ]; then
+            echo "$MATCHES" | while IFS= read -r line; do
+              # Single anchored capture so colons in the message cannot
+              # corrupt the file/line/col split; the space after the
+              # column colon is optional (some tools omit it).
+              if ! [[ "$line" =~ ^([^:]+):([0-9]+):([0-9]+):\ ?(.*)$ ]]; then
+                continue
+              fi
+              f="${BASH_REMATCH[1]}"
+              l="${BASH_REMATCH[2]}"
+              c="${BASH_REMATCH[3]}"
+              msg="${BASH_REMATCH[4]}"
+              # Existence is checked before percent-encoding: the encoded
+              # form would not match paths containing % or , on disk.
+              [ -f "$f" ] || continue
+              ef="${f//%/\%25}"
+              ef="${ef//,/%2C}"
+              ef="${ef//$'\r'/%0D}"
+              emsg="${msg//%/\%25}"
+              emsg="${emsg//$'\r'/%0D}"
+              emsg="${emsg//$'\n'/%0A}"
+              echo "::error file=${ef},line=${l},col=${c}::${emsg} (pre-commit-strict)"
+            done
+          fi
       - name: Pre-commit warning
         if: steps.precommit.outcome == 'failure'
         run: |
