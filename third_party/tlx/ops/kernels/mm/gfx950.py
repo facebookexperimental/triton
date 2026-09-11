@@ -1,9 +1,8 @@
-"""gfx950 small-M GEMM implementation for :func:`triton.tlx.ops.mm`.
+"""gfx950 GEMM implementation for :func:`triton.tlx.ops.mm`.
 
-The logical M dimension is too small to expose enough output tiles. Each wave
-therefore computes one block-cyclic K partition of the same output tile. The
-FP32 partials are reduced in wave order inside the workgroup before the logical
-result is stored.
+Small-M shapes use LocalSplitU: each wave computes one block-cyclic K partition
+of the same output tile, then the FP32 partials are reduced in wave order.
+Irregular intermediate-M shapes use the geometry-selected register pipeline.
 """
 
 from functools import lru_cache
@@ -16,6 +15,8 @@ import triton.language.extra.tlx as tlx
 
 from ..._catalog import InvalidInput
 from ._shapes import GFX950_FOCUS
+from .gfx950_register import launch as _launch_register_pipeline
+from .gfx950_register import plan_for as _register_plan_for_shape
 
 __all__ = ["mm", "matmul", "supports"]
 
@@ -401,8 +402,7 @@ def _select_plan(a, b, out):
     return selected
 
 
-def supports(a, b):
-    """Return whether a and b fit the aligned small-M LocalSplitU family."""
+def _supports_local_split_u(a, b):
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         return False
     m, k = a.shape
@@ -422,11 +422,41 @@ def supports(a, b):
     return bool(_generate_plans(m, n, k))
 
 
+def _register_plan_for(a, b):
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        return None
+    if not (
+        a.dtype in (torch.float16, torch.bfloat16)
+        and b.dtype == a.dtype
+        and a.is_cuda
+        and a.device == b.device
+        and _device_arch(a.device) == "gfx950"
+        and a.stride(1) == 1
+        and b.stride(0) == 1
+    ):
+        return None
+    m, k = a.shape
+    _, n = b.shape
+    if min(m, n, k) <= 0:
+        return None
+    return _register_plan_for_shape(m, n, k)
+
+
+def supports(a, b):
+    """Return whether a and b select a validated gfx950 GEMM plan."""
+    return (
+        _supports_local_split_u(a, b)
+        or _register_plan_for(a, b) is not None
+    )
+
+
 def matmul(a, b, out=None):
-    """Run a tuned gfx950 LocalSplitU GEMM specialization."""
-    if not supports(a, b):
+    """Run the selected gfx950 GEMM specialization."""
+    local_split_u = _supports_local_split_u(a, b)
+    register_plan = None if local_split_u else _register_plan_for(a, b)
+    if not local_split_u and register_plan is None:
         raise InvalidInput(
-            "gfx950 LocalSplitU matmul does not support "
+            "gfx950 mm does not support "
             f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
         )
     m, k = a.shape
@@ -435,23 +465,31 @@ def matmul(a, b, out=None):
         out = torch.empty((m, n), device=a.device, dtype=a.dtype)
     elif not isinstance(out, torch.Tensor):
         raise InvalidInput(
-            "gfx950 LocalSplitU output must be a torch.Tensor; "
+            "gfx950 mm output must be a torch.Tensor; "
             f"got {type(out).__name__}"
         )
     elif out.shape != (m, n):
         raise InvalidInput(
-            f"gfx950 LocalSplitU output shape must be {(m, n)}; "
+            f"gfx950 mm output shape must be {(m, n)}; "
             f"got {tuple(out.shape)}"
         )
     elif out.dtype != a.dtype:
         raise InvalidInput(
-            f"gfx950 LocalSplitU output dtype must be {a.dtype}; "
+            f"gfx950 mm output dtype must be {a.dtype}; "
             f"got {out.dtype}"
         )
     elif out.device != a.device:
         raise InvalidInput(
-            f"gfx950 LocalSplitU output device must be {a.device}; "
+            f"gfx950 mm output device must be {a.device}; "
             f"got {out.device}"
+        )
+
+    if register_plan is not None:
+        return _launch_register_pipeline(
+            a,
+            b,
+            config=register_plan,
+            out=out,
         )
 
     plan = _select_plan(a, b, out)
@@ -498,13 +536,9 @@ def matmul(a, b, out=None):
 
 
 def mm(a, b, *, space="heuristic"):
-    """Run the gfx950 implementation selected by ``tlx.ops.mm``.
-
-    The initial implementation has one measured plan per supported shape;
-    the next stack revision broadens this into a bounded plan generator.
-    """
+    """Run the heuristic gfx950 implementation selected by ``tlx.ops.mm``."""
     if space != "heuristic":
         raise InvalidInput(
-            "gfx950 LocalSplitU mm currently supports space='heuristic' only"
+            "gfx950 mm currently supports space='heuristic' only"
         )
     return matmul(a, b)

@@ -20,7 +20,7 @@ compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
 second. On implementations that provide it, pass `space="full"` explicitly to
 buy back the tuned configs, which are worth up to ~4x on small shapes. The
-gfx950 LocalSplitU implementation currently provides only `"heuristic"`.
+gfx950 implementation currently provides only `"heuristic"`.
 
 Ops with no heuristic yet -- flash_attn, hstu_attn, kimi_delta_attention --
 still default to "full". Their remaining space is "smoke", which selects for
