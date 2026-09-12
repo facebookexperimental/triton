@@ -318,14 +318,17 @@ public:
     if (!useAcc2 || *useAcc2 == false)
       return failure();
 
-    // Walk init2 back through single-use, data-preserving ops to a tmem_load.
+    // Walk init2 back through single-use layout conversions to a tmem_load.
+    // The rewrite erases this chain, so every op in it must be elementwise
+    // identity -- only `convert_layout` qualifies. The wider list used by
+    // `findZeroInitOp` preserves all-zeros, not values, and the tile-type
+    // check below does not catch a square-tile `tt.trans`.
     SmallVector<Operation *> chain;
     Value v = init2;
     while (Operation *d = v.getDefiningOp()) {
       if (isa<triton::nvidia_gpu::TMEMLoadOp>(d))
         break;
-      if (!v.hasOneUse() || !isa<ConvertLayoutOp, ReshapeOp, TransOp,
-                                 BroadcastOp, ExpandDimsOp, SplitOp>(d))
+      if (!v.hasOneUse() || !isa<ConvertLayoutOp>(d))
         return failure();
       chain.push_back(d);
       v = d->getOperand(0);
