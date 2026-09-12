@@ -1,4 +1,5 @@
 #include "Utilities.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -8,6 +9,42 @@ using namespace mlir::triton::gpu;
 using namespace mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::nvws {
+
+namespace semaphore {
+
+std::optional<PartitionWsTagIds> getPartitionWsTagIds(Operation *op) {
+  std::optional<PartitionWsTagIds> partitionWsTagIds;
+  if (hasPartition(op)) {
+    partitionWsTagIds =
+        PartitionWsTagIds{std::nullopt, triton::gpu::getPartitionIds(op)};
+    if (auto wsTag = getWarpSpecializeTag(op)) {
+      partitionWsTagIds->wsTag = *wsTag;
+    }
+  }
+  return partitionWsTagIds;
+}
+
+void assignStageCluster(Operation *op,
+                        std::optional<PartitionWsTagIds> partitionWsTagIds,
+                        StageCluster stageCluster, OpBuilder &builder) {
+  if (partitionWsTagIds) {
+    setPartition(op, partitionWsTagIds->partitionIds);
+    if (auto wsTag = partitionWsTagIds->wsTag) {
+      setWarpSpecializeTag(op, *wsTag);
+    }
+    setStageCluster(builder, op, stageCluster);
+  }
+}
+
+SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs) {
+  SmallVector<AsyncOp> kinds;
+  for (auto asyncKind : opAttrs) {
+    kinds.push_back(cast<AsyncOpAttr>(asyncKind).getValue());
+  }
+  return kinds;
+}
+
+} // namespace semaphore
 
 Operation *createAlloc(OpBuilder &builder, Location loc,
                        MemDescType memDescType, Value src) {
