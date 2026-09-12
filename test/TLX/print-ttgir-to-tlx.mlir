@@ -1248,3 +1248,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// The async-copy group ops take their tokens as a list, and async_wait carries
+// its outstanding-group count in the `num` attribute rather than an operand.
+// Printed positionally, the second token binds to async_load_commit_group's
+// `_semantic` and async_load_wait_group loses its required `pendings` argument,
+// so neither survives recompilation.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def async_copy_groups(
+  // CHECK: [[T0:[a-z0-9_]+]] = tlx.async_load(
+  // CHECK: [[T1:[a-z0-9_]+]] = tlx.async_load(
+  // Capture the commit result so the wait is pinned to the token that commit
+  // actually produced, not merely to some identifier.
+  // CHECK: [[G:[a-z0-9_]+]] = tlx.async_load_commit_group([[[T0]], [[T1]]])
+  // The leading pendings count comes from the `num` attribute, not an operand.
+  // CHECK: tlx.async_load_wait_group(1, [[[G]]])
+  tt.func public @async_copy_groups(%ptr: !tt.ptr<f16>, %offs: tensor<64x64xi32, #blocked>,
+                                    %mask: tensor<64x64xi1, #blocked>) attributes {noinline = false} {
+    %d0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %d1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %t0 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d0 : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    %t1 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d1 : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    %g = ttg.async_commit_group tokens %t0, %t1
+    %w = ttg.async_wait %g {num = 1 : i32}
+    tt.return
+  }
+
+  // A token-less commit group is valid IR -- the assembly format makes the
+  // token list optional -- so the empty-list and omitted-list branches are
+  // both reachable.
+  // CHECK-LABEL: def async_groups_no_tokens(
+  // CHECK: tlx.async_load_commit_group([])
+  // CHECK: tlx.async_load_wait_group(0)
+  tt.func public @async_groups_no_tokens() attributes {noinline = false} {
+    %g = ttg.async_commit_group
+    %w = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+}
