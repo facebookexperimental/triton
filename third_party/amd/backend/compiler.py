@@ -238,7 +238,7 @@ class HIPBackend(BaseBackend):
                 pm,
                 f"hip:{options.arch}",
                 options.num_warps,
-                64,
+                options.warp_size,
                 options.num_ctas,
                 [1, 1, 1],
             )

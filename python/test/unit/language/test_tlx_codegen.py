@@ -7,6 +7,7 @@ parametrized across targets and dtypes.
 import pytest
 import triton
 import triton.language as tl
+from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton._filecheck import run_parser
@@ -663,6 +664,12 @@ class TestReuseGroup:
             )
 
 
+SM80 = GPUTarget("cuda", 80, 32)
+
+SM90 = GPUTarget("cuda", 90, 32)
+
+SM100 = GPUTarget("cuda", 100, 32)
+
 GFX950 = GPUTarget("hip", "gfx950", 64)
 
 GFX942 = GPUTarget("hip", "gfx942", 64)
@@ -705,6 +712,46 @@ def _warp_predicate_kernel(x_ptr, lhs_ptr, rhs_ptr, side_ptr, size: tl.constexpr
     )
     tl.store(lhs_ptr + offsets, lhs)
     tl.store(rhs_ptr + offsets, rhs)
+
+
+@pytest.mark.parametrize(
+    "target,expected_warp_size",
+    [
+        (SM80, 32),
+        (SM90, 32),
+        (SM100, 32),
+        (GFX942, 64),
+        (GFX950, 64),
+        (GFX1250, 32),
+    ],
+    ids=["sm80", "sm90", "sm100", "gfx942", "gfx950", "gfx1250"],
+)
+def test_raw_ttir_uses_target_warp_size(target, expected_warp_size):
+    backend = triton.compiler.compiler.make_backend(target)
+    options = backend.parse_options({})
+    assert options.warp_size == expected_warp_size
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    source = ASTSource(
+        fn=_async_local_slice_dot_kernel,
+        signature={
+            "q_ptr": "*fp16",
+            "k_ptr": "*fp16",
+            "output_ptr": "*fp32",
+        },
+        constexprs={},
+    )
+
+    module = source.make_ir(
+        target,
+        options,
+        backend.get_codegen_implementation(options),
+        backend.get_module_map(),
+        context,
+    )
+
+    assert module.get_int_attr("ttg.threads-per-warp") == expected_warp_size
 
 
 @triton.jit
