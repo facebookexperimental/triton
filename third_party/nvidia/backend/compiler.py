@@ -761,7 +761,7 @@ class CUDABackend(BaseBackend):
                 pm,
                 f"cuda:{capability}",
                 options.num_warps,
-                32,
+                options.warp_size,
                 options.num_ctas,
                 list(options.cluster_dims),
             )
