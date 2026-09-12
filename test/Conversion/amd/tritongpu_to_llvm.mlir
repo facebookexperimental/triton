@@ -7,6 +7,18 @@
 // COMMON-DAG: [[$GLOBAL_MMRA_TAG:#[A-Za-z0-9_]+]] = #llvm.mmra_tag<"amdgpu-synchronize-as":"global">
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // COMMON-LABEL: read_barrier_phase
+  tt.func @read_barrier_phase(%alloc: !ttg.memdesc<1xi64, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>) -> i32 {
+    // COMMON: %[[PHASE:.*]] = llvm.load {{.*}} : !llvm.ptr<3> -> i32
+    // CHECK-NEXT: rocdl.s.waitcnt 49279
+    // GFX950-NEXT: rocdl.s.waitcnt 49279
+    // GFX906-NEXT: rocdl.s.waitcnt 49279
+    // GFX1250-NEXT: rocdl.s.wait.dscnt 0
+    // COMMON-NEXT: llvm.return %[[PHASE]] : i32
+    %phase = "amdg.read_barrier_phase"(%alloc) : (!ttg.memdesc<1xi64, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>) -> i32
+    tt.return %phase : i32
+  }
+
   // COMMON-LABEL: lower_barrier
   tt.func @lower_barrier() {
     // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
