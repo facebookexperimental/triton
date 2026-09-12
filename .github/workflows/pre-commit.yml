@@ -2,6 +2,12 @@ name: Pre-Commit Check
 
 on:
   workflow_call:
+    inputs:
+      strict:
+        description: 'true: blocking check scoped to PR changed files; false: advisory check on all files'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   pre-commit:
@@ -27,8 +33,61 @@ jobs:
           path: |
             ~/.cache/pre-commit
           key: ${{ runner.os }}-${{ steps.cache-key.outputs.pre_commit_hash }}
+      - name: Get PR changed files
+        id: changed
+        if: inputs.strict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+            echo "Not a pull_request event — nothing to check." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # List files via the API so no extra git history is needed.
+          # Fail closed: an API error must fail the check, never silently
+          # produce an empty file list that would skip the blocking step.
+          # Filenames arrive base64-encoded (one per line) so paths with
+          # whitespace or embedded newlines survive the line-based
+          # transport intact; they are stored NUL-delimited below.
+          if ! gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" --paginate \
+            --jq '.[] | select(.status != "removed") | .filename | @base64' > /tmp/changed_b64.txt; then
+            echo "::error::Failed to list PR changed files via the GitHub API."
+            exit 1
+          fi
+          # Deleted files are excluded: pre-commit errors on paths that
+          # don't exist in the checkout.
+          : > /tmp/changed_files.txt
+          while IFS= read -r b; do
+            if ! f=$(printf '%s' "$b" | base64 --decode); then
+              echo "::error::Failed to decode a PR changed-file name."
+              exit 1
+            fi
+            [ -f "$f" ] && printf '%s\0' "$f" >> /tmp/changed_files.txt
+          done < /tmp/changed_b64.txt
+          mapfile -d '' -t FILES_PRESENT < /tmp/changed_files.txt
+          COUNT=${#FILES_PRESENT[@]}
+          echo "Changed files present in checkout: ${COUNT}"
+          if [ "$COUNT" -gt 0 ]; then
+            printf '%s\n' "${FILES_PRESENT[@]}"
+          fi
+          if [ "$COUNT" -eq 0 ]; then
+            # Fail closed: a non-empty API response that yields zero
+            # checkout files (e.g. submodule pointers) must not
+            # silently skip the blocking check.
+            if [ -s /tmp/changed_b64.txt ]; then
+              echo "::error::PR changed files were reported but none exist in the checkout; failing closed."
+              exit 1
+            fi
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Check pre-commit
         id: precommit
+        if: inputs.strict == false
         # Formatting issues are reported as a warning, not a hard failure, so
         # they never block a PR. The "Pre-commit warning" step below is the
         # marker other workflows key off of (see pre-commit-autofix.yml).
@@ -36,6 +95,13 @@ jobs:
         run: |
           python3 -m pip install --upgrade pre-commit
           python3 -m pre_commit run --all-files --verbose
+      - name: Check pre-commit (strict)
+        id: precommit_strict
+        if: inputs.strict && steps.changed.outputs.has_files == 'true'
+        run: |
+          python3 -m pip install --upgrade pre-commit
+          mapfile -d '' -t FILES < /tmp/changed_files.txt
+          python3 -m pre_commit run --files "${FILES[@]}" --show-diff-on-failure --verbose
       - name: Pre-commit warning
         if: steps.precommit.outcome == 'failure'
         run: |
