@@ -611,7 +611,8 @@ def test_a_missing_extra_key_renders_as_absent_not_as_a_crash():
     result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]), extra={})
     # The data row, not the dashed separator: the cell itself must be a dash.
     row = report.table([result], (("Mtok/s", "mtokens_per_s"), )).splitlines()[2]
-    assert row.endswith("-  ok")
+    # ... <extra cell>  <status>  <best config>
+    assert row.split()[-3:] == ["-", "ok", "-"]
 
 
 # --------------------------------------------------------------------------
@@ -701,6 +702,53 @@ def test_bind_returns_the_four_entry_points_bound_to_the_module():
     supported, default_json, run, main = driver.bind(bench)
     assert callable(supported) and callable(run) and callable(main)
     assert default_json() == bench.default_json()
+
+
+# --------------------------------------------------------------------------
+# driver: the best-config column
+# --------------------------------------------------------------------------
+
+
+def test_a_config_is_abbreviated_whichever_tile_spelling_a_kernel_uses():
+    from _harness import driver
+
+    config = triton.Config({"BLOCK_M": 128, "BLOCK_SIZE_N": 256, "SPLIT_K": 2}, num_warps=8, num_stages=3)
+    assert driver._fmt_config(config) == "BM=128 BN=256 SPLIT_K=2 w8 s3"
+
+
+def test_every_autotuned_kernel_a_case_launches_is_recorded(monkeypatch):
+    """The column is the harness's, not an op's: whatever ran is what is named."""
+    import types
+
+    from triton.runtime.autotuner import Autotuner
+
+    from _harness import driver
+
+    stub = lambda self, *a, **k: None  # noqa: E731
+    monkeypatch.setattr(Autotuner, "run", stub)
+
+    def attn_fwd():
+        pass
+
+    def attn_bwd():
+        pass
+
+    captured: dict = {}
+    with driver._record_configs(captured):
+        for fn, warps in ((attn_fwd, 4), (attn_bwd, 8)):
+            Autotuner.run(
+                types.SimpleNamespace(base_fn=fn, best_config=triton.Config({"BLOCK_M": 64}, num_warps=warps,
+                                                                            num_stages=2)))
+    assert Autotuner.run is stub, "the patch must not outlive the launch"
+    assert driver._render_configs(captured) == "attn_fwd: BM=64 w4 s2 | attn_bwd: BM=64 w8 s2"
+
+
+def test_an_op_whose_kernels_are_not_autotuned_reports_no_config():
+    from _harness import driver, report
+
+    assert driver._render_configs({}) is None
+    result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]))
+    assert report.table([result]).splitlines()[2].endswith("-")
 
 
 # --------------------------------------------------------------------------
