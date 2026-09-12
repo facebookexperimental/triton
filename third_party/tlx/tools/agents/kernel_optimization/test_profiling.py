@@ -1,27 +1,72 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from . import profiling
 from .profiling import (
     ProfileRequest,
+    affected_region_upper_bound,
+    annotate_profile,
     compact_profile_summary,
+    diagnostic_capabilities,
     export_ncu_report_details,
     extract_ncu_duration_us,
+    is_profile_fresh,
+    is_valid_intra_kernel_evidence,
     ncu_regression_diagnostic,
     normalize_ncu_metrics,
     normalize_profile_request,
     parse_ncu_csv,
     parse_ncu_query_metrics,
+    parse_proton_intra_kernel_trace,
     parse_proton_launch_attribution,
     per_case_profile_request,
     resolve_profile_request_for_target,
     resolve_profile_tools,
     select_ncu_metric_names,
 )
+from .profiling_policy import (
+    adaptive_candidate_profile_decision,
+    full_diagnostic_request,
+    targeted_diagnostic_decision,
+)
+
+
+def _diagnostic_profile(
+    *,
+    valid: bool = True,
+    validation_errors: object = (),
+    passes: dict[str, object] | None = None,
+    dominant_phases: list[dict[str, object]] | None = None,
+    dominant_waits: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if passes is None:
+        passes = {
+            "role": {
+                "valid": True,
+                "expected_regions": ["consumer_loop"],
+                "dropped_events": 0,
+            },
+            "wait": {
+                "valid": True,
+                "expected_regions": ["tma_wait", "barrier_wait"],
+                "drop_warnings": {"dropped_events": 0},
+                "validation": {"details": [{"dropped": 0}]},
+            },
+        }
+    return {
+        "diagnostic_proton_intra_kernel": {
+            "valid": valid,
+            "dominant_phases": dominant_phases or [],
+            "dominant_waits": dominant_waits or [],
+            "validation": {"errors": validation_errors, "passes": passes},
+        }
+    }
 
 
 class ProfileRequestTest(unittest.TestCase):
@@ -111,7 +156,619 @@ class ProfileRequestTest(unittest.TestCase):
             self.assertNotIn("/", artifacts_dir.name)
 
 
+class ProfileMetadataTest(unittest.TestCase):
+    def test_profile_request_json_round_trip_preserves_diagnostic_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProfileRequest(
+                level="deep",
+                tools=("proton_intra_kernel",),
+                passes=("role", "wait"),
+                experiment_id="exp-1",
+                artifacts_dir=Path(directory),
+                reason="collect diagnostic profile",
+                source_digest="digest-123",
+                policy_reason="targeted_diagnostic",
+                diagnostic_only=True,
+                granularity="warp",
+            )
+
+            payload = json.loads(json.dumps(request.to_json()))
+            restored = ProfileRequest.from_mapping(payload)
+
+        self.assertEqual(restored.level, "deep")
+        self.assertEqual(restored.tools, ("proton_intra_kernel",))
+        self.assertEqual(restored.passes, ("role", "wait"))
+        self.assertEqual(restored.experiment_id, "exp-1")
+        self.assertEqual(restored.reason, "collect diagnostic profile")
+        self.assertEqual(restored.source_digest, "digest-123")
+        self.assertEqual(restored.policy_reason, "targeted_diagnostic")
+        self.assertTrue(restored.diagnostic_only)
+        self.assertEqual(restored.granularity, "warp")
+        self.assertEqual(restored.artifacts_dir, Path(directory))
+
+    def test_rejects_passes_without_intra_kernel_tool(self) -> None:
+        with self.assertRaisesRegex(ValueError, "passes require proton_intra_kernel"):
+            ProfileRequest(tools=("native_profiler",), passes=("role",))
+
+    def test_annotates_profile_and_checks_freshness(self) -> None:
+        request = ProfileRequest(
+            tools=("proton_launch", "native_profiler"),
+            experiment_id="exp-1",
+            reason="candidate_profile",
+            source_digest="digest-123",
+            policy_reason="candidate",
+        )
+
+        annotated = annotate_profile({"summary": {"duration_us": 12.5}}, request, "case/a")
+
+        self.assertEqual(annotated["summary"], {"duration_us": 12.5})
+        self.assertEqual(
+            annotated["profile_metadata"],
+            {
+                "source_digest": "digest-123",
+                "case_id": "case/a",
+                "experiment_id": "exp-1",
+                "tools": ["proton_launch", "native_profiler"],
+                "passes": [],
+                "reason": "candidate_profile",
+                "policy_reason": "candidate",
+                "diagnostic_only": False,
+                "granularity": None,
+            },
+        )
+        self.assertTrue(is_profile_fresh(annotated, "digest-123"))
+        self.assertFalse(is_profile_fresh(annotated, "digest-456"))
+        self.assertTrue(is_profile_fresh({"summary": {}}, "digest-123"))
+        self.assertFalse(
+            is_profile_fresh({"summary": {}}, "digest-123", allow_legacy=False)
+        )
+
+
+class IntraKernelEvidenceTest(unittest.TestCase):
+    def test_valid_intra_kernel_evidence_accepts_zero_drop_passes(self) -> None:
+        self.assertTrue(is_valid_intra_kernel_evidence(_diagnostic_profile()))
+
+    def test_valid_intra_kernel_evidence_rejects_invalid_errors_and_drops(
+        self,
+    ) -> None:
+        cases = {
+            "invalid_diagnostic": _diagnostic_profile(valid=False),
+            "validation_error": _diagnostic_profile(validation_errors=("bad trace",)),
+            "invalid_pass": _diagnostic_profile(
+                passes={"wait": {"valid": False, "dropped_events": 0}}
+            ),
+            "record_drop": _diagnostic_profile(
+                passes={"wait": {"valid": True, "dropped_events": 1}}
+            ),
+            "drop_warning_details": _diagnostic_profile(
+                passes={
+                    "wait": {
+                        "valid": True,
+                        "drop_warnings": {"details": [{"dropped": 1}]},
+                    }
+                }
+            ),
+            "nested_validation_drop": _diagnostic_profile(
+                passes={
+                    "wait": {
+                        "valid": True,
+                        "validation": {"details": [{"dropped": 1}]},
+                    }
+                }
+            ),
+        }
+        for name, profile in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(is_valid_intra_kernel_evidence(profile))
+
+    def test_diagnostic_capabilities_extracts_expected_regions(self) -> None:
+        self.assertEqual(
+            diagnostic_capabilities(_diagnostic_profile()),
+            {
+                "role": ("consumer_loop",),
+                "wait": ("tma_wait", "barrier_wait"),
+            },
+        )
+
+    def test_affected_region_upper_bound_uses_dominant_cycles(self) -> None:
+        profile = _diagnostic_profile(
+            dominant_phases=[
+                {"name": "consumer_loop", "mean_cycles": 100.0},
+                {"name": "tma_load", "mean_cycles": 30.0},
+                {"name": "tma_wait", "mean_cycles": 40.0},
+            ],
+            dominant_waits=[
+                {"name": "tma_wait", "mean_cycles": 45.0},
+                {"name": "barrier_wait", "mean_cycles": 80.0},
+            ],
+        )
+
+        self.assertEqual(
+            affected_region_upper_bound(profile, ("tma_load", "tma_wait")), 0.75
+        )
+        self.assertEqual(
+            affected_region_upper_bound(
+                profile,
+                ("tma_wait", "tma_wait", "barrier_wait"),
+            ),
+            1.0,
+        )
+        self.assertIsNone(affected_region_upper_bound(profile, "unknown_region"))
+        self.assertIsNone(
+            affected_region_upper_bound(
+                _diagnostic_profile(
+                    dominant_phases=[{"name": "tma_load", "mean_cycles": 30.0}]
+                ),
+                "tma_load",
+            )
+        )
+
+
+class ProfilingPolicyTest(unittest.TestCase):
+    def test_adaptive_candidate_profile_decision_skips_bad_candidates(self) -> None:
+        root = Path("/tmp/kernel-profile-tests")
+
+        unstable = adaptive_candidate_profile_decision(
+            False,
+            1.2,
+            1.05,
+            root,
+            "exp-1",
+            "digest-123",
+        )
+        self.assertIsNone(unstable.request)
+        self.assertEqual(unstable.reason, "incorrect_or_unstable")
+
+        loser = adaptive_candidate_profile_decision(
+            True,
+            1.039,
+            1.05,
+            root,
+            "exp-1",
+            "digest-123",
+        )
+        self.assertIsNone(loser.request)
+        self.assertEqual(loser.reason, "clear_loser")
+
+    def test_adaptive_candidate_profile_decision_requests_profile_by_window(
+        self,
+    ) -> None:
+        root = Path("/tmp/kernel-profile-tests")
+
+        near = adaptive_candidate_profile_decision(
+            True,
+            1.05,
+            1.05,
+            root,
+            "exp-1",
+            "digest-123",
+        )
+        assert near.request is not None
+        self.assertEqual(near.reason, "near_threshold")
+        self.assertEqual(near.request.level, "deep")
+        self.assertEqual(near.request.tools, ("proton_launch", "native_profiler"))
+        self.assertEqual(near.request.source_digest, "digest-123")
+        self.assertEqual(near.request.policy_reason, "near_threshold")
+        self.assertEqual(
+            near.request.artifacts_dir,
+            root / "experiments" / "exp-1" / "profile_artifacts",
+        )
+
+        candidate = adaptive_candidate_profile_decision(
+            True,
+            1.07,
+            1.05,
+            root,
+            "exp-2",
+            "digest-456",
+        )
+        assert candidate.request is not None
+        self.assertEqual(candidate.reason, "candidate")
+        self.assertEqual(candidate.request.level, "summary")
+        self.assertEqual(candidate.request.source_digest, "digest-456")
+        self.assertEqual(candidate.request.policy_reason, "candidate")
+
+    def test_targeted_diagnostic_decision_rejects_invalid_requests(self) -> None:
+        root = Path("/tmp/kernel-profile-tests")
+        capabilities = {"wait": ("tma_wait",)}
+        baseline = _diagnostic_profile(
+            dominant_phases=[{"name": "consumer_loop", "mean_cycles": 100.0}],
+            dominant_waits=[{"name": "tma_wait", "mean_cycles": 20.0}],
+        )
+        low_impact = _diagnostic_profile(
+            dominant_phases=[{"name": "consumer_loop", "mean_cycles": 100.0}],
+            dominant_waits=[{"name": "tma_wait", "mean_cycles": 5.0}],
+        )
+
+        cases = (
+            (
+                "disabled",
+                False,
+                "wait",
+                ("tma_wait",),
+                capabilities,
+                baseline,
+                2,
+            ),
+            (
+                "unsupported_pass",
+                True,
+                "compute",
+                ("mma",),
+                capabilities,
+                baseline,
+                2,
+            ),
+            (
+                "unsupported_regions",
+                True,
+                "wait",
+                ("tma_wait", "barrier_wait"),
+                capabilities,
+                baseline,
+                2,
+            ),
+            (
+                "pass_budget_exhausted",
+                True,
+                "wait",
+                ("tma_wait",),
+                capabilities,
+                baseline,
+                1,
+            ),
+            (
+                "low_upper_bound",
+                True,
+                "wait",
+                ("tma_wait",),
+                capabilities,
+                low_impact,
+                2,
+            ),
+        )
+        for reason, enabled, hint_pass, regions, caps, profile, budget in cases:
+            with self.subTest(reason=reason):
+                decision = targeted_diagnostic_decision(
+                    enabled,
+                    hint_pass,
+                    regions,
+                    caps,
+                    profile,
+                    1.1,
+                    budget,
+                    root,
+                    "exp-1",
+                    "digest-123",
+                )
+                self.assertIsNone(decision.request)
+                self.assertEqual(decision.reason, reason)
+
+    def test_targeted_diagnostic_decision_requests_role_and_hint_pass(self) -> None:
+        root = Path("/tmp/kernel-profile-tests")
+        baseline = _diagnostic_profile(
+            dominant_phases=[{"name": "consumer_loop", "mean_cycles": 100.0}],
+            dominant_waits=[{"name": "tma_wait", "mean_cycles": 25.0}],
+        )
+
+        decision = targeted_diagnostic_decision(
+            True,
+            "wait",
+            ("tma_wait",),
+            {"wait": ("tma_wait", "barrier_wait")},
+            baseline,
+            1.1,
+            2,
+            root,
+            "exp-1",
+            "digest-123",
+        )
+
+        assert decision.request is not None
+        self.assertEqual(decision.reason, "targeted_diagnostic")
+        self.assertEqual(decision.request.level, "deep")
+        self.assertEqual(decision.request.tools, ("proton_intra_kernel",))
+        self.assertEqual(decision.request.passes, ("role", "wait"))
+        self.assertEqual(decision.request.reason, "targeted_diagnostic")
+        self.assertEqual(decision.request.source_digest, "digest-123")
+        self.assertEqual(decision.request.policy_reason, "targeted_diagnostic")
+        self.assertTrue(decision.request.diagnostic_only)
+        self.assertEqual(decision.request.granularity, "warp")
+        self.assertEqual(
+            decision.request.artifacts_dir,
+            root / "experiments" / "exp-1" / "diagnostic_profile_artifacts",
+        )
+
+    def test_full_diagnostic_request_enforces_budget(self) -> None:
+        root = Path("/tmp/kernel-profile-tests")
+
+        self.assertIsNone(
+            full_diagnostic_request(
+                root,
+                "exp-1",
+                "digest-123",
+                reason="investigate",
+                pass_budget=0,
+            )
+        )
+        self.assertIsNone(
+            full_diagnostic_request(
+                root,
+                "exp-1",
+                "digest-123",
+                reason="investigate",
+                pass_budget=1,
+                passes=("wait",),
+            )
+        )
+        self.assertIsNone(
+            full_diagnostic_request(
+                root,
+                "exp-1",
+                "digest-123",
+                reason="investigate",
+                passes=(),
+            )
+        )
+
+        targeted = full_diagnostic_request(
+            root,
+            "exp-1",
+            "digest-123",
+            reason="investigate",
+            pass_budget=2,
+            passes=("wait", "wait"),
+        )
+        assert targeted is not None
+        self.assertEqual(targeted.passes, ("role", "wait"))
+        self.assertEqual(targeted.tools, ("proton_intra_kernel",))
+        self.assertTrue(targeted.diagnostic_only)
+
+        full = full_diagnostic_request(
+            root,
+            "exp-1",
+            "digest-123",
+            reason="investigate",
+            pass_budget=4,
+        )
+        assert full is not None
+        self.assertEqual(full.passes, ("role", "coarse", "wait", "compute"))
+        self.assertEqual(full.policy_reason, "full_diagnostic")
+
+
 class ProfileParsingTest(unittest.TestCase):
+    def _write_proton_trace(self, root: Path, events: list[object]) -> Path:
+        path = root / "profile.chrome_trace"
+        path.write_text(json.dumps({"traceEvents": events}))
+        return path
+
+    def _proton_mapping(self) -> dict[str, object]:
+        return {
+            "expected_kernel": r"^my_kernel_v\d+$",
+            "tasks": {
+                "compute": {"warps": ["2-3"], "scope": "compute_scope"},
+                "load": {"warps": [0], "scope": "load_scope"},
+                "mma": {"warps": [1], "scope": "mma_scope"},
+                "store": {"warps": [[4, 5]], "scope": "store_scope"},
+            },
+            "required_scopes": ["wait_input", "wait_output"],
+            "scope_kinds": {
+                "compute_scope": "work",
+                "load_scope": "work",
+                "mma_scope": "work",
+                "store_scope": "work",
+                "wait_input": "wait",
+                "wait_output": "wait",
+            },
+        }
+
+    def _proton_event(
+        self,
+        *,
+        name: str,
+        cta: int,
+        warp: int,
+        ts: float,
+        dur: float,
+        kernel: str = "my_kernel_v1",
+        phase: str = "X",
+    ) -> dict[str, object]:
+        return {
+            "name": name,
+            "cat": kernel,
+            "ph": phase,
+            "pid": f"{kernel} Core11 CTA{cta}",
+            "tid": f"warp {warp} (line 0)",
+            "ts": ts,
+            "dur": dur,
+            "args": {"raw_secret": "must-not-leak"},
+        }
+
+    def test_parse_proton_intra_kernel_selects_complete_cta_and_summarizes_tasks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incomplete = [
+                self._proton_event(
+                    name="load_scope", cta=1, warp=0, ts=0.0, dur=10.0
+                ),
+                self._proton_event(
+                    name="mma_scope", cta=1, warp=1, ts=2.0, dur=8.0
+                ),
+                self._proton_event(
+                    name="compute_scope", cta=1, warp=2, ts=4.0, dur=6.0
+                ),
+            ]
+            complete = [
+                self._proton_event(
+                    name="load_scope", cta=2, warp=0, ts=0.0, dur=10.0
+                ),
+                self._proton_event(
+                    name="mma_scope", cta=2, warp=1, ts=2.0, dur=8.0
+                ),
+                self._proton_event(
+                    name="compute_scope", cta=2, warp=2, ts=4.0, dur=6.0
+                ),
+                self._proton_event(
+                    name="compute_scope", cta=2, warp=3, ts=5.0, dur=4.0
+                ),
+                self._proton_event(
+                    name="store_scope", cta=2, warp=4, ts=9.0, dur=3.0
+                ),
+                self._proton_event(
+                    name="store_scope", cta=2, warp=5, ts=10.0, dur=1.0
+                ),
+                self._proton_event(
+                    name="wait_input", cta=2, warp=0, ts=1.0, dur=2.0
+                ),
+                self._proton_event(
+                    name="wait_input", cta=2, warp=0, ts=4.0, dur=1.0
+                ),
+                self._proton_event(
+                    name="wait_output", cta=2, warp=4, ts=10.0, dur=1.5
+                ),
+                self._proton_event(
+                    name="ignored_instant", cta=2, warp=0, ts=0.0, dur=99.0, phase="i"
+                ),
+                self._proton_event(
+                    name="other_kernel_scope",
+                    cta=0,
+                    warp=0,
+                    ts=0.0,
+                    dur=99.0,
+                    kernel="other_kernel",
+                ),
+            ]
+            trace = self._write_proton_trace(root, incomplete + complete)
+
+            summary = parse_proton_intra_kernel_trace(trace, self._proton_mapping())
+
+        self.assertEqual(summary["schema"], "proton_intra_kernel_v1")
+        self.assertTrue(summary["diagnostic_only"])
+        self.assertTrue(summary["valid"])
+        self.assertEqual(summary["selected_kernel"], "my_kernel_v1")
+        self.assertEqual(summary["selected_cta"], 2)
+        self.assertEqual(
+            summary["task_mappings"]["compute"],
+            {"scope": "compute_scope", "warps": [2, 3]},
+        )
+        self.assertEqual(
+            summary["task_spans"],
+            {"compute": 6.0, "load": 10.0, "mma": 8.0, "store": 3.0},
+        )
+        self.assertEqual(
+            summary["scope_stats"]["wait_input"],
+            {"kind": "wait", "count": 2, "total_us": 3.0, "max_us": 2.0},
+        )
+        self.assertEqual(summary["dominant_waits"][0]["name"], "wait_input")
+        load_mma = next(
+            overlap
+            for overlap in summary["task_overlaps"]
+            if overlap["tasks"] == ["load", "mma"]
+        )
+        self.assertEqual(load_mma["overlap_us"], 8.0)
+        self.assertEqual(load_mma["left_ratio"], 0.8)
+        self.assertEqual(load_mma["right_ratio"], 1.0)
+        serialized = json.dumps(summary)
+        self.assertNotIn("traceEvents", serialized)
+        self.assertNotIn("raw_secret", serialized)
+        self.assertNotIn("must-not-leak", serialized)
+
+    def test_parse_proton_intra_kernel_validates_paths_and_mapping(self) -> None:
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            parse_proton_intra_kernel_trace("relative.trace", {})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(FileNotFoundError, "does not exist"):
+                parse_proton_intra_kernel_trace(root / "missing.trace", {})
+            empty = root / "empty.trace"
+            empty.write_text("")
+            with self.assertRaisesRegex(ValueError, "empty"):
+                parse_proton_intra_kernel_trace(empty, {})
+
+            trace = self._write_proton_trace(root, [])
+            missing = parse_proton_intra_kernel_trace(trace, {})
+            malformed = parse_proton_intra_kernel_trace(
+                trace,
+                {
+                    "expected_kernel": "[",
+                    "tasks": {},
+                    "required_scopes": [],
+                    "wait_scopes": [],
+                },
+            )
+
+        self.assertFalse(missing["valid"])
+        self.assertTrue(any("expected_kernel" in item for item in missing["diagnostics"]))
+        self.assertFalse(malformed["valid"])
+        self.assertTrue(any("invalid mapping" in item for item in malformed["diagnostics"]))
+
+    def test_parse_proton_intra_kernel_reports_ownership_and_required_coverage(
+        self,
+    ) -> None:
+        mapping = self._proton_mapping()
+        mapping["selected_cta"] = 7
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = [
+                self._proton_event(
+                    name="load_scope", cta=7, warp=1, ts=0.0, dur=1.0
+                ),
+                self._proton_event(
+                    name="mma_scope", cta=7, warp=1, ts=0.0, dur=1.0
+                ),
+                self._proton_event(
+                    name="compute_scope", cta=7, warp=2, ts=0.0, dur=1.0
+                ),
+                self._proton_event(
+                    name="store_scope", cta=7, warp=4, ts=0.0, dur=1.0
+                ),
+                self._proton_event(
+                    name="wait_input", cta=7, warp=0, ts=0.0, dur=1.0
+                ),
+            ]
+            trace = self._write_proton_trace(root, events)
+            summary = parse_proton_intra_kernel_trace(trace, mapping)
+
+        self.assertEqual(summary["selected_cta"], 7)
+        self.assertFalse(summary["valid"])
+        self.assertTrue(
+            any("load_scope" in item and "expected load" in item for item in summary["diagnostics"])
+        )
+        self.assertTrue(
+            any("wait_output" in item for item in summary["diagnostics"])
+        )
+
+    def test_parse_proton_intra_kernel_enforces_output_bounds(self) -> None:
+        mapping = self._proton_mapping()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = self._write_proton_trace(
+                root,
+                [
+                    self._proton_event(
+                        name="load_scope", cta=2, warp=0, ts=index, dur=1.0
+                    )
+                    for index in range(3)
+                ],
+            )
+            with mock.patch.object(profiling, "_PROTON_MAX_EVENTS", 2):
+                summary = parse_proton_intra_kernel_trace(trace, mapping)
+
+            oversized_mapping = self._proton_mapping()
+            oversized_mapping["tasks"] = {
+                f"task_{index}": {"warps": [index], "scope": f"scope_{index}"}
+                for index in range(profiling._PROTON_MAX_TASKS + 1)
+            }
+            oversized = parse_proton_intra_kernel_trace(trace, oversized_mapping)
+
+        self.assertFalse(summary["valid"])
+        self.assertEqual(summary["task_spans"], {})
+        self.assertTrue(any("limit is 2" in item for item in summary["diagnostics"]))
+        self.assertFalse(oversized["valid"])
+        self.assertTrue(any("tasks exceeds" in item for item in oversized["diagnostics"]))
+
     def test_parse_proton_tree_into_launch_attribution_summary(self) -> None:
         proton = {
             "name": "root",

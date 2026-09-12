@@ -25,10 +25,23 @@ from .models import (
 from .profiling import (
     ProfileRequest,
     compact_profile_summary,
+    diagnostic_capabilities,
     extract_ncu_duration_us,
+    is_profile_fresh,
+    is_valid_intra_kernel_evidence,
     ncu_regression_diagnostic,
 )
-from .providers import CandidateContext, CandidateProvider, CodexCandidateProvider
+from .profiling_policy import (
+    adaptive_candidate_profile_decision,
+    full_diagnostic_request,
+    targeted_diagnostic_decision,
+)
+from .providers import (
+    CandidateContext,
+    CandidateProposal,
+    CandidateProvider,
+    CodexCandidateProvider,
+)
 from .source import source_digest
 
 _PROFILE_TOOLS = ("proton_launch", "native_profiler")
@@ -55,6 +68,8 @@ def _profile_request(
     *,
     level: str,
     reason: str,
+    source_digest: str = "",
+    policy_reason: str = "legacy",
 ) -> ProfileRequest:
     return ProfileRequest(
         level=level,
@@ -62,6 +77,8 @@ def _profile_request(
         experiment_id=experiment_id,
         artifacts_dir=artifacts_dir / "experiments" / experiment_id / "profile_artifacts",
         reason=reason,
+        source_digest=source_digest,
+        policy_reason=policy_reason,
     )
 
 
@@ -70,16 +87,21 @@ def _diagnostic_profile_request(
     experiment_id: str,
     *,
     reason: str,
+    source_digest: str = "",
+    passes: tuple[str, ...] = (),
 ) -> ProfileRequest:
     return ProfileRequest(
         level="deep",
         tools=_DIAGNOSTIC_PROFILE_TOOLS,
+        passes=passes,
         experiment_id=experiment_id,
         artifacts_dir=artifacts_dir
         / "experiments"
         / experiment_id
         / "diagnostic_profile_artifacts",
         reason=reason,
+        source_digest=source_digest,
+        policy_reason="legacy_diagnostic",
         diagnostic_only=True,
         granularity="warp",
     )
@@ -106,21 +128,25 @@ def _collect_diagnostic_profiles(
     experiment_id: str,
     *,
     reason: str,
+    profile_request: ProfileRequest | None = None,
+    cases: tuple[InputCase, ...] | None = None,
 ) -> dict[str, dict[str, Any]]:
     try:
         performance = harness.evaluate(
             source,
-            request.cases,
+            cases or request.cases,
             request.target,
             request.budget.benchmark_repetitions,
-            profile=_diagnostic_profile_request(
+            profile=profile_request
+            or _diagnostic_profile_request(
                 artifacts_dir,
                 experiment_id,
                 reason=reason,
+                source_digest=source_digest(source),
             ),
         )
     except Exception as error:  # noqa: BLE001
-        return _diagnostic_error_profiles(request.cases, error)
+        return _diagnostic_error_profiles(cases or request.cases, error)
     return _profiles_by_case(performance)
 
 
@@ -197,6 +223,82 @@ def _report_performance(
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
+def _diagnostic_intra_kernel_profile(
+    profile: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    compact = compact_profile_summary(profile)
+    diagnostic = compact.get(_DIAGNOSTIC_PROFILE_KEY)
+    if not isinstance(diagnostic, Mapping):
+        diagnostic = profile.get(_DIAGNOSTIC_PROFILE_KEY)
+    if not isinstance(diagnostic, Mapping):
+        return None
+    intra = diagnostic.get(_DIAGNOSTIC_PROFILE_KEY)
+    if isinstance(intra, Mapping):
+        return intra
+    summary = diagnostic.get("summary")
+    diagnostic_keys = {
+        "valid",
+        "selected_cta",
+        "logical_coordinates",
+        "task_spans",
+        "top_waits",
+        "dominant_waits",
+        "key_overlaps",
+        "missing_scopes",
+    }
+    if isinstance(summary, Mapping) and diagnostic_keys.intersection(summary):
+        return summary
+    return diagnostic
+
+
+def _named_duration(value: object, *, default_name: str = "unknown") -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    name = next(
+        (
+            str(value[key])
+            for key in ("name", "task", "scope", "pair", "tasks", "scopes")
+            if value.get(key) not in (None, "")
+        ),
+        default_name,
+    )
+    if name == default_name:
+        endpoints = [
+            str(value[key])
+            for key in ("source", "target", "producer", "consumer")
+            if value.get(key) not in (None, "")
+        ]
+        if endpoints:
+            name = "->".join(endpoints)
+    duration = next(
+        (
+            parsed
+            for key in ("duration_us", "duration", "overlap_us")
+            if (parsed := _coerce_float(value.get(key))) is not None
+        ),
+        None,
+    )
+    return f"{name}:{duration:.3f}us" if duration is not None else name
+
+
+def _named_duration_list(value: object, *, limit: int = 3) -> str:
+    if isinstance(value, Mapping):
+        entries = [
+            {"name": name, "duration_us": duration}
+            for name, duration in value.items()
+        ]
+    elif isinstance(value, list | tuple):
+        entries = list(value)
+    else:
+        return ""
+    formatted = [
+        text
+        for entry in entries[:limit]
+        if (text := _named_duration(entry)) is not None
+    ]
+    return ";".join(formatted)
+
+
 def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
     if not profile:
         return ["ncu=unavailable"]
@@ -225,13 +327,8 @@ def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
         parts.append(f"ncu.duration_us={ncu_duration:.3f}")
     else:
         parts.append("ncu=unavailable")
-    diagnostic = compact.get(_DIAGNOSTIC_PROFILE_KEY)
-    if not isinstance(diagnostic, Mapping):
-        diagnostic = profile.get(_DIAGNOSTIC_PROFILE_KEY)
-    if isinstance(diagnostic, Mapping):
-        intra = diagnostic.get(_DIAGNOSTIC_PROFILE_KEY)
-        if not isinstance(intra, Mapping):
-            intra = diagnostic
+    intra = _diagnostic_intra_kernel_profile(profile)
+    if intra is not None:
         valid = intra.get("valid")
         if isinstance(valid, bool):
             parts.append(f"proton.intra.valid={str(valid).lower()}")
@@ -253,14 +350,29 @@ def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
             )
             if coordinate_text:
                 parts.append(f"proton.intra.tile={coordinate_text}")
-        waits = intra.get("dominant_waits")
-        if isinstance(waits, list) and waits and isinstance(waits[0], Mapping):
-            wait_name = waits[0].get("name")
-            wait_duration = _coerce_float(waits[0].get("duration"))
-            if wait_name and wait_duration is not None:
-                parts.append(
-                    f"proton.intra.dominant_wait={wait_name}:{wait_duration:.3f}us"
-                )
+        task_spans = _named_duration_list(intra.get("task_spans"), limit=5)
+        if task_spans:
+            parts.append(f"proton.intra.task_spans={task_spans}")
+        waits = intra.get("top_waits", intra.get("dominant_waits"))
+        top_waits = _named_duration_list(waits)
+        if top_waits:
+            parts.append(f"proton.intra.top_waits={top_waits}")
+        if isinstance(waits, list | tuple) and waits:
+            dominant_wait = _named_duration(waits[0])
+            if dominant_wait:
+                parts.append(f"proton.intra.dominant_wait={dominant_wait}")
+        key_overlaps = _named_duration_list(intra.get("key_overlaps"))
+        if key_overlaps:
+            parts.append(f"proton.intra.key_overlaps={key_overlaps}")
+        missing_scopes = intra.get("missing_scopes")
+        if isinstance(missing_scopes, list | tuple) and missing_scopes:
+            parts.append(
+                "proton.intra.missing_scopes="
+                + ";".join(str(scope) for scope in missing_scopes[:5])
+            )
+        diagnostic_error = intra.get("error")
+        if diagnostic_error:
+            parts.append(f"proton.intra.error={diagnostic_error}")
         trace_path = intra.get("trace_path")
         if trace_path:
             parts.append(f"proton.intra.trace={trace_path}")
@@ -271,6 +383,22 @@ def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
     if artifact:
         parts.append(f"profile.artifact={artifact}")
     return parts
+
+
+def _baseline_diagnostic_evidence(
+    performance: PerformanceSummary,
+) -> tuple[str, ...]:
+    evidence = []
+    for evaluation in performance.cases:
+        parts = [
+            part
+            for part in _profile_log_parts(evaluation.profile)
+            if part.startswith("proton.intra.")
+            and not part.startswith("proton.intra.trace=")
+        ]
+        if parts:
+            evidence.append(f"- {evaluation.case_id}: " + ", ".join(parts))
+    return tuple(evidence)
 
 
 def _rejection_feedback(
@@ -363,6 +491,87 @@ def _is_near_threshold(speedup: float, threshold: float) -> bool:
     return threshold - _NEAR_THRESHOLD_WINDOW <= speedup <= threshold + _NEAR_THRESHOLD_WINDOW
 
 
+def _targeted_diagnostic_case(
+    request: KernelOptimizationRequest,
+    requested_case_ids: tuple[str, ...],
+) -> InputCase:
+    requested = set(requested_case_ids)
+    eligible = [case for case in request.cases if not requested or case.case_id in requested]
+    if not eligible:
+        eligible = list(request.cases)
+    return max(eligible, key=lambda case: (case.protected, case.weight))
+
+
+def _collect_targeted_diagnostic(
+    harness: SubprocessHarness,
+    source: str,
+    performance: PerformanceSummary,
+    proposal: CandidateProposal,
+    request: KernelOptimizationRequest,
+    baseline: PerformanceSummary,
+    baseline_digest: str,
+    artifacts_dir: Path,
+    experiment_id: str,
+    diagnostic_passes_used: int,
+) -> tuple[PerformanceSummary, int, str]:
+    if not proposal.profiling_hint.pass_name:
+        return performance, diagnostic_passes_used, ""
+    selected_case = _targeted_diagnostic_case(
+        request, proposal.profiling_hint.case_ids
+    )
+    baseline_evaluation = next(
+        evaluation
+        for evaluation in baseline.cases
+        if evaluation.case_id == selected_case.case_id
+    )
+    baseline_diagnostic = baseline_evaluation.profile
+    capabilities = (
+        diagnostic_capabilities(baseline_diagnostic)
+        if is_profile_fresh(
+            baseline_diagnostic,
+            baseline_digest,
+            allow_legacy=False,
+        )
+        and is_valid_intra_kernel_evidence(baseline_diagnostic)
+        else {}
+    )
+    remaining_pass_budget = max(
+        0,
+        request.budget.max_diagnostic_proton_passes
+        - diagnostic_passes_used
+        - 4,
+    )
+    decision = targeted_diagnostic_decision(
+        True,
+        proposal.profiling_hint.pass_name,
+        proposal.profiling_hint.expected_regions,
+        capabilities,
+        baseline_diagnostic,
+        request.budget.min_speedup,
+        remaining_pass_budget,
+        artifacts_dir,
+        experiment_id,
+        source_digest(source),
+    )
+    if decision.request is None:
+        return performance, diagnostic_passes_used, decision.reason
+    profiles = _collect_diagnostic_profiles(
+        harness,
+        source,
+        request,
+        artifacts_dir,
+        experiment_id,
+        reason="targeted_diagnostic",
+        profile_request=decision.request,
+        cases=(selected_case,),
+    )
+    return (
+        _merge_diagnostic_profiles(performance, profiles),
+        diagnostic_passes_used + len(decision.request.passes),
+        decision.reason,
+    )
+
+
 def _ncu_regression_diagnostics(
     baseline: PerformanceSummary,
     candidate: PerformanceSummary,
@@ -440,6 +649,7 @@ class KernelOptimizer:
         )
         start_time = time.monotonic()
         baseline_source_path = store.write_source("baseline", request.kernel_source)
+        baseline_digest = source_digest(request.kernel_source)
         baseline = harness.evaluate(
             request.kernel_source,
             request.cases,
@@ -450,6 +660,8 @@ class KernelOptimizer:
                 "baseline",
                 level="deep",
                 reason="baseline",
+                source_digest=baseline_digest,
+                policy_reason=request.profiling_policy,
             ),
         )
         if not passes_protected_cases(baseline, request.cases):
@@ -457,16 +669,29 @@ class KernelOptimizer:
                 "baseline failed one or more protected correctness cases"
             )
         baseline = replace(baseline, aggregate_speedup=1.0)
-        if request.diagnostic_proton_intra_kernel:
-            baseline_diagnostics = _collect_diagnostic_profiles(
-                harness,
-                request.kernel_source,
-                request,
+        diagnostic_passes_used = 0
+        use_diagnostic_proton = request.use_diagnostic_proton_intra_kernel
+        if use_diagnostic_proton:
+            baseline_diagnostic_request = full_diagnostic_request(
                 artifacts_dir,
                 "baseline",
+                baseline_digest,
                 reason="baseline_diagnostic",
+                pass_budget=request.budget.max_diagnostic_proton_passes,
             )
-            baseline = _merge_diagnostic_profiles(baseline, baseline_diagnostics)
+            if baseline_diagnostic_request is not None:
+                baseline_diagnostics = _collect_diagnostic_profiles(
+                    harness,
+                    request.kernel_source,
+                    request,
+                    artifacts_dir,
+                    "baseline",
+                    reason="baseline_diagnostic",
+                    profile_request=baseline_diagnostic_request,
+                )
+                baseline = _merge_diagnostic_profiles(baseline, baseline_diagnostics)
+                diagnostic_passes_used += len(baseline_diagnostic_request.passes)
+        baseline_diagnostic_evidence = _baseline_diagnostic_evidence(baseline)
         baseline_profiles = _profiles_by_case(baseline)
         baseline_profile_path = store.write_profile("baseline", baseline_profiles)
         store.write_aggregated_profile("baseline_profile", baseline_profiles)
@@ -528,6 +753,7 @@ class KernelOptimizer:
                             current_source=parent_source,
                             current_performance=best_performance,
                             previous_diagnostics=tuple(diagnostics),
+                            baseline_diagnostic_evidence=baseline_diagnostic_evidence,
                         ),
                     )
                     _report_candidate_summary(experiment_id, proposal)
@@ -549,23 +775,64 @@ class KernelOptimizer:
                         raise ValueError(f"candidate source duplicates {origin}")
                     seen_sources.add(digest)
                     _report_performance(experiment_id, "evaluating", None)
+                    candidate_digest = source_digest(proposal.source)
+                    if request.profiling_policy == "legacy":
+                        candidate_profile_request = _profile_request(
+                            artifacts_dir,
+                            experiment_id,
+                            level="summary",
+                            reason="candidate",
+                            source_digest=candidate_digest,
+                        )
+                    else:
+                        candidate_profile_request = None
                     performance = harness.evaluate(
                         proposal.source,
                         request.cases,
                         request.target,
                         request.budget.benchmark_repetitions,
-                        profile=_profile_request(
-                            artifacts_dir,
-                            experiment_id,
-                            level="summary",
-                            reason="candidate",
-                        ),
+                        profile=candidate_profile_request,
                     )
                     speedup = weighted_geometric_speedup(
                         baseline, performance, request.cases
                     )
                     performance = replace(performance, aggregate_speedup=speedup)
-                    if _is_correct_and_stable(
+                    if request.profiling_policy == "adaptive":
+                        profile_decision = adaptive_candidate_profile_decision(
+                            _is_correct_and_stable(
+                                performance,
+                                request.budget,
+                                request.cases,
+                            ),
+                            speedup,
+                            request.budget.min_speedup,
+                            artifacts_dir,
+                            experiment_id,
+                            candidate_digest,
+                        )
+                        if profile_decision.request is not None:
+                            _report_performance(
+                                experiment_id,
+                                "adaptive-profiling",
+                                performance,
+                                baseline=baseline,
+                                cases=request.cases,
+                                diagnostics=f"reason={profile_decision.reason}",
+                            )
+                            performance = harness.evaluate(
+                                proposal.source,
+                                request.cases,
+                                request.target,
+                                request.budget.benchmark_repetitions,
+                                profile=profile_decision.request,
+                            )
+                            speedup = weighted_geometric_speedup(
+                                baseline, performance, request.cases
+                            )
+                            performance = replace(
+                                performance, aggregate_speedup=speedup
+                            )
+                    elif _is_correct_and_stable(
                         performance,
                         request.budget,
                         request.cases,
@@ -588,6 +855,7 @@ class KernelOptimizer:
                                 experiment_id,
                                 level="deep",
                                 reason="near_threshold",
+                                source_digest=candidate_digest,
                             ),
                         )
                         speedup = weighted_geometric_speedup(
@@ -605,6 +873,33 @@ class KernelOptimizer:
                         and speedup > best_performance.aggregate_speedup
                         else "rejected"
                     )
+                    targeted_profile_reason = ""
+                    if (
+                        status == "promoted"
+                        and not request.auto_test
+                        and request.profiling_policy == "adaptive"
+                        and use_diagnostic_proton
+                    ):
+                        (
+                            performance,
+                            diagnostic_passes_used,
+                            targeted_profile_reason,
+                        ) = _collect_targeted_diagnostic(
+                            harness,
+                            proposal.source,
+                            performance,
+                            proposal,
+                            request,
+                            baseline,
+                            baseline_digest,
+                            artifacts_dir,
+                            experiment_id,
+                            diagnostic_passes_used,
+                        )
+                        perf_profiles = _profiles_by_case(performance)
+                        profile_path = store.write_profile(
+                            experiment_id, perf_profiles
+                        )
                     experiment = ExperimentSummary(
                         experiment_id=experiment_id,
                         round_index=round_index,
@@ -653,7 +948,14 @@ class KernelOptimizer:
                         performance,
                         baseline=baseline,
                         cases=request.cases,
-                        diagnostics=f"decision={decision}",
+                        diagnostics=(
+                            f"decision={decision}"
+                            + (
+                                f" targeted_proton={targeted_profile_reason}"
+                                if targeted_profile_reason
+                                else ""
+                            )
+                        ),
                     )
                     if status == "promoted" and promotion_committer is not None:
                         commit_result = promotion_committer.commit_promotion(
@@ -733,6 +1035,8 @@ class KernelOptimizer:
                 "final",
                 level="deep",
                 reason="final",
+                source_digest=source_digest(best_source),
+                policy_reason=request.profiling_policy,
             ),
         )
         final_profile = replace(
@@ -746,8 +1050,42 @@ class KernelOptimizer:
             final_ncu_diagnostics
             or not is_promotable(final_profile, request.budget, request.cases)
         ):
-            if final_ncu_diagnostics:
-                diagnostics.append(f"final: rejected: {final_ncu_diagnostics}")
+            finalist_revalidation = final_profile
+            if request.diagnostic_proton_intra_kernel:
+                rejected_request = full_diagnostic_request(
+                    artifacts_dir,
+                    "finalist_revalidation",
+                    source_digest(best_source),
+                    reason="rejected_finalist_diagnostic",
+                    pass_budget=max(
+                        0,
+                        request.budget.max_diagnostic_proton_passes
+                        - diagnostic_passes_used,
+                    ),
+                )
+                if rejected_request is not None:
+                    rejected_final_diagnostics = _collect_diagnostic_profiles(
+                        harness,
+                        best_source,
+                        request,
+                        artifacts_dir,
+                        "finalist_revalidation",
+                        reason="rejected_finalist_diagnostic",
+                        profile_request=rejected_request,
+                    )
+                    finalist_revalidation = _merge_diagnostic_profiles(
+                        finalist_revalidation,
+                        rejected_final_diagnostics,
+                    )
+            store.write_profile(
+                "finalist_revalidation",
+                _profiles_by_case(finalist_revalidation),
+            )
+            finalist_rejection = (
+                final_ncu_diagnostics
+                or "final performance did not pass correctness, speedup, or CV gates"
+            )
+            diagnostics.append(f"final: rejected: {finalist_rejection}")
             best_source = request.kernel_source
             final_profile = baseline
             final_profiles = baseline_profiles
@@ -765,17 +1103,30 @@ class KernelOptimizer:
                     stopping_reason = "rollback_commit_failed"
         elif best_experiment_id != "baseline":
             if request.diagnostic_proton_intra_kernel:
-                final_diagnostics = _collect_diagnostic_profiles(
-                    harness,
-                    best_source,
-                    request,
+                final_diagnostic_request = full_diagnostic_request(
                     artifacts_dir,
                     "final",
+                    source_digest(best_source),
                     reason="final_winner_diagnostic",
+                    pass_budget=max(
+                        0,
+                        request.budget.max_diagnostic_proton_passes
+                        - diagnostic_passes_used,
+                    ),
                 )
-                final_profile = _merge_diagnostic_profiles(
-                    final_profile, final_diagnostics
-                )
+                if final_diagnostic_request is not None:
+                    final_diagnostics = _collect_diagnostic_profiles(
+                        harness,
+                        best_source,
+                        request,
+                        artifacts_dir,
+                        "final",
+                        reason="final_winner_diagnostic",
+                        profile_request=final_diagnostic_request,
+                    )
+                    final_profile = _merge_diagnostic_profiles(
+                        final_profile, final_diagnostics
+                    )
             final_profiles = _profiles_by_case(final_profile)
             best_profiles = final_profiles
         else:

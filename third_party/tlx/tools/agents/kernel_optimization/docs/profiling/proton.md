@@ -66,7 +66,10 @@ commands. Keep inline JSON compact; do not paste raw traces into the live log.
 Use this layer only when wrapper attribution and target counters disagree or
 when a specific async-task overlap hypothesis needs lane-level evidence.
 Instrumentation perturbs source, compiler decisions, and timing, so it is
-strictly diagnostic-only.
+strictly diagnostic-only. The optimizer may retain a compact summary from the
+frozen baseline for every later proposal, including proposals made after a
+candidate promotion, but diagnostic duration never participates in scoring or
+promotion.
 
 When requested, use Proton instrumentation mode with:
 
@@ -83,6 +86,14 @@ absolute artifact paths so another agent can reproduce the grouping.
 
 Do not request `warp_group` granularity because the runtime rejects it today.
 Do not infer async-task overlap from CTA-level or kernel-level scopes.
+
+The retained baseline evidence should be bounded and contain only actionable
+summary fields such as selected CTA/tile coordinates, task spans, the top waits,
+key task overlaps, and missing semantic scopes. Store raw event arrays and trace
+payloads only in artifacts; do not include them in candidate prompts. The prompt
+must label this evidence separately from benchmark and normal profiler
+measurements and warn that instrumentation perturbs timing and cannot drive
+promotion.
 
 ## Diagnostic Safety
 
@@ -112,6 +123,14 @@ the returned JSON:
       "granularity": "warp",
       "triton_semantic": true,
       "warp_mapping": "/absolute/path/to/async_task_warp_mapping.json"
+    },
+    "summary": {
+      "task_spans": {"load": 4.5, "mma": 8.25},
+      "top_waits": [{"name": "input_wait", "duration_us": 1.25}],
+      "key_overlaps": [
+        {"producer": "load", "consumer": "mma", "overlap_us": 3.75}
+      ],
+      "missing_scopes": ["store"]
     },
     "artifacts": {
       "chrome_trace": "/absolute/path/to/proton.instrumented.chrome_trace",

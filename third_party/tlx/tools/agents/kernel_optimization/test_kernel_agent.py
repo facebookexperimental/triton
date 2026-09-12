@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -113,6 +114,19 @@ class ScoringTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "not valid Python"):
             extract_python_source("```python\nif:\n```")
+
+    def test_candidate_context_has_safe_immutable_diagnostic_default(self) -> None:
+        context = CandidateContext(
+            1,
+            0,
+            "VALUE = 1\n",
+            _performance(("target", 100.0)),
+            (),
+        )
+
+        self.assertEqual(context.baseline_diagnostic_evidence, ())
+        with self.assertRaisesRegex(AttributeError, "cannot assign"):
+            context.baseline_diagnostic_evidence = ("evidence",)  # type: ignore[misc]
 
     def test_codex_prompt_has_generic_and_target_guidance(self) -> None:
         target_guidance = (
@@ -426,6 +440,51 @@ class ScoringTest(unittest.TestCase):
                     original_source=original,
                 )
 
+    def test_codex_prompt_renders_bounded_diagnostic_only_evidence(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget("cuda", "blackwell"),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+        raw_trace = "RAW_TRACE_EVENT_SHOULD_NOT_APPEAR"
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="target",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((100.0, 100.0, 100.0)),
+                    profile={
+                        "diagnostic_proton_intra_kernel": {
+                            "summary": {"task_spans": {"load": 4.5}},
+                            "trace_events": [{"name": raw_trace}],
+                        }
+                    },
+                ),
+            )
+        )
+        evidence = ("- target: proton.intra.task_spans=load:4.500us", "x" * 5000)
+
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                performance,
+                (),
+                baseline_diagnostic_evidence=evidence,
+            ),
+        )
+
+        self.assertIn("Diagnostic-only intra-kernel evidence", prompt)
+        self.assertIn("proton.intra.task_spans=load:4.500us", prompt)
+        self.assertIn("Instrumentation perturbs source, compiler decisions, and timing", prompt)
+        self.assertIn("diagnostic timing cannot drive promotion", prompt)
+        self.assertIn("<truncated>", prompt)
+        self.assertNotIn(raw_trace, prompt)
+        self.assertNotIn("trace_events", prompt)
     def test_codex_prompt_compacts_profile_and_preserves_scope_boundaries(self) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
@@ -504,7 +563,8 @@ class ScoringTest(unittest.TestCase):
             cases=(InputCase("a", {}),),
             target=KernelTarget("fake", "fake"),
         )
-        self.assertFalse(request.diagnostic_proton_intra_kernel)
+        self.assertIsNone(request.diagnostic_proton_intra_kernel)
+        self.assertFalse(request.use_diagnostic_proton_intra_kernel)
 
     def test_failed_protected_case_is_not_promotable(self) -> None:
         summary = PerformanceSummary(
@@ -637,9 +697,9 @@ class CliTest(unittest.TestCase):
         )
         self.assertFalse(args.commit_winner)
 
-    def test_diagnostic_proton_intra_kernel_is_disabled_by_default(self) -> None:
+    def test_diagnostic_proton_intra_kernel_is_automatic_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
-        self.assertFalse(args.diagnostic_proton_intra_kernel)
+        self.assertIsNone(args.diagnostic_proton_intra_kernel)
 
     def test_diagnostic_proton_intra_kernel_can_be_enabled(self) -> None:
         args = _parse_args(
@@ -652,6 +712,30 @@ class CliTest(unittest.TestCase):
             ]
         )
         self.assertTrue(args.diagnostic_proton_intra_kernel)
+        args = _parse_args(
+            [
+                "--kernel",
+                "kernel.py",
+                "--output-dir",
+                "/tmp/out",
+                "--no-diagnostic-proton-intra-kernel",
+            ]
+        )
+        self.assertFalse(args.diagnostic_proton_intra_kernel)
+
+    def test_adaptive_cuda_enables_diagnostic_proton_automatically(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}),),
+            target=KernelTarget("cuda", "H100"),
+        )
+        self.assertTrue(request.use_diagnostic_proton_intra_kernel)
+        self.assertFalse(
+            replace(
+                request, diagnostic_proton_intra_kernel=False
+            ).use_diagnostic_proton_intra_kernel
+        )
 
 
 class HarnessTest(unittest.TestCase):
@@ -1344,6 +1428,7 @@ class KernelOptimizerTest(unittest.TestCase):
                             benchmark_repetitions=2,
                         ),
                         output_dir=output_dir,
+                        profiling_policy="legacy",
                     )
                 )
             baseline_profile = _read_json(output_dir / "baseline_profile.json")
@@ -1378,6 +1463,7 @@ class KernelOptimizerTest(unittest.TestCase):
                         benchmark_repetitions=2,
                     ),
                     output_dir=output_dir,
+                    profiling_policy="legacy",
                 )
             )
 
@@ -1434,6 +1520,7 @@ class KernelOptimizerTest(unittest.TestCase):
                         benchmark_repetitions=2,
                     ),
                     output_dir=Path(tmp) / "out",
+                    profiling_policy="legacy",
                 )
             )
         candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
@@ -1509,9 +1596,22 @@ class KernelOptimizerTest(unittest.TestCase):
                             "mma_producer_j": 32,
                             "load_input_j": 31,
                         },
-                        "dominant_waits": [
-                            {"name": "reduction_wait_dq", "duration": 2.852}
+                        "task_spans": {
+                            "load": 4.5,
+                            "mma": 8.25,
+                        },
+                        "top_waits": [
+                            {"name": "reduction_wait_dq", "duration": 2.852},
+                            {"name": "input_wait", "duration_us": 1.25},
                         ],
+                        "key_overlaps": [
+                            {
+                                "producer": "load",
+                                "consumer": "mma",
+                                "overlap_us": 3.75,
+                            }
+                        ],
+                        "missing_scopes": ["store", "epilogue"],
                         "trace_path": trace_path,
                     }
                 }
@@ -1523,10 +1623,65 @@ class KernelOptimizerTest(unittest.TestCase):
             "proton.intra.tile=start_n:3840/logical_block:31/curr_m:3968/mma_producer_j:32/load_input_j:31",
             parts,
         )
+        self.assertIn("proton.intra.task_spans=load:4.500us;mma:8.250us", parts)
+        self.assertIn(
+            "proton.intra.top_waits=reduction_wait_dq:2.852us;input_wait:1.250us",
+            parts,
+        )
         self.assertIn(
             "proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts
         )
+        self.assertIn("proton.intra.key_overlaps=load->mma:3.750us", parts)
+        self.assertIn("proton.intra.missing_scopes=store;epilogue", parts)
         self.assertIn(f"proton.intra.trace={trace_path}", parts)
+
+    def test_baseline_diagnostic_evidence_persists_after_promotion(self) -> None:
+        contexts: list[CandidateContext] = []
+        prompts: list[str] = []
+        proposals = [
+            CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "first"),
+            CandidateProposal("LATENCY_US = 60\nCORRECT = True\nNCU_US = 80\n", "second"),
+        ]
+
+        class RecordingProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> CandidateProposal:
+                contexts.append(context)
+                prompts.append(_build_prompt(request, context))
+                return proposals.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = KernelOptimizer(RecordingProvider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n",
+                    harness_path=_write_policy_harness(root),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                    diagnostic_proton_intra_kernel=True,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(contexts[0].baseline_diagnostic_evidence, contexts[1].baseline_diagnostic_evidence)
+        self.assertTrue(contexts[0].baseline_diagnostic_evidence)
+        self.assertEqual(contexts[1].current_source, contexts[0].current_source.replace("100", "80", 1).replace("100", "90", 1))
+        self.assertIn("proton.intra.task_spans=load:4.500us;mma:8.250us", prompts[1])
+        self.assertIn("diagnostic timing cannot drive promotion", prompts[1])
+        self.assertNotIn("raw diagnostic trace event", prompts[1])
+        with self.assertRaisesRegex(AttributeError, "cannot assign"):
+            contexts[1].baseline_diagnostic_evidence = ()  # type: ignore[misc]
 
     def test_diagnostic_proton_profiles_baseline_and_successful_final_only(self) -> None:
         provider = FixedCandidateProvider(
@@ -1652,8 +1807,16 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
         self.assertEqual(
+            result.baseline.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"]["summary"]["duration_us"],
+            999999.0,
+        )
+        self.assertEqual(
             result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"]["summary"]["duration_us"],
             999999.0,
+        )
+        self.assertEqual(
+            result.experiments[1].performance.cases[0].profile["ncu"]["summary"]["duration_us"],  # type: ignore[union-attr]
+            90.0,
         )
 
     def test_profile_payload_caps_large_values(self) -> None:
@@ -1729,10 +1892,17 @@ def _write_policy_harness(directory: Path) -> Path:
         "            'level': request['level'],\n"
         "            'tools': tools,\n"
         "            'request': request,\n"
-        "            'summary': {'active_warps': 8, 'granularity': request.get('granularity')},\n"
+        "            'summary': {\n"
+        "                'active_warps': 8,\n"
+        "                'granularity': request.get('granularity'),\n"
+        "                'task_spans': {'load': 4.5, 'mma': 8.25},\n"
+        "                'top_waits': [{'name': 'input_wait', 'duration_us': 1.25}],\n"
+        "                'key_overlaps': [{'producer': 'load', 'consumer': 'mma', 'overlap_us': 3.75}],\n"
+        "                'missing_scopes': ['store'],\n"
+        "            },\n"
         "            'ncu': {'summary': {'duration_us': 999999.0}},\n"
         "            'artifacts': {'trace': '/tmp/proton.trace'},\n"
-        "            'trace_events': [{'raw': 'event'}],\n"
+        "            'trace_events': [{'raw': 'raw diagnostic trace event'}],\n"
         "            'raw_profile': 'raw trace blob',\n"
         "        }\n"
         "    proton = {'totals': {'wrapper_us': 1.0, 'main_kernel_us': 2.0, 'non_main_kernel_us': 3.0}}\n"
