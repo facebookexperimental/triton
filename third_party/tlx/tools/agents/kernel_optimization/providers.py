@@ -6,14 +6,19 @@ import json
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
 from .models import KernelOptimizationRequest, KernelTarget, PerformanceSummary
-from .profiling import compact_profile_summary
-from .source import validate_replacement_source
+from .profiling import (
+    compact_profile_summary,
+    format_intra_kernel_evidence,
+    is_profile_fresh,
+    is_valid_intra_kernel_evidence,
+)
+from .source import source_digest, validate_replacement_source
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 _LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
@@ -63,7 +68,11 @@ The complete current source is available as `candidate.py` in your writable work
 directory. Edit that file directly and leave it as the complete replacement source. Also
 write `candidate_metadata.json` with integer `schema_version` set to 2 and these string
 fields: `hypothesis`, `evidence`, `change`, `expected_effect`, `risk`, `commit_title`,
-`commit_summary`, and `source_sha256`. `original.py` is an immutable copy of the source you
+`commit_summary`, and `source_sha256`. You may also add a `profiling_hint` object with
+`pass_name`, string arrays `expected_regions` and `case_ids`, and a one-line `rationale`
+when validating this hypothesis requires targeted intra-kernel Proton. Valid pass names
+come only from the diagnostic evidence supplied below. The hint is advisory and may be
+ignored when unsupported, low-impact, stale, or over budget. `original.py` is an immutable copy of the source you
 started from. After the final edit, inspect the final unified diff from `original.py` to `candidate.py`
 and base all metadata only on that diff. Set `source_sha256` to the lowercase SHA-256 digest
 of the final `candidate.py` bytes so stale metadata from an earlier edit is rejected.
@@ -84,6 +93,14 @@ do not print source code or a patch.
 
 
 @dataclass(frozen=True)
+class CandidateProfilingHint:
+    pass_name: str = ""
+    expected_regions: tuple[str, ...] = ()
+    case_ids: tuple[str, ...] = ()
+    rationale: str = ""
+
+
+@dataclass(frozen=True)
 class CandidateProposal:
     source: str
     summary: str = ""
@@ -93,6 +110,9 @@ class CandidateProposal:
     risk: str = ""
     commit_title: str = ""
     commit_summary: str = ""
+    profiling_hint: CandidateProfilingHint = field(
+        default_factory=CandidateProfilingHint
+    )
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,7 @@ class CandidateContext:
     current_source: str
     current_performance: PerformanceSummary
     previous_diagnostics: tuple[str, ...]
+    baseline_diagnostic_evidence: tuple[str, ...] = ()
 
 
 class CandidateProvider(Protocol):
@@ -249,7 +270,7 @@ def _read_candidate_metadata(
     *,
     source: str,
     original_source: str,
-) -> dict[str, str]:
+) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text())
     except FileNotFoundError as error:
@@ -263,18 +284,19 @@ def _read_candidate_metadata(
             f"candidate metadata schema_version must be {_METADATA_SCHEMA_VERSION}"
         )
 
-    metadata: dict[str, str] = {}
+    metadata: dict[str, object] = {}
     for field in (*_SHORT_METADATA_FIELDS, "commit_title", "commit_summary"):
         value = payload.get(field)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"candidate metadata field {field!r} must be non-empty")
         metadata[field] = value.strip()
     for field in _SHORT_METADATA_FIELDS:
-        if "\n" in metadata[field] or len(metadata[field]) > 240:
+        text = str(metadata[field])
+        if "\n" in text or len(text) > 240:
             raise ValueError(f"candidate metadata field {field!r} must be one line under 240 characters")
-        metadata[field] = _clean_short_metadata(metadata[field])
+        metadata[field] = _clean_short_metadata(text)
 
-    title = metadata["commit_title"]
+    title = str(metadata["commit_title"])
     if "\n" in title or len(title) >= 80:
         raise ValueError("commit_title must be one line under 80 characters")
     title = _clean_commit_title(title)
@@ -282,7 +304,7 @@ def _read_candidate_metadata(
         raise ValueError("commit_title is too generic to describe the candidate diff")
     metadata["commit_title"] = title
 
-    summary = metadata["commit_summary"]
+    summary = str(metadata["commit_summary"])
     if len(summary) >= 4000:
         raise ValueError("commit_summary must be under 4000 characters")
     match = _COMMIT_SUMMARY_RE.fullmatch(summary)
@@ -313,6 +335,34 @@ def _read_candidate_metadata(
     if digest != expected_digest:
         raise ValueError("candidate metadata source_sha256 does not match candidate.py")
     metadata["source_sha256"] = expected_digest
+    hint_payload = payload.get("profiling_hint")
+    if hint_payload is None:
+        metadata["profiling_hint"] = CandidateProfilingHint()
+    else:
+        if not isinstance(hint_payload, dict):
+            raise ValueError("profiling_hint must be a JSON object")
+        pass_name = hint_payload.get("pass_name", "")
+        expected_regions = hint_payload.get("expected_regions", [])
+        case_ids = hint_payload.get("case_ids", [])
+        rationale = hint_payload.get("rationale", "")
+        if not isinstance(pass_name, str) or not isinstance(rationale, str):
+            raise ValueError("profiling_hint pass_name and rationale must be strings")
+        if not isinstance(expected_regions, list) or not all(
+            isinstance(region, str) for region in expected_regions
+        ):
+            raise ValueError("profiling_hint expected_regions must be a string array")
+        if not isinstance(case_ids, list) or not all(
+            isinstance(case_id, str) for case_id in case_ids
+        ):
+            raise ValueError("profiling_hint case_ids must be a string array")
+        if "\n" in rationale or len(rationale) > 240:
+            raise ValueError("profiling_hint rationale must be one line under 240 characters")
+        metadata["profiling_hint"] = CandidateProfilingHint(
+            pass_name=pass_name.strip(),
+            expected_regions=tuple(region.strip() for region in expected_regions if region.strip()),
+            case_ids=tuple(case_id.strip() for case_id in case_ids if case_id.strip()),
+            rationale=_clean_short_metadata(rationale),
+        )
     return metadata
 
 
@@ -384,13 +434,14 @@ class CodexCandidateProvider:
         validate_replacement_source(source, context.current_source)
         return CandidateProposal(
             source=source,
-            summary=metadata["change"] or "Codex-edited candidate",
-            hypothesis=metadata["hypothesis"],
-            evidence=metadata["evidence"],
-            expected_effect=metadata["expected_effect"],
-            risk=metadata["risk"],
-            commit_title=metadata["commit_title"],
-            commit_summary=metadata["commit_summary"],
+            summary=str(metadata["change"]) or "Codex-edited candidate",
+            hypothesis=str(metadata["hypothesis"]),
+            evidence=str(metadata["evidence"]),
+            expected_effect=str(metadata["expected_effect"]),
+            risk=str(metadata["risk"]),
+            commit_title=str(metadata["commit_title"]),
+            commit_summary=str(metadata["commit_summary"]),
+            profiling_hint=metadata["profiling_hint"],
         )
 
 
@@ -447,6 +498,26 @@ def _prior_run_prompt_block(request: KernelOptimizationRequest) -> str:
     )
 
 
+def _profile_prompt_summary(profile: dict[str, object]) -> dict[str, object]:
+    compact = compact_profile_summary(profile)
+    compact.pop("diagnostic_proton_intra_kernel", None)
+    return compact
+
+
+def _diagnostic_evidence_prompt_block(context: CandidateContext) -> str:
+    evidence = "\n".join(context.baseline_diagnostic_evidence) or "None captured."
+    limit = 4000
+    if len(evidence) > limit:
+        evidence = evidence[: limit - 16].rstrip() + "\n<truncated>"
+    return f"""
+Diagnostic-only intra-kernel evidence from the frozen baseline:
+Instrumentation perturbs source, compiler decisions, and timing. Use this summary only to
+form optimization hypotheses; diagnostic timing cannot drive promotion. Raw trace events
+are intentionally omitted.
+{evidence}
+"""
+
+
 def _build_prompt(
     request: KernelOptimizationRequest,
     context: CandidateContext,
@@ -460,10 +531,33 @@ def _build_prompt(
         f"{case.timing.median_us if case.timing else 'unavailable'}, "
         f"p95_us={case.timing.p95_us if case.timing else 'unavailable'}, "
         f"cv={case.timing.coefficient_of_variation if case.timing else 'unavailable'}, "
-        f"profile={compact_profile_summary(case.profile)}"
+        f"profile={_profile_prompt_summary(dict(case.profile))}"
         for case in context.current_performance.cases
     )
     diagnostics = "\n".join(context.previous_diagnostics[-5:]) or "None"
+    intra_kernel_lines = []
+    current_digest = source_digest(context.current_source)
+    for case in context.current_performance.cases:
+        if (
+            "diagnostic_proton_intra_kernel" in case.profile
+            and is_profile_fresh(
+                case.profile,
+                current_digest,
+                allow_legacy=request.profiling_policy == "legacy",
+            )
+            and is_valid_intra_kernel_evidence(case.profile)
+        ):
+            intra_kernel_lines.append(
+                f"- {case.case_id}:\n{format_intra_kernel_evidence(case.profile)}"
+            )
+    intra_kernel_block = (
+        "\nDiagnostic intra-kernel Proton evidence (instrumented, hypothesis-only):\n"
+        + "\n".join(intra_kernel_lines)
+        + "\n"
+        if intra_kernel_lines
+        else ""
+    )
+    performance_lines += intra_kernel_block
     reference_block = ""
     if getattr(request, "reference_kernel_source", None):
         reference_block = f"\nReference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):\n```python\n{request.reference_kernel_source[:4000]}\n```\n"
@@ -480,6 +574,7 @@ def _build_prompt(
         else ""
     )
     prior_run_block = _prior_run_prompt_block(request)
+    diagnostic_evidence_block = _diagnostic_evidence_prompt_block(context)
     return f"""{TLX_PROMPT_PREAMBLE}{target_skills_block}{guidance_block}{reference_block}{prior_run_block}
 You are proposing one candidate for the closed loop `build -> verify -> benchmark -> profile -> propose -> repeat`.
 Edit `candidate.py` directly. Do not return source or a diff, and do not claim correctness
@@ -494,7 +589,7 @@ Cases:
 
 Current measurements:
 {performance_lines}
-
+{diagnostic_evidence_block}
 Recent failed-candidate diagnostics:
 {diagnostics}
 

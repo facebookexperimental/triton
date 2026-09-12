@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import io
 import json
+import math
 import re
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
@@ -14,6 +15,18 @@ from typing import Any
 
 _INLINE_PROFILE_LIMIT_BYTES = 1_000_000
 _PROFILE_LEVELS = frozenset({"summary", "deep"})
+_INTRA_KERNEL_PROFILE_KEY = "diagnostic_proton_intra_kernel"
+_PROTON_MAX_TRACE_BYTES = 64 * 1024 * 1024
+_PROTON_MAX_EVENTS = 100_000
+_PROTON_MAX_TASKS = 32
+_PROTON_MAX_WARPS = 128
+_PROTON_MAX_SCOPES = 128
+_PROTON_MAX_WAITS = 10
+_PROTON_MAX_OVERLAPS = 128
+_PROTON_MAX_DIAGNOSTICS = 50
+_PROTON_MAX_TEXT = 256
+_PROTON_PID_RE = re.compile(r"^(?P<kernel>.+?) Core(?P<core>\d+) CTA(?P<cta>\d+)$")
+_PROTON_TID_RE = re.compile(r"^warp (?P<warp>\d+) \(line (?P<line>\d+)\)$")
 _RAW_PROFILE_KEYS = frozenset(
     {
         "blob",
@@ -145,12 +158,34 @@ _NCU_FIELD_GROUPS: Mapping[str, str] = {
 
 
 @dataclass(frozen=True)
+class _ProtonEvent:
+    name: str
+    kernel: str
+    core: int
+    cta: int
+    warp: int
+    start_us: float
+    end_us: float
+    duration_us: float
+
+
+@dataclass(frozen=True)
+class _ProtonTask:
+    name: str
+    scope: str
+    warps: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class ProfileRequest:
     level: str = "summary"
     tools: tuple[str, ...] = ()
+    passes: tuple[str, ...] = ()
     experiment_id: str = ""
     artifacts_dir: Path | None = None
     reason: str = ""
+    source_digest: str = ""
+    policy_reason: str = ""
     diagnostic_only: bool = False
     granularity: str | None = None
 
@@ -158,6 +193,11 @@ class ProfileRequest:
         if self.level not in _PROFILE_LEVELS:
             raise ValueError("profile level must be 'summary' or 'deep'")
         object.__setattr__(self, "tools", tuple(str(tool) for tool in self.tools))
+        object.__setattr__(
+            self, "passes", tuple(str(pass_name) for pass_name in self.passes)
+        )
+        if self.passes and "proton_intra_kernel" not in self.tools:
+            raise ValueError("profile passes require proton_intra_kernel")
         if self.artifacts_dir is not None:
             artifacts_dir = Path(self.artifacts_dir)
             if not artifacts_dir.is_absolute():
@@ -173,36 +213,43 @@ class ProfileRequest:
         return {
             "level": self.level,
             "tools": list(self.tools),
+            "passes": list(self.passes),
             "experiment_id": self.experiment_id,
             "artifacts_dir": str(self.artifacts_dir) if self.artifacts_dir else None,
             "reason": self.reason,
+            "source_digest": self.source_digest,
+            "policy_reason": self.policy_reason,
             "diagnostic_only": self.diagnostic_only,
             "granularity": self.granularity,
         }
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> ProfileRequest:
-        tools = payload.get("tools", ())
-        if isinstance(tools, str):
-            tools = (tools,)
-        if not isinstance(tools, Iterable):
-            raise TypeError("profile tools must be a string or iterable")
+        tools = _string_tuple(payload.get("tools", ()), "tools")
+        passes = _string_tuple(payload.get("passes", ()), "passes")
         artifacts_dir_raw = payload.get("artifacts_dir")
         artifacts_dir = Path(str(artifacts_dir_raw)) if artifacts_dir_raw else None
         return cls(
             level=str(payload.get("level", "summary")),
-            tools=tuple(str(tool) for tool in tools),
+            tools=tools,
+            passes=passes,
             experiment_id=str(payload.get("experiment_id", "")),
             artifacts_dir=artifacts_dir,
             reason=str(payload.get("reason", "")),
+            source_digest=str(payload.get("source_digest", "")),
+            policy_reason=str(payload.get("policy_reason", "")),
             diagnostic_only=bool(payload.get("diagnostic_only", False)),
             granularity=(
-                str(payload["granularity"]) if payload.get("granularity") is not None else None
+                str(payload["granularity"])
+                if payload.get("granularity") is not None
+                else None
             ),
         )
 
 
-def normalize_profile_request(profile: bool | ProfileRequest | Mapping[str, Any]) -> ProfileRequest | None:
+def normalize_profile_request(
+    profile: bool | ProfileRequest | Mapping[str, Any],
+) -> ProfileRequest | None:
     if profile is False or profile is None:
         return None
     if profile is True:
@@ -214,9 +261,125 @@ def normalize_profile_request(profile: bool | ProfileRequest | Mapping[str, Any]
     raise TypeError("profile must be bool, ProfileRequest, or mapping")
 
 
-def profile_request_to_json(profile: bool | ProfileRequest | Mapping[str, Any]) -> dict[str, Any] | bool:
+def profile_request_to_json(
+    profile: bool | ProfileRequest | Mapping[str, Any],
+) -> dict[str, Any] | bool:
     request = normalize_profile_request(profile)
     return request.to_json() if request is not None else False
+
+
+def annotate_profile(
+    profile: Mapping[str, Any],
+    request: ProfileRequest | Mapping[str, Any],
+    case_id: object,
+) -> dict[str, Any]:
+    request_obj = normalize_profile_request(request)
+    if request_obj is None:
+        raise TypeError("profile metadata requires a profile request")
+    annotated = dict(profile)
+    annotated["profile_metadata"] = {
+        "source_digest": request_obj.source_digest,
+        "case_id": str(case_id),
+        "experiment_id": request_obj.experiment_id,
+        "tools": list(request_obj.tools),
+        "passes": list(request_obj.passes),
+        "reason": request_obj.reason,
+        "policy_reason": request_obj.policy_reason,
+        "diagnostic_only": request_obj.diagnostic_only,
+        "granularity": request_obj.granularity,
+    }
+    return annotated
+
+
+def is_profile_fresh(
+    profile: Mapping[str, Any],
+    source_digest: str,
+    *,
+    allow_legacy: bool = True,
+) -> bool:
+    metadata = profile.get("profile_metadata")
+    if not isinstance(metadata, Mapping):
+        return allow_legacy
+    return str(metadata.get("source_digest", "")) == source_digest
+
+
+def is_valid_intra_kernel_evidence(profile: Mapping[str, Any]) -> bool:
+    layers = _intra_kernel_diagnostic_layers(profile)
+    if not layers:
+        return False
+    for layer in layers:
+        if "valid" in layer and layer.get("valid") is not True:
+            return False
+    diagnostic = layers[-1]
+    if diagnostic.get("valid") is not True:
+        return False
+    validation = diagnostic.get("validation")
+    if not isinstance(validation, Mapping):
+        return False
+    if _validation_has_errors(validation):
+        return False
+    passes = validation.get("passes")
+    if not isinstance(passes, Mapping):
+        return False
+    for record in passes.values():
+        if not isinstance(record, Mapping):
+            return False
+        if record.get("valid") is not True:
+            return False
+        if _dropped_event_count(record) > 0:
+            return False
+        if _dropped_event_count(record.get("drop_warnings")) > 0:
+            return False
+        if _dropped_event_count(record.get("validation")) > 0:
+            return False
+    return True
+
+
+def diagnostic_capabilities(profile: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    diagnostic = _intra_kernel_diagnostic(profile)
+    if diagnostic is None:
+        return {}
+    validation = diagnostic.get("validation")
+    if not isinstance(validation, Mapping):
+        return {}
+    passes = validation.get("passes")
+    if not isinstance(passes, Mapping):
+        return {}
+    capabilities: dict[str, tuple[str, ...]] = {}
+    for pass_name, record in passes.items():
+        if not isinstance(record, Mapping):
+            continue
+        expected_regions = record.get("expected_regions", ())
+        capabilities[str(pass_name)] = _string_tuple(
+            expected_regions,
+            "expected_regions",
+        )
+    return capabilities
+
+
+def affected_region_upper_bound(
+    profile: Mapping[str, Any],
+    regions: Iterable[str] | str,
+) -> float | None:
+    diagnostic = _intra_kernel_diagnostic(profile)
+    if diagnostic is None:
+        return None
+    requested = (
+        {str(regions)}
+        if isinstance(regions, str)
+        else {str(region) for region in regions}
+    )
+    if not requested:
+        return None
+    cycles_by_region = _dominant_region_cycles(diagnostic)
+    consumer_loop_cycles = cycles_by_region.get("consumer_loop")
+    if consumer_loop_cycles is None or consumer_loop_cycles <= 0:
+        return None
+    matched = requested & cycles_by_region.keys()
+    if not matched:
+        return None
+    ratio = sum(cycles_by_region[region] for region in matched) / consumer_loop_cycles
+    return min(1.0, max(0.0, ratio))
 
 
 def safe_case_id(case_id: object) -> str:
@@ -369,6 +532,471 @@ def parse_proton_launch_attribution(
         "leaves": leaves,
         "totals": totals,
     }
+
+
+def parse_proton_intra_kernel_trace(
+    trace_path: str | Path, mapping: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Summarize one representative CTA from a Proton warp-granularity trace."""
+    path = _validated_proton_trace_path(trace_path)
+    result = _empty_proton_intra_kernel_result(path)
+    try:
+        kernel_pattern, selected_cta, tasks, required_scopes, scope_kinds = (
+            _parse_proton_mapping(mapping)
+        )
+    except (TypeError, ValueError, re.error) as error:
+        _proton_diagnostic(result, f"invalid mapping: {error}")
+        return result
+
+    if path.stat().st_size > _PROTON_MAX_TRACE_BYTES:
+        _proton_diagnostic(
+            result,
+            f"trace exceeds {_PROTON_MAX_TRACE_BYTES} byte processing limit",
+        )
+        return result
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        _proton_diagnostic(result, f"could not parse Chrome trace: {error}")
+        return result
+    if not isinstance(payload, Mapping) or not isinstance(
+        payload.get("traceEvents"), list
+    ):
+        _proton_diagnostic(result, "Chrome trace must contain a traceEvents list")
+        return result
+    raw_events = payload["traceEvents"]
+    if len(raw_events) > _PROTON_MAX_EVENTS:
+        _proton_diagnostic(
+            result,
+            f"trace contains {len(raw_events)} events; limit is {_PROTON_MAX_EVENTS}",
+        )
+        return result
+
+    events = _parse_proton_events(raw_events, kernel_pattern)
+    groups = _group_proton_events(events)
+    selected = _select_proton_cta(groups, tasks, selected_cta, result)
+    if selected is None:
+        return result
+    (selected_kernel, selected_cta_value), selected_events = selected
+    result["selected_kernel"] = selected_kernel
+    result["selected_cta"] = selected_cta_value
+    result["task_mappings"] = {
+        task.name: {"scope": task.scope, "warps": list(task.warps)} for task in tasks
+    }
+
+    errors = _validate_proton_ownership(selected_events, tasks, required_scopes)
+    for error in errors:
+        _proton_diagnostic(result, error)
+    spans, intervals = _proton_task_spans(selected_events, tasks)
+    result["task_spans"] = spans
+    result["scope_stats"] = _proton_scope_stats(
+        selected_events, tasks, scope_kinds, result
+    )
+    result["dominant_waits"] = _proton_dominant_waits(result["scope_stats"])
+    overlaps = _proton_task_overlaps(tasks, intervals)
+    if len(overlaps) > _PROTON_MAX_OVERLAPS:
+        _proton_diagnostic(
+            result,
+            f"pairwise task overlaps truncated to {_PROTON_MAX_OVERLAPS}",
+        )
+    result["task_overlaps"] = overlaps[:_PROTON_MAX_OVERLAPS]
+    result["key_overlaps"] = result["task_overlaps"]
+    result["valid"] = not errors and len(overlaps) <= _PROTON_MAX_OVERLAPS
+    return result
+
+
+def _validated_proton_trace_path(trace_path: str | Path) -> Path:
+    path = Path(trace_path)
+    if not path.is_absolute():
+        raise ValueError("Proton trace path must be absolute")
+    if not path.is_file():
+        raise FileNotFoundError(f"Proton trace does not exist: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"Proton trace is empty: {path}")
+    return path
+
+
+def _empty_proton_intra_kernel_result(path: Path) -> dict[str, Any]:
+    return {
+        "schema": "proton_intra_kernel_v1",
+        "diagnostic_only": True,
+        "valid": False,
+        "selected_kernel": None,
+        "selected_cta": None,
+        "task_mappings": {},
+        "task_spans": {},
+        "scope_stats": {},
+        "dominant_waits": [],
+        "task_overlaps": [],
+        "key_overlaps": [],
+        "diagnostics": [],
+        "trace_path": str(path),
+    }
+
+
+def _proton_diagnostic(result: dict[str, Any], message: str) -> None:
+    diagnostics = result["diagnostics"]
+    if len(diagnostics) < _PROTON_MAX_DIAGNOSTICS:
+        diagnostics.append(message[:_PROTON_MAX_TEXT])
+
+
+def _parse_proton_mapping(
+    mapping: Mapping[str, Any],
+) -> tuple[re.Pattern[str], int | None, tuple[_ProtonTask, ...], tuple[str, ...], dict[str, str]]:
+    if not isinstance(mapping, Mapping):
+        raise TypeError("mapping must be a mapping")
+    expected_kernel = mapping.get("expected_kernel")
+    if not isinstance(expected_kernel, str) or not expected_kernel.strip():
+        raise ValueError("expected_kernel must be a nonempty regex string")
+    if len(expected_kernel) > _PROTON_MAX_TEXT:
+        raise ValueError(f"expected_kernel exceeds {_PROTON_MAX_TEXT} characters")
+    kernel_pattern = re.compile(expected_kernel)
+    selected_cta = mapping.get("selected_cta")
+    if isinstance(selected_cta, bool) or (
+        selected_cta is not None and not isinstance(selected_cta, int)
+    ):
+        raise TypeError("selected_cta must be an integer")
+    if selected_cta is not None and selected_cta < 0:
+        raise ValueError("selected_cta must be nonnegative")
+    tasks = _parse_proton_tasks(mapping.get("tasks"))
+    required_scopes = _parse_proton_names(
+        mapping.get("required_scopes"), "required_scopes"
+    )
+    scope_kinds = _parse_proton_scope_kinds(mapping)
+    return kernel_pattern, selected_cta, tasks, required_scopes, scope_kinds
+
+
+def _parse_proton_tasks(value: Any) -> tuple[_ProtonTask, ...]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("tasks must be a nonempty mapping")
+    if len(value) > _PROTON_MAX_TASKS:
+        raise ValueError(f"tasks exceeds {_PROTON_MAX_TASKS} entries")
+    tasks: list[_ProtonTask] = []
+    owned_warps: set[int] = set()
+    owned_scopes: set[str] = set()
+    for raw_name in sorted(value, key=str):
+        raw_task = value[raw_name]
+        name = _bounded_proton_name(raw_name, "task name")
+        if not isinstance(raw_task, Mapping):
+            raise TypeError(f"task {name!r} must be a mapping")
+        scope = _bounded_proton_name(raw_task.get("scope"), f"task {name!r} scope")
+        warps = _parse_proton_warps(raw_task.get("warps"), name)
+        overlap = owned_warps.intersection(warps)
+        if overlap:
+            raise ValueError(f"task {name!r} reuses owned warps {sorted(overlap)}")
+        if scope in owned_scopes:
+            raise ValueError(f"task scope {scope!r} has more than one owner")
+        owned_warps.update(warps)
+        owned_scopes.add(scope)
+        tasks.append(_ProtonTask(name=name, scope=scope, warps=warps))
+    return tuple(tasks)
+
+
+def _parse_proton_warps(value: Any, task_name: str) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"task {task_name!r} warps must be a nonempty list")
+    warps: set[int] = set()
+    for item in value:
+        if isinstance(item, bool):
+            raise TypeError(f"task {task_name!r} has a non-integer warp")
+        if isinstance(item, int):
+            start = end = item
+        elif isinstance(item, str) and re.fullmatch(r"\d+-\d+", item):
+            start, end = (int(part) for part in item.split("-", 1))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            start, end = item
+        elif isinstance(item, Mapping) and set(item) >= {"start", "end"}:
+            start, end = item["start"], item["end"]
+        else:
+            raise ValueError(f"task {task_name!r} has an invalid warp or range")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end < start
+        ):
+            raise ValueError(f"task {task_name!r} has an invalid warp range")
+        if end - start + 1 > _PROTON_MAX_WARPS:
+            raise ValueError(f"task {task_name!r} warp range is too large")
+        warps.update(range(start, end + 1))
+    if len(warps) > _PROTON_MAX_WARPS:
+        raise ValueError(f"task {task_name!r} exceeds {_PROTON_MAX_WARPS} warps")
+    return tuple(sorted(warps))
+
+
+def _parse_proton_names(value: Any, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise TypeError(f"{field} must be a list")
+    names = tuple(_bounded_proton_name(item, field) for item in value)
+    if len(names) > _PROTON_MAX_SCOPES:
+        raise ValueError(f"{field} exceeds {_PROTON_MAX_SCOPES} entries")
+    if len(names) != len(set(names)):
+        raise ValueError(f"{field} contains duplicates")
+    return names
+
+
+def _parse_proton_scope_kinds(mapping: Mapping[str, Any]) -> dict[str, str]:
+    raw_kinds = mapping.get("scope_kinds")
+    raw_waits = mapping.get("wait_scopes")
+    if raw_kinds is None and raw_waits is None:
+        raise ValueError("scope_kinds or wait_scopes is required")
+    if raw_kinds is not None and raw_waits is not None:
+        raise ValueError("provide scope_kinds or wait_scopes, not both")
+    if raw_waits is not None:
+        return {name: "wait" for name in _parse_proton_names(raw_waits, "wait_scopes")}
+    if not isinstance(raw_kinds, Mapping):
+        raise TypeError("scope_kinds must be a mapping")
+    kinds: dict[str, str] = {}
+    for raw_scope, raw_kind in raw_kinds.items():
+        scope = _bounded_proton_name(raw_scope, "scope_kinds scope")
+        kind = _bounded_proton_name(raw_kind, f"scope kind for {scope!r}")
+        kinds[scope] = kind
+    if len(kinds) > _PROTON_MAX_SCOPES:
+        raise ValueError(f"scope_kinds exceeds {_PROTON_MAX_SCOPES} entries")
+    return kinds
+
+
+def _bounded_proton_name(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a nonempty string")
+    if len(value) > _PROTON_MAX_TEXT:
+        raise ValueError(f"{field} exceeds {_PROTON_MAX_TEXT} characters")
+    return value
+
+
+def _parse_proton_events(
+    raw_events: list[Any], kernel_pattern: re.Pattern[str]
+) -> tuple[_ProtonEvent, ...]:
+    events: list[_ProtonEvent] = []
+    for raw in raw_events:
+        if not isinstance(raw, Mapping) or raw.get("ph") != "X":
+            continue
+        pid_match = _PROTON_PID_RE.fullmatch(str(raw.get("pid", "")))
+        tid_match = _PROTON_TID_RE.fullmatch(str(raw.get("tid", "")))
+        if pid_match is None or tid_match is None:
+            continue
+        kernel = pid_match.group("kernel")
+        if kernel_pattern.search(kernel) is None:
+            continue
+        name = raw.get("name")
+        start_us = _coerce_float(raw.get("ts"))
+        duration_us = _coerce_float(raw.get("dur"))
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > _PROTON_MAX_TEXT
+            or start_us is None
+            or duration_us is None
+            or not math.isfinite(start_us)
+            or not math.isfinite(duration_us)
+            or duration_us < 0
+        ):
+            continue
+        events.append(
+            _ProtonEvent(
+                name=name,
+                kernel=kernel,
+                core=int(pid_match.group("core")),
+                cta=int(pid_match.group("cta")),
+                warp=int(tid_match.group("warp")),
+                start_us=start_us,
+                end_us=start_us + duration_us,
+                duration_us=duration_us,
+            )
+        )
+    return tuple(events)
+
+
+def _group_proton_events(
+    events: tuple[_ProtonEvent, ...],
+) -> dict[tuple[str, int], tuple[_ProtonEvent, ...]]:
+    grouped: dict[tuple[str, int], list[_ProtonEvent]] = {}
+    for event in events:
+        grouped.setdefault((event.kernel, event.cta), []).append(event)
+    return {
+        key: tuple(sorted(value, key=lambda event: (event.start_us, event.warp, event.name)))
+        for key, value in grouped.items()
+    }
+
+
+def _select_proton_cta(
+    groups: Mapping[tuple[str, int], tuple[_ProtonEvent, ...]],
+    tasks: tuple[_ProtonTask, ...],
+    requested_cta: int | None,
+    result: dict[str, Any],
+) -> tuple[tuple[str, int], tuple[_ProtonEvent, ...]] | None:
+    candidates = [
+        (key, events)
+        for key, events in groups.items()
+        if requested_cta is None or key[1] == requested_cta
+    ]
+    if not candidates:
+        detail = f" CTA {requested_cta}" if requested_cta is not None else ""
+        _proton_diagnostic(result, f"no matching complete events found for{detail}")
+        return None
+    candidates.sort(key=lambda item: (item[0][1], item[0][0]))
+    complete = [item for item in candidates if _complete_proton_task_count(item[1], tasks) == len(tasks)]
+    if complete:
+        return complete[0]
+    selected = max(
+        candidates,
+        key=lambda item: (
+            _complete_proton_task_count(item[1], tasks),
+            -item[0][1],
+            item[0][0],
+        ),
+    )
+    missing = _missing_proton_task_scopes(selected[1], tasks)
+    _proton_diagnostic(
+        result,
+        "no CTA has complete task scopes; selected best partial CTA with missing scopes: "
+        + ", ".join(missing),
+    )
+    return selected
+
+
+def _complete_proton_task_count(
+    events: tuple[_ProtonEvent, ...], tasks: tuple[_ProtonTask, ...]
+) -> int:
+    return len(tasks) - len(_missing_proton_task_scopes(events, tasks))
+
+
+def _missing_proton_task_scopes(
+    events: tuple[_ProtonEvent, ...], tasks: tuple[_ProtonTask, ...]
+) -> list[str]:
+    return [
+        task.scope
+        for task in tasks
+        if not any(event.name == task.scope and event.warp in task.warps for event in events)
+    ]
+
+
+def _validate_proton_ownership(
+    events: tuple[_ProtonEvent, ...],
+    tasks: tuple[_ProtonTask, ...],
+    required_scopes: tuple[str, ...],
+) -> list[str]:
+    warp_owner = {warp: task.name for task in tasks for warp in task.warps}
+    scope_owner = {task.scope: task.name for task in tasks}
+    errors = [
+        f"missing task scope {scope!r}"
+        for scope in _missing_proton_task_scopes(events, tasks)
+    ]
+    for event in events:
+        expected_owner = scope_owner.get(event.name)
+        if expected_owner is None:
+            continue
+        actual_owner = warp_owner.get(event.warp)
+        if actual_owner != expected_owner:
+            errors.append(
+                f"scope {event.name!r} on warp {event.warp} belongs to "
+                f"{actual_owner or 'no mapped task'}, expected {expected_owner}"
+            )
+    owned_scope_names = {
+        event.name for event in events if event.warp in warp_owner
+    }
+    errors.extend(
+        f"missing required scope {scope!r}"
+        for scope in required_scopes
+        if scope not in owned_scope_names
+    )
+    return sorted(set(errors))
+
+
+def _proton_task_spans(
+    events: tuple[_ProtonEvent, ...], tasks: tuple[_ProtonTask, ...]
+) -> tuple[dict[str, float], dict[str, tuple[float, float]]]:
+    spans: dict[str, float] = {}
+    intervals: dict[str, tuple[float, float]] = {}
+    for task in tasks:
+        matching = [
+            event
+            for event in events
+            if event.name == task.scope and event.warp in task.warps
+        ]
+        if not matching:
+            continue
+        start = min(event.start_us for event in matching)
+        end = max(event.end_us for event in matching)
+        intervals[task.name] = (start, end)
+        spans[task.name] = end - start
+    return spans, intervals
+
+
+def _proton_scope_stats(
+    events: tuple[_ProtonEvent, ...],
+    tasks: tuple[_ProtonTask, ...],
+    scope_kinds: Mapping[str, str],
+    result: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    owned_warps = {warp for task in tasks for warp in task.warps}
+    stats: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.warp not in owned_warps:
+            continue
+        entry = stats.setdefault(
+            event.name,
+            {
+                "kind": scope_kinds.get(event.name, "other"),
+                "count": 0,
+                "total_us": 0.0,
+                "max_us": 0.0,
+            },
+        )
+        entry["count"] += 1
+        entry["total_us"] += event.duration_us
+        entry["max_us"] = max(entry["max_us"], event.duration_us)
+    ordered = {name: stats[name] for name in sorted(stats)}
+    if len(ordered) > _PROTON_MAX_SCOPES:
+        _proton_diagnostic(result, f"scope stats truncated to {_PROTON_MAX_SCOPES}")
+        result["valid"] = False
+    return dict(list(ordered.items())[:_PROTON_MAX_SCOPES])
+
+
+def _proton_dominant_waits(
+    scope_stats: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    waits = [
+        {
+            "name": name,
+            "duration_us": stats["total_us"],
+            "count": stats["count"],
+            "total_us": stats["total_us"],
+            "max_us": stats["max_us"],
+        }
+        for name, stats in scope_stats.items()
+        if str(stats.get("kind", "")).lower() == "wait"
+    ]
+    waits.sort(key=lambda item: (-item["total_us"], -item["max_us"], item["name"]))
+    return waits[:_PROTON_MAX_WAITS]
+
+
+def _proton_task_overlaps(
+    tasks: tuple[_ProtonTask, ...], intervals: Mapping[str, tuple[float, float]]
+) -> list[dict[str, Any]]:
+    overlaps: list[dict[str, Any]] = []
+    for left_index, left in enumerate(tasks):
+        if left.name not in intervals:
+            continue
+        left_start, left_end = intervals[left.name]
+        left_duration = left_end - left_start
+        for right in tasks[left_index + 1 :]:
+            if right.name not in intervals:
+                continue
+            right_start, right_end = intervals[right.name]
+            right_duration = right_end - right_start
+            overlap_us = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+            overlaps.append(
+                {
+                    "tasks": [left.name, right.name],
+                    "overlap_us": overlap_us,
+                    "left_ratio": overlap_us / left_duration if left_duration else 0.0,
+                    "right_ratio": overlap_us / right_duration if right_duration else 0.0,
+                }
+            )
+    return overlaps
 
 
 def parse_ncu_csv(csv_text: str) -> dict[str, dict[str, Any]]:
@@ -627,6 +1255,54 @@ def ncu_regression_diagnostic(
     return ""
 
 
+def format_intra_kernel_evidence(profile: Mapping[str, Any]) -> str:
+    """Format bounded, diagnostic-only Proton evidence for an agent prompt."""
+    diagnostic = profile.get("diagnostic_proton_intra_kernel", profile)
+    if not isinstance(diagnostic, Mapping):
+        return "Unavailable"
+    nested = diagnostic.get("diagnostic_proton_intra_kernel")
+    if isinstance(nested, Mapping):
+        diagnostic = nested
+
+    lines = [
+        "Instrumented Proton cycles are diagnostic-only and cannot justify promotion."
+    ]
+    valid = diagnostic.get("valid")
+    lines.append(f"valid={valid if isinstance(valid, bool) else 'unknown'}")
+    role_mapping = diagnostic.get("role_mapping")
+    if isinstance(role_mapping, Mapping):
+        lines.append(
+            f"warp_roles={json.dumps(_compact_value(role_mapping), sort_keys=True)}"
+        )
+
+    for label, key in (
+        ("dominant_phases", "dominant_phases"),
+        ("dominant_waits", "dominant_waits"),
+    ):
+        values = diagnostic.get(key)
+        if isinstance(values, list):
+            lines.append(
+                f"{label}={json.dumps(_compact_value(values[:5]), sort_keys=True)}"
+            )
+
+    overlap = diagnostic.get("overlap")
+    if isinstance(overlap, Mapping):
+        lines.append(
+            f"overlap={json.dumps(_compact_value(overlap), sort_keys=True)}"
+        )
+    validation = diagnostic.get("validation")
+    if isinstance(validation, Mapping):
+        lines.append(
+            f"validation={json.dumps(_compact_value(validation), sort_keys=True)}"
+        )
+    artifacts = diagnostic.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        lines.append(
+            f"artifacts={json.dumps(_compact_value(artifacts), sort_keys=True)}"
+        )
+    return "\n".join(lines)[:8000]
+
+
 def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
     preferred = (
         "level",
@@ -638,6 +1314,7 @@ def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
         "native_profiler",
         "diagnostics",
         "diagnostic_proton_intra_kernel",
+        "profile_metadata",
         "artifacts",
         "artifact",
         "size_bytes",
@@ -656,6 +1333,77 @@ def _ncu_aliases_for_level(level: str) -> Mapping[str, tuple[str, ...]]:
     if level == "deep":
         return DEEP_NCU_METRIC_ALIASES
     raise ValueError("profile level must be 'summary' or 'deep'")
+
+
+def _string_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if not isinstance(value, Iterable):
+        raise TypeError(f"profile {field_name} must be a string or iterable")
+    return tuple(str(item) for item in value)
+
+
+def _intra_kernel_diagnostic_layers(profile: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    first = profile.get(_INTRA_KERNEL_PROFILE_KEY, profile)
+    if not isinstance(first, Mapping):
+        return ()
+    nested = first.get(_INTRA_KERNEL_PROFILE_KEY)
+    if isinstance(nested, Mapping):
+        return (first, nested)
+    return (first,)
+
+
+def _intra_kernel_diagnostic(profile: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    layers = _intra_kernel_diagnostic_layers(profile)
+    if not layers:
+        return None
+    return layers[-1]
+
+
+def _validation_has_errors(validation: Mapping[str, Any]) -> bool:
+    errors = validation.get("errors", ())
+    if isinstance(errors, str):
+        return bool(errors)
+    if isinstance(errors, Iterable):
+        return any(bool(error) for error in errors)
+    return bool(errors)
+
+
+def _dropped_event_count(record: object) -> int:
+    if not isinstance(record, Mapping):
+        return 0
+    count = _coerce_float(record.get("dropped_events"))
+    if count is not None:
+        return int(count)
+    total = 0
+    details = record.get("details")
+    if isinstance(details, Iterable) and not isinstance(details, (str, bytes)):
+        for detail in details:
+            if isinstance(detail, Mapping):
+                dropped = _coerce_float(detail.get("dropped"))
+                if dropped is not None:
+                    total += int(dropped)
+    return total
+
+
+def _dominant_region_cycles(diagnostic: Mapping[str, Any]) -> dict[str, float]:
+    cycles_by_region: dict[str, float] = {}
+    for key in ("dominant_phases", "dominant_waits"):
+        records = diagnostic.get(key)
+        if not isinstance(records, Iterable) or isinstance(records, (str, bytes)):
+            continue
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            name = record.get("name")
+            mean_cycles = _coerce_float(record.get("mean_cycles"))
+            if name is None or mean_cycles is None:
+                continue
+            region = str(name)
+            cycles_by_region[region] = max(
+                cycles_by_region.get(region, 0.0), mean_cycles
+            )
+    return cycles_by_region
 
 
 def _iter_nodes(payload: Any) -> Iterable[Mapping[str, Any]]:

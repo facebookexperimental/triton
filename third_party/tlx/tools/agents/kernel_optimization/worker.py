@@ -11,9 +11,19 @@ from types import ModuleType
 from typing import Any
 
 try:
-    from .profiling import compact_profile_output, invoke_profile, per_case_profile_request
+    from .profiling import (
+        annotate_profile,
+        compact_profile_output,
+        invoke_profile,
+        per_case_profile_request,
+    )
 except ImportError:  # pragma: no cover - subprocess script execution path
-    from profiling import compact_profile_output, invoke_profile, per_case_profile_request
+    from profiling import (
+        annotate_profile,
+        compact_profile_output,
+        invoke_profile,
+        per_case_profile_request,
+    )
 
 
 def _load_harness(path: Path) -> ModuleType:
@@ -104,8 +114,13 @@ def _main() -> int:
                     raw_profile = invoke_profile(
                         harness.profile, artifact, case, profile_request
                     )
+                    annotated_profile = annotate_profile(
+                        raw_profile,
+                        profile_request,
+                        case["case_id"],
+                    )
                     case_result["profile"] = compact_profile_output(
-                        raw_profile, profile_request
+                        annotated_profile, profile_request
                     )
                 except Exception as error:  # noqa: BLE001
                     case_result["profile"] = {

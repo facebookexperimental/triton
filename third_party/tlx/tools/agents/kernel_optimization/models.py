@@ -43,6 +43,7 @@ class OptimizationBudget:
     min_speedup: float = 1.01
     max_cv: float = 0.10
     benchmark_repetitions: int = 10
+    max_diagnostic_proton_passes: int = 10
 
     def __post_init__(self) -> None:
         if self.max_rounds <= 0 or self.candidates_per_round <= 0:
@@ -55,6 +56,8 @@ class OptimizationBudget:
             raise ValueError("max_cv must not be negative")
         if self.benchmark_repetitions <= 0:
             raise ValueError("benchmark_repetitions must be positive")
+        if self.max_diagnostic_proton_passes < 0:
+            raise ValueError("max_diagnostic_proton_passes must not be negative")
 
 
 @dataclass(frozen=True)
@@ -86,8 +89,10 @@ class KernelOptimizationRequest:
     strategy: str = "best_first"
     reference_kernel_source: str | None = None
     output_dir: Path | None = None
-    diagnostic_proton_intra_kernel: bool = False
+    diagnostic_proton_intra_kernel: bool | None = None
+    profiling_policy: str = "adaptive"
     prior_run_evidence: PriorRunEvidence | None = None
+    auto_test: bool = False
 
     def __post_init__(self) -> None:
         if not self.kernel_source.strip():
@@ -96,6 +101,17 @@ class KernelOptimizationRequest:
             raise ValueError("at least one input case is required")
         if self.strategy not in VALID_STRATEGIES:
             raise ValueError(f"strategy must be one of {sorted(VALID_STRATEGIES)}")
+        if self.profiling_policy not in {"adaptive", "legacy"}:
+            raise ValueError("profiling_policy must be 'adaptive' or 'legacy'")
+
+    @property
+    def use_diagnostic_proton_intra_kernel(self) -> bool:
+        if self.diagnostic_proton_intra_kernel is not None:
+            return self.diagnostic_proton_intra_kernel
+        return (
+            self.profiling_policy == "adaptive"
+            and self.target.backend.strip().lower() in {"cuda", "nvidia"}
+        )
 
 
 @dataclass(frozen=True)

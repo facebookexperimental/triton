@@ -70,6 +70,7 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-speedup", type=float, default=1.01)
     parser.add_argument("--max-cv", type=float, default=0.10)
     parser.add_argument("--benchmark-repetitions", type=int, default=10)
+    parser.add_argument("--max-diagnostic-proton-passes", type=int, default=10)
     parser.add_argument("--model", default=None)
     parser.add_argument(
         "--commit-winner",
@@ -109,12 +110,32 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         help="Collect harness profile() for baseline and candidates (default: profile is always collected).",
     )
     parser.add_argument(
-        "--diagnostic-proton-intra-kernel",
+        "--auto-test",
         action="store_true",
         default=False,
         help=(
-            "Collect diagnostic-only per-warp proton_intra_kernel traces for the "
-            "baseline and final winner only."
+            "Automatically generate isolated optimization experiments, run them "
+            "through the frozen harness, and write auto_test_report.json. This "
+            "mode never commits."
+        ),
+    )
+    parser.add_argument(
+        "--profiling-policy",
+        choices=["adaptive", "legacy"],
+        default="adaptive",
+        help=(
+            "adaptive profiles only viable candidates; legacy preserves the "
+            "previous always-profile behavior"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-proton-intra-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override adaptive diagnostic-only per-warp Proton selection. By default, "
+            "adaptive CUDA/NVIDIA campaigns enable it automatically; use --no-... "
+            "to disable it explicitly."
         ),
     )
     parser.add_argument(
@@ -145,6 +166,12 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
             benchmark_repetitions=int(
                 payload.get("benchmark_repetitions", args.benchmark_repetitions)
             ),
+            max_diagnostic_proton_passes=int(
+                payload.get(
+                    "max_diagnostic_proton_passes",
+                    args.max_diagnostic_proton_passes,
+                )
+            ),
         )
     return OptimizationBudget(
         max_rounds=args.max_rounds,
@@ -154,6 +181,7 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
         min_speedup=args.min_speedup,
         max_cv=args.max_cv,
         benchmark_repetitions=args.benchmark_repetitions,
+        max_diagnostic_proton_passes=args.max_diagnostic_proton_passes,
     )
 
 
@@ -505,7 +533,9 @@ def main() -> int:
         budget=budget,
         output_dir=args.output_dir,
         diagnostic_proton_intra_kernel=args.diagnostic_proton_intra_kernel,
+        profiling_policy=args.profiling_policy,
         prior_run_evidence=prior_run_evidence,
+        auto_test=args.auto_test,
     )
     promotion_committer = None
     if commit_snapshot is not None:
