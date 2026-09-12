@@ -850,11 +850,12 @@ static std::string getLocName(Operation *op) {
 
 /// Priority levels for SMEM multi-buffering candidates.
 enum class WSBufferPriority {
-  P0_InnermostTMA = 0, // innermost loop + TMA channel
-  P1_InnermostNonTMA,  // innermost loop, non-TMA
-  P2_InnerTMAStaging,  // TMA staging buffer inside the innermost loop (e.g. dq)
-  P3_OuterTMAStaging,  // TMA staging buffer outside loops (e.g. dk, dv)
-  P4_Other,            // outside loop / non-innermost (regular epilogue)
+  P0_ComputedMMAOperand = 0, // computed SMEM tile consumed by an MMA
+  P1_InnermostTMA,           // innermost loop + TMA channel
+  P2_InnermostNonTMA,        // innermost loop, non-TMA
+  P3_InnerTMAStaging, // TMA staging buffer inside the innermost loop (e.g. dq)
+  P4_OuterTMAStaging, // TMA staging buffer outside loops (e.g. dk, dv)
+  P5_Other,           // outside loop / non-innermost (regular epilogue)
 };
 
 /// A wrapper around one ttg.local_alloc op for the new SMEM allocation.
@@ -1255,6 +1256,45 @@ static bool isSmemTMAChannel(Operation *alloc,
   return isa<ttnvws::DescriptorLoadOp>(srcOp);
 }
 
+/// Return true for an SMEM channel that materializes a descriptor-fed computed
+/// tensor directly consumed by an MMA. Unlike a TMA-fed operand, buffering this
+/// channel hides both the register computation and its source-load latency
+/// while retaining only the narrower, post-conversion tile in the ring.
+static bool
+isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
+                                         SmallVector<Channel *> &channels) {
+  if (isSmemTMAChannel(alloc, channels))
+    return false;
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
+    return false;
+  DenseSet<Operation *> consumers;
+  (void)getAllAcutalUsersForChannel(ch, consumers, alloc);
+  if (!llvm::any_of(consumers, [](Operation *op) {
+        return isa<ttng::MMAv5OpInterface>(op);
+      }))
+    return false;
+
+  Operation *producer = ch->getSrcOp();
+  if (!producer)
+    return false;
+  SmallVector<Value> worklist(producer->getOperands());
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    if (auto localLoad = value.getDefiningOp<ttg::LocalLoadOp>()) {
+      if (Operation *sourceAlloc = localLoad.getSrc().getDefiningOp();
+          sourceAlloc && isSmemTMAChannel(sourceAlloc, channels))
+        return true;
+    }
+    if (Operation *def = value.getDefiningOp())
+      llvm::append_range(worklist, def->getOperands());
+  }
+  return false;
+}
+
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
 static int getLoopStage(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
@@ -1413,7 +1453,7 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   return total;
 }
 
-/// Group P2_Other WSBuffers by their original load op (or by compatible
+/// Group P5_Other WSBuffers by their original load op (or by compatible
 /// type/size for TMA store staging buffers) and assign the same buffer.id
 /// to buffers within each group.
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
@@ -1467,7 +1507,7 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
       }
       continue;
     }
-    if (buf.priority != WSBufferPriority::P4_Other)
+    if (buf.priority != WSBufferPriority::P5_Other)
       continue;
     Channel *ch = findChannelForOp(buf.allocOp, channels);
     Operation *origLoad = findOriginalLoadForChannel(ch);
@@ -1502,13 +1542,13 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                "TMA staging per-(descriptor,load-or-task) fusion");
 }
 
-/// Phase 3.7: Iterative copy increase for fused P2_Other groups.
+/// Phase 3.7: Iterative copy increase for fused P5_Other groups.
 /// Epilogue buffers merged in Phase 3.5 share a single bufferId but are
 /// left at numCopies=1 by Phase 4. Increase copies uniformly for each
 /// fused group while staying within the SMEM budget.
 /// Phase 3.7: Iterative copy increase for fused groups eligible for epilogue-
 /// style budget bumping. Inner-loop TMA staging is tried first (highest pay-
-/// off per slot), then outer-loop TMA staging, then regular P4_Other groups.
+/// off per slot), then outer-loop TMA staging, then regular P5_Other groups.
 // Optional cap on the fused TMA-staging pipeline depth, exposing staging copies
 // as a search/autotune axis. TRITON_WS_STAGING_COPIES=K bounds Phase 3.7's bump
 // target to min(numBuffers, K); the K|S divisibility and budget checks still
@@ -1532,9 +1572,9 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
     numBuffers = std::min(numBuffers, cap);
   // Eligible priority tiers, in the order Phase 3.7 should try to bump them.
   static const WSBufferPriority kPhase45Order[] = {
-      WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
-      WSBufferPriority::P3_OuterTMAStaging, // dk / dv
-      WSBufferPriority::P4_Other,           // regular epilogue / non-innermost
+      WSBufferPriority::P3_InnerTMAStaging, // dq \u2014 highest payoff per slot
+      WSBufferPriority::P4_OuterTMAStaging, // dk / dv
+      WSBufferPriority::P5_Other,           // regular epilogue / non-innermost
   };
   auto isEligible = [&](WSBufferPriority p) {
     for (auto q : kPhase45Order)
@@ -2462,7 +2502,7 @@ static unsigned allocateSmemBuffers(
     buf.isCrossStage = isSmemCrossStage(alloc, channels);
     buf.bufferId = nextBufferId++;
     buf.numCopies = 1;
-    buf.priority = WSBufferPriority::P4_Other;
+    buf.priority = WSBufferPriority::P5_Other;
     buf.isAllocated = true; // default: every buffer gets dedicated SMEM
 
     // Check for annotation-based pre-assignment.
@@ -2481,7 +2521,7 @@ static unsigned allocateSmemBuffers(
       // WSAtomicBroadcast stamped the requested tile-prefetch depth on the
       // alloc. Pin the buffer to it so the planner honors the depth exactly and
       // accounts for the extra copies against the SMEM budget, instead of
-      // leaving this non-innermost (P4_Other) channel single-buffered.
+      // leaving this non-innermost (P5_Other) channel single-buffered.
       buf.numCopies = copies.getInt();
       buf.minCopies = copies.getInt();
       buf.isPinned = true;
@@ -2599,14 +2639,17 @@ static unsigned allocateSmemBuffers(
     if (buf.isPinned)
       continue;
     if (buf.tmaStaging > 0) {
-      buf.priority = buf.isInnermost ? WSBufferPriority::P2_InnerTMAStaging
-                                     : WSBufferPriority::P3_OuterTMAStaging;
+      buf.priority = buf.isInnermost ? WSBufferPriority::P3_InnerTMAStaging
+                                     : WSBufferPriority::P4_OuterTMAStaging;
+    } else if (buf.isInnermost && isDescriptorFedComputedMMAOperandChannel(
+                                      buf.allocOp, channels)) {
+      buf.priority = WSBufferPriority::P0_ComputedMMAOperand;
     } else if (buf.isInnermost && buf.isTMA) {
-      buf.priority = WSBufferPriority::P0_InnermostTMA;
+      buf.priority = WSBufferPriority::P1_InnermostTMA;
     } else if (buf.isInnermost) {
-      buf.priority = WSBufferPriority::P1_InnermostNonTMA;
+      buf.priority = WSBufferPriority::P2_InnermostNonTMA;
     } else {
-      buf.priority = WSBufferPriority::P4_Other;
+      buf.priority = WSBufferPriority::P5_Other;
     }
     LDBG("Phase 3: WSBuffer["
          << buf.bufferId << "] priority=" << static_cast<int>(buf.priority)
@@ -2616,7 +2659,7 @@ static unsigned allocateSmemBuffers(
     LLVM_DEBUG(buf.allocOp->dump());
   }
 
-  // ── Phase 3.5: Merge P4_Other buffers from the same original load ───
+  // ── Phase 3.5: Merge P5_Other buffers from the same original load ───
   // Epilogue buffers (e.g., from splitting a tmem_load result into sub-tiles
   // stored to separate SMEM buffers) have disjoint liveness and can share
   // the same buffer.id to reduce SMEM usage before the copy increase pass.
@@ -2726,15 +2769,34 @@ static unsigned allocateSmemBuffers(
   // TMA store/reduce staging is on the output critical path. Reserve its
   // legal copy depth before discretionary P0/P1 operand buffering consumes
   // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
-  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, smemBudget);
+  // Reserve the bytes needed to take computed MMA operands to the requested
+  // depth before opportunistically growing TMA-store staging.  Without this,
+  // an output ring is grown first and a compact producer result can be left at
+  // one slot even though it sits on the critical input path of every MMA.
+  unsigned epilogueBudget = smemBudget;
+  for (const auto &buf : wsBuffers) {
+    if (buf.isPinned ||
+        buf.priority != WSBufferPriority::P0_ComputedMMAOperand ||
+        buf.numCopies >= numBuffers)
+      continue;
+    uint64_t reserve =
+        uint64_t(numBuffers - buf.numCopies) * uint64_t(buf.sizeBytes);
+    epilogueBudget = reserve < epilogueBudget
+                         ? epilogueBudget - static_cast<unsigned>(reserve)
+                         : 0;
+  }
+  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, epilogueBudget);
 
   LDBG("Phase 3.7 epilogue copies complete: totalSmem="
        << computeTotalSmem(wsBuffers));
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
-  // Process P0 then P1. P2 is never increased.
-  for (auto priority : {WSBufferPriority::P0_InnermostTMA,
-                        WSBufferPriority::P1_InnermostNonTMA}) {
+  // Prefer the compact computed MMA tile, then direct TMA operands and other
+  // innermost allocations.  This avoids spending the budget on wide FP32
+  // descriptor scratch before buffering a narrowed BF16 producer result.
+  for (auto priority : {WSBufferPriority::P0_ComputedMMAOperand,
+                        WSBufferPriority::P1_InnermostTMA,
+                        WSBufferPriority::P2_InnermostNonTMA}) {
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
