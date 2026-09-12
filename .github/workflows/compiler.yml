@@ -3,8 +3,22 @@ name: Compiler LIT Tests
 on:
   push:
     branches: [main]
+    paths-ignore:
+      # Agent instructions and skills do not affect compiler output.
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
   pull_request:
     branches-ignore: ['llvm-**']
+    paths-ignore:
+      # Agent instructions and skills do not affect compiler output.
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
   merge_group:
     branches: [main, 'dev-**']
     types: [checks_requested]
