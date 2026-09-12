@@ -53,7 +53,7 @@ CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
         op="mm",
         arch="gfx942",
-        variant="lds_ring",
+        variant="direct_load",
         impl="kernels.mm.gfx942:mm",
         dtypes=_FP16,
         # No `accepts`: operands are read through explicit strides rather than a

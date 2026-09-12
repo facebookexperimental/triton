@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from triton._internal_testing import is_hip_cdna3
-from triton.tlx.ops.kernels.mm.gfx942_tuned import TUNED_CONFIGS
+from triton.tlx.ops.kernels.mm.gfx942 import TUNED_CONFIGS
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="tlx.ops.addmm requires gfx942")
 

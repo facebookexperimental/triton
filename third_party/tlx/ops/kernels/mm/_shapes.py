@@ -54,7 +54,7 @@ def _union(*lists: list[list]) -> list[list]:
 
 GFX942_FOCUS: list[list] = [
     # BF16 production shapes with row-major A and column-major B. These select
-    # the frozen direct-load fast paths in gfx942_tuned.py.
+    # the frozen direct-load fast paths in gfx942.py.
     [819200, 1024, 192, (192, 1), (1, 192), "bf16"],
     [4096, 1894, 242432, (242432, 1), (1, 242432), "bf16"],
     [1024, 6144, 20480, (20480, 1), (1, 20480), "bf16"],

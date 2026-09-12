@@ -15,7 +15,7 @@ import sys
 
 import torch
 
-from triton.tlx.ops.kernels.mm.gfx942_tuned import TUNED_CONFIGS
+from triton.tlx.ops.kernels.mm.gfx942 import TUNED_CONFIGS
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
