@@ -145,7 +145,9 @@ def _run_autows_bwd(L, Z, jagged=False):
     lens = [L] * Z
     if jagged:
         assert Z == 2
-        lens[-1] = L - 65
+        # Leave at least one full BLOCK_N=128 tail tile invalid so a rectangular
+        # schedule would exercise the skip path between persistent iterations.
+        lens[-1] = L - 129
     t = sum(lens)
     g = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
     q, k, v = g().requires_grad_(True), g().requires_grad_(True), g().requires_grad_(True)
@@ -272,7 +274,7 @@ def test_self_attention_bwd_autows_clc(L, Z):
 
 
 def test_self_attention_bwd_autows_clc_jagged_production():
-    """Production shape exercises the collective jagged-tail guard."""
+    """Production shape exercises compact scheduling of jagged tail tiles."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     L, Z = 4096, 2
