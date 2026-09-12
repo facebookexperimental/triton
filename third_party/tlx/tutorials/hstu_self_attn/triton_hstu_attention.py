@@ -2407,8 +2407,9 @@ def _hstu_attn_bwd_clc(  # noqa C901
         dk_base = DK + seq_start_kv * stride_dkn
         dv_base = DV + seq_start_kv * stride_dvn
 
-        # Dense identity and compact jagged schedules contain only valid tiles.
-        if tl.constexpr(True):
+        # Every partition evaluates the same validity predicate. Invalid
+        # rectangular-grid tiles skip the complete partitioned body.
+        if start_n < seq_len_kv:
             _hstu_attn_bwd_one_col_block(
                 start_n=start_n,
                 desc_row_q=seq_start_q,
@@ -2608,32 +2609,13 @@ def triton_hstu_attention_bwd(
     if _AUTOWS_CFG.clc:
         assert enable_tma and _AUTOWS_CFG.autows and _AUTOWS_CFG.dq_reduce
         assert sort_by_length_indices is None
-        # A full rectangular input already uses the CLC scheduler's identity
-        # order. Avoid constructing a compact schedule and synchronizing its
-        # device-computed size back to the host on every backward invocation.
-        has_tile_ids = not (
-            q.shape[0] == Z * max_q_len and k.shape[0] == Z * max_seq_len
-        )
+        # Run the full rectangular grid. A collective in-kernel guard skips
+        # jagged tail tiles while preserving each channel's accumulation count.
         block_n = _AUTOWS_CFG.bwd_bn
         num_n_tiles = triton.cdiv(max_q_len, block_n)
-        if has_tile_ids:
-            # Compact the rectangular max-length grid to valid jagged tiles.
-            # Empty tail tiles cannot enter the partitioned body: their
-            # divergent inner-loop trip counts break cross-partition barrier
-            # cadence.
-            seq_lens = seq_offsets_q[1:] - seq_offsets_q[:-1]
-            blocks_per_seq = torch.div(seq_lens + block_n - 1, block_n, rounding_mode="floor")
-            counts = blocks_per_seq.repeat_interleave(H)
-            tile_count = int(counts.sum().item())
-            tile_starts = torch.cumsum(counts, dim=0) - counts
-            compact_ids = torch.arange(tile_count, device=q.device, dtype=torch.int64)
-            off_hz = torch.repeat_interleave(torch.arange(Z * H, device=q.device, dtype=torch.int64), counts)
-            local_n = compact_ids - torch.repeat_interleave(tile_starts, counts)
-            tile_ids = (off_hz * num_n_tiles + local_n).to(torch.int32)
-        else:
-            tile_count = Z * H * num_n_tiles
-            # Keep TILE_IDS pointer-typed; HAS_TILE_IDS removes the load.
-            tile_ids = seq_offsets
+        tile_count = Z * H * num_n_tiles
+        # Keep TILE_IDS pointer-typed; HAS_TILE_IDS removes the load.
+        tile_ids = seq_offsets
         grid = lambda meta: (  # noqa E731
             tile_count, )
         bwd_kernel = _hstu_attn_bwd_clc

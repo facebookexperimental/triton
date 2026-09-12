@@ -122,6 +122,20 @@ A CLC body may be wrapped in a zero-result bounds guard such as
 - reuse-group ordering uses the nearest enclosing `for`/`if`/`while`, so
   guarded channels use the same accumulation counter and staging rotation.
 
+The guard is also a state merge. Each data-channel accumulation counter is
+looked up from the persistent while's after-region arguments, advanced only by
+the taken branch, returned unchanged by the skipped branch, and then yielded by
+the while into the next scheduler iteration. CLC broadcast counters remain
+unconditional because the scheduler itself advances on every tile, including a
+hole. Conflating these two cadences is a barrier-phase bug.
+
+An outer-produced input used by an inner MMAv5 loop has one more cadence
+requirement: its EMPTY completion fires only on the last inner iteration. The
+outer producer can be enclosed by this `scf.while` rather than an `scf.for`;
+failing to recognize that shape releases the input once per inner iteration
+while its counter advances once per valid tile. A hole can then expose an
+already-passed barrier phase on the next valid tile.
+
 This requires a collective predicate: all partitions must compute the same
 boolean. It permits rectangular CLC scheduling for jagged inputs, where an
 invalid tail tile skips the complete partitioned body in every task without

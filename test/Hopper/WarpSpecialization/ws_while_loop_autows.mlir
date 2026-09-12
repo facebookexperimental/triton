@@ -438,6 +438,67 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A collective guard directly inside a persistent while must merge both a
+  // direct channel counter and a nested-loop counter: taken advances each by
+  // the transactions it executes, skipped preserves both incoming values. A
+  // channel outside the guard models the CLC broadcast cadence and advances on
+  // every while iteration independently of the two guarded counters.
+  // CODEPART-LABEL: @while_if_channel_counter
+  // CODEPART: ttg.warp_specialize
+  // CODEPART: scf.while
+  // CODEPART: ^bb0({{.*}}%[[OUTSIDE:.*]]: i64, %[[DIRECT:.*]]: i64, %[[NESTED:.*]]: i64
+  // CODEPART: %[[MERGED:.*]]:2 = scf.if {{.*}} -> (i64, i64) {
+  // CODEPART: %[[INNER:.*]] = scf.for {{.*}} iter_args(%{{.*}} = %[[NESTED]]) -> (i64)
+  // CODEPART: %[[NEXT_DIRECT:.*]] = arith.addi %[[DIRECT]], {{.*}} : i64
+  // CODEPART: scf.yield {{.*}}%[[NEXT_DIRECT]], %[[INNER]] : i64, i64
+  // CODEPART: } else {
+  // CODEPART: scf.yield {{.*}}%[[DIRECT]], %[[NESTED]] : i64, i64
+  // CODEPART: %[[NEXT_OUTSIDE:.*]] = arith.addi %[[OUTSIDE]], {{.*}} : i64
+  // CODEPART: scf.yield {{.*}}%[[NEXT_OUTSIDE]], %[[MERGED]]#0, %[[MERGED]]#1
+  tt.func public @while_if_channel_counter(
+      %src: tensor<16xf32, #blocked>,
+      %dst: tensor<16x!tt.ptr<f32>, #blocked>, %run: i1) {
+    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
+    %false = arith.constant {async_task_id = array<i32: 0, 1>} false
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : index
+    %c1 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : index
+    %c2 = arith.constant {async_task_id = array<i32: 0, 1>} 2 : index
+    %alloc = ttg.local_alloc {async_task_id = array<i32: 0>, buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    %inner_alloc = ttg.local_alloc {async_task_id = array<i32: 0>, buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    %outside_alloc = ttg.local_alloc {async_task_id = array<i32: 0>, buffer.copy = 2 : i32, buffer.id = 2 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    %result = scf.while (%keep = %true, %run_arg = %run) : (i1, i1) -> i1 {
+      scf.condition(%keep) {async_task_id = array<i32: 0, 1>} %run_arg : i1
+    } do {
+    ^bb0(%run_arg: i1):
+      scf.if %run_arg {
+        %stored = arith.addf %src, %src {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked>
+        ttg.local_store %stored, %alloc {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+        %loaded = ttg.local_load %alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+        tt.store %dst, %loaded {async_task_id = array<i32: 1>} : tensor<16x!tt.ptr<f32>, #blocked>
+        scf.for %i = %c0 to %c2 step %c1 {
+          %inner_stored = arith.addf %src, %src {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked>
+          ttg.local_store %inner_stored, %inner_alloc {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+          %inner_loaded = ttg.local_load %inner_alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+          tt.store %dst, %inner_loaded {async_task_id = array<i32: 1>} : tensor<16x!tt.ptr<f32>, #blocked>
+        } {async_task_id = array<i32: 0, 1>}
+      } {async_task_id = array<i32: 0, 1>}
+      %outside_stored = arith.addf %src, %src {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked>
+      ttg.local_store %outside_stored, %outside_alloc {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+      %outside_loaded = ttg.local_load %outside_alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+      tt.store %dst, %outside_loaded {async_task_id = array<i32: 1>} : tensor<16x!tt.ptr<f32>, #blocked>
+      scf.yield {async_task_id = array<i32: 0, 1>} %false, %run_arg : i1, i1
+    } attributes {async_task_id = array<i32: 0, 1>, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32], ttg.partition.types = ["compute", "load"]}
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>

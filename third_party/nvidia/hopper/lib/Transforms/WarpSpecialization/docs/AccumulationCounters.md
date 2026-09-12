@@ -40,26 +40,60 @@ own `accumCnt` argument threaded through the enclosing control flow.
 A channel needs an accumulation counter when it has `numBuffers > 1` (is
 multi-buffered). Channels in a reuse group share a single `accumCnt`.
 
-### Step 2: Extend Loop Arguments (`createNewLoop`)
+### Step 2: Extend Loop Arguments (`createNewLoop` / `createNewWhileLoop`)
 
-For each `scf::ForOp` that contains multi-buffered channels:
+For each loop that contains multi-buffered channels, append one `i64` state
+value per accumulation counter. The exact carrier depends on the loop form:
+
+| Loop | Counter input in the scheduled body | Counter backedge |
+|---|---|---|
+| `scf.for` | trailing body `iter_arg` | trailing `scf.yield` operand |
+| `scf.while` | trailing after-region block argument, forwarded from a trailing before-region argument by `scf.condition` | trailing after-region `scf.yield` operand |
+
+For `scf.for` (`createNewLoop`):
 
 1. Create a new loop with additional `i64` block arguments — one per
    accumulation counter.
 2. All arguments start at 0 (`arith::ConstantOp(0)`).
 3. The original loop body is moved into the new loop.
 
-`createNewLoopWrapper` handles the case where the loop is wrapped in an
-outer structure.
+For `scf.while` (`createNewWhileLoop`), the same counter must appear at every
+edge of the two-region state machine. Merely adding a before-region argument is
+not enough: the counter would never reach the scheduled after region. Merely
+adding an after-region argument is also not enough: its next value would never
+reach the next condition evaluation.
 
 ### Step 3: Extend If-Op Results (`rewriteIfOp`)
 
-When `scf::IfOp` appears inside a loop with accumulation counters, its
-results must be extended to carry the `accumCnt` values through both the
-then and else branches:
+When `scf::IfOp` appears inside an accumulation-carrying loop, its results must
+be extended to merge the `accumCnt` values from both branches. The carrier may
+be either an `scf.for` body argument or an `scf.while` before/after argument;
+the branch logic is identical:
+
+```
+incoming = enclosing loop's counter for this channel region
+then     = incoming + number of transactions executed by the then branch
+else     = incoming
+merged   = scf.if result selected from then/else
+```
+
+The enclosing loop must yield `merged`, not the pre-branch value. This is what
+lets a dynamic persistent sequence such as `valid -> skipped -> valid` resume
+the same buffer slot and mbarrier phase after the hole. Resetting the else arm
+to zero, incrementing it, or yielding the old loop argument discards the
+transaction history and eventually deadlocks a producer/consumer pair.
 
 - `generateYieldCntsForThenBlock`: generates yield values for the then branch
 - `generateYieldCntsForIfOp`: generates yield values for both branches
+- `getEnclosingAccumLoopCarrier`: selects the nearest `scf.for` body or the
+  containing `scf.while` region as the source of `incoming`
+
+For an `scf.if` in an `scf.while` after region, `incoming` is specifically the
+matching **after-region block argument**. The corresponding before-region
+argument is the value before the condition; the condition forwards it into the
+after region. Looking up a while result is wrong because that result is only
+available after the loop terminates, and looking up an init operand would reset
+the counter on every persistent iteration.
 
 ### Step 4: Update Counter Values (`updateAccumLoopCount`)
 
@@ -115,6 +149,59 @@ The `scf.while` is threaded analogously to `scf.for` (`createNewWhileWrapper` /
 3. The after-region `scf.yield` yields the next accumCnt value back, so it flows
    to the next iteration's before args.
 
+The canonical rewrite for a guarded transaction is:
+
+```mlir
+// Before counter insertion.
+%r = scf.while (%valid = %true, %tile = %pid) : (i1, i32) -> i32 {
+  scf.condition(%valid) %tile : i32
+} do {
+^bb0(%tile_after: i32):
+  scf.if %tile_is_in_bounds {
+    // channel transaction(s)
+  }
+  scf.yield %next_valid, %next_tile : i1, i32
+}
+
+// After counter insertion (irrelevant values elided).
+%r:2 = scf.while (%valid = %true, %tile = %pid, %cnt = %c0)
+    : (i1, i32, i64) -> (i32, i64) {
+^bb0(%valid_before: i1, %tile_before: i32, %cnt_before: i64):
+  scf.condition(%valid_before) %tile_before, %cnt_before : i32, i64
+} do {
+^bb0(%tile_after: i32, %cnt_after: i64):
+  %cnt_merged = scf.if %tile_is_in_bounds -> i64 {
+    %cnt_next = arith.addi %cnt_after, %c1 : i64
+    scf.yield %cnt_next : i64
+  } else {
+    scf.yield %cnt_after : i64
+  }
+  scf.yield %next_valid, %next_tile, %cnt_merged : i1, i32, i64
+}
+```
+
+There are two distinct merges here:
+
+1. `scf.if` merges **transaction state**. A skipped tile preserves the
+   after-region counter because no corresponding barrier phase was produced or
+   consumed.
+2. `scf.while` merges **persistent state**. Its after-yield feeds the selected
+   value back to the before region; `scf.condition` then forwards that value to
+   the next scheduled body execution.
+
+Dropping either merge can look correct for the first tile. It fails only after
+a CTA is reused, which is why a one-tile or non-persistent test does not cover
+this contract.
+
+Counter preservation is necessary but not sufficient for a channel whose
+producer is outside a nested `scf.for` and whose MMAv5 consumer is inside it.
+That channel has outer-loop cadence: the consumer's EMPTY-barrier completion
+must fire only on the last inner iteration. The enclosing producer loop may be
+either `scf.for` or `scf.while`; treating only the former as loop-invariant
+causes multiple phase flips per outer transaction. A skipped while iteration
+then gives those asynchronous flips time to overtake the preserved counter, so
+the next valid tile can wait forever on an already-passed phase.
+
 Two kinds of counters can live on a persistent while:
 
 - **Nested-loop counter** — for the inner warp-specialized `scf.for` (e.g. the
@@ -123,6 +210,38 @@ Two kinds of counters can live on a persistent while:
 - **Direct counter** — for a channel whose producer/consumer lives directly in
   the while's after region (e.g. the accumulator/epilogue channel). Like a
   channel directly in an `scf.for`, it advances by one per persistent iteration.
+
+When those channels are inside a collective `scf.if`, "per persistent
+iteration" means per **taken transaction**, not per scheduler iteration. The
+if therefore returns one merged counter for every direct or nested
+channel-bearing region. Its taken arm returns the advanced value (or the nested
+loop's final value), while its skipped arm returns the corresponding incoming
+after-region argument unchanged. The while's after-yield feeds those merged
+results back to the before region for the next CLC tile.
+
+For example, a CLC loop with a direct K/V transaction and a nested Q/dO loop
+has the state transition:
+
+```
+(outer, inner) --valid--> (outer + 1, inner + inner_trip_count)
+(outer, inner) --hole---> (outer,     inner)
+```
+
+The CLC broadcast counter is separate and unconditional: it advances once for
+every scheduler iteration, including holes. Mixing that counter with a guarded
+data-channel counter is invalid even though both are carried by the same
+`scf.while`.
+
+| Counter class | Advances on valid tile | Advances on hole | Used by |
+|---|---:|---:|---|
+| CLC scheduler/broadcast | yes | yes | CLC result publication barriers |
+| guarded direct channel | yes, once | no | K/V and outer accumulator channels |
+| guarded nested channel | yes, by nested trip count | no | Q/dO and inner MMA channels |
+
+Counter lookup must use the block that actually contains the guarded op. For a
+guard in the while after region this is `while.getAfterBody()`; using only
+`getParentOfType<scf::ForOp>()` misses the carrier and synthesizes branch-local
+constants (`then = 1`, `else = 0`) on every persistent iteration.
 
 For ops directly in the after region, `getAccumCount` resolves the counter from
 the while's after-region arguments (no enclosing `scf.for`). In

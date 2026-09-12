@@ -3914,11 +3914,14 @@ void insertAsyncComm(
           bool releaseOnLastIterOnly = false;
           if (addCompletionBarrier) {
             if (auto mmaLoop = mmaOp->getParentOfType<scf::ForOp>()) {
-              if (auto prodLoop = headProducer->getParentOfType<scf::ForOp>()) {
+              Operation *prodLoop = headProducer->getParentOp();
+              while (prodLoop && !isa<scf::ForOp, scf::WhileOp>(prodLoop))
+                prodLoop = prodLoop->getParentOp();
+              if (prodLoop) {
                 for (Operation *anc = mmaLoop->getParentOp();
                      anc && !isa<triton::FuncOp>(anc);
                      anc = anc->getParentOp()) {
-                  if (anc == prodLoop.getOperation()) {
+                  if (anc == prodLoop) {
                     releaseOnLastIterOnly = true;
                     break;
                   }

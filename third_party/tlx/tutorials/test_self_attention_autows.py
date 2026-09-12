@@ -70,8 +70,13 @@ _DQREDUCE_CFG = dict(
     pin=True,
 )
 _CLC_CFG = dict(
-    _DQREDUCE_CFG, clc=True, bwd_bm=64, bwd_bn=128,
-    bwd_stages=2, dkdv_subtile=2, clc_smem_algo=2,
+    _DQREDUCE_CFG,
+    clc=True,
+    bwd_bm=64,
+    bwd_bn=128,
+    bwd_stages=2,
+    dkdv_subtile=2,
+    clc_smem_algo=2,
 )
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
@@ -144,10 +149,10 @@ def _run_autows_bwd(L, Z, jagged=False):
     torch.manual_seed(0)
     lens = [L] * Z
     if jagged:
-        assert Z == 2
-        # Leave at least one full BLOCK_N=128 tail tile invalid so a rectangular
-        # schedule would exercise the skip path between persistent iterations.
-        lens[-1] = L - 129
+        assert Z >= 2
+        # Alternate full rows with rows that have one invalid BLOCK_N=128 tail
+        # tile in the rectangular schedule.
+        lens = [L - (i % 2) * 128 for i in range(Z)]
     t = sum(lens)
     g = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
     q, k, v = g().requires_grad_(True), g().requires_grad_(True), g().requires_grad_(True)
@@ -273,20 +278,22 @@ def test_self_attention_bwd_autows_clc(L, Z):
     assert r.returncode == 0, (f"CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
-def test_self_attention_bwd_autows_clc_jagged_production():
-    """Production shape exercises compact scheduling of jagged tail tiles."""
+@pytest.mark.parametrize("L,Z", [(4096, 2), (256, 120)])
+def test_self_attention_bwd_autows_clc_jagged_production(L, Z):
+    """Exercise jagged tails at production depth and across reused CTAs."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    L, Z = 4096, 2
     r = subprocess.run(
-        [sys.executable, __file__, "--run-clc-jagged", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        [sys.executable, __file__, "--run-clc-jagged", str(L),
+         str(Z)],
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"jagged production CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"jagged production CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
@@ -353,15 +360,10 @@ if __name__ == "__main__":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
         assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged"))
-        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(
-            _L, _Z, jagged=sys.argv[1] == "--run-clc-jagged"
-        )
-        rls = {n: _rel_l2(g_, w) for n, g_, w in
-               (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
-        print(
-            f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
-            f"(L={_L} Z={_Z})"
-        )
+        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z, jagged=sys.argv[1] == "--run-clc-jagged")
+        rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
+        print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
+              f"(L={_L} Z={_Z})")
         bad = {n: v for n, v in rls.items() if not (v < 1e-2)}
         if bad:
             print(f"FAIL: rel-L2 too high: {bad}")
