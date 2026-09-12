@@ -300,6 +300,7 @@ jobs:
         timeout-minutes: 30
         run: |
           . "${SETUP_SCRIPT}"
+          . ./.ci/tritonbench/setup-ld-library.sh
           python -m pytest python/test/unit/runtime/ -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (runtime)
         id: parse
