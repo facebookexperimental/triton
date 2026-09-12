@@ -123,6 +123,80 @@ public:
                                 maxnreg))
       return failure();
 
+    // Allow an `arrive`/`barrier` immediately after the tmem_load on a warp-
+    // spec partition boundary. The pass is expected to hoist the fusion across
+    // that barrier by pushing the arrive past the reduction, provided there are
+    // no intervening memory ops. This mirrors the tmem_load splitting analysis
+    // which operates per subtile.
+    SmallVector<Operation *> barriersToMove;
+    auto usesTMemLoad = [&](Operation *op) {
+      return llvm::any_of(op->getOperands(), [&](Value operand) {
+        return stripConvertLayout(operand) == tmemLoad.getResult() ||
+            (tmemLoad.getToken() && operand == tmemLoad.getToken());
+      });
+    };
+    if (tmemLoad->getBlock() == reduceOp->getBlock()) {
+      for (Operation *op = tmemLoad->getNextNode(); op != reduceOp.getOperation();
+           op = op->getNextNode()) {
+        if (isa<ttg::ConvertLayoutOp>(op)) {
+          // The convert_layout on the tmem_load -> reduce edge is already
+          // handled via stripConvertLayout; allow it.
+          continue;
+        }
+        // Allow mbarrier/cluster/named arrives that constitute the warp-spec
+        // partition edge. Use operator info (isa) rather than name string
+        // so only true arrive ops are considered. Wait barriers must not be
+        // hoisted past the reduction.
+        if (isa<ArriveBarrierOp, ClusterArriveOp, NamedBarrierArriveOp,
+                AsyncCopyMbarrierArriveOp>(op)) {
+          // Reject if the barrier uses the tmem_load result as an operand
+          // (should not happen) or has a memory effect that would prevent
+          // reordering past the reduction.
+          if (usesTMemLoad(op))
+            return failure();
+          // Only pure barrier ops (no additional memory ops) are allowed to be
+          // pushed past the reduction. Query MemoryEffectOpInterface directly
+          // (arrive ops are not HasRecursiveMemoryEffects).
+          if (auto effects = dyn_cast<MemoryEffectOpInterface>(op)) {
+            SmallVector<MemoryEffects::EffectInstance> effs;
+            effects.getEffects(effs);
+            bool onlyBarrier = true;
+            for (auto &eff : effs) {
+              if (!isa<MemoryEffects::Read, MemoryEffects::Write>(
+                      eff.getEffect()))
+                continue;
+              // Only an effect on the shared-memory mbarrier state is safe to
+              // reorder past the reduction. Compare against the SharedMemory
+              // resource singleton rather than its stringified name. A null
+              // resource is unmodeled/unknown memory and must block hoisting.
+              if (eff.getResource() != ttg::SharedMemory::get())
+                onlyBarrier = false;
+            }
+            if (!onlyBarrier)
+              return failure();
+          }
+          barriersToMove.push_back(op);
+          continue;
+        }
+        // Pure, memory-effect-free bookkeeping may be inserted on the
+        // partition edge (for example, memdesc_index selects the barrier
+        // slot). It is safe to cross as long as it is independent of the
+        // tmem_load result and token.
+        if (isPure(op) && isMemoryEffectFree(op) && !usesTMemLoad(op))
+          continue;
+        // Any other op between load and reduce blocks fusion. This ensures we
+        // do not reorder past real memory operations; only the partition
+        // barrier is hoisted.
+        return failure();
+      }
+    } else {
+      // Cross-block / cross-region (e.g. different warp_specialize partitions)
+      // is not handled yet. The TLX explicit arrive case and the AutoWS
+      // same-partition case are both same-block, so reject otherwise.
+      // Future per-subtile splitting would need to handle channels.
+      return failure();
+    }
+
     // Now build the fused load.
     auto *ctx = tmemLoad.getContext();
     auto redOpAttr = TMEMLoadReduceModifierAttr::get(ctx, redOpKind);
@@ -150,6 +224,14 @@ public:
       rewriter.setInsertionPoint(reduceOp);
       redResult = ttg::ConvertLayoutOp::create(rewriter, reduceOp.getLoc(),
                                                expectedTy, redResult);
+    }
+    // Push the warp-spec partition barrier(s) past the reduction so the
+    // fused tcgen05.ld.red can be formed. The barrier is independent of the
+    // reduction's data flow and is moved to after the reduce (now the fused
+    // load's red result) per subtile. Reverse iteration preserves relative
+    // order of multiple arrives.
+    for (Operation *barrier : llvm::reverse(barriersToMove)) {
+      rewriter.moveOpAfter(barrier, reduceOp.getOperation());
     }
     rewriter.replaceOp(reduceOp, redResult);
     return success();
