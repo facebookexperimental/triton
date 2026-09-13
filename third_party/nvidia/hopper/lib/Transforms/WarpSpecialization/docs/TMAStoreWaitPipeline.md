@@ -124,6 +124,13 @@ after these operand correctness floors. Ordinary single-group MMA operands and
 TMA-fed metadata used only by elementwise computation remain discretionary, so
 FA-backward dQ/dK/dV staging stays prioritized over their extra copies.
 
+`TRITON_WS_TMA_REDUCE_STAGING_COPIES=K` independently sets the copy target for
+TMA-reduce staging. It may exceed `num_stages`, because the output
+reduction ring is drained by TMA store waits and can overlap stores without
+increasing the operand/GEMM pipeline depth. The normal SMEM-budget and `K | S`
+safety checks still apply. Other output staging remains bounded by
+`num_stages`.
+
 Groups whose members all reuse another allocation (`isAllocated=false`) are
 bumped only when every Phase 3.6 host has enough physical capacity for the
 enlarged ring (`stagingSize × copies ≤ hostSize × hostCopies`). Their apparent
