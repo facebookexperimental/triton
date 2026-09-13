@@ -71,12 +71,13 @@ _DQREDUCE_CFG = dict(
 )
 _CLC_CFG = dict(
     _DQREDUCE_CFG,
+    dq_fp32=True,
     clc=True,
     bwd_bm=64,
     bwd_bn=128,
     bwd_stages=2,
     dkdv_subtile=2,
-    clc_smem_algo=2,
+    clc_smem_algo=1,
 )
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
@@ -360,6 +361,8 @@ if __name__ == "__main__":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
         assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged"))
+        if A._AUTOWS_CFG.clc:
+            assert A._AUTOWS_CFG.dq_fp32, "CLC dQ must use the TLX-matching FP32 mode"
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z, jagged=sys.argv[1] == "--run-clc-jagged")
         rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
         print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
