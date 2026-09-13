@@ -1523,6 +1523,17 @@ static unsigned getStagingCopiesCap() {
   return n < 1 ? 0u : static_cast<unsigned>(n);
 }
 
+// Optional copy target for TMA-reduce staging. Unlike the general
+// staging cap, this may exceed the loop pipeline depth: the output reduction
+// ring is drained by TMA store waits independently of the GEMM pipeline.
+static unsigned getTmaReduceStagingCopies() {
+  auto v = triton::tools::getStrEnv("TRITON_WS_TMA_REDUCE_STAGING_COPIES");
+  if (v.empty())
+    return 0;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 0u : static_cast<unsigned>(n);
+}
+
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
                                         unsigned numBuffers,
@@ -1530,6 +1541,9 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
   if (unsigned cap = getStagingCopiesCap())
     numBuffers = std::min(numBuffers, cap);
+  unsigned tmaReduceNumBuffers = numBuffers;
+  if (unsigned copies = getTmaReduceStagingCopies())
+    tmaReduceNumBuffers = copies;
   // Eligible priority tiers, in the order Phase 3.7 should try to bump them.
   static const WSBufferPriority kPhase45Order[] = {
       WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
@@ -1623,6 +1637,8 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       unsigned currentCopies = wsBuffers[indices[0]].numCopies;
       unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
       unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
+      unsigned targetNumBuffers =
+          firstTmaStaging == 2 ? tmaReduceNumBuffers : numBuffers;
 
       // Defensive K | S cap for same-partition (wait_group-drained) TMA
       // staging. Such staging rotates S = indices.size() subtiles through K =
@@ -1665,13 +1681,13 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
            << " groupSize=" << indices.size() << " perAllocSize=" << firstSize
            << " tmaStaging=" << firstTmaStaging << " currentCopies="
            << currentCopies << " anyCrossStage=" << anyCrossStage
-           << " \u2014 will try bumping to numBuffers=" << numBuffers);
+           << " \u2014 will try bumping to numBuffers=" << targetNumBuffers);
 
-      if (currentCopies >= numBuffers) {
-        LDBG("Phase 3.7:   bufferId=" << bufferId
-                                      << " currentCopies=" << currentCopies
-                                      << " already >= numBuffers=" << numBuffers
-                                      << " \u2014 no room to bump");
+      if (currentCopies >= targetNumBuffers) {
+        LDBG("Phase 3.7:   bufferId="
+             << bufferId << " currentCopies=" << currentCopies
+             << " already >= numBuffers=" << targetNumBuffers
+             << " \u2014 no room to bump");
         continue;
       }
 
@@ -1686,7 +1702,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
              << " — wait_group rotation may be unsafe");
 
       unsigned tryCopies = currentCopies + 1;
-      while (tryCopies <= numBuffers) {
+      while (tryCopies <= targetNumBuffers) {
         if (!reusedGroupFitsHosts(tryCopies)) {
           LDBG("Phase 3.7:     bufferId="
                << bufferId << " copies=" << tryCopies
