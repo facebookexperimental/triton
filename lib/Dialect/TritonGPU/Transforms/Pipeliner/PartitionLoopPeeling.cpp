@@ -16,6 +16,10 @@ namespace {
 
 namespace tt = mlir::triton;
 
+static constexpr StringLiteral kPeelIterationsAttrName =
+    "ttg.loop_peel_iterations";
+static constexpr int64_t kMaxPeeledIterations = 4;
+
 // A `splat(base) + make_range(0, extent)` offset vector, the shape both sides
 // of the causal mask have. Pass-local: nothing outside this file reasons about
 // the mask operands.
@@ -24,7 +28,12 @@ struct OffsetRange {
   int64_t extent;
 };
 
-static arith::CmpIOp getFirstIterationPredicate(scf::ForOp forOp);
+struct PeelCandidate {
+  arith::CmpIOp predicate;
+  int64_t iterations;
+};
+
+static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp);
 
 static Value stripBroadcastAndExpandDims(Value value) {
   while (true) {
@@ -82,26 +91,31 @@ static bool isSameUnorderedPair(Value lhs0, Value rhs0, Value lhs1,
 }
 
 /// Shared tail of the causal-mask match: `m` must be `iv + [0, M)`, `n` must be
-/// `lb + [0, N)`, the step must cover the n range -- together these prove the
-/// mask is triangular only in the first iteration and all true afterwards --
-/// and every use of `mask` must be a select whose false value is all zero.
-static bool isFirstIterationCausalMask(scf::ForOp forOp, int64_t step, Value m,
-                                       Value n, Value mask) {
+/// `lb + [0, N)`, and every use of `mask` must be a select whose false value is
+/// all zero. The first ceil(N / step) iterations may be masked; every later
+/// iteration is all true.
+static std::optional<int64_t> getCausalMaskIterations(scf::ForOp forOp,
+                                                      int64_t step, Value m,
+                                                      Value n, Value mask) {
   auto mRange = matchOffsetRange(m);
   auto nRange = matchOffsetRange(n);
   if (!mRange || !nRange || mRange->base != forOp.getInductionVar() ||
-      nRange->base != forOp.getLowerBound() || step < nRange->extent)
-    return false;
+      nRange->base != forOp.getLowerBound())
+    return std::nullopt;
+
+  int64_t iterations = (nRange->extent + step - 1) / step;
+  if (iterations <= 0 || iterations > kMaxPeeledIterations)
+    return std::nullopt;
 
   bool hasSelect = false;
   for (Operation *user : mask.getUsers()) {
     auto select = dyn_cast<arith::SelectOp>(user);
     if (!select || select.getCondition() != mask ||
         !isZeroSplat(select.getFalseValue()))
-      return false;
+      return std::nullopt;
     hasSelect = true;
   }
-  return hasSelect;
+  return hasSelect ? std::optional<int64_t>(iterations) : std::nullopt;
 }
 
 /// Match the causal HSTU mask, which is `m >= n` written either as
@@ -112,7 +126,13 @@ static bool isFirstIterationCausalMask(scf::ForOp forOp, int64_t step, Value m,
 /// where m is based on the loop IV and n is based on the loop lower bound.
 /// Both spellings are accepted so the pattern does not depend on whether an
 /// earlier pass folded the disjunction.
-static Value matchFirstIterationTensorMask(scf::ForOp forOp) {
+struct TensorMaskMatch {
+  Value mask;
+  int64_t iterations;
+};
+
+static std::optional<TensorMaskMatch>
+matchFirstIterationsTensorMask(scf::ForOp forOp) {
   APInt stepValue;
   if (!matchPattern(forOp.getStep(), m_ConstantInt(&stepValue)))
     return {};
@@ -120,7 +140,7 @@ static Value matchFirstIterationTensorMask(scf::ForOp forOp) {
   if (step <= 0)
     return {};
 
-  Value candidate;
+  std::optional<TensorMaskMatch> candidate;
   forOp.getBody()->walk([&](arith::OrIOp orOp) {
     if (candidate || orOp->getBlock() != forOp.getBody())
       return;
@@ -138,25 +158,25 @@ static Value matchFirstIterationTensorMask(scf::ForOp forOp) {
                                        sub.getRhs()))
         return;
 
-      if (isFirstIterationCausalMask(forOp, step, sub.getLhs(), sub.getRhs(),
-                                     orOp.getResult()))
-        candidate = orOp.getResult();
+      if (auto iterations = getCausalMaskIterations(
+              forOp, step, sub.getLhs(), sub.getRhs(), orOp.getResult()))
+        candidate = TensorMaskMatch{orOp.getResult(), *iterations};
     };
 
     tryMatch(orOp.getLhs(), orOp.getRhs());
     if (!candidate)
       tryMatch(orOp.getRhs(), orOp.getLhs());
   });
-  if (candidate)
+  if (candidate.has_value())
     return candidate;
 
   forOp.getBody()->walk([&](arith::CmpIOp cmp) {
     if (candidate || cmp->getBlock() != forOp.getBody() ||
         cmp.getPredicate() != arith::CmpIPredicate::sge)
       return;
-    if (isFirstIterationCausalMask(forOp, step, cmp.getLhs(), cmp.getRhs(),
-                                   cmp.getResult()))
-      candidate = cmp.getResult();
+    if (auto iterations = getCausalMaskIterations(
+            forOp, step, cmp.getLhs(), cmp.getRhs(), cmp.getResult()))
+      candidate = TensorMaskMatch{cmp.getResult(), *iterations};
   });
   return candidate;
 }
@@ -169,17 +189,18 @@ static void copyScheduleAttrs(Operation *source, Operation *destination) {
       destination->setAttr(name, attr);
 }
 
-/// Turn a tensor causal mask into a scalar first-iteration branch. The branch
-/// result remains the real mask in the first iteration and becomes all-true in
-/// the remainder. peelFirstIteration folds the scalar branch immediately when
-/// it clones each path.
-static bool materializeFirstIterationMaskBranch(scf::ForOp forOp) {
-  if (getFirstIterationPredicate(forOp))
+/// Turn a tensor causal mask into a scalar masked-prefix branch. The branch
+/// result remains the real mask in the first ceil(N / step) iterations and
+/// becomes all-true in the remainder. peelIterations folds the scalar branch
+/// immediately when it clones each path.
+static bool materializeFirstIterationsMaskBranch(scf::ForOp forOp) {
+  if (getPeelCandidate(forOp))
     return false;
 
-  Value mask = matchFirstIterationTensorMask(forOp);
-  if (!mask)
+  auto match = matchFirstIterationsTensorMask(forOp);
+  if (!match)
     return false;
+  Value mask = match->mask;
 
   auto maskType = dyn_cast<RankedTensorType>(mask.getType());
   if (!maskType || !maskType.getElementType().isInteger(1))
@@ -189,15 +210,20 @@ static bool materializeFirstIterationMaskBranch(scf::ForOp forOp) {
   IRRewriter rewriter(forOp);
   rewriter.setInsertionPointAfter(maskOp);
   Location loc = mask.getLoc();
-  auto boundary = arith::AddIOp::create(rewriter, loc, forOp.getLowerBound(),
-                                        forOp.getStep());
+  Value boundary = forOp.getLowerBound();
+  for (int64_t i = 0; i < match->iterations; ++i) {
+    auto add = arith::AddIOp::create(rewriter, loc, boundary, forOp.getStep());
+    copyScheduleAttrs(maskOp, add);
+    boundary = add;
+  }
   auto needsMask =
       arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::slt,
                             forOp.getInductionVar(), boundary);
+  needsMask->setAttr(kPeelIterationsAttrName,
+                     rewriter.getI64IntegerAttr(match->iterations));
   auto effectiveMask = scf::IfOp::create(rewriter, loc, TypeRange{maskType},
                                          needsMask, /*withElseRegion=*/true);
   effectiveMask->setAttr(kSyntheticMaskBranchAttrName, rewriter.getUnitAttr());
-  copyScheduleAttrs(maskOp, boundary);
   copyScheduleAttrs(maskOp, needsMask);
   copyScheduleAttrs(maskOp, effectiveMask);
 
@@ -230,13 +256,22 @@ static bool materializeFirstIterationMaskBranch(scf::ForOp forOp) {
 // peeled: the transform is a first-iteration split, so peeling more than one
 // guard would need nested prologues, and the HSTU masked prologue this targets
 // has exactly one.
-static arith::CmpIOp getFirstIterationPredicate(scf::ForOp forOp) {
+static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp) {
   arith::CmpIOp candidate;
   forOp.getBody()->walk([&](arith::CmpIOp cmp) {
     if (cmp.getPredicate() != arith::CmpIPredicate::slt ||
         cmp.getLhs() != forOp.getInductionVar() ||
         cmp->getBlock() != forOp.getBody())
       return WalkResult::advance();
+
+    if (auto count = cmp->getAttrOfType<IntegerAttr>(kPeelIterationsAttrName)) {
+      int64_t iterations = count.getInt();
+      if (iterations > 0 && iterations <= kMaxPeeledIterations) {
+        candidate = cmp;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    }
 
     auto add = cmp.getRhs().getDefiningOp<arith::AddIOp>();
     if (!add)
@@ -258,7 +293,13 @@ static arith::CmpIOp getFirstIterationPredicate(scf::ForOp forOp) {
     candidate = cmp;
     return WalkResult::interrupt();
   });
-  return candidate;
+  if (!candidate)
+    return std::nullopt;
+  int64_t iterations = 1;
+  if (auto count =
+          candidate->getAttrOfType<IntegerAttr>(kPeelIterationsAttrName))
+    iterations = count.getInt();
+  return PeelCandidate{candidate, iterations};
 }
 
 static SmallVector<Value>
@@ -332,7 +373,14 @@ static void copyDiscardableAttrs(Operation *source, Operation *destination) {
     destination->setDiscardableAttr(attr.getName(), attr.getValue());
 }
 
-static void peelFirstIteration(scf::ForOp forOp, arith::CmpIOp predicate) {
+static void eraseDefaultYield(IRRewriter &rewriter, Block *block) {
+  if (block->mightHaveTerminator())
+    if (auto yield = dyn_cast<scf::YieldOp>(block->getTerminator()))
+      rewriter.eraseOp(yield);
+}
+
+static void peelIterations(scf::ForOp forOp, arith::CmpIOp predicate,
+                           int64_t iterations) {
   IRRewriter rewriter(forOp);
   Location loc = forOp.getLoc();
 
@@ -348,25 +396,55 @@ static void peelFirstIteration(scf::ForOp forOp, arith::CmpIOp predicate) {
   // (a loop without iter args). Drop those so the explicit yields below are the
   // only terminators, instead of appending ops after a terminator.
   for (Block *block : {peeled.thenBlock(), peeled.elseBlock()})
-    if (block->mightHaveTerminator())
-      rewriter.eraseOp(block->getTerminator());
+    eraseDefaultYield(rewriter, block);
 
   Block *thenBlock = peeled.thenBlock();
-  if (!thenBlock->empty())
-    if (auto yield = dyn_cast<scf::YieldOp>(thenBlock->getTerminator()))
-      rewriter.eraseOp(yield);
   SmallVector<Value> firstResults =
       cloneIteration(rewriter, forOp, thenBlock, forOp.getLowerBound(),
                      forOp.getInitArgs(), predicate, /*predicateValue=*/true);
 
+  Value nextInduction = forOp.getLowerBound();
+  SmallVector<Value> prefixResults = firstResults;
+  for (int64_t i = 1; i < iterations; ++i) {
+    rewriter.setInsertionPointToEnd(thenBlock);
+    auto nextInductionOp =
+        arith::AddIOp::create(rewriter, loc, nextInduction, forOp.getStep());
+    copyTaskId(forOp, nextInductionOp);
+    nextInduction = nextInductionOp;
+    auto hasIterationOp =
+        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::slt,
+                              nextInduction, forOp.getUpperBound());
+    copyTaskId(forOp, hasIterationOp);
+    auto optionalIteration =
+        scf::IfOp::create(rewriter, loc, forOp.getResultTypes(), hasIterationOp,
+                          /*withElseRegion=*/true);
+    copyTaskId(forOp, optionalIteration);
+    for (Block *block :
+         {optionalIteration.thenBlock(), optionalIteration.elseBlock()})
+      eraseDefaultYield(rewriter, block);
+
+    SmallVector<Value> iterationResults = cloneIteration(
+        rewriter, forOp, optionalIteration.thenBlock(), nextInduction,
+        prefixResults, predicate, /*predicateValue=*/true);
+    rewriter.setInsertionPointToEnd(optionalIteration.thenBlock());
+    auto iterationYield = scf::YieldOp::create(rewriter, loc, iterationResults);
+    copyTaskId(forOp, iterationYield);
+
+    rewriter.setInsertionPointToStart(optionalIteration.elseBlock());
+    auto skippedYield = scf::YieldOp::create(rewriter, loc, prefixResults);
+    copyTaskId(forOp, skippedYield);
+    prefixResults.assign(optionalIteration.getResults().begin(),
+                         optionalIteration.getResults().end());
+  }
+
   rewriter.setInsertionPointToEnd(thenBlock);
-  auto remainderLowerBoundOp = arith::AddIOp::create(
-      rewriter, loc, forOp.getLowerBound(), forOp.getStep());
+  auto remainderLowerBoundOp =
+      arith::AddIOp::create(rewriter, loc, nextInduction, forOp.getStep());
   copyTaskId(forOp, remainderLowerBoundOp);
   Value remainderLowerBound = remainderLowerBoundOp.getResult();
   auto remainder =
       scf::ForOp::create(rewriter, loc, remainderLowerBound,
-                         forOp.getUpperBound(), forOp.getStep(), firstResults);
+                         forOp.getUpperBound(), forOp.getStep(), prefixResults);
   // Only the remainder loop continues to expandLoops, so it inherits the
   // source loop's schedule metadata. The peeled prologue is a straight-line
   // clone whose ops keep their own per-op stage/cluster attributes; giving it
@@ -394,9 +472,6 @@ static void peelFirstIteration(scf::ForOp forOp, arith::CmpIOp predicate) {
   copyTaskId(forOp, thenYield);
 
   Block *elseBlock = peeled.elseBlock();
-  if (!elseBlock->empty())
-    if (auto yield = dyn_cast<scf::YieldOp>(elseBlock->getTerminator()))
-      rewriter.eraseOp(yield);
   rewriter.setInsertionPointToStart(elseBlock);
   auto elseYield = scf::YieldOp::create(rewriter, loc, forOp.getInitArgs());
   copyTaskId(forOp, elseYield);
@@ -417,16 +492,16 @@ void peelPartitionLoops(ModuleOp moduleOp) {
     }
   });
   for (scf::ForOp forOp : partitionLoops)
-    materializeFirstIterationMaskBranch(forOp);
+    materializeFirstIterationsMaskBranch(forOp);
 
-  SmallVector<std::pair<scf::ForOp, arith::CmpIOp>> candidates;
+  SmallVector<std::pair<scf::ForOp, PeelCandidate>> candidates;
   moduleOp.walk([&](WarpSpecializeOp wsOp) {
     for (Region *partition : wsOp.getPartitionRegions()) {
       partition->walk([&](scf::ForOp forOp) {
         if (forOp->getParentOfType<WarpSpecializeOp>() != wsOp)
           return;
-        if (auto predicate = getFirstIterationPredicate(forOp))
-          candidates.emplace_back(forOp, predicate);
+        if (auto candidate = getPeelCandidate(forOp))
+          candidates.emplace_back(forOp, *candidate);
       });
     }
   });
@@ -435,8 +510,8 @@ void peelPartitionLoops(ModuleOp moduleOp) {
   // with an scf.if and erases the original, so an outer loop must be peeled
   // after the inner ones it contains -- the other way round the outer clone
   // erases the inner loop and leaves the remaining entries dangling.
-  for (auto [forOp, predicate] : candidates)
-    peelFirstIteration(forOp, predicate);
+  for (auto [forOp, candidate] : candidates)
+    peelIterations(forOp, candidate.predicate, candidate.iterations);
 }
 
 } // namespace mlir::triton::gpu
