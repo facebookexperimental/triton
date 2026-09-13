@@ -1089,26 +1089,19 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     dqk_trans = dqk_trans.to(k.dtype)
 
     if DQ_REDUCE and ENABLE_TMA:
-        # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
-        # (tl.trans(k) is a cheap memdesc_trans on the SMEM k tile), then transpose
-        # the small [BLOCK_D_Q, BLOCK_M] result to [BLOCK_M, BLOCK_D_Q] and atomic-add
-        # into global dq. Transposing the *result* (not the dqk register operand)
-        # keeps the MMA structure meta-WS can partition. DQ is pre-zeroed; the head
-        # slice is selected by the store column offset (device_desc_dq base has only
-        # the seq offset). Mirrors triton_bw_cross_attention.py's autoWS dq reduce.
-        dq_trans = (
-            tl.dot(
-                tl.trans(k),
-                dqk_trans,
-                allow_tf32=ALLOW_TF32,
-                # Keep dQ in a distinct TMEM allocation, matching TLX. Reusing
-                # dP's id5 leaves 128 columns free, which the persistent TMEM
-                # post-pass spends on a second dV accumulator copy.
-                attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
-            ) * alpha)
-        dq = tl.trans(dq_trans)
-        if not DQ_FP32:
-            dq = dq.to(k.dtype)
+        # Match FA backward's dQ epilogue: form dQ in its output orientation,
+        # split the MMA accumulator, then scale and convert one slice at a time.
+        # This gives lowering four physical 64x32 TMEM unloads instead of one
+        # full transposed unload. Staging-slot rotation is matched separately.
+        dq = tl.dot(
+            tl.trans(dqk_trans),
+            k,
+            allow_tf32=ALLOW_TF32,
+            # Keep dQ in a distinct TMEM allocation, matching TLX. Reusing
+            # dP's id5 leaves 128 columns free, which the persistent TMEM
+            # post-pass spends on a second dV accumulator copy.
+            attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
+        )
         # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
         # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
         # compiler stages separately (the source-level analog of TLX's subtiled +
@@ -1117,9 +1110,12 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         dq_slice_size: tl.constexpr = BLOCK_D_Q // DQ_ITERS
         dqs = _split_n_2D(dq, DQ_ITERS)
         for _s in tl.static_range(DQ_ITERS):
+            dq_slice = dqs[_s] * alpha
+            if not DQ_FP32:
+                dq_slice = dq_slice.to(k.dtype)
             device_desc_dq.store(
                 [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
-                dqs[_s],
+                dq_slice,
                 store_reduce="add",
             )
     else:
@@ -1954,7 +1950,6 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             DQ_REUSE=DQ_REUSE,
         )
     # write-back
-    dk = dk * alpha
     if ENABLE_TMA:
         dv_slices = _split_n_2D(dv, DKDV_SUBTILE)
         dv_slice_size: tl.constexpr = BLOCK_D_V // DKDV_SUBTILE
@@ -1966,11 +1961,14 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         dk_slices = _split_n_2D(dk, DKDV_SUBTILE)
         dk_slice_size: tl.constexpr = BLOCK_D_Q // DKDV_SUBTILE
         for slice_id in tl.static_range(DKDV_SUBTILE):
+            # Scale after splitting so lowering unloads and converts one
+            # accumulator slice at a time, as in FA backward and TLX.
             device_desc_dk.store(
                 [(desc_row_kv + start_n).to(tl.int32), (off_h * stride_dkh + slice_id * dk_slice_size).to(tl.int32)],
-                dk_slices[slice_id].to(k.dtype),
+                (dk_slices[slice_id] * alpha).to(k.dtype),
             )
     else:
+        dk = dk * alpha
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
         tl.store(dv_ptrs, dv.to(k.dtype), mask=mask_n[:, None])  # pyre-ignore[61]
