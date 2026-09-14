@@ -45,6 +45,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
+| `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
@@ -56,6 +57,15 @@ single analytically chosen config. The rest autotune a full space on their first
 call, which is minutes rather than seconds; they raise `cap_s` accordingly rather
 than measure a `smoke` space no user takes. Writing a `heuristic_config` for each
 is the real fix and is tracked in the `tlx.ops` module docstring.
+
+`mm` and `mm_torchtlx` are two providers of the same op over the same shape
+list, so their tables line up row for row: `mm` calls the TLX kernel directly,
+`mm_torchtlx` reaches it through `torch.compile`. The latter forces the TLX
+template (`tlx_mode="force"`) and races it against the same compile with TLX
+off, so `speedup > 1` is exactly "TLX would have won the autotune under
+`tlx_mode="allow"`". It needs `torch >= 2.14` for `config.triton.tlx_mode`, and
+skips cleanly on anything older. A shape where Inductor emits no TLX kernel at
+all is an error row, not a quiet 1.00x.
 
 There is no vendor library for SiLU-scaled ragged attention, so `hstu_attn`
 races the Triton kernel that ships today. The two are not tuned symmetrically --
