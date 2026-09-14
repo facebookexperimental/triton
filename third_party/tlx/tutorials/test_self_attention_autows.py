@@ -81,6 +81,10 @@ _CLC_CFG = dict(
     warps=8,
     dkdv_subtile=2,
     clc_smem_algo=1,
+    # Production uses one source loop plus compiler peeling. Keep the manual
+    # sibling-loop implementation available as an independently tested mode.
+    split_causal_loops=False,
+    dq_transposed=True,
 )
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
@@ -91,8 +95,15 @@ _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
 # select the config (before the kernel import below) from argv.
-if "--run-clc" in sys.argv or "--run-clc-jagged" in sys.argv:
-    _C.set_config(**_CLC_CFG)
+if "--run-clc" in sys.argv or "--run-clc-jagged" in sys.argv or "--run-clc-matrix" in sys.argv:
+    clc_cfg = dict(_CLC_CFG)
+    if "--run-clc-matrix" in sys.argv:
+        mode_idx = sys.argv.index("--run-clc-matrix")
+        clc_cfg.update(
+            split_causal_loops=bool(int(sys.argv[mode_idx + 3])),
+            dq_transposed=bool(int(sys.argv[mode_idx + 4])),
+        )
+    _C.set_config(**clc_cfg)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
     os.environ["TRITON_WS_TMA_REDUCE_STAGING_COPIES"] = "2"
 elif "--run-dqreduce" in sys.argv:
@@ -159,11 +170,11 @@ def _run_autows_bwd(L, Z, jagged=False):
         # tile in the rectangular schedule.
         lens = [L - (i % 2) * 128 for i in range(Z)]
     t = sum(lens)
-    g = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
-    q, k, v = g().requires_grad_(True), g().requires_grad_(True), g().requires_grad_(True)
+    gq = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
+    q, k, v = gq().requires_grad_(True), gq().requires_grad_(True), gq().requires_grad_(True)
     so = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device="cuda", dtype=torch.int64)
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
-    do = g()
+    do = gq()
 
     rq, rk, rv = _torch_ref(q, k, v, do, so, asc)
 
@@ -283,6 +294,49 @@ def test_self_attention_bwd_autows_clc(L, Z):
     assert r.returncode == 0, (f"CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
+@pytest.mark.parametrize(
+    "split_causal_loops,dq_transposed",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+    ids=["single-loop-dq-direct", "split-loops-dq-direct", "single-loop-dq-transposed", "split-loops-dq-transposed"],
+)
+def test_self_attention_bwd_autows_clc_loop_dq_matrix(split_causal_loops, dq_transposed):
+    """Cover all source-loop topology x dQ-layout combinations.
+
+    The reused-CTA grid is intentional: for split loops, the last KV tile has
+    an empty unmasked sibling and requires the post-sibling completion commit.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    L, Z = 256, 120
+    r = subprocess.run(
+        [
+            sys.executable,
+            __file__,
+            "--run-clc-matrix",
+            str(L),
+            str(Z),
+            str(int(split_causal_loops)),
+            str(int(dq_transposed)),
+        ],
+        env=_subprocess_env(),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if split_causal_loops and not dq_transposed and r.returncode != 0:
+        assert "out of resource: shared memory" in r.stderr
+        pytest.xfail("split/direct dQ still exceeds Blackwell SMEM after TMEM-safe subtiling")
+    assert r.returncode == 0, ("CLC autoWS loop/dQ matrix failed "
+                               f"(split={split_causal_loops}, dq_transposed={dq_transposed}):\n{r.stdout}\n{r.stderr}")
+
+
 @pytest.mark.parametrize("L,Z", [(4096, 2), (256, 120)])
 def test_self_attention_bwd_autows_clc_jagged_production(L, Z):
     """Exercise jagged tails and sibling-loop releases across reused CTAs.
@@ -365,13 +419,16 @@ if __name__ == "__main__":
     # Subprocess entry point for the dq-reduce config. _DQREDUCE_CFG was applied
     # via set_config() at the top of this file (argv --run-dqreduce) before the
     # kernel import, so the dq-reduce constexprs / autotune config are baked on.
-    bwd_modes = ("--run-dqreduce", "--run-clc", "--run-clc-jagged")
+    bwd_modes = ("--run-dqreduce", "--run-clc", "--run-clc-jagged", "--run-clc-matrix")
     if len(sys.argv) >= 4 and sys.argv[1] in bwd_modes:
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
-        assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged"))
+        assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged", "--run-clc-matrix"))
         if A._AUTOWS_CFG.clc:
             assert A._AUTOWS_CFG.dq_fp32, "CLC dQ must use the TLX-matching FP32 mode"
+        if sys.argv[1] == "--run-clc-matrix":
+            assert A._AUTOWS_CFG.split_causal_loops == bool(int(sys.argv[4]))
+            assert A._AUTOWS_CFG.dq_transposed == bool(int(sys.argv[5]))
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z, jagged=sys.argv[1] == "--run-clc-jagged")
         rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
         print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
@@ -409,4 +466,4 @@ if __name__ == "__main__":
         print("OK")
         sys.exit(0)
     sys.exit("usage: test_self_attention_autows.py "
-             "--run-dqreduce|--run-clc|--run-clc-jagged|--run-fadp|--run-fwd L Z")
+             "--run-dqreduce|--run-clc|--run-clc-jagged|--run-clc-matrix|--run-fadp|--run-fwd L Z")
