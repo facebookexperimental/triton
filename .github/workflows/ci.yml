@@ -25,3 +25,4 @@ jobs:
     uses: ./.github/workflows/pre-commit.yml
     with:
       strict: true
+    secrets: inherit
