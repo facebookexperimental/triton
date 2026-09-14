@@ -4,7 +4,7 @@ import triton.tlx.ops as ops
 from triton.tlx.ops._catalog import OpSpec
 
 
-def test_backend_without_accepts_keeps_arbitrary_strides(monkeypatch):
+def test_backend_without_a_validate_hook_keeps_arbitrary_strides(monkeypatch):
     spec = OpSpec(
         op="mm",
         arch="test",

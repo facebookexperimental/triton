@@ -60,24 +60,10 @@ def mm(a, b, *, arch=None, space="heuristic"):
         raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
                            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
     fn, spec = impl_for("mm", arch)
-    if spec.accepts is None:
-        # No descriptor, so no layout to normalize: this arch reads operands
-        # through explicit strides and accepts arbitrary ones.
-        check_inputs(spec, dtype=a.dtype)
-        return fn(a, b, space=space)
-
-    # Normalize exactly as the kernel does, so the stride we validate is the one
-    # TMA will see. Deriving it from `is_contiguous()` instead rejects padded
-    # row-major operands, which are aligned and supported.
-    from .kernels.mm._layout import descriptor_layout
-
-    try:
-        a_layout = descriptor_layout(a, "a")
-        b_layout = descriptor_layout(b, "b")
-    except ValueError as exc:
-        raise InvalidInput(f"{spec} does not support these inputs: {exc}") from exc
-    check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
-                 row_strides=(a_layout.row_stride, b_layout.row_stride, b.shape[1]), elem_bytes=a.element_size())
+    # Layout rules are the selected kernel's, not this function's: an arch whose
+    # operands go through TMA descriptors rejects strides an arch reading them
+    # explicitly accepts. `check_inputs` defers to the entry's own hook.
+    check_inputs(spec, a, b, dtype=a.dtype)
     return fn(a, b, space=space)
 
 

@@ -3,9 +3,8 @@ import torch
 
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops import InvalidInput, mm
-from triton.tlx.ops.kernels.mm._layout import shape_has_tma_compatible_strides
 from triton.tlx.ops.kernels.mm._shapes import SM100_FOCUS
-from triton.tlx.ops.kernels.mm.sm100 import PERF_SHAPES, UNSUPPORTED_SHAPES
+from triton.tlx.ops.kernels.mm.sm100 import PERF_SHAPES, UNSUPPORTED_SHAPES, shape_has_tma_compatible_strides
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.mm input layouts are sm100-specific")
 
@@ -71,7 +70,7 @@ def test_unaligned_output_row_stride_is_rejected_before_launch():
     a = torch.randn((64, 64), device="cuda", dtype=dtype)
     b = torch.randn((64, 16), device="cuda", dtype=dtype)[:, :12]
 
-    with pytest.raises(InvalidInput, match="row_strides"):
+    with pytest.raises(InvalidInput, match="output row stride 12 elements"):
         mm(a, b, arch="sm100")
 
 
