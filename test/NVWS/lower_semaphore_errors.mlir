@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-lower-semaphore -verify-diagnostics
+// RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore -verify-diagnostics
 
 // Negative coverage for the first-class count contract
 // (fable/integrate-pending-count-plan.md): the lowering REQUIRES

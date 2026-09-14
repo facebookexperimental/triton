@@ -94,8 +94,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK-DAG: %[[TMEM:.*]], %[[TOKEN:.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 31 : i32}
     // CHECK: scf.for
     scf.for %i = %lb to %ub step %step : i32 {
-      %view = ttg.memdesc_subslice %a[0] {async_task_id = array<i32: 2>} : !ttg.memdesc<2xi32, #shared1, #smem, mutable> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
-      ttg.local_store %value, %view {async_task_id = array<i32: 2>} : tensor<1xi32, #blocked1> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
+      %view = ttg.memdesc_subslice %a[0] {async_task_id = array<i32: 2>} : !ttg.memdesc<2xi32, #shared1, #smem, mutable> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable, 2>
+      ttg.local_store %value, %view {async_task_id = array<i32: 2>} : tensor<1xi32, #blocked1> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable, 2>
       %loaded = ttg.local_load %b {async_task_id = array<i32: 2>} : !ttg.memdesc<2xi32, #shared1, #smem, mutable> -> tensor<2xi32, #blocked1>
       %true = arith.constant {async_task_id = array<i32: 2>} true
       %stored = ttng.tmem_store %accValue, %tmem[%token], %true {async_task_id = array<i32: 2>} : tensor<128x128xf32, #acc> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>

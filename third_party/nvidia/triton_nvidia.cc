@@ -243,7 +243,7 @@ void init_triton_nvidia_passes_nvws(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_lower_warp_group",
                      mlir::triton::createNVWSLowerWarpGroup);
   ADD_PASS_WRAPPER_0("add_assign_stage_phase",
-                     mlir::triton::createNVWSAssignStagePhase);
+                     mlir::triton::createNVWSAssignSemaphoreStagePhase);
   ADD_PASS_WRAPPER_0("add_lower_semaphore",
                      mlir::triton::createNVWSLowerSemaphore);
   m.def("add_strip_partition_attrs_outside_ws", [](mlir::PassManager &pm) {

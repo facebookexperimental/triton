@@ -1,4 +1,4 @@
-#include "AssignStagePhase.h"
+#include "AssignSemaphoreStagePhase.h"
 #include "InsertSemas.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "llvm/ADT/BitVector.h"
@@ -410,14 +410,28 @@ static Value emitBacking(OpBuilder &b, Location loc, const GroupDag &g,
       backing.getDefiningOp()->setAttr(name, attr);
   return backing;
 }
-static Value emitTmemView(OpBuilder &b, Location loc, Value owner,
-                          gpu::MemDescType target, int64_t offset,
-                          int64_t sizeHint, bool reinterpret = false) {
-  Value view = nvidia_gpu::TMEMSubSliceOp::create(
-      b, loc, owner, static_cast<int32_t>(offset),
-      static_cast<int32_t>(sizeHint));
-  if (reinterpret || view.getType() != target)
-    view = gpu::MemDescReinterpretOp::create(b, loc, target, view);
+static Value emitTmemMemberView(OpBuilder &b, Location loc, const GroupDag &g,
+                                MemberId memberId, Value buffer,
+                                const Owner &owner,
+                                gpu::StageCluster stageCluster) {
+  const Member &member = g.pieceTable.members[memberId];
+  if (!g.isTmem() || member.backingPrimary == memberId)
+    return buffer;
+  const Member &primary = g.pieceTable.members[member.backingPrimary];
+  auto target = withMutable(member.type, true);
+  if (member.offset == primary.offset && sameViewType(buffer.getType(), target))
+    return buffer;
+
+  // Select the semaphore stage on the whole allocation before taking a
+  // logical member's subview, so each stage keeps the physical backing stride.
+  Value view = emitInto<nvidia_gpu::TMEMSubSliceOp>(
+      b, loc, owner, stageCluster, buffer,
+      static_cast<int32_t>(member.offset - primary.offset),
+      static_cast<int32_t>(target.getShape().back()),
+      cast<gpu::MemDescType>(buffer.getType()).getRank() - 1);
+  if (!sameViewType(view.getType(), target))
+    view = emitInto<gpu::MemDescReinterpretOp>(b, loc, owner, stageCluster,
+                                              target, view);
   return view;
 }
 static Value emitMixedCopyLocalView(OpBuilder &b, Location loc, Value owner,
@@ -461,14 +475,9 @@ static void materializeLogicalBacking(EmitCtx &ctx, const GroupDag &g) {
             members[j].allocOp->hasAttr(kBufferStartAttrName)) {
           continue;
         }
-        auto target = backingType(g, members[j]);
-        if (members[j].offset == member.offset &&
-            target == backing[i].getType())
-          backing[j] = backing[i];
-        else
-          backing[j] = emitTmemView(b, loc, backing[i], target,
-                                    members[j].offset - member.offset,
-                                    target.getShape().back());
+        // Keep one tuple entry per member, backed by the whole physical
+        // allocation. The member subview is materialized after stage selection.
+        backing[j] = backing[i];
       }
   }
 }
@@ -490,8 +499,8 @@ static void emitPhysicalIR(EmitCtx &ctx, ArrayRef<const GroupDag *> groups) {
     Operation *anchor = g.semaAnchor;
     b.setInsertionPoint(anchor);
     SmallVector<Type> baseTypes;
-    for (const Member &member : g.pieceTable.members)
-      baseTypes.push_back(backingType(g, member));
+    for (Value backing : ctx.backing(g))
+      baseTypes.push_back(backing.getType());
     auto semaTy = nvws::SemaphoreType::get(
         b.getContext(), nvws::TypeArrayAttr::get(b.getContext(), baseTypes));
     for (bool entry : {true, false})
@@ -522,8 +531,11 @@ static void materializeTokenlessMembers(EmitCtx &ctx,
       OpBuilder b(member.allocOp);
       Value zero = arith::ConstantIntOp::create(b, member.allocOp->getLoc(), 0,
                                                 32);
+      auto type = group->isTmem()
+                      ? group->pieceTable.members[member.backingPrimary].type
+                      : member.type;
       auto view = gpu::MemDescIndexOp::create(
-          b, member.allocOp->getLoc(), member.type, backing[index], zero);
+          b, member.allocOp->getLoc(), type, backing[index], zero);
       for (StringRef name : {"async_task_id", gpu::kPartitionAttrName,
                              gpu::kWarpSpecializeTagAttrName, "loop.stage",
                              "loop.cluster"})
@@ -531,7 +543,10 @@ static void materializeTokenlessMembers(EmitCtx &ctx,
           zero.getDefiningOp()->setAttr(name, attr);
           view->setAttr(name, attr);
         }
-      member.allocOp->getResult(0).replaceAllUsesWith(view.getResult());
+      Value memberView = emitTmemMemberView(
+          b, member.allocOp->getLoc(), *group, index, view.getResult(),
+          resolveOwner(member.allocOp), gpu::getStageCluster(member.allocOp));
+      member.allocOp->getResult(0).replaceAllUsesWith(memberView);
       member.allocOp->erase();
     }
   }
@@ -807,8 +822,9 @@ static Value getView(EmitCtx &ctx, const GroupDag &g, RenderState &rs,
     bundle = &*rs.view;
   }
   Value base = bundle->buffers[touch.member];
-  Value cur = base;
   OpBuilder b(accessOp);
+  Value cur = emitTmemMemberView(b, accessOp->getLoc(), g, touch.member, base,
+                                 owner, stageCluster);
   for (const AliasStep &step : touch.alias) {
     Operation *old = step.op;
     if (old->getName().getStringRef() == "ttg.memdesc_index" &&

@@ -242,6 +242,11 @@ void AutomaticWarpSpecialization::runOnOperation() {
   insertSemasOptions.useMetaPartitioner = useMetaPartitioner;
   insertSemasOptions.numStages = numStages;
   addPassWithPartitionVerifier(createNVWSInsertSemas(insertSemasOptions));
+  NVWSSemaphoreOptimizeOptions semaphoreOptimizeOptions;
+  semaphoreOptimizeOptions.numStages = numStages;
+  addPassWithPartitionVerifier(
+      createNVWSSemaphoreOptimize(semaphoreOptimizeOptions));
+  addPassWithPartitionVerifier(createNVWSAssignSemaphoreStagePhase());
   addPassWithPartitionVerifier(createNVWSLowerSemaphore({numStages}));
   TritonGPUScheduleLoopsOptions scheduleLoopsOptions;
   pm.addPass(createTritonGPUPartitionLoops());

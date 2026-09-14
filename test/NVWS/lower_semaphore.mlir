@@ -2488,7 +2488,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %base = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>
     // CHECK-NOT: ttng.tmem_alloc {{.*}}buffer.id = 42
     // CHECK: [[SUB:%.*]] = ttng.tmem_subslice [[BASE]] {dim = 2 : i32, offset = 0 : i32}
-    // CHECK-SAME: -> !ttg.memdesc<1x128x64xf32,
+    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf32,
     // CHECK-NEXT: [[VIEW:%.*]] = ttg.memdesc_reinterpret [[SUB]]
     // CHECK-SAME: -> !ttg.memdesc<1x128x128xf16, #[[TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>
     %alias = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>

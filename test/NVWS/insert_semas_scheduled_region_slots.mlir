@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas | FileCheck %s --check-prefix=SEMA
-// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-assign-stage-phase -cse | FileCheck %s --check-prefix=ASP
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-assign-semaphore-stage-phase -cse | FileCheck %s --check-prefix=ASP
 
 // These tests cover slot replay across an atomic scheduled region.  The
 // scf.if itself owns the stage-2 schedule; its child operations intentionally

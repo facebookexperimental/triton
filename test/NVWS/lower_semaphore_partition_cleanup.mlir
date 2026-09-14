@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -allow-unregistered-dialect --nvws-lower-semaphore --tritongpu-partition-loops | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --tritongpu-partition-loops | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>

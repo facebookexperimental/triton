@@ -1,4 +1,4 @@
-// RUN: not triton-opt %s -allow-unregistered-dialect --nvws-assign-stage-phase 2>&1 | FileCheck %s
+// RUN: not triton-opt %s -allow-unregistered-dialect --nvws-assign-semaphore-stage-phase 2>&1 | FileCheck %s
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory

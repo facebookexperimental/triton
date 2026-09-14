@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-lower-semaphore --cse | FileCheck %s --implicit-check-not=nvws.semaphore
+// RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --cse | FileCheck %s --implicit-check-not=nvws.semaphore
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

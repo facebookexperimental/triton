@@ -1,4 +1,4 @@
-// RUN: triton-opt --split-input-file %s --nvws-insert-tmem-aref --verify-diagnostics
+// RUN: triton-opt --split-input-file %s --verify-diagnostics
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -39,7 +39,8 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
     %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
     %parent = ttng.tmem_alloc : () -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %view = ttng.tmem_subslice %parent {offset = 128 : i32, dim = 0 : i32} : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 256x128>
-    // expected-error @+1 {{TMEM subviews NYI in the pipeliner}}
+    // TMEM subviews are valid IR; the removed Aref insertion pass used to
+    // reject this input. Keep checking the view's allocation-shape contract.
     ttng.tmem_store %zero, %view, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 256x128>
     scf.for %i = %c0 to %c1 step %c1 {
       scf.yield

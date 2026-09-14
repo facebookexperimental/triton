@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-lower-semaphore | FileCheck %s --implicit-check-not=nvws.semaphore
+// RUN: triton-opt %s -split-input-file --allow-unregistered-dialect --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore | FileCheck %s --implicit-check-not=nvws.semaphore
 
 // Arrive multiplicity (r S(n>1)): a single release satisfying a
 // pending_count > 1 semaphore arrives N times — first-class via the

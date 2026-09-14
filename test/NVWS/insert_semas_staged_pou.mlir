@@ -1,9 +1,5 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
-// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas \
-// RUN:   --nvws-assign-stage-phase --nvws-lower-semaphore=num-stages=2 \
-// RUN:   --tritongpu-partition-loops --nvws-lower-warp-group \
-// RUN:   --tritongpu-schedule-loops=num-stages=2 \
-// RUN:   --tritongpu-pipeline=num-stages=2 -o /dev/null
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas   --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2   --tritongpu-partition-loops --nvws-lower-warp-group   --tritongpu-schedule-loops=num-stages=2   --tritongpu-pipeline=num-stages=2 -o /dev/null
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory

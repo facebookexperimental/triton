@@ -1,6 +1,6 @@
 // RUN: triton-opt %s -allow-unregistered-dialect -test-print-allocation \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEFAULT
-// RUN: TRITON_USE_META_WS=1 triton-opt %s -allow-unregistered-dialect \
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s -allow-unregistered-dialect \
 // RUN:   -test-print-allocation -o /dev/null 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=META
 

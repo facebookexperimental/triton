@@ -730,7 +730,10 @@ std::optional<TmemReuseView> getReuseView(TMEMAllocOp representative,
   } else if (baseElemWidth == duplicateElemWidth * 2) {
     if (duplicateBlockN % 2 != 0)
       return std::nullopt;
-    sliceSize = duplicateBlockN / 2;
+    // createReinterpretType uses an unpacked 16-bit view (colStride = 2).
+    // Each element still occupies a 32-bit TMEM column, so the source slice
+    // must own the full destination column footprint.
+    sliceSize = duplicateBlockN;
   } else {
     return std::nullopt;
   }

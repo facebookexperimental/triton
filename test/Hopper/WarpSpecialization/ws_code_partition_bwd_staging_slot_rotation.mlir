@@ -1,6 +1,7 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s
 // RUN: triton-opt %s --nvws-meta-to-nvws-convert --nvws-order-buffer-groups \
 // RUN:   --nvws-insert-semas="use-meta-partitioner=true num-stages=2" \
+// RUN:   --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase \
 // RUN:   --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops \
 // RUN:   --nvws-lower-warp-group \
 // RUN:   --tritongpu-schedule-loops="num-stages=2 use-meta-ws=true" \

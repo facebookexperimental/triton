@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s --check-prefix=EMIT
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-lower-semaphore -cse | FileCheck %s --check-prefix=LOWER
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore -cse | FileCheck %s --check-prefix=LOWER
 //
 // EMIT/LOWER pin the first-class count contract end to end on THIS
 // pass-produced shape (fable/integrate-pending-count-plan.md): the

@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas | FileCheck %s --check-prefix=SEMA
-// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-assign-stage-phase -cse | FileCheck %s --check-prefix=ASP
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-assign-semaphore-stage-phase -cse | FileCheck %s --check-prefix=ASP
 
 // Two exact-alias epilogue members share one depth-2 physical allocation.
 // The first member uses slot 0 and the second uses slot 1, so each

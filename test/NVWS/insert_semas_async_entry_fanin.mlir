@@ -1,6 +1,5 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
-// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas \
-// RUN:   --nvws-lower-semaphore -cse -o /dev/null
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas   --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore -cse -o /dev/null
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>

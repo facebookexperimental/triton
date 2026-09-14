@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s --check-prefix=SEMA
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --verify-each=false --nvws-insert-semas --nvws-lower-semaphore --triton-nvidia-tma-lowering -cse | FileCheck %s --check-prefix=LOWER
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --verify-each=false --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --triton-nvidia-tma-lowering -cse | FileCheck %s --check-prefix=LOWER
 
 // TMA lowering does not propagate partition attrs to its new helper ops, so
 // this synthetic pre-partition fixture disables per-pass verification only

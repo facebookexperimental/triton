@@ -23,10 +23,10 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       // CHECK: nvws.semaphore.release [[FULL]], [[EMPTY_TOKEN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]>, !ttg.async.token
       // CHECK: [[FULL_TOKEN:%[0-9]+]] = nvws.semaphore.acquire [[FULL]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]> -> !ttg.async.token
       // CHECK-NEXT: [[WHOLE_READ_BUFFER:%[0-9]+]] = nvws.semaphore.buffer [[FULL]], [[FULL_TOKEN]] {ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<2xi32, #shared, #smem, mutable>
-      // CHECK-NEXT: [[SLICE:%[0-9]+]] = ttg.memdesc_subslice [[WHOLE_READ_BUFFER]][0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-      %view = ttg.memdesc_subslice %alloc[0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-      // CHECK-NEXT: [[LOADED:%[0-9]+]] = ttg.local_load [[SLICE]] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> tensor<1xi32, #blocked>
-      %loaded = ttg.local_load %view {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !one
+      // CHECK-NEXT: [[SLICE:%[0-9]+]] = ttg.memdesc_subslice [[WHOLE_READ_BUFFER]][0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2>
+      %view = ttg.memdesc_subslice %alloc[0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 2>
+      // CHECK-NEXT: [[LOADED:%[0-9]+]] = ttg.local_load [[SLICE]] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable, 2> -> tensor<1xi32, #blocked>
+      %loaded = ttg.local_load %view {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable, 2> -> !one
       // CHECK: nvws.semaphore.release [[EMPTY]], [[FULL_TOKEN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]>, !ttg.async.token
       "consumer"(%loaded) {ttg.partition = array<i32: 1>} : (!one) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}

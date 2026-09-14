@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas -cse | FileCheck %s
-// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-lower-semaphore -cse | FileCheck %s --check-prefix=LOWER --implicit-check-not=nvws.descriptor_load
+// RUN: triton-opt %s -allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore -cse | FileCheck %s --check-prefix=LOWER --implicit-check-not=nvws.descriptor_load
 
 // Two exact-alias members are filled by one partition before either is
 // consumed by another partition.  The first fill is a TMA load and the second
