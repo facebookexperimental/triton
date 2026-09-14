@@ -285,7 +285,12 @@ def test_self_attention_bwd_autows_clc(L, Z):
 
 @pytest.mark.parametrize("L,Z", [(4096, 2), (256, 120)])
 def test_self_attention_bwd_autows_clc_jagged_production(L, Z):
-    """Exercise jagged tails at production depth and across reused CTAs."""
+    """Exercise jagged tails and sibling-loop releases across reused CTAs.
+
+    The L=256 shape leaves the final KV tile's unmasked Q loop empty. The
+    Z=120 grid reuses physical CTAs, exposing a missing outer-cadence K/V EMPTY
+    completion as a deadlock on the next tile.
+    """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     r = subprocess.run(
