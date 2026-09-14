@@ -115,9 +115,12 @@ independently of live progress.
 max_total_seconds, min_speedup, max_cv, benchmark_repetitions}`).
 
 `cases.json` is a list of `{case_id, parameters, weight, protected}` objects. `target.json`
-contains `{backend, architecture, device, environment}`. The harness receives the full
-`target` dict (including `environment` merged into `os.environ` for the worker) and each
-`case` dict verbatim.
+contains `{backend, architecture, device, environment}` and may include
+`optimization_guidance` plus an `optimization_skills` list. AMD targets may explicitly
+select `optimize-amd-tlx-attention` or `analyze-amd-ir-live-ranges`; specialized guidance
+is not inferred from the backend or source text. The harness receives the full `target`
+dict (including `environment` merged into `os.environ` for the worker) and each `case` dict
+verbatim.
 
 The output directory contains:
 

@@ -495,6 +495,9 @@ def main() -> int:
     )
     case_payloads = _load_json(cases_path)
     target_payload = _load_json(target_path)
+    optimization_skills = target_payload.get("optimization_skills", [])
+    if not isinstance(optimization_skills, list):
+        raise ValueError("target optimization_skills must be a list")
     cases = tuple(
         InputCase(
             case_id=str(case["case_id"]),
@@ -510,6 +513,7 @@ def main() -> int:
         device=target_payload.get("device"),
         environment=target_payload.get("environment", {}),
         optimization_guidance=str(target_payload.get("optimization_guidance", "")),
+        optimization_skills=tuple(optimization_skills),
     )
     _validate_host_matches_target(target, args.arch)
     budget = _budget_from_args(args)

@@ -265,18 +265,66 @@ class ScoringTest(unittest.TestCase):
         self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
 
-    def test_codex_prompt_selects_common_skill_only_for_amd(self) -> None:
+    def test_codex_prompt_selects_only_general_amd_skill_by_default(self) -> None:
         guidance = "Preserve runtime scale behavior."
+        for backend in ("amd", "hip", "rocm"):
+            with self.subTest(backend=backend):
+                request = KernelOptimizationRequest(
+                    kernel_source="VALUE = 1\n",
+                    harness_path=Path(__file__),
+                    cases=(InputCase("target", {}),),
+                    target=KernelTarget(
+                        backend,
+                        "gfx950",
+                        optimization_guidance=guidance,
+                    ),
+                    output_dir=Path("/tmp/tlx-agent-test"),
+                )
+                prompt = _build_prompt(
+                    request,
+                    CandidateContext(
+                        1,
+                        0,
+                        request.kernel_source,
+                        _performance(("target", 100.0)),
+                        (),
+                    ),
+                )
+                self.assertIn(guidance, prompt)
+                self.assertIn("Trusted built-in target optimization skills", prompt)
+                self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+                self.assertIn("# AMD Kernel Optimization", prompt)
+                self.assertNotIn("# AMD TLX Attention Optimization", prompt)
+                self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
+                self.assertNotIn("HSTU", prompt)
+                self.assertNotIn("IKBO", prompt)
+                self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
+                self.assertNotIn("# NVIDIA Warp Barrier Efficiency", prompt)
+                self.assertNotIn("## Build A Barrier Ledger", prompt)
+                self.assertNotIn("tlx.alloc_warp_barrier", prompt)
+                self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+                self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
+                self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+                self.assertLess(
+                    prompt.index("# TLX Layout Conversion Efficiency"),
+                    prompt.index("# AMD Kernel Optimization"),
+                )
+                self.assertLess(
+                    prompt.index("# AMD Kernel Optimization"),
+                    prompt.index("Frozen target-specific optimization guidance"),
+                )
+
+    def test_codex_prompt_selects_explicit_amd_attention_skill(self) -> None:
+        target = KernelTarget(
+            "amd",
+            "gfx950",
+            optimization_skills=("optimize-amd-tlx-attention",),
+        )
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
             cases=(InputCase("target", {}),),
-            target=KernelTarget(
-                "amd",
-                "gfx950",
-                optimization_guidance=guidance,
-            ),
-            output_dir=Path("/tmp/tlx-agent-test"),
+            target=target,
         )
         prompt = _build_prompt(
             request,
@@ -288,20 +336,86 @@ class ScoringTest(unittest.TestCase):
                 (),
             ),
         )
-        self.assertIn(guidance, prompt)
-        self.assertIn("Trusted built-in target optimization skills", prompt)
-        self.assertIn("# TLX Layout Conversion Efficiency", prompt)
-        self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
-        self.assertNotIn("# NVIDIA Warp Barrier Efficiency", prompt)
-        self.assertNotIn("## Build A Barrier Ledger", prompt)
-        self.assertNotIn("tlx.alloc_warp_barrier", prompt)
-        self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
-        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
-        self.assertLess(
-            prompt.index("# TLX Layout Conversion Efficiency"),
-            prompt.index("Frozen target-specific optimization guidance"),
+        self.assertIn("# AMD Kernel Optimization", prompt)
+        self.assertIn("# AMD TLX Attention Optimization", prompt)
+        self.assertIn("# AMD Attention Variant Reference", prompt)
+        self.assertIn("HSTU self-attention", prompt)
+        self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
+        self.assertNotIn("third_party/tlx/tools/agents", prompt)
+
+    def test_codex_prompt_selects_explicit_amd_live_range_skill(self) -> None:
+        target = KernelTarget(
+            "hip",
+            "gfx950",
+            optimization_skills=("analyze-amd-ir-live-ranges",),
         )
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=target,
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                _performance(("target", 100.0)),
+                (),
+            ),
+        )
+        self.assertIn("# AMD Kernel Optimization", prompt)
+        self.assertIn("# AMD IR Live-Range Interpretation", prompt)
+        self.assertIn("# Interpreting AMD IR live-range reports", prompt)
+        self.assertIn("Do not attempt to generate a new artifact", prompt)
+        self.assertNotIn("analyze_live_ranges.py", prompt)
+        self.assertNotIn("# AMD TLX Attention Optimization", prompt)
+
+    def test_codex_prompt_rejects_unsupported_optimization_skill(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget(
+                "amd",
+                "gfx950",
+                optimization_skills=("unknown-skill",),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported AMD optimization skill"):
+            _build_prompt(
+                request,
+                CandidateContext(
+                    1,
+                    0,
+                    request.kernel_source,
+                    _performance(("target", 100.0)),
+                    (),
+                ),
+            )
+
+    def test_kernel_target_normalizes_optimization_skills(self) -> None:
+        target = KernelTarget(
+            "AMD",
+            "gfx950",
+            optimization_skills=(
+                " Optimize-AMD-TLX-Attention ",
+                "optimize-amd-tlx-attention",
+            ),
+        )
+        self.assertEqual(
+            target.optimization_skills,
+            ("optimize-amd-tlx-attention",),
+        )
+
+    def test_kernel_target_rejects_string_optimization_skills(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a sequence of names"):
+            KernelTarget(
+                "amd",
+                "gfx950",
+                optimization_skills="optimize-amd-tlx-attention",  # type: ignore[arg-type]
+            )
 
     def test_prompt_includes_prior_run_evidence_without_source(self) -> None:
         prior_source = "SECRET_PRIOR_SOURCE = 1\n"
