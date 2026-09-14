@@ -9,6 +9,7 @@ Python DSL → TTIR → GPU: TTGIR → LLVM IR → PTX/AMDGPU; CPU: TTCIR → TT
 - **TLX Tutorials/Kernels** (`third_party/tlx/tutorials/`): Reference kernel implementations (Hopper/Blackwell GEMM and
   Flash Attention variants)
 - **Core Triton compiler** (`python/triton/compiler/`, `lib/`, `include/`): TTIR and TTGIR lowering
+- **CPU backend** (`third_party/cpu/`): TTCIR and TTTCIR lowering and host-code generation
 - **NVIDIA backend** (`third_party/nvidia/`): PTX codegen, CUDA-specific passes
 - **AMD backend** (`third_party/amd/`): AMDGPU codegen
 - **Gluon** (`python/triton/experimental/gluon/`): Experimental high-level abstraction layer (upstream-synced, do not
