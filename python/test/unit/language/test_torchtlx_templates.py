@@ -72,7 +72,7 @@ def flex_choices_hook_available() -> bool:
 
 
 def flex_backward_choices_hook_available() -> bool:
-    """True when torch exposes the complete backward choices-hook contract."""
+    """True when torch exposes the dedicated backward choices-hook contract."""
     try:
         from torch._inductor.choices import InductorChoices
 
@@ -2144,8 +2144,9 @@ HEURISTIC_CODEGEN_CASES = [
 ]
 
 
+@unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
 class TestFlexAttentionChoiceRegistration(TestCase):
-    """Host-only contracts for the forward/backward TLX choices hook."""
+    """Registration contracts for the gfx950 FlexAttention choices hooks."""
 
     class _Node:
 
@@ -2228,6 +2229,12 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                 "num_stages": 1,
             },
         )()
+
+    def test_flex_backward_choices_hook_contract_is_available(self):
+        self.assertTrue(
+            flex_backward_choices_hook_available(),
+            "Requires PyTorch c9c6fe27 (#195786) or newer",
+        )
 
     def test_flex_choices_use_separate_forward_and_backward_hooks(self):
         """TLX must implement PyTorch's independent FlexAttention hooks."""
