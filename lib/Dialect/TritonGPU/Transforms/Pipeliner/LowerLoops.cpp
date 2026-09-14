@@ -852,6 +852,35 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
 
   SmallVector<Operation *> allocUsers =
       llvm::to_vector(alloc.getResult().getUsers());
+  auto isConstTrue = [](Value v) {
+    if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+      if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
+        return attr.getValue();
+      }
+    }
+    return false;
+  };
+  // A multibuffered tile's buffer index admits at most one net advance per
+  // iteration: two advances freeze rotation (net +2 = 0 mod numStages) while
+  // the scheduled wait distances assume one step per iteration, so consumers
+  // would read wrong-iteration data. The first overwrite (in dominance
+  // order) spends the iteration's single advance; every later overwrite
+  // reuses its index. Basing this on dominance rather than use-list order
+  // keeps it independent of processing order (HoistTMEMAlloc-materialized
+  // stores are created after the MMAs they precede) and gives each
+  // conditional path its own single advance.
+  auto hasPriorAdvance = [&](Operation *op) {
+    for (Operation *u : allocUsers) {
+      if (u == op || !forOp->isAncestor(u))
+        continue;
+      bool overwrites = isa<ttng::TMEMStoreOp>(u);
+      if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(u))
+        overwrites = !isConstTrue(mma.useAccumulator());
+      if (overwrites && domInfo.properlyDominates(u, op))
+        return true;
+    }
+    return false;
+  };
   auto auxBuilder = OpBuilder(forOp);
   Value replTok = ub::PoisonOp::create(auxBuilder, forOp.getLoc(),
                                        builder.getType<AsyncTokenType>());
@@ -868,15 +897,19 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
         multibufferingIsValid = true;
         builder.setStageCluster(schedule[store]);
         builder.setInsertionPoint(store);
-        // Change the buffer index to the new buffer index on store.
+        // Change the buffer index to the new buffer index on store, unless
+        // the iteration's single advance was already spent.
         Value curBufIdx = getCurrBufIdx(store);
-        Value newBufIdx = createIncrementModulo(
-            builder, forOp.getLoc(), curBufIdx, numStagesVal, zero, one);
-        if (Value pred = store.getPred()) {
-          newBufIdx = arith::SelectOp::create(builder, newBufIdx.getType(),
-                                              pred, newBufIdx, curBufIdx);
+        Value newBufIdx = curBufIdx;
+        if (!hasPriorAdvance(store)) {
+          newBufIdx = createIncrementModulo(
+              builder, forOp.getLoc(), curBufIdx, numStagesVal, zero, one);
+          if (Value pred = store.getPred()) {
+            newBufIdx = arith::SelectOp::create(builder, newBufIdx.getType(),
+                                                pred, newBufIdx, curBufIdx);
+          }
+          replaceAllUsesDominatedBy(store, newBufIdx, curBufIdx, domInfo);
         }
-        replaceAllUsesDominatedBy(store, newBufIdx, curBufIdx, domInfo);
         bufIdxDefs.push_back({store, newBufIdx});
         auto tmemSlice =
             triton::createSingleBufferView(builder, newAlloc, newBufIdx);
@@ -914,23 +947,18 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
       builder.setInsertionPoint(mma);
       // We can legally switch to next buffer index if the mma does not use the
       // accumulator
-      auto isConstTrue = [](Value v) {
-        if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
-          if (auto attr = dyn_cast<BoolAttr>(constOp.getValueAttr())) {
-            return attr.getValue();
-          }
-        }
-        return false;
-      };
-      multibufferingIsValid = !isConstTrue(mma.useAccumulator());
+      multibufferingIsValid |= !isConstTrue(mma.useAccumulator());
       Value curBufIdx = getCurrBufIdx(mma.getOperation());
-      Value newBufIdx = createIncrementModulo(
-          builder, forOp.getLoc(), curBufIdx, numStagesVal, zero, one);
-      newBufIdx =
-          arith::SelectOp::create(builder, newBufIdx.getType(),
-                                  mma.useAccumulator(), curBufIdx, newBufIdx);
-      replaceAllUsesDominatedBy(mma.getOperation(), newBufIdx, curBufIdx,
-                                domInfo);
+      Value newBufIdx = curBufIdx;
+      if (!hasPriorAdvance(mma.getOperation())) {
+        newBufIdx = createIncrementModulo(
+            builder, forOp.getLoc(), curBufIdx, numStagesVal, zero, one);
+        newBufIdx =
+            arith::SelectOp::create(builder, newBufIdx.getType(),
+                                    mma.useAccumulator(), curBufIdx, newBufIdx);
+        replaceAllUsesDominatedBy(mma.getOperation(), newBufIdx, curBufIdx,
+                                  domInfo);
+      }
       bufIdxDefs.push_back({mma.getOperation(), newBufIdx});
       auto tmemSlice =
           triton::createSingleBufferView(builder, newAlloc, newBufIdx);
