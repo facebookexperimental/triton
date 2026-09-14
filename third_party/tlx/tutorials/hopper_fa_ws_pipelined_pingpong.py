@@ -89,23 +89,22 @@ def _select_row_schedule(causal, n_ctx, block_m):
 def _select_forward_policy(causal, shape, dtype, block_m, num_sms):
     row_schedule = _select_row_schedule(causal, shape[2], block_m)
     workload_key = (dtype, *shape)
-    launch_tuning = (
-        _CAUSAL_WORKLOAD_LAUNCH_TUNING.get(workload_key, _DEFAULT_LAUNCH_TUNING)
-        if causal else _DEFAULT_LAUNCH_TUNING
-    )
+    launch_tuning = (_CAUSAL_WORKLOAD_LAUNCH_TUNING.get(workload_key, _DEFAULT_LAUNCH_TUNING)
+                     if causal else _DEFAULT_LAUNCH_TUNING)
     worker_cap = launch_tuning["WORKER_CAP"]
     target_workers = num_sms if worker_cap is None else min(num_sms, worker_cap)
     return row_schedule, launch_tuning["STEADY_UNROLL"], target_workers
 
 
 configs = [
-    triton.Config({
-        'BLOCK_M': _DEFAULT_BLOCK_M,
-        'BLOCK_N': 128,
-        'NUM_BUFFERS': 2,
-        'NUM_MMA_WARPS': 8,
-        'NUM_MMA_GROUPS': 2,
-    }, num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config(
+        {
+            'BLOCK_M': _DEFAULT_BLOCK_M,
+            'BLOCK_N': 128,
+            'NUM_BUFFERS': 2,
+            'NUM_MMA_WARPS': 8,
+            'NUM_MMA_GROUPS': 2,
+        }, num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
 ]
 
 
@@ -134,19 +133,13 @@ def _compute_offsets(
     if CAUSAL:
         if ROW_REVERSE_HEAD_GROUP != 0:
             reverse_rows = ((off_hz // ROW_REVERSE_HEAD_GROUP) & 1) != 0
-            start_m = tl.where(
-                reverse_rows, ROW_REVERSE_MAX - start_m, start_m
-            )
+            start_m = tl.where(reverse_rows, ROW_REVERSE_MAX - start_m, start_m)
 
         if ROW_AFFINE_MOD != 0:
             source_m = start_m
-            mapped_m = (
-                source_m * ROW_AFFINE_MUL + ROW_AFFINE_ADD
-            ) % ROW_AFFINE_MOD
+            mapped_m = (source_m * ROW_AFFINE_MUL + ROW_AFFINE_ADD) % ROW_AFFINE_MOD
             if ROW_SWAP_XOR != 0:
-                swap_rows = (source_m == ROW_SWAP_SRC_0) | (
-                    source_m == ROW_SWAP_SRC_1
-                )
+                swap_rows = (source_m == ROW_SWAP_SRC_0) | (source_m == ROW_SWAP_SRC_1)
                 mapped_m = tl.where(swap_rows, mapped_m ^ ROW_SWAP_XOR, mapped_m)
             start_m = mapped_m
     off_z = off_hz // H
@@ -377,11 +370,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                 # -- compute m_i and l_i ----
                 if CAUSAL:
-                    offs_m = (
-                        start_m * BLOCK_M
-                        + cid * BLOCK_M_SPLIT
-                        + tl.arange(0, BLOCK_M_SPLIT)
-                    )
+                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
                     if lo + BLOCK_N == hi:
                         offs_n = lo + tl.arange(0, BLOCK_N)
                         qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
@@ -401,16 +390,12 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # peel the final diagonal tile and apply its mask separately.
                 steady_hi = hi - BLOCK_N if CAUSAL else hi
                 steady_tiles = (steady_hi - (lo + BLOCK_N)) // BLOCK_N
-                paired_hi = (
-                    steady_hi - (steady_tiles % 2) * BLOCK_N
-                    if CAUSAL
-                    else steady_hi
-                )
+                paired_hi = (steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi)
                 for kv_idx in tl.range(
-                    lo + BLOCK_N,
-                    paired_hi,
-                    BLOCK_N,
-                    loop_unroll_factor=STEADY_UNROLL,
+                        lo + BLOCK_N,
+                        paired_hi,
+                        BLOCK_N,
+                        loop_unroll_factor=STEADY_UNROLL,
                 ):
                     k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
 
@@ -542,13 +527,13 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 @triton.jit
 # Triton TR001: backward preprocess uses the fixed 128-row FA tile from the wrapper.
 def _attn_bwd_preprocess(  # noqa: TR001
-    O,
-    DO,
-    Delta,
-    DQ,
-    N_CTX,
-    BLOCK_M: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
+        O,
+        DO,
+        Delta,
+        DQ,
+        N_CTX,
+        BLOCK_M: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
 ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
@@ -709,12 +694,10 @@ def _attn_bwd_tlx(
 
     with tlx.async_tasks():
         with tlx.async_task("default"):
-            k_load_view = tlx.local_reinterpret(
-                k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
-            v_load_view = tlx.local_reinterpret(
-                v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
+            k_load_view = tlx.local_reinterpret(k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM],
+                                                layout=kv_atom_layout, pin=False)
+            v_load_view = tlx.local_reinterpret(v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM],
+                                                layout=kv_atom_layout, pin=False)
             tlx.barrier_expect_bytes(
                 kv_full[0],
                 BLOCK_N * HEAD_DIM * (K_BYTES_PER_ELEM + V_BYTES_PER_ELEM),
@@ -751,18 +734,16 @@ def _attn_bwd_tlx(
                 tlx.async_descriptor_load(desc_do, do_load_view, [global_start_m, 0], do_fulls[q_buf])
 
         with tlx.async_task(
-            num_warps=NUM_MMA_WARPS_BWD // NUM_MMA_GROUPS_BWD,
-            registers=BWD_REGISTERS,
-            replicate=NUM_MMA_GROUPS_BWD,
+                num_warps=NUM_MMA_WARPS_BWD // NUM_MMA_GROUPS_BWD,
+                registers=BWD_REGISTERS,
+                replicate=NUM_MMA_GROUPS_BWD,
         ):
             cid: tl.constexpr = tlx.async_task_replica_id()
             cid_start_n: tl.constexpr = cid * CID_BLOCK_N
-            k_view = tlx.local_reinterpret(
-                k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
-            v_view = tlx.local_reinterpret(
-                v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
+            k_view = tlx.local_reinterpret(k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout,
+                                           pin=False)
+            v_view = tlx.local_reinterpret(v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout,
+                                           pin=False)
             score_view = tlx.local_reinterpret(
                 score_smem_full[0],
                 tlx.dtype_of(desc_q),

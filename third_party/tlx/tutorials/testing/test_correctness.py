@@ -1188,21 +1188,17 @@ def test_hopper_fa_ws_pipelined_pingpong_row_schedule_policy():
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
 def test_hopper_fa_ws_pipelined_pingpong_launch_policy():
-    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(
-        True, (4, 48, 2048, 128), torch.bfloat16, 128, 132
-    )
+    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(True, (4, 48, 2048, 128), torch.bfloat16, 128,
+                                                                        132)
     assert steady_unroll == 1
     assert target_workers == 132
 
-    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(
-        True, (4, 48, 4096, 128), torch.bfloat16, 128, 132
-    )
+    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(True, (4, 48, 4096, 128), torch.bfloat16, 128,
+                                                                        132)
     assert steady_unroll == 1
     assert target_workers == 131
 
-    _, _, target_workers = _hopper_fa_select_forward_policy(
-        True, (4, 48, 4096, 128), torch.bfloat16, 128, 120
-    )
+    _, _, target_workers = _hopper_fa_select_forward_policy(True, (4, 48, 4096, 128), torch.bfloat16, 128, 120)
     assert target_workers == 120
 
     for causal, dtype, shape in (
@@ -1210,9 +1206,7 @@ def test_hopper_fa_ws_pipelined_pingpong_launch_policy():
         (True, torch.float16, (4, 48, 4096, 128)),
         (True, torch.bfloat16, (4, 8, 4096, 128)),
     ):
-        _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(
-            causal, shape, dtype, 128, 132
-        )
+        _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(causal, shape, dtype, 128, 132)
         assert steady_unroll == 2
         assert target_workers == 132
 
@@ -1240,13 +1234,10 @@ def test_hopper_fa_ws_pipelined_pingpong_row_mapping_equivalence():
         affine_mod = schedule["ROW_AFFINE_MOD"]
         if affine_mod != 0:
             affine_source_m = mapped_m
-            mapped_m = (
-                affine_source_m * schedule["ROW_AFFINE_MUL"]
-                + schedule["ROW_AFFINE_ADD"]
-            ) % affine_mod
+            mapped_m = (affine_source_m * schedule["ROW_AFFINE_MUL"] + schedule["ROW_AFFINE_ADD"]) % affine_mod
             if schedule["ROW_SWAP_XOR"] != 0 and affine_source_m in (
-                schedule["ROW_SWAP_SRC_0"],
-                schedule["ROW_SWAP_SRC_1"],
+                    schedule["ROW_SWAP_SRC_0"],
+                    schedule["ROW_SWAP_SRC_1"],
             ):
                 mapped_m ^= schedule["ROW_SWAP_XOR"]
         return mapped_m
@@ -1255,9 +1246,7 @@ def test_hopper_fa_ws_pipelined_pingpong_row_mapping_equivalence():
         schedule = _hopper_fa_select_row_schedule(True, num_rows * 128, 128)
         for source_m in range(num_rows):
             for off_hz in range(128):
-                assert parameterized_mapping(schedule, source_m, off_hz) == legacy_mapping(
-                    num_rows, source_m, off_hz
-                )
+                assert parameterized_mapping(schedule, source_m, off_hz) == legacy_mapping(num_rows, source_m, off_hz)
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
@@ -1637,9 +1626,7 @@ def test_amd_bmm(dtype):
     ],
 )
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_register_staged_bmm_resident_operand_policies(
-    dtype, m, n, k, kernel_spec
-):
+def test_register_staged_bmm_resident_operand_policies(dtype, m, n, k, kernel_spec):
     """Exercise both dot orders, input dtypes, and partial output tiles."""
     batch = 2
     torch.manual_seed(0)
@@ -1678,9 +1665,7 @@ def test_register_staged_bmm_rejects_unsupported_wrap_contracts(m, n, k, error):
     ],
 )
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_shared_a_bmm_production_dispatches_at_group_boundaries(
-    batch, m, n, k, dtype
-):
+def test_shared_a_bmm_production_dispatches_at_group_boundaries(batch, m, n, k, dtype):
     """Cover every tuned dispatch at the batch size that enables grouping."""
     torch.manual_seed(0)
     a = torch.randn((1, m, k), device=DEVICE, dtype=dtype).expand(batch, -1, -1)
