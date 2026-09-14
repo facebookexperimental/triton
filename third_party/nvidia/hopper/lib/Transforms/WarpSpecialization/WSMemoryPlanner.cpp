@@ -1523,6 +1523,25 @@ static unsigned getStagingCopiesCap() {
   return n < 1 ? 0u : static_cast<unsigned>(n);
 }
 
+static constexpr bool isLegalOrdinaryOutputRingDepth(unsigned subtiles,
+                                                     unsigned copies,
+                                                     bool twoCTAs) {
+  if (copies == 0)
+    return false;
+  if (twoCTAs)
+    return copies == 1;
+  return copies == 1 || subtiles % copies == 0;
+}
+
+static constexpr unsigned
+findLegalOrdinaryOutputRingDepth(unsigned subtiles, unsigned floor,
+                                 unsigned configuredDepth, bool twoCTAs) {
+  for (unsigned copies = floor; copies <= configuredDepth; ++copies)
+    if (isLegalOrdinaryOutputRingDepth(subtiles, copies, twoCTAs))
+      return copies;
+  return 0;
+}
+
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
                                         triton::FuncOp funcOp,
@@ -1617,7 +1636,8 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
              << " kept at one copy for 2CTA ordinary output staging");
         continue;
       }
-      if (indices.size() < 2) {
+      unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
+      if (indices.size() < 2 && firstTmaStaging != 1) {
         LDBG("Phase 3.7: bufferId=" << bufferId << " \u2014 only "
                                     << indices.size()
                                     << " buffer(s) in group, skipping");
@@ -1649,18 +1669,12 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 
       unsigned currentCopies = wsBuffers[indices[0]].numCopies;
       unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
-      unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
 
-      // Defensive K | S cap for same-partition (wait_group-drained) TMA
-      // staging. Such staging rotates S = indices.size() subtiles through K =
-      // numCopies slots of one circular buffer, drained by a fixed
-      // in-flight-count TMA store-wait (cp.async.bulk.wait_group K-1).
-      // Correctness requires same-slot stores to be exactly K apart in issue
-      // order, i.e. K | S; a non-dividing K makes a store clobber a slot before
-      // it drains (T277224987). Cross- partition staging (producer task !=
-      // consumer task, e.g. FA-fwd desc_o) uses a continuous-accumCnt
-      // producer/consumer mbarrier rotation (getStaggeredAccumCnt) that
-      // tolerates any K, so it is exempt.
+      // A subtiled ordinary TMA output rotates S = indices.size() subtiles
+      // through K = numCopies slots. K must divide S so the producer and store
+      // partitions return to the same slot/phase at an iteration boundary.
+      // Same-task wait_group staging has the same K | S requirement. TMA
+      // reductions retain their existing cross-partition behavior.
       unsigned subtileCount = indices.size();
       bool sameTaskStaging = false;
       if (firstTmaStaging > 0) {
@@ -1673,6 +1687,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                 (getAsyncTaskIds(prodOp) == getAsyncTaskIds(consOp));
         }
       }
+      bool requiresDivisibleDepth = sameTaskStaging || firstTmaStaging == 1;
 
       // Respect the enforced cross-stage floor from Phase 2 (the real stage
       // span via WSBuffer::minCopies, not a hardcoded 2). Phase 3.7 copy
@@ -1694,24 +1709,6 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
            << currentCopies << " anyCrossStage=" << anyCrossStage
            << " \u2014 will try bumping to numBuffers=" << numBuffers);
 
-      if (currentCopies >= numBuffers) {
-        LDBG("Phase 3.7:   bufferId=" << bufferId
-                                      << " currentCopies=" << currentCopies
-                                      << " already >= numBuffers=" << numBuffers
-                                      << " \u2014 no room to bump");
-        continue;
-      }
-
-      // The cross-stage floor is a hard correctness floor; if it already
-      // violates K | S for a wait_group ring there is nothing Phase 3.7 can do
-      // (it must not drop below the floor) — warn so the condition is visible.
-      if (sameTaskStaging && currentCopies > 1 &&
-          (subtileCount % currentCopies != 0))
-        LDBG("Phase 3.7: WARNING bufferId="
-             << bufferId << " floor copies=" << currentCopies
-             << " does not divide subtileCount=" << subtileCount
-             << " — wait_group rotation may be unsafe");
-
       unsigned tryCopies = currentCopies + 1;
       while (tryCopies <= numBuffers) {
         if (!reusedGroupFitsHosts(tryCopies)) {
@@ -1721,14 +1718,15 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                << currentCopies);
           break;
         }
-        // For same-partition (wait_group-drained) staging, only depths that
-        // divide the subtile count keep the fixed-count rotation correct
-        // (K | S); skip the rest. Cross-partition staging is unconstrained.
-        if (sameTaskStaging && (subtileCount % tryCopies != 0)) {
+        // Only depths that divide the subtile count keep output-ring rotation
+        // correct (K | S).
+        if (requiresDivisibleDepth &&
+            !isLegalOrdinaryOutputRingDepth(subtileCount, tryCopies,
+                                            /*twoCTAs=*/false)) {
           LDBG("Phase 3.7:     bufferId="
                << bufferId << " skip copies=" << tryCopies
                << " (does not divide subtileCount=" << subtileCount
-               << " for same-task wait_group staging)");
+               << " for output-ring staging)");
           tryCopies++;
           continue;
         }
@@ -1757,8 +1755,22 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
         }
       }
 
-      LDBG("Phase 3.7:   bufferId=" << bufferId << " final copies="
-                                    << wsBuffers[indices[0]].numCopies);
+      unsigned finalCopies = wsBuffers[indices[0]].numCopies;
+      if (requiresDivisibleDepth && finalCopies > 1 &&
+          !isLegalOrdinaryOutputRingDepth(subtileCount, finalCopies,
+                                          /*twoCTAs=*/false)) {
+        funcOp->setAttr("ttg.ws_memory_plan_invalid",
+                        UnitAttr::get(funcOp.getContext()));
+        funcOp.emitError()
+            << "illegal ordinary TMA output-ring depth " << finalCopies
+            << " for " << subtileCount << " subtiles; no legal depth at or "
+            << "above the correctness floor fits the configured depth, "
+               "reuse host, and shared-memory budget";
+        return;
+      }
+
+      LDBG("Phase 3.7:   bufferId=" << bufferId
+                                    << " final copies=" << finalCopies);
     }
   }
 
