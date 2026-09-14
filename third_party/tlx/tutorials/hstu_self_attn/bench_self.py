@@ -218,11 +218,14 @@ _PERF_ENV = {
         "HSTU_SELF_DP": "1",
         "HSTU_SELF_AUTOWS_BWD_BM": "64",
         "HSTU_SELF_AUTOWS_BWD_BN": "128",
-        "HSTU_SELF_AUTOWS_BWD_STAGES": "2",
-        "HSTU_SELF_AUTOWS_WARPS": "4",
+        # One stage wins for this persistent CLC schedule by reducing SMEM and
+        # spill pressure; two stages do not recover the added overhead.
+        "HSTU_SELF_AUTOWS_BWD_STAGES": "1",
+        "HSTU_SELF_AUTOWS_WARPS": "8",
         "HSTU_SELF_PIN": "1",
         "HSTU_SELF_DQ_ITERS": "4",
         "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+        "TRITON_WS_TMA_REDUCE_STAGING_COPIES": "2",
     },
 }
 
