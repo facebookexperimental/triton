@@ -117,6 +117,11 @@ int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
     consumerOp = consumerOp->getParentOp();
   }
 
+  // A forwarded token may be defined in a different, dominating block of the
+  // same region. We cannot scan between blocks without traversing the CFG.
+  if (defValue.getParentBlock() != consumerOp->getBlock())
+    return 0;
+
   auto result = dyn_cast<OpResult>(defValue);
   Operation *owner =
       result ? result.getOwner() : defValue.getParentRegion()->getParentOp();

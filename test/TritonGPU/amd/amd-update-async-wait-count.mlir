@@ -920,6 +920,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+  // A single-block region can forward a token from a dominating block in its
+  // enclosing region. Tracing it must fall back before scanning across blocks.
+  // CHECK-LABEL: @execute_region_multiblock_forwarded_token
+  tt.func @execute_region_multiblock_forwarded_token(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    scf.execute_region {
+      %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group0 = ttg.async_commit_group tokens %copy0
+      cf.br ^next
+    ^next:
+      %forwarded = scf.execute_region -> !ttg.async.token {
+        scf.yield %group0 : !ttg.async.token
+      }
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+      %wait0 = ttg.async_wait %forwarded {num = 0 : i32}
+      // Waiting directly on a token from another block is also conservative.
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+      %wait1 = ttg.async_wait %group0 {num = 0 : i32}
+
+      // Same-block scans still work within a multi-block region.
+      %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group1 = ttg.async_commit_group tokens %copy1
+      %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+      %wait2 = ttg.async_wait %group1 {num = 0 : i32}
+      scf.yield
+    }
+    tt.return
+  }
+
   // TDM token waits share the same traversal, but count only TDM instructions.
   // CHECK-LABEL: @execute_region_tdm_tokens
   tt.func @execute_region_tdm_tokens(%desc: !tt.tensordesc<128x16xf16>, %tdm_buf: !ttg.memdesc<128x16xf16, #tdm_shared, #smem, mutable>, %src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
