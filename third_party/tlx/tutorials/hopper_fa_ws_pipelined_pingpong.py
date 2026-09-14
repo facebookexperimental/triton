@@ -26,9 +26,91 @@ def _host_descriptor_pre_hook(nargs):
     nargs["desc_o"].block_shape = [BLOCK_M_SPLIT, HEAD_DIM]
 
 
+_DEFAULT_BLOCK_M = 128
+# Profile-selected on H100 to avoid consumer spills without reducing CTA residency.
+_FWD_CONSUMER_REGISTERS = 240
+_DEFAULT_ROW_SCHEDULE = {
+    "ROW_REVERSE_HEAD_GROUP": 0,
+    "ROW_REVERSE_MAX": 0,
+    "ROW_AFFINE_MUL": 1,
+    "ROW_AFFINE_ADD": 0,
+    "ROW_AFFINE_MOD": 0,
+    "ROW_SWAP_SRC_0": 0,
+    "ROW_SWAP_SRC_1": 0,
+    "ROW_SWAP_XOR": 0,
+}
+_CAUSAL_ROW_SCHEDULES = {
+    8: {
+        **_DEFAULT_ROW_SCHEDULE,
+        "ROW_REVERSE_HEAD_GROUP": 1,
+        "ROW_REVERSE_MAX": 7,
+    },
+    16: {
+        **_DEFAULT_ROW_SCHEDULE,
+        "ROW_REVERSE_HEAD_GROUP": 1,
+        "ROW_REVERSE_MAX": 15,
+    },
+    32: {
+        **_DEFAULT_ROW_SCHEDULE,
+        "ROW_AFFINE_MUL": 5,
+        "ROW_AFFINE_ADD": 29,
+        "ROW_AFFINE_MOD": 32,
+        "ROW_SWAP_SRC_0": 7,
+        "ROW_SWAP_SRC_1": 15,
+        "ROW_SWAP_XOR": 8,
+    },
+    64: {
+        **_DEFAULT_ROW_SCHEDULE,
+        "ROW_REVERSE_HEAD_GROUP": 2,
+        "ROW_REVERSE_MAX": 63,
+    },
+}
+_DEFAULT_LAUNCH_TUNING = {
+    "STEADY_UNROLL": 2,
+    "WORKER_CAP": None,
+}
+_CAUSAL_WORKLOAD_LAUNCH_TUNING = {
+    (torch.bfloat16, 4, 48, 2048, 128): {
+        "STEADY_UNROLL": 1,
+        "WORKER_CAP": None,
+    },
+    (torch.bfloat16, 4, 48, 4096, 128): {
+        "STEADY_UNROLL": 1,
+        "WORKER_CAP": 131,
+    },
+}
+
+
+def _select_row_schedule(causal, n_ctx, block_m):
+    if not causal:
+        return dict(_DEFAULT_ROW_SCHEDULE)
+    num_row_tiles = triton.cdiv(n_ctx, block_m)
+    return dict(_CAUSAL_ROW_SCHEDULES.get(num_row_tiles, _DEFAULT_ROW_SCHEDULE))
+
+
+def _select_forward_policy(causal, shape, dtype, block_m, num_sms):
+    row_schedule = _select_row_schedule(causal, shape[2], block_m)
+    workload_key = (dtype, *shape)
+    launch_tuning = (_CAUSAL_WORKLOAD_LAUNCH_TUNING.get(workload_key, _DEFAULT_LAUNCH_TUNING)
+                     if causal else _DEFAULT_LAUNCH_TUNING)
+    worker_cap = launch_tuning["WORKER_CAP"]
+    target_workers = num_sms if worker_cap is None else min(num_sms, worker_cap)
+    return row_schedule, launch_tuning["STEADY_UNROLL"], target_workers
+
+
 configs = [
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'NUM_BUFFERS': 2, 'NUM_MMA_WARPS': 8, 'NUM_MMA_GROUPS': 2},
-                  num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+    triton.Config(
+        {
+            "BLOCK_M": _DEFAULT_BLOCK_M,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS": 2,
+            "NUM_MMA_WARPS": 8,
+            "NUM_MMA_GROUPS": 2,
+        },
+        num_stages=1,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
 ]
 
 
@@ -41,24 +123,31 @@ def _compute_offsets(
     N_CTX,
     BLOCK_M: tl.constexpr,
     CAUSAL: tl.constexpr,
+    ROW_REVERSE_HEAD_GROUP: tl.constexpr,
+    ROW_REVERSE_MAX: tl.constexpr,
+    ROW_AFFINE_MUL: tl.constexpr,
+    ROW_AFFINE_ADD: tl.constexpr,
+    ROW_AFFINE_MOD: tl.constexpr,
+    ROW_SWAP_SRC_0: tl.constexpr,
+    ROW_SWAP_SRC_1: tl.constexpr,
+    ROW_SWAP_XOR: tl.constexpr,
 ):
     group_id = tile_idx // num_pid_in_group
     first_pid_n = group_id
     off_hz = first_pid_n
     start_m = tile_idx % num_pid_in_group
     if CAUSAL:
-        # Reverse selected heads so persistent workers receive a balanced mix
-        # of short and long causal prefixes for the tuned sequence lengths.
-        reverse_rows = (off_hz & 1) != 0
-        balanced_start_m = tl.where(
-            reverse_rows, num_pid_in_group - 1 - start_m, start_m
-        )
-        use_alternate_heads = (num_pid_in_group == 8) | (num_pid_in_group == 16)
-        start_m = tl.where(use_alternate_heads, balanced_start_m, start_m)
+        if ROW_REVERSE_HEAD_GROUP != 0:
+            reverse_rows = ((off_hz // ROW_REVERSE_HEAD_GROUP) & 1) != 0
+            start_m = tl.where(reverse_rows, ROW_REVERSE_MAX - start_m, start_m)
 
-        reverse_s8192 = ((off_hz // 2) & 1) != 0
-        balanced_s8192 = tl.where(reverse_s8192, 63 - start_m, start_m)
-        start_m = tl.where(num_pid_in_group == 64, balanced_s8192, start_m)
+        if ROW_AFFINE_MOD != 0:
+            source_m = start_m
+            mapped_m = (source_m * ROW_AFFINE_MUL + ROW_AFFINE_ADD) % ROW_AFFINE_MOD
+            if ROW_SWAP_XOR != 0:
+                swap_rows = (source_m == ROW_SWAP_SRC_0) | (source_m == ROW_SWAP_SRC_1)
+                mapped_m = tl.where(swap_rows, mapped_m ^ ROW_SWAP_XOR, mapped_m)
+            start_m = mapped_m
     off_z = off_hz // H
     off_h = off_hz % H
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
@@ -78,6 +167,14 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                     BLOCK_N: tl.constexpr,  #
                                     FP8_OUTPUT: tl.constexpr,  #
                                     CAUSAL: tl.constexpr,  #
+                                    ROW_REVERSE_HEAD_GROUP: tl.constexpr,  #
+                                    ROW_REVERSE_MAX: tl.constexpr,  #
+                                    ROW_AFFINE_MUL: tl.constexpr,  #
+                                    ROW_AFFINE_ADD: tl.constexpr,  #
+                                    ROW_AFFINE_MOD: tl.constexpr,  #
+                                    ROW_SWAP_SRC_0: tl.constexpr,  #
+                                    ROW_SWAP_SRC_1: tl.constexpr,  #
+                                    ROW_SWAP_XOR: tl.constexpr,  #
                                     STEADY_UNROLL: tl.constexpr,  #
                                     NUM_BUFFERS: tl.constexpr,  #
                                     NUM_MMA_WARPS: tl.constexpr,  #
@@ -144,10 +241,19 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     N_CTX,
                     BLOCK_M,
                     CAUSAL=CAUSAL,
+                    ROW_REVERSE_HEAD_GROUP=ROW_REVERSE_HEAD_GROUP,
+                    ROW_REVERSE_MAX=ROW_REVERSE_MAX,
+                    ROW_AFFINE_MUL=ROW_AFFINE_MUL,
+                    ROW_AFFINE_ADD=ROW_AFFINE_ADD,
+                    ROW_AFFINE_MOD=ROW_AFFINE_MOD,
+                    ROW_SWAP_SRC_0=ROW_SWAP_SRC_0,
+                    ROW_SWAP_SRC_1=ROW_SWAP_SRC_1,
+                    ROW_SWAP_XOR=ROW_SWAP_XOR,
                 )
 
-                # Interleave the first K load between the two Q loads so consumer 0
-                # can begin its first QK while the producer finishes startup.
+                # Publish both Q splits before starting the KV stream. The two
+                # consumers rendezvous before issuing the first QK, so neither can
+                # use an intervening K load until both Q splits are ready.
                 _, q_phase = get_bufidx_phase(i, 1)
                 q_cid: tl.constexpr = 0
                 tlx.barrier_wait(q_empties[q_cid], q_phase ^ 1)
@@ -155,18 +261,18 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 qo_offset_y_split = qo_offset_y + q_cid * BLOCK_M_SPLIT
                 tlx.async_descriptor_load(desc_q, q_tiles[q_cid], [qo_offset_y_split, 0], q_fulls[q_cid])
 
-                kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                kv_offset = kv_offset_y + lo
-                tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
-
                 for cid in tl.range(1, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS):
                     # TR051 heuristically unrolls the persistent loop and misses the matching consumer arrival.
                     tlx.barrier_wait(q_empties[cid], q_phase ^ 1)  # noqa: TR051
                     tlx.barrier_expect_bytes(q_fulls[cid], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_load(desc_q, q_tiles[cid], [qo_offset_y_split, 0], q_fulls[cid])
+
+                kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+                kv_offset = kv_offset_y + lo
+                tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
+                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
 
                 tlx.barrier_wait(v_empties[kv_buf_id], kv_phase ^ 1)
                 tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
@@ -195,7 +301,11 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 tile_idx += num_progs
 
         # consumer group
-        with tlx.async_task(num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS, registers=232, replicate=NUM_MMA_GROUPS):
+        with tlx.async_task(
+                num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
+                registers=_FWD_CONSUMER_REGISTERS,
+                replicate=NUM_MMA_GROUPS,
+        ):
             accum_cnt_kv = 0
             cid: tl.constexpr = tlx.async_task_replica_id()
 
@@ -213,6 +323,14 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     N_CTX,
                     BLOCK_M,
                     CAUSAL=CAUSAL,
+                    ROW_REVERSE_HEAD_GROUP=ROW_REVERSE_HEAD_GROUP,
+                    ROW_REVERSE_MAX=ROW_REVERSE_MAX,
+                    ROW_AFFINE_MUL=ROW_AFFINE_MUL,
+                    ROW_AFFINE_ADD=ROW_AFFINE_ADD,
+                    ROW_AFFINE_MOD=ROW_AFFINE_MOD,
+                    ROW_SWAP_SRC_0=ROW_SWAP_SRC_0,
+                    ROW_SWAP_SRC_1=ROW_SWAP_SRC_1,
+                    ROW_SWAP_XOR=ROW_SWAP_XOR,
                 )
 
                 # initialize pointer to m and l
@@ -256,14 +374,13 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 qk = tlx.async_dot_wait(0, qk)
                 # release the K buffer
                 tlx.barrier_arrive(k_empties[k_buf_id], 1)
+                # The single-tile path has completed its final QK read.
+                if lo + BLOCK_N == hi:
+                    tlx.barrier_arrive(q_empties[cid], 1)
 
                 # -- compute m_i and l_i ----
                 if CAUSAL:
-                    offs_m = (
-                        start_m * BLOCK_M
-                        + cid * BLOCK_M_SPLIT
-                        + tl.arange(0, BLOCK_M_SPLIT)
-                    )
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     if lo + BLOCK_N == hi:
                         offs_n = lo + tl.arange(0, BLOCK_N)
                         qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
@@ -283,16 +400,12 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # peel the final diagonal tile and apply its mask separately.
                 steady_hi = hi - BLOCK_N if CAUSAL else hi
                 steady_tiles = (steady_hi - (lo + BLOCK_N)) // BLOCK_N
-                paired_hi = (
-                    steady_hi - (steady_tiles % 2) * BLOCK_N
-                    if CAUSAL
-                    else steady_hi
-                )
+                paired_hi = steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi
                 for kv_idx in tl.range(
-                    lo + BLOCK_N,
-                    paired_hi,
-                    BLOCK_N,
-                    loop_unroll_factor=STEADY_UNROLL,
+                        lo + BLOCK_N,
+                        paired_hi,
+                        BLOCK_N,
+                        loop_unroll_factor=STEADY_UNROLL,
                 ):
                     k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
 
@@ -375,6 +488,8 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                         qk = tlx.async_dot_wait(1, qk)
                         tlx.barrier_arrive(k_empties[k_buf_id], 1)
+                        if kv_idx + BLOCK_N == hi:
+                            tlx.barrier_arrive(q_empties[cid], 1)
 
                         if kv_idx + BLOCK_N == hi:
                             offs_n = kv_idx + tl.arange(0, BLOCK_N)
@@ -399,9 +514,10 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # prepare p and v for the dot
                 p = p.to(tlx.dtype_of(desc_k))
                 acc = tlx.async_dot(p, v_tiles[v_buf_id], acc)
-                # Q is no longer live once the final PV has been issued.
                 acc = tlx.async_dot_wait(1, acc)
-                tlx.barrier_arrive(q_empties[cid], 1)
+                if not CAUSAL:
+                    if lo + BLOCK_N != hi:
+                        tlx.barrier_arrive(q_empties[cid], 1)
                 inv_l_i = 1.0 / l_i
                 m_i += tl.math.log2(l_i)
                 offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
@@ -422,13 +538,13 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 @triton.jit
 # Triton TR001: backward preprocess uses the fixed 128-row FA tile from the wrapper.
 def _attn_bwd_preprocess(  # noqa: TR001
-    O,
-    DO,
-    Delta,
-    DQ,
-    N_CTX,
-    BLOCK_M: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
+        O,
+        DO,
+        Delta,
+        DQ,
+        N_CTX,
+        BLOCK_M: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
 ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
@@ -589,12 +705,10 @@ def _attn_bwd_tlx(
 
     with tlx.async_tasks():
         with tlx.async_task("default"):
-            k_load_view = tlx.local_reinterpret(
-                k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
-            v_load_view = tlx.local_reinterpret(
-                v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
+            k_load_view = tlx.local_reinterpret(k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM],
+                                                layout=kv_atom_layout, pin=False)
+            v_load_view = tlx.local_reinterpret(v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM],
+                                                layout=kv_atom_layout, pin=False)
             tlx.barrier_expect_bytes(
                 kv_full[0],
                 BLOCK_N * HEAD_DIM * (K_BYTES_PER_ELEM + V_BYTES_PER_ELEM),
@@ -631,18 +745,16 @@ def _attn_bwd_tlx(
                 tlx.async_descriptor_load(desc_do, do_load_view, [global_start_m, 0], do_fulls[q_buf])
 
         with tlx.async_task(
-            num_warps=NUM_MMA_WARPS_BWD // NUM_MMA_GROUPS_BWD,
-            registers=BWD_REGISTERS,
-            replicate=NUM_MMA_GROUPS_BWD,
+                num_warps=NUM_MMA_WARPS_BWD // NUM_MMA_GROUPS_BWD,
+                registers=BWD_REGISTERS,
+                replicate=NUM_MMA_GROUPS_BWD,
         ):
             cid: tl.constexpr = tlx.async_task_replica_id()
             cid_start_n: tl.constexpr = cid * CID_BLOCK_N
-            k_view = tlx.local_reinterpret(
-                k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
-            v_view = tlx.local_reinterpret(
-                v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout, pin=False
-            )
+            k_view = tlx.local_reinterpret(k_smem[0], tlx.dtype_of(desc_k), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout,
+                                           pin=False)
+            v_view = tlx.local_reinterpret(v_smem[0], tlx.dtype_of(desc_v), [BLOCK_N, HEAD_DIM], layout=kv_atom_layout,
+                                           pin=False)
             score_view = tlx.local_reinterpret(
                 score_smem_full[0],
                 tlx.dtype_of(desc_q),
@@ -772,33 +884,41 @@ class _attention(torch.autograd.Function):
         triton.set_allocator(alloc_fn)
 
         NUM_SMS = torch.cuda.get_device_properties(q.device).multi_processor_count
-
-        use_s4096_tuning = (
-            causal
-            and q.shape == (4, 48, 4096, 128)
-            and q.dtype == torch.bfloat16
+        if config is not None:
+            config = dict(config)
+        block_m = _DEFAULT_BLOCK_M if config is None else config["BLOCK_M"]
+        row_schedule, steady_unroll, target_workers = _select_forward_policy(
+            causal,
+            q.shape,
+            q.dtype,
+            block_m,
+            NUM_SMS,
         )
-        target_s4096_workers = min(NUM_SMS, 131) if use_s4096_tuning else NUM_SMS
-        steady_unroll = 1 if use_s4096_tuning else 2
 
         def grid(META):
             total_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
-            return (min(target_s4096_workers, total_tiles), 1, 1)
+            return (min(target_workers, total_tiles), 1, 1)
 
         ctx.grid = grid
         if config is None:
             _attn_fwd_ws_pipelined_pingpong[grid](
-                sm_scale, M,  #
-                q.shape[0], q.shape[1],  #
-                desc_q, desc_k, desc_v, desc_o,  #
+                sm_scale,
+                M,  #
+                q.shape[0],
+                q.shape[1],  #
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,  #
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
                 FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
                 CAUSAL=causal,  #
                 STEADY_UNROLL=steady_unroll,  #
-                **extra_kern_args)
+                **row_schedule,  #
+                **extra_kern_args,
+            )
         else:
-            config = dict(config)
             nargs = {
                 **config,
                 "HEAD_DIM": HEAD_DIM_K,
@@ -823,6 +943,7 @@ class _attention(torch.autograd.Function):
                 FP8_OUTPUT=q.dtype == torch.float8_e5m2,
                 CAUSAL=causal,
                 STEADY_UNROLL=steady_unroll,
+                **row_schedule,
                 **config,
             )
 
