@@ -35,6 +35,63 @@ struct PeelCandidate {
 
 static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp);
 
+// Match a scalar prefix boundary of the form `lb + K * step`, where K is a
+// small positive compile-time constant. Canonicalization commonly folds the
+// product to a single constant, so accept both the explicit multiply and the
+// folded constant-offset forms.
+static std::optional<int64_t> matchScalarPeelIterations(scf::ForOp forOp,
+                                                        Value boundary) {
+  auto add = boundary.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return std::nullopt;
+
+  Value offset;
+  if (add.getLhs() == forOp.getLowerBound())
+    offset = add.getRhs();
+  else if (add.getRhs() == forOp.getLowerBound())
+    offset = add.getLhs();
+  else
+    return std::nullopt;
+
+  APInt stepValue;
+  if (!matchPattern(forOp.getStep(), m_ConstantInt(&stepValue)))
+    return std::nullopt;
+  int64_t step = stepValue.getSExtValue();
+  if (step <= 0)
+    return std::nullopt;
+
+  int64_t iterations = 0;
+  if (offset == forOp.getStep()) {
+    iterations = 1;
+  } else {
+    APInt offsetValue;
+    if (matchPattern(offset, m_ConstantInt(&offsetValue))) {
+      int64_t distance = offsetValue.getSExtValue();
+      if (distance <= 0 || distance % step != 0)
+        return std::nullopt;
+      iterations = distance / step;
+    } else if (auto mul = offset.getDefiningOp<arith::MulIOp>()) {
+      Value factor;
+      if (mul.getLhs() == forOp.getStep())
+        factor = mul.getRhs();
+      else if (mul.getRhs() == forOp.getStep())
+        factor = mul.getLhs();
+      else
+        return std::nullopt;
+      APInt factorValue;
+      if (!matchPattern(factor, m_ConstantInt(&factorValue)))
+        return std::nullopt;
+      iterations = factorValue.getSExtValue();
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  if (iterations <= 0 || iterations > kMaxPeeledIterations)
+    return std::nullopt;
+  return iterations;
+}
+
 static Value stripBroadcastAndExpandDims(Value value) {
   while (true) {
     if (auto broadcast = value.getDefiningOp<tt::BroadcastOp>()) {
@@ -258,6 +315,7 @@ static bool materializeFirstIterationsMaskBranch(scf::ForOp forOp) {
 // has exactly one.
 static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp) {
   arith::CmpIOp candidate;
+  int64_t candidateIterations = 1;
   forOp.getBody()->walk([&](arith::CmpIOp cmp) {
     if (cmp.getPredicate() != arith::CmpIPredicate::slt ||
         cmp.getLhs() != forOp.getInductionVar() ||
@@ -268,19 +326,14 @@ static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp) {
       int64_t iterations = count.getInt();
       if (iterations > 0 && iterations <= kMaxPeeledIterations) {
         candidate = cmp;
+        candidateIterations = iterations;
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
     }
 
-    auto add = cmp.getRhs().getDefiningOp<arith::AddIOp>();
-    if (!add)
-      return WalkResult::advance();
-    bool isFirstIterationBoundary = (add.getLhs() == forOp.getLowerBound() &&
-                                     add.getRhs() == forOp.getStep()) ||
-                                    (add.getRhs() == forOp.getLowerBound() &&
-                                     add.getLhs() == forOp.getStep());
-    if (!isFirstIterationBoundary)
+    auto iterations = matchScalarPeelIterations(forOp, cmp.getRhs());
+    if (!iterations)
       return WalkResult::advance();
 
     bool controlsIf = llvm::any_of(cmp->getUsers(), [&](Operation *user) {
@@ -291,15 +344,12 @@ static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp) {
       return WalkResult::advance();
 
     candidate = cmp;
+    candidateIterations = *iterations;
     return WalkResult::interrupt();
   });
   if (!candidate)
     return std::nullopt;
-  int64_t iterations = 1;
-  if (auto count =
-          candidate->getAttrOfType<IntegerAttr>(kPeelIterationsAttrName))
-    iterations = count.getInt();
-  return PeelCandidate{candidate, iterations};
+  return PeelCandidate{candidate, candidateIterations};
 }
 
 static SmallVector<Value>
