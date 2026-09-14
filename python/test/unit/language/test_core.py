@@ -3255,6 +3255,188 @@ def roll(a1, b1_last, b1_cur, a2, b2_last, b2_cur):
     return a1 + a2, tl.where(a2 == 1, b1_cur, 0) + b2_last, b2_cur
 
 
+@pytest.mark.parametrize("length", [1, 31, 128, 1023, 2049])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("op", ["sum", "prod", "affine"])
+def test_scan_inner_tree_reference(length, axis, reverse, dtype, op, device):
+
+    @triton.jit
+    def add(a, b):
+        return a + b
+
+    @triton.jit
+    def mul(a, b):
+        return a * b
+
+    @triton.jit
+    def affine(a0, b0, a1, b1):
+        return a0 * a1, b0 * a1 + b1
+
+    @triton.jit
+    def kernel(X, Y, A, B, M: tl.constexpr, N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, AXIS: tl.constexpr,
+               REVERSE: tl.constexpr, OP: tl.constexpr):
+        rows = tl.arange(0, BM)[:, None]
+        cols = tl.arange(0, BN)[None, :]
+        offsets = rows * N + cols
+        mask = (rows < M) & (cols < N)
+        x = tl.load(X + offsets, mask, other=0 if OP == "sum" else 1)
+        if OP == "affine":
+            y = tl.load(Y + offsets, mask, other=0)
+            a, b = tl.associative_scan((x, y), AXIS, affine, reverse=REVERSE,
+                                       reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+            tl.store(B + offsets, b, mask)
+        else:
+            a = tl.associative_scan(x, AXIS, add if OP == "sum" else mul, reverse=REVERSE,
+                                    reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+        tl.store(A + offsets, a, mask)
+
+    torch.manual_seed(42)
+    x = torch.randn((3, length), dtype=dtype)
+    if op != "sum":
+        x = 1 + x * 0.01
+    y = torch.randn_like(x)
+    # Independently reduce each prefix by pairing adjacent values. Unlike a
+    # scan, this reference never carries a result from one prefix to the next.
+    padding = triton.next_power_of_2(length) - length
+    padded_x = torch.cat((x, torch.full((3, padding), 0 if op == "sum" else 1, dtype=dtype)), dim=1)
+    padded_y = torch.cat((y, torch.zeros((3, padding), dtype=dtype)), dim=1)
+    ref_x, ref_y = (padded_x.flip(1), padded_y.flip(1)) if reverse else (padded_x, padded_y)
+    expected_a, expected_b = torch.empty_like(x), torch.empty_like(y)
+    for i in range(length):
+        end = i + 1 + (padding if reverse else 0)
+        a, b = ref_x[:, :end], ref_y[:, :end]
+        while a.shape[1] > 1:
+            pairs = a.shape[1] // 2 * 2
+            left, right = a[:, :pairs:2], a[:, 1:pairs:2]
+            merged_a = left + right if op == "sum" else left * right
+            a = torch.cat((merged_a, a[:, pairs:]), dim=1)
+            if op == "affine":
+                merged_b = b[:, :pairs:2] * right + b[:, 1:pairs:2]
+                b = torch.cat((merged_b, b[:, pairs:]), dim=1)
+        expected_a[:, i] = a[:, 0]
+        if op == "affine":
+            expected_b[:, i] = b[:, 0]
+    if reverse:
+        expected_a, expected_b = expected_a.flip(1), expected_b.flip(1)
+    if axis == 0:
+        x, y, expected_a, expected_b = (t.T.contiguous() for t in (x, y, expected_a, expected_b))
+    x, y = x.to(device), y.to(device)
+    out_a, out_b = torch.empty_like(x), torch.empty_like(y)
+    m, n = x.shape
+    for num_warps in (1, 2, 4, 8):
+        kernel[(1, )](x, y, out_a, out_b, m, n, triton.next_power_of_2(m), triton.next_power_of_2(n), axis, reverse, op,
+                      num_warps=num_warps, enable_fp_fusion=False)
+        assert torch.equal(out_a.cpu().view(torch.uint8), expected_a.view(torch.uint8)), num_warps
+        if op == "affine":
+            assert torch.equal(out_b.cpu().view(torch.uint8), expected_b.view(torch.uint8)), num_warps
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_scan_inner_tree_tuple_nan(reverse, device):
+
+    @triton.jit
+    def combine(a, ia, b, ib):
+        a_nan, b_nan = a != a, b != b
+        take_a = a_nan | ((~b_nan) & (a >= b))
+        return tl.where(take_a, a, b), tl.where(take_a, ia, ib)
+
+    @triton.jit
+    def kernel(X, Y, I, REVERSE: tl.constexpr):
+        r = tl.arange(0, 256)
+        x = tl.load(X + r)
+        y, i = tl.associative_scan((x, r.to(tl.int64)), 0, combine, reverse=REVERSE,
+                                   reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+        tl.store(Y + r, y)
+        tl.store(I + r, i)
+
+    x = (torch.arange(256) % 13).float()
+    x[37], x[211] = float("nan"), float("nan")
+    expected_y, expected_i = torch.empty_like(x), torch.empty(256, dtype=torch.int64)
+    order = list(range(255, -1, -1)) if reverse else list(range(256))
+    best = order[0]
+    for i in order:
+        if not torch.isnan(x[best]) and (torch.isnan(x[i]) or x[i] > x[best]):
+            best = i
+        expected_y[i], expected_i[i] = x[best], best
+    x = x.to(device)
+    y, indices = torch.empty_like(x), torch.empty(256, dtype=torch.int64, device=device)
+    for num_warps in (1, 2, 4, 8):
+        kernel[(1, )](x, y, indices, reverse, num_warps=num_warps)
+        assert torch.equal(y.cpu().view(torch.uint8), expected_y.view(torch.uint8))
+        assert torch.equal(indices.cpu(), expected_i)
+
+
+@triton.jit
+def _scan_maximum_with_control_flow(a, b):
+    if a > b:
+        return a
+    return b
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("ordering", [None, tl.ReductionOrdering.INNER_TREE])
+def test_scan_scalar_combine_control_flow(reverse, ordering, device):
+
+    @triton.jit
+    def kernel(X, Y, REVERSE: tl.constexpr, ORDERING: tl.constexpr):
+        offsets = tl.arange(0, 32)
+        x = tl.load(X + offsets)
+        y = tl.associative_scan(x, 0, _scan_maximum_with_control_flow, reverse=REVERSE, reduction_ordering=ORDERING)
+        tl.store(Y + offsets, y)
+
+    x = (torch.arange(32, device=device) * 7 % 13).float()
+    y = torch.empty_like(x)
+    kernel[(1, )](x, y, reverse, ordering)
+    expected = torch.cummax(x.flip(0) if reverse else x, 0).values
+    if reverse:
+        expected = expected.flip(0)
+    assert torch.equal(y, expected)
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("op", ["cumsum", "cumprod"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("length", [1023, 2049])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_scan_inner_tree_batch_invariant(op, dtype, length, reverse, device):
+
+    @triton.jit
+    def kernel(X, Y, B: tl.constexpr, R: tl.constexpr, XBLOCK: tl.constexpr, RBLOCK: tl.constexpr, OP: tl.constexpr,
+               REVERSE: tl.constexpr):
+        rows = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)
+        cols = tl.arange(0, RBLOCK)
+        offsets = rows[:, None] * R + cols[None, :]
+        mask = (rows[:, None] < B) & (cols[None, :] < R)
+        x = tl.load(X + offsets, mask, other=0 if OP == "cumsum" else 1)
+        if OP == "cumsum":
+            y = tl.cumsum(x, 1, reverse=REVERSE, reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+        else:
+            y = tl.cumprod(x, 1, reverse=REVERSE, reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+        tl.store(Y + offsets, y, mask)
+
+    torch.manual_seed(42)
+    row = torch.randn(length, device=device)
+    if op == "cumprod":
+        row = 1 + row * 0.01
+    row = row.to(dtype)
+    reference = None
+    for batch, xblock, num_warps in itertools.product((1, 3, 17), (1, 2, 8), (1, 4, 8)):
+        x = row.repeat(batch, 1)
+        # cumsum/cumprod promote bf16 inputs to fp32.
+        y = torch.empty((batch, length), dtype=torch.float32, device=device)
+        compiled = kernel[(triton.cdiv(batch, xblock), )](x, y, batch, length, xblock, triton.next_power_of_2(length),
+                                                          op, reverse, num_warps=num_warps)
+        if not is_interpreter():
+            assert 'reduction_ordering = "inner_tree"' in compiled.asm["ttgir"]
+        if reference is None:
+            reference = y[0].clone()
+        expected = reference.expand_as(y).contiguous()
+        assert torch.equal(y.view(torch.uint8), expected.view(torch.uint8)), (batch, xblock, num_warps)
+
+
 @pytest.mark.interpreter
 @pytest.mark.parametrize("op, dtype_str, shape, axis, reverse, num_warps", scan_configs + negative_config)
 def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
