@@ -1,5 +1,18 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+tt.func @invalid_scan_ordering(%x: tensor<32xf32>) {
+  // expected-error @+1 {{unsupported scan reduction ordering}}
+  %result = "tt.scan"(%x) ({
+  ^bb0(%a: f32, %b: f32):
+    %sum = arith.addf %a, %b : f32
+    tt.scan.return %sum : f32
+  }) {axis = 0 : i32, reverse = false, reduction_ordering = "invalid"}
+     : (tensor<32xf32>) -> tensor<32xf32>
+  tt.return
+}
+
+// -----
+
 tt.func @fn(%v: i32) {
   %b = tt.splat %v : i32 -> tensor<128xi32>
   // expected-error @+1 {{rank of source must be same as rank of result}}

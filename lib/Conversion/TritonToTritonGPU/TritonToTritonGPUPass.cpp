@@ -481,9 +481,9 @@ struct TritonScanPattern : public OpConversionPattern<triton::ScanOp> {
   LogicalResult
   matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto newScan =
-        triton::ScanOp::create(rewriter, op.getLoc(), adaptor.getOperands(),
-                               adaptor.getAxis(), op.getReverse());
+    auto newScan = triton::ScanOp::create(
+        rewriter, op.getLoc(), adaptor.getOperands(), adaptor.getAxis(),
+        op.getReverse(), op.getReductionOrderingAttr());
     addNamedAttrs(newScan, adaptor.getAttributes());
 
     auto &newCombineOp = newScan.getCombineOp();
