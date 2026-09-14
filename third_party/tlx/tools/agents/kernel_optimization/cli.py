@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -43,10 +44,23 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         description="Optimize a Triton or TLX kernel with a deterministic harness."
     )
     parser.add_argument("--kernel", type=Path, required=True)
-    parser.add_argument("--reference-kernel", type=Path, default=None, help="Optional reference kernel source used as correctness oracle (harness verify can compare candidate vs reference).")
+    parser.add_argument(
+        "--reference-kernel",
+        type=Path,
+        default=None,
+        help="Optional reference kernel source used as correctness oracle (harness verify can compare candidate vs reference).",
+    )
     parser.add_argument("--harness", type=Path, default=None)
     parser.add_argument("--cases", type=Path, default=None)
     parser.add_argument("--target", type=Path, default=None)
+    parser.add_argument(
+        "--target-name",
+        default=None,
+        help=(
+            "Target contract under harnesses/<arch>/targets/<target-name>; "
+            "defaults to the kernel filename stem."
+        ),
+    )
     parser.add_argument(
         "--arch",
         default=None,
@@ -157,13 +171,20 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
     )
 
 
-def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | None, target: Path | None, arch: str | None) -> tuple[Path, Path, Path]:
+def _resolve_harness_paths(
+    kernel: Path,
+    harness: Path | None,
+    cases: Path | None,
+    target: Path | None,
+    arch: str | None,
+    target_name: str | None = None,
+) -> tuple[Path, Path, Path]:
     # Kernel-only invocation: infer harness/cases/target from
     # harnesses/<arch>/targets/<stem>/
     # e.g. --kernel gemm.py -> harnesses/blackwell/targets/gemm/{harness.py,cases.json,target.json}
     # Harness must be colocated with cases (target-specific), so both are resolved together.
     base = Path(__file__).resolve().parent / "harnesses"
-    stem = kernel.stem  # gemm, vector_add, etc.
+    stem = target_name or kernel.stem  # gemm, vector_add, etc.
     if base.exists() and (harness is None or cases is None or target is None):
         archs = sorted(
             p.name
@@ -182,8 +203,14 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
             if target is None and (tdir / "target.json").exists():
                 target = tdir / "target.json"
     if harness is None or cases is None or target is None:
-        missing = [n for n, v in [("harness", harness), ("cases", cases), ("target", target)] if v is None]
-        raise SystemExit(f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/")
+        missing = [
+            n
+            for n, v in [("harness", harness), ("cases", cases), ("target", target)]
+            if v is None
+        ]
+        raise SystemExit(
+            f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/"
+        )
     return harness, cases, target
 
 
@@ -214,35 +241,72 @@ def _probe_cuda_compute_capability(device: str | None) -> tuple[int, int]:
     return torch.cuda.get_device_capability(device_index)
 
 
+def _probe_rocm_architecture(device: str | None) -> str:
+    try:
+        import torch
+    except ImportError as error:
+        raise SystemExit(
+            "HIP target validation requires torch to be importable"
+        ) from error
+    if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
+        raise SystemExit("HIP target selected, but no ROCm device is available")
+    torch_device = torch.device(device or "cuda")
+    if torch_device.type != "cuda":
+        raise SystemExit(f"HIP target selected, but target device is {device!r}")
+    device_index = torch_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    architecture = str(getattr(properties, "gcnArchName", ""))
+    return architecture or str(torch.cuda.get_device_name(device_index))
+
+
 def _validate_host_matches_target(
     target: KernelTarget,
     arch: str | None,
-    capability_probe: Callable[[str | None], tuple[int, int]] = _probe_cuda_compute_capability,
+    capability_probe: Callable[
+        [str | None], tuple[int, int]
+    ] = _probe_cuda_compute_capability,
+    rocm_arch_probe: Callable[[str | None], str] = _probe_rocm_architecture,
 ) -> None:
-    if target.backend != "cuda":
-        return
-    expected_major = _expected_cuda_major(arch or target.architecture)
-    if expected_major is None:
-        return
     previous_environment: dict[str, str | None] = {}
     try:
         for key, value in target.environment.items():
             previous_environment[key] = os.environ.get(key)
             os.environ[key] = value
-        actual_major, actual_minor = capability_probe(target.device)
+        backend = target.backend.lower()
+        if backend == "cuda":
+            expected_major = _expected_cuda_major(arch or target.architecture)
+            if expected_major is None:
+                return
+            actual_major, actual_minor = capability_probe(target.device)
+            if actual_major != expected_major:
+                expected = f"sm_{expected_major}x"
+                actual = f"sm_{actual_major}{actual_minor}"
+                raise SystemExit(
+                    f"--arch {arch or target.architecture} expects {expected}, "
+                    f"but {target.device or 'cuda'} is {actual}"
+                )
+        elif backend in {"amd", "hip", "rocm"}:
+            expected_match = re.search(
+                r"gfx[0-9a-f]+", (arch or target.architecture).lower()
+            )
+            if expected_match is None:
+                return
+            expected = expected_match.group(0)
+            actual = rocm_arch_probe(target.device)
+            actual_match = re.search(r"gfx[0-9a-f]+", actual.lower())
+            if actual_match is None or expected != actual_match.group(0):
+                raise SystemExit(
+                    f"--arch {arch or target.architecture} expects {expected}, "
+                    f"but {target.device or 'cuda'} is {actual}"
+                )
     finally:
         for key, value in previous_environment.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-    if actual_major != expected_major:
-        expected = f"sm_{expected_major}x"
-        actual = f"sm_{actual_major}{actual_minor}"
-        raise SystemExit(
-            f"--arch {arch or target.architecture} expects {expected}, "
-            f"but {target.device or 'cuda'} is {actual}"
-        )
 
 
 def _performance_commit_body(
@@ -421,7 +485,14 @@ def _report_commit(commit_result: object) -> None:
 
 def main() -> int:
     args = _parse_args()
-    harness_path, cases_path, target_path = _resolve_harness_paths(args.kernel, args.harness, args.cases, args.target, args.arch)
+    harness_path, cases_path, target_path = _resolve_harness_paths(
+        args.kernel,
+        args.harness,
+        args.cases,
+        args.target,
+        args.arch,
+        args.target_name,
+    )
     case_payloads = _load_json(cases_path)
     target_payload = _load_json(target_path)
     cases = tuple(

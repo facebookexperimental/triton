@@ -71,7 +71,11 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --commit-message "Optimize my kernel with TLX agent"
 ```
 
-`--arch` selects `harnesses/<arch>/targets/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
+`--arch` and `--target-name` select
+`harnesses/<arch>/targets/<target-name>`. `--target-name` defaults to the kernel
+filename stem; use it when an implementation-specific filename such as
+`amd_gemm_warp_pipeline.py` should use the generic `gemm` target contract.
+`harness`/`cases`/`target` can also be passed explicitly.
 
 `--prior-run` accepts a completed output directory or its `experiments.json`. It
 imports recomputed source hashes for exact cross-run deduplication and bounded,
@@ -181,6 +185,41 @@ Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `ha
 device you are tuning for. Architecture-wide notes, known optimization tricks, and shared
 target metadata can live directly under `harnesses/<arch>/`. Pass an existing TLX tutorial such as
 `third_party/tlx/tutorials/blackwell_gemm_ws.py` as `--kernel`.
+
+AMD gfx950 GEMM is available under `harnesses/gfx950/targets/gemm/`. The target uses
+the ROCm PyTorch convention `device="cuda:0"` with `backend="hip"` and accepts any
+complete candidate source that exports `matmul(a, b)`.
+
+AMD timing uses `rocprofv3 --kernel-trace` device timestamps after a 20-second
+steady-state burn, rather than short `do_bench` wall-clock measurements that can catch
+the transient MI350 boost clock. A conservative 3x-IQR filter removes only extreme
+system-noise samples before variance checks; raw trace samples remain in the profile
+artifacts. Summary and deep profile requests also collect
+supported PMC groups, including `MfmaUtil`, `VALUBusy`, `MemUnitStalled`, HBM fetch
+size, and LDS conflicts. Raw commands, logs, traces, and counter CSVs remain under the
+experiment artifacts directory. Set `TLX_AMD_STEADY_STATE_SECONDS` to override the
+burn duration for debugging, and `TLX_ROCPROFV3` when `rocprofv3` is not on `PATH`.
+
+Deep profiles additionally run `fb_att` by default for one selected dispatch of the
+dominant kernel. Its local `_ui` directory contains the per-wave instruction timeline
+and source mapping. Set `TLX_FB_ATT` when the wrapper is not on `PATH`. Candidate
+summary profiles use rocprofv3 only; ATT is reserved for baseline/final or other deep
+profiles because it is diagnostic instrumentation, not a promotion timing source.
+Unsupported PMC groups and ATT failures are retained as diagnostics without discarding
+correctness results.
+
+For an initial AMD smoke run, disable automatic commits and use a small search budget.
+The tutorial below is only a convenient seed, not a reference implementation or claim
+of optimality:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+  --kernel third_party/tlx/tutorials/amd_gemm_warp_pipeline.py \
+  --arch gfx950 --target-name gemm \
+  --output-dir /tmp/tlx-agent-gfx950 \
+  --max-rounds 1 --candidates-per-round 1 \
+  --min-speedup 1.05 --no-commit-winner
+```
 
 `harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
 without a real GPU. Candidate must export `vector_add(a, b)`; on CPU the benchmark uses
