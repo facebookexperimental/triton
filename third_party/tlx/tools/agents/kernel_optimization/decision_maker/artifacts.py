@@ -73,14 +73,30 @@ def load_prior_run_evidence(path: Path) -> PriorRunEvidence:
         speedup = performance.get("aggregate_speedup") if isinstance(performance, dict) else None
         if not isinstance(speedup, (int, float)) or not math.isfinite(float(speedup)):
             speedup = None
+        decision = item.get("decision")
+        decision_status = (
+            _bounded_text(decision.get("status"), 40)
+            if isinstance(decision, dict)
+            else ""
+        )
+        decision_rationale = (
+            _bounded_text(decision.get("rationale"), 500)
+            if isinstance(decision, dict)
+            else ""
+        )
         evidence.append(
             PriorExperimentEvidence(
                 experiment_id=experiment_id,
                 status=_bounded_text(item.get("status"), 40) or "unknown",
+                experiment_kind=_bounded_text(item.get("experiment_kind"), 40),
+                decision_status=decision_status,
                 hypothesis=_bounded_text(item.get("hypothesis"), 240),
                 change=_bounded_text(item.get("mutation_summary"), 240),
                 aggregate_speedup=float(speedup) if speedup is not None else None,
-                diagnostics=_bounded_text(item.get("diagnostics"), 500),
+                diagnostics=(
+                    _bounded_text(item.get("diagnostics"), 500)
+                    or decision_rationale
+                ),
             )
         )
     return PriorRunEvidence(
@@ -169,6 +185,15 @@ class ArtifactStore:
             }
             return self.write_json(f"experiments/{experiment_id}/profile.json", pointer)
         return self.write_json(f"experiments/{experiment_id}/profile.json", profile)
+
+    def write_experiment_payload(
+        self,
+        experiment_id: str,
+        payload: Mapping[str, JsonValue],
+    ) -> Path | None:
+        if not payload:
+            return None
+        return self.write_json(f"experiments/{experiment_id}/experiment.json", payload)
 
     def write_aggregated_profile(
         self, name: str, profiles: Mapping[str, Mapping[str, JsonValue]]

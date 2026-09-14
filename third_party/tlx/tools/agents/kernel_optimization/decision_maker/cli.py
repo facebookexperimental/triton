@@ -12,6 +12,8 @@ from .artifacts import load_prior_run_evidence
 from .harness import HarnessExecutionError, SubprocessHarness
 from ..contracts import (
     AutoCommitResult,
+    DecisionStatus,
+    ExperimentKind,
     ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
@@ -51,9 +53,7 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--target-name",
         default=None,
-        help=(
-            "Registered target operation name; defaults to the kernel filename stem."
-        ),
+        help="Registered target operation name; defaults to the kernel filename stem.",
     )
     parser.add_argument(
         "--arch",
@@ -443,6 +443,14 @@ def _report_commit(commit_result: object) -> None:
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
+def _result_exit_code(result: KernelOptimizationResult) -> int:
+    if result.stopping_reason in {"promotion_commit_failed", "rollback_commit_failed"}:
+        return 3
+    if result.decision is not None and result.decision.status is DecisionStatus.NEEDS_HUMAN:
+        return 4
+    return 0 if result.success else 2
+
+
 def main() -> int:
     args = _parse_args()
     harness_path, cases_path, target_path = _resolve_harness_paths(
@@ -474,6 +482,13 @@ def main() -> int:
         environment=target_payload.get("environment", {}),
         optimization_guidance=str(target_payload.get("optimization_guidance", "")),
         optimization_skills=tuple(optimization_skills),
+        supported_experiment_kinds=tuple(
+            ExperimentKind(value)
+            for value in target_payload.get(
+                "supported_experiment_kinds",
+                (ExperimentKind.PROMOTABLE.value, ExperimentKind.HUMAN_REVIEW.value),
+            )
+        ),
     )
     _validate_host_matches_target(target, args.arch)
     budget = _budget_from_args(args)
@@ -555,13 +570,11 @@ def main() -> int:
             args.commit_message,
         )
     result = KernelOptimizer(provider).optimize(request, promotion_committer)
-    exit_code = 0 if result.success else 2
+    exit_code = _result_exit_code(result)
     if result.auto_commit is not None:
         args.output_dir.joinpath("auto_commit.json").write_text(
             json.dumps(to_json_value(result.auto_commit), indent=2, sort_keys=True) + "\n"
         )
-    if result.stopping_reason in {"promotion_commit_failed", "rollback_commit_failed"}:
-        exit_code = 3
     print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
     return exit_code
 

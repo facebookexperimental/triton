@@ -1,4 +1,5 @@
 from .contracts import (
+    BlastRadius,
     BuildResult,
     CandidateChange,
     CandidateSubmission,
@@ -21,6 +22,7 @@ from .contracts import (
 from .decision_maker import (
     BuildError,
     DecisionMaker,
+    ExperimentHarness,
     HarnessExecutionError,
     HarnessTimeoutError,
     KernelHarness,
@@ -44,6 +46,7 @@ from .optimizer import (
 )
 
 __all__ = [
+    "BlastRadius",
     "BuildError",
     "BuildResult",
     "CandidateChange",
@@ -61,6 +64,7 @@ __all__ = [
     "DecisionStatus",
     "ExperimentSummary",
     "ExperimentKind",
+    "ExperimentHarness",
     "find_fb_att",
     "find_rocprofv3",
     "FixedCandidateProvider",

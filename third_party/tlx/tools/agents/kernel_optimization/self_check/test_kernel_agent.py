@@ -15,15 +15,23 @@ from ..decision_maker.artifacts import load_prior_run_evidence
 from ..decision_maker.cli import (
     _commit_body,
     _parse_args,
+    _result_exit_code,
     _resolve_harness_paths,
     _validate_host_matches_target,
 )
 from ..decision_maker.harness import StandaloneHarness, SubprocessHarness
 from ..contracts import (
     AutoCommitResult,
+    BlastRadius,
+    CandidateChange,
     CaseEvaluation,
+    ChangeScope,
+    Decision,
+    DecisionStatus,
+    ExperimentKind,
     InputCase,
     KernelOptimizationRequest,
+    KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
     PerformanceSummary,
@@ -33,8 +41,10 @@ from ..contracts import (
     VerificationResult,
 )
 from ..decision_maker.policy import (
+    evaluated_decision,
     is_promotable,
     per_case_speedups,
+    preflight_decision,
     weighted_geometric_speedup,
 )
 from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
@@ -57,6 +67,65 @@ from ..optimizer.source import (
 
 
 class ScoringTest(unittest.TestCase):
+    def test_each_ablation_kind_records_signal(self) -> None:
+        performance = PerformanceSummary(
+            cases=_performance(("a", 50.0)).cases,
+            aggregate_speedup=2.0,
+        )
+        for kind in (
+            ExperimentKind.PTX_ABLATION,
+            ExperimentKind.AMDGCN_ABLATION,
+            ExperimentKind.IR_OVERRIDE,
+        ):
+            with self.subTest(kind=kind):
+                decision = evaluated_decision(
+                    CandidateProposal(
+                        source="VALUE = 1\n",
+                        experiment_kind=kind,
+                        change_scopes=frozenset({ChangeScope.COMPILER}),
+                        blast_radius=BlastRadius.COMPILER,
+                        changes=(CandidateChange(ChangeScope.COMPILER, "ablate"),),
+                        experiment_payload={"artifact": "override"},
+                    ),
+                    performance,
+                    OptimizationBudget(),
+                    (InputCase("a", {}),),
+                    best_speedup=1.0,
+                )
+                self.assertEqual(decision.status, DecisionStatus.RECORD_SIGNAL)
+
+    def test_ablation_backend_and_blast_radius_boundaries(self) -> None:
+        ptx = CandidateProposal(
+            source="VALUE = 1\n",
+            experiment_kind=ExperimentKind.PTX_ABLATION,
+            change_scopes=frozenset({ChangeScope.COMPILER}),
+            blast_radius=BlastRadius.COMPILER,
+            changes=(CandidateChange(ChangeScope.COMPILER, "ablate PTX"),),
+            experiment_payload={"ptx": "override"},
+        )
+        target = KernelTarget(
+            "amd",
+            "gfx950",
+            supported_experiment_kinds=(
+                ExperimentKind.PROMOTABLE,
+                ExperimentKind.PTX_ABLATION,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "NVIDIA"):
+            preflight_decision(ptx, target)
+
+        broad_promotable = CandidateProposal(
+            source="VALUE = 2\n",
+            change_scopes=frozenset({ChangeScope.KERNEL}),
+            blast_radius=BlastRadius.MULTI_FILE,
+            changes=(CandidateChange(ChangeScope.KERNEL, "change multiple files"),),
+        )
+        decision = preflight_decision(
+            broad_promotable,
+            KernelTarget("cuda", "blackwell"),
+        )
+        self.assertEqual(decision.status, DecisionStatus.NEEDS_HUMAN)
+
     def test_weighted_geometric_speedup(self) -> None:
         cases = (
             InputCase("large", {}, weight=3.0),
@@ -159,6 +228,10 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("do not print source code or a patch", prompt)
         self.assertIn("candidate_metadata.json", prompt)
         self.assertIn("schema_version", prompt)
+        self.assertIn("experiment_kind", prompt)
+        self.assertIn("change_scopes", prompt)
+        self.assertIn("blast_radius", prompt)
+        self.assertIn("Target-supported experiment kinds: promotable, human_review", prompt)
         self.assertIn("source_sha256", prompt)
         self.assertIn("original.py", prompt)
         self.assertIn("final unified diff", prompt)
@@ -467,7 +540,7 @@ class ScoringTest(unittest.TestCase):
         original = "def kernel():\n    return 1\n"
         source = "def kernel():\n    return 2\n"
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "hypothesis": "Reduce repeated work.",
             "evidence": "The profile attributes time to the repeated operation.",
             "change": "Fold the repeated operation in kernel.",
@@ -480,6 +553,17 @@ class ScoringTest(unittest.TestCase):
                 "to the repeated operation."
             ),
             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+            "experiment_kind": "promotable",
+            "change_scopes": ["kernel"],
+            "blast_radius": "local",
+            "changes": [
+                {
+                    "scope": "kernel",
+                    "summary": "Fold the repeated operation in kernel.",
+                    "files": ["candidate.py"],
+                }
+            ],
+            "experiment_payload": {},
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "candidate_metadata.json"
@@ -492,6 +576,8 @@ class ScoringTest(unittest.TestCase):
             self.assertEqual(metadata["hypothesis"], "Reduce repeated work.")
             self.assertEqual(metadata["commit_title"], "Fold repeated work in kernel")
             self.assertIn("Update kernel", metadata["commit_summary"])
+            self.assertEqual(metadata["experiment_kind"], ExperimentKind.PROMOTABLE)
+            self.assertEqual(metadata["blast_radius"], BlastRadius.LOCAL)
 
             stale = dict(payload, source_sha256="0" * 64)
             path.write_text(json.dumps(stale))
@@ -546,6 +632,64 @@ class ScoringTest(unittest.TestCase):
                     source=source,
                     original_source=original,
                 )
+
+            missing_kind = dict(payload)
+            del missing_kind["experiment_kind"]
+            path.write_text(json.dumps(missing_kind))
+            with self.assertRaisesRegex(ValueError, "experiment_kind"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            mismatched_scopes = dict(payload, change_scopes=["config"])
+            path.write_text(json.dumps(mismatched_scopes))
+            with self.assertRaisesRegex(ValueError, "exactly match"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            human_review = dict(
+                payload,
+                experiment_kind="human_review",
+                blast_radius="cross_platform",
+                change_scopes=["compiler"],
+                changes=[
+                    {
+                        "scope": "compiler",
+                        "summary": "Request review of a compiler design.",
+                        "files": [],
+                    }
+                ],
+                experiment_payload={"question": "Which lowering owns this change?"},
+                commit_title="",
+                commit_summary="",
+                source_sha256=hashlib.sha256(original.encode()).hexdigest(),
+            )
+            path.write_text(json.dumps(human_review))
+            metadata = _read_candidate_metadata(
+                path,
+                source=original,
+                original_source=original,
+            )
+            self.assertEqual(metadata["experiment_kind"], ExperimentKind.HUMAN_REVIEW)
+            self.assertEqual(metadata["commit_title"], "")
+
+            ir_ablation = dict(
+                human_review,
+                experiment_kind="ir_override",
+                experiment_payload={"override": "schedule-a"},
+            )
+            path.write_text(json.dumps(ir_ablation))
+            metadata = _read_candidate_metadata(
+                path,
+                source=original,
+                original_source=original,
+            )
+            self.assertEqual(metadata["experiment_kind"], ExperimentKind.IR_OVERRIDE)
 
     def test_codex_prompt_compacts_profile_and_preserves_scope_boundaries(self) -> None:
         request = KernelOptimizationRequest(
@@ -695,6 +839,11 @@ class PriorRunEvidenceTest(unittest.TestCase):
                 {
                     "experiment_id": "r001-c000",
                     "status": "rejected",
+                    "experiment_kind": "ir_override",
+                    "decision": {
+                        "status": "record_signal",
+                        "rationale": "IR override reduced the measured stalls",
+                    },
                     "source_path": "/etc/passwd",
                     "hypothesis": "  remove   a conversion  ",
                     "mutation_summary": "pin consumer layout",
@@ -712,6 +861,8 @@ class PriorRunEvidenceTest(unittest.TestCase):
             self.assertEqual(prior.source_hashes, (source_digest(source),))
             self.assertEqual(prior.experiments[0].hypothesis, "remove a conversion")
             self.assertEqual(prior.experiments[0].aggregate_speedup, 0.99)
+            self.assertEqual(prior.experiments[0].experiment_kind, "ir_override")
+            self.assertEqual(prior.experiments[0].decision_status, "record_signal")
 
     def test_rejects_unsafe_experiment_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -731,6 +882,23 @@ class PriorRunEvidenceTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_human_review_has_distinct_exit_code(self) -> None:
+        performance = _performance(("a", 100.0))
+        result = KernelOptimizationResult(
+            success=True,
+            best_kernel="source",
+            baseline=performance,
+            final=performance,
+            experiments=(),
+            artifacts_dir=Path("/tmp/result"),
+            stopping_reason="human_review_requested",
+            decision=Decision(
+                DecisionStatus.NEEDS_HUMAN,
+                "review compiler scope",
+            ),
+        )
+        self.assertEqual(_result_exit_code(result), 4)
+
     def test_commit_winner_is_enabled_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertTrue(args.commit_winner)
@@ -1108,6 +1276,204 @@ class CommitBodyTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+    def test_ablation_records_signal_without_promoting_or_committing(self) -> None:
+        class RejectCommitter:
+            def commit_promotion(self, experiment, source, baseline, performance):
+                raise AssertionError("an ablation must never be committed")
+
+            def rollback_to_baseline(self, diagnostics):
+                raise AssertionError(f"unexpected rollback: {diagnostics}")
+
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        proposal = CandidateProposal(
+            source=baseline_source,
+            summary="measure an IR scheduling override",
+            hypothesis="the alternate schedule removes a pipeline stall",
+            change_scopes=frozenset({ChangeScope.COMPILER}),
+            experiment_kind=ExperimentKind.IR_OVERRIDE,
+            blast_radius=BlastRadius.COMPILER,
+            changes=(
+                CandidateChange(ChangeScope.COMPILER, "override the scheduled IR"),
+            ),
+            experiment_payload={"override": "test-schedule", "latency_us": 50},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            result = KernelOptimizer(FixedCandidateProvider([proposal])).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("fixtures")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget(
+                        "cuda",
+                        "blackwell",
+                        supported_experiment_kinds=(
+                            ExperimentKind.PROMOTABLE,
+                            ExperimentKind.IR_OVERRIDE,
+                            ExperimentKind.HUMAN_REVIEW,
+                        ),
+                    ),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=output_dir,
+                ),
+                RejectCommitter(),
+            )
+            experiment = result.experiments[-1]
+            payload = json.loads(experiment.experiment_payload_path.read_text())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.best_kernel, baseline_source)
+        self.assertEqual(result.winner_experiment_id, "baseline")
+        self.assertEqual(experiment.status, "signal_recorded")
+        self.assertEqual(experiment.experiment_kind, ExperimentKind.IR_OVERRIDE)
+        self.assertEqual(experiment.decision.status, DecisionStatus.RECORD_SIGNAL)
+        self.assertEqual(experiment.performance.aggregate_speedup, 2.0)
+        self.assertEqual(payload, {"override": "test-schedule", "latency_us": 50})
+        self.assertEqual(result.promotion_commits, ())
+
+    def test_ablation_signal_reaches_next_proposal_without_advancing_best(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        contexts: list[CandidateContext] = []
+        proposals = [
+            CandidateProposal(
+                source=baseline_source,
+                summary="measure an IR override",
+                change_scopes=frozenset({ChangeScope.COMPILER}),
+                experiment_kind=ExperimentKind.IR_OVERRIDE,
+                blast_radius=BlastRadius.COMPILER,
+                changes=(CandidateChange(ChangeScope.COMPILER, "override IR"),),
+                experiment_payload={"override": "schedule-a", "latency_us": 50},
+            ),
+            CandidateProposal(
+                source="LATENCY_US = 80\nCORRECT = True\n",
+                summary="implement the measured schedule",
+            ),
+        ]
+
+        class RecordingProvider:
+            def propose(self, request, context):
+                del request
+                contexts.append(context)
+                return proposals.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(RecordingProvider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("fixtures")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget(
+                        "cuda",
+                        "blackwell",
+                        supported_experiment_kinds=(
+                            ExperimentKind.PROMOTABLE,
+                            ExperimentKind.IR_OVERRIDE,
+                            ExperimentKind.HUMAN_REVIEW,
+                        ),
+                    ),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory),
+                )
+            )
+
+        self.assertEqual(contexts[1].current_source, baseline_source)
+        self.assertIn("ir_override measured 2.0000x", contexts[1].previous_diagnostics[-1])
+        self.assertEqual(result.experiments[1].status, "signal_recorded")
+        self.assertEqual(result.experiments[2].status, "promoted")
+        self.assertEqual(result.best_kernel, "LATENCY_US = 80\nCORRECT = True\n")
+
+    def test_human_review_stops_without_candidate_evaluation_or_vcs(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        baseline = _performance(("a", 100.0))
+        harness = Mock()
+        harness.evaluate.return_value = baseline
+        committer = Mock()
+        proposal = CandidateProposal(
+            source=baseline_source,
+            summary="review a cross-platform compiler change",
+            change_scopes=frozenset({ChangeScope.COMPILER}),
+            experiment_kind=ExperimentKind.HUMAN_REVIEW,
+            blast_radius=BlastRadius.CROSS_PLATFORM,
+            changes=(CandidateChange(ChangeScope.COMPILER, "review compiler design"),),
+            experiment_payload={"question": "Should this change span both backends?"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                optimizer_module,
+                "SubprocessHarness",
+                return_value=harness,
+            ):
+                result = KernelOptimizer(FixedCandidateProvider([proposal])).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source=baseline_source,
+                        harness_path=Path(directory) / "unused.py",
+                        cases=(InputCase("a", {}),),
+                        target=KernelTarget("cuda", "blackwell"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=1,
+                            benchmark_repetitions=2,
+                        ),
+                        output_dir=Path(directory),
+                    ),
+                    committer,
+                )
+
+        self.assertEqual(harness.evaluate.call_count, 1)
+        committer.commit_promotion.assert_not_called()
+        committer.rollback_to_baseline.assert_not_called()
+        self.assertFalse(result.success)
+        self.assertEqual(result.stopping_reason, "human_review_requested")
+        self.assertEqual(result.decision.status, DecisionStatus.NEEDS_HUMAN)
+        self.assertEqual(result.experiments[-1].status, "needs_human")
+        self.assertEqual(
+            result.experiments[-1].decision.status,
+            DecisionStatus.NEEDS_HUMAN,
+        )
+
+    def test_unsupported_ablation_fails_closed(self) -> None:
+        proposal = CandidateProposal(
+            source="LATENCY_US = 50\nCORRECT = True\n",
+            summary="try an unsupported IR override",
+            change_scopes=frozenset({ChangeScope.COMPILER}),
+            experiment_kind=ExperimentKind.IR_OVERRIDE,
+            blast_radius=BlastRadius.COMPILER,
+            changes=(CandidateChange(ChangeScope.COMPILER, "override IR"),),
+            experiment_payload={"override": "schedule-a"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(FixedCandidateProvider([proposal])).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=Path(__file__).with_name("fixtures")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("cuda", "blackwell"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory),
+                )
+            )
+
+        self.assertEqual(result.experiments[-1].status, "failed")
+        self.assertIn(
+            "target does not support experiment kind 'ir_override'",
+            result.experiments[-1].diagnostics,
+        )
+
     def test_prior_source_is_rejected_without_adopting_prior_winner(self) -> None:
         baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
         prior_source = "LATENCY_US = 80\nCORRECT = True\n"
@@ -1301,6 +1667,7 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertIn("native_profiler=unavailable", output)
             self.assertIn("[tlx-agent] final status=revalidated", output)
             self.assertEqual(result.winner_experiment_id, "r001-c001")
+            self.assertEqual(result.decision.status, DecisionStatus.STOP)
             self.assertEqual(result.winner_commit_title, "Use faster latency path")
             self.assertIn("Use the faster path.", result.winner_commit_summary)
             self.assertTrue(result.success)

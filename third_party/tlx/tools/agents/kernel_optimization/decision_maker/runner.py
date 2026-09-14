@@ -73,7 +73,16 @@ def _main() -> int:
     request = json.load(sys.stdin)
     harness = _load_harness(args.harness)
     target = request["target"]
-    build_result = harness.build(request["kernel_source"], target)
+    experiment = request.get("experiment")
+    if experiment is None:
+        build_result = harness.build(request["kernel_source"], target)
+    else:
+        build_experiment = getattr(harness, "build_experiment", None)
+        if build_experiment is None:
+            raise RuntimeError(
+                "non-promotable experiments require harness.build_experiment()"
+            )
+        build_result = build_experiment(request["kernel_source"], target, experiment)
     success, artifact, diagnostics = _normalize_build(build_result)
     response: dict[str, Any] = {
         "build": {"success": success, "diagnostics": diagnostics},

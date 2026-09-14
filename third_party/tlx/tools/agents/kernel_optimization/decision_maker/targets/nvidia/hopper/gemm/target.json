@@ -2,5 +2,6 @@
   "backend": "cuda",
   "architecture": "H100",
   "device": "cuda:0",
-  "environment": {}
+  "environment": {},
+  "supported_experiment_kinds": ["promotable", "human_review"]
 }

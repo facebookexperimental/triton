@@ -26,6 +26,13 @@ class ExperimentKind(str, Enum):
     HUMAN_REVIEW = "human_review"
 
 
+class BlastRadius(str, Enum):
+    LOCAL = "local"
+    MULTI_FILE = "multi_file"
+    COMPILER = "compiler"
+    CROSS_PLATFORM = "cross_platform"
+
+
 class DecisionStatus(str, Enum):
     PROMOTE = "promote"
     RETRY = "retry"
@@ -63,6 +70,10 @@ class KernelTarget:
     environment: Mapping[str, str] = field(default_factory=dict)
     optimization_guidance: str = ""
     optimization_skills: tuple[str, ...] = ()
+    supported_experiment_kinds: tuple[ExperimentKind, ...] = (
+        ExperimentKind.PROMOTABLE,
+        ExperimentKind.HUMAN_REVIEW,
+    )
 
     def __post_init__(self) -> None:
         raw_skills = self.optimization_skills
@@ -76,6 +87,17 @@ class KernelTarget:
             if name not in normalized:
                 normalized.append(name)
         object.__setattr__(self, "optimization_skills", tuple(normalized))
+        if not self.supported_experiment_kinds:
+            raise ValueError("target must support at least one experiment kind")
+        if any(
+            not isinstance(kind, ExperimentKind)
+            for kind in self.supported_experiment_kinds
+        ):
+            raise ValueError("supported_experiment_kinds must contain ExperimentKind values")
+        if len(set(self.supported_experiment_kinds)) != len(
+            self.supported_experiment_kinds
+        ):
+            raise ValueError("supported_experiment_kinds must not contain duplicates")
 
 
 @dataclass(frozen=True)
@@ -109,6 +131,8 @@ class PriorExperimentEvidence:
     change: str = ""
     aggregate_speedup: float | None = None
     diagnostics: str = ""
+    experiment_kind: str = ""
+    decision_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -229,10 +253,35 @@ class PerformanceSummary:
 @dataclass(frozen=True)
 class CandidateSubmission:
     source: str
-    rationale: str
+    summary: str = ""
+    hypothesis: str = ""
+    evidence: str = ""
+    expected_effect: str = ""
+    risk: str = ""
+    commit_title: str = ""
+    commit_summary: str = ""
+    change_scopes: frozenset[ChangeScope] = frozenset({ChangeScope.KERNEL})
     changes: tuple[CandidateChange, ...] = ()
     experiment_kind: ExperimentKind = ExperimentKind.PROMOTABLE
-    blast_radius: str = "local"
+    blast_radius: BlastRadius = BlastRadius.LOCAL
+    experiment_payload: Mapping[str, JsonValue] = field(default_factory=dict)
+    rationale: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.experiment_kind, ExperimentKind):
+            raise ValueError("experiment_kind must be an ExperimentKind")
+        if not isinstance(self.blast_radius, BlastRadius):
+            raise ValueError("blast_radius must be a BlastRadius")
+        if not self.change_scopes or any(
+            not isinstance(scope, ChangeScope) for scope in self.change_scopes
+        ):
+            raise ValueError("change_scopes must contain at least one ChangeScope")
+        if self.summary and self.rationale and self.summary != self.rationale:
+            raise ValueError("summary and rationale must match when both are provided")
+        if self.rationale and not self.summary:
+            object.__setattr__(self, "summary", self.rationale)
+        elif self.summary and not self.rationale:
+            object.__setattr__(self, "rationale", self.summary)
 
 
 @dataclass(frozen=True)
@@ -250,6 +299,11 @@ class ExperimentSummary:
     parent_id: str | None
     status: str
     source_path: Path
+    decision: Decision | None = None
+    experiment_kind: ExperimentKind = ExperimentKind.PROMOTABLE
+    change_scopes: tuple[ChangeScope, ...] = ()
+    blast_radius: BlastRadius = BlastRadius.LOCAL
+    experiment_payload_path: Path | None = None
     incremental_patch_path: Path | None = None
     cumulative_patch_path: Path | None = None
     performance: PerformanceSummary | None = None
@@ -290,6 +344,7 @@ class KernelOptimizationResult:
     experiments: tuple[ExperimentSummary, ...]
     artifacts_dir: Path
     stopping_reason: str
+    decision: Decision | None = None
     winner_experiment_id: str = "baseline"
     winner_commit_title: str = ""
     winner_commit_summary: str = ""

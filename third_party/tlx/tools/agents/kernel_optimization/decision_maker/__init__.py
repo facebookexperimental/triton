@@ -1,5 +1,6 @@
 from .harness import (
     BuildError,
+    ExperimentHarness,
     HarnessExecutionError,
     HarnessTimeoutError,
     KernelHarness,
@@ -11,6 +12,7 @@ from .orchestrator import DecisionMaker, KernelOptimizer
 __all__ = [
     "BuildError",
     "DecisionMaker",
+    "ExperimentHarness",
     "HarnessExecutionError",
     "HarnessTimeoutError",
     "KernelHarness",

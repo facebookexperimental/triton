@@ -20,6 +20,24 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_experiment(
+    kernel_source: str,
+    target: dict[str, Any],
+    experiment: dict[str, Any],
+) -> dict[str, Any]:
+    payload = experiment.get("payload")
+    if not isinstance(payload, dict) or not payload:
+        return {"success": False, "diagnostics": "missing experiment payload"}
+    result = build(kernel_source, target)
+    artifact = result.get("artifact")
+    if result.get("success") and isinstance(artifact, dict):
+        if "latency_us" in payload:
+            artifact["latency_us"] = float(payload["latency_us"])
+        if "correct" in payload:
+            artifact["correct"] = bool(payload["correct"])
+    return result
+
+
 def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     del case
     return {

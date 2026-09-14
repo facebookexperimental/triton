@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from ..contracts import CandidateChange, ChangeScope, ExperimentKind, KernelTarget
+from ..contracts import (
+    BlastRadius,
+    CandidateChange,
+    CandidateSubmission,
+    ChangeScope,
+    ExperimentKind,
+    KernelTarget,
+)
 from ..decision_maker import DecisionMaker, KernelOptimizer
 from ..decision_maker.profiling import native_profiler_for_backend
 from ..decision_maker.targets import expected_cuda_major, resolve_target_paths
@@ -17,12 +24,15 @@ def test_candidate_can_describe_composed_and_experimental_changes() -> None:
         source="kernel source",
         change_scopes=frozenset({ChangeScope.CONFIG, ChangeScope.KERNEL, ChangeScope.COMPILER}),
         experiment_kind=ExperimentKind.IR_OVERRIDE,
+        blast_radius=BlastRadius.COMPILER,
         changes=(
             CandidateChange(ChangeScope.CONFIG, "adjust launch configuration"),
             CandidateChange(ChangeScope.KERNEL, "change data movement"),
             CandidateChange(ChangeScope.COMPILER, "scope the confirmed lowering change"),
         ),
+        experiment_payload={"override": "schedule-a"},
     )
+    assert isinstance(proposal, CandidateSubmission)
     assert proposal.change_scopes == frozenset(ChangeScope)
     assert proposal.experiment_kind is ExperimentKind.IR_OVERRIDE
 

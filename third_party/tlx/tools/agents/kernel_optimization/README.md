@@ -30,12 +30,20 @@ faster. A candidate is promoted only when every protected case passes and the we
 geometric-mean speedup and measurement-variance thresholds are met. Failed unprotected
 cases are retained as diagnostics and excluded from the aggregate speedup.
 
+Every optimizer submission declares an `experiment_kind`, its `change_scopes`, and a
+`blast_radius`. Only `promotable` submissions can update the winner or reach VCS. PTX,
+AMDGCN, and IR-override ablations are evaluated as isolated experiments and recorded as
+signals; a measured signal must be converted into a later promotable implementation.
+`human_review` stops autonomous execution before candidate evaluation. Compiler-scoped or
+non-local promotable submissions are also escalated instead of being applied automatically.
+
 ## Harness contract
 
 A harness is a Python file with these functions:
 
 ```python
 def build(kernel_source: str, target: dict): ...
+def build_experiment(kernel_source: str, target: dict, experiment: dict): ...  # optional
 def verify(build_artifact, case: dict) -> bool | dict: ...
 def benchmark(build_artifact, case: dict, repetitions: int) -> list[float] | dict: ...
 def profile(build_artifact, case: dict) -> dict: ...  # optional
@@ -47,6 +55,11 @@ a bool or `{passed, diagnostics, metrics}`. `benchmark` returns microsecond samp
 `{samples_us, warmup_count, cache_policy}`. `profile` is optional; when present it is
 called after a successful `verify` + `benchmark` pair and its return value (a JSON object)
 is persisted per case.
+
+`build_experiment` is required only when a target opts into `ptx_ablation`,
+`amdgcn_ablation`, or `ir_override`. It receives the declared kind, scopes, blast radius,
+and harness-specific payload. The remaining verification, benchmark, and profile steps use
+the normal authoritative harness path.
 
 The default harness mode is **subprocess isolation** (`decision_maker/runner.py` subprocess per candidate):
 candidate state and imported kernel modules never leak across evaluations. An in-process
@@ -111,6 +124,7 @@ edits fail safely. If final revalidation fails after promotions, the Agent creat
 rollback commit without the winner attribution and keeps the checkpoint commits in history.
 Exit code `3` means a promotion or rollback commit failed. Ordered commit metadata is written
 to `promotion_commits.json`; the compatibility summary remains in `auto_commit.json`.
+Exit code `4` means autonomous execution stopped for human review.
 
 The optimizer reports baseline, every candidate, and final revalidation performance
 to stderr as soon as each evaluation completes. Each line includes status, aggregate
@@ -126,7 +140,9 @@ independently of live progress.
 max_total_seconds, min_speedup, max_cv, benchmark_repetitions}`).
 
 `cases.json` is a list of `{case_id, parameters, weight, protected}` objects. `target.json`
-contains `{backend, architecture, device, environment}`. The harness receives the full
+contains `{backend, architecture, device, environment, supported_experiment_kinds}`. The
+kind list defaults to `promotable` and `human_review`; targets must opt into each supported
+ablation kind. The harness receives the full
 `target` dict (including `environment` merged into `os.environ` for the worker) and each
 `case` dict verbatim.
 
@@ -142,7 +158,7 @@ auto_commit.json             # present when --commit-winner reaches finalization
 artifacts/profile_traces/   # spilled large profile payloads
 experiments/
   baseline/{kernel.py, result.json, profile.json}
-  r001-c000/{kernel.py, incremental.patch, cumulative.patch, result.json, profile.json}
+  r001-c000/{kernel.py, incremental.patch, cumulative.patch, experiment.json, result.json, profile.json}
   r001-c001/...
 ```
 

@@ -2,5 +2,6 @@
   "backend": "cpu",
   "architecture": "host",
   "device": "cpu",
-  "environment": {}
+  "environment": {},
+  "supported_experiment_kinds": ["promotable", "human_review"]
 }

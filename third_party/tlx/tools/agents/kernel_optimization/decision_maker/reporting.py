@@ -12,12 +12,21 @@ from .profiling import compact_profile_summary, extract_native_profiler_duration
 
 
 def report_candidate_summary(experiment_id: str, proposal: object) -> None:
+    experiment_kind = getattr(proposal, "experiment_kind", None)
+    change_scopes = getattr(proposal, "change_scopes", ())
+    blast_radius = getattr(proposal, "blast_radius", None)
     fields = (
         ("hypothesis", getattr(proposal, "hypothesis", "")),
         ("evidence", getattr(proposal, "evidence", "")),
         ("change", getattr(proposal, "summary", "")),
         ("expected", getattr(proposal, "expected_effect", "")),
         ("risk", getattr(proposal, "risk", "")),
+        ("kind", getattr(experiment_kind, "value", experiment_kind)),
+        (
+            "scopes",
+            ",".join(sorted(getattr(scope, "value", str(scope)) for scope in change_scopes)),
+        ),
+        ("blast_radius", getattr(blast_radius, "value", blast_radius)),
     )
     details = " ".join(
         f"{name}={value!r}" for name, value in fields if value

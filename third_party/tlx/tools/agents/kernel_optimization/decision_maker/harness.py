@@ -70,6 +70,18 @@ class KernelHarness(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
 
+@runtime_checkable
+class ExperimentHarness(KernelHarness, Protocol):
+    """Harness extension for explicitly supported non-promotable experiments."""
+
+    def build_experiment(
+        self,
+        kernel_source: str,
+        target: Mapping[str, JsonValue],
+        experiment: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue] | object: ...
+
+
 # ---------------------------------------------------------------------------
 # Subprocess isolation (default)
 # ---------------------------------------------------------------------------
@@ -87,6 +99,7 @@ class SubprocessHarness:
         target: KernelTarget,
         benchmark_repetitions: int,
         profile: bool | ProfileRequest | Mapping[str, Any] = False,
+        experiment: Mapping[str, JsonValue] | None = None,
     ) -> PerformanceSummary:
         request = {
             "kernel_source": kernel_source,
@@ -97,6 +110,7 @@ class SubprocessHarness:
                 profile_request_to_json(profile),
                 to_json_value(target),  # type: ignore[arg-type]
             ),
+            "experiment": dict(experiment) if experiment is not None else None,
         }
         worker_path = Path(__file__).with_name("runner.py")
         environment = os.environ.copy()
@@ -184,6 +198,7 @@ class StandaloneHarness:
         target: KernelTarget,
         benchmark_repetitions: int,
         profile: bool | ProfileRequest | Mapping[str, Any] = False,
+        experiment: Mapping[str, JsonValue] | None = None,
     ) -> PerformanceSummary:
         harness = _load_harness(self.harness_path)
         if not hasattr(harness, "build") or not hasattr(harness, "verify") or not hasattr(harness, "benchmark"):
@@ -198,7 +213,19 @@ class StandaloneHarness:
             profile_request_to_json(profile),
             target_dict,
         )
-        build_result = harness.build(kernel_source, dict(target_dict))  # type: ignore[arg-type]
+        if experiment is None:
+            build_result = harness.build(kernel_source, dict(target_dict))  # type: ignore[arg-type]
+        else:
+            build_experiment = getattr(harness, "build_experiment", None)
+            if build_experiment is None:
+                raise HarnessExecutionError(
+                    "non-promotable experiments require harness.build_experiment()"
+                )
+            build_result = build_experiment(
+                kernel_source,
+                dict(target_dict),
+                dict(experiment),
+            )
         success, artifact, diagnostics = _normalize_build(build_result)
         if not success:
             raise BuildError(str(diagnostics))

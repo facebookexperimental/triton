@@ -8,12 +8,15 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..contracts import (
+    BlastRadius,
     CandidateChange,
+    CandidateSubmission,
     ChangeScope,
     ExperimentKind,
+    JsonValue,
     KernelOptimizationRequest,
     PerformanceSummary,
 )
@@ -51,13 +54,16 @@ TLX API guidance:
 
 The complete current source is available as `candidate.py` in your writable working
 directory. Edit that file directly and leave it as the complete replacement source. Also
-write `candidate_metadata.json` with integer `schema_version` set to 2 and these string
+write `candidate_metadata.json` with integer `schema_version` set to 3 and these string
 fields: `hypothesis`, `evidence`, `change`, `expected_effect`, `risk`, `commit_title`,
-`commit_summary`, and `source_sha256`. `original.py` is an immutable copy of the source you
+`commit_summary`, `experiment_kind`, and `blast_radius`; a `change_scopes` string list, a
+`changes` list of `{scope, summary, files}` objects, an `experiment_payload` object, and
+`source_sha256`. `original.py` is an immutable copy of the source you
 started from. After the final edit, inspect the final unified diff from `original.py` to `candidate.py`
 and base all metadata only on that diff. Set `source_sha256` to the lowercase SHA-256 digest
 of the final `candidate.py` bytes so stale metadata from an earlier edit is rejected.
-The first five fields must each be one line and under 240 characters. `commit_title` must be
+The first five fields must each be one line and under 240 characters. For a promotable
+submission, `commit_title` must be
 an imperative, one-line title under 80 characters that precisely describes the actual
 source change, without performance claims, vague labels such as "Optimize kernel", or
 attribution. `commit_summary` must be under 4000 characters and contain exactly two clearly
@@ -68,25 +74,20 @@ optimization rationale. Do not describe edits absent from the final diff. Do not
 commit subject, a `Performance:` section, `TLX agent authored`, or any unverified
 performance or correctness claim. The external harness adds a formatted `Performance:`
 section with authoritative numbers after final revalidation.
+Use `promotable` only for a source candidate that may become the winner. Use
+`ptx_ablation`, `amdgcn_ablation`, or `ir_override` only when the target explicitly lists
+that kind and put the harness-specific override description in `experiment_payload`; these
+experiments can record evidence but cannot be promoted. Use `human_review` to stop and
+escalate without changing `candidate.py`. For non-promotable submissions, leave
+`commit_title` and `commit_summary` empty. Always describe the real scope and blast radius;
+do not rely on defaults. Valid scopes are `config`, `kernel`, and `compiler`; valid blast
+radii are `local`, `multi_file`, `compiler`, and `cross_platform`.
 Do not modify any other file. Keep the final response to one short plain-text summary;
 do not print source code or a patch.
 """
 
 
-@dataclass(frozen=True)
-class CandidateProposal:
-    source: str
-    summary: str = ""
-    hypothesis: str = ""
-    evidence: str = ""
-    expected_effect: str = ""
-    risk: str = ""
-    commit_title: str = ""
-    commit_summary: str = ""
-    change_scopes: frozenset[ChangeScope] = frozenset({ChangeScope.KERNEL})
-    experiment_kind: ExperimentKind = ExperimentKind.PROMOTABLE
-    blast_radius: str = "local"
-    changes: tuple[CandidateChange, ...] = ()
+CandidateProposal = CandidateSubmission
 
 
 @dataclass(frozen=True)
@@ -147,7 +148,7 @@ class MockLLMProvider:
         return CandidateProposal(source=context.current_source, summary="mock-echo")
 
 
-_METADATA_SCHEMA_VERSION = 2
+_METADATA_SCHEMA_VERSION = 3
 _COMMIT_SUMMARY_RE = re.compile(
     r"\AChange summary:[ \t]*\n?(?P<change>.+?)\n\nWhy:[ \t]*\n?(?P<why>.+)\Z",
     re.DOTALL,
@@ -246,7 +247,7 @@ def _read_candidate_metadata(
     *,
     source: str,
     original_source: str,
-) -> dict[str, str]:
+) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text())
     except FileNotFoundError as error:
@@ -260,18 +261,108 @@ def _read_candidate_metadata(
             f"candidate metadata schema_version must be {_METADATA_SCHEMA_VERSION}"
         )
 
-    metadata: dict[str, str] = {}
-    for field in (*_SHORT_METADATA_FIELDS, "commit_title", "commit_summary"):
+    metadata: dict[str, object] = {}
+    for field in _SHORT_METADATA_FIELDS:
         value = payload.get(field)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"candidate metadata field {field!r} must be non-empty")
         metadata[field] = value.strip()
     for field in _SHORT_METADATA_FIELDS:
-        if "\n" in metadata[field] or len(metadata[field]) > 240:
+        value = str(metadata[field])
+        if "\n" in value or len(value) > 240:
             raise ValueError(f"candidate metadata field {field!r} must be one line under 240 characters")
-        metadata[field] = _clean_short_metadata(metadata[field])
+        metadata[field] = _clean_short_metadata(value)
 
-    title = metadata["commit_title"]
+    try:
+        experiment_kind = ExperimentKind(payload["experiment_kind"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("experiment_kind must name a supported experiment kind") from error
+    try:
+        blast_radius = BlastRadius(payload["blast_radius"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("blast_radius must name a supported blast radius") from error
+
+    raw_scopes = payload.get("change_scopes")
+    if not isinstance(raw_scopes, list) or not raw_scopes:
+        raise ValueError("change_scopes must be a non-empty list")
+    try:
+        change_scopes = frozenset(ChangeScope(scope) for scope in raw_scopes)
+    except (TypeError, ValueError) as error:
+        raise ValueError("change_scopes contains an unsupported scope") from error
+    if len(change_scopes) != len(raw_scopes):
+        raise ValueError("change_scopes must not contain duplicates")
+
+    raw_changes = payload.get("changes")
+    if not isinstance(raw_changes, list) or not raw_changes:
+        raise ValueError("changes must be a non-empty list")
+    changes = []
+    for index, raw_change in enumerate(raw_changes):
+        if not isinstance(raw_change, dict):
+            raise ValueError(f"changes[{index}] must be an object")
+        try:
+            scope = ChangeScope(raw_change["scope"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"changes[{index}].scope is invalid") from error
+        summary = raw_change.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError(f"changes[{index}].summary must be non-empty")
+        files = raw_change.get("files", [])
+        if not isinstance(files, list) or not all(
+            isinstance(file, str) and file.strip() for file in files
+        ):
+            raise ValueError(f"changes[{index}].files must be a string list")
+        changes.append(
+            CandidateChange(
+                scope=scope,
+                summary=_clean_short_metadata(summary),
+                files=tuple(file.strip() for file in files),
+            )
+        )
+    if frozenset(change.scope for change in changes) != change_scopes:
+        raise ValueError("change_scopes must exactly match the scopes in changes")
+
+    experiment_payload = payload.get("experiment_payload")
+    if not isinstance(experiment_payload, dict):
+        raise ValueError("experiment_payload must be an object")
+    if experiment_kind is ExperimentKind.PROMOTABLE and experiment_payload:
+        raise ValueError("promotable submissions must not include experiment_payload")
+    if experiment_kind is not ExperimentKind.PROMOTABLE and not experiment_payload:
+        raise ValueError("non-promotable submissions require experiment_payload")
+
+    metadata.update(
+        experiment_kind=experiment_kind,
+        blast_radius=blast_radius,
+        change_scopes=change_scopes,
+        changes=tuple(changes),
+        experiment_payload=experiment_payload,
+    )
+
+    digest = payload.get("source_sha256")
+    expected_digest = hashlib.sha256(source.encode()).hexdigest()
+    if digest != expected_digest:
+        raise ValueError("candidate metadata source_sha256 does not match candidate.py")
+    metadata["source_sha256"] = expected_digest
+
+    if experiment_kind is ExperimentKind.HUMAN_REVIEW:
+        if source != original_source:
+            raise ValueError("human_review must not modify candidate.py")
+        if payload.get("commit_title", "") or payload.get("commit_summary", ""):
+            raise ValueError("human_review must not provide commit metadata")
+        metadata["commit_title"] = ""
+        metadata["commit_summary"] = ""
+        return metadata
+
+    if experiment_kind is not ExperimentKind.PROMOTABLE:
+        if payload.get("commit_title", "") or payload.get("commit_summary", ""):
+            raise ValueError("ablation submissions must not provide commit metadata")
+        metadata["commit_title"] = ""
+        metadata["commit_summary"] = ""
+        return metadata
+
+    title_value = payload.get("commit_title")
+    if not isinstance(title_value, str) or not title_value.strip():
+        raise ValueError("candidate metadata field 'commit_title' must be non-empty")
+    title = title_value.strip()
     if "\n" in title or len(title) >= 80:
         raise ValueError("commit_title must be one line under 80 characters")
     title = _clean_commit_title(title)
@@ -279,7 +370,10 @@ def _read_candidate_metadata(
         raise ValueError("commit_title is too generic to describe the candidate diff")
     metadata["commit_title"] = title
 
-    summary = metadata["commit_summary"]
+    summary_value = payload.get("commit_summary")
+    if not isinstance(summary_value, str) or not summary_value.strip():
+        raise ValueError("candidate metadata field 'commit_summary' must be non-empty")
+    summary = summary_value.strip()
     if len(summary) >= 4000:
         raise ValueError("commit_summary must be under 4000 characters")
     match = _COMMIT_SUMMARY_RE.fullmatch(summary)
@@ -305,11 +399,6 @@ def _read_candidate_metadata(
         f"Change summary:\n{change_summary}\n\nWhy:\n{why}"
     )
 
-    digest = payload.get("source_sha256")
-    expected_digest = hashlib.sha256(source.encode()).hexdigest()
-    if digest != expected_digest:
-        raise ValueError("candidate metadata source_sha256 does not match candidate.py")
-    metadata["source_sha256"] = expected_digest
     return metadata
 
 
@@ -381,13 +470,18 @@ class CodexCandidateProvider:
         validate_replacement_source(source, context.current_source)
         return CandidateProposal(
             source=source,
-            summary=metadata["change"] or "Codex-edited candidate",
-            hypothesis=metadata["hypothesis"],
-            evidence=metadata["evidence"],
-            expected_effect=metadata["expected_effect"],
-            risk=metadata["risk"],
-            commit_title=metadata["commit_title"],
-            commit_summary=metadata["commit_summary"],
+            summary=cast(str, metadata["change"]) or "Codex-edited candidate",
+            hypothesis=cast(str, metadata["hypothesis"]),
+            evidence=cast(str, metadata["evidence"]),
+            expected_effect=cast(str, metadata["expected_effect"]),
+            risk=cast(str, metadata["risk"]),
+            commit_title=cast(str, metadata["commit_title"]),
+            commit_summary=cast(str, metadata["commit_summary"]),
+            change_scopes=cast(frozenset[ChangeScope], metadata["change_scopes"]),
+            experiment_kind=cast(ExperimentKind, metadata["experiment_kind"]),
+            blast_radius=cast(BlastRadius, metadata["blast_radius"]),
+            changes=cast(tuple[CandidateChange, ...], metadata["changes"]),
+            experiment_payload=cast(dict[str, JsonValue], metadata["experiment_payload"]),
         )
 
 
@@ -404,6 +498,8 @@ def _prior_run_prompt_block(request: KernelOptimizationRequest) -> str:
         )
         lines.append(
             f"- {experiment.experiment_id}: status={experiment.status}, "
+            f"kind={experiment.experiment_kind or 'unknown'}, "
+            f"decision={experiment.decision_status or 'unknown'}, "
             f"speedup={speedup}, hypothesis={json.dumps(experiment.hypothesis)}, "
             f"change={json.dumps(experiment.change)}, "
             f"diagnostics={json.dumps(experiment.diagnostics)}"
@@ -451,6 +547,9 @@ def _build_prompt(
         else ""
     )
     prior_run_block = _prior_run_prompt_block(request)
+    supported_kinds = ", ".join(
+        kind.value for kind in request.target.supported_experiment_kinds
+    )
     return f"""{TLX_PROMPT_PREAMBLE}
 Optimization strategy:
 {OPTIMIZATION_STRATEGY}
@@ -462,6 +561,7 @@ Preserve the public entry points expected by the harness. Make one coherent opti
 that can be diagnosed if it fails.
 
 Target: backend={request.target.backend}, architecture={request.target.architecture}
+Target-supported experiment kinds: {supported_kinds}
 Round: {context.round_index}, candidate: {context.candidate_index}
 Cases:
 {case_lines}
