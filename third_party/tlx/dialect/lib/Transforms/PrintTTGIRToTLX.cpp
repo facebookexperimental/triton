@@ -381,6 +381,21 @@ bool isConstantTrue(Value v) {
   return false;
 }
 
+// Split a memdesc shape into the `num` and `shape` arguments of tlx.local_alloc.
+// A buffer is up to 2-D, so only a rank above that is multi-buffering; this is the
+// same rule analyzeLocalAlloc applies, and the two must agree or an alias and its
+// base describe different buffer counts.
+static void splitAllocShape(ArrayRef<int64_t> shape, int64_t &count,
+                            SmallVectorImpl<int64_t> &tileShape) {
+  if (shape.size() > 2) {
+    count = shape[0];
+    tileShape.assign(shape.begin() + 1, shape.end());
+    return;
+  }
+  count = 1;
+  tileShape.assign(shape.begin(), shape.end());
+}
+
 // Build a lookup map for fast operation name lookup
 llvm::StringMap<StringRef> buildOpNameMap() {
   llvm::StringMap<StringRef> map;
@@ -2030,17 +2045,14 @@ void printSimplifiedOp(
       bool dtypeDiffers = srcType.getElementType() != dstType.getElementType();
       bool shapeDiffers = srcType.getShape() != dstType.getShape();
       if (dtypeDiffers || shapeDiffers) {
-        ArrayRef<int64_t> shape = dstType.getShape();
         Type elemType = dstType.getElementType();
         int64_t count = 1;
         SmallVector<int64_t> actualShape;
-        if (shape.size() >= 2) {
-          count = shape[0];
-          for (size_t i = 1; i < shape.size(); ++i)
-            actualShape.push_back(shape[i]);
-        } else if (shape.size() == 1) {
-          actualShape.push_back(shape[0]);
-        }
+        // This op is legal on shared memory too, so name the storage kind from the
+        // memory space rather than assuming tensor memory.
+        bool isTmem = isa_and_nonnull<ttng::TensorMemorySpaceAttr>(
+            dstType.getMemorySpace());
+        splitAllocShape(dstType.getShape(), count, actualShape);
         // Emit local_alloc with reuse= for dtype or shape changes
         os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         os << "tlx.local_alloc((";
@@ -2051,9 +2063,11 @@ void printSimplifiedOp(
         }
         if (actualShape.size() == 1)
           os << ","; // trailing comma for single-element tuple
-        os << "), " << getElementTypeName(elemType) << ", " << count
-           << ", tlx.storage_kind.tmem, reuse="
-           << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+        os << "), " << getElementTypeName(elemType) << ", " << count;
+        if (isTmem)
+          os << ", tlx.storage_kind.tmem";
+        os << ", reuse=" << getValueName(op->getOperand(0), argSubstitutionMap)
+           << ")";
       } else {
         // Same dtype and shape: emit as alias
         os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
@@ -2070,17 +2084,10 @@ void printSimplifiedOp(
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
     if (auto memDescType =
             dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
-      ArrayRef<int64_t> shape = memDescType.getShape();
       Type elemType = memDescType.getElementType();
       int64_t count = 1;
       SmallVector<int64_t> actualShape;
-      if (shape.size() >= 2) {
-        count = shape[0];
-        for (size_t i = 1; i < shape.size(); ++i)
-          actualShape.push_back(shape[i]);
-      } else if (shape.size() == 1) {
-        actualShape.push_back(shape[0]);
-      }
+      splitAllocShape(memDescType.getShape(), count, actualShape);
       os << "tlx.local_alloc((";
       for (size_t i = 0; i < actualShape.size(); ++i) {
         if (i > 0)
