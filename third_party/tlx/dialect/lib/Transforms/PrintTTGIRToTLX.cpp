@@ -480,6 +480,17 @@ static bool isPythonIdentifier(StringRef s) {
   });
 }
 
+// Whether getValueName spells an element-type cast or erases it: erased when
+// TLX cannot name the dtype, or the operand is `None`. Shared with the resolver.
+static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
+  return castOp && castOp->getNumOperands() > 0 &&
+         castOp->getNumResults() > 0 &&
+         elementTypeCastOps.contains(castOp->getName().getStringRef()) &&
+         isNameableElementType(
+             getElementType(castOp->getResult(0).getType())) &&
+         operandName != "None";
+}
+
 // Get simplified name for a value (just the SSA name)
 // If argSubstitutionMap is provided, substitute block args with their mapped
 // values
@@ -531,31 +542,18 @@ getValueName(Value v,
     // so unlike the layout-only casts below it is re-emitted, inline at each use.
     if (elementTypeCastOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
-      Type resultType = v.getType();
-      if (auto tensorType = dyn_cast<RankedTensorType>(resultType))
-        resultType = tensorType.getElementType();
-      // Only spell the cast when the dtype has a TLX name. getElementTypeName
-      // otherwise falls back to raw MLIR (`f8E4M3FN`), which is not a Triton
-      // dtype; leave those to the transparent list below rather than emit a
-      // call that cannot compile.
-      if (isNameableElementType(resultType)) {
-        std::string operand = getValueName(defOp->getOperand(0),
-                                           argSubstitutionMap, inlineConstants);
-        std::string dtype = getElementTypeName(resultType);
+      std::string operand = getValueName(defOp->getOperand(0),
+                                         argSubstitutionMap, inlineConstants);
+      if (spellsElementTypeCast(defOp, operand)) {
+        std::string dtype = getElementTypeName(getElementType(v.getType()));
         // `.to` is a method on a tensor, so it only works when the operand
         // names one: an inlined constant reaches here as a Python literal and
         // `(0).to(tl.float32)` raises AttributeError at kernel compile time.
-        // tl.cast accepts those, with one exception -- ub.poison prints as
-        // `None`, which tl.cast rejects outright. That value is undefined, so
-        // erasing its cast (below) costs nothing.
-        if (operand == "None") {
-          // fall through to the transparent list
-        } else if (!isPythonIdentifier(operand)) {
+        if (!isPythonIdentifier(operand))
           return "tl.cast(" + operand + ", " + dtype + ")";
-        } else {
-          return operand + ".to(" + dtype + ")";
-        }
+        return operand + ".to(" + dtype + ")";
       }
+      // Otherwise the cast is erased: fall through to the transparent list.
     }
 
     // Layout- and shape-only ops, plus the width/index casts Triton leaves
@@ -965,11 +963,9 @@ static Value resolveThroughNonElementCasts(Value v) {
     StringRef name = op->getName().getStringRef();
     if (!castOpsSet.contains(name) || op->getNumOperands() == 0)
       break;
-    // Stop only where getValueName actually spells the cast. An element cast
-    // to a dtype TLX cannot name is erased there, so walking past it here
-    // keeps the two in agreement and lets the store re-add the conversion.
-    if (elementTypeCastOps.contains(name) &&
-        isNameableElementType(getElementType(v.getType())))
+    // Stop where getValueName spells the cast; walking past one it erased would
+    // report a dtype the emitted name does not carry.
+    if (spellsElementTypeCast(op, getValueName(op->getOperand(0))))
       break;
     v = op->getOperand(0);
   }
@@ -1688,6 +1684,8 @@ void printSimplifiedOp(
       resolvedSrcElemType = resolvedType.getElementType();
 
     os << "tlx.local_store(" << dstName << ", " << srcName;
+    // dstElemType is always nameable: local_store requires src and dst element
+    // types to match, and TT_Float is exactly what isNameableElementType covers.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
@@ -1714,6 +1712,7 @@ void printSimplifiedOp(
 
     os << "tlx.local_store(" << getValueName(dst, argSubstitutionMap) << ", "
        << srcName;
+    // dstElemType is always nameable here, as in ttg.local_store above.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
