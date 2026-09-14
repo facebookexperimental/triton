@@ -297,7 +297,6 @@ def _tdm_copy_view_kernel(input_ptr, other_ptr, output_ptr, row, VIEW: tl.conste
         tl.store(output_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], values)
 
 
-
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 @pytest.mark.parametrize(
     "view, padded",
@@ -323,7 +322,6 @@ def test_tdm_copy_view_correctness_gfx1250(device, view, padded, mode):
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-
 @triton.jit
 def _tdm_reused_descriptor_kernel(input_ptr, output_ptr, FUSED: tl.constexpr):
     first_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(256, 8)], [64, 128])
@@ -342,7 +340,6 @@ def _tdm_reused_descriptor_kernel(input_ptr, output_ptr, FUSED: tl.constexpr):
     tlx.async_amd_descriptor_wait(pendings=0)
     values = tlx.local_load(first) + tlx.local_load(second)
     tl.store(output_ptr + tl.arange(0, 32)[:, None] * 128 + tl.arange(0, 128)[None, :], values)
-
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
