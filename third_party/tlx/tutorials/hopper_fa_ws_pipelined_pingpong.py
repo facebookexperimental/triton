@@ -27,6 +27,8 @@ def _host_descriptor_pre_hook(nargs):
 
 
 _DEFAULT_BLOCK_M = 128
+# Profile-selected on H100 to avoid consumer spills without reducing CTA residency.
+_FWD_CONSUMER_REGISTERS = 240
 _DEFAULT_ROW_SCHEDULE = {
     "ROW_REVERSE_HEAD_GROUP": 0,
     "ROW_REVERSE_MAX": 0,
@@ -99,12 +101,16 @@ def _select_forward_policy(causal, shape, dtype, block_m, num_sms):
 configs = [
     triton.Config(
         {
-            'BLOCK_M': _DEFAULT_BLOCK_M,
-            'BLOCK_N': 128,
-            'NUM_BUFFERS': 2,
-            'NUM_MMA_WARPS': 8,
-            'NUM_MMA_GROUPS': 2,
-        }, num_stages=1, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+            "BLOCK_M": _DEFAULT_BLOCK_M,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS": 2,
+            "NUM_MMA_WARPS": 8,
+            "NUM_MMA_GROUPS": 2,
+        },
+        num_stages=1,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+    ),
 ]
 
 
@@ -295,7 +301,11 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 tile_idx += num_progs
 
         # consumer group
-        with tlx.async_task(num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS, registers=240, replicate=NUM_MMA_GROUPS):
+        with tlx.async_task(
+                num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
+                registers=_FWD_CONSUMER_REGISTERS,
+                replicate=NUM_MMA_GROUPS,
+        ):
             accum_cnt_kv = 0
             cid: tl.constexpr = tlx.async_task_replica_id()
 
@@ -370,7 +380,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                 # -- compute m_i and l_i ----
                 if CAUSAL:
-                    offs_m = (start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT))
+                    offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     if lo + BLOCK_N == hi:
                         offs_n = lo + tl.arange(0, BLOCK_N)
                         qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
@@ -390,7 +400,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # peel the final diagonal tile and apply its mask separately.
                 steady_hi = hi - BLOCK_N if CAUSAL else hi
                 steady_tiles = (steady_hi - (lo + BLOCK_N)) // BLOCK_N
-                paired_hi = (steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi)
+                paired_hi = steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi
                 for kv_idx in tl.range(
                         lo + BLOCK_N,
                         paired_hi,
@@ -433,8 +443,6 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     qk = tlx.async_dot_wait(1, qk)
                     # release the K buffer
                     tlx.barrier_arrive(k_empties[k_buf_id], 1)
-                    if kv_idx + BLOCK_N == hi:
-                        tlx.barrier_arrive(q_empties[cid], 1)
 
                     # -- compute m_i and l_i ----
                     m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -507,6 +515,9 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 p = p.to(tlx.dtype_of(desc_k))
                 acc = tlx.async_dot(p, v_tiles[v_buf_id], acc)
                 acc = tlx.async_dot_wait(1, acc)
+                if not CAUSAL:
+                    if lo + BLOCK_N != hi:
+                        tlx.barrier_arrive(q_empties[cid], 1)
                 inv_l_i = 1.0 / l_i
                 m_i += tl.math.log2(l_i)
                 offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
@@ -891,16 +902,22 @@ class _attention(torch.autograd.Function):
         ctx.grid = grid
         if config is None:
             _attn_fwd_ws_pipelined_pingpong[grid](
-                sm_scale, M,  #
-                q.shape[0], q.shape[1],  #
-                desc_q, desc_k, desc_v, desc_o,  #
+                sm_scale,
+                M,  #
+                q.shape[0],
+                q.shape[1],  #
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,  #
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
                 FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
                 CAUSAL=causal,  #
                 STEADY_UNROLL=steady_unroll,  #
                 **row_schedule,  #
-                **extra_kern_args)
+                **extra_kern_args,
+            )
         else:
             nargs = {
                 **config,
