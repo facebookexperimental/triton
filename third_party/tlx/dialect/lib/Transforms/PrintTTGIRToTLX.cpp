@@ -1431,6 +1431,40 @@ void printLocComment(Operation *op, llvm::raw_ostream &os) {
   os << "\n";
 }
 
+// Emit `s` as a double-quoted Python string literal. Assertion messages carry
+// source text, so they can contain quotes, backslashes and newlines.
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os) {
+  os << '"';
+  for (char c : s) {
+    switch (c) {
+    case '"':
+      os << "\\\"";
+      break;
+    case '\\':
+      os << "\\\\";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      // Bytes >= 0x80 are left alone: they are UTF-8 continuation bytes, and
+      // escaping them individually would turn one character into several.
+      unsigned char b = static_cast<unsigned char>(c);
+      if (b < 0x20 || b == 0x7f)
+        os << llvm::format("\\x%02x", b);
+      else
+        os << c;
+    }
+  }
+  os << '"';
+}
+
 // Resolve an operand of an AttrSizedOperandSegments op by declared position.
 // Absent optional groups have size 0, so positional reads shift.
 static Value getSegmentOperand(Operation *op, unsigned segmentIdx) {
@@ -1597,6 +1631,20 @@ void printSimplifiedOp(
   }
 
   // === Special-case handlers for ops needing custom printing ===
+
+  // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is a
+  // syntax error rather than an undefined name, and it drops the message.
+  if (opName == "tt.assert") {
+    os << "tl.device_assert("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto msgAttr = op->getAttrOfType<StringAttr>("message")) {
+      os << ", ";
+      printPythonStringLiteral(msgAttr.getValue(), os);
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
 
   // tt.get_program_id: emit tl.program_id(axis=N)
   if (opName == "tt.get_program_id") {
