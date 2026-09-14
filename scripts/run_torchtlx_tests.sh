@@ -16,6 +16,8 @@ PY="${PYTHON:-python3}"
 TESTS=(
   python/test/unit/language/test_torchtlx_templates.py
   python/test/unit/language/test_torchtlx_fusions.py
+  python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
+  python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
 )
 BENCH=python/test/tlx_benchmark/test_ops_perf.py
 
@@ -41,7 +43,7 @@ try:
     mode = config.triton.tlx_mode
 except AttributeError:
     sys.exit(f"[torchtlx] torch {torch.__version__} has no config.triton.tlx_mode; "
-             "torchTLX needs PyTorch >= 2.14")
+             "torchTLX needs a PyTorch build with the TorchTLX Inductor changes")
 try:
     import triton.language.extra.tlx.inductor.registry  # noqa: F401
 except ImportError as e:

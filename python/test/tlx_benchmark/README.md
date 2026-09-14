@@ -11,8 +11,8 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `mm`, `flash_attn`, `hstu_attn`, `kda`, `kda_prefill`,
-`kda_decode`.
+`{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`flash_attn`, `hstu_attn`, `kda`, `kda_prefill`, `kda_decode`.
 
 ```
 options:
@@ -46,26 +46,28 @@ options:
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
+| `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
+| `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
 
-Only `mm` has a `heuristic_config`, so it is the only op whose default is a
-single analytically chosen config. The rest autotune a full space on their first
-call, which is minutes rather than seconds; they raise `cap_s` accordingly rather
-than measure a `smoke` space no user takes. Writing a `heuristic_config` for each
-is the real fix and is tracked in the `tlx.ops` module docstring.
+The direct `mm` provider has a `heuristic_config`, so its default is a single
+analytically chosen config. The TorchTLX providers use Inductor's template
+selection and expose `heuristic` as the suite's comparable default label. The
+remaining direct providers autotune a full space on their first call, which is
+minutes rather than seconds; they raise `cap_s` accordingly rather than measure
+a `smoke` space no user takes.
 
-`mm` and `mm_torchtlx` are two providers of the same op over the same shape
-list, so their tables line up row for row: `mm` calls the TLX kernel directly,
-`mm_torchtlx` reaches it through `torch.compile`. The latter forces the TLX
-template (`tlx_mode="force"`) and races it against the same compile with TLX
-off, so `speedup > 1` is exactly "TLX would have won the autotune under
-`tlx_mode="allow"`". It needs `torch >= 2.14` for `config.triton.tlx_mode`, and
-skips cleanly on anything older. A shape where Inductor emits no TLX kernel at
-all is an error row, not a quiet 1.00x.
+The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
+They force the TLX template (`tlx_mode="force"`) and race it against the same
+compile with TLX off, so `speedup > 1` is exactly "TLX would have won the
+autotune under `tlx_mode="allow"`". `mm_torchtlx` covers Blackwell;
+`addmm_torchtlx` and `bmm_torchtlx` cover MI350X. They need `torch >= 2.14` for
+`config.triton.tlx_mode`. A shape where Inductor emits no TLX kernel at all is
+an error row, not a quiet 1.00x.
 
 There is no vendor library for SiLU-scaled ragged attention, so `hstu_attn`
 races the Triton kernel that ships today. The two are not tuned symmetrically --

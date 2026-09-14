@@ -8,8 +8,8 @@
 #
 # Defaults to /data/users/daohang/pytorch, installing into <repo>/.venv-torchsrc.
 # Afterwards, run against that venv's interpreter directly:
-#   .venv-torchsrc/bin/python -m pytest python/test/unit/tlx_ops/...
-#   .venv-torchsrc/bin/python python/test/tlx_benchmark/bench_torchtlx_mm.py
+#   .venv-torchsrc/bin/python -m pytest python/test/unit/tlx_ops/test_torchtlx_*.py
+#   .venv-torchsrc/bin/python -m pytest python/test/tlx_benchmark/test_ops_perf.py -k torchtlx
 #
 # Env knobs: TORCHTLX_VENV, TORCH_CUDA_ARCH_LIST (default 10.0 = B200), MAX_JOBS.
 set -euo pipefail
@@ -99,5 +99,5 @@ import torch._inductor.heuristics.template.tlx as t
 print("loader  ->", t.__file__)
 CHECK
 log "done -- run against it with $PY, e.g."
-log "  $PY -m pytest python/test/unit/tlx_ops/test_torchtlx_mm_sm100.py"
-log "  $PY python/test/tlx_benchmark/bench_torchtlx_mm.py"
+log "  $PY -m pytest python/test/unit/tlx_ops/test_torchtlx_*.py"
+log "  $PY -m pytest python/test/tlx_benchmark/test_ops_perf.py -k torchtlx"

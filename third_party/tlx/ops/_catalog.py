@@ -85,6 +85,24 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        # TorchTLX providers are benchmark/catalog entries rather than public
+        # wrappers: their API is torch.addmm, with TLX selected by Inductor.
+        op="addmm_torchtlx",
+        arch="gfx950",
+        variant="inductor_gfx950_addmm",
+        impl="kernels.addmm.gfx950_torch:addmm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="bmm_torchtlx",
+        arch="gfx950",
+        variant="inductor_gfx950_bmm",
+        impl="kernels.bmm.gfx950_torch:bmm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
