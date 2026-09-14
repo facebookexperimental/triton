@@ -4,7 +4,9 @@ import torch
 import torch.nn.functional as F
 from triton._internal_testing import is_blackwell
 
-pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.kimi_delta_attention is sm100-only today")
+# Blackwell-only (B200/GB200/GB300): device capability and CUDA version floors
+# are enforced by the build's arch generation, not by this test.
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.kimi_delta_attention is Blackwell-only")
 
 torch.manual_seed(0)
 
