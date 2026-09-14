@@ -91,7 +91,10 @@ if is_hopper_or_newer():
     from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
         attention as _hopper_fa_ws_pipelined_pingpong_persistent, )
     from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
-        attention as _hopper_fa_ws_pipelined_pingpong, )
+        _select_forward_policy as _hopper_fa_select_forward_policy,
+        _select_row_schedule as _hopper_fa_select_row_schedule,
+        attention as _hopper_fa_ws_pipelined_pingpong,
+    )
     from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
         attention as _hopper_fa_ws_pipelined, )
     from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
@@ -1139,6 +1142,122 @@ def test_hopper_fa_ws_pipelined():
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
         tri_out = _hopper_fa_ws_pipelined(q, k, v, sm_scale, config=config)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
+def test_hopper_fa_ws_pipelined_pingpong_row_schedule_policy():
+    disabled = _hopper_fa_select_row_schedule(False, 4096, 128)
+    assert disabled == {
+        "ROW_REVERSE_HEAD_GROUP": 0,
+        "ROW_REVERSE_MAX": 0,
+        "ROW_AFFINE_MUL": 1,
+        "ROW_AFFINE_ADD": 0,
+        "ROW_AFFINE_MOD": 0,
+        "ROW_SWAP_SRC_0": 0,
+        "ROW_SWAP_SRC_1": 0,
+        "ROW_SWAP_XOR": 0,
+    }
+
+    for n_ctx, reverse_max in ((1024, 7), (2048, 15)):
+        schedule = _hopper_fa_select_row_schedule(True, n_ctx, 128)
+        assert schedule["ROW_REVERSE_HEAD_GROUP"] == 1
+        assert schedule["ROW_REVERSE_MAX"] == reverse_max
+        assert schedule["ROW_AFFINE_MOD"] == 0
+
+    affine = _hopper_fa_select_row_schedule(True, 4096, 128)
+    assert affine == {
+        "ROW_REVERSE_HEAD_GROUP": 0,
+        "ROW_REVERSE_MAX": 0,
+        "ROW_AFFINE_MUL": 5,
+        "ROW_AFFINE_ADD": 29,
+        "ROW_AFFINE_MOD": 32,
+        "ROW_SWAP_SRC_0": 7,
+        "ROW_SWAP_SRC_1": 15,
+        "ROW_SWAP_XOR": 8,
+    }
+
+    pairwise_reverse = _hopper_fa_select_row_schedule(True, 8192, 128)
+    assert pairwise_reverse["ROW_REVERSE_HEAD_GROUP"] == 2
+    assert pairwise_reverse["ROW_REVERSE_MAX"] == 63
+    assert pairwise_reverse["ROW_AFFINE_MOD"] == 0
+
+    explicit_config = _hopper_fa_select_row_schedule(True, 4096, 256)
+    assert explicit_config["ROW_REVERSE_HEAD_GROUP"] == 1
+    assert explicit_config["ROW_REVERSE_MAX"] == 15
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
+def test_hopper_fa_ws_pipelined_pingpong_launch_policy():
+    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(
+        True, (4, 48, 2048, 128), torch.bfloat16, 128, 132
+    )
+    assert steady_unroll == 1
+    assert target_workers == 132
+
+    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(
+        True, (4, 48, 4096, 128), torch.bfloat16, 128, 132
+    )
+    assert steady_unroll == 1
+    assert target_workers == 131
+
+    _, _, target_workers = _hopper_fa_select_forward_policy(
+        True, (4, 48, 4096, 128), torch.bfloat16, 128, 120
+    )
+    assert target_workers == 120
+
+    for causal, dtype, shape in (
+        (False, torch.bfloat16, (4, 48, 4096, 128)),
+        (True, torch.float16, (4, 48, 4096, 128)),
+        (True, torch.bfloat16, (4, 8, 4096, 128)),
+    ):
+        _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(
+            causal, shape, dtype, 128, 132
+        )
+        assert steady_unroll == 2
+        assert target_workers == 132
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
+def test_hopper_fa_ws_pipelined_pingpong_row_mapping_equivalence():
+
+    def legacy_mapping(num_rows, source_m, off_hz):
+        mapped_m = source_m
+        if num_rows in (8, 16) and (off_hz & 1) != 0:
+            mapped_m = num_rows - 1 - mapped_m
+        if num_rows == 64 and ((off_hz // 2) & 1) != 0:
+            mapped_m = 63 - mapped_m
+        if num_rows == 32:
+            mapped_m = (mapped_m * 5 + 29) % 32
+            if source_m in (7, 15):
+                mapped_m ^= 8
+        return mapped_m
+
+    def parameterized_mapping(schedule, source_m, off_hz):
+        mapped_m = source_m
+        reverse_head_group = schedule["ROW_REVERSE_HEAD_GROUP"]
+        if reverse_head_group != 0 and ((off_hz // reverse_head_group) & 1) != 0:
+            mapped_m = schedule["ROW_REVERSE_MAX"] - mapped_m
+        affine_mod = schedule["ROW_AFFINE_MOD"]
+        if affine_mod != 0:
+            affine_source_m = mapped_m
+            mapped_m = (
+                affine_source_m * schedule["ROW_AFFINE_MUL"]
+                + schedule["ROW_AFFINE_ADD"]
+            ) % affine_mod
+            if schedule["ROW_SWAP_XOR"] != 0 and affine_source_m in (
+                schedule["ROW_SWAP_SRC_0"],
+                schedule["ROW_SWAP_SRC_1"],
+            ):
+                mapped_m ^= schedule["ROW_SWAP_XOR"]
+        return mapped_m
+
+    for num_rows in (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65):
+        schedule = _hopper_fa_select_row_schedule(True, num_rows * 128, 128)
+        for source_m in range(num_rows):
+            for off_hz in range(128):
+                assert parameterized_mapping(schedule, source_m, off_hz) == legacy_mapping(
+                    num_rows, source_m, off_hz
+                )
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
