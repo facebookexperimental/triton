@@ -4,6 +4,7 @@
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -882,6 +883,7 @@ struct TMAStagingGroup {
   Value desc;
   Operation *origLoad = nullptr;
   int producerTask = -1;
+  Block *producerBlock = nullptr;
   SmallVector<unsigned> indices;
 };
 
@@ -1419,7 +1421,8 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                                   SmallVector<Channel *> &channels) {
   DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
-  // TMA staging buffers: group per (descriptor, original load) so dk slices
+  // TMA staging buffers: group per (descriptor, original load, producer block)
+  // so dk slices
   // share one id, dv slices another, dq reduce slices a third, etc. The
   // original-load component (the source tmem_load / accumulator, reached via
   // findOriginalLoadForChannel — the same discriminator the loadGroups path
@@ -1452,9 +1455,12 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
         Channel *channel = findChannelForOp(buf.allocOp, channels);
         Operation *origLoad = findOriginalLoadForChannel(channel);
         int producerTask = origLoad || !channel ? -1 : channel->relation.first;
+        Operation *producer = channel ? channel->getSrcOp() : nullptr;
+        Block *producerBlock = producer ? producer->getBlock() : nullptr;
         auto it = llvm::find_if(tmaStagingGroups, [&](const auto &group) {
           return group.desc == desc && group.origLoad == origLoad &&
-                 group.producerTask == producerTask;
+                 group.producerTask == producerTask &&
+                 group.producerBlock == producerBlock;
         });
         if (it == tmaStagingGroups.end()) {
           tmaStagingGroups.emplace_back();
@@ -1462,6 +1468,7 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
           it->desc = desc;
           it->origLoad = origLoad;
           it->producerTask = producerTask;
+          it->producerBlock = producerBlock;
         }
         it->indices.push_back(i);
       }
@@ -1499,7 +1506,7 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
 
   for (auto &group : tmaStagingGroups)
     mergeGroup(group.indices,
-               "TMA staging per-(descriptor,load-or-task) fusion");
+               "TMA staging per-(descriptor,load-or-task,block) fusion");
 }
 
 /// Phase 3.7: Iterative copy increase for fused P2_Other groups.
@@ -1523,6 +1530,17 @@ static unsigned getStagingCopiesCap() {
   return n < 1 ? 0u : static_cast<unsigned>(n);
 }
 
+// Optional copy target for TMA-reduce staging. Unlike the general
+// staging cap, this may exceed the loop pipeline depth: the output reduction
+// ring is drained by TMA store waits independently of the GEMM pipeline.
+static unsigned getTmaReduceStagingCopies() {
+  auto v = triton::tools::getStrEnv("TRITON_WS_TMA_REDUCE_STAGING_COPIES");
+  if (v.empty())
+    return 0;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 0u : static_cast<unsigned>(n);
+}
+
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
                                         unsigned numBuffers,
@@ -1530,6 +1548,9 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
   if (unsigned cap = getStagingCopiesCap())
     numBuffers = std::min(numBuffers, cap);
+  unsigned tmaReduceNumBuffers = numBuffers;
+  if (unsigned copies = getTmaReduceStagingCopies())
+    tmaReduceNumBuffers = copies;
   // Eligible priority tiers, in the order Phase 3.7 should try to bump them.
   static const WSBufferPriority kPhase45Order[] = {
       WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
@@ -1623,6 +1644,8 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       unsigned currentCopies = wsBuffers[indices[0]].numCopies;
       unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
       unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
+      unsigned targetNumBuffers =
+          firstTmaStaging == 2 ? tmaReduceNumBuffers : numBuffers;
 
       // Defensive K | S cap for same-partition (wait_group-drained) TMA
       // staging. Such staging rotates S = indices.size() subtiles through K =
@@ -1665,13 +1688,13 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
            << " groupSize=" << indices.size() << " perAllocSize=" << firstSize
            << " tmaStaging=" << firstTmaStaging << " currentCopies="
            << currentCopies << " anyCrossStage=" << anyCrossStage
-           << " \u2014 will try bumping to numBuffers=" << numBuffers);
+           << " \u2014 will try bumping to numBuffers=" << targetNumBuffers);
 
-      if (currentCopies >= numBuffers) {
-        LDBG("Phase 3.7:   bufferId=" << bufferId
-                                      << " currentCopies=" << currentCopies
-                                      << " already >= numBuffers=" << numBuffers
-                                      << " \u2014 no room to bump");
+      if (currentCopies >= targetNumBuffers) {
+        LDBG("Phase 3.7:   bufferId="
+             << bufferId << " currentCopies=" << currentCopies
+             << " already >= numBuffers=" << targetNumBuffers
+             << " \u2014 no room to bump");
         continue;
       }
 
@@ -1686,7 +1709,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
              << " — wait_group rotation may be unsafe");
 
       unsigned tryCopies = currentCopies + 1;
-      while (tryCopies <= numBuffers) {
+      while (tryCopies <= targetNumBuffers) {
         if (!reusedGroupFitsHosts(tryCopies)) {
           LDBG("Phase 3.7:     bufferId="
                << bufferId << " copies=" << tryCopies
@@ -1849,7 +1872,8 @@ static bool isOrderedDescriptorReuseTarget(const WSBuffer &candidate,
   Channel *targetChannel = findChannelForOp(target.allocOp, channels);
   Channel *candidateChannel = findChannelForOp(candidate.allocOp, channels);
   if (!targetChannel || !candidateChannel ||
-      !isa<ttnvws::DescriptorLoadOp>(targetChannel->getSrcOp()))
+      !isa<tt::DescriptorLoadOp, ttnvws::DescriptorLoadOp>(
+          targetChannel->getSrcOp()))
     return false;
 
   Operation *candidateProducer = getLogicalProducerOp(candidateChannel);
@@ -1927,19 +1951,22 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
       continue;
     }
 
-    // Landing on a host that stays live across the inner loop is only safe
-    // for a TMA-staging candidate: code partition (Step 7.5) emits the WAR
-    // token that keeps the next iteration's producer off the host's SMEM
-    // while the staging store drains. A non-staging candidate (e.g. an
-    // epilogue bias load) gets no such guard, so aliasing it onto an operand
-    // the inner loop is still reading silently corrupts that operand. This
-    // mirrors the candidate-side filter in Phase 3.6.
-    if (candidate.tmaStaging == 0 &&
-        isSmemLiveAcrossInnerLoop(buf.allocOp, channels)) {
+    // Landing on a host that stays live across the inner loop is restricted to
+    // TMA staging reusing a descriptor-loaded operand. Step 7.5 protects this
+    // producer/consumer pattern across persistent-loop iterations. It does not
+    // make arbitrary inner-loop scratch safe to reuse; for example, dV staging
+    // must not overwrite dS while later dK/dQ MMAs still read it.
+    Channel *targetChannel = findChannelForOp(buf.allocOp, channels);
+    bool isDescriptorOperand =
+        targetChannel && isa<tt::DescriptorLoadOp, ttnvws::DescriptorLoadOp>(
+                             targetChannel->getSrcOp());
+    if ((buf.isInnermost || isSmemLiveAcrossInnerLoop(buf.allocOp, channels)) &&
+        (candidate.tmaStaging == 0 || !isDescriptorOperand)) {
       LDBG("  findReuseCandidate: target bufferId="
            << buf.bufferId
-           << " is live across the inner loop and candidate bufferId="
-           << candidate.bufferId << " is not TMA staging — skip");
+           << " is live across the inner loop but is not a descriptor operand "
+              "eligible for TMA-staging reuse by candidate bufferId="
+           << candidate.bufferId << " — skip");
       continue;
     }
 
@@ -5585,7 +5612,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   // If two buffers are sharing a multi-staged alloc, the liveness can overlap,
   // otherwise, the liveness can't overlap.
 
-  // Check for per-loop SMEM allocation attributes on the WS ForOp.
+  // Check for per-loop SMEM allocation attributes on the WS loop.
   // These override the pass-level defaults, following the same pattern
   // as tt.tmem_alloc_algo.
   // Env override so every caller (combined WarpSpecialization pass and the
@@ -5598,20 +5625,19 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = options.smemCircularReuse;
   bool hasSmemAllocAlgoAttr = false;
-  funcOp->walk([&](scf::ForOp forOp) {
-    if (!forOp->hasAttr("tt.warp_specialize"))
+  funcOp->walk([&](LoopLikeOpInterface wsLoop) {
+    if (!wsLoop->hasAttr(tt::kWarpSpecializeAttrName))
       return;
-    // Walk from the WS ForOp up through parent ForOps, collecting
-    // attributes. The innermost (WS) loop has highest priority.
-    SmallVector<scf::ForOp> loopChain;
-    loopChain.push_back(forOp);
-    for (auto parent = forOp->getParentOfType<scf::ForOp>(); parent;
-         parent = parent->getParentOfType<scf::ForOp>()) {
-      loopChain.push_back(parent);
-    }
+    // Walk from the WS loop up through parent loops, collecting attributes.
+    // CLC persistent loops remain scf.while here, while countable loops are
+    // commonly represented as scf.for. The innermost WS loop has priority.
+    SmallVector<Operation *> loopChain;
+    for (Operation *loop = wsLoop; loop; loop = loop->getParentOp())
+      if (isa<LoopLikeOpInterface>(loop))
+        loopChain.push_back(loop);
     // Apply from outermost to innermost (innermost wins).
     for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
-      auto loop = *it;
+      Operation *loop = *it;
       if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo")) {
         effectiveSmemAllocAlgo = attr.getInt();
         hasSmemAllocAlgoAttr = true;

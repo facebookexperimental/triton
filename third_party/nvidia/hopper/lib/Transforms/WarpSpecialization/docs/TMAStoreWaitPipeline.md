@@ -43,13 +43,14 @@ The flag drives a special path through three phases:
 
 ### Phase 3.5: TMA Staging Fusion
 
-TMA staging WSBuffers are merged by descriptor and originating load (via
-`fuseEpilogueWSBuffers`). If the originating load cannot be traced, as with
+TMA staging WSBuffers are merged by descriptor, originating load, and producer
+basic block (via `fuseEpilogueWSBuffers`). If the originating load cannot be traced, as with
 Hopper register accumulators, the producer task is used instead. For example,
 the 4 same-task subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all
 share one `bufferId`, as do the dk and dv subtile stagings (each per their own
 descriptor). Different data-partition tasks targeting the same descriptor stay
-in distinct buffers.
+in distinct buffers. Sibling loops also stay distinct because each
+multi-buffered staging ring must rotate from one loop-local accumulation counter.
 
 The shared `bufferId` is honored by `doCodePartition` downstream: the
 subtile allocs are physically merged into one `local_alloc` of shape
@@ -123,6 +124,13 @@ Phase 3.7 therefore reserves output staging only from the budget remaining
 after these operand correctness floors. Ordinary single-group MMA operands and
 TMA-fed metadata used only by elementwise computation remain discretionary, so
 FA-backward dQ/dK/dV staging stays prioritized over their extra copies.
+
+`TRITON_WS_TMA_REDUCE_STAGING_COPIES=K` independently sets the copy target for
+TMA-reduce staging. It may exceed `num_stages`, because the output
+reduction ring is drained by TMA store waits and can overlap stores without
+increasing the operand/GEMM pipeline depth. The normal SMEM-budget and `K | S`
+safety checks still apply. Other output staging remains bounded by
+`num_stages`.
 
 Groups whose members all reuse another allocation (`isAllocated=false`) are
 bumped only when every Phase 3.6 host has enough physical capacity for the

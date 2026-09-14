@@ -162,13 +162,22 @@ handled by the ordinary same-task reuse machinery and must NOT be collapsed
 For a data-partitioned epilogue (`tt.data_partition_factor > 1`) with
 `early_tma_store_lowering`, every partition's TMA-store staging buffer targets the
 **same** descriptor. `WSMemoryPlanner.cpp` `fuseEpilogueWSBuffers` therefore keys
-the TMA-staging fusion on `(descriptor, originalLoad)` — `originalLoad` traces the
-`local_store` source back to the originating `ttng.tmem_load` / accumulator. When
+the TMA-staging fusion on `(descriptor, originalLoad, producerBlock)` —
+`originalLoad` traces the `local_store` source back to the originating
+`ttng.tmem_load` / accumulator. When
 that trace is unavailable for a Hopper register accumulator, the key uses the
 producer task instead. Thus two data partitions get **distinct** `buffer.id`s
 instead of sharing one physical buffer + barrier (which aliases concurrent
-partitions → corruption + deadlock), while same-task subtiles still fuse. This
-mirrors the non-staging `loadGroups` discriminator.
+partitions → corruption + deadlock), while same-task subtiles still fuse. The
+producer block also keeps sibling-loop staging rings distinct: a multi-buffered
+ring uses a loop-local accumulation counter and cannot span basic blocks. This
+mirrors the non-staging `loadGroups` discriminator and the A1 reuse-group
+invariant.
+
+When staging reuses an inner-loop or loop-spanning buffer, the planner restricts
+the target to a descriptor-loaded operand, the pattern protected by the
+persistent cross-tile WAR token. Arbitrary loop scratch is excluded; for
+example, dV staging cannot alias dS while later dK/dQ MMAs still read dS.
 
 ## What Reuse Groups Affect
 
