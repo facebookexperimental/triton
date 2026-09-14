@@ -211,10 +211,11 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   }
   // Ops without a built-in pred operand: wrap in scf.if.
   //
-  // Synchronous descriptor loads/gathers and the TMA "store" family have no
-  // mask/pred operand, so they cannot be masked in place. They must be
-  // predicated when the pipeliner peels prologue/epilogue iterations of a
-  // dynamic loop. Guard them with scf.if(pred); result-producing operations
+  // Synchronous descriptor loads/gathers, descriptor stores/reductions/
+  // scatters, and the TMA "store" family have no mask/pred operand, so they
+  // cannot be masked in place. They must be predicated when the pipeliner
+  // peels prologue/epilogue iterations of a dynamic loop. Guard them with
+  // scf.if(pred); result-producing operations
   // yield poison on the inactive path because their consumers are predicated
   // by the same pipeline-stage condition.
   //
@@ -225,8 +226,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   // those are masked in place and never need the scf.if wrapper. An nvws load
   // arriving here would hit the "doesn't know how to predicate" error below
   // rather than being silently mishandled.
-  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
-          ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op) ||
+      isa<tt::DescriptorStoreLikeOpInterface>(op) ||
+      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
           ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
@@ -456,9 +458,9 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
 bool mlir::triton::canPipelineTMALoad(Operation *op) {
   auto tensorTy = cast<RankedTensorType>(op->getResultTypes()[0]);
   auto sharedEncoding = getSharedEncoding(op);
-  int64_t stageSizeInBits = product(ttg::getAllocationShapePerCTA(
-                                sharedEncoding, tensorTy.getShape())) *
-                            tensorTy.getElementTypeBitWidth();
+  int64_t stageSizeInBits =
+      ttg::getAllocationElems(sharedEncoding, tensorTy.getShape()) *
+      tensorTy.getElementTypeBitWidth();
   return stageSizeInBits % (ttng::TMA_ALIGN * 8) == 0;
 }
 

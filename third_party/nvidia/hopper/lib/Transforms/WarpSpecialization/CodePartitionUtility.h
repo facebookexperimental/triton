@@ -450,6 +450,26 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
 // Returns true otherwise (explicit synchronization needed).
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 
+// Packed start column of a TMEM allocation within its reuse group's physical
+// slot. Reusers carry `buffer.offset`; the group's space owner has no such
+// attribute and starts at column 0.
+int64_t getTmemBufferOffset(Operation *allocOp);
+
+// The `[begin, end)` TMEM column range `allocOp` occupies within that slot.
+// Reuse-group membership is what makes two ranges comparable: members share one
+// physical allocation, so intersecting column ranges mean the same storage.
+std::pair<int64_t, int64_t> getTmemColumnRange(Operation *allocOp);
+// Same, for a channel's allocation. A TMEM reuse channel always has one.
+std::pair<int64_t, int64_t> getTmemColumnRange(Channel *channel);
+
+// Whether two TMEM allocations in the same reuse group occupy overlapping
+// columns. Callers must have established that they share a physical slot.
+bool tmemColumnRangesOverlap(Operation *allocA, Operation *allocB);
+// Same, for ranges already obtained from getTmemColumnRange, so a loop over
+// siblings can hoist the invariant side out.
+bool tmemColumnRangesOverlap(std::pair<int64_t, int64_t> rangeA,
+                             std::pair<int64_t, int64_t> rangeB);
+
 // Returns true when `ownerCh` is the space owner of a reuse group and its
 // producer overwrites the whole physical allocation before writing, not just
 // its logical slice. Packed sibling slices can be clobbered by such a producer,

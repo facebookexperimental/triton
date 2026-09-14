@@ -498,15 +498,11 @@ private:
     if (!alloc || !alloc.isSharedMemoryAlloc())
       return;
     auto allocType = alloc.getType();
-    int64_t numElems = 0;
-    if (auto paddedEnc =
-            dyn_cast<ttg::PaddedSharedEncodingAttr>(allocType.getEncoding())) {
-      SmallVector<int64_t> unpaddedShape = ttg::getShapePerCTA(allocType);
-      numElems = paddedEnc.getPaddedSize(unpaddedShape);
-    } else {
-      auto shapePerCTA = ttg::getAllocationShapePerCTA(allocType);
-      numElems = product<int64_t>(shapePerCTA);
-    }
+    int64_t numElems =
+        ttg::getAllocationElems(allocType.getEncoding(), allocType.getShape(),
+                                allocType.getAllocShape());
+    if (auto padded = ttg::getPaddedEncoding(allocType.getEncoding()))
+      numElems = padded.getPaddedSize({numElems});
     int64_t bytes = numElems * allocType.getElementTypeBitWidth() / 8;
 
     auto alignment = alloc.getAlignmentOrDefault();
@@ -1386,15 +1382,10 @@ static bool isSmemLiveAcrossInnerLoop(Operation *alloc,
 /// Compute the byte size for a local_alloc op.
 static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
   auto allocType = alloc.getType();
-  int64_t numElems = 0;
-  if (auto paddedEnc =
-          dyn_cast<ttg::PaddedSharedEncodingAttr>(allocType.getEncoding())) {
-    SmallVector<int64_t> unpaddedShape = ttg::getShapePerCTA(allocType);
-    numElems = paddedEnc.getPaddedSize(unpaddedShape);
-  } else {
-    auto shapePerCTA = ttg::getAllocationShapePerCTA(allocType);
-    numElems = product<int64_t>(shapePerCTA);
-  }
+  int64_t numElems = ttg::getAllocationElems(
+      allocType.getEncoding(), allocType.getShape(), allocType.getAllocShape());
+  if (auto padded = ttg::getPaddedEncoding(allocType.getEncoding()))
+    numElems = padded.getPaddedSize({numElems});
   return static_cast<unsigned>(numElems * allocType.getElementTypeBitWidth() /
                                8);
 }

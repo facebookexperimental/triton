@@ -82,9 +82,12 @@ validated.
 
 Candidate generation automatically receives trusted source-optimization skills
 owned by `third_party/tlx/tools/agents/kernel_optimization/skills/`: every target
-receives layout-conversion efficiency guidance, CUDA/NVIDIA targets additionally
-receive async TMA output publication guidance, and Blackwell targets additionally
-receive persistent CLC scheduling and persistent pipeline efficiency guidance.
+receives layout-conversion efficiency guidance, while CUDA/NVIDIA targets also
+receive async TMA output publication and warp-barrier efficiency guidance. Known
+Hopper and Blackwell targets additionally receive NVIDIA persistent pipeline
+efficiency guidance, and Blackwell targets also receive persistent CLC scheduling
+guidance. Unknown NVIDIA architectures receive the common NVIDIA guidance but
+require an explicit allowlist update before receiving persistent pipeline guidance.
 Canonical profiling workflow documentation lives under
 `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/` and is not
 injected as source guidance. Keep workload-specific
@@ -110,6 +113,31 @@ configured round budget after an unpromoted round. Reject incorrect, duplicate,
 unstable, and materially regressing candidates.
 
 ## Layer 2: Profiling Request And Artifacts
+
+The optimizer sends a profile request for the baseline (deep), every
+correctness-passing candidate (summary, escalated to deep near the promotion
+threshold), and the finalist (deep). Profiling is always on; the `--profile`
+flag is vestigial. Every request carries `tools=["proton_launch",
+"native_profiler"]`, where `native_profiler` resolves to `ncu` on CUDA/NVIDIA
+targets automatically. Pass `--diagnostic-proton-intra-kernel` to additionally
+collect warp-granularity Proton instrumentation traces for the baseline and
+final winner only (diagnostic-only: never benchmark, promote, or commit
+instrumented source or timing).
+
+These requests produce data only if the bundle's `harness.py::profile()`
+implements them. A stub that repackages endpoint timings yields
+`ncu=unavailable` and zeroed `proton.*` fields on every line, and all
+hypotheses degrade to endpoint latency plus source inspection. Before
+launching, verify the harness profile path end to end:
+
+- Proton launch attribution: follow
+  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/proton.md`
+  and return `profile()["proton"]` with nonzero `main_kernel_us` for the
+  expected kernel launch.
+- Target counters: follow
+  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`
+  (CUDA/NVIDIA) and return `profile()["ncu"]` with non-null summary duration.
+  Report unsupported counters as JSON `null` with a diagnostic, never as zero.
 
 Harnesses that implement `profile` should accept a structured request with:
 

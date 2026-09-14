@@ -44,6 +44,10 @@ def PT_RecordOp : PT_Op<"record", [
     OpBuilder<(ins "bool":$isStart, "StringAttr":$name), [{
       build($_builder, $_state, isStart, name,
             /*predicate=*/static_cast<mlir::Value>(nullptr));
+    }]>,
+    OpBuilder<(ins "UnitAttr":$isStart, "StringAttr":$name), [{
+      build($_builder, $_state, isStart, name,
+            /*predicate=*/static_cast<mlir::Value>(nullptr));
     }]>
   ];
 

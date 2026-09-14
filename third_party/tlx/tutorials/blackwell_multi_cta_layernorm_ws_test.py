@@ -360,7 +360,6 @@ def _torch_layernorm_impl(x, weight, bias, eps=1e-5):
     return torch.nn.functional.layer_norm(x, (x.shape[-1], ), weight, bias, eps)
 
 
-torch_layernorm = torch.compile(_torch_layernorm_impl)
 @pytest.mark.parametrize("M,N", [(4, 16384), (1152, 16384), (1024, 16384), (1024, 32768)])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_op(M, N, dtype):
@@ -370,7 +369,8 @@ def test_op(M, N, dtype):
     bias = torch.randn(N, device=DEVICE, dtype=dtype)
     eps = 1e-5
 
-    output_torch = torch_layernorm(x, weight, bias, eps)
+    # Keep correctness validation independent of PT2 compiler-cache availability.
+    output_torch = _torch_layernorm_impl(x, weight, bias, eps)
     output_triton, _, _ = multi_cta_layernorm_ws(x, weight, bias, eps)
 
     rtol = atol = 1e-2 if dtype == torch.float16 else 1e-3

@@ -31,6 +31,7 @@ def judge(
     compile_stat: Optional[CompileStat] = None,
     correct: Optional[bool] = None,
     accuracy_note: str = "",
+    floor_tflops: Optional[float] = None,
 ) -> Result:
     # Precedence is the README's order: error, pip, noisy, ok. pip ahead of noisy is
     # deliberate -- a shape that is slow AND jittery is the one most worth seeing, and
@@ -64,6 +65,17 @@ def judge(
         result.status = Status.PIP
         result.notes.append(f"speedup {result.speedup:.3f}x is under the {MIN_SPEEDUP:g}x floor")
         if tlx.cv > MAX_CV:  # still worth saying the number is soft
+            result.notes.append(f"CV {tlx.cv * 100:.1f}% is also over the {MAX_CV * 100:.0f}% limit")
+        return result
+
+    # The gate for an op with no runnable reference. Without it such an op can
+    # only fail on ERROR or the compile cap, so a 3x regression passes silently.
+    # Absolute and op-supplied rather than derived from history: this suite reads
+    # nothing from disk, so "slower than last week" is not a question it can ask.
+    if ref is None and floor_tflops and tlx.mean < floor_tflops:
+        result.status = Status.PIP
+        result.notes.append(f"{tlx.mean:.0f} TFLOP/s is under the {floor_tflops:.0f} TFLOP/s floor")
+        if tlx.cv > MAX_CV:
             result.notes.append(f"CV {tlx.cv * 100:.1f}% is also over the {MAX_CV * 100:.0f}% limit")
         return result
 

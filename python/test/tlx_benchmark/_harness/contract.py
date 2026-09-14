@@ -7,7 +7,10 @@ from typing import Any, Optional, Sequence
 #: 2: ``Stat`` is TFLOP/s rather than milliseconds, and the redundant
 #: ``Result.tlx_tflops`` / ``ref_tflops`` are gone -- they were
 #: ``flop_count / mean_latency``, which ``Stat.mean`` now is.
-SCHEMA_VERSION = 2
+#: 3: multi-op. ``Case.direction`` (an op with a backward has two cases per
+#: shape), ``Result.extra`` (op-specific derived metrics), and ``env["ref"]``
+#: (which reference was raced -- not every op races torch).
+SCHEMA_VERSION = 3
 
 
 class Status(str, enum.Enum):
@@ -30,13 +33,22 @@ class Case:
     #: says nothing; "8192x8192x8192 A:row B:col" says what was measured. Falls
     #: back to the raw tuple so a new op need not provide one.
     label: str = ""
+    #: "fwd" or "bwd". A real field rather than an entry in ``Result.extra``
+    #: because it changes the FLOP count, changes which reference is fair, and
+    #: has to reach ``key`` -- otherwise an op's forward and backward cases
+    #: collide in the artifact and the second silently wins.
+    direction: str = "fwd"
 
     @property
     def key(self) -> str:
         # Flattened, because a shape element may be a tuple (mm carries operand
         # strides) and str() on one puts parens and spaces in the artifact key.
         parts = ("_".join(str(x) for x in s) if isinstance(s, (tuple, list)) else str(s) for s in self.shape)
-        return f"{self.op}/{self.arch}/{self.dtype}/{'x'.join(parts)}"
+        key = f"{self.op}/{self.arch}/{self.dtype}/{'x'.join(parts)}"
+        # Appended only when there is something to disambiguate, so every key an
+        # op with no backward has ever written stays byte-identical and old
+        # artifacts remain diffable against new ones.
+        return key if self.direction == "fwd" else f"{key}/{self.direction}"
 
     @property
     def input(self) -> str:
@@ -48,6 +60,7 @@ class Case:
             "arch": self.arch,
             "dtype": self.dtype,
             "shape": list(self.shape),
+            "direction": self.direction,
             "input": self.input,
             "key": self.key,
         }
@@ -126,6 +139,13 @@ class Result:
     n_configs: Optional[int] = None
     #: Free-text, carried into the failure message and the artifact.
     notes: list = dataclasses.field(default_factory=list)
+    #: Op-specific derived metrics, JSON-serializable. The dividing line against
+    #: ``Case``: ``Case`` holds what the run was ASKED for (shape, dtype, causal,
+    #: direction -- inputs you chose), ``extra`` holds what the run FOUND OUT
+    #: (which SDPA backend torch dispatched, how many tokens a ragged batch
+    #: actually carried). An op declares which of these earn a table column via
+    #: its ``EXTRA_COLUMNS``; the rest ride along in the artifact.
+    extra: dict = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +161,7 @@ class Result:
             "t_compile_single_s": self.t_compile_single_s,
             "n_configs": self.n_configs,
             "notes": list(self.notes),
+            "extra": dict(self.extra),
         }
 
 

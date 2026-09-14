@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -21,27 +23,27 @@ from .models import (
     AutoCommitResult,
     CaseEvaluation,
     InputCase,
+    is_promotable,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
+    per_case_speedups,
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
     TimingSamples,
     VerificationResult,
-    is_promotable,
-    per_case_speedups,
     weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer, _profile_log_parts
+from .optimizer import _profile_log_parts, KernelOptimizer
 from .profiling import ProfileRequest
 from .providers import (
+    _build_prompt,
+    _read_candidate_metadata,
     CandidateContext,
     CandidateProposal,
     FixedCandidateProvider,
     MockLLMProvider,
-    _build_prompt,
-    _read_candidate_metadata,
 )
 from .source import (
     apply_candidate_diff,
@@ -151,8 +153,11 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("do not print source code or a patch", prompt)
         self.assertIn("candidate_metadata.json", prompt)
         self.assertIn("schema_version", prompt)
+        self.assertIn("source_sha256", prompt)
+        self.assertIn("original.py", prompt)
+        self.assertIn("final unified diff", prompt)
         self.assertIn("commit_title", prompt)
-        self.assertIn("actual source change", prompt)
+        self.assertIn("precisely describes the actual", prompt)
         self.assertIn("commit_summary", prompt)
         self.assertIn("Change summary:", prompt)
         self.assertIn("Why:", prompt)
@@ -162,8 +167,12 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Trusted built-in target optimization skills", prompt)
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
+        self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
+        self.assertIn("## Build A Barrier Ledger", prompt)
+        self.assertIn("tlx.alloc_warp_barrier", prompt)
+        self.assertIn("num_warps * 32 * num_arrivals", prompt)
         self.assertIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertIn("# Blackwell Persistent Pipeline Efficiency", prompt)
+        self.assertIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertIn("optimize data movement and scheduling", prompt)
         self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
         self.assertLess(
@@ -171,16 +180,70 @@ class ScoringTest(unittest.TestCase):
             prompt.index("# NVIDIA Async TMA Output Publication"),
         )
         self.assertLess(
+            prompt.index("# NVIDIA Async TMA Output Publication"),
+            prompt.index("# NVIDIA Warp Barrier Efficiency"),
+        )
+        self.assertLess(
+            prompt.index("# NVIDIA Warp Barrier Efficiency"),
+            prompt.index("# Blackwell Persistent CLC Scheduling"),
+        )
+        self.assertLess(
+            prompt.index("# Blackwell Persistent CLC Scheduling"),
+            prompt.index("# NVIDIA Persistent Pipeline Efficiency"),
+        )
+        self.assertLess(
             prompt.index("Trusted built-in target optimization skills"),
             prompt.index("Frozen target-specific optimization guidance"),
         )
 
-    def test_codex_prompt_selects_nvidia_non_blackwell_skill(self) -> None:
+    def test_codex_prompt_selects_hopper_persistent_pipeline_without_clc(self) -> None:
+        for architecture in ("hopper", "h100", "sm90", "sm_90"):
+            with self.subTest(architecture=architecture):
+                request = KernelOptimizationRequest(
+                    kernel_source="VALUE = 1\n",
+                    harness_path=Path(__file__),
+                    cases=(InputCase("target", {}),),
+                    target=KernelTarget("nvidia", architecture),
+                    output_dir=Path("/tmp/tlx-agent-test"),
+                )
+                prompt = _build_prompt(
+                    request,
+                    CandidateContext(
+                        1,
+                        0,
+                        request.kernel_source,
+                        _performance(("target", 100.0)),
+                        (),
+                    ),
+                )
+                self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+                self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
+                self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
+                self.assertIn("## Build A Barrier Ledger", prompt)
+                self.assertIn("tlx.alloc_warp_barrier", prompt)
+                self.assertIn("num_warps * 32 * num_arrivals", prompt)
+                self.assertIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
+                self.assertLess(
+                    prompt.index("# TLX Layout Conversion Efficiency"),
+                    prompt.index("# NVIDIA Async TMA Output Publication"),
+                )
+                self.assertLess(
+                    prompt.index("# NVIDIA Async TMA Output Publication"),
+                    prompt.index("# NVIDIA Warp Barrier Efficiency"),
+                )
+                self.assertLess(
+                    prompt.index("# NVIDIA Warp Barrier Efficiency"),
+                    prompt.index("# NVIDIA Persistent Pipeline Efficiency"),
+                )
+                self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+                self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+
+    def test_codex_prompt_does_not_inject_persistence_for_unknown_nvidia(self) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
             cases=(InputCase("target", {}),),
-            target=KernelTarget("nvidia", "hopper"),
+            target=KernelTarget("nvidia", "sm89"),
             output_dir=Path("/tmp/tlx-agent-test"),
         )
         prompt = _build_prompt(
@@ -195,26 +258,73 @@ class ScoringTest(unittest.TestCase):
         )
         self.assertIn("# TLX Layout Conversion Efficiency", prompt)
         self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
-        self.assertLess(
-            prompt.index("# TLX Layout Conversion Efficiency"),
-            prompt.index("# NVIDIA Async TMA Output Publication"),
-        )
+        self.assertIn("# NVIDIA Warp Barrier Efficiency", prompt)
+        self.assertIn("## Build A Barrier Ledger", prompt)
+        self.assertIn("tlx.alloc_warp_barrier", prompt)
+        self.assertIn("num_warps * 32 * num_arrivals", prompt)
+        self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertNotIn("# Blackwell Persistent Pipeline Efficiency", prompt)
-        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
 
-    def test_codex_prompt_selects_common_skill_only_for_amd(self) -> None:
+    def test_codex_prompt_selects_only_general_amd_skill_by_default(self) -> None:
         guidance = "Preserve runtime scale behavior."
+        for backend in ("amd", "hip", "rocm"):
+            with self.subTest(backend=backend):
+                request = KernelOptimizationRequest(
+                    kernel_source="VALUE = 1\n",
+                    harness_path=Path(__file__),
+                    cases=(InputCase("target", {}),),
+                    target=KernelTarget(
+                        backend,
+                        "gfx950",
+                        optimization_guidance=guidance,
+                    ),
+                    output_dir=Path("/tmp/tlx-agent-test"),
+                )
+                prompt = _build_prompt(
+                    request,
+                    CandidateContext(
+                        1,
+                        0,
+                        request.kernel_source,
+                        _performance(("target", 100.0)),
+                        (),
+                    ),
+                )
+                self.assertIn(guidance, prompt)
+                self.assertIn("Trusted built-in target optimization skills", prompt)
+                self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+                self.assertIn("# AMD Kernel Optimization", prompt)
+                self.assertNotIn("# AMD TLX Attention Optimization", prompt)
+                self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
+                self.assertNotIn("HSTU", prompt)
+                self.assertNotIn("IKBO", prompt)
+                self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
+                self.assertNotIn("# NVIDIA Warp Barrier Efficiency", prompt)
+                self.assertNotIn("## Build A Barrier Ledger", prompt)
+                self.assertNotIn("tlx.alloc_warp_barrier", prompt)
+                self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+                self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
+                self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+                self.assertLess(
+                    prompt.index("# TLX Layout Conversion Efficiency"),
+                    prompt.index("# AMD Kernel Optimization"),
+                )
+                self.assertLess(
+                    prompt.index("# AMD Kernel Optimization"),
+                    prompt.index("Frozen target-specific optimization guidance"),
+                )
+
+    def test_codex_prompt_selects_explicit_amd_attention_skill(self) -> None:
+        target = KernelTarget(
+            "amd",
+            "gfx950",
+            optimization_skills=("optimize-amd-tlx-attention",),
+        )
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
             cases=(InputCase("target", {}),),
-            target=KernelTarget(
-                "amd",
-                "gfx950",
-                optimization_guidance=guidance,
-            ),
-            output_dir=Path("/tmp/tlx-agent-test"),
+            target=target,
         )
         prompt = _build_prompt(
             request,
@@ -226,17 +336,86 @@ class ScoringTest(unittest.TestCase):
                 (),
             ),
         )
-        self.assertIn(guidance, prompt)
-        self.assertIn("Trusted built-in target optimization skills", prompt)
-        self.assertIn("# TLX Layout Conversion Efficiency", prompt)
-        self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
-        self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
-        self.assertNotIn("# Blackwell Persistent Pipeline Efficiency", prompt)
-        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
-        self.assertLess(
-            prompt.index("# TLX Layout Conversion Efficiency"),
-            prompt.index("Frozen target-specific optimization guidance"),
+        self.assertIn("# AMD Kernel Optimization", prompt)
+        self.assertIn("# AMD TLX Attention Optimization", prompt)
+        self.assertIn("# AMD Attention Variant Reference", prompt)
+        self.assertIn("HSTU self-attention", prompt)
+        self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
+        self.assertNotIn("third_party/tlx/tools/agents", prompt)
+
+    def test_codex_prompt_selects_explicit_amd_live_range_skill(self) -> None:
+        target = KernelTarget(
+            "hip",
+            "gfx950",
+            optimization_skills=("analyze-amd-ir-live-ranges",),
         )
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=target,
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                _performance(("target", 100.0)),
+                (),
+            ),
+        )
+        self.assertIn("# AMD Kernel Optimization", prompt)
+        self.assertIn("# AMD IR Live-Range Interpretation", prompt)
+        self.assertIn("# Interpreting AMD IR live-range reports", prompt)
+        self.assertIn("Do not attempt to generate a new artifact", prompt)
+        self.assertNotIn("analyze_live_ranges.py", prompt)
+        self.assertNotIn("# AMD TLX Attention Optimization", prompt)
+
+    def test_codex_prompt_rejects_unsupported_optimization_skill(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget(
+                "amd",
+                "gfx950",
+                optimization_skills=("unknown-skill",),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported AMD optimization skill"):
+            _build_prompt(
+                request,
+                CandidateContext(
+                    1,
+                    0,
+                    request.kernel_source,
+                    _performance(("target", 100.0)),
+                    (),
+                ),
+            )
+
+    def test_kernel_target_normalizes_optimization_skills(self) -> None:
+        target = KernelTarget(
+            "AMD",
+            "gfx950",
+            optimization_skills=(
+                " Optimize-AMD-TLX-Attention ",
+                "optimize-amd-tlx-attention",
+            ),
+        )
+        self.assertEqual(
+            target.optimization_skills,
+            ("optimize-amd-tlx-attention",),
+        )
+
+    def test_kernel_target_rejects_string_optimization_skills(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a sequence of names"):
+            KernelTarget(
+                "amd",
+                "gfx950",
+                optimization_skills="optimize-amd-tlx-attention",  # type: ignore[arg-type]
+            )
 
     def test_prompt_includes_prior_run_evidence_without_source(self) -> None:
         prior_source = "SECRET_PRIOR_SOURCE = 1\n"
@@ -278,32 +457,89 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("speedup=0.9500x", prompt)
         self.assertNotIn(prior_source.strip(), prompt)
 
-    def test_candidate_metadata_reads_summary_and_builds_fallback(self) -> None:
+    def test_candidate_metadata_is_bound_to_changed_source_scope(self) -> None:
+        original = "def kernel():\n    return 1\n"
+        source = "def kernel():\n    return 2\n"
+        payload = {
+            "schema_version": 2,
+            "hypothesis": "Reduce repeated work.",
+            "evidence": "The profile attributes time to the repeated operation.",
+            "change": "Fold the repeated operation in kernel.",
+            "expected_effect": "Reduce instruction count.",
+            "risk": "Preserve the existing return type.",
+            "commit_title": "Fold repeated work in kernel",
+            "commit_summary": (
+                "Change summary:\nUpdate kernel to fold the repeated operation while "
+                "preserving its return contract.\n\nWhy:\nThe profile attributes time "
+                "to the repeated operation."
+            ),
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "candidate_metadata.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "hypothesis": "  reduce   work ",
-                        "change": "Fold a constant scale.",
-                        "commit_title": "Fold half scale into dS encoding",
-                        "commit_summary": "Change summary:\nFold the scale into the encoded exponent.\n\nWhy:\nReduce repeated arithmetic while preserving the generic fallback.",
-                    }
-                )
+            path.write_text(json.dumps(payload))
+            metadata = _read_candidate_metadata(
+                path,
+                source=source,
+                original_source=original,
             )
-            metadata = _read_candidate_metadata(path)
-            self.assertEqual(metadata["hypothesis"], "reduce work")
-            self.assertEqual(metadata["commit_title"], "Fold half scale into dS encoding")
-            self.assertIn("encoded exponent", metadata["commit_summary"])
-            self.assertIn("generic fallback", metadata["commit_summary"])
+            self.assertEqual(metadata["hypothesis"], "Reduce repeated work.")
+            self.assertEqual(metadata["commit_title"], "Fold repeated work in kernel")
+            self.assertIn("Update kernel", metadata["commit_summary"])
 
-            path.write_text(json.dumps({"change": "Fold a constant scale."}))
-            fallback = _read_candidate_metadata(path)
-            self.assertEqual(fallback["commit_title"], "Fold a constant scale")
-            self.assertIn("Change summary:", fallback["commit_summary"])
-            self.assertIn("Fold a constant scale.", fallback["commit_summary"])
-            self.assertIn("Why:", fallback["commit_summary"])
+            stale = dict(payload, source_sha256="0" * 64)
+            path.write_text(json.dumps(stale))
+            with self.assertRaisesRegex(ValueError, "source_sha256"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            unrelated = dict(
+                payload,
+                commit_summary=(
+                    "Change summary:\nUpdate helper behavior.\n\n"
+                    "Why:\nReduce repeated work."
+                ),
+            )
+            path.write_text(json.dumps(unrelated))
+            with self.assertRaisesRegex(ValueError, "changed top-level scope: kernel"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            generic = dict(payload, commit_title="Optimize kernel")
+            path.write_text(json.dumps(generic))
+            with self.assertRaisesRegex(ValueError, "too generic"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            unrelated_title = dict(payload, commit_title="Pipeline descriptor stores")
+            path.write_text(json.dumps(unrelated_title))
+            with self.assertRaisesRegex(ValueError, "does not describe"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
+
+            malformed = dict(
+                payload,
+                commit_summary="Change summary:\nUpdate kernel without a rationale.",
+            )
+            path.write_text(json.dumps(malformed))
+            with self.assertRaisesRegex(ValueError, "exactly.*sections"):
+                _read_candidate_metadata(
+                    path,
+                    source=source,
+                    original_source=original,
+                )
 
     def test_codex_prompt_compacts_profile_and_preserves_scope_boundaries(self) -> None:
         request = KernelOptimizationRequest(
@@ -376,7 +612,9 @@ class ScoringTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty"):
             validate_kernel_source("   \n")
 
-    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(self) -> None:
+    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(
+        self,
+    ) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
@@ -559,6 +797,32 @@ class HarnessTest(unittest.TestCase):
 
         _validate_host_matches_target(target, "host", capability_probe=fail_probe)
 
+    def test_rocm_arch_validation_rejects_mismatched_host(self) -> None:
+        target = KernelTarget("hip", "gfx950", device="cuda:0")
+        with self.assertRaisesRegex(SystemExit, "expects gfx950.*is gfx942"):
+            _validate_host_matches_target(
+                target,
+                "gfx950",
+                rocm_arch_probe=lambda device: "gfx942",
+            )
+
+    def test_rocm_arch_validation_accepts_matching_host(self) -> None:
+        target = KernelTarget("hip", "gfx950", device="cuda:0")
+        _validate_host_matches_target(
+            target,
+            "gfx950",
+            rocm_arch_probe=lambda device: "gfx950:sramecc+:xnack-",
+        )
+
+    def test_rocm_arch_validation_rejects_prefix_match(self) -> None:
+        target = KernelTarget("hip", "gfx90", device="cuda:0")
+        with self.assertRaisesRegex(SystemExit, "expects gfx90.*is gfx900"):
+            _validate_host_matches_target(
+                target,
+                "gfx90",
+                rocm_arch_probe=lambda device: "gfx900:sramecc+:xnack-",
+            )
+
     def test_resolves_arch_first_harness_layout(self) -> None:
         kernel = Path("gemm.py")
         harness, cases, target = _resolve_harness_paths(
@@ -575,11 +839,23 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
 
+    def test_resolves_gfx950_gemm_harness(self) -> None:
+        harness, cases, target = _resolve_harness_paths(
+            Path("amd_gemm_warp_pipeline.py"),
+            None,
+            None,
+            None,
+            "gfx950",
+            "gemm",
+        )
+        expected = Path(__file__).with_name("harnesses") / "gfx950" / "targets" / "gemm"
+        self.assertEqual(harness, expected / "harness.py")
+        self.assertEqual(cases, expected / "cases.json")
+        self.assertEqual(target, expected / "target.json")
+
     def test_default_arch_only_uses_arches_with_matching_target(self) -> None:
         kernel = Path("vector_add.py")
-        harness, cases, target = _resolve_harness_paths(
-            kernel, None, None, None, None
-        )
+        harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
             Path(__file__).with_name("harnesses")
@@ -622,7 +898,9 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(performance.cases[0].profile.get("bottleneck"), "synthetic")
 
-    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(self) -> None:
+    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "three_arg_harness.py"
             harness_path.write_text(
@@ -682,7 +960,9 @@ class HarnessTest(unittest.TestCase):
                 "    return {'case_id': case['case_id'], 'request': request, 'exists': Path(request['artifacts_dir']).exists()}\n"
             )
             artifacts_dir = Path(tmp) / "profiles"
-            performance = SubprocessHarness(harness_path, timeout_seconds=30.0).evaluate(
+            performance = SubprocessHarness(
+                harness_path, timeout_seconds=30.0
+            ).evaluate(
                 "source",
                 (InputCase("case a", {}),),
                 KernelTarget("cuda", "blackwell"),
@@ -702,7 +982,9 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual(request["tools"], ["proton_launch", "ncu"])
             self.assertEqual(Path(str(request["artifacts_dir"])).parent, artifacts_dir)
 
-    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(self) -> None:
+    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "big_profile_harness.py"
             harness_path.write_text(
@@ -1000,7 +1282,7 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertIn("[tlx-agent] r001-c001 status=promoted", output)
             self.assertIn("speedup=1.2500x", output)
             self.assertIn("decision=correct and exceeded speedup threshold", output)
-            self.assertIn("ncu=unavailable", output)
+            self.assertIn("native_profiler=unavailable", output)
             self.assertIn("[tlx-agent] final status=revalidated", output)
             self.assertEqual(result.winner_experiment_id, "r001-c001")
             self.assertEqual(result.winner_commit_title, "Use faster latency path")
@@ -1093,7 +1375,7 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertIn("median=120.000us", feedback)
         self.assertIn("cv=0.0000", feedback)
         self.assertIn("speedup=0.8333x", feedback)
-        self.assertIn("ncu=unavailable", feedback)
+        self.assertIn("native_profiler=unavailable", feedback)
 
     def test_continues_after_round_without_promotion(self) -> None:
         provider = FixedCandidateProvider(
@@ -1233,13 +1515,19 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertEqual(result.stopping_reason, "finalist_revalidation_failed")
             self.assertEqual(result.best_kernel, baseline_source)
             self.assertEqual(result.final.cases[0].profile["marker"], "baseline")
-            self.assertEqual((output_dir / "best_kernel.py").read_text(), baseline_source)
+            self.assertEqual(
+                (output_dir / "best_kernel.py").read_text(), baseline_source
+            )
             self.assertEqual(best_profile, baseline_profile)
             self.assertEqual(final_profile, baseline_profile)
 
     def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = _write_policy_harness(Path(tmp))
@@ -1261,7 +1549,9 @@ class KernelOptimizerTest(unittest.TestCase):
             )
 
         baseline_request = result.baseline.cases[0].profile["request"]
-        candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
+        candidate_request = (
+            result.experiments[1].performance.cases[0].profile["request"]
+        )  # type: ignore[union-attr]
         final_request = result.final.cases[0].profile["request"]
         self.assertEqual(baseline_request["level"], "deep")
         expected_tools = ["proton_launch", "native_profiler"]
@@ -1315,7 +1605,9 @@ class KernelOptimizerTest(unittest.TestCase):
                     output_dir=Path(tmp) / "out",
                 )
             )
-        candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
+        candidate_request = (
+            result.experiments[1].performance.cases[0].profile["request"]
+        )  # type: ignore[union-attr]
         self.assertEqual(candidate_request["level"], "deep")
         self.assertEqual(
             candidate_request["tools"],
@@ -1326,7 +1618,11 @@ class KernelOptimizerTest(unittest.TestCase):
 
     def test_ncu_regression_diagnostic_vetoes_candidate(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             stderr = io.StringIO()
@@ -1349,6 +1645,125 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.experiments[1].status, "rejected")
         self.assertIn("NCU duration regressed", stderr.getvalue())
+
+    def test_rocprof_regression_diagnostic_vetoes_candidate(self) -> None:
+        baseline = _performance(("a", 100.0))
+        baseline = PerformanceSummary(
+            cases=(
+                replace(
+                    baseline.cases[0],
+                    profile={"rocprofv3": {"summary": {"duration_us": 100.0}}},
+                ),
+            )
+        )
+        candidate = _performance(("a", 80.0))
+        candidate = PerformanceSummary(
+            cases=(
+                replace(
+                    candidate.cases[0],
+                    profile={"rocprofv3": {"summary": {"duration_us": 102.0}}},
+                ),
+            )
+        )
+        harness = Mock()
+        harness.evaluate.side_effect = [baseline, candidate, baseline]
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "fast-wrapper")]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    optimizer_module,
+                    "SubprocessHarness",
+                    return_value=harness,
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = KernelOptimizer(provider).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                        harness_path=Path(directory) / "unused_harness.py",
+                        cases=(InputCase("a", {}),),
+                        target=KernelTarget("hip", "gfx950"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=1,
+                            min_speedup=1.01,
+                            benchmark_repetitions=2,
+                        ),
+                        output_dir=Path(directory) / "out",
+                    )
+                )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.experiments[1].status, "rejected")
+        self.assertIn("rocprofv3 duration regressed", stderr.getvalue())
+
+    def test_rocprof_profile_does_not_veto_rocprof_benchmark(self) -> None:
+        baseline = _performance(("a", 100.0))
+        baseline_timing = baseline.cases[0].timing
+        assert baseline_timing is not None
+        baseline = PerformanceSummary(
+            cases=(
+                replace(
+                    baseline.cases[0],
+                    timing=replace(
+                        baseline_timing,
+                        cache_policy="steady_state_20s_rocprofv3_iqr3",
+                    ),
+                    profile={"rocprofv3": {"summary": {"duration_us": 100.0}}},
+                ),
+            )
+        )
+        candidate = _performance(("a", 80.0))
+        candidate_timing = candidate.cases[0].timing
+        assert candidate_timing is not None
+        candidate = PerformanceSummary(
+            cases=(
+                replace(
+                    candidate.cases[0],
+                    timing=replace(
+                        candidate_timing,
+                        cache_policy="steady_state_20s_rocprofv3_iqr3",
+                    ),
+                    profile={"rocprofv3": {"summary": {"duration_us": 102.0}}},
+                ),
+            )
+        )
+        harness = Mock()
+        harness.evaluate.side_effect = [baseline, candidate, candidate]
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster")]
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                optimizer_module,
+                "SubprocessHarness",
+                return_value=harness,
+            ),
+        ):
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=Path(directory) / "unused_harness.py",
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("hip", "gfx950"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory) / "out",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.experiments[1].status, "promoted")
 
     def test_missing_ncu_does_not_veto_candidate(self) -> None:
         provider = FixedCandidateProvider(
@@ -1402,16 +1817,33 @@ class KernelOptimizerTest(unittest.TestCase):
             "proton.intra.tile=start_n:3840/logical_block:31/curr_m:3968/mma_producer_j:32/load_input_j:31",
             parts,
         )
-        self.assertIn(
-            "proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts
-        )
+        self.assertIn("proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts)
         self.assertIn(f"proton.intra.trace={trace_path}", parts)
 
-    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(self) -> None:
+    def test_profile_log_includes_fb_att_artifact(self) -> None:
+        parts = _profile_log_parts(
+            {
+                "fb_att": {
+                    "valid": True,
+                    "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
+                }
+            }
+        )
+
+        self.assertIn("fb_att.valid=true", parts)
+        self.assertIn("fb_att.ui=/tmp/gemm_0_ui", parts)
+
+    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(
+        self,
+    ) -> None:
         provider = FixedCandidateProvider(
             [
-                CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"),
-                CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"),
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"
+                ),
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                ),
             ]
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -1443,7 +1875,10 @@ class KernelOptimizerTest(unittest.TestCase):
             if request["tools"] == ["proton_intra_kernel"]
         ]
         self.assertEqual(
-            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [
+                (request["experiment_id"], request["reason"])
+                for request in diagnostic_requests
+            ],
             [("baseline", "baseline_diagnostic"), ("final", "final_winner_diagnostic")],
         )
         candidate_diagnostics = [
@@ -1456,7 +1891,9 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "rejected")
         self.assertEqual(result.experiments[2].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
-        self.assertIn("diagnostic_proton_intra_kernel", result.baseline.cases[0].profile)
+        self.assertIn(
+            "diagnostic_proton_intra_kernel", result.baseline.cases[0].profile
+        )
         self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
         self.assertNotIn(
             "diagnostic_proton_intra_kernel",
@@ -1466,11 +1903,22 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(baseline_diag["tools"], ["proton_intra_kernel"])
         self.assertEqual(baseline_diag["artifacts"]["trace"], "/tmp/proton.trace")
         self.assertNotIn("trace_events", baseline_diag)
-        self.assertEqual(best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"]["granularity"], "warp")
+        self.assertEqual(
+            best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"][
+                "granularity"
+            ],
+            "warp",
+        )
 
-    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(self) -> None:
+    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(
+        self,
+    ) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1499,14 +1947,21 @@ class KernelOptimizerTest(unittest.TestCase):
         ]
         self.assertFalse(result.success)
         self.assertEqual(
-            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [
+                (request["experiment_id"], request["reason"])
+                for request in diagnostic_requests
+            ],
             [("baseline", "baseline_diagnostic")],
         )
         self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
 
     def test_diagnostic_proton_is_promotion_neutral(self) -> None:
         provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+            [
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"
+                )
+            ]
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1531,7 +1986,9 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(result.experiments[1].status, "promoted")
         self.assertEqual(result.final.aggregate_speedup, 1.25)
         self.assertEqual(
-            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"]["summary"]["duration_us"],
+            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"][
+                "summary"
+            ]["duration_us"],
             999999.0,
         )
 

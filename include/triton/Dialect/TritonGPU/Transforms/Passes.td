@@ -312,7 +312,8 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
            "scratch would push shared memory usage above this budget (bytes)">,
     Option<"disableRematSplitting", "disable-remat-splitting",
            "bool", /*default*/"false",
-           "prevent backward rematerialization from duplicating operations">
+           "prevent rematerialization from splitting or duplicating "
+           "convert-layout work">
   ];
 }
 

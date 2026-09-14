@@ -1096,15 +1096,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 stacklevel=2,
             )
         _user_kwargs = dict(kwargs) if kwargs else {}
-        # When the autotuner seeds the C fast-dispatch cache it stores the
-        # winning config's compilation options (num_warps, ctas_per_cga, …) in
-        # _fc_meta_kwargs. The steady-state autotuner path dispatches via
-        # self.fn[grid](*args) WITHOUT those kwargs. If the C cache misses (new
-        # argument specialization), we fall through to here and need the options
-        # for a correct recompilation. Merge them as defaults so callers that
-        # explicitly pass kwargs still win.
+        # A steady-state proxy fallback arrives without the winning config's
+        # compilation options, so restore the options saved when it was seeded.
         _fc_meta = getattr(self, '_fc_meta_kwargs', None)
-        if _fc_meta:
+        # Regular launches (including autotuner benchmarks) already carry a
+        # complete option set. Filling absent fields from a previous winner can,
+        # for example, attach a stale ctas_per_cga to a 1-CTA candidate.
+        has_explicit_options = any(k not in self._param_name_to_idx for k in _user_kwargs)
+        if _fc_meta and not has_explicit_options:
             for k, v in _fc_meta.items():
                 if k not in kwargs:
                     kwargs[k] = v
@@ -1113,6 +1112,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
                                                  False) or knobs.runtime.sanitize_overflow or kwargs["debug"]
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+        kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:

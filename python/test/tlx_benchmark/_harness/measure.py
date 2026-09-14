@@ -213,16 +213,81 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
     return statistics.median(samples)
 
 
+#: The two ways to time a call.
+#:
+#: "wallclock" is `triton.testing.do_bench`: CUDA events around each `fn()`,
+#: dispatched normally from the host. That is the authoritative mode here,
+#: because what it reports is what a caller gets -- if the host cannot keep the
+#: GPU fed, that is a real cost of using the op, and `tlx_host_us` says so
+#: alongside. It is also what every existing number in this suite was taken
+#: with.
+#:
+#: "gpu_events" is tritonbench's `--latency-measure-mode=gpu_events`: the whole
+#: batch is enqueued behind a blocked stream, so the host runs far ahead and
+#: the measured interval contains no dispatch gaps. That isolates device time,
+#: which is the right question when comparing two kernels rather than two
+#: end-to-end paths -- most useful on the multi-kernel backward passes
+#: (attention, KDA), where a wallclock reading folds in several launches' worth
+#: of host work. It flatters both providers equally, so a speedup ratio moves
+#: less than either absolute number.
+LATENCY_MODES = ("wallclock", "gpu_events")
+
+#: GPU cycles to hold the stream while the host enqueues the batch. Only the
+#: ramp needs covering -- once the first iteration runs there is always queued
+#: work behind it -- so this is sized for the enqueue, not for the measurement.
+#: ~20ms at 1GHz, against a few microseconds of Python per iteration.
+_GATE_CYCLES = 20_000_000
+
+
+def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None) -> list[float]:
+    """Per-iteration ms, with the host held off until the batch is queued."""
+    import torch
+
+    di = triton.runtime.driver.active.get_device_interface()
+    cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+    starts = [di.Event(enable_timing=True) for _ in range(iters)]
+    ends = [di.Event(enable_timing=True) for _ in range(iters)]
+
+    di.synchronize()
+    # Everything below is enqueued behind this sleep, so the host reaches the
+    # end of the loop before the GPU reaches the start of it.
+    torch.cuda._sleep(_GATE_CYCLES)
+    for i in range(iters):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        triton.runtime.driver.active.clear_cache(cache)
+        starts[i].record()
+        fn()
+        ends[i].record()
+    di.synchronize()
+    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+
+
 def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optional[int] = None,
             rep: Optional[int] = None, auto_window: bool = False, replicates: int = DEFAULT_REPLICATES,
-            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True) -> Stat:
+            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True, mode: str = "wallclock") -> Stat:
     # replicates>1 re-warms each time and measures drift BETWEEN runs
     # (rel_max_deviation); that is no longer the gate, hence the default of 1.
     # Window sizing is inherently temporal -- `do_bench` derives its iteration
     # count from a duration -- so this half of the function stays in ms no
     # matter what the caller wants reported.
+    if mode not in LATENCY_MODES:
+        raise ValueError(f"mode must be one of {LATENCY_MODES}, got {mode!r}")
     estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
     replicates = max(1, replicates)
+
+    if mode == "gpu_events":
+        # Same sample quota as the wallclock path, so the tail columns mean the
+        # same thing; the window is a count here rather than a duration.
+        iters = max(1, math.ceil(MIN_TOTAL_SAMPLES / replicates))
+        for _ in range(DEFAULT_WARMUP_ITERS):
+            fn()
+        runs = [_gpu_event_samples(fn, iters, grad_to_none) for _ in range(replicates)]
+        if flop_count:
+            return summarize([to_tflops(r, flop_count) for r in runs], remove_outliers=remove_outliers, unit="tflops")
+        return summarize(runs, remove_outliers=remove_outliers, unit="ms")
+
     if auto_window:
         warmup_ms, rep_ms = resolve_warmup_and_rep(warmup, rep, estimate_ms)
     else:

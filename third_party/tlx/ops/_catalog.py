@@ -33,6 +33,7 @@ class OpSpec:
 
 
 _FP16 = frozenset({"float16", "bfloat16"})
+_BF16 = frozenset({"bfloat16"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -70,6 +71,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm",
+        arch="gfx950",
+        variant="local_split_u",
+        impl="kernels.mm.gfx950:mm",
+        # Deliberately not `_FP16`: that shared set also contains bfloat16,
+        # while this first gfx950 implementation has only been validated for
+        # IEEE fp16 operands.
+        dtypes=frozenset({"float16"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
@@ -104,6 +116,22 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma", "tmem"}),
     ),
+    OpSpec(
+        op="kda_paged_prefill",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.kda.gfx950_prefill:kda_paged_prefill",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("KEY_DIM") == 128 and d.get("VALUE_DIM") == 128,
+    ),
+    OpSpec(
+        op="kda_recurrent_decode",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.kda.gfx950_decode:kda_recurrent_decode",
+        dtypes=_BF16,
+        accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
+    ),
 )
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
@@ -136,6 +164,16 @@ def _load(impl: str) -> Callable[..., Any]:
 
 def _arches_for(op: str) -> list[str]:
     return sorted(s.arch for s in CATALOG if s.op == op)
+
+
+def has_impl(op: str, arch: str) -> bool:
+    """Is there a catalog entry for this pair, without importing the kernel?
+
+    A table lookup, not a capability check: the benchmark suite uses it to skip
+    an op cleanly on an arch it was never written for, rather than running every
+    shape and reporting each one as an error.
+    """
+    return (op, arch) in _BY_KEY
 
 
 def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:

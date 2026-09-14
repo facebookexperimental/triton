@@ -1068,12 +1068,8 @@ static bool tmemReuseGroupOverlaps(ReuseGroup *group) {
     auto *allocOp = ch->getAllocOp();
     if (!allocOp)
       return false;
-    auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
-    int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
-    int64_t off = 0;
-    if (auto a = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
-      off = a.getInt();
-    ranges.push_back({off, off + numCols});
+    auto [lo, hi] = getTmemColumnRange(allocOp);
+    ranges.push_back({lo, hi});
   }
   for (unsigned i = 0; i < ranges.size(); ++i)
     for (unsigned j = i + 1; j < ranges.size(); ++j)
@@ -1333,6 +1329,38 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
        << earlyChannel->srcName << ") and lateChannel " << lateChannel->uniqID
        << " (" << lateChannel->srcName << ")");
   return true;
+}
+
+int64_t getTmemBufferOffset(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+    return attr.getInt();
+  return 0;
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  int64_t offset = getTmemBufferOffset(allocOp);
+  int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
+  return {offset, offset + numCols};
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Channel *channel) {
+  assert(channel && "TMEM column queries require a channel");
+  Operation *allocOp = channel->getAllocOp();
+  assert(allocOp && "TMEM reuse channel must have an allocation");
+  return getTmemColumnRange(allocOp);
+}
+
+bool tmemColumnRangesOverlap(std::pair<int64_t, int64_t> rangeA,
+                             std::pair<int64_t, int64_t> rangeB) {
+  return rangeA.first < rangeB.second && rangeB.first < rangeA.second;
+}
+
+bool tmemColumnRangesOverlap(Operation *allocA, Operation *allocB) {
+  return tmemColumnRangesOverlap(getTmemColumnRange(allocA),
+                                 getTmemColumnRange(allocB));
 }
 
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {

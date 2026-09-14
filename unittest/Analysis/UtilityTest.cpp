@@ -7,6 +7,9 @@
 #include <deque>
 #include <set>
 
+#include <deque>
+#include <set>
+
 namespace mlir {
 
 TEST(Analysis, reorder) {

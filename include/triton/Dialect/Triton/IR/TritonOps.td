@@ -306,6 +306,20 @@ def TT_StoreOp
 //
 // Atomic Ops
 //
+def TT_GridDependencyWaitOp
+    : TT_Op<"grid_dependency_wait", [MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>]> {
+    let summary = "wait for prerequisite grids and acquire their memory writes";
+    let arguments = (ins);
+    let assemblyFormat = "attr-dict";
+}
+
+def TT_GridDependencyLaunchDependentsOp
+    : TT_Op<"grid_dependency_launch_dependents", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+    let summary = "allow dependent grids to begin execution";
+    let arguments = (ins);
+    let assemblyFormat = "attr-dict";
+}
+
 def TT_AtomicPollOp : TT_Op<"atomic_poll", [
   TypesMatchWith<"ptr type matches expected type", "expected", "ptr",
                  "getPointerTypeSameShape($_self)">
@@ -339,7 +353,8 @@ def TT_AtomicPollOp : TT_Op<"atomic_poll", [
 
 def TT_AtomicRMWOp
     : TT_Op<"atomic_rmw",
-            [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+            [AtomicOpInterface, SameOperandsAndResultShape,
+             SameOperandsAndResultEncoding,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
                             "getPointerTypeSameShape($_self)">,
@@ -372,7 +387,8 @@ def TT_AtomicRMWOp
 
 def TT_AtomicCASOp
     : TT_Op<"atomic_cas",
-            [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+            [AtomicOpInterface, SameOperandsAndResultShape,
+             SameOperandsAndResultEncoding,
              TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",

@@ -184,8 +184,39 @@ def _entropy_warmup_sample_limit(probe_ms: float, budget_ms: int) -> int:
     return max(1, min(10000, int(budget_ms / probe_ms)))
 
 
-def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
-    """Adaptive warmup using entropy convergence. Returns (n_samples, avg_ms)."""
+def _entropy_repeat_count(
+    rep_ms: float,
+    sampling_wall_s: float,
+    n_sampling_launches: int,
+    kernel_avg_ms: float,
+) -> int:
+    """Number of timed measurement iterations for the entropy benchmarker.
+
+    Sized from the measured wall-clock cost per iteration (cache clear + kernel
+    + events, as observed across sampling launches) so the timed phase lasts
+    ~rep_ms of wall time. kernel_avg_ms covers the kernel only, so it would
+    overshoot the budget whenever the clear dominates (fast kernels); it is
+    only a fallback when no sampling launches were recorded. Mirrors do_bench,
+    whose runtime estimate includes the cache clear.
+
+    The denominator conservatively includes the sampling phase's per-sample
+    sync/analysis overhead (event synchronize + elapsed_time + entropy
+    bookkeeping), which the back-to-back timed phase does not pay, so the
+    timed phase may undershoot rep_ms rather than overshoot it. Bounded to
+    [10, 10000]: the floor keeps slow kernels measurable, the ceiling bounds
+    the 2*n_repeat event pre-allocation in _timed_measurement.
+    """
+    if n_sampling_launches > 0:
+        per_iter_ms = sampling_wall_s / n_sampling_launches * 1000.0
+    else:
+        per_iter_ms = kernel_avg_ms
+    if per_iter_ms > 0:
+        return max(10, min(10000, int(rep_ms / per_iter_ms)))
+    return 100
+
+
+def _entropy_sampling(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
+    """Adaptive sampling using entropy convergence. Returns (n_samples, avg_ms, n_launched). n_launched counts all issued launches, including any trailing batch whose measurements were skipped after early convergence."""
     crit = _EntropyCriterion(
         max_angle=0.048,
         min_r2=0.36,
@@ -197,6 +228,7 @@ def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, re
     last_batch = [0.0] * BATCH_SIZE
     n_written = 0
     counter = 0
+    launched = 0
     converged = False
     precision_increase = False
 
@@ -209,6 +241,7 @@ def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, re
             start_ev[i].record()
             kernel_call()
             end_ev[i].record()
+        launched += batch_size
         n_written = 0
         for i in range(batch_size):
             end_ev[i].synchronize()
@@ -230,8 +263,14 @@ def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, re
                 crit.reset()
                 precision_increase = True
 
+    # On early convergence the trailing launches of the final batch were issued
+    # but never synchronized; wait for the last one so the caller's wall-clock
+    # span covers exactly the launched count used as the repeat denominator.
+    if converged and n_written < batch_size:
+        end_ev[batch_size - 1].synchronize()
+
     avg_ms = statistics.fmean(last_batch[:n_written]) if n_written > 0 else 0.0
-    return counter, avg_ms
+    return counter, avg_ms, launched
 
 
 def _timed_measurement(kernel_call, clear_cache, n_repeat, torch):
@@ -473,7 +512,8 @@ class Autotuner(KernelInterface):
             entropy_window = min(500, max(50, int(_WARMUP_BUDGET_MS / probe_ms)))
             regr_window = max(20, int(entropy_window * 0.6))
 
-            n_warmup = _entropy_warmup(
+            t0 = time.perf_counter()
+            sampling = _entropy_sampling(
                 kernel_call,
                 clear,
                 torch,
@@ -481,8 +521,13 @@ class Autotuner(KernelInterface):
                 regr_window_size=regr_window,
                 max_samples=max_samples,
             )
-            avg_ms = n_warmup[1]
-            n_repeat = max(10, int(rep / avg_ms)) if avg_ms > 0 else 100
+            sampling_wall_s = time.perf_counter() - t0
+            avg_ms = sampling[1]
+            # Divide by launched (not consumed) samples: every launch pays a
+            # clear+kernel even when early convergence skips consuming the
+            # trailing batch, so the launched count is the unbiased
+            # per-iteration cost basis.
+            n_repeat = _entropy_repeat_count(rep, sampling_wall_s, sampling[2], avg_ms)
             times = _timed_measurement(kernel_call, clear, n_repeat, torch)
 
             if quantiles is not None:
@@ -517,7 +562,9 @@ class Autotuner(KernelInterface):
             raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
-        current = dict(meta, **config.all_kwargs())
+        config_kwargs = config.all_kwargs()
+        current = dict(meta, **config_kwargs)
+        self._set_fast_cache_meta(config_kwargs)
         full_nargs = {**self.nargs, **current}
 
         # Capture the CompiledKernel the launch returns (run(...) returns it even on a normal
@@ -709,6 +756,18 @@ class Autotuner(KernelInterface):
         native_autotune_proxy_insert(proxy, key_vals, constexpr_vals, constexpr_positions, options_hash,
                                      config.pre_hook)
 
+    def _set_fast_cache_meta(self, config_kwargs):
+        """Install one config's compilation options before launching it."""
+        if not getattr(self.fn, 'c_cache', False):
+            return
+        meta = {k: v for k, v in config_kwargs.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
+        if getattr(self.fn, '_fc_meta_kwargs', None) == meta:
+            return
+        options_hash = _hash_fc_opts(meta) if meta else 0
+        self.fn._fc_options_hash = options_hash
+        self.fn._fc_meta_kwargs = meta
+        self.fn._jit_proxy_cache = {}
+
     def _try_fast_path(self, args, kwargs, config):
         """Attempt C fast cache dispatch; return kernel or None to fall back.
 
@@ -770,18 +829,6 @@ class Autotuner(KernelInterface):
             except (ImportError, AttributeError):
                 native_fast_dispatch_insert = None
             kernel = self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
-            # Update _fc_options_hash so C proxy and JIT.run fast path lookups
-            # use the same hash that JIT.run's insertion used (includes meta-params
-            # like ctas_per_cga that affect compilation options).
-            if _meta:
-                _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
-                if _meta_opts:
-                    self.fn._fc_options_hash = _hash_fc_opts(_meta_opts)
-                # Store meta kwargs for C proxy fallback forwarding.
-                self.fn._fc_meta_kwargs = _meta
-                # Invalidate proxy cache so next __getitem__ creates a new proxy
-                # with the updated options_hash and meta_kwargs.
-                self.fn._jit_proxy_cache = {}
             if native_fast_dispatch_insert is not None:
                 _disp = getattr(kernel, '_dispatcher', None)
                 if _disp is not None:
@@ -922,6 +969,9 @@ class Autotuner(KernelInterface):
                 self._at_proxy_seeded.add(key)
         else:
             config = self.configs[0]
+        # Restore the winner before every launch path, including Python
+        # fallbacks and dump_best_config_ir recompilation.
+        self._set_fast_cache_meta(config.all_kwargs())
         self.best_config = config
         if knobs.autotuning.print and not used_cached_result:
             print(f"Triton autotuning for function {self.base_fn.__name__},\nwith key as {key},\n"
@@ -1030,7 +1080,7 @@ class Autotuner(KernelInterface):
                 # set rounds down to zero, which would prune everything and crash
                 # the later min() on an empty set. early_config_prune already
                 # guarantees at least one config; mirror that here.
-                top_k = max(1, int(len(self.configs) * top_k))
+                top_k = max(1, int(len(pruned_configs) * top_k))
             elif not isinstance(top_k, int):
                 # Slice index must be an integer
                 raise TypeError("Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")

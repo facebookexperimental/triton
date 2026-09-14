@@ -197,12 +197,16 @@ class ProfileRequest:
             reason=str(payload.get("reason", "")),
             diagnostic_only=bool(payload.get("diagnostic_only", False)),
             granularity=(
-                str(payload["granularity"]) if payload.get("granularity") is not None else None
+                str(payload["granularity"])
+                if payload.get("granularity") is not None
+                else None
             ),
         )
 
 
-def normalize_profile_request(profile: bool | ProfileRequest | Mapping[str, Any]) -> ProfileRequest | None:
+def normalize_profile_request(
+    profile: bool | ProfileRequest | Mapping[str, Any],
+) -> ProfileRequest | None:
     if profile is False or profile is None:
         return None
     if profile is True:
@@ -214,7 +218,9 @@ def normalize_profile_request(profile: bool | ProfileRequest | Mapping[str, Any]
     raise TypeError("profile must be bool, ProfileRequest, or mapping")
 
 
-def profile_request_to_json(profile: bool | ProfileRequest | Mapping[str, Any]) -> dict[str, Any] | bool:
+def profile_request_to_json(
+    profile: bool | ProfileRequest | Mapping[str, Any],
+) -> dict[str, Any] | bool:
     request = normalize_profile_request(profile)
     return request.to_json() if request is not None else False
 
@@ -250,7 +256,9 @@ def resolve_profile_tools(
     default: Iterable[object] = (),
 ) -> tuple[str, ...]:
     """Resolve target-neutral profiler names while preserving request order."""
-    requested = tuple(str(tool) for tool in tools) or tuple(str(tool) for tool in default)
+    requested = tuple(str(tool) for tool in tools) or tuple(
+        str(tool) for tool in default
+    )
     resolved: list[str] = []
     for tool in requested:
         if tool == "native_profiler" and native_profiler is not None:
@@ -268,14 +276,27 @@ def resolve_profile_request_for_target(
     if request is None:
         return None
     backend = str(target.get("backend", "")).strip().lower()
-    native_profiler = "ncu" if backend in {"cuda", "nvidia"} else None
-    return replace(
-        request,
-        tools=resolve_profile_tools(
-            request.tools,
-            native_profiler=native_profiler,
-        ),
-    ).to_json()
+    if backend in {"cuda", "nvidia"}:
+        native_profiler = "ncu"
+    elif backend in {"amd", "hip", "rocm"}:
+        native_profiler = "rocprofv3"
+    else:
+        native_profiler = None
+    tools = resolve_profile_tools(
+        request.tools,
+        native_profiler=native_profiler,
+    )
+    if backend in {"amd", "hip", "rocm"}:
+        resolved: list[str] = []
+        for tool in tools:
+            if tool == "proton_launch":
+                if request.level == "deep" and "fb_att" not in resolved:
+                    resolved.append("fb_att")
+                continue
+            if tool not in resolved:
+                resolved.append(tool)
+        tools = tuple(resolved)
+    return replace(request, tools=tools).to_json()
 
 
 def profile_accepts_request(profile_fn: Callable[..., Any]) -> bool:
@@ -311,7 +332,9 @@ def compact_profile_output(
     serialized = json.dumps(dict(raw_profile))
     if len(serialized.encode("utf-8")) <= _INLINE_PROFILE_LIMIT_BYTES:
         return dict(raw_profile)
-    artifacts_dir_raw = request_payload.get("artifacts_dir") if request_payload else None
+    artifacts_dir_raw = (
+        request_payload.get("artifacts_dir") if request_payload else None
+    )
     if artifacts_dir_raw:
         artifacts_dir = Path(str(artifacts_dir_raw))
         if artifacts_dir.is_absolute():
@@ -553,7 +576,9 @@ def select_ncu_metric_names(
     return {"metrics": selected, "diagnostics": diagnostics}
 
 
-def normalize_ncu_metrics(raw_metrics: Mapping[str, Any], level: str = "summary") -> dict[str, Any]:
+def normalize_ncu_metrics(
+    raw_metrics: Mapping[str, Any], level: str = "summary"
+) -> dict[str, Any]:
     selected = select_ncu_metric_names(raw_metrics.keys(), level)
     result: dict[str, Any] = {
         "level": level,
@@ -602,14 +627,35 @@ def extract_ncu_duration_us(profile: Mapping[str, Any]) -> float | None:
     for key in SUMMARY_NCU_METRIC_ALIASES["duration_us"]:
         if key in ncu:
             value = ncu[key]
-            return _duration_to_us(_metric_record_value(value), _metric_record_unit(value))
+            return _duration_to_us(
+                _metric_record_value(value), _metric_record_unit(value)
+            )
     raw_metrics = ncu.get("raw_metrics")
     if isinstance(raw_metrics, Mapping):
         for key in SUMMARY_NCU_METRIC_ALIASES["duration_us"]:
             if key in raw_metrics:
                 value = raw_metrics[key]
-                return _duration_to_us(_metric_record_value(value), _metric_record_unit(value))
+                return _duration_to_us(
+                    _metric_record_value(value), _metric_record_unit(value)
+                )
     return None
+
+
+def extract_native_profiler_duration_us(
+    profile: Mapping[str, Any],
+) -> tuple[str | None, float | None]:
+    if isinstance(profile.get("ncu"), Mapping):
+        duration = extract_ncu_duration_us(profile)
+        if duration is not None:
+            return "NCU", duration
+    rocprof = profile.get("rocprofv3")
+    if isinstance(rocprof, Mapping):
+        summary = rocprof.get("summary")
+        if isinstance(summary, Mapping):
+            duration = _coerce_float(summary.get("duration_us"))
+            if duration is not None:
+                return "rocprofv3", duration
+    return None, None
 
 
 def ncu_regression_diagnostic(
@@ -627,6 +673,28 @@ def ncu_regression_diagnostic(
     return ""
 
 
+def native_profiler_regression_diagnostic(
+    baseline_profile: Mapping[str, Any], candidate_profile: Mapping[str, Any]
+) -> str:
+    baseline_tool, baseline_us = extract_native_profiler_duration_us(baseline_profile)
+    candidate_tool, candidate_us = extract_native_profiler_duration_us(
+        candidate_profile
+    )
+    if (
+        baseline_tool is None
+        or baseline_tool != candidate_tool
+        or baseline_us is None
+        or candidate_us is None
+    ):
+        return ""
+    if candidate_us > baseline_us * 1.01:
+        return (
+            f"{baseline_tool} duration regressed: "
+            f"candidate {candidate_us:.3f}us > baseline {baseline_us:.3f}us by >1%"
+        )
+    return ""
+
+
 def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
     preferred = (
         "level",
@@ -635,6 +703,8 @@ def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
         "summary",
         "proton",
         "ncu",
+        "rocprofv3",
+        "fb_att",
         "native_profiler",
         "diagnostics",
         "diagnostic_proton_intra_kernel",
@@ -833,7 +903,9 @@ def _normalize_header(header: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", header.strip().lower()).strip("_")
 
 
-def _first_header(headers: Mapping[str, str], candidates: tuple[str, ...]) -> str | None:
+def _first_header(
+    headers: Mapping[str, str], candidates: tuple[str, ...]
+) -> str | None:
     for candidate in candidates:
         if candidate in headers:
             return headers[candidate]

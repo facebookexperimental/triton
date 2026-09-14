@@ -1,3 +1,4 @@
+#include "Dialect/NVGPU/IR/Dialect.h"
 #include "TargetInfo.h"
 #include "Utility.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
@@ -48,6 +49,10 @@ public:
 
   bool isBarrierOp(Operation *op) const override {
     return isa<NVVM::BarrierOp>(op);
+  }
+
+  bool isBarrierHandleOp(Operation *op) const override {
+    return isa<mlir::triton::nvgpu::WarpGroupBarrierIdOp>(op);
   }
 
   Type getBarrierHandleType(MLIRContext *ctx) const override {
