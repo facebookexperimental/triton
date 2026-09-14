@@ -176,10 +176,7 @@ def _pinned_config(overrides):
         sm100._tuned.cache_clear()
 
 
-<<<<<<< HEAD:python/test/unit/tlx_ops/test_mm_splitk_sm100.py
-=======
 # ``(M, N, K, NUM_CTAS)``. Each runs across SPLIT_KS_GPU and must agree.
->>>>>>> 7e237ca59 ([TLX.ops] Fix SM100 MM input and cluster correctness):python/test/unit/tlx_ops/test_mm_splitk.py
 GPU_SHAPES = [
     # M % BLOCK_SIZE_M != 0 -- the reported bug (BLOCK_SIZE_M=256 -> 24 rows over).
     (1000, 1000, 1024, 1),

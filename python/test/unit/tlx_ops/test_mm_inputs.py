@@ -79,11 +79,11 @@ def test_unaligned_output_row_stride_is_rejected_before_launch():
     "a, b, message",
     [
         (lambda: torch.randn((2, 3, 4), device="cuda", dtype=torch.bfloat16), lambda: torch.randn(
-            (4, 5), device="cuda", dtype=torch.bfloat16), "expects two 2D tensors"),
+            (4, 5), device="cuda", dtype=torch.bfloat16), "expects two rank-2 tensors"),
         (lambda: torch.randn((4, 7), device="cuda", dtype=torch.bfloat16), lambda: torch.randn(
-            (8, 5), device="cuda", dtype=torch.bfloat16), "incompatible dimensions"),
+            (8, 5), device="cuda", dtype=torch.bfloat16), "reduction dimensions must match"),
         (lambda: torch.randn((4, 8), device="cuda", dtype=torch.bfloat16), lambda: torch.randn(
-            (8, 5), device="cuda", dtype=torch.float16), "matching dtypes"),
+            (8, 5), device="cuda", dtype=torch.float16), "same dtype and device"),
     ],
 )
 def test_invalid_metadata_is_rejected_before_launch(a, b, message):
