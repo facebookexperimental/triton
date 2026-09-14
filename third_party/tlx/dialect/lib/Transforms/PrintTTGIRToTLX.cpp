@@ -113,6 +113,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttng.arrive_barrier_named", "tlx.named_barrier_arrive",
      "Arrive at named hardware barrier"},
 
+    // Takes (mask, pred) in both spellings, so the generic operand order holds.
+    {"ttng.vote_ballot_sync", "tlx.vote_ballot_sync",
+     "Warp-level vote ballot"},
+
     // Memory allocation operations - local_alloc is handled specially
     // ttng.tmem_alloc: handled specially in printSimplifiedOp
 
