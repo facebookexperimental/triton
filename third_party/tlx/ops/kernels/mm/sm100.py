@@ -7,8 +7,10 @@ so the search space can vary per caller. The tutorial's explicit-config launch
 branch is gone: its shape heuristic survives as a one-config space
 (`heuristic_config`), so every caller goes through one launch body.
 """
+import dataclasses
 import functools
 import math
+from typing import Any
 
 import torch
 import triton
@@ -17,11 +19,99 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ..._catalog import InvalidInput
 from ._shapes import SM100_FOCUS
 
-#: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
-#: of every arch's list; perf runs only its own.
-PERF_SHAPES = SM100_FOCUS
+# --------------------------------------------------------------------------
+# TMA descriptor layout -- this kernel's input contract
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class DescriptorLayout:
+    source: Any
+    row_major: bool
+    row_stride: int
+
+
+def _descriptor_properties(rows: int, cols: int, strides: tuple[int, int]) -> tuple[bool, int] | None:
+    stride_row, stride_col = strides
+    if stride_col == 1 and stride_row >= cols:
+        return True, stride_row
+    if stride_row == 1 and stride_col >= rows:
+        return False, stride_col
+    return None
+
+
+def shape_has_tma_compatible_strides(M, N, K, a_strides, b_strides, element_size: int) -> bool:
+    """Whether a captured MM shape can use aligned row-major TMA descriptors."""
+
+    # ``operand`` realizes a broadcast-looking stride on a singleton row as a
+    # normal contiguous tensor. Its recorded stride addresses no second row.
+    if M == 1 and a_strides == (0, 1):
+        a_strides = (K, 1)
+    if K == 1 and b_strides == (0, 1):
+        b_strides = (N, 1)
+
+    a_layout = _descriptor_properties(M, K, a_strides)
+    b_layout = _descriptor_properties(K, N, b_strides)
+    if a_layout is None or b_layout is None:
+        return False
+    row_strides = (a_layout[1], b_layout[1], N)
+    return all(stride * element_size % 16 == 0 for stride in row_strides)
+
+
+def descriptor_layout(tensor, name: str) -> DescriptorLayout:
+    """Normalize a supported 2D tensor view for a row-major TMA descriptor."""
+    if tensor.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape {tuple(tensor.shape)}")
+
+    rows, cols = tensor.shape
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"{name} must have positive dimensions, got {tuple(tensor.shape)}")
+    tensor_type = type(tensor).__name__
+    if tensor_type not in ("FakeTensor", "FunctionalTensor") and tensor.data_ptr() % 16 != 0:
+        raise ValueError(f"{name} base pointer must be 16-byte aligned")
+    properties = _descriptor_properties(rows, cols, tensor.stride())
+    if properties is None:
+        raise ValueError(f"{name} has unsupported shape/strides {tuple(tensor.shape)}/{tuple(tensor.stride())}; "
+                         "expected row-major or column-major storage without broadcast or overlap")
+    row_major, row_stride = properties
+    source = tensor if row_major else tensor.T
+
+    if row_stride * tensor.element_size() % 16 != 0:
+        raise ValueError(f"{name} descriptor row stride {row_stride} elements is not 16-byte aligned "
+                         f"for {tensor.dtype}")
+    return DescriptorLayout(source=source, row_major=row_major, row_stride=row_stride)
+
+
+def validate_inputs(a, b) -> None:
+    """The catalog's `validate` hook: reject what these descriptors cannot address.
+
+    Pre-launch rather than in-kernel because TMA does not mask an out-of-contract
+    access, it traps, and a misaligned row stride is silently wrong data.
+    """
+    try:
+        descriptor_layout(a, "a")
+        descriptor_layout(b, "b")
+    except ValueError as exc:
+        raise InvalidInput(f"mm/sm100 (ws) does not support these inputs: {exc}") from exc
+    # The output is freshly allocated row-major, so N alone decides its stride.
+    if b.shape[1] * a.element_size() % 16 != 0:
+        raise InvalidInput(f"mm/sm100 (ws) does not support these inputs: output row stride {b.shape[1]} "
+                           f"elements is not 16-byte aligned for {a.dtype}")
+
+
+def _focus_shape_is_supported(shape):
+    M, N, K, a_strides, b_strides, dtype = shape
+    element_size = {"fp16": 2, "bf16": 2}[dtype]
+    return shape_has_tma_compatible_strides(M, N, K, a_strides, b_strides, element_size)
+
+
+# Keep unsupported captured calls visible without sending them through a
+# benchmark that they cannot execute. The public API tests pin the rejection.
+PERF_SHAPES = [shape for shape in SM100_FOCUS if _focus_shape_is_supported(shape)]
+UNSUPPORTED_SHAPES = [shape for shape in SM100_FOCUS if not _focus_shape_is_supported(shape)]
 
 
 # Cached SM count — never changes during program lifetime.
@@ -83,13 +173,32 @@ def get_heuristic_config(M, N, K, num_sms=148):
     # Use arithmetic intensity to select tile shape, and K size to select BLOCK_K
     if is_tall_m and is_gpu_saturated:
         arithmetic_intensity = K / max(min(M, N), 1)
+        # A 256-wide 2-CTA tile gives CTA1 no B columns when N <= 128.
+        # Sustained launches of that configuration fail. Use a 128-wide tile
+        # with one epilogue store and more M tiles instead.
+        if N <= 128:
+            return {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 128, num_ctas=2),
+                "NUM_SMEM_BUFFERS": 4,
+                "NUM_TMEM_BUFFERS": 3,
+                "NUM_MMA_GROUPS": 1,
+                "EPILOGUE_SUBTILE": 1,
+                "NUM_CTAS": 2,
+                "SPLIT_K": 1,
+                "INTERLEAVE_EPILOGUE": 0,
+                "ctas_per_cga": (2, 1, 1),
+                "pre_hook": matmul_tma_set_block_size_hook,
+            }
         # For low arithmetic intensity (memory-bound), use narrower tiles with larger BLOCK_K
         if arithmetic_intensity <= 1.5:
             return {
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -109,7 +218,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -125,7 +234,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -330,7 +439,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas=num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -345,7 +454,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m):
+def _select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
@@ -357,19 +466,23 @@ def _select_group_size_m(M, N, block_m):
     - When M >> N: Use small GROUP_SIZE_M to reuse B (smaller dimension)
     - When N >> M: Use large GROUP_SIZE_M to reuse A (smaller dimension)
     - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
+
+    Rounded up to a multiple of num_ctas: correctness, not tuning. See the
+    pairing gate in preprocess_configs.
     """
     num_m_tiles = (M + block_m - 1) // block_m
     ratio = M / max(N, 1)
 
     if ratio > 10:
-        # M >> N: sweep M, reuse B
-        return 1
+        # M >> N: sweep M, reuse B. A cluster must stay inside one group.
+        group_size = 1
     elif ratio < 0.1:
         # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
+        group_size = min(64, num_m_tiles)
     else:
         # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
+        group_size = min(8, num_m_tiles)
+    return max(num_ctas, math.ceil(group_size / num_ctas) * num_ctas)
 
 
 def get_cuda_autotune_config():
@@ -497,6 +610,11 @@ def preprocess_configs(configs, named_args, **kwargs):
             continue
         # Pair-CTA MMA doesn't work with M=64 per MMA group
         if NUM_CTAS == 2 and BLOCK_M // NUM_MMA_GROUPS == 64:
+            continue
+        # Every CTA in a pair must own at least one B column. A TMA load whose
+        # starting column is at or beyond N is an invalid launch, not a masked
+        # tail tile.
+        if (NUM_CTAS - 1) * (BLOCK_N // NUM_CTAS) >= N:
             continue
         # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
         # tile_ids (assigned to paired CTAs in a cluster) always map to the
@@ -1551,6 +1669,15 @@ def heuristic_config(M, N, K):
     if cfg is None:
         return None
     cfg = dict(cfg)
+    # The heuristic path bypasses preprocess_configs, so check its gate here.
+    group_m, num_ctas = cfg["GROUP_SIZE_M"], cfg.get("NUM_CTAS", 1)
+    if group_m % num_ctas != 0:
+        raise AssertionError(f"heuristic config for {M}x{N}x{K} has GROUP_SIZE_M={group_m} with "
+                             f"NUM_CTAS={num_ctas}; paired CTAs would straddle two pid_n values")
+    block_n = cfg["BLOCK_SIZE_N"]
+    if (num_ctas - 1) * (block_n // num_ctas) >= N:
+        raise AssertionError(f"heuristic config for {M}x{N}x{K} has BLOCK_SIZE_N={block_n} with "
+                             f"NUM_CTAS={num_ctas}; a CTA would start its B tile outside N")
     ctas_per_cga = cfg.pop("ctas_per_cga", None)
     pre_hook = cfg.pop("pre_hook", None) or matmul_tma_set_block_size_hook
     return [triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=pre_hook, ctas_per_cga=ctas_per_cga)]
@@ -1602,15 +1729,15 @@ def mm(a, b, *, space="full"):
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only
-    # transpose. No copy.
-    a_row_major = a.is_contiguous()
-    b_row_major = b.is_contiguous()
+    # transpose. No copy. Padded row-major views keep their original orientation.
+    a_layout = descriptor_layout(a, "a")
+    b_layout = descriptor_layout(b, "b")
+    a_row_major = a_layout.row_major
+    b_row_major = b_layout.row_major
 
     dummy_block = [1, 1]
-    a_src = a if a_row_major else a.T
-    b_src = b if b_row_major else b.T
-    a_desc = TensorDescriptor(a_src, a_src.shape, a_src.stride(), dummy_block)
-    b_desc = TensorDescriptor(b_src, b_src.shape, b_src.stride(), dummy_block)
+    a_desc = TensorDescriptor(a_layout.source, a_layout.source.shape, a_layout.source.stride(), dummy_block)
+    b_desc = TensorDescriptor(b_layout.source, b_layout.source.shape, b_layout.source.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     # Dummy workspace; the pre_hook sizes a real one once SPLIT_K is known.

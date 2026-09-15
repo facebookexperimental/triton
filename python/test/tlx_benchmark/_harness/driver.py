@@ -196,6 +196,37 @@ def _errored(case: Case, exc: Exception) -> Result:
     return result
 
 
+#: Errors after which the CUDA context is no longer usable.
+_FATAL_CUDA_ERRORS = (
+    "device-side assert",
+    "illegal memory access",
+    "launch failure",
+    "launch timeout",
+    "misaligned address",
+)
+
+
+def _is_fatal_cuda_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _FATAL_CUDA_ERRORS)
+
+
+def _run_cases(cases, run_one) -> list:
+    results = []
+    for case in cases:
+        try:
+            results.append(run_one(case))
+        except Exception as exc:  # a broken case must not hide the others
+            results.append(_errored(case, exc))
+            # A validation failure is isolated to one case. A fatal CUDA error
+            # poisons the process context, so every later case would report a
+            # cascade of launch failures rather than an independent result.
+            if _is_fatal_cuda_error(exc):
+                results[-1].notes.append("stopping: the CUDA context may be unusable after this error")
+                break
+    return results
+
+
 def resolve_space(bench, space: Optional[str]) -> str:
     """`None` means "whatever this op's own default is".
 
@@ -256,17 +287,16 @@ def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_co
         cases = [c for c in cases if c.direction in directions]
     if head:
         cases = _head_per_direction(cases, head)
-    results = []
     sampled = set()
+
+    def run_one(case):
+        cold = cold_mode == "all" or (cold_mode == "first" and case.direction not in sampled)
+        if cold:
+            sampled.add(case.direction)
+        return run_case(bench, case, space=space, cold=cold, latency_mode=latency_mode)
+
     with stable(device_index()) as info:
-        for case in cases:
-            cold = cold_mode == "all" or (cold_mode == "first" and case.direction not in sampled)
-            if cold:
-                sampled.add(case.direction)
-            try:
-                results.append(run_case(bench, case, space=space, cold=cold, latency_mode=latency_mode))
-            except Exception as exc:  # a broken case must not hide the others
-                results.append(_errored(case, exc))
+        results = _run_cases(cases, run_one)
     # The autotune space is part of what a number means: a heuristic-space
     # latency and a full-space latency for the same shape differ by 4x, so two
     # artifacts are only comparable when this matches. Same for the reference --

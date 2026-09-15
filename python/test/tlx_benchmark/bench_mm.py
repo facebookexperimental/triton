@@ -45,6 +45,18 @@ def cases(synthetic: bool = False) -> list[Case]:
     ]
 
 
+def _correctness_reference(a, b):
+    """A true fp32 product, not the timed fp16/bf16 `torch.matmul`.
+
+    Checking against the reference we race conflates two approximations: a
+    cuBLAS half-precision product is itself off the exact answer, so a TLX
+    result can agree with it and still be wrong.
+    """
+    if torch.get_float32_matmul_precision() != "highest":
+        raise RuntimeError("the MM correctness reference requires float32_matmul_precision='highest'")
+    return a.float() @ b.float()
+
+
 def prepare(case: Case, space: str) -> Prepared:
     from triton.tlx.ops import mm as tlx_mm
 
@@ -58,7 +70,7 @@ def prepare(case: Case, space: str) -> Prepared:
         tlx_fn=tlx_fn,
         ref_fn=ref_fn,
         flop_count=flops(M, N, K),
-        check=lambda: close_enough(tlx_fn(), ref_fn(), REL_PRECISION[case.dtype]),
+        check=lambda: close_enough(tlx_fn().float(), _correctness_reference(a, b), REL_PRECISION[case.dtype]),
     )
 
 

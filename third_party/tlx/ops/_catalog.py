@@ -27,6 +27,11 @@ class OpSpec:
     dtypes: frozenset = frozenset()  # bare torch names, so the table needs no torch
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
+    # "module:attr", like `impl`. For an entry whose input contract is about the
+    # operand layouts rather than about dimensions the caller can state: the
+    # rule is the kernel's, so it lives with the kernel and raises its own
+    # message. Loaded on first use, so the table still imports nothing.
+    validate: Optional[str] = None
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -45,10 +50,11 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws",
         impl="kernels.mm.sm100:mm",
         dtypes=_FP16,
-        # TMA needs 16-byte-aligned descriptor row strides. Checked against the
-        # real strides, not M/N/K: a column-major operand is fed to its
-        # descriptor transposed, which moves the constraint to another dim.
-        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        # TMA needs 16-byte-aligned descriptor row strides, and no broadcast or
+        # overlap. The rule is about the operands' real strides rather than
+        # M/N/K -- a column-major operand is fed to its descriptor transposed,
+        # which moves the constraint to another dim -- so the kernel owns it.
+        validate="kernels.mm.sm100:validate_inputs",
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
@@ -57,9 +63,9 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="lds_ring",
         impl="kernels.mm.gfx942:mm",
         dtypes=_FP16,
-        # No `accepts`: operands are read through explicit strides rather than a
-        # descriptor, so there is no alignment rule to fail. This arch therefore
-        # admits shapes sm100 declines -- see kernels/mm/_shapes.py.
+        # No `validate`: operands are read through explicit strides rather than
+        # a descriptor, so there is no alignment rule to fail. This arch
+        # therefore admits shapes sm100 declines -- see kernels/mm/_shapes.py.
         requires=frozenset(),
     ),
     OpSpec(
@@ -198,10 +204,17 @@ def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], O
     return _load(spec.impl), spec
 
 
-def check_inputs(spec: OpSpec, dtype=None, **dims) -> None:
+def check_inputs(spec: OpSpec, *operands, dtype=None, **dims) -> None:
+    """Dtype, then the `accepts` predicate over dims, then the kernel's own hook.
+
+    `operands` are the tensors, passed positionally, for an entry whose contract
+    needs them. Passing them to an entry without a `validate` hook is free.
+    """
     if dtype is not None and spec.dtypes:
         name = str(dtype).removeprefix("torch.")
         if name not in spec.dtypes:
             raise InvalidInput(f"{spec} does not support {name}; supported: {sorted(spec.dtypes)}")
     if spec.accepts is not None and not spec.accepts(dims):
         raise InvalidInput(f"{spec} does not support these inputs: {dims}")
+    if spec.validate is not None:
+        _load(spec.validate)(*operands)

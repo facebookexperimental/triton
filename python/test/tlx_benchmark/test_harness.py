@@ -955,3 +955,54 @@ def test_an_unknown_latency_mode_is_rejected():
 
     with pytest.raises(ValueError, match="mode must be one of"):
         measure(lambda: None, mode="profiler")
+
+
+@pytest.mark.parametrize("message", [
+    "CUDA error: unspecified launch failure",
+    "CUDA error: an illegal memory access was encountered",
+    "device-side assert triggered",
+])
+def test_benchmark_stops_after_fatal_cuda_error(message):
+    from _harness import driver
+
+    seen = []
+    case_list = [Case(op="mm", arch="sm100", dtype="bfloat16", shape=(i, i, i)) for i in (1, 2, 3)]
+
+    def run_one(case):
+        seen.append(case)
+        if len(seen) == 2:
+            raise RuntimeError(message)
+        return Result(case=case)
+
+    results = driver._run_cases(case_list, run_one)
+    assert len(seen) == 2
+    assert len(results) == 2
+    assert results[-1].status is Status.ERROR
+    assert "stopping:" in results[-1].notes[-1]
+
+
+def test_benchmark_continues_after_recoverable_error():
+    from _harness import driver
+
+    case_list = [Case(op="mm", arch="sm100", dtype="bfloat16", shape=(i, i, i)) for i in (1, 2, 3)]
+
+    def run_one(case):
+        if case.shape[0] == 2:
+            raise ValueError("unsupported layout")
+        return Result(case=case)
+
+    results = driver._run_cases(case_list, run_one)
+    assert len(results) == 3
+    assert [result.status for result in results] == [Status.OK, Status.ERROR, Status.OK]
+
+
+def test_mm_correctness_reference_uses_true_float32():
+    import bench_mm
+    import torch
+
+    a = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    b = torch.tensor([[3.0], [4.0]], dtype=torch.bfloat16)
+    ref = bench_mm._correctness_reference(a, b)
+
+    assert ref.dtype == torch.float32
+    torch.testing.assert_close(ref, a.float() @ b.float())
