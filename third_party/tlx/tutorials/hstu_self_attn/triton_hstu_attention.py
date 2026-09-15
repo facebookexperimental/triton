@@ -76,6 +76,8 @@ class HSTUAutoWSConfig:
     sp: bool = False  # bwd SEQUENCE_PARALLEL
     clc: bool = False  # bwd CLC-persistent flattened tile loop
     clc_smem_algo: int = 1  # CLC outer-loop SMEM allocation algorithm
+    split_causal_loops: bool = False  # manually split masked/unmasked CLC Q loops
+    dq_transposed: bool = False  # form dQ through the TLX-matching transposed MMA
     pin: bool = False  # pin autotune to one config (fast compile)
 
     @classmethod
@@ -99,6 +101,11 @@ class HSTUAutoWSConfig:
             sp=g("HSTU_SELF_AUTOWS_SP") == "1",
             clc=g("HSTU_SELF_AUTOWS_CLC") == "1",
             clc_smem_algo=int(g("HSTU_SELF_AUTOWS_CLC_SMEM_ALGO", "1")),
+            split_causal_loops=g("HSTU_SELF_SPLIT_CAUSAL_LOOPS") == "1",
+            dq_transposed=g(
+                "HSTU_SELF_DQ_TRANSPOSED",
+                "1" if g("HSTU_SELF_AUTOWS_CLC") == "1" else "0",
+            ) == "1",
             pin=g("HSTU_SELF_PIN") == "1",
         )
 
@@ -159,11 +166,12 @@ def configure_autows(cfg=None, **kwargs) -> "HSTUAutoWSConfig":
 
 
 # The autoWS structural knobs (autows / dp / manual_dp / dq_reduce / dq_fp32 /
-# dq_iters / dq_reuse) are passed to the kernels as tl.constexpr ARGUMENTS from the fwd/bwd
-# Python wrappers (sourced from _AUTOWS_CFG), so they are part of the JIT/autotune
-# cache key -- switching config recompiles a distinct, correctly-keyed kernel with
-# no module-level constexpr globals and no cache-invalidation dance. dq_reuse is
-# the derived AND (dq_reduce and dq_reuse), computed in the wrapper.
+# dq_iters / dq_reuse / split_causal_loops / dq_transposed) are passed to the
+# kernels as tl.constexpr ARGUMENTS from the fwd/bwd Python wrappers (sourced
+# from _AUTOWS_CFG), so they are part of the JIT/autotune cache key -- switching
+# config recompiles a distinct, correctly-keyed kernel with no module-level
+# constexpr globals and no cache-invalidation dance. dq_reuse is the derived
+# AND (dq_reduce and dq_reuse), computed in the wrapper.
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -600,6 +608,9 @@ def _get_bw_configs() -> List[triton.Config]:
             _bm = min(_bm, 64)
         _bn = _AUTOWS_CFG.bwd_bn
         _ns = _AUTOWS_CFG.bwd_stages
+        _split_direct_dq = _AUTOWS_CFG.split_causal_loops and not _AUTOWS_CFG.dq_transposed
+        _min_regs = 72 if _split_direct_dq else 80
+        _max_regs = 72 if _split_direct_dq else 192
         # SEQUENCE_PARALLEL=True -> one KV block per program => a single M loop
         # (no outer start_n loop), matching FA bwd's flat reduction loop; the
         # nested (SP=False) path is where the dq-reduce reduction partition's
@@ -616,10 +627,11 @@ def _get_bw_configs() -> List[triton.Config]:
                 },
                 num_stages=_ns,
                 num_warps=_w,
-                # Match TLX: 80 regs/thread for the 1-warp GEMM/load groups,
-                # 192 for the 8-warp computation group, and ~80 left for default.
-                minRegAutoWS=80,
-                maxRegAutoWS=192,
+                # Match TLX's default register split. Direct dQ subtiling puts
+                # register tensors in all three numbered workers, so cap those
+                # workers at the minimum and leave registers for computation.
+                minRegAutoWS=_min_regs,
+                maxRegAutoWS=_max_regs,
                 pre_hook=_bwd_pre_hook,
                 generate_subtiled_region=_AUTOWS_CFG.dkdv_subtile > 1,
             )
@@ -692,9 +704,6 @@ def backward_activation_prescaled(qk_trans, alpha, scale, valid_mask_trans, k):
     return half_qk, one_plus_tanh, act_qk_trans
 
 
-# Unmasked counterpart of backward_activation_prescaled. The CLC backward
-# kernel uses it after the diagonal causal block, where every in-bounds Q/K
-# pair is visible and the causal tl.where chain is unnecessary.
 @triton.jit
 def backward_activation_prescaled_unmasked(qk_trans, alpha, scale, k):
     half_qk = qk_trans * (alpha * 0.5)
@@ -1012,7 +1021,9 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
     APPLY_MASK: tl.constexpr = True,
+    PEEL_CAUSAL_MASK: tl.constexpr = False,
     DQ_TRANSPOSED: tl.constexpr = False,
+    DQ_SUBTILED: tl.constexpr = False,
 ):
     offs_m = offs_m + start_m
     # Keep the integer KV-index/mask chain inside the warp-specialized loop.
@@ -1053,7 +1064,33 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             "channels": ["opndD,tmem,1,2" if APPLY_MASK else "opndD,tmem,1,12"],
         } if DQ_REUSE else None),
     )
-    if APPLY_MASK:
+    if not APPLY_MASK:
+        valid_mask_trans = None
+    elif (
+        PEEL_CAUSAL_MASK
+        and not HAS_NUM_TARGETS
+        and not HAS_MAX_ATTN_LEN
+        and not HAS_CONTEXTUAL_SEQ_LEN
+    ):
+        # Expose the fixed causal prefix as scalar control flow. The compiler
+        # folds this branch while peeling the prefix. Target-aware clamping is
+        # not a pure causal predicate, so target workloads retain the full mask.
+        needs_causal_mask = start_m < start_n + BLOCK_N
+        if needs_causal_mask:
+            valid_mask_trans = backward_valid_mask(
+                offs_m,
+                pos_offs_n,
+                offs_n,
+                max_ids,
+                contextual_seq_len,
+                max_attn_len,
+                HAS_CONTEXTUAL_SEQ_LEN,
+                HAS_NUM_TARGETS,
+                HAS_MAX_ATTN_LEN,
+            )
+        else:
+            valid_mask_trans = tl.full((BLOCK_N, BLOCK_M), True, tl.int1)
+    else:
         valid_mask_trans = backward_valid_mask(
             offs_m,
             pos_offs_n,
@@ -1112,7 +1149,10 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         attrs=({
             "stage": "0",
             "order": "2",
-            "channels": ["opndA,tmem,1,2" if APPLY_MASK else "opndA,tmem,1,12", "opndD,tmem,1,7"],
+            "channels": [
+                "opndA,tmem,1,2" if APPLY_MASK else "opndA,tmem,1,12",
+                "opndD,tmem,1,7",
+            ],
         } if DQ_REUSE else None),
     )
 
@@ -1140,11 +1180,12 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     )
 
     if DQ_REDUCE and ENABLE_TMA:
-        # Match FA backward's dQ epilogue: form dQ in its output orientation,
-        # split the MMA accumulator, then scale and convert one slice at a time.
-        # This gives lowering four physical 64x32 TMEM unloads instead of one
-        # full transposed unload. Staging-slot rotation is matched separately.
+        dq_slice_size: tl.constexpr = BLOCK_D_Q // DQ_ITERS
         if DQ_TRANSPOSED:
+            # Match FA backward's dQ epilogue: form dQ in its output
+            # orientation, then split the transposed MMA accumulator. This
+            # gives lowering four physical 64x32 TMEM unloads instead of one
+            # full transposed unload.
             dq = tl.trans(
                 tl.dot(
                     tl.trans(k),
@@ -1161,33 +1202,61 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
                         ],
                     } if DQ_REUSE else None),
                 ) * alpha)
+            dqs = _split_n_2D(dq, DQ_ITERS)
+            for _s in tl.static_range(DQ_ITERS):
+                dq_slice = dqs[_s]
+                if not DQ_FP32:
+                    dq_slice = dq_slice.to(k.dtype)
+                device_desc_dq.store(
+                    [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
+                    dq_slice,
+                    store_reduce="add",
+                )
         else:
-            dq = tl.dot(
-                tl.trans(dqk_trans),
-                k,
-                allow_tf32=ALLOW_TF32,
-                attrs=({
-                    "stage": "1",
-                    "order": "1",
-                    "channels": ["opndD,tmem,1,11"],
-                } if DQ_REUSE else None),
-            )
-        # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
-        # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
-        # compiler stages separately (the source-level analog of TLX's subtiled +
-        # depth-2 dq_store_buf staging). _split_n_2D does the register split that
-        # `dq[:, a:b]` cannot.
-        dq_slice_size: tl.constexpr = BLOCK_D_Q // DQ_ITERS
-        dqs = _split_n_2D(dq, DQ_ITERS)
-        for _s in tl.static_range(DQ_ITERS):
-            dq_slice = dqs[_s] if DQ_TRANSPOSED else dqs[_s] * alpha
-            if not DQ_FP32:
-                dq_slice = dq_slice.to(k.dtype)
-            device_desc_dq.store(
-                [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
-                dq_slice,
-                store_reduce="add",
-            )
+            if DQ_SUBTILED:
+                # Manual loop splitting duplicates scratch for both siblings.
+                # Form direct dQ one output subtile at a time so each MMA can
+                # reuse the loop-local dP TMEM slot.
+                k_slices = _split_n_2D(k, DQ_ITERS)
+                for _s in tl.static_range(DQ_ITERS):
+                    dq_slice = tl.dot(
+                        tl.trans(dqk_trans),
+                        k_slices[_s],
+                        allow_tf32=ALLOW_TF32,
+                        attrs=({
+                            "stage": "1",
+                            "order": "1",
+                            "channels": ["opndD,tmem,1,5" if APPLY_MASK else "opndD,tmem,1,15"],
+                        } if DQ_REUSE else None),
+                    ) * alpha
+                    if not DQ_FP32:
+                        dq_slice = dq_slice.to(k.dtype)
+                    device_desc_dq.store(
+                        [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
+                        dq_slice,
+                        store_reduce="add",
+                    )
+            else:
+                dq = tl.dot(
+                    tl.trans(dqk_trans),
+                    k,
+                    allow_tf32=ALLOW_TF32,
+                    attrs=({
+                        "stage": "1",
+                        "order": "1",
+                        "channels": ["opndD,tmem,1,11"],
+                    } if DQ_REUSE else None),
+                )
+                dqs = _split_n_2D(dq, DQ_ITERS)
+                for _s in tl.static_range(DQ_ITERS):
+                    dq_slice = dqs[_s] * alpha
+                    if not DQ_FP32:
+                        dq_slice = dq_slice.to(k.dtype)
+                    device_desc_dq.store(
+                        [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
+                        dq_slice,
+                        store_reduce="add",
+                    )
     else:
         acc_dq(
             dq_ptrs_trans=dq_ptrs_trans,
@@ -1847,6 +1916,8 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     DQ_REUSE: tl.constexpr = False,
     DKDV_SUBTILE: tl.constexpr = 1,
     SPLIT_CAUSAL_LOOPS: tl.constexpr = False,
+    PEEL_CAUSAL_MASK: tl.constexpr = False,
+    DQ_TRANSPOSED: tl.constexpr = False,
 ):
     offs_m = tl.arange(0, BLOCK_M)
     offs_qk_d = tl.arange(0, BLOCK_D_Q)
@@ -1922,7 +1993,9 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
-                DQ_TRANSPOSED=SPLIT_CAUSAL_LOOPS,
+                PEEL_CAUSAL_MASK=False,
+                DQ_TRANSPOSED=DQ_TRANSPOSED,
+                DQ_SUBTILED=SPLIT_CAUSAL_LOOPS and not DQ_TRANSPOSED,
             )
     if HAS_NUM_TARGETS:
         low = start_n
@@ -1942,13 +2015,13 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         contextual_block_end = tl.cdiv(contextual_seq_len, BLOCK_M) * BLOCK_M
         if low < contextual_block_end:
             low = contextual_block_end
-    # The hand-written TLX kernel has two physical loops: the diagonal/semi-local
-    # region requires the HSTU mask, while the strictly lower causal region does
-    # not. Keep the split scoped to CLC for stepwise AutoWS/TLX matching; the
-    # regular kernel retains its original single-loop shape.
+    # Preserve the manual TLX-shaped split as an independent option. The first
+    # loop covers the diagonal causal prefix; the second is strictly lower and
+    # can omit the tensor mask. When disabled, one source loop remains and the
+    # compiler may peel its scalar prefix after physical code partitioning.
     if SPLIT_CAUSAL_LOOPS:
         masked_high = high
-        if not HAS_MAX_ATTN_LEN:
+        if not HAS_MAX_ATTN_LEN and not HAS_NUM_TARGETS:
             causal_high = start_n + BLOCK_N
             masked_high = causal_high if causal_high < high else high
         unmasked_low = masked_high
@@ -2035,7 +2108,9 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
                 APPLY_MASK=not SPLIT_CAUSAL_LOOPS or loop_part == 0,
-                DQ_TRANSPOSED=SPLIT_CAUSAL_LOOPS,
+                PEEL_CAUSAL_MASK=PEEL_CAUSAL_MASK and not SPLIT_CAUSAL_LOOPS,
+                DQ_TRANSPOSED=DQ_TRANSPOSED,
+                DQ_SUBTILED=SPLIT_CAUSAL_LOOPS and not DQ_TRANSPOSED,
             )
     # write-back
     if ENABLE_TMA:
@@ -2435,6 +2510,8 @@ def _hstu_attn_bwd_clc(  # noqa C901
     DQ_REUSE: tl.constexpr,
     DKDV_SUBTILE: tl.constexpr,
     CLC_SMEM_ALGO: tl.constexpr,
+    SPLIT_CAUSAL_LOOPS: tl.constexpr,
+    DQ_TRANSPOSED: tl.constexpr,
 ):
     tl.static_assert(ENABLE_TMA)
     tl.static_assert(DQ_REDUCE)
@@ -2570,7 +2647,9 @@ def _hstu_attn_bwd_clc(  # noqa C901
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
                 DKDV_SUBTILE=DKDV_SUBTILE,
-                SPLIT_CAUSAL_LOOPS=True,
+                SPLIT_CAUSAL_LOOPS=SPLIT_CAUSAL_LOOPS,
+                PEEL_CAUSAL_MASK=not SPLIT_CAUSAL_LOOPS,
+                DQ_TRANSPOSED=DQ_TRANSPOSED,
             )
         sched = sched.advance()
 
@@ -2720,7 +2799,11 @@ def triton_hstu_attention_bwd(
         grid = lambda meta: (  # noqa E731
             tile_count, )
         bwd_kernel = _hstu_attn_bwd_clc
-        clc_kwargs = {"CLC_SMEM_ALGO": _AUTOWS_CFG.clc_smem_algo}
+        clc_kwargs = {
+            "CLC_SMEM_ALGO": _AUTOWS_CFG.clc_smem_algo,
+            "SPLIT_CAUSAL_LOOPS": _AUTOWS_CFG.split_causal_loops,
+            "DQ_TRANSPOSED": _AUTOWS_CFG.dq_transposed,
+        }
     else:
         grid = lambda meta: (  # noqa E731
             Z * H,

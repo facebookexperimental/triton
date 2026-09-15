@@ -74,6 +74,104 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A source-level scalar guard can state the masked-prefix boundary directly
+// when the tensor predicate contains application-specific transforms that the
+// generic causal-mask matcher cannot safely rediscover.  The boundary spans
+// two loop steps here, so both guarded iterations must be peeled.
+
+#blocked_scalar = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_scalar_two_tiles
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // CHECK: %[[HAS_FIRST:.*]] = arith.cmpi slt
+  // CHECK: scf.if %[[HAS_FIRST]]
+  // CHECK: tt.store
+  // CHECK: %[[SECOND_IV:.*]] = arith.addi
+  // CHECK: %[[HAS_SECOND:.*]] = arith.cmpi slt, %[[SECOND_IV]], %{{.*}} : i32
+  // CHECK: scf.if %[[HAS_SECOND]]
+  // CHECK: tt.store
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]]
+  // CHECK-NOT: scf.if
+  // CHECK: tt.store
+  // CHECK: }
+  tt.func public @peel_scalar_two_tiles(%lb: i32, %ub: i32,
+                                        %out: !tt.ptr<i32>) {
+    ttg.warp_specialize(%lb, %ub, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32,
+               %part_out: !tt.ptr<i32>) num_warps(4) {
+      %c64 = arith.constant 64 : i32
+      %c2 = arith.constant 2 : i32
+      %masked = arith.constant 1 : i32
+      %unmasked = arith.constant 2 : i32
+      %distance = arith.muli %c64, %c2 : i32
+      %boundary = arith.addi %part_lb, %distance : i32
+      scf.for %m = %part_lb to %part_ub step %c64 : i32 {
+        %needs_mask = arith.cmpi slt, %m, %boundary : i32
+        %value = scf.if %needs_mask -> (i32) {
+          scf.yield %masked : i32
+        } else {
+          scf.yield %unmasked : i32
+        }
+        tt.store %part_out, %value : !tt.ptr<i32>
+      }
+      ttg.warp_return
+    } : (i32, i32, !tt.ptr<i32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Preserve the original one-iteration scalar match for loops whose step is
+// dynamic. Only generalized K-step and folded-offset matching needs a constant
+// step.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_scalar_dynamic_step
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // CHECK: %[[HAS_FIRST:.*]] = arith.cmpi slt
+  // CHECK: scf.if %[[HAS_FIRST]]
+  // CHECK: tt.store
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]] to %{{.*}} step %{{.*}}
+  // CHECK-NOT: scf.if
+  // CHECK: tt.store
+  // CHECK: }
+  tt.func public @peel_scalar_dynamic_step(%lb: i32, %ub: i32, %step: i32,
+                                            %out: !tt.ptr<i32>) {
+    ttg.warp_specialize(%lb, %ub, %step, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32, %part_step: i32,
+               %part_out: !tt.ptr<i32>) num_warps(4) {
+      %masked = arith.constant 1 : i32
+      %unmasked = arith.constant 2 : i32
+      %boundary = arith.addi %part_lb, %part_step : i32
+      scf.for %m = %part_lb to %part_ub step %part_step : i32 {
+        %needs_mask = arith.cmpi slt, %m, %boundary : i32
+        %value = scf.if %needs_mask -> (i32) {
+          scf.yield %masked : i32
+        } else {
+          scf.yield %unmasked : i32
+        }
+        tt.store %part_out, %value : !tt.ptr<i32>
+      }
+      ttg.warp_return
+    } : (i32, i32, i32, !tt.ptr<i32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 // When N % step == 1, only ceil((N - 1) / step) iterations need the mask.
 // N=128 and step=127 therefore peel one iteration, not two.
 

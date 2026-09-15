@@ -12,16 +12,21 @@ The transformation is intentionally narrow. It recognizes an `scf.for` body
 predicate of the form:
 
 ```mlir
-%boundary = arith.addi %lb, %step
+%distance = arith.muli %step, %K
+%boundary = arith.addi %lb, %distance
 %masked = arith.cmpi slt, %iv, %boundary
 %result = scf.if %masked { ... } else { ... }
 ```
 
-when `%iv` is the loop induction variable and the comparison controls an
-`scf.if`. It rewrites the loop to a zero-trip-safe outer `scf.if`, clones the
-first iteration with `%masked = true`, and creates a remainder loop beginning
-at `%lb + %step` with `%masked = false`. Canonicalization removes the dead side
-of each activation branch later in the AutoWS pipeline.
+when `%iv` is the loop induction variable, `K` is a positive compile-time
+constant of at most four, and the comparison controls an `scf.if`. The one-step
+`%lb + %step` form also accepts a dynamic step, preserving the legacy match.
+The equivalent constant-folded `%lb + C` form is accepted when `C` is an exact
+multiple of a constant loop step. It rewrites the loop to a zero-trip-safe
+outer `scf.if`, clones the first `K` iterations with `%masked = true`, and
+creates a remainder loop beginning at `%lb + K * %step` with `%masked = false`.
+Canonicalization removes the dead side of each activation branch later in the
+AutoWS pipeline.
 
 The pass also recognizes the equivalent tensor-select form emitted by the HSTU
 backward kernel before the source-level branch was added:
@@ -79,8 +84,10 @@ This placement and restriction are important: communication channels and
 physical buffers have already been planned, so peeling cannot change channel
 discovery or memory-planner decisions.
 
-The HSTU self-attention backward kernel uses this pattern for its first masked
-dK/dV tile. The explicit-branch regression is
+The HSTU self-attention backward kernel uses the scalar form to expose its two
+causal-prefix dK/dV tiles when the mask is purely causal. Target-aware clamping
+is not peeled because it is not a pure causal predicate; those workloads retain
+the full tensor mask. The explicit-branch regression is
 `test/Hopper/WarpSpecialization/ws_single_partition_else_hstu_bwd.mlir`; the
-tensor-select regression is
+scalar multi-tile and tensor-select regressions are
 `test/Hopper/WarpSpecialization/ws_partition_where_loop_peeling.mlir`.
