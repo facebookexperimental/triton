@@ -1028,5 +1028,5 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     if space not in ("full", "smoke"):
         raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
-        sm_scale = q.shape[-1] ** -0.5
+        sm_scale = q.shape[-1]**-0.5
     return _attention.apply(q, k, v, sm_scale, causal, None)

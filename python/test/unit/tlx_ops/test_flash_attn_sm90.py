@@ -19,8 +19,7 @@ def _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=False):
             (Z, H, N_CTX, HEAD_DIM),
             device="cuda",
             dtype=dtype,
-        ).requires_grad_(requires_grad)
-        for _ in range(3)
+        ).requires_grad_(requires_grad) for _ in range(3)
     ]
 
 

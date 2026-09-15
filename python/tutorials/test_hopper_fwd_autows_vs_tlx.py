@@ -37,6 +37,7 @@ def _import(name, path):
 # TLX kernels
 tlx_pp = _import("hopper_fa_ws_pipelined_pingpong", os.path.join(_tlx_dir, "hopper_fa_ws_pipelined_pingpong.py"))
 
+
 def load_autows(swp=True):
     os.environ["TRITON_HOPPER_SWP"] = "1" if swp else "0"
     os.environ["TRITON_ALWAYS_COMPILE"] = "1"
