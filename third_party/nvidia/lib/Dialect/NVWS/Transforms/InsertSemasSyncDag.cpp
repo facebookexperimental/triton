@@ -710,12 +710,14 @@ public:
     assert(!g.root->children.empty() && "edges require an access DAG");
     Chain placed;
     placeChain(g.root->children[0], placed);
-    if (hadError)
+    if (hadError || failed(resolveDeferredEntries()))
       return failure();
     if (remainingEdges.empty() && placed.supplies.empty()) {
       if (failed(verifyRegionDrains()))
         return failure();
-      return formSemaphores();
+      if (failed(formSemaphores()))
+        return failure();
+      return verifyResolvedEntries();
     }
     dumpSyncDagTree(g);
     if (!remainingEdges.empty()) {
@@ -797,6 +799,20 @@ private:
     EdgeRefs entry, closes;
   };
   using LoopSupplies = llvm::MapVector<Owner, LoopSupply>;
+  // An inherited ENTER is provisional until the enclosing region chooses
+  // between a carried token and point-of-use acquisition. Keep the boundary,
+  // not a snapshot of its producer: placement may rewrite that producer.
+  struct DeferredEntry {
+    Node *enter = nullptr;
+    Node *loop = nullptr;
+    Node *acquire = nullptr;
+    Owner owner;
+  };
+  struct ResolvedEntry {
+    DeferredEntry entry;
+    Node *release = nullptr;
+    Node *before = nullptr;
+  };
   struct BranchExit {
     Chain chain;
     Node *exit = nullptr;
@@ -1046,20 +1062,26 @@ private:
     }
   }
   Node *materializeRelease(Tokens::Token &token, const Owner &owner,
-                           Node *acquire, Node *guard) {
+                           Node *acquire, Node *guard,
+                           Node *before = nullptr) {
     if (!token.producer || !token.last) {
       fail(token.last, "release has no exact source token");
       return nullptr;
     }
     Node *release = newProtocolNode(
-        g, Node::Release, guard ? guard->parent : token.last->parent, owner);
+        g, Node::Release,
+        before ? before->parent : guard ? guard->parent : token.last->parent,
+        owner);
     release->payloads = token.payloads;
     assert(!release->payloads.empty() &&
            "token must retain completion payload");
     release->tokenSource = token.producer;
     release->sat = acquire;
     release->scheduleAnchor = token.last;
-    guard ? spliceAfter(release, guard) : spliceAfterLast(release, token.last);
+    if (before)
+      spliceBefore(release, before);
+    else
+      guard ? spliceAfter(release, guard) : spliceAfterLast(release, token.last);
     return release;
   }
   Node *insertRelease(const EdgeRec &edge, Node *acquire, Tokens &tokens,
@@ -1088,6 +1110,8 @@ private:
       }
     }
     acquire->count = expected;
+    if (!supply.empty())
+      appliedSupplies[acquire].push_back(supply);
   }
   Supply collectSupply(Node *acquire, ArrayRef<EdgeRec *> refs, Tokens &tokens,
                        Chain &chain, Node *guard = nullptr) {
@@ -1394,7 +1418,14 @@ private:
       chain.tokens.record(owner, input->producer, region, input->payloads);
       return;
     }
-    bool hasOutput =
+    // A completed branch token also supplies the next enclosing iteration's
+    // deferred child entry. Preserve it even when read/read reuse left no
+    // memory edge at the conditional's exit; bypass branches keep their input.
+    bool returnsDeferredEntry = hasDeferredEntry(region, owner) && input &&
+        llvm::any_of(exits, [&](const BranchExit &branch) {
+          return branch.completionReady && !branch.passesInput;
+        });
+    bool hasOutput = returnsDeferredEntry ||
         reusableUse(next, owner) || exitSources.contains(region) ||
         llvm::any_of(exits, [&](const BranchExit &branch) {
           return !branch.exitEdges.empty() ||
@@ -1458,6 +1489,7 @@ private:
                        const Tokens &loopInputs, Node *acquire,
                        const Owner &owner, LoopSupply &supply, bool seed) {
     if (!supply.entry.empty()) {
+      cancelDeferredEntries(acquire);
       seeded.erase(acquire);
       Supply entry =
           collectSupply(acquire, supply.entry, incoming, chain, chain.guard);
@@ -1466,10 +1498,18 @@ private:
     }
     const Tokens::Token *initial = loopInputs.findOpen(owner);
     if (!initial || initial->last->kind == Node::Enter) {
+      if (initial && llvm::none_of(deferredEntries, [&](const DeferredEntry &entry) {
+            return entry.enter == initial->last && entry.loop == region &&
+                   entry.acquire == acquire;
+          }))
+        deferredEntries.push_back({initial->last, region, acquire, owner});
+      // This seed is provisional when an inherited ENTER exists. It must be
+      // replaced by real entry supply if that ENTER becomes a carried token.
       if (seed)
         seeded.insert(acquire);
       return;
     }
+    cancelDeferredEntries(acquire);
     Tokens::Token token = *initial;
     Owner releaseOwner = token.producer->kind == Node::Acquire
                              ? token.producer->owner
@@ -1480,6 +1520,153 @@ private:
     Supply entry;
     entry.appendExecuted(release);
     applySupply(acquire, entry, /*requiredCount=*/acquire->count);
+  }
+  bool hasDeferredEntry(Node *region, const Owner &owner) const {
+    return llvm::any_of(deferredEntries, [&](const DeferredEntry &entry) {
+      if (!sameOwner(entry.owner, owner))
+        return false;
+      DenseSet<Node *> visited;
+      for (Node *source = entry.enter->tokenSource;
+           source && visited.insert(source).second;
+           source = source->isRegion() ? source->tokenSource : nullptr)
+        if (source == region)
+          return true;
+      return false;
+    });
+  }
+  void cancelDeferredEntries(Node *acquire) {
+    llvm::erase_if(deferredEntries, [&](const DeferredEntry &entry) {
+      return entry.acquire == acquire;
+    });
+  }
+  static bool withinRegion(Node *node, Node *region) {
+    for (; node; node = node->parent)
+      if (node == region)
+        return true;
+    return false;
+  }
+  Node *entryProducer(const DeferredEntry &entry) {
+    Node *source = entry.enter->tokenSource;
+    Node *producer = source;
+    DenseSet<Node *> visited;
+    while (producer && producer->isRegion()) {
+      if (!visited.insert(producer).second) {
+        fail(entry.loop, "cyclic deferred region-entry token");
+        return nullptr;
+      }
+      if (producer->flow)
+        return source;
+      producer = producer->tokenSource;
+    }
+    if (!producer || producer == entry.acquire)
+      return nullptr;
+    if (producer->kind != Node::Acquire) {
+      fail(entry.loop, "deferred entry has no concrete token producer");
+      return nullptr;
+    }
+    Node *before = entry.loop;
+    while (before && before->parent != producer->parent) {
+      if (before->parent && before->parent->kind == Node::For)
+        break;
+      before = before->parent;
+    }
+    if (before && before->parent == producer->parent &&
+        precedesInChain(producer, before))
+      return source;
+    // Replacing a tokenless region's ENTER with its own POU acquire does not
+    // create an incoming supply. That acquire still consumes the initial seed.
+    if (withinRegion(producer, entry.enter->parent))
+      return nullptr;
+    fail(entry.loop, "deferred entry token is not carried across its loop");
+    return nullptr;
+  }
+  LogicalResult resolveDeferredEntries() {
+    llvm::MapVector<Node *, DeferredEntry> selected;
+    for (const DeferredEntry &entry : deferredEntries) {
+      Node *producer = entryProducer(entry);
+      if (hadError)
+        return failure();
+      if (!producer)
+        continue;
+      auto [it, inserted] = selected.try_emplace(entry.acquire, entry);
+      // Prefer the nearest materialized boundary. A carried middle-loop token
+      // supplies each middle iteration; its ancestor's input supplies the
+      // middle loop itself, not another release on the same child channel.
+      if (!inserted) {
+        DeferredEntry &prior = it->second;
+        if (entry.enter == prior.enter) {
+          if (withinRegion(prior.loop, entry.loop))
+            prior = entry;
+          else if (!withinRegion(entry.loop, prior.loop))
+            return semaError(entry.loop->op)
+                   << "deferred entry has incomparable loop boundaries";
+        } else if (entry.enter->parent == prior.enter->parent) {
+          return semaError(entry.loop->op)
+                 << "deferred entry has incomparable conditional guards";
+        } else if (withinRegion(entry.enter, prior.enter->parent)) {
+          prior = entry;
+        } else if (!withinRegion(prior.enter, entry.enter->parent)) {
+          return semaError(entry.loop->op)
+                 << "deferred entry has incomparable token boundaries";
+        }
+      }
+    }
+    DenseMap<Node *, unsigned> channelCounts;
+    for (Node *acquire : g.nodesOfKind(Node::Acquire))
+      channelCounts[findChannel(acquire)] =
+          std::max(channelCounts.lookup(findChannel(acquire)), acquire->count);
+    for (auto &[acquire, entry] : selected) {
+      Node *producer = entryProducer(entry);
+      if (!producer || hadError)
+        return failure();
+      Tokens::Token token{entry.owner, producer, entry.enter,
+                          entry.enter->payloads};
+      // Keep the release in the original child-loop boundary, including its
+      // conditional branch. It also supplies the post-loop acquire when the
+      // child has zero trips; a bypass branch must not release its input.
+      Node *before = entry.loop;
+      if (acquire->parent == before->parent && precedesInChain(acquire, before))
+        before = acquire;
+      Node *release = materializeRelease(token, entry.owner, acquire, nullptr,
+                                         before);
+      Supply supply;
+      supply.appendExecuted(release);
+      applySupply(acquire, supply, channelCounts.lookup(findChannel(acquire)));
+      if (hadError)
+        return failure();
+      seeded.erase(acquire);
+      resolvedEntries.push_back({entry, release, before});
+    }
+    // Recheck after removing provisional seeds: a fallback must not depend on
+    // a seed that another resolved entry just replaced with an owned transfer.
+    for (const DeferredEntry &entry : deferredEntries) {
+      if (selected.count(entry.acquire))
+        continue;
+      bool hasInitialSupply = llvm::any_of(seeded, [&](Node *acquire) {
+        return findChannel(acquire) == findChannel(entry.acquire);
+      });
+      if (!hasInitialSupply)
+        return semaError(entry.loop->op)
+               << "deferred entry has neither an incoming token nor an initial supply";
+    }
+    deferredEntries.clear();
+    return success();
+  }
+  LogicalResult verifyResolvedEntries() {
+    if (!deferredEntries.empty())
+      return semaError(g.root->op) << "unresolved region-entry supply";
+    for (const ResolvedEntry &resolved : resolvedEntries) {
+      const DeferredEntry &entry = resolved.entry;
+      Node *release = resolved.release;
+      if (!release || !release->tokenSource ||
+          release->scheduleAnchor != entry.enter ||
+          release->parent != entry.loop->parent ||
+          !precedesInChain(release, resolved.before) ||
+          release->sat != entry.acquire || seeded.contains(entry.acquire) ||
+          release->sema != entry.acquire->sema)
+        return semaError(g.root->op) << "invalid resolved region-entry supply";
+    }
+    return success();
   }
   LoopSupplies indexLoopSupplies(Node *exit, ArrayRef<EdgeRec *> rawEntry) {
     LoopSupplies supplies;
@@ -1751,6 +1938,64 @@ private:
       node = next;
     }
   }
+  LogicalResult normalizeEntrySupplies(Node *acquire, unsigned required) {
+    SmallVector<Supply::Path *> paths;
+    for (Supply &supply : appliedSupplies[acquire])
+      for (Supply::Path &path : supply.paths) {
+        path.arrivals = 0;
+        for (Node *release : path.releases)
+          path.arrivals += release->count * release->payloads.size();
+        if (path.arrivals > required)
+          return semaError(g.root->op)
+                 << "region-entry supply exceeds its channel count";
+        paths.push_back(&path);
+      }
+    while (true) {
+      auto pending = llvm::find_if(paths, [&](Supply::Path *path) {
+        return path->arrivals != required;
+      });
+      if (pending == paths.end())
+        return success();
+      Node *anchor = nullptr;
+      unsigned padding = 0;
+      for (Node *candidate : (*pending)->releases) {
+        unsigned commonDeficit = required;
+        for (Supply::Path *path : paths)
+          if (llvm::is_contained(path->releases, candidate))
+            commonDeficit = std::min(commonDeficit, required - path->arrivals);
+        if (commonDeficit) {
+          anchor = candidate;
+          padding = commonDeficit;
+          break;
+        }
+      }
+      if (!anchor)
+        return semaError(g.root->op)
+               << "conditional region-entry supply has no safe padding anchor";
+      // Every path executing this source receives the same extra arrivals.
+      // Bound padding by their common deficit, preserving every async arrival
+      // and never overfilling an alternative that shares the source operation.
+      Node *filler = anchor;
+      if (anchor->payloads.size() == 1 &&
+          anchor->payloads.front() == AsyncOp::NONE) {
+        anchor->count += padding;
+      } else {
+        filler = newProtocolNode(g, Node::Release, anchor->parent, anchor->owner);
+        filler->payloads = {AsyncOp::NONE};
+        filler->tokenSource = anchor->tokenSource;
+        filler->scheduleAnchor = anchor->scheduleAnchor;
+        filler->sat = acquire;
+        filler->count = padding;
+        spliceAfter(filler, anchor);
+      }
+      for (Supply::Path *path : paths)
+        if (llvm::is_contained(path->releases, anchor)) {
+          path->arrivals += padding;
+          if (filler != anchor)
+            path->releases.push_back(filler);
+        }
+    }
+  }
   LogicalResult formSemaphores() {
     llvm::MapVector<Node *, SmallVector<Node *, 2>> classes;
     DenseMap<Node *, SmallVector<Node *, 2>> releasesAt;
@@ -1760,6 +2005,21 @@ private:
       classes[root].push_back(acquire);
       if (seeded.contains(acquire))
         entryOwners.try_emplace(root, acquire->owner);
+    }
+    // Deferred entry and recurrence supply are alternative executions of the
+    // same acquire. If unioning raised its count, normalize every recorded
+    // path, not just the newly added generic entry release.
+    DenseSet<Node *> normalizedEntries;
+    for (const ResolvedEntry &resolved : resolvedEntries) {
+      Node *acquire = resolved.entry.acquire;
+      if (!normalizedEntries.insert(acquire).second)
+        continue;
+      unsigned required = 1;
+      for (Node *site : classes[findChannel(acquire)])
+        required = std::max(required, site->count);
+      if (failed(normalizeEntrySupplies(acquire, required)))
+        return failure();
+      acquire->count = required;
     }
     for (Node *release : g.nodesOfKind(Node::Release)) {
       if (release->sat)
@@ -1816,6 +2076,9 @@ private:
   DenseMap<Node *, Node *> channelParent;
   std::map<BoundaryKey, Node *> regionChannels;
   SmallVector<ScopedRegionDrain, 4> regionDrains;
+  SmallVector<DeferredEntry, 4> deferredEntries;
+  SmallVector<ResolvedEntry, 4> resolvedEntries;
+  DenseMap<Node *, SmallVector<Supply, 2>> appliedSupplies;
   DenseSet<Node *> seeded;
   DenseSet<Node *> exitSources;
   llvm::SmallSetVector<EdgeRec *, 8> remainingEdges;
