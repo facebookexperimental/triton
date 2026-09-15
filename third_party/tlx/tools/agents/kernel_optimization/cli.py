@@ -25,6 +25,7 @@ from .models import (
 )
 from .optimizer import KernelOptimizer
 from .providers import CodexCandidateProvider, MockLLMProvider
+from .source_research import discover_repository_root
 from .vcs import (
     AutoCommitSession,
     commit_promotion,
@@ -44,6 +45,15 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         description="Optimize a Triton or TLX kernel with a deterministic harness."
     )
     parser.add_argument("--kernel", type=Path, required=True)
+    parser.add_argument(
+        "--repository-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root for bounded read-only source research; defaults to the TLX "
+            "source tree containing tutorials and ops."
+        ),
+    )
     parser.add_argument(
         "--reference-kernel",
         type=Path,
@@ -85,6 +95,22 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-cv", type=float, default=0.10)
     parser.add_argument("--benchmark-repetitions", type=int, default=10)
     parser.add_argument("--max-diagnostic-proton-passes", type=int, default=10)
+    parser.add_argument("--max-diagnostic-ncu-collections", type=int, default=2)
+    parser.add_argument("--max-agent-actions-per-candidate", type=int, default=3)
+    parser.add_argument("--max-diagnostic-actions-per-candidate", type=int, default=2)
+    parser.add_argument(
+        "--max-source-research-actions-per-candidate", type=int, default=1
+    )
+    parser.add_argument("--max-source-research-actions-total", type=int, default=4)
+    parser.add_argument(
+        "--source-research-saturation-threshold",
+        type=int,
+        default=1,
+        help=(
+            "Rejected candidates without research evidence required before source "
+            "research is strongly preferred (default: 1)."
+        ),
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument(
         "--commit-winner",
@@ -186,6 +212,42 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
                     args.max_diagnostic_proton_passes,
                 )
             ),
+            max_diagnostic_ncu_collections=int(
+                payload.get(
+                    "max_diagnostic_ncu_collections",
+                    args.max_diagnostic_ncu_collections,
+                )
+            ),
+            max_agent_actions_per_candidate=int(
+                payload.get(
+                    "max_agent_actions_per_candidate",
+                    args.max_agent_actions_per_candidate,
+                )
+            ),
+            max_diagnostic_actions_per_candidate=int(
+                payload.get(
+                    "max_diagnostic_actions_per_candidate",
+                    args.max_diagnostic_actions_per_candidate,
+                )
+            ),
+            max_source_research_actions_per_candidate=int(
+                payload.get(
+                    "max_source_research_actions_per_candidate",
+                    args.max_source_research_actions_per_candidate,
+                )
+            ),
+            max_source_research_actions_total=int(
+                payload.get(
+                    "max_source_research_actions_total",
+                    args.max_source_research_actions_total,
+                )
+            ),
+            source_research_saturation_threshold=int(
+                payload.get(
+                    "source_research_saturation_threshold",
+                    args.source_research_saturation_threshold,
+                )
+            ),
         )
     return OptimizationBudget(
         max_rounds=args.max_rounds,
@@ -196,6 +258,18 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
         max_cv=args.max_cv,
         benchmark_repetitions=args.benchmark_repetitions,
         max_diagnostic_proton_passes=args.max_diagnostic_proton_passes,
+        max_diagnostic_ncu_collections=args.max_diagnostic_ncu_collections,
+        max_agent_actions_per_candidate=args.max_agent_actions_per_candidate,
+        max_diagnostic_actions_per_candidate=(
+            args.max_diagnostic_actions_per_candidate
+        ),
+        max_source_research_actions_per_candidate=(
+            args.max_source_research_actions_per_candidate
+        ),
+        max_source_research_actions_total=args.max_source_research_actions_total,
+        source_research_saturation_threshold=(
+            args.source_research_saturation_threshold
+        ),
     )
 
 
@@ -565,6 +639,11 @@ def main() -> int:
     )
     kernel_path = args.kernel.resolve()
     kernel_source = kernel_path.read_text()
+    repository_root = (
+        args.repository_root.resolve()
+        if args.repository_root is not None
+        else discover_repository_root()
+    )
     fallback_commit_subject = f"Optimize {kernel_path.name} with TLX agent"
     commit_snapshot = None
     if args.commit_winner:
@@ -611,6 +690,8 @@ def main() -> int:
         profiling_policy=args.profiling_policy,
         prior_run_evidence=prior_run_evidence,
         auto_test=args.auto_test,
+        kernel_path=kernel_path,
+        repository_root=repository_root,
     )
     promotion_committer = None
     if commit_snapshot is not None:

@@ -9,6 +9,18 @@ from typing import Any, Mapping, TypeAlias
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 VALID_STRATEGIES: frozenset[str] = frozenset({"best_first", "beam"})
+VALID_HYPOTHESIS_KINDS: frozenset[str] = frozenset(
+    {
+        "algorithmic",
+        "compiler_layout",
+        "memory_layout",
+        "parameter",
+        "pipeline",
+        "synchronization",
+        "topology",
+        "unknown",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +70,12 @@ class OptimizationBudget:
     max_cv: float = 0.10
     benchmark_repetitions: int = 10
     max_diagnostic_proton_passes: int = 10
+    max_diagnostic_ncu_collections: int = 2
+    max_agent_actions_per_candidate: int = 3
+    max_diagnostic_actions_per_candidate: int = 2
+    max_source_research_actions_per_candidate: int = 1
+    max_source_research_actions_total: int = 4
+    source_research_saturation_threshold: int = 1
 
     def __post_init__(self) -> None:
         if self.max_rounds <= 0 or self.candidates_per_round <= 0:
@@ -72,6 +90,102 @@ class OptimizationBudget:
             raise ValueError("benchmark_repetitions must be positive")
         if self.max_diagnostic_proton_passes < 0:
             raise ValueError("max_diagnostic_proton_passes must not be negative")
+        if self.max_diagnostic_ncu_collections < 0:
+            raise ValueError("max_diagnostic_ncu_collections must not be negative")
+        if self.max_agent_actions_per_candidate <= 0:
+            raise ValueError("max_agent_actions_per_candidate must be positive")
+        if self.max_diagnostic_actions_per_candidate < 0:
+            raise ValueError("max_diagnostic_actions_per_candidate must not be negative")
+        if self.max_source_research_actions_per_candidate < 0:
+            raise ValueError(
+                "max_source_research_actions_per_candidate must not be negative"
+            )
+        if self.max_source_research_actions_total < 0:
+            raise ValueError("max_source_research_actions_total must not be negative")
+        if self.source_research_saturation_threshold <= 0:
+            raise ValueError("source_research_saturation_threshold must be positive")
+
+
+@dataclass(frozen=True)
+class DiagnosticArtifact:
+    reference: str
+    sha256: str = ""
+
+
+@dataclass(frozen=True)
+class DiagnosticResult:
+    available: bool = False
+    summary: Mapping[str, JsonValue] = field(default_factory=dict)
+    failure: str = ""
+    artifacts: tuple[DiagnosticArtifact, ...] = ()
+    tool_schema_version: str = ""
+    parser_schema_version: str = ""
+
+
+@dataclass(frozen=True)
+class DiagnosticEvidence:
+    action_id: str
+    status: str
+    source_digest: str
+    target_identity: str
+    tool: str
+    case_ids: tuple[str, ...]
+    canonical_key: str
+    question: str = ""
+    rationale: str = ""
+    level: str = ""
+    focus: tuple[str, ...] = ()
+    passes: tuple[str, ...] = ()
+    expected_regions: tuple[str, ...] = ()
+    result: DiagnosticResult = field(default_factory=DiagnosticResult)
+    collection_duration_seconds: float = 0.0
+    instrumented_source_digest: str = ""
+    instrumentation_mapping_digest: str = ""
+
+
+@dataclass(frozen=True)
+class SourceExcerpt:
+    path: str
+    start_line: int
+    end_line: int
+    symbol: str = ""
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class ResearchEvidence:
+    action_id: str
+    status: str
+    source_digest: str
+    question: str
+    rationale: str
+    findings: tuple[str, ...] = ()
+    excerpts: tuple[SourceExcerpt, ...] = ()
+    inspected_paths: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    collection_duration_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class DiagnosticMetricComparison:
+    name: str
+    before: float | None = None
+    after: float | None = None
+    relative_change: float | None = None
+
+
+@dataclass(frozen=True)
+class DiagnosticComparison:
+    comparison_id: str
+    verdict: str
+    tool: str
+    before_action_id: str
+    after_action_id: str
+    before_source_digest: str
+    after_source_digest: str
+    case_ids: tuple[str, ...]
+    metrics: tuple[DiagnosticMetricComparison, ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,6 +221,8 @@ class KernelOptimizationRequest:
     profiling_policy: str = "adaptive"
     prior_run_evidence: PriorRunEvidence | None = None
     auto_test: bool = False
+    kernel_path: Path | None = None
+    repository_root: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.kernel_source.strip():
@@ -117,6 +233,10 @@ class KernelOptimizationRequest:
             raise ValueError(f"strategy must be one of {sorted(VALID_STRATEGIES)}")
         if self.profiling_policy not in {"adaptive", "legacy"}:
             raise ValueError("profiling_policy must be 'adaptive' or 'legacy'")
+        if self.repository_root is not None and not self.repository_root.is_dir():
+            raise ValueError("repository_root must be an existing directory")
+        if self.kernel_path is not None and not self.kernel_path.is_file():
+            raise ValueError("kernel_path must be an existing file")
 
     @property
     def use_diagnostic_proton_intra_kernel(self) -> bool:
@@ -225,6 +345,9 @@ class ExperimentSummary:
     diagnostics: str = ""
     mutation_summary: str = ""
     hypothesis: str = ""
+    hypothesis_kind: str = "unknown"
+    escalation_reason: str = ""
+    research_evidence_ids: tuple[str, ...] = ()
     evidence: str = ""
     expected_effect: str = ""
     risk: str = ""
