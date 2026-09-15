@@ -3483,6 +3483,62 @@ def test_tlx_wave_converter_preserves_nonnegative_for_iv_signed_div_rem(tmp_path
     del ctx
 
 
+def test_tlx_wave_converter_derives_signed_div_loop_address_ranges(tmp_path):
+    local_func = """
+  tt.func public @converter_signed_div_loop_range(%k: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c3 = arith.constant 3 : i32
+    %c63 = arith.constant 63 : i32
+    %c64 = arith.constant 64 : i32
+    %positive = arith.cmpi sgt, %k, %c0 : i32
+    llvm.intr.assume %positive : i1
+    %biased = arith.addi %k, %c63 : i32
+    %tiles = arith.divsi %biased, %c64 : i32
+    %upper = arith.subi %tiles, %c3 : i32
+    %sum = scf.for %i = %c0 to %upper step %c1 iter_args(%acc = %c0) -> (i32) : i32 {
+      %prefetch = arith.addi %i, %c3 : i32
+      %offset = arith.muli %prefetch, %c64 : i32
+      %next = arith.addi %acc, %offset : i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    facts = converter_facts.analyze_facts(source, converted)
+
+    tiles = next(op for op in source.ops if op.name == "arith.divsi")
+    tiles_ranges = [(fact.lower, fact.upper)
+                    for fact in converter_facts.facts_for_value(facts, tiles.results[0])
+                    if fact.provenance == "derived:arith.divsi"]
+    assert tiles_ranges == [(-(1 << 25), (1 << 25) - 1)]
+
+    loop = next(op for op in source.ops if op.name == "scf.for")
+    induction = source.regions[loop.region_ids[0]].block_arg_ids[0]
+    induction_ranges = [(fact.lower, fact.upper)
+                        for fact in converter_facts.facts_for_value(facts, induction)
+                        if fact.provenance == "derived:scf.for"]
+    assert induction_ranges == [(0, (1 << 25) - 5)]
+
+    body_ops = [source.ops[index] for index in source.regions[loop.region_ids[0]].op_indices]
+    offset = next(op for op in body_ops if op.name == "arith.muli")
+    offset_ranges = [(fact.lower, fact.upper)
+                     for fact in converter_facts.facts_for_value(facts, offset.results[0])
+                     if fact.provenance == "derived:arith.muli"]
+    assert offset_ranges == [(0, (1 << 31) - 128)]
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    offset_target = next(op for op in output.target_program.ops
+                         if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "muli"
+                         and op.source_op_index == offset.index)
+    assert any(op.kind == "assume" and op.operands == offset_target.results for op in output.target_program.ops)
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
 @pytest.mark.parametrize(("lower", "step", "divisor"), ((0, 16, 16), (8, 4, 4), (6, 4, 2)))
 def test_tlx_wave_converter_passes_loop_induction_facts_to_wave(tmp_path, lower, step, divisor):
     local_func = f"""
@@ -4555,6 +4611,53 @@ def test_tlx_wave_converter_preserves_explicit_arith_overflow_flags(tmp_path):
     assert converter_target_ir.attrs_dict(binary_op)["nsw"] is True
     assert "wave.index_expr" not in output.emitted_module.text
     assert "overflow<nsw>" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_materializes_derived_arithmetic_ranges(tmp_path):
+    local_func = """
+  tt.func public @converter_derived_ranges(%arg0: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %c30 = arith.constant 30 : i32
+    %nonnegative = arith.cmpi sge, %arg0, %c0 : i32
+    llvm.intr.assume %nonnegative : i1
+    %bounded = arith.cmpi sle, %arg0, %c30 : i32
+    llvm.intr.assume %bounded : i1
+    %next = arith.addi %arg0, %c1 : i32
+    %phase = arith.remsi %next, %c4 : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    source = output.source_program
+    facts = output.fact_program
+    next_op = next(op for op in source.ops if op.name == "arith.addi")
+    phase_op = next(op for op in source.ops if op.name == "arith.remsi")
+    next_fact = next(fact for fact in converter_facts.facts_for_value(facts, next_op.results[0])
+                     if fact.provenance == "derived:arith.addi")
+    phase_fact = next(fact for fact in converter_facts.facts_for_value(facts, phase_op.results[0])
+                      if fact.provenance == "derived:arith.remsi")
+    assert (next_fact.lower, next_fact.upper) == (1, 31)
+    assert (phase_fact.lower, phase_fact.upper) == (0, 3)
+
+    add_target = next(op for op in output.target_program.ops
+                      if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "addi")
+    rem_target = next(op for op in output.target_program.ops
+                      if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "remsi")
+    next_assume = next(op for op in output.target_program.ops
+                       if op.kind == "assume" and next_fact.fact_id in op.fact_ids)
+    phase_assume = next(op for op in output.target_program.ops
+                        if op.kind == "assume" and phase_fact.fact_id in op.fact_ids)
+    assert next_assume.operands == add_target.results
+    assert next_assume.results[0] in rem_target.operands
+    assert phase_assume.operands == rem_target.results
+    assert add_target.target_op_id < next_assume.target_op_id < rem_target.target_op_id < phase_assume.target_op_id
+    assert output.emitted_module.text.count("wave.assume") >= 4
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 

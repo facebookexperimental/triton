@@ -583,6 +583,12 @@ def _convert_region(
             fact_program,
             op,
         )
+        _refine_derived_result_facts(
+            builder,
+            conversion_input,
+            fact_program,
+            op,
+        )
     # Result-free SCF regions can use an implicit terminator.  The importer sees
     # a genuinely empty region for the absent else arm of a one-sided scf.if.
     # Callers validate the returned count, so a missing value yield still gets
@@ -909,6 +915,10 @@ def _refine_assumed_values(
             resource_target_ids=value.resource_target_ids,
         )
         builder.source_value_targets[int(value.source_value_id)] = (result_id, )
+        if operand_id in builder.value_relations:
+            builder.value_relations[result_id] = builder.value_relations[operand_id]
+        if operand_id in builder.pointer_relations:
+            builder.pointer_relations[result_id] = builder.pointer_relations[operand_id]
         result_by_operand[operand_id] = result_id
 
     result_ids = tuple(result_by_operand[operand_id] for operand_id in operand_ids)
@@ -921,6 +931,43 @@ def _refine_assumed_values(
         source_op_index=source_op_index,
     )
     return result_ids
+
+
+def _refine_derived_result_facts(
+    builder,
+    conversion_input,
+    fact_program,
+    op,
+):
+    # Wave preserves binary operations as integer-expression nodes. Refine
+    # their derived facts because later lowering cannot recover source bounds.
+    # Other operations preserve their range semantics structurally.
+    if op.name not in _BINARY_OPS:
+        return
+    result_ids = frozenset(int(result_id) for result_id in op.results)
+    if not result_ids:
+        return
+    fact_ids = []
+    for fact_id in conversion_input.fact_ids_by_op.get(op.index, ()):
+        fact = fact_program.facts[fact_id]
+        if (fact.subject_value_id not in result_ids or fact.kind not in {"range", "divisible"}
+                or not fact.provenance.startswith("derived:")):
+            continue
+        target_ids = builder.source_value_targets.get(fact.subject_value_id, ())
+        if len(target_ids) != 1:
+            _fact_target_id(builder, fact, op)
+        target_type = builder.values[target_ids[0]].type
+        if (target_type.representation == "scalar" and _integer_target_type(target_type)):
+            fact_ids.append(fact_id)
+    fact_ids = tuple(fact_ids)
+    if not fact_ids:
+        return
+    _refine_assumed_values(
+        builder,
+        fact_ids,
+        _fact_target_ids(builder, fact_program, fact_ids, op),
+        source_op_index=op.index,
+    )
 
 
 def _declare_results(builder, op, type_layout_program):
