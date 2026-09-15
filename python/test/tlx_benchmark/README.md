@@ -11,8 +11,15 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `mm`, `flash_attn`, `hstu_attn`, `kda`, `kda_prefill`,
-`kda_decode`.
+`{op}` is one of `mm`, `addmm`, `flash_attn`, `hstu_attn`, `kda`,
+`kda_prefill`, `kda_decode`.
+
+For the four tuned MI300X addmm shapes:
+
+python python/test/tlx_benchmark/bench_addmm.py
+
+The fifth, bias-free production shape is part of the gfx942 focus list in
+`bench_mm.py`; that benchmark also exercises all five shapes as plain `mm`.
 
 ```
 options:
@@ -45,17 +52,19 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
+| `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
 
-Only `mm` has a `heuristic_config`, so it is the only op whose default is a
-single analytically chosen config. The rest autotune a full space on their first
-call, which is minutes rather than seconds; they raise `cap_s` accordingly rather
-than measure a `smoke` space no user takes. Writing a `heuristic_config` for each
-is the real fix and is tracked in the `tlx.ops` module docstring.
+Only `mm` and gfx942 `addmm` have a `heuristic_config`, so they default to a
+single analytically chosen config. The rest autotune a full space on their
+first call, which is minutes rather than seconds; they raise `cap_s` accordingly
+rather than measure a `smoke` space no user takes. Writing a
+`heuristic_config` for each is the real fix and is tracked in the `tlx.ops`
+module docstring.
 
 There is no vendor library for SiLU-scaled ragged attention, so `hstu_attn`
 races the Triton kernel that ships today. The two are not tuned symmetrically --
