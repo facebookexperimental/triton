@@ -1305,6 +1305,42 @@ bool regionHasMeaningfulOps(
   return false;
 }
 
+// Print an async_task body, or `pass` if it turns out to be empty.
+// A partition can hold nothing the printer emits -- the "default" partition of a
+// warp_specialize often holds only ops that are skipped -- and Python needs a
+// body, so an empty one has to be spelled rather than omitted.
+static void printTaskBody(Region &region, llvm::raw_ostream &os,
+                          const llvm::StringMap<StringRef> &opNameMap,
+                          const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                          llvm::DenseSet<Operation *> &skippedOps,
+                          unsigned indent,
+                          DenseMap<Value, Value> *argSubstitutionMap) {
+  std::string body;
+  llvm::raw_string_ostream bodyOs(body);
+  printRegion(region, bodyOs, opNameMap, allocInfoMap, skippedOps, indent,
+              argSubstitutionMap);
+  bodyOs.flush();
+
+  // A comment does not count: the printer emits standalone `# unsupported: ...`
+  // markers, and a block holding only those is as unparseable as an empty one.
+  bool hasStatement = false;
+  for (StringRef line : llvm::split(StringRef(body), '\n')) {
+    StringRef trimmed = line.ltrim();
+    if (trimmed.empty() || trimmed.starts_with("#"))
+      continue;
+    hasStatement = true;
+    break;
+  }
+
+  os << body;
+  if (hasStatement)
+    return;
+  // Keep any markers that were emitted and give the block something to run.
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "pass\n";
+}
+
 // Print warp_specialize operation in TLX async_tasks format
 void printWarpSpecialize(
     Operation *op, llvm::raw_ostream &os,
@@ -1342,8 +1378,8 @@ void printWarpSpecialize(
       os << "with tlx.async_task(\"default\"):\n";
 
       // Print region contents with extra indentation and substitution map
-      printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
-                  &argSubstitutionMap);
+      printTaskBody(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
+                    &argSubstitutionMap);
     } else {
       // Subsequent regions contain ttg.warp_specialize.partitions
       // which has multiple regions (one per partition)
@@ -1394,8 +1430,8 @@ void printWarpSpecialize(
               os << "):\n";
 
               // Print partition contents
-              printRegion(partitionRegion, os, opNameMap, allocInfoMap,
-                          skippedOps, indent + 2, &argSubstitutionMap);
+              printTaskBody(partitionRegion, os, opNameMap, allocInfoMap,
+                            skippedOps, indent + 2, &argSubstitutionMap);
               partitionIdx++;
             }
           }
