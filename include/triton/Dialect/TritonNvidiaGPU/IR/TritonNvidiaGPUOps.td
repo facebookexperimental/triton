@@ -685,6 +685,7 @@ def TTNG_UserNamedBarrierIdOp : TTNG_Op<"user_named_barrier_id", [Pure]> {
   let results = (outs TTNG_NamedBarrierIdType:$result);
 
   let assemblyFormat = "$value attr-dict `:` type($value)";
+  let hasVerifier = 1;
 }
 
 def TTNG_CompilerNamedBarrierIdOp
@@ -695,6 +696,7 @@ def TTNG_CompilerNamedBarrierIdOp
   let results = (outs TTNG_NamedBarrierIdType:$result);
 
   let assemblyFormat = "$value attr-dict `:` type($value)";
+  let hasVerifier = 1;
 }
 
 def TTNG_NamedBarrierArriveOp : TTNG_Op<"arrive_barrier_named", []> {

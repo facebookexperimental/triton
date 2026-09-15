@@ -217,12 +217,17 @@ def named_barrier_wait(
     Wait until the total participant count reaches the specified named barrier.
 
     Arguments:
-        bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Total number of threads required to flip the
+        bar (int): Hardware named-barrier identifier. A statically known value must be
+            in the range [0, 15]; ID 0 is reserved for the compiler and IDs 1 and 2 are
+            reserved for special lowering. A dynamic value is accepted but cannot be
+            validated, and its presence stops the compiler from allocating named
+            barriers of its own, since it cannot prove which IDs are free.
+        arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
     """
 
+    _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_wait(bar_handle, arrive_count_handle)
@@ -230,22 +235,39 @@ def named_barrier_wait(
 
 @tl.builtin
 def named_barrier_arrive(
-    bar: tl.constexpr,
-    arrive_count: tl.constexpr,
+    bar: int,
+    arrive_count: int,
     _semantic=None,
 ) -> None:
     """
     Signal arrival at a named mbarrier.
 
     Arguments:
-        bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Total number of threads required to flip the
+        bar (int): Hardware named-barrier identifier. A statically known value must be
+            in the range [0, 15]; ID 0 is reserved for the compiler and IDs 1 and 2 are
+            reserved for special lowering. A dynamic value is accepted but cannot be
+            validated, and its presence stops the compiler from allocating named
+            barriers of its own, since it cannot prove which IDs are free.
+        arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
     """
+    _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_arrive(bar_handle, arrive_count_handle)
+
+
+def _validate_named_barrier_id(bar) -> None:
+    barrier_id = tl._unwrap_if_constexpr(bar)
+    if not isinstance(barrier_id, int):
+        return
+    if barrier_id < 0 or barrier_id > 15:
+        raise ValueError("named barrier ID must be in the range [0, 15]")
+    if barrier_id == 0:
+        raise ValueError("named barrier ID 0 is reserved for the compiler")
+    if barrier_id in (1, 2):
+        raise ValueError("named barrier IDs 1 and 2 are reserved for special lowering")
 
 
 @tl.builtin
