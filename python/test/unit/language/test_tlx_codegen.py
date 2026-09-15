@@ -678,14 +678,14 @@ GFX942 = GPUTarget("hip", "gfx942", 64)
 GFX1250 = GPUTarget("hip", "gfx1250", 32)
 
 
-def compile_for_target(fn, signature, constexprs, target):
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+def compile_for_target(fn, signature, constexprs, target, attrs=None):
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     return triton_compile(src, target=target)
 
 
-def compile_for_gfx950(fn, signature, constexprs):
+def compile_for_gfx950(fn, signature, constexprs, attrs=None):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
-    return compile_for_target(fn, signature, constexprs, GFX950)
+    return compile_for_target(fn, signature, constexprs, GFX950, attrs=attrs)
 
 
 def compile_for_gfx942(fn, signature, constexprs):
@@ -3988,6 +3988,26 @@ def _async_load_kernel(
 
 
 @triton.jit
+def _async_load_gather_transpose_kernel(v_ptr, output_ptr):
+    n = tl.arange(0, 128)
+    d = tl.arange(0, 64)
+    n_u32 = n.to(tl.uint32)
+    page = (n_u32 // 64).to(tl.int32)
+    token_u32 = n_u32 % 64
+    token_group = (token_u32 // 8).to(tl.int32)
+    token_in_group = (token_u32 % 8).to(tl.int32)
+    ptrs = (v_ptr + page[:, None] * 4096 + token_group[:, None] * 512 + d[None, :] * 8 + token_in_group[:, None])
+
+    buffers = tlx.local_alloc((128, 64), tl.bfloat16, 2)
+    view = tlx.local_view(buffers, 0)
+    token = tlx.async_load(ptrs, view)
+    tlx.async_load_commit_group([token])
+    tlx.async_load_wait_group(0)
+    value = tlx.local_load(view)
+    tl.store(output_ptr + n[:, None] * 64 + d[None, :], value)
+
+
+@triton.jit
 def _local_load_kernel(
     x_ptr,
     output_ptr,
@@ -4340,6 +4360,19 @@ def test_async_load_compiles_gfx950(device):
     # Verify the kernel compiled all the way to AMDGCN.
     assert "amdgcn" in compiled.asm
     assert len(compiled.asm["amdgcn"]) > 0
+
+
+def test_async_load_gather_transpose_compiles_gfx950(device):
+    """A grouped gather-transpose should lower to a 128-bit direct LDS load."""
+    compiled = compile_for_gfx950(
+        _async_load_gather_transpose_kernel,
+        signature={"v_ptr": "*bf16", "output_ptr": "*bf16"},
+        constexprs={},
+        # Runtime JIT launches attach this base-pointer alignment
+        # automatically; ASTSource compile-only signatures do not.
+        attrs={(0, ): [("tt.divisibility", 16)]},
+    )
+    assert re.search(r"(buffer_load_dwordx4.*lds|global_load_lds_dwordx4)", compiled.asm["amdgcn"])
 
 
 def test_local_load_compiles_gfx950(device):
