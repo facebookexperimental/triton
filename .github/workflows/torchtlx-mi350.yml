@@ -30,6 +30,7 @@ jobs:
       CONDA_ENV: pytorch
       SETUP_SCRIPT: /workspace/setup_instance.sh
       MAX_JOBS: 16
+      TORCHTLX_ARCH: gfx950
     timeout-minutes: 120
     permissions:
       id-token: write

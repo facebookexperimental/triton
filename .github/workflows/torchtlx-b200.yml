@@ -20,7 +20,7 @@ on:
     - cron: '15 */6 * * *'
 
 # TorchTLX follows floating-nightly PyTorch Inductor APIs. Keep it separate from
-# mi350.yml, whose pinned torch wheel is intentionally stable for the wider suite.
+# b200.yml, whose pre-provisioned torch is intentionally stable for the wider suite.
 
 jobs:
   b200-torchtlx-test:
@@ -29,6 +29,7 @@ jobs:
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
+      TORCHTLX_ARCH: sm100
     timeout-minutes: 90
     permissions:
       id-token: write

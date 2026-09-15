@@ -231,6 +231,13 @@ jobs:
             python/test/unit/language/test_tlx_*sm100*.py
             python/test/unit/tlx_ops/test_*sm100*.py
           )
+          # TorchTLX depends on floating PyTorch Inductor APIs and runs in
+          # torchtlx-b200.yml, not this regular TLX job.
+          TLX_FILES=()
+          for file in "${FILES[@]}"; do
+            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
+          done
+          FILES=("${TLX_FILES[@]}")
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
           echo "b200 collects:" "${FILES[@]}"
           python -m pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml

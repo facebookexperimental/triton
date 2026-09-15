@@ -13,12 +13,36 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PY="${PYTHON:-python3}"
 
-TESTS=(
+COMMON_TESTS=(
   python/test/unit/language/test_torchtlx_templates.py
   python/test/unit/language/test_torchtlx_fusions.py
-  python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
-  python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
 )
+case "${TORCHTLX_ARCH:-all}" in
+  sm100)
+    ARCH_TESTS=(python/test/unit/tlx_ops/test_torchtlx_mm_sm100.py)
+    PERF_FILTER=mm_torchtlx
+    ;;
+  gfx950)
+    ARCH_TESTS=(
+      python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
+      python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
+    )
+    PERF_FILTER="addmm_torchtlx or bmm_torchtlx"
+    ;;
+  all)
+    ARCH_TESTS=(
+      python/test/unit/tlx_ops/test_torchtlx_mm_sm100.py
+      python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
+      python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
+    )
+    PERF_FILTER=torchtlx
+    ;;
+  *)
+    echo "[torchtlx] unsupported TORCHTLX_ARCH=${TORCHTLX_ARCH}; expected sm100 or gfx950" >&2
+    exit 2
+    ;;
+esac
+TESTS=("${COMMON_TESTS[@]}" "${ARCH_TESTS[@]}")
 BENCH=python/test/tlx_benchmark/test_ops_perf.py
 
 PERF=0
@@ -56,6 +80,6 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 if [ "$PERF" = 1 ]; then
-  exec "$PY" -m pytest -p no:cacheprovider "$BENCH" -k torchtlx "$@" -v
+  exec "$PY" -m pytest -p no:cacheprovider "$BENCH" -k "$PERF_FILTER" "$@" -v
 fi
 exec "$PY" -m pytest -p no:cacheprovider "${TESTS[@]}" "$@" -v
