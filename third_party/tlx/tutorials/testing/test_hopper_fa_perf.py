@@ -4,24 +4,15 @@ import torch
 
 import triton
 
-from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
-    attention as _attention_ws_pipelined_pingpong_persistent, )
 from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
     attention as _attention_ws_pipelined_pingpong, )
-from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
-    attention as _attention_ws_pipelined, )
-from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
-    attention as _attention_ws, )
 
 from triton._internal_testing import is_hopper
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 ATTENTION_METHODS = {
-    "ws_pipelined_pingpong_persistent": _attention_ws_pipelined_pingpong_persistent,
     "ws_pipelined_pingpong": _attention_ws_pipelined_pingpong,
-    "ws_pipelined": _attention_ws_pipelined,
-    "ws": _attention_ws,
 }
 
 ref_lib = "SDPA"

@@ -24,6 +24,7 @@ from .models import (
 )
 from .profiling import (
     ProfileRequest,
+    annotate_profile,
     compact_profile_output,
     invoke_profile,
     per_case_profile_request,
@@ -88,24 +89,80 @@ class SubprocessHarness:
         benchmark_repetitions: int,
         profile: bool | ProfileRequest | Mapping[str, Any] = False,
     ) -> PerformanceSummary:
-        request = {
+        target_payload: Mapping[str, JsonValue] = to_json_value(target)  # type: ignore[assignment]
+        request: dict[str, Any] = {
+            "mode": "evaluate",
             "kernel_source": kernel_source,
             "cases": to_json_value(cases),
-            "target": to_json_value(target),
+            "target": dict(target_payload),
             "benchmark_repetitions": benchmark_repetitions,
             "profile": resolve_profile_request_for_target(
                 profile_request_to_json(profile),
-                to_json_value(target),  # type: ignore[arg-type]
+                target_payload,
             ),
         }
+        return self._run_worker_request(request, target.environment)
+
+    def profile_only(
+        self,
+        source: str,
+        cases: tuple[InputCase, ...],
+        target: KernelTarget,
+        profile: ProfileRequest | Mapping[str, Any],
+    ) -> PerformanceSummary:
+        profile_payload = profile_request_to_json(profile)
+        if not profile_payload:
+            raise ValueError("profile_only requires a profile request")
+        target_payload: Mapping[str, JsonValue] = to_json_value(target)  # type: ignore[assignment]
+        request: dict[str, Any] = {
+            "mode": "profile_only",
+            "kernel_source": source,
+            "cases": to_json_value(cases),
+            "target": dict(target_payload),
+            "profile": resolve_profile_request_for_target(
+                profile_payload,
+                target_payload,
+            ),
+        }
+        return self._run_worker_request(request, target.environment)
+
+    def _run_worker_request(
+        self,
+        request: Mapping[str, Any],
+        target_environment: Mapping[str, str],
+    ) -> PerformanceSummary:
         worker_path = Path(__file__).with_name("worker.py")
         environment = os.environ.copy()
-        environment.update(target.environment)
+        environment.update(target_environment)
         response_file = tempfile.NamedTemporaryFile(
             prefix="tlx-kernel-agent-response-", suffix=".json", delete=False
         )
         response_path = Path(response_file.name)
         response_file.close()
+        try:
+            completed = self._communicate_with_worker(
+                worker_path,
+                response_path,
+                request,
+                environment,
+            )
+            payload = _load_worker_response(response_path, completed)
+        finally:
+            response_path.unlink(missing_ok=True)
+        if not payload.get("build", {}).get("success", False):
+            diagnostics = payload.get("build", {}).get("diagnostics", "build failed")
+            raise BuildError(str(diagnostics))
+        return PerformanceSummary(
+            cases=tuple(_case_evaluation_from_json(case) for case in payload["cases"])
+        )
+
+    def _communicate_with_worker(
+        self,
+        worker_path: Path,
+        response_path: Path,
+        request: Mapping[str, Any],
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
         try:
             process = subprocess.Popen(
                 [
@@ -134,37 +191,20 @@ class SubprocessHarness:
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.communicate()
-                response_path.unlink(missing_ok=True)
                 raise HarnessTimeoutError(
                     f"harness timed out after {self.timeout_seconds:.1f}s"
                 ) from error
-            completed = subprocess.CompletedProcess(
-                process.args, process.returncode, stdout, stderr
-            )
         except OSError as error:
-            response_path.unlink(missing_ok=True)
             raise HarnessExecutionError(f"could not start harness: {error}") from error
+        completed = subprocess.CompletedProcess(
+            process.args, process.returncode, stdout, stderr
+        )
         if completed.returncode != 0:
-            response_path.unlink(missing_ok=True)
             diagnostics = completed.stderr.strip() or completed.stdout.strip()
             raise HarnessExecutionError(
                 f"harness exited with code {completed.returncode}: {diagnostics}"
             )
-        try:
-            payload = json.loads(response_path.read_text())
-        except (OSError, json.JSONDecodeError) as error:
-            raise HarnessExecutionError(
-                "harness did not write a valid response; "
-                f"stdout={completed.stdout[:500]!r}, stderr={completed.stderr[:500]!r}"
-            ) from error
-        finally:
-            response_path.unlink(missing_ok=True)
-        if not payload.get("build", {}).get("success", False):
-            diagnostics = payload.get("build", {}).get("diagnostics", "build failed")
-            raise BuildError(str(diagnostics))
-        return PerformanceSummary(
-            cases=tuple(_case_evaluation_from_json(case) for case in payload["cases"])
-        )
+        return completed
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +284,71 @@ class StandaloneHarness:
             )
         return PerformanceSummary(cases=tuple(evaluations))
 
+    def profile_only(
+        self,
+        source: str,
+        cases: tuple[InputCase, ...],
+        target: KernelTarget,
+        profile: ProfileRequest | Mapping[str, Any],
+    ) -> PerformanceSummary:
+        profile_payload = profile_request_to_json(profile)
+        if not profile_payload:
+            raise ValueError("profile_only requires a profile request")
+        harness = _load_harness(self.harness_path)
+        if not hasattr(harness, "build") or not hasattr(harness, "verify"):
+            raise HarnessExecutionError("harness must define build() and verify()")
+        if not hasattr(harness, "profile"):
+            raise HarnessExecutionError("profile_only requires harness profile()")
+        target_dict: Mapping[str, JsonValue] = to_json_value(target)  # type: ignore[assignment]
+        from .worker import _normalize_build, _normalize_verification
+
+        profile_payload_root = resolve_profile_request_for_target(
+            profile_payload,
+            target_dict,
+        )
+        build_result = harness.build(source, dict(target_dict))  # type: ignore[arg-type]
+        success, artifact, diagnostics = _normalize_build(build_result)
+        if not success:
+            raise BuildError(str(diagnostics))
+        evaluations: list[CaseEvaluation] = []
+        for case in cases:
+            case_dict: Mapping[str, JsonValue] = to_json_value(case)  # type: ignore[assignment]
+            verification_norm = _normalize_verification(
+                harness.verify(artifact, dict(case_dict))  # type: ignore[arg-type]
+            )
+            verification = VerificationResult(
+                passed=bool(verification_norm["passed"]),
+                diagnostics=str(verification_norm.get("diagnostics", "")),
+                metrics=dict(verification_norm.get("metrics", {})),
+            )
+            profile_result: Mapping[str, JsonValue] = {}
+            if verification.passed:
+                try:
+                    case_request = per_case_profile_request(
+                        profile_payload_root, case.case_id
+                    )
+                    raw_profile = invoke_profile(
+                        harness.profile,
+                        artifact,
+                        dict(case_dict),  # type: ignore[arg-type]
+                        case_request,
+                    )
+                    profile_result = compact_profile_output(
+                        annotate_profile(raw_profile, case_request, case.case_id),
+                        case_request,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    profile_result = {"error": f"{type(error).__name__}: {error}"}
+            evaluations.append(
+                CaseEvaluation(
+                    case_id=case.case_id,
+                    verification=verification,
+                    timing=None,
+                    profile=profile_result,
+                )
+            )
+        return PerformanceSummary(cases=tuple(evaluations))
+
 
 def _load_harness(path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location("tlx_kernel_agent_user_harness", path)
@@ -252,6 +357,22 @@ def _load_harness(path: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_worker_response(
+    response_path: Path,
+    completed: subprocess.CompletedProcess[str],
+) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(response_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise HarnessExecutionError(
+            "harness did not write a valid response; "
+            f"stdout={completed.stdout[:500]!r}, stderr={completed.stderr[:500]!r}"
+        ) from error
+    if not isinstance(payload, Mapping):
+        raise HarnessExecutionError("harness response must be a JSON object")
+    return payload
 
 
 def _case_evaluation_from_json(payload: Mapping[str, JsonValue]) -> CaseEvaluation:
