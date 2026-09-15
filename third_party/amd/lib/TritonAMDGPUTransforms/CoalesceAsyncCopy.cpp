@@ -229,8 +229,15 @@ struct CoalesceAsyncCopyWrites
       sharedLayout = triton::gpu::toLinearLayout(dstTy);
     }
     auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
-    loadContig = std::min<unsigned>(loadContig,
-                                    regToSharedLayout.getNumConsecutiveInOut());
+    unsigned layoutContig = regToSharedLayout.getNumConsecutiveInOut();
+
+    // The src encoding supports more contiguous elements per thread than the
+    // reg->shared layout can write coalesced (e.g. the blocked and shared
+    // encodings have a different order). In this case the current src encoding
+    // results in strided writes into LDS which the lowering cannot handle, so
+    // we always have to rewrite the src layout.
+    bool layoutRestrictsContig = layoutContig < loadContig;
+    loadContig = std::min<unsigned>(loadContig, layoutContig);
 
     // Select the largest supported load width equal or smaller than loadContig
     auto elemBitWidth = dstTy.getElementTypeBitWidth();
@@ -276,9 +283,17 @@ struct CoalesceAsyncCopyWrites
 
     ttg::DistributedEncodingTrait newDistEnc;
 
-    if (!forcedSrcEnc &&
-        LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
-                                      dstTy.getAllocShape(), loadContig)) {
+    // canLoadDirectToLDS updates loadContig through a reference.  Run it for
+    // the ordinary path, but not after selecting a forced source encoding:
+    // that encoding was computed for the retargeted destination and the old
+    // source layout would incorrectly narrow its vector width again.
+    bool alreadyCoalesced = false;
+    if (!forcedSrcEnc) {
+      alreadyCoalesced =
+          LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
+                                        dstTy.getAllocShape(), loadContig);
+    }
+    if (alreadyCoalesced && !layoutRestrictsContig) {
       if (copyOp.getContiguity() < loadContig) {
         rewriter.modifyOpInPlace(copyOp,
                                  [&]() { copyOp.setContiguity(loadContig); });
@@ -294,17 +309,30 @@ struct CoalesceAsyncCopyWrites
 
     if (forcedSrcEnc) {
       newDistEnc = forcedSrcEnc;
-    } else if (isa<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding())) {
+    } else if (auto swizzledEnc = dyn_cast<ttg::SwizzledSharedEncodingAttr>(
+                   dstTy.getEncoding())) {
       // For swizzled layouts we apply the swizzling during lowering so we only
-      // adjust the sizePerThread of the blocked encoding to avoid strided
-      // writes into LDS
+      // adjust the blocked encoding to avoid strided writes into LDS.
       auto contigPerThread = ttg::getContigPerThread(srcTy);
       auto srcElemContig = contigPerThread[blockedEnc.getOrder()[0]];
       assert(srcElemContig >= loadContig);
       contigPerThread[blockedEnc.getOrder()[0]] = loadContig;
-      newDistEnc = BlockedEncodingAttr::get(
+
+      // The default builder distributes the lanes (and warps) of a blocked
+      // encoding along its own order. When the blocked and shared order
+      // disagree this spreads consecutive lanes along a dimension that is
+      // strided in LDS, resulting in uncoalesced writes. Instead we distribute
+      // the lanes/warps following the shared order so consecutive lanes map to
+      // consecutive LDS offsets, and keep the original blocked order for the
+      // final blocked encoding.
+      auto distEncSharedOrder = BlockedEncodingAttr::get(
           copyOp.getContext(), srcTy.getShape(), contigPerThread,
-          blockedEnc.getOrder(), numWarps, threadsPerWarp,
+          swizzledEnc.getOrder(), numWarps, threadsPerWarp,
+          blockedEnc.getCGALayout());
+      newDistEnc = BlockedEncodingAttr::get(
+          copyOp.getContext(), distEncSharedOrder.getSizePerThread(),
+          distEncSharedOrder.getThreadsPerWarp(),
+          distEncSharedOrder.getWarpsPerCTA(), blockedEnc.getOrder(),
           blockedEnc.getCGALayout());
     } else if (paddedEnc) {
       // For padded layouts the linear_component maps from LDS offsets to n-D

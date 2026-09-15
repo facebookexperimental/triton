@@ -78,55 +78,6 @@ ValueType createBufferDescriptorsTensor(ImplicitLocOpBuilder &builder,
           tensorType};
 }
 
-SmallVector<SmallVector<uint8_t>>
-createAliasingMatrix(ArrayRef<BufferRegion> regions) {
-  SmallVector<SmallVector<uint8_t>> matrix;
-  size_t numRegions = regions.size();
-  matrix.resize(numRegions);
-  for (size_t i = 0; i < numRegions; ++i)
-    matrix[i].assign(numRegions, /*Value=*/0);
-
-  for (size_t i = 0; i < numRegions; ++i) {
-    uint64_t startI = regions[i].baseOffset;
-    uint64_t endI = startI + regions[i].length;
-    if (regions[i].length == 0)
-      continue;
-    // Include self-aliasing
-    for (size_t j = i; j < numRegions; ++j) {
-      uint64_t startJ = regions[j].baseOffset;
-      uint64_t endJ = startJ + regions[j].length;
-      if (regions[j].length == 0)
-        continue;
-      bool alias = (startI < endJ) && (startJ < endI);
-      if (alias) {
-        matrix[i][j] = 1;
-        matrix[j][i] = 1;
-      }
-    }
-  }
-  return matrix;
-}
-
-bool hasCrossBufferAliasing(ArrayRef<BufferRegion> regions) {
-  size_t numRegions = regions.size();
-  for (size_t i = 0; i < numRegions; ++i) {
-    if (regions[i].length == 0)
-      continue;
-    uint64_t startI = regions[i].baseOffset;
-    uint64_t endI = startI + regions[i].length;
-    for (size_t j = i + 1; j < numRegions; ++j) {
-      if (regions[j].length == 0)
-        continue;
-      uint64_t startJ = regions[j].baseOffset;
-      uint64_t endJ = startJ + regions[j].length;
-      if ((startI < endJ) && (startJ < endI)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 ValueType createInitStateTensor(ImplicitLocOpBuilder &b,
                                 ArrayRef<int64_t> shape, int bitWidth,
                                 int64_t initialValue,
@@ -167,30 +118,6 @@ ValueType createZeroInitStateTensor(ImplicitLocOpBuilder &b,
                                     ArrayRef<int64_t> shape, int bitWidth,
                                     FunctionBuilder &funcBuilder) {
   return createInitStateTensor(b, shape, bitWidth, 0, funcBuilder);
-}
-
-TypedValue<RankedTensorType>
-createAliasMatrixTensor(ImplicitLocOpBuilder &b,
-                        ArrayRef<SmallVector<uint8_t>> matrix, Region *region) {
-  size_t rows = matrix.size();
-  if (rows == 0)
-    return {};
-  size_t cols = matrix.front().size();
-  for (const auto &row : matrix)
-    assert(row.size() == cols && "Expected square alias matrix");
-
-  auto type = getIntTensorType(
-      region, {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
-      /*bitWidth=*/1);
-  SmallVector<APInt> values;
-  values.reserve(rows * cols);
-  for (const auto &row : matrix)
-    for (uint8_t v : row)
-      values.emplace_back(/*numBits=*/1, v);
-
-  auto denseAttr = DenseElementsAttr::get(type, values);
-  Value constValue = arith::ConstantOp::create(b, b.getLoc(), type, denseAttr);
-  return cast<TypedValue<RankedTensorType>>(constValue);
 }
 
 bool hasCpAsync(ModuleOp module) {
@@ -600,26 +527,6 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
                                    nestedBuilder, memType,
                                    bufRegions[iMemType]);
                              });
-
-      hasNonTrivialAliasing[iMemType] =
-          hasCrossBufferAliasing(bufRegions[iMemType]);
-      if (hasNonTrivialAliasing[iMemType]) {
-        auto aliasMatrixData = createAliasingMatrix(bufRegions[iMemType]);
-        if (!aliasMatrixData.empty()) {
-          auto aliasTensor =
-              createAliasMatrixTensor(b, aliasMatrixData, entryRegion);
-          aliasMatrices[iMemType].insert(entryRegion,
-                                         {aliasTensor, aliasTensor.getType()});
-          createInWarpSpecialize(
-              entryPoint, aliasMatrices[iMemType],
-              [aliasMatrixData](ImplicitLocOpBuilder &nestedBuilder) {
-                Region *region = nestedBuilder.getInsertionBlock()->getParent();
-                auto tensor = createAliasMatrixTensor(nestedBuilder,
-                                                      aliasMatrixData, region);
-                return ValueType{tensor, tensor.getType()};
-              });
-        }
-      }
     }
 
     writeVisibility[iMemType].insert(
@@ -783,7 +690,6 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
     return failure();
 
   SmallVector<std::pair<Value, RegionInfo>> candidates[numMemTypes];
-  SmallVector<std::pair<Operation *, BufferRegion>> scratchCandidates;
   DenseSet<Value> seenValues;
   auto collectCandidates = [&](Value value) {
     if (!seenValues.insert(value).second)
@@ -801,33 +707,19 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
     candidates[static_cast<int>(*memType)].push_back(
         {value, analysis->getLatticeElement(value)->getValue()});
   };
-  WalkResult walkResult = module.walk([&](Operation *op) -> WalkResult {
-    auto infoOr = hooks.getMemEffectsOpInfo(op);
-    if (failed(infoOr))
-      return WalkResult::interrupt();
-    if (!*infoOr)
-      return WalkResult::advance();
-    const MemEffectsOpInfo &info = **infoOr;
-    if (info.trackingKind == MemEffectsOpInfo::TrackingKind::CommitCount &&
-        info.commitKind == CommitKind::AsyncCp)
+  module.walk([&](Operation *op) {
+    auto info = hooks.getMemEffectsOpInfo(op);
+    if (!info)
+      return;
+    if (info->trackingKind == MemEffectsOpInfo::TrackingKind::CommitCount &&
+        info->commitKind == CommitKind::AsyncCp)
       hasAsyncCopyReads |= llvm::any_of(
-          info.operandEffects, [](const MemEffectsOpInfo::Effects &e) {
+          info->operandEffects, [](const MemEffectsOpInfo::Effects &e) {
             return e.rw == MemEffectsOpInfo::Effects::Read;
           });
-    for (const auto &effect : info.operandEffects) {
-      if (auto *value = std::get_if<Value>(&effect.buffer)) {
-        collectCandidates(*value);
-      } else {
-        scratchCandidates.push_back(
-            {op, std::get<MemEffectsOpInfo::Effects::StaticSharedBuffer>(
-                     effect.buffer)
-                     .region});
-      }
-    }
-    return WalkResult::advance();
+    for (const auto &effect : info->operandEffects)
+      collectCandidates(effect.buf);
   });
-  if (walkResult.wasInterrupted())
-    return failure();
 
   analysis->calculateUsedBufferRegions(module);
   barrierRegions = analysis->getAllUsedBufferRegions(
@@ -840,12 +732,6 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
                           : BufferRegionAnalysis::TENSOR_MEMORY;
     SmallVector<BufferRegion> regions =
         analysis->getAllUsedBufferRegions(regionType);
-    if (memType == MemType::SHARED_MEM) {
-      for (const auto &[op, region] : scratchCandidates)
-        regions.push_back(region);
-      llvm::sort(regions);
-      regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
-    }
     bufRegions[iMemType] = regions;
     bool hasUnknown = analysis->hasUnknownUsedBufferRegions(regionType);
     if (regions.empty() && !hasUnknown)
@@ -885,23 +771,6 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
         }
       }
       bufferCandidates[iMemType].try_emplace(value, std::move(stateCandidates));
-    }
-
-    if (memType == MemType::SHARED_MEM) {
-      for (const auto &[op, region] : scratchCandidates) {
-        auto it = llvm::lower_bound(regions, region);
-        if (it == regions.end() || !(*it == region)) {
-          InFlightDiagnostic diag = op->emitError(
-              "compiler scratch region is absent from the ConSan registry: ");
-          region.print(diag);
-          return failure();
-        }
-        uint32_t id = std::distance(regions.begin(), it);
-        BufferStateCandidates stateCandidates;
-        stateCandidates.cases.push_back(
-            {region.baseOffset, bufferStatePlans[iMemType].regionMasks[id], 1});
-        scratchBufferCandidates.try_emplace(op, std::move(stateCandidates));
-      }
     }
 
     if (!bufRegions[iMemType].empty())

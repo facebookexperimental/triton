@@ -218,6 +218,11 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
   // look like a conflict. Encoding-free callers retain the original.
   SmallVector<std::pair<::mlir::triton::CallOp, ::mlir::triton::FuncOp>>
       concreteClones;
+  // Build the symbol-to-user index once. Calling getSymbolUses(callee, mod)
+  // for each concrete call repeatedly walks the whole module and is quadratic
+  // for large helper-heavy TLX kernels.
+  SymbolTableCollection symbolTables;
+  SymbolUserMap symbolUsers(symbolTables, mod);
   mod.walk([&](::mlir::triton::CallOp call) {
     if (!llvm::any_of(call.getOperandTypes(), isConcreteDistributed))
       return;
@@ -225,15 +230,7 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
         call, call.getCalleeAttr());
     if (!callee || callee.getBody().empty())
       return;
-    auto uses = SymbolTable::getSymbolUses(callee, mod);
-    if (!uses)
-      return;
-    unsigned useCount = 0;
-    for (const auto &use : *uses) {
-      (void)use;
-      ++useCount;
-    }
-    if (useCount > 1)
+    if (symbolUsers.getUsers(callee).size() > 1)
       concreteClones.emplace_back(call, callee);
   });
   for (auto [call, callee] : concreteClones) {
@@ -1732,6 +1729,7 @@ public:
       int numWarpSpecializeOps = 0;
       bool hasExclusiveWS = false;
       bool hasNoEndingClusterSync = false;
+      bool hasLessRegMMA = false;
       std::optional<int32_t> mbarrierTryWaitSuspendNs;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
@@ -1739,6 +1737,8 @@ public:
           hasExclusiveWS = true;
         if (op->hasAttr("tlx.no_ending_cluster_sync"))
           hasNoEndingClusterSync = true;
+        if (op->hasAttr("tlx.less_reg_mma"))
+          hasLessRegMMA = true;
         if (auto attr = op->getAttrOfType<IntegerAttr>(
                 "tlx.mbarrier_try_wait_suspend_ns")) {
           int32_t value = attr.getInt();
@@ -1749,6 +1749,11 @@ public:
       if (mbarrierTryWaitSuspendNs)
         mod->setAttr("tlx.mbarrier_try_wait_suspend_ns",
                      b.getI32IntegerAttr(*mbarrierTryWaitSuspendNs));
+      // `less_reg_mma`: give every MMA its own SMEM operand address
+      // computation instead of letting LLVM CSE one across distant MMAs. The
+      // NVIDIA MMA lowering reads this off the module.
+      if (hasLessRegMMA)
+        mod->setAttr("tlx.less_reg_mma", b.getUnitAttr());
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
           mod.emitError()

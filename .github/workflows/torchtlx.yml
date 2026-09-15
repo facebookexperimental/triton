@@ -3,7 +3,21 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      # Agent instructions and skills do not affect TorchTLX.
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
   pull_request:
+    paths-ignore:
+      # Agent instructions and skills do not affect TorchTLX.
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
   schedule:
     # Every 6 hours at :15 past (00:15, 06:15, 12:15, 18:15 UTC).
     - cron: '15 */6 * * *'

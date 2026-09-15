@@ -298,14 +298,8 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
   return b.or_(orPart, xorPart, /*disjoint=*/true);
 }
 
-FailureOr<bool> cvtAlwaysUseWarpShuffle(ConvertLayoutOp cvt) {
-  if (cvtUsesForcedWarpShuffle(cvt))
-    return true;
-  if (!cvtIsWarpShuffleForced(cvt))
-    return false;
-  cvt.emitError("'always_use_warp_shuffle' requires a warp-local layout "
-                "conversion");
-  return failure();
+bool cvtAlwaysUseWarpShuffle(ConvertLayoutOp cvt) {
+  return cvt->getParentOp()->hasAttrOfType<UnitAttr>("always_use_warp_shuffle");
 }
 
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b) {
@@ -1179,6 +1173,33 @@ SmallVector<Value> lowerLdSt(
     regBaseI8 = b.xor_(regBaseI8, affineOffsetI8);
   }
 
+  // Pre-compute the base pointers for partitioned tensors.
+  SmallVector<Value> partitionBases;
+  if (isPartitioned) {
+    // Loop-invariant partition contribution (register = 0).
+    SmallVector<std::pair<StringAttr, Value>> partitionInputs;
+    for (StringAttr dim : inDimNames) {
+      if (dim == kLane)
+        partitionInputs.push_back({kLane, laneId});
+      else if (dim == kWarp)
+        partitionInputs.push_back({kWarp, warpId});
+      else
+        partitionInputs.push_back({dim, b.i32_val(0)});
+    }
+    Value dynamicPartition =
+        applyLinearLayout(loc, rewriter, partitionLayout, partitionInputs)[0]
+            .second;
+    unsigned numPartitions = smemBases.size();
+    partitionBases.resize(numPartitions);
+    for (unsigned c = 0; c < numPartitions; ++c) {
+      // partitionBases[c] holds the base for register partitions that map to
+      // `c`, so reordering by `dynamicPartition ^ c` folds the loop-invariant
+      // part in once.
+      Value idx = b.xor_(dynamicPartition, b.i32_val(c));
+      partitionBases[c] = b.extract_element(basesVec, idx);
+    }
+  }
+
   SmallVector<Value> outVals;
   auto vecTy = vec_ty(llvmElemTy, elemsPerVec);
   for (int i = 0; i < cvt.getInDimSize(kReg); i += nAdditive) {
@@ -1213,28 +1234,19 @@ SmallVector<Value> lowerLdSt(
       regIdxAddI8 = applyPadding(regIdxAddI8, paddingShifts);
       Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
 
-      // Select the appropriate base pointer for partitioned tensors. Meta
-      // Triton's lowerLdSt addressing does not thread a block id (CTA targeting
-      // is handled separately via ctaRank/barrierPtr), so the partition index
-      // is computed over this layout's in-dims with any block dim taken as CTA
-      // 0.
+      // Select the appropriate base pointer for partitioned tensors.
       Value smemBase = smemBases[0];
       if (isPartitioned) {
-        SmallVector<std::pair<StringAttr, Value>> partitionInputs;
+        SmallVector<std::pair<StringAttr, int32_t>> regPartitionInputs;
         for (StringAttr dim : inDimNames) {
           if (dim == kReg)
-            partitionInputs.push_back({kReg, b.i32_val(i + j)});
-          else if (dim == kLane)
-            partitionInputs.push_back({kLane, laneId});
-          else if (dim == kWarp)
-            partitionInputs.push_back({kWarp, warpId});
+            regPartitionInputs.push_back({kReg, i + j});
           else
-            partitionInputs.push_back({dim, b.i32_val(0)});
+            regPartitionInputs.push_back({dim, 0});
         }
-        Value partitionIdx = applyLinearLayout(loc, rewriter, partitionLayout,
-                                               partitionInputs)[0]
-                                 .second;
-        smemBase = b.extract_element(basesVec, partitionIdx);
+        unsigned regPartition =
+            partitionLayout.apply(regPartitionInputs)[0].second;
+        smemBase = partitionBases[regPartition];
       }
       Value innerCtaOffset;
       if (crossCTA) {
@@ -1519,6 +1531,28 @@ void insertAtomicOrderingBarriers(Operation *op, MemSemantic memOrdering,
   }
 }
 
+Value broadcastScalarAtomicResult(Operation *op, Type valueElemTy,
+                                  Value resultVal,
+                                  ConversionPatternRewriter &rewriter,
+                                  TritonLLVMOpBuilder &b, Value threadPred,
+                                  const TargetInfoBase &targetInfo) {
+  if (!op->hasAttr("allocation.offset"))
+    return resultVal;
+
+  auto loc = op->getLoc();
+  Value smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
+  targetInfo.storeShared(rewriter, loc, smemBase, resultVal, threadPred);
+  if (triton::gpu::lookupNumCTAs(op) == 1) {
+    targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+    return targetInfo.loadShared(rewriter, loc, smemBase, valueElemTy,
+                                 b.true_val());
+  }
+
+  targetInfo.clusterBarrier(loc, rewriter, op);
+  return targetInfo.loadDShared(rewriter, loc, smemBase, b.i32_val(0),
+                                valueElemTy, b.true_val());
+}
+
 llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx) {
   // Mask where all elements are redundant
   auto kReg = str_attr("reg");
@@ -1713,11 +1747,10 @@ SmallVector<Type> SharedMemoryObject::getTypes() const {
 std::pair<uint64_t, uint64_t> SharedMemoryObject::getMaskSpanOffsetsAndBlocks(
     triton::gpu::MemDescType srcTy) {
   auto ctx = srcTy.getContext();
-  auto shape = srcTy.getShape();
-  auto allocShape = srcTy.getAllocShape();
-  assert(allocShape.size() >= shape.size());
-  assert(allocShape.size() - shape.size() <= 1);
-  allocShape = allocShape.take_back(shape.size());
+  auto encoding = srcTy.getEncoding();
+  auto shape = triton::gpu::dropPipeliningDim(srcTy.getShape(), encoding);
+  auto allocShape =
+      triton::gpu::dropPipeliningDim(srcTy.getAllocShape(), encoding);
 
   // Early exist when there is no subview
   if (allocShape == shape) {
@@ -1776,9 +1809,11 @@ std::pair<Value, Value> SharedMemoryObject::getShmemOffsetAndBlock(
     ll = triton::gpu::toLinearLayout(srcTy);
   }
 
-  auto dimNames = standardOutDimNames(ctx, offsets.size());
+  auto layoutOffsets =
+      triton::gpu::dropPipeliningDim(ArrayRef(offsets), srcTy.getEncoding());
+  auto dimNames = standardOutDimNames(ctx, layoutOffsets.size());
   SmallVector<std::pair<StringAttr, Value>> logicalOffsets;
-  for (auto [dim, offset] : llvm::zip(dimNames, offsets)) {
+  for (auto [dim, offset] : llvm::zip(dimNames, layoutOffsets)) {
     logicalOffsets.push_back({dim, offset});
   }
 

@@ -33,6 +33,7 @@ class OpSpec:
 
 
 _FP16 = frozenset({"float16", "bfloat16"})
+_BF16 = frozenset({"bfloat16"})
 
 # A static table, not decorator self-registration: `impl` stays a string so
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
@@ -51,6 +52,27 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="mm",
+        arch="gfx942",
+        variant="lds_ring",
+        impl="kernels.mm.gfx942:mm",
+        dtypes=_FP16,
+        # No `accepts`: operands are read through explicit strides rather than a
+        # descriptor, so there is no alignment rule to fail. This arch therefore
+        # admits shapes sm100 declines -- see kernels/mm/_shapes.py.
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="mm",
+        arch="gfx950",
+        variant="heuristic",
+        impl="kernels.mm.gfx950:mm",
+        # LocalSplitU remains FP16-only; the register fallback also supports
+        # BF16 and performs the narrower per-plan validation.
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
@@ -60,7 +82,7 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
-        op="hstu_attn",
+        op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
         impl="kernels.hstu_attn.sm100:hstu_attn",
@@ -70,6 +92,13 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="hstu_attn_dev",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.hstu_attn.gfx950:hstu_attn",
+        dtypes=_FP16,
+    ),
+    OpSpec(
         op="kimi_delta_attention",
         arch="sm100",
         variant="ws",
@@ -77,6 +106,22 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="kda_paged_prefill",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.kda.gfx950_prefill:kda_paged_prefill",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("KEY_DIM") == 128 and d.get("VALUE_DIM") == 128,
+    ),
+    OpSpec(
+        op="kda_recurrent_decode",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.kda.gfx950_decode:kda_recurrent_decode",
+        dtypes=_BF16,
+        accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
 )
 
@@ -110,6 +155,16 @@ def _load(impl: str) -> Callable[..., Any]:
 
 def _arches_for(op: str) -> list[str]:
     return sorted(s.arch for s in CATALOG if s.op == op)
+
+
+def has_impl(op: str, arch: str) -> bool:
+    """Is there a catalog entry for this pair, without importing the kernel?
+
+    A table lookup, not a capability check: the benchmark suite uses it to skip
+    an op cleanly on an arch it was never written for, rather than running every
+    shape and reporting each one as an error.
+    """
+    return (op, arch) in _BY_KEY
 
 
 def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:

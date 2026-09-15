@@ -113,7 +113,22 @@ def TTI_ExperimentalLocalGatherOp : TTI_Op<"experimental_local_gather"> {
 
 def TTI_ExperimentalGSanInitOp : TTI_Op<"experimental_gsan_init"> {
   let summary = "Initialize GSan thread";
+  let arguments = (ins BoolAttr:$acquireStreamClock);
+  let assemblyFormat = "$acquireStreamClock attr-dict";
+}
+
+def TTI_ExperimentalGSanKernelExitOp
+    : TTI_Op<"experimental_gsan_kernel_exit", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "Publish a completed GSan thread clock to its launch stream";
   let arguments = (ins);
+  let assemblyFormat = "attr-dict";
+}
+
+def TTI_ExperimentalGSanGridDependencyWaitOp
+    : TTI_Op<"experimental_gsan_grid_dependency_wait", [MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>]> {
+  let summary = "Acquire completed predecessor clocks after a grid dependency wait";
+  let arguments = (ins);
+  let assemblyFormat = "attr-dict";
 }
 
 def TTI_ExperimentalGSanTensorDescInfoOp
@@ -192,7 +207,8 @@ def TTI_ExperimentalGSanAtomicTensorAccessOp
 
 def TTI_ExperimentalGSanAtomicRMWOp
     : TTI_Op<"experimental_gsan_atomic_rmw",
-             [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+             [AtomicOpInterface, SameOperandsAndResultShape,
+              SameOperandsAndResultEncoding,
               TypesMatchWith<"ptr type matches value type", "val", "ptr",
                              "getPointerTypeSameShape($_self)">,
               TypesMatchWith<
@@ -213,7 +229,8 @@ def TTI_ExperimentalGSanAtomicRMWOp
 
 def TTI_ExperimentalGSanAtomicCASOp
     : TTI_Op<"experimental_gsan_atomic_cas",
-             [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
+             [AtomicOpInterface, SameOperandsAndResultShape,
+              SameOperandsAndResultEncoding,
               TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                              "getPointerTypeSameShape($_self)">,
               TypesMatchWith<"ptr type matches value type", "val", "ptr",

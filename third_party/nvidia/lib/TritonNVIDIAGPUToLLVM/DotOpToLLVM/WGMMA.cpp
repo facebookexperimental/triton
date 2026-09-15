@@ -223,9 +223,9 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   SmallVector<Value> structA;
   bool transA = false;
   if (aInShared) {
-    auto loader =
-        DotOpMmaSmemLoader::build(loc, rewriter, cast<MemDescType>(aTensorTy),
-                                  baseA, {M, K}, 0, 3, false, dTensorTy);
+    auto loader = DotOpMmaSmemLoader::build(
+        loc, rewriter, cast<MemDescType>(aTensorTy), baseA, {M, K}, 0, 3,
+        hasLessRegMMA(op), /*isFp4=*/false, dTensorTy);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid wgmma layout for "
                                   "operand A in shared memory ")
@@ -238,7 +238,8 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
     structA = unpackTensorElements(loc, loadedA, rewriter, aTensorTy);
   }
   auto bLoader = DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
-                                           {K, N}, 1, 3, false, dTensorTy);
+                                           {K, N}, 1, 3, hasLessRegMMA(op),
+                                           /*isFp4=*/false, dTensorTy);
   if (failed(bLoader)) {
     return mlir::emitError(loc, "failed to find valid wgmma layout for "
                                 "operand B in shared memory ")

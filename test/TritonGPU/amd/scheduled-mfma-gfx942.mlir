@@ -134,7 +134,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 // the MFMA that wrote the register. The commit-time diagnostic cannot cover
 // that: it needs the producing scheduled_mfma to be visible from an
 // mfma_commit, and an epilogue with no commit -- or one behind an
-// amd_register_handoff -- silently miscompiles instead.
+// amd_register_class_anchor -- silently miscompiles instead.
 //
 // The commit-time AGPR/live-operand interaction is still covered on CDNA4, in
 // scheduled-mfma-gfx950.mlir, where the explicit class is legal.

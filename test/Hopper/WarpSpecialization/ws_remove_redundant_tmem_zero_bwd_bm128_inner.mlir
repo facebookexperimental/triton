@@ -1,5 +1,8 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=232448" | FileCheck %s
 // CHECK-LABEL: tt.func public @_attn_bwd
+// The MMA's parent loop is proved non-empty by tl.assume(hi > lo) on its bounds,
+// which is what lets removeRedundantTmemZeroStores drop the redundant operand-D
+// zero-store.
 // Dead load-task rematerialization clones of m/Di must be removed before
 // descriptor conversion derives the local_load consumer set. Otherwise these
 // loads carry tasks {0, 3} and create an unsafe self-consumer TMA channel.
@@ -88,6 +91,8 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %result_7, %token_8 = ttng.tmem_alloc : () -> (!ttg.memdesc<64x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %34 = ttng.tmem_store %cst_0, %result_5[%token_6], %true {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %35 = ttng.tmem_store %cst_0, %result_3[%token_4], %true {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %nonempty = arith.cmpi sgt, %31, %c0_i32 {ttg.partition = array<i32: 1>} : i32
+    llvm.intr.assume %nonempty : i1 {ttg.partition = array<i32: 1>}
     %36:7 = scf.for %arg63 = %c0_i32 to %31 step %c1_i32 iter_args(%arg64 = %c0_i32, %arg65 = %false, %arg66 = %token, %arg67 = %token_2, %arg68 = %35, %arg69 = %34, %arg70 = %token_8) -> (i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token)  : i32 {
       %58 = arith.extsi %arg64 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i32 to i64
       %59 = arith.addi %11, %58 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : i64
@@ -174,7 +179,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttng.async_tma_store_token_wait %126   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.async.token
       %127 = arith.addi %arg64, %c128_i32 {loop.cluster = 0 : i32, loop.stage = 1 : i32} : i32
       scf.yield %127, %true, %token_16, %token_19, %86, %95, %token_24 : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
-    } {tt.assume_nonempty, tt.merge_epilogue_to_computation = true, tt.scheduled_max_stage = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 180000 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["computation", "reduction", "gemm", "load", "relay"], ttg.warp_specialize.tag = 0 : i32}
+    } {tt.merge_epilogue_to_computation = true, tt.scheduled_max_stage = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 180000 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["computation", "reduction", "gemm", "load", "relay"], ttg.warp_specialize.tag = 0 : i32}
     %result_9, %token_10 = ttng.tmem_load %result_3[%36#4] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
     %result_11, %token_12 = ttng.tmem_load %result_5[%36#5] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
     %37 = tt.reshape %result_9 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> tensor<128x2x64xf32, #linear3>

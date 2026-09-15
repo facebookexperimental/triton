@@ -1,10 +1,3 @@
-"""Rendering: a table for a person, a JSON artifact for a machine.
-
-The JSON is the interface a review agent consumes -- it must never have to
-parse the table. The table exists so that a person reading CI output can see
-what happened without downloading anything.
-"""
-
 from __future__ import annotations
 
 import json
@@ -15,67 +8,76 @@ from .contract import Result, Status, artifact
 
 #: Marks that survive a terminal with no colour and a diff with no rendering.
 _MARK = {
-    Status.PASS: "ok",
-    Status.REGRESSED: "REGRESSED",
-    Status.SLOW_COMPILE: "SLOW-COMPILE",
+    Status.OK: "ok",
+    Status.PIP: "PIP",
     Status.NOISY: "noisy",
-    Status.HOST_BOUND: "host-bound",
     Status.ERROR: "ERROR",
 }
 
-#: Statuses that should fail an enforcing run. ``NOISY`` and ``HOST_BOUND`` are
-#: deliberately absent: neither is a claim that the code got worse, and failing
-#: on them would train people to ignore the suite.
-FAILING = (Status.REGRESSED, Status.SLOW_COMPILE, Status.ERROR)
+#: Statuses that fail the run. ``NOISY`` is deliberately absent: it is not a
+#: claim that the code is slow, only that the machine would not hold still, and
+#: failing on it would train people to ignore the suite.
+FAILING = (Status.PIP, Status.ERROR)
 
 
-def _tf(result, latency_ms) -> str:
-    """Throughput at a given latency, in TFLOP/s."""
-    if not result.flop_count or not latency_ms:
+def _tf(value) -> str:
+    if not value:
         return "        -"
-    return f"{result.flop_count / (latency_ms * 1e-3) / 1e12:9.0f}"
+    return f"{value:9.0f}"
+
+
+def _stat(stat, field: str):
+    return getattr(stat, field) if stat else None
 
 
 def _fmt_samples(result) -> str:
-    """Total timed kernel invocations behind the row.
-
-    One number, not a replicates-by-iterations pair: the split matters to the
-    harness -- replicates make the result reproducible, iterations make each
-    run precise -- but a reader of the table only needs to know how much
-    evidence is behind it. The breakdown is in the artifact.
-    """
     return str(result.tlx.n_kept) if result.tlx else "-"
 
 
 def _fmt_cv(result) -> str:
-    """Coefficient of variation of the within-run samples, as a percentage."""
     return f"{result.tlx.cv * 100:.1f}" if result.tlx else "-"
 
 
 def _fmt_compile(result) -> str:
     if result.t_cold_s is None:
-        return "-"  # --measure latency; no cold pass was run
+        return "-"  # no cold pass was run for this case
     return f"{result.t_cold_s:.2f}s" if result.t_cold_s < 10 else f"{result.t_cold_s:.0f}s"
 
 
-def table(results: Sequence[Result]) -> str:
+def _fmt_extra(result, key: str) -> str:
+    value = result.extra.get(key)
+    if value is None:
+        return "-"
+    return f"{value:.3g}" if isinstance(value, float) else str(value)
+
+
+def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str:
+    """The common columns, then whichever op-specific ones the op asked for.
+
+    ``extra_columns`` is a sequence of ``(header, key)`` where ``key`` indexes
+    ``Result.extra``. Nothing here knows what any of them mean -- an op that
+    wants one of its derived metrics in the table declares it and the width is
+    taken from the data.
+    """
+    width = max([len(r.case.input) for r in results] + [len("input")])
+    extra_widths = [max([len(head)] + [len(_fmt_extra(r, key)) for r in results]) for head, key in extra_columns]
+    heads = "".join(f" {head:>{w}}" for (head, _), w in zip(extra_columns, extra_widths))
     lines = [
-        f"{'input':<34} {'dtype':<8} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
-        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p90 TF/s':>9} {'p99 TF/s':>9}  status",
-        "-" * 150,
+        f"{'input':<{width}} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
+        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}{heads}  status",
+        "-" * (width + 84 + sum(w + 1 for w in extra_widths)),
     ]
     for r in results:
-        lines.append(f"{r.case.input:<34} {r.case.dtype:<8} "
-                     f"{_tf(r, r.ref.mean if r.ref else None)} {_tf(r, r.tlx.mean if r.tlx else None)} "
+        cells = "".join(f" {_fmt_extra(r, key):>{w}}" for (_, key), w in zip(extra_columns, extra_widths))
+        lines.append(f"{r.case.input:<{width}} "
+                     f"{_tf(_stat(r.ref, 'mean'))} {_tf(_stat(r.tlx, 'mean'))} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
                      f"{_fmt_compile(r):>8} "
                      f"{_fmt_samples(r):>8} "
                      f"{_fmt_cv(r):>6} "
-                     f"{_tf(r, r.tlx.p50 if r.tlx else None)} "
-                     f"{_tf(r, r.tlx.p90 if r.tlx else None)} "
-                     f"{_tf(r, r.tlx.p99 if r.tlx else None)}  {_MARK[r.status]}")
-        for note in r.notes:
-            lines.append(f"{'':<34} {'':<8} -> {note}")
+                     f"{_tf(_stat(r.tlx, 'p50'))} "
+                     f"{_tf(_stat(r.tlx, 'p95'))} "
+                     f"{_tf(_stat(r.tlx, 'p99'))}{cells}  {_MARK[r.status]}")
     return "\n".join(lines)
 
 
@@ -99,30 +101,41 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
     return path
 
 
-#: Explains the columns whose meaning is not obvious from the header.
-LEGEND = ("Every throughput column is TFLOP/s, HIGHER is better. `ref`/`tlx` are at the mean latency\n"
-          "        (median of the per-replicate means). Latencies are in the JSON artifact.\n"
-          "speedup = tlx TF/s / ref TF/s, so >1 means TLX is faster.\n"
-          "pNN TF/s = throughput at the pNN *latency*, so the columns descend: p99 is the worst-case\n"
-          "        throughput, not the best. Percentiles are nearest-rank over the pooled samples.\n"
-          "samples = total timed kernel invocations behind the row, over all replicates.\n"
-          "CV%  = coefficient of variation of the latency samples within a run, sd/mean, after IQR\n"
-          "        rejection.\n"
-          "The gate reads NEITHER CV nor the percentiles: it reads the between-run deviation of the\n"
-          "replicate means, which is the uncertainty on the headline rather than the width of one run.\n"
-          "That figure is in the JSON artifact, and in the note printed when it trips.")
+def _details(results: Sequence[Result], statuses: tuple[Status, ...]) -> list[str]:
+    return [f"  {r.case.key}: {'; '.join(r.notes) or _MARK[r.status]}" for r in results if r.status in statuses]
 
 
-def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None) -> str:
-    legend = LEGEND
-    if env.get("input_spec"):
-        legend = f"input  = {env['input_spec']}\n{legend}"
-    out = [table(results), "", legend, "", summary(results)]
+def by_direction(results: Sequence[Result]) -> dict:
+    """Results grouped by `Case.direction`, in the order the directions appear."""
+    groups: dict = {}
+    for r in results:
+        groups.setdefault(r.case.direction, []).append(r)
+    return groups
+
+
+def tables(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str:
+    """One table per direction, or just the one when the op has a single one.
+
+    Split because forward and backward are different kernels doing different
+    amounts of work: interleaving them puts two unrelated TFLOP/s scales in one
+    column, and the eye reads down a column.
+    """
+    groups = by_direction(results)
+    if len(groups) <= 1:
+        return table(results, extra_columns)
+    return "\n\n".join(f"[{direction}]\n{table(group, extra_columns)}" for direction, group in groups.items())
+
+
+def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None,
+           extra_columns: Sequence[tuple] = ()) -> str:
+    out = [tables(results, extra_columns), ""]
     if json_path:
         out.append(f"artifact: {write_json(results, env, json_path)}")
+    out.append(summary(results))
+    noisy = _details(results, (Status.NOISY, ))
+    if noisy:
+        out.extend(("", "Noisy data:", *noisy))
     bad = failures(results)
     if bad:
-        out.append("")
-        out.append("FAILING:")
-        out.extend(f"  {r.case.key}: {'; '.join(r.notes) or _MARK[r.status]}" for r in bad)
+        out.extend(("", "Issues:", *_details(bad, FAILING)))
     return "\n".join(out)

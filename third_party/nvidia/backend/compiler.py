@@ -229,6 +229,8 @@ class CUDAOptions:
     sanitize_overflow: bool = False
     arch: str = None
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
+
     early_tma_store_lowering: Optional[None] = None
     tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
@@ -751,11 +753,27 @@ class CUDABackend(BaseBackend):
         import triton.language.extra.cuda as cuda
 
         capability = int(self._parse_arch(options.arch))
+
+        def post_ast_lowering(mod):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            tlx.tlx_passes.add_triton_tlx_fixup(
+                pm,
+                f"cuda:{capability}",
+                options.num_warps,
+                options.warp_size,
+                options.num_ctas,
+                list(options.cluster_dims),
+            )
+            pm.run(mod, "post_ast_lowering")
+
         codegen_fns = {
             "convert_custom_types":
             (cuda.convert_custom_float8_sm80 if capability >= 80 else cuda.convert_custom_float8_sm70),
             "min_dot_size":
             min_dot_size(self.target),
+            "post_ast_lowering":
+            post_ast_lowering,
         }
         return codegen_fns
 
@@ -780,15 +798,6 @@ class CUDABackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        # Pass cluster_dims as a list
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm,
-            f"cuda:{capability}",
-            opt.num_warps,
-            32,
-            opt.num_ctas,
-            list(opt.cluster_dims),
-        )
         passes.common.add_inliner(pm)
         # Storage alias lowering moved to make_ttgir (after layout propagation)
         # so the backing TMEM allocation is materialized with the resolved
@@ -1069,6 +1078,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
+        if knobs.nvidia.enable_unify_ws_barrier_locations:
+            nvidia.passes.ttnvgpuir.add_unify_ws_barrier_locations(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -1083,7 +1094,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
         if "fpsan" in opt.instrumentation_mode:
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, opt.fpsan_homomorphic_casts)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
@@ -1150,7 +1161,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
         if "fpsan" in options.instrumentation_mode:
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
             passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
@@ -1170,6 +1181,7 @@ class CUDABackend(BaseBackend):
 
         if "gsan" in options.instrumentation_mode:
             # GSan introduces layout conversions, so must come before shared memory allocation
+            mod.set_attr("tti.gsan_launch_pdl", ir.builder(mod.context).get_int32_attr(int(options.launch_pdl)))
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
@@ -1192,11 +1204,11 @@ class CUDABackend(BaseBackend):
         tlx_dump_dir = None
         tlx_saved_fd = None
         tlx_capture_file = None
-        if knobs.nvidia.dump_tlx_benchmark:
+        if knobs.compilation.dump_tlx_benchmark:
             from triton.tools.tlx_benchmark_gen import setup_tlx_dump
 
             tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
-        elif knobs.nvidia.dump_ttgir_to_tlx:
+        elif knobs.compilation.dump_ttgir_to_tlx:
             tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
@@ -1238,13 +1250,15 @@ class CUDABackend(BaseBackend):
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
-        pm.run(mod, "make_llir")
+        try:
+            pm.run(mod, "make_llir")
+        finally:
+            # finalize_tlx_dump restores the stdout fd setup_tlx_dump redirected,
+            # so it has to run even when the pipeline raises.
+            if tlx_dump_dir is not None:
+                from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
 
-        # After pm.run(), restore stdout and generate TLX benchmark artifacts
-        if tlx_dump_dir is not None:
-            from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
-
-            finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
+                finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it

@@ -5,7 +5,7 @@ here -- both overflow the CDNA3 LDS budget (measured: ``OutOfResources ...
 Required: 75968, Hardware limit: 65536``) and their fast path is the
 direct-to-LDS one that CDNA3 caps at 32 bits per lane.
 
-So this is the ``amd_gemm_gfx942`` kernel with a batch axis: the same
+So this is the ``tlx.ops.mm`` gfx942 kernel with a batch axis: the same
 register-staged operand path, the same autotuned tile and LDS ring depth, the
 same 64 KB budget pruning. See that file for why CDNA3 wants register staging.
 
@@ -27,10 +27,8 @@ exactly as they do in the single-matrix kernel.
 Batch base offsets are computed in int64: ``batch * M * K`` overflows int32 well
 inside the shapes this is benchmarked at. Within-tile offsets stay int32.
 
-Exposes ``bmm`` and ``make_bmm_inputs`` for the correctness suite
-(``testing/test_correctness.py``) and the perf script
-(``testing/test_amd_bmm_gfx942_perf.py``, which compares against aten's
-``torch.bmm``).
+Not wired to anything: the correctness and perf entries were removed when GEMM
+moved to `tlx.ops.mm`. Kept as the reference body for promoting this op next.
 """
 
 import torch
@@ -39,7 +37,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from triton.language.extra.tlx.tutorials.amd_gemm_gfx942 import (
+from triton.tlx.ops.kernels.mm.gfx942 import (
     CDNA3_LDS_BYTES,
     NUM_XCDS,
     _xcd_remap,
@@ -71,7 +69,7 @@ def bmm_kernel_gfx942(
     NUM_BUFFERS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
-    """C[i] = A[i] @ B[i], register-staged LDS ring (see amd_gemm_gfx942)."""
+    """C[i] = A[i] @ B[i], register-staged LDS ring (see ops/kernels/mm/gfx942.py)."""
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
@@ -152,7 +150,7 @@ def bmm_kernel_gfx942(
 
 
 def _configs():
-    """Same tile space as amd_gemm_gfx942 -- the hot loop is identical."""
+    """Same tile space as ops/kernels/mm/gfx942.py -- the hot loop is identical."""
     tiles = [
         (64, 64, 64, 4),
         (128, 128, 32, 4),

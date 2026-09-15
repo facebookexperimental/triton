@@ -35,6 +35,12 @@ LogicalResult CircularStoreOp::verify() {
   if (scopeId < 0 || scopeId > 255)
     return emitOpError("scope id must be in [0, 255]");
 
+  if (Value predicate = getPredicate()) {
+    auto predTy = dyn_cast<IntegerType>(predicate.getType());
+    if (!predTy || predTy.getWidth() != 1)
+      return emitOpError("predicate must be a scalar i1");
+  }
+
   return success();
 }
 

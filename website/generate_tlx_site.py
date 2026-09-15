@@ -75,8 +75,13 @@ TLX_PAGES = (
     ),
     Page(
         "kernels",
-        "Kernels implemented with TLX",
-        "GEMM and attention kernels implemented with TLX.",
+        "Tutorial kernels",
+        "GEMM and attention examples implemented with TLX.",
+    ),
+    Page(
+        "tlx-ops",
+        "High-performance kernels",
+        "Production-ready TLX kernels, one blessed implementation per op and architecture.",
     ),
     Page(
         "testing",
@@ -107,12 +112,6 @@ COMPILER_PAGE = Page(
     "Compiler features",
     "AutoWS enablement and knobs, and deterministic reduction ordering.",
     "triton",
-)
-TLX_OPS_PAGE = Page(
-    "tlx-ops",
-    "tlx.ops",
-    "Production-ready TLX kernels, one blessed implementation per op and architecture.",
-    "tlx-ops",
 )
 TORCHTLX_PAGE = Page(
     "torchtlx",
@@ -145,7 +144,6 @@ TOOLING_PAGES = (TOOLING_PAGE, TLX_AGENT_PAGE)
 SECTIONS = {
     "triton": TRITON_PAGES,
     "tlx": TLX_PAGES,
-    "tlx-ops": (TLX_OPS_PAGE,),
     "torchtlx": (TORCHTLX_PAGE,),
     "ci": (CI_PAGE,),
     "tooling": TOOLING_PAGES,
@@ -154,7 +152,6 @@ SECTION_PAGES = tuple(pages[0] for pages in SECTIONS.values())
 SECTION_LABELS = {
     "triton": "Triton",
     "tlx": "TLX",
-    "tlx-ops": "tlx.ops",
     "torchtlx": "TorchTLX",
     "ci": "CI",
     "tooling": "Tooling",
@@ -163,7 +160,6 @@ PAGES = (
     HOME_PAGE,
     *TRITON_PAGES,
     *TLX_PAGES,
-    TLX_OPS_PAGE,
     TORCHTLX_PAGE,
     CI_PAGE,
     *TOOLING_PAGES,

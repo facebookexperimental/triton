@@ -192,6 +192,18 @@ static unsigned getMaxElementsPerThread(Operation *op, unsigned maxVecBits) {
   return maxElementsPerThread;
 }
 
+static bool hasDotOperandLayoutUser(Operation *op) {
+  for (Operation *user : op->getUsers()) {
+    for (Value result : user->getResults()) {
+      auto resultType = dyn_cast<RankedTensorType>(result.getType());
+      if (resultType &&
+          isa<ttg::DotOperandEncodingAttr>(resultType.getEncoding()))
+        return true;
+    }
+  }
+  return false;
+}
+
 unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                                  ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                  ArrayRef<int64_t> shapePerCTA,
@@ -206,6 +218,19 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
   unsigned alignment = std::min(maxMultiple, maxContig);
+  // Some targets implement byte-aligned global vector loads in hardware, so no
+  // residual element-alignment proof is required. Axis analysis must still
+  // prove the elements contiguous, and the normal logical-extent and width
+  // caps remain. A mask additionally limits the width to groups with one
+  // shared predicate.
+  if (canUseUnalignedVectorizedLoad(op) && !hasDotOperandLayoutUser(op)) {
+    unsigned unalignedAlignment = maxContig;
+    if (auto load = dyn_cast<triton::LoadOp>(op); load && load.getMask())
+      unalignedAlignment =
+          std::min(unalignedAlignment,
+                   axisInfoAnalysis.getMaskAlignment(load.getMask(), order[0]));
+    alignment = std::max(alignment, unalignedAlignment);
+  }
   unsigned maxElementsPerThread = getMaxElementsPerThread(op, maxVecBits);
   unsigned currPerThread = std::min(alignment, maxElementsPerThread);
   LDBG("elemNumBytes: " << elemNumBytes
@@ -1302,6 +1327,25 @@ std::optional<StringRef> getAMDArch(Operation *module) {
   }
 
   return ref.drop_front(4); // drop the "hip:"
+}
+
+bool canUseUnalignedVectorizedLoad(Operation *op) {
+  auto module = op->getParentOfType<ModuleOp>();
+  if (!module)
+    return false;
+  auto arch = getAMDArch(module);
+  return arch && canUseUnalignedVectorizedLoad(op, *arch);
+}
+
+bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch) {
+  auto load = dyn_cast<triton::LoadOp>(op);
+  if (!load || load.getIsVolatile())
+    return false;
+
+  // Keep this restricted to gfx950 so future targets must opt in through an
+  // explicit capability update. Ignore target feature suffixes when matching
+  // the processor name.
+  return targetArch.split(':').first == "gfx950";
 }
 
 static inline ttg::SwizzledSharedEncodingAttr

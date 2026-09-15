@@ -1,25 +1,21 @@
-"""pytest options for the perf suite.
-
-Deliberately the same names and choices as the ``bench_<op>.py`` CLI, so the
-two entry points are one interface with two front ends rather than two
-interfaces that drift.
-"""
-
-
 def pytest_addoption(parser):
     group = parser.getgroup("tlx-benchmark")
     group.addoption(
-        "--measure", choices=("latency", "compile", "all"), default="all",
-        help="'all' is cheap at --space heuristic (~0.7s cold compile per case); "
-        "at --space full the cold pass costs ~4 min PER CASE")
-    group.addoption("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
-                    help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
-    group.addoption("--guard", choices=("off", "report", "enforce"), default="enforce",
-                    help="enforce fails the test on a regression or a compile-cap breach")
-    group.addoption("--replicates", type=int, default=None,
-                    help="independent measurements per case; this is what the noise gate reads")
+        "--space", choices=("heuristic", "full", "smoke"), default=None,
+        help="autotune search space; the default is each op's own (mm: heuristic, everything "
+        "else: full), and measuring anything else measures a path users do not take")
+    group.addoption("--head", type=int, default=None, metavar="N",
+                    help="only the first N cases per direction, for a quick look")
+    group.addoption("--synthetic", action="store_true",
+                    help="run the correctness shapes instead of this arch's focus list")
+    group.addoption("--fwd-only", action="store_true", dest="fwd_only", help="skip the backward cases")
+    group.addoption("--bwd-only", action="store_true", dest="bwd_only", help="skip the forward cases")
+    group.addoption(
+        "--latency-measure-mode", choices=("wallclock", "gpu_events"), default="wallclock", dest="latency_mode",
+        help="'wallclock' (default) times each call as a caller would see it; 'gpu_events' "
+        "pre-enqueues the batch behind a blocked stream to isolate device time")
+    group.addoption(
+        "--cold-compile", choices=("all", "first", "none"), default=None, dest="cold_compile",
+        help="how often to time a first call on a fresh cache; the default is each op's own "
+        "(mm: all, everything else: first, since their cold pass compiles a full autotune space)")
     group.addoption("--json", default=None, help="machine-readable artifact (default: bench module's)")
-    group.addoption("--update-baseline", action="store_true",
-                    help="record this run as the baseline; refuses noisy and host-bound cases")
-    group.addoption("--strict-env", action="store_true",
-                    help="fail instead of warning when the environment is not denoised")

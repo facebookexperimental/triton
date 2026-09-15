@@ -20,3 +20,9 @@ jobs:
 
   pre-commit:
     uses: ./.github/workflows/pre-commit.yml
+
+  pre-commit-strict:
+    uses: ./.github/workflows/pre-commit.yml
+    with:
+      strict: true
+    secrets: inherit

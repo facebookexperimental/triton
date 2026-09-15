@@ -22,6 +22,10 @@ namespace ttg = tt::gpu;
 namespace tti = mlir::triton::instrument;
 namespace ttng = mlir::triton::nvidia_gpu;
 
+// The first 24 bits of the shared memory object are CTA-invariant
+// The next 4 bits are the CTA index
+constexpr uint32_t kSharedMemoryObjectMask = (1u << 24) - 1;
+
 ////////////////////////////////////////////
 // Utility functions
 ////////////////////////////////////////////
@@ -44,7 +48,7 @@ Value createMemDescToI32(RewriterBase &rewriter, Location loc,
   offset = b.mul(offset, b.i32_val(elemSize));
   Value base = b.ptrtoint(i32Ty, smemObj.getBase());
   Value address = b.add(offset, base);
-  Value mask = b.i32_val(tti::kSharedMemoryObjectMask);
+  Value mask = b.i32_val(kSharedMemoryObjectMask);
   return b.and_(address, mask);
 }
 
@@ -121,7 +125,7 @@ struct BufferDescriptorsOpConversion
 
     SmallVector<uint64_t> maskVals(offsets.size(),
                                    op.getMemType() == tti::MemType::SHARED_MEM
-                                       ? tti::kSharedMemoryObjectMask
+                                       ? kSharedMemoryObjectMask
                                        : 0xffffffffu);
     Value maskTensor =
         createInitializedIntArrayTensor(rewriter, loc, encoding, maskVals);
@@ -350,7 +354,7 @@ public:
 
     Value address = b.add(base, b.i32_val(op.getOffset()));
     if (op.getMemType() == tti::MemType::SHARED_MEM)
-      address = b.and_(address, b.i32_val(tti::kSharedMemoryObjectMask));
+      address = b.and_(address, b.i32_val(kSharedMemoryObjectMask));
     rewriter.replaceOp(op, address);
     return success();
   }

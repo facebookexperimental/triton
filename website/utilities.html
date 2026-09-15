@@ -12,7 +12,6 @@
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
-<a href="tlx-ops.html">tlx.ops</a>
 <a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
@@ -32,7 +31,8 @@
 <a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html" aria-current="page">Other operations</a>
 <a class="sub" href="#tlx-assume-uniform">`tlx.assume_uniform`</a>
-<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="kernels.html">Tutorial kernels</a>
+<a href="tlx-ops.html">High-performance kernels</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
@@ -136,7 +136,7 @@
 base = tlx.assume_uniform(base)
 data = tlx.buffer_load(base, offsets)</code></pre>
 <p>Lowers to <code>amdg.assume_uniform</code>, which is eventually lowered to <code>llvm.amdgcn.readfirstlane</code> — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.</p></article>
-<footer class="pager"><a href="layouts.html">← Layout control and diagnostics</a><a class="next" href="kernels.html">Kernels implemented with TLX →</a></footer>
+<footer class="pager"><a href="layouts.html">← Layout control and diagnostics</a><a class="next" href="kernels.html">Tutorial kernels →</a></footer>
     </main>
   </div>
 </body>

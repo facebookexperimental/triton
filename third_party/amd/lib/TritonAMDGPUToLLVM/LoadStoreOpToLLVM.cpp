@@ -13,6 +13,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -771,9 +772,13 @@ struct BufferLoadToLocalOpConversion
     SmallVector<Value> offsetElems =
         unpackTensorElements(loc, llOffset, rewriter, offset.getType());
     SmallVector<Value> otherElems;
-    if (llOther)
+    bool isOtherZeroConst = false;
+    if (llOther) {
       otherElems =
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
+      isOtherZeroConst = isZeroConst(op.getOther());
+    }
+    bool hasMask = llMask != nullptr;
 
     auto dstTy = op.getDest().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
@@ -847,12 +852,12 @@ struct BufferLoadToLocalOpConversion
       // Buffer-load-to-local supports zero-fill for per-lane masks by adjusting
       // the src offset to be OOB. Redundant-thread predication still needs a
       // branch when there are other values, otherwise inactive threads
-      // zero-fill values loaded by active lanes from another warp.
+      // will lave the lds untorched.
       // Optimization: for warp-uniform thread predicates and no other values we
       // can avoid the branch by selecting an out-of-range *shared* address. The
       // HW will drop the load before fetching the data from global memory so we
       // will not overwrite values.
-      if (isThreadPredWarpUniform && !hasOther) {
+      if (isThreadPredWarpUniform && ((!hasMask) || isOtherZeroConst)) {
         Value predicatedAddress =
             selectLdsAddressForPredicate(b, threadPred, shmemAddr);
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
@@ -861,8 +866,7 @@ struct BufferLoadToLocalOpConversion
         if (targetInfo.requiresAliasInfoForAsyncOps())
           AMD::addAsyncCopyAliasScope(bufferLoadToLds);
       } else {
-        Value pred =
-            hasOther ? b.and_(threadPred, maybeSwizzledMaskElem) : threadPred;
+        Value pred = b.and_(threadPred, maybeSwizzledMaskElem);
         auto [loadBlock, afterLoadBlock] = emitBranch(rewriter, loc, pred);
 
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
@@ -1239,6 +1243,34 @@ struct AsyncCopyLocalToGlobalOpConversion
   }
 };
 
+// TDM operates on base pointers, whereas a memdesc subslice keeps its logical
+// offsets separately. Materialize the view origin, including padding, for
+// every partition. The subslice contract requires tile-aligned origins:
+// MemDescSubsliceOp verifies static alignment; MemDescDynamicSubsliceOp
+// requires callers to guarantee runtime alignment and bounds (violations are
+// UB, with no runtime check). TDM's supported layouts preserve the disjoint
+// bits of the origin and intra-tile offsets. Thus padding can be applied
+// separately here and in TDMUtility: P(origin + tileOffset) = P(origin) +
+// P(tileOffset).
+static SmallVector<Value>
+getTDMSharedBases(Location loc, ConversionPatternRewriter &rewriter,
+                  const LLVM::SharedMemoryObject &smemObj,
+                  triton::gpu::MemDescType type) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto offset = smemObj.getShmemOffset(loc, rewriter, type);
+  if (isPaddedEncoding(type.getEncoding()))
+    offset = applyPadding(
+        loc, rewriter, offset,
+        getPaddedSharedShifts(type.getEncoding(),
+                              type.getElementType().getIntOrFloatBitWidth(),
+                              /*offsetInBytes=*/false));
+  SmallVector<Value> bases;
+  for (Value base : smemObj.getBases())
+    bases.push_back(
+        b.gep(base.getType(), smemObj.getBaseElemType(), base, offset));
+  return bases;
+}
+
 struct AsyncTDMCopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>,
@@ -1296,7 +1328,8 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getResult(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
-    SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
+    SmallVector<Value> dstPtrs =
+        getTDMSharedBases(loc, rewriter, dstMemObj, op.getResult().getType());
     // Positioning lives in the descriptor; the copy only does per-warp
     // distribution, so the user offset is zero.
     SmallVector<Value> offset(blockShape.size(), b.i32_val(0));
@@ -1389,7 +1422,9 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
 
       auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
           loc, adaptor.getDests()[i], member.elementType, rewriter);
-      member.dstPtrs = llvm::to_vector(dstMemObj.getBases());
+      member.dstPtrs = getTDMSharedBases(
+          loc, rewriter, dstMemObj,
+          cast<triton::gpu::MemDescType>(op.getDests()[i].getType()));
       member.pred = Value();
       memberHints.push_back(static_cast<uint32_t>(op.getWarpUsedHints()[i]));
     }
@@ -1438,7 +1473,8 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
-    SmallVector<Value> srcPtrs = llvm::to_vector(dstMemObj.getBases());
+    SmallVector<Value> srcPtrs =
+        getTDMSharedBases(loc, rewriter, dstMemObj, smemTy);
     // Positioning lives in the descriptor; the copy only does per-warp
     // distribution, so the user offset is zero.
     SmallVector<Value> offset(blockShape.size(), b.i32_val(0));

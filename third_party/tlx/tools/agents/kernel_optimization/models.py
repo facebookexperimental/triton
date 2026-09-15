@@ -32,6 +32,20 @@ class KernelTarget:
     device: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     optimization_guidance: str = ""
+    optimization_skills: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        raw_skills = self.optimization_skills
+        if not isinstance(raw_skills, (list, tuple)):
+            raise ValueError("optimization_skills must be a sequence of names")
+        normalized: list[str] = []
+        for raw_name in raw_skills:
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError("optimization_skills must contain non-empty strings")
+            name = raw_name.strip().lower()
+            if name not in normalized:
+                normalized.append(name)
+        object.__setattr__(self, "optimization_skills", tuple(normalized))
 
 
 @dataclass(frozen=True)
@@ -58,6 +72,25 @@ class OptimizationBudget:
 
 
 @dataclass(frozen=True)
+class PriorExperimentEvidence:
+    experiment_id: str
+    status: str
+    hypothesis: str = ""
+    change: str = ""
+    aggregate_speedup: float | None = None
+    diagnostics: str = ""
+
+
+@dataclass(frozen=True)
+class PriorRunEvidence:
+    run_path: Path
+    experiments_path: Path
+    source_hashes: tuple[str, ...] = ()
+    experiments: tuple[PriorExperimentEvidence, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class KernelOptimizationRequest:
     kernel_source: str
     harness_path: Path
@@ -68,6 +101,7 @@ class KernelOptimizationRequest:
     reference_kernel_source: str | None = None
     output_dir: Path | None = None
     diagnostic_proton_intra_kernel: bool = False
+    prior_run_evidence: PriorRunEvidence | None = None
 
     def __post_init__(self) -> None:
         if not self.kernel_source.strip():
@@ -169,6 +203,8 @@ class ExperimentSummary:
     parent_id: str | None
     status: str
     source_path: Path
+    incremental_patch_path: Path | None = None
+    cumulative_patch_path: Path | None = None
     performance: PerformanceSummary | None = None
     diagnostics: str = ""
     mutation_summary: str = ""
@@ -176,7 +212,10 @@ class ExperimentSummary:
     evidence: str = ""
     expected_effect: str = ""
     risk: str = ""
+    commit_title: str = ""
+    commit_summary: str = ""
     profile_path: Path | None = None
+    auto_commit: AutoCommitResult | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +243,11 @@ class KernelOptimizationResult:
     experiments: tuple[ExperimentSummary, ...]
     artifacts_dir: Path
     stopping_reason: str
+    winner_experiment_id: str = "baseline"
+    winner_commit_title: str = ""
+    winner_commit_summary: str = ""
+    promotion_commits: tuple[AutoCommitResult, ...] = ()
+    rollback_commit: AutoCommitResult | None = None
     auto_commit: AutoCommitResult | None = None
 
 

@@ -225,6 +225,22 @@ def TritonNvidiaGPUInterleaveTMemPass : Pass<"triton-nvidia-interleave-tmem", "m
   }];
 }
 
+def TritonNvidiaGPUUnifyWSBarrierLocationsPass : Pass<"triton-nvidia-unify-ws-barrier-locations", "mlir::ModuleOp"> {
+  let summary = "Co-locate related AutoWS waits around cheap load preparation.";
+
+  let description = [{
+    The `triton-nvidia-unify-ws-barrier-locations` pass raises a later
+    AutoWS-generated wait next to an earlier wait when they guard a TMA load
+    and a TMEM load feeding the same consumer, and only cheap preparation work
+    separates them.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 def TritonNvidiaGPUTestGenerateSubtiledRegionPass
     : Pass<"triton-nvidia-gpu-test-generate-subtiled-region", "mlir::ModuleOp"> {
   let summary = "Test pass: generate subtiled_region ops from split patterns";

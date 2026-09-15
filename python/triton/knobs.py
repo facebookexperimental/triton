@@ -423,6 +423,9 @@ class compilation_knobs(base_knobs):
     override: env_bool = env_bool("TRITON_KERNEL_OVERRIDE")
     dump_ir: env_bool = env_bool("TRITON_KERNEL_DUMP")
     dump_ir_extract_di_local_variables: env_bool = env_bool("LLVM_EXTRACT_DI_LOCAL_VARIABLES")
+    # Dump the final TTGIR of each kernel as equivalent TLX Python
+    dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
+    dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     store_binary_only: env_bool = env_bool("TRITON_STORE_BINARY_ONLY")
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")
     # TODO: Use enum to constrain / 'typecheck' the values
@@ -435,6 +438,12 @@ class compilation_knobs(base_knobs):
     # Instrumentation mode is checked on every run, which is expensive.
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
+    fpsan_homomorphic_casts: env_bool = env_bool("TRITON_FPSAN_HOMOMORPHIC_CASTS")
+    # os.pathsep-separated plugin extension shared objects. loadPlugins()
+    # (lib/Tools/PluginUtils.cpp) reads the environment directly and is memoized on
+    # the first call, which happens while libtriton is being imported, so assigning
+    # this afterwards records the value but loads nothing.
+    plugin_paths: env_opt_str = env_opt_str("TRITON_PLUGIN_PATHS")
     listener: Union[CompilationListener, None] = None
 
 
@@ -633,8 +642,6 @@ class nvidia_knobs(base_knobs):
     # it (knobs.nvidia.scope()) instead of leaking global env state.
     modulo_strict_error: env_bool = env_bool("TRITON_MODULO_STRICT_ERROR")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
-    dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
-    dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     # Default ON; opt out with TRITON_USE_C_DISPATCHER=0.
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)
@@ -649,6 +656,8 @@ class nvidia_knobs(base_knobs):
     # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
     # testing against the operand-D back-edge channel fix.
     enable_interleave_tmem: env_bool = env_bool("TRITON_ENABLE_INTERLEAVE_TMEM", True)
+    # Default ON; opt out with TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS=0.
+    enable_unify_ws_barrier_locations: env_bool = env_bool("TRITON_ENABLE_UNIFY_WS_BARRIER_LOCATIONS", True)
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
     disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
     # Gate opt-in perf-benchmark tests (do_bench sweeps) so unit-test runs do

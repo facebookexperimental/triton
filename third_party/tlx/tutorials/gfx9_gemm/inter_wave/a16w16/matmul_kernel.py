@@ -1,6 +1,8 @@
-"""8-wave inter-wave warp-pipelined FP16/BF16 GEMM for gfx950 (CDNA4).
+"""Inter-wave warp-pipelined FP16/BF16 GEMM for gfx950 (CDNA4).
 
-Runs a 256x256 output tile on 8 warps (2 waves/SIMD). Key ideas:
+The default 256x256 tile uses 8 waves (2 waves/SIMD); the 128x128 occupancy
+fallback uses 4 waves so its smaller MFMA grid does not carry idle waves. Key
+ideas:
 
   * 2x2 quadrant tiling: the tile is split into four [128x128] quadrants, and
     each operand half-tile gets its OWN double-buffered LDS allocation
@@ -28,10 +30,19 @@ variable-work Stream-K tail, including an even-work fast path for the two
 performance-critical production shapes.
 """
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.tlx.ops.kernels.mm.gfx950_register import (
+    _full_grid_config as _register_config_for,  # noqa: F401
+    _intermediate_config as _intermediate_register_config,  # noqa: F401
+    _kernel as _register_kernel_impl,
+    launch as _launch_register_plan,
+    plan_for as _register_plan_for_shape,
+)
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -238,91 +249,14 @@ _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
 _A_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((8, 1024, 64), (1, 512)))
 _B_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((1024, 16, 1), (128, 8)))
 
-
-@triton.autotune(
+_register_kernel = triton.autotune(
     configs=_REGISTER_CONFIGS,
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_register_configs},
-)
-@triton.jit
-def _register_kernel(
-    a_ptr,
-    b_ptr,
-    bias_ptr,
-    c_ptr,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
-    stride_bk: tl.constexpr,
-    stride_bn: tl.constexpr,
-    stride_bias_m: tl.constexpr,
-    stride_bias_n: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
-    ADD_BIAS: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int32)
-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
-    grid_mn = grid_m * grid_n
-
-    xcd_chunk: tl.constexpr = 4
-    if NUM_XCDS != 1:
-        aligned = (grid_mn // (NUM_XCDS * xcd_chunk)) * (NUM_XCDS * xcd_chunk)
-        if pid < aligned:
-            xcd = pid % NUM_XCDS
-            local_pid = pid // NUM_XCDS
-            pid = (local_pid // xcd_chunk) * NUM_XCDS * xcd_chunk + xcd * xcd_chunk + local_pid % xcd_chunk
-
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + pid % group_size
-    pid_n = pid % width // group_size
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-
-    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
-    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
-    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
-    reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-        k = k_idx * BLOCK_K
-        a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-        b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-        if K % BLOCK_K == 0:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-        else:
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
-        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
-
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
-    idx_m = rows[:, None]
-    idx_n = cols[None, :]
-    mask = (idx_m < M) & (idx_n < N)
-    if ADD_BIAS:
-        bias_offsets = idx_m * stride_bias_m + idx_n * stride_bias_n
-        bias = tl.load(bias_ptr + bias_offsets, mask=mask, eviction_policy="evict_last")
-        acc += bias.to(tl.float32)
-    output_offsets = idx_m * N + idx_n
-    tl.store(c_ptr + output_offsets, acc, mask=mask)
+)(_register_kernel_impl)
 
 
-def _launch_register(a, b, bias=None, config=None):
+def _launch_register(a, b, bias=None, config=None, out=None):
     """Launch the register-resident gfx950 GEMM path.
 
     ``config=None`` autotunes over `_REGISTER_CONFIGS`. Passing an explicit
@@ -330,6 +264,15 @@ def _launch_register(a, b, bias=None, config=None):
     the same convention the Blackwell/Hopper tutorials use so correctness
     tests can pin a config instead of paying for a sweep.
     """
+    if config is not None:
+        return _launch_register_plan(
+            a,
+            b,
+            bias=bias,
+            config=config,
+            out=out,
+        )
+
     M, K = a.shape
     b_k, N = b.shape
     if K != b_k:
@@ -339,7 +282,8 @@ def _launch_register(a, b, bias=None, config=None):
             raise ValueError(f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}")
         if bias.device != a.device or bias.dtype != a.dtype:
             raise ValueError("Bias and matrix operands must have matching device and dtype")
-    out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    if out is None:
+        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
     disable_agpr = (K == 256 and N > 256) or (K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024))
     launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {}
     bias_ptr = bias if bias is not None else out
@@ -357,13 +301,15 @@ def _launch_register(a, b, bias=None, config=None):
         b.stride(1),
         bias.stride(0) if bias is not None else 0,
         bias.stride(1) if bias is not None else 0,
+        out.stride(0),
+        out.stride(1),
     )
-    if config is not None:
-        grid = (triton.cdiv(M, config["BLOCK_M"]) * triton.cdiv(N, config["BLOCK_N"]), )
-        _register_kernel.fn[grid](*args, ADD_BIAS=bias is not None, **config, **launch_options)
-    else:
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
-        _register_kernel[grid](*args, ADD_BIAS=bias is not None, **launch_options)
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
+    _register_kernel[grid](
+        *args,
+        ADD_BIAS=bias is not None,
+        **launch_options,
+    )
     return out
 
 
@@ -594,6 +540,9 @@ def a16w16_8wave(
     HAS_REGISTER_TAIL: tl.constexpr,
     USE_I64_A_OFFSETS: tl.constexpr,
     USE_I64_B_OFFSETS: tl.constexpr,
+    USE_I64_C_OFFSETS: tl.constexpr,
+    HAS_M_TAIL: tl.constexpr,
+    HAS_N_TAIL: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
 ):
@@ -690,27 +639,67 @@ def a16w16_8wave(
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
     offs_k = tl.arange(0, BLOCK_K)
 
+    # Direct-to-LDS vectorizes its address construction before masked zero-fill
+    # lowering. Redirect padded edge rows/columns to valid elements so every
+    # source address is legal; the corresponding accumulator lanes are later
+    # discarded by the output masks. Keep this coordinate work entirely inside
+    # constexpr tail branches so complete tiles retain the original address IR.
+    if HAS_M_TAIL:
+        offs_am_bot = offs_am + HALF_M
+        global_am = tl.where(offs_am < M, offs_am, 0)
+        global_am_bot = tl.where(offs_am_bot < M, offs_am_bot, 0)
+    if HAS_N_TAIL:
+        offs_bn_right = offs_bn + HALF_N
+        global_bn = tl.where(offs_bn < N, offs_bn, 0)
+        global_bn_right = tl.where(offs_bn_right < N, offs_bn_right, 0)
+
     # Widen coordinates before multiplying by strides so large tensors cannot
     # overflow while constructing the pointer offset.
     if USE_I64_A_OFFSETS:
-        a_row_off = offs_am.to(tl.int64)[:, None] * stride_am
+        if HAS_M_TAIL:
+            a_row_off = global_am.to(tl.int64)[:, None] * stride_am
+            a_bot_row_off = global_am_bot.to(tl.int64)[:, None] * stride_am
+        else:
+            a_row_off = offs_am.to(tl.int64)[:, None] * stride_am
         a_k_off = offs_k.to(tl.int64)[None, :] * stride_ak
     else:
-        a_row_off = offs_am[:, None] * stride_am
+        if HAS_M_TAIL:
+            a_row_off = global_am[:, None] * stride_am
+            a_bot_row_off = global_am_bot[:, None] * stride_am
+        else:
+            a_row_off = offs_am[:, None] * stride_am
         a_k_off = offs_k[None, :] * stride_ak
     if USE_I64_B_OFFSETS:
-        b_col_off = offs_bn.to(tl.int64)[None, :] * stride_bn
+        if HAS_N_TAIL:
+            b_col_off = global_bn.to(tl.int64)[None, :] * stride_bn
+            b_right_col_off = global_bn_right.to(tl.int64)[None, :] * stride_bn
+        else:
+            b_col_off = offs_bn.to(tl.int64)[None, :] * stride_bn
         b_k_off = offs_k.to(tl.int64)[:, None] * stride_bk
     else:
-        b_col_off = offs_bn[None, :] * stride_bn
+        if HAS_N_TAIL:
+            b_col_off = global_bn[None, :] * stride_bn
+            b_right_col_off = global_bn_right[None, :] * stride_bn
+        else:
+            b_col_off = offs_bn[None, :] * stride_bn
         b_k_off = offs_k[:, None] * stride_bk
     if PIN_OFFSET_LAYOUT:
         a_row_off = tl.multiple_of(a_row_off, (8, 8))
         b_col_off = tl.multiple_of(b_col_off, (8, 8))
+        if HAS_M_TAIL:
+            a_bot_row_off = tl.multiple_of(a_bot_row_off, (8, 8))
+        if HAS_N_TAIL:
+            b_right_col_off = tl.multiple_of(b_right_col_off, (8, 8))
     a_top_off = a_row_off + a_k_off
-    a_bot_off = a_top_off + HALF_M * stride_am
+    if HAS_M_TAIL:
+        a_bot_off = a_bot_row_off + a_k_off
+    else:
+        a_bot_off = a_top_off + HALF_M * stride_am
     b_left_off = b_k_off + b_col_off
-    b_right_off = b_left_off + HALF_N * stride_bn
+    if HAS_N_TAIL:
+        b_right_off = b_k_off + b_right_col_off
+    else:
+        b_right_off = b_left_off + HALF_N * stride_bn
     if PIN_OFFSET_LAYOUT:
         a_top_off = tlx.require_layout(a_top_off, _A_OFFSET_LAYOUT_256)
         a_bot_off = tlx.require_layout(a_bot_off, _A_OFFSET_LAYOUT_256)
@@ -720,7 +709,10 @@ def a16w16_8wave(
     a_top_mask = (offs_am[:, None] < M) & a_k_mask
     a_bot_mask = ((offs_am[:, None] + HALF_M) < M) & a_k_mask
     b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
-    b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
+    if HAS_N_TAIL:
+        b_right_mask = tl.broadcast_to(offs_bn_right[None, :] < N, b_right_off.shape)
+    else:
+        b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -899,6 +891,20 @@ def a16w16_8wave(
     m_bot = offs_cm_bot[:, None] < M
     n_left = offs_cn_left[None, :] < N
     n_right = offs_cn_right[None, :] < N
+    if USE_I64_C_OFFSETS:
+        c_row_top = offs_cm_top.to(tl.int64)[:, None] * stride_cm
+        c_row_bot = offs_cm_bot.to(tl.int64)[:, None] * stride_cm
+        c_col_left = offs_cn_left.to(tl.int64)[None, :] * stride_cn
+        c_col_right = offs_cn_right.to(tl.int64)[None, :] * stride_cn
+    else:
+        c_row_top = offs_cm_top[:, None] * stride_cm
+        c_row_bot = offs_cm_bot[:, None] * stride_cm
+        c_col_left = offs_cn_left[None, :] * stride_cn
+        c_col_right = offs_cn_right[None, :] * stride_cn
+    c_top_left = c_row_top + c_col_left
+    c_bot_left = c_row_bot + c_col_left
+    c_top_right = c_row_top + c_col_right
+    c_bot_right = c_row_bot + c_col_right
 
     if SPLIT_K == 1 and not DEFER_EPILOGUE:
         if ADD_BIAS:
@@ -946,23 +952,15 @@ def a16w16_8wave(
             # remove-layout-conversions / AMD optimize-epilogue so the store stays
             # a wide dwordx4. Fails compilation if a future change drops the pin.
             tlx.assert_same_layout(c_tl, L)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], c_tl,
-                     mask=m_top & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
-                     tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
-                     tlx.require_layout(acc_tr.to(et), L), mask=m_top & n_right)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
-                     tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
+            tl.store(c_ptr + c_top_left, c_tl, mask=m_top & n_left)
+            tl.store(c_ptr + c_bot_left, tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
+            tl.store(c_ptr + c_top_right, tlx.require_layout(acc_tr.to(et), L), mask=m_top & n_right)
+            tl.store(c_ptr + c_bot_right, tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
         else:
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], acc_tl.to(et),
-                     mask=m_top & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :], acc_bl.to(et),
-                     mask=m_bot & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :], acc_tr.to(et),
-                     mask=m_top & n_right)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :], acc_br.to(et),
-                     mask=m_bot & n_right)
+            tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left)
+            tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left)
+            tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right)
+            tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
@@ -1351,6 +1349,7 @@ def _split_k_for(grid_mn, K):
     return best
 
 
+@lru_cache(maxsize=None)
 def choose_tile(M, N, K):
     """Pick (BLOCK_M, BLOCK_N, SPLIT_K) by CU fill -- no shape hardcoding.
 
@@ -1389,6 +1388,15 @@ def _needs_i64_offsets(tensor):
     return max_byte_offset > (1 << 31) - 1
 
 
+@lru_cache(maxsize=None)
+def _matmul_plan(M, N, K):
+    """Cache the pure shape-based dispatch decision used by ``matmul``."""
+    register_config = _register_plan_for_shape(M, N, K)
+    if register_config is not None:
+        return "register", register_config
+    return "lds", choose_tile(M, N, K)
+
+
 def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
@@ -1400,6 +1408,9 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         assert bias.shape == (M, N), f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}"
         assert bias.device == a.device, "Bias and matrix operands must be on the same device"
         assert bias.dtype == a.dtype, "Bias and matrix operands must have the same dtype"
+        if _needs_i64_offsets(bias):
+            raise ValueError("gfx950 inter-wave GEMM bias exceeds signed-i32 byte offsets; "
+                             f"shape={tuple(bias.shape)}, strides={bias.stride()}")
     if TILE is not None:
         BM, BN = TILE
         grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
@@ -1418,15 +1429,21 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     if SPLIT_K > 1 or DEFER_EPILOGUE:
+        workspace_shape = (SPLIT_K * M, N)
+        workspace_view = torch.empty(workspace_shape, device="meta", dtype=torch.float32)
+        if _needs_i64_offsets(workspace_view):
+            raise ValueError("gfx950 inter-wave GEMM FP32 workspace exceeds signed-i32 byte offsets; "
+                             f"shape={workspace_shape}, SPLIT_K={SPLIT_K}, DEFER_EPILOGUE={DEFER_EPILOGUE}")
         # fp32 workspace: partials are stored without a rounding step, so the
         # split-K result matches a single fp32-accumulated GEMM (an fp16 workspace
         # would lose ~1e-1 near cancellation). The reduce sums in fp32 too.
-        workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32)
+        workspace = torch.empty(workspace_shape, device=a.device, dtype=torch.float32)
     else:
         workspace = c  # dummy; the kernel writes c_ptr directly when SPLIT_K==1
     bias_ptr = bias if bias is not None else c
     stride_bias_m = bias.stride(0) if bias is not None else 0
     stride_bias_n = bias.stride(1) if bias is not None else 0
+    use_i64_c_offsets = _needs_i64_offsets(c)
     a16w16_8wave[(GRID_MN * SPLIT_K, )](
         a,
         b,
@@ -1456,9 +1473,12 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         HAS_REGISTER_TAIL=KS % (2 * BLOCK_K) != 0,
         USE_I64_A_OFFSETS=_needs_i64_offsets(a),
         USE_I64_B_OFFSETS=_needs_i64_offsets(b),
+        USE_I64_C_OFFSETS=use_i64_c_offsets,
+        HAS_M_TAIL=M % BM != 0,
+        HAS_N_TAIL=N % BN != 0,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
-        num_warps=NUM_WARPS,
+        num_warps=4 if BM == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
@@ -1505,6 +1525,19 @@ def matmul(a, b, SPLIT_K=None):
     numerically identical to the non-split-K kernel; only an int-free fp32 sum is
     added, so there is no precision loss and the result is deterministic.
     """
+    if SPLIT_K is None:
+        M, K = a.shape
+        N = b.shape[1]
+        path, config = _matmul_plan(M, N, K)
+        if path == "register":
+            return _launch_register(a, b, config=config)
+        block_m, block_n, split_k = config
+        return _launch(
+            a,
+            b,
+            SPLIT_K=split_k,
+            TILE=(block_m, block_n),
+        )
     return _launch(a, b, SPLIT_K=SPLIT_K)
 
 

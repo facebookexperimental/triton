@@ -24,7 +24,7 @@ option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
 option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 option(TRITON_BUILD_TLX "Build Triton TLX" ON)
 option(TRITON_OFFLINE_BUILD "Build without downloading dependencies" OFF)
-option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" OFF)
+option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" ON)
 option(TRITON_ENABLE_Z3_JOINT_SOLVER "Enable the native Z3 joint modulo scheduler" OFF)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 set(TRITON_VERSION "" CACHE STRING "Triton version string (passed from setup.py)")
@@ -483,6 +483,28 @@ if(TRITON_BUILD_PYTHON_MODULE)
     "${LLVM_SYSPATH}/bin/FileCheck"
     "${TRITON_WHEEL_DIR}/FileCheck"
     COPYONLY)
+
+  # Install Triton headers and TableGen definitions into the wheel staging
+  # directory so that downstream projects can use Triton as a C++ library
+  # without a separate cmake --install step.
+  set(_TRITON_WHEEL_INCLUDE "${TRITON_WHEEL_DIR}/include")
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}"
+    FILES_MATCHING PATTERN "*.h")
+  install(DIRECTORY ${PROJECT_BINARY_DIR}/include/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}"
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.h.inc")
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}"
+    FILES_MATCHING PATTERN "*.td")
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/python/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}/python"
+    FILES_MATCHING PATTERN "*.h"
+    PATTERN "triton" EXCLUDE)
 
   # Build plugins when building libtriton since they depend on libtriton.
   if(TRITON_EXT_ENABLED)

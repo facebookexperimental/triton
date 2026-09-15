@@ -31,8 +31,12 @@ struct CircularStoreOpConversion
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    auto dataPack =
-        lowerCircularStoreOpHelper(op, adaptor.getSegment(), rewriter);
+    // AMD lowers the existing writer predicate through a masked store, so a
+    // dynamic user predicate only strengthens that condition but still uses a
+    // branch. If this becomes costly, consider rejecting dynamic predicates on
+    // AMD while preserving unpredicated records and constant-false elision.
+    auto dataPack = lowerCircularStoreOpHelper(
+        op, adaptor.getSegment(), adaptor.getPredicate(), rewriter);
 
     uint32_t addrSpace = dataPack.addrSpace;
     if (addrSpace == 1) {

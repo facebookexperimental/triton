@@ -22,39 +22,6 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
-                                        ArrayRef<StringRef> keys) {
-  SmallVector<bool> flags(keys.size(), false);
-  unsigned pending = keys.size();
-  if (pending == 0)
-    return flags;
-  funcOp.walk([&](Operation *op) {
-    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
-    if (!attr)
-      return WalkResult::advance();
-    auto parsed = llvm::json::parse(attr.getValue());
-    if (!parsed) {
-      llvm::consumeError(parsed.takeError());
-      return WalkResult::advance();
-    }
-    auto *object = parsed->getAsObject();
-    if (!object)
-      return WalkResult::advance();
-    for (unsigned i = 0; i < keys.size(); ++i) {
-      if (flags[i] || !object->getBoolean(keys[i]).value_or(false))
-        continue;
-      flags[i] = true;
-      --pending;
-    }
-    return pending == 0 ? WalkResult::interrupt() : WalkResult::advance();
-  });
-  return flags;
-}
-
-bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key) {
-  return getAutoWSBooleanFlags(funcOp, {key}).front();
-}
-
 void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is
   // a no-op when the attribute is absent, so a single walk over every op
@@ -1101,12 +1068,8 @@ static bool tmemReuseGroupOverlaps(ReuseGroup *group) {
     auto *allocOp = ch->getAllocOp();
     if (!allocOp)
       return false;
-    auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
-    int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
-    int64_t off = 0;
-    if (auto a = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
-      off = a.getInt();
-    ranges.push_back({off, off + numCols});
+    auto [lo, hi] = getTmemColumnRange(allocOp);
+    ranges.push_back({lo, hi});
   }
   for (unsigned i = 0; i < ranges.size(); ++i)
     for (unsigned j = i + 1; j < ranges.size(); ++j)
@@ -1366,6 +1329,38 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
        << earlyChannel->srcName << ") and lateChannel " << lateChannel->uniqID
        << " (" << lateChannel->srcName << ")");
   return true;
+}
+
+int64_t getTmemBufferOffset(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+    return attr.getInt();
+  return 0;
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  int64_t offset = getTmemBufferOffset(allocOp);
+  int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
+  return {offset, offset + numCols};
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Channel *channel) {
+  assert(channel && "TMEM column queries require a channel");
+  Operation *allocOp = channel->getAllocOp();
+  assert(allocOp && "TMEM reuse channel must have an allocation");
+  return getTmemColumnRange(allocOp);
+}
+
+bool tmemColumnRangesOverlap(std::pair<int64_t, int64_t> rangeA,
+                             std::pair<int64_t, int64_t> rangeB) {
+  return rangeA.first < rangeB.second && rangeB.first < rangeA.second;
+}
+
+bool tmemColumnRangesOverlap(Operation *allocA, Operation *allocB) {
+  return tmemColumnRangesOverlap(getTmemColumnRange(allocA),
+                                 getTmemColumnRange(allocB));
 }
 
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {

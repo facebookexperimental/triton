@@ -523,23 +523,19 @@ struct DotConversion {
     unsigned K;
   } shape;
   int mmaSizeK;
-  SmallVector<int64_t> shapeA;
-  SmallVector<int64_t> shapeB;
   int numBitsPerElementA;
   int numBitsPerElementB;
   GetAccAddressFn getAccAddress;
   CreateMMAInstFn createMMAInst;
 };
 
-LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
-                             ConversionPatternRewriter &rewriter, Location loc,
-                             Value a, Value b, Value loadedA, Value loadedB,
-                             MemDescType dTensorTy, Value useDFlag, Value pred,
-                             ValueRange barriers, ValueRange barrierPreds,
-                             bool twoCTAs, bool tlxPairedMMA,
-                             ValueRange commitDescs, bool opKindIsMXFP4,
-                             const ttng::TargetFeatures &targetFeatures,
-                             const DotConversion &op) {
+LogicalResult convertDotImpl(
+    const LLVMTypeConverter &typeConverter, ConversionPatternRewriter &rewriter,
+    Location loc, Value a, Value b, Value loadedA, Value loadedB,
+    MemDescType dTensorTy, Value useDFlag, Value pred, ValueRange barriers,
+    ValueRange barrierPreds, bool twoCTAs, bool tlxPairedMMA,
+    ValueRange commitDescs, bool opKindIsMXFP4, bool lessRegMMA,
+    const ttng::TargetFeatures &targetFeatures, const DotConversion &op) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
@@ -611,8 +607,6 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
          "grep for [Note: numRepN > 1 and two_ctas]");
   int numRepK = ceil<unsigned>(K, mmaSizeK);
 
-  SmallVector<int64_t> shapeA = op.shapeA;
-  SmallVector<int64_t> shapeB = op.shapeB;
   // In A * B = C
   // For M=64 twoCTAs, B and C have the same split and A has a split half of C
   // along M.
@@ -630,8 +624,9 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
         std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
             loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
   } else {
-    auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
-                                            aOperandShape, 0, 5, isFp4a);
+    auto loader =
+        DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
+                                  aOperandShape, 0, 5, lessRegMMA, isFp4a);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                   "operand A in shared memory ")
@@ -643,8 +638,8 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
-  auto bLoader = DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
-                                           bOperandShape, 1, 5, isFp4b);
+  auto bLoader = DotOpMmaSmemLoader::build(
+      loc, rewriter, bTensorTy, baseB, bOperandShape, 1, 5, lessRegMMA, isFp4b);
   if (failed(bLoader)) {
     return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                 "operand B in shared memory ")
@@ -752,8 +747,6 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
     dot.mmaSizeK = 64;
   }
 
-  dot.shapeA = getShapePerCTA(aTensorTy);
-  dot.shapeB = getShapePerCTA(bTensorTy);
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
 
@@ -784,12 +777,12 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
                   useInitAcc, desc.aInTmem, twoCTAs, collectorB);
   };
 
-  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
-                        adaptor.getA(), adaptor.getB(), dTensorTy,
-                        adaptor.getUseD(), adaptor.getPred(),
-                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
-                        twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs,
-                        /*opKindIsMXFP4=*/false, targetFeatures, dot);
+  return convertDotImpl(
+      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
+      adaptor.getB(), dTensorTy, adaptor.getUseD(), adaptor.getPred(),
+      adaptor.getBarriers(), adaptor.getBarrierPreds(), twoCTAs,
+      tlx::tlxEnablePairedMMA(op), commitDescs,
+      /*opKindIsMXFP4=*/false, hasLessRegMMA(op), targetFeatures, dot);
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {
@@ -824,6 +817,9 @@ int getScaleFactorColsPerSet(mxfpKind kind, ttng::TCGen5MMAScaledOp op,
 };
 
 bool isFp4Padded(MemDescType operand) {
+  if (auto tmemLayout =
+          dyn_cast<ttng::TensorMemoryEncodingAttr>(operand.getEncoding()))
+    return tmemLayout.getFp4Padded();
   auto encoding = operand.getEncoding();
   if (auto shared = dyn_cast<NVMMASharedEncodingAttr>(encoding))
     return shared.getFp4Padded();
@@ -880,13 +876,6 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   dot.shape.M = dstPerCTA[0];
   dot.shape.N = dstPerCTA[1];
   dot.shape.K = blockK; // K is not split across CTAs
-
-  dot.shapeA = triton::gpu::getAllocationShapePerCTA(aTensorTy);
-  dot.shapeB = triton::gpu::getAllocationShapePerCTA(bTensorTy);
-  if (opKindIsMXFP4) {
-    dot.shapeA[1] *= 2;
-    dot.shapeB[0] *= 2;
-  }
 
   bool hasFp4PaddedOperand = isFp4Padded(aTensorTy) || isFp4Padded(bTensorTy);
 
@@ -974,7 +963,7 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                         adaptor.getUseD(), adaptor.getPred(),
                         adaptor.getBarriers(), adaptor.getBarrierPreds(),
                         twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs,
-                        opKindIsMXFP4, targetFeatures, dot);
+                        opKindIsMXFP4, hasLessRegMMA(op), targetFeatures, dot);
 }
 
 //===----------------------------------------------------------------------===//

@@ -484,16 +484,12 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
       packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
   } else if (auto tmemLayout =
                  dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(layout)) {
-    // An fp4Padded TMEM descriptor keeps the packed Mx(K/2)xi8 shape. Allocate
-    // two physical columns per packed K coordinate so each logical FP4 element
-    // occupies one byte in TMEM.
     if (tmemLayout.getFp4Padded())
       packedAxis = 1;
   }
   if (packedAxis)
     shape[*packedAxis] *= 2;
   if (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout)) {
-    // Pad only the trailing dimensions covered by the swizzle.
     unsigned tileRank = getCGALayout(layout).getRank();
     size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
     for (size_t i = firstTileDim; i < shape.size(); ++i) {
@@ -513,6 +509,40 @@ SmallVector<int64_t> getAllocationShapePerCTA(Type type) {
   auto tensorType = cast<TensorOrMemDesc>(type);
   return getAllocationShapePerCTA(tensorType.getEncoding(),
                                   tensorType.getShape());
+}
+
+int64_t getAllocationElems(Attribute encoding, ArrayRef<int64_t> shape,
+                           ArrayRef<int64_t> allocShape) {
+  assert(isa<SharedEncodingTrait>(encoding) &&
+         "expected a shared-memory encoding");
+  if (allocShape.empty())
+    allocShape = shape;
+  auto layoutShape = dropPipeliningDim(shape, encoding);
+  auto allocationShape = dropPipeliningDim(allocShape, encoding);
+  if (!llvm::all_of(layoutShape, llvm::isPowerOf2_64) ||
+      !llvm::all_of(allocationShape, llvm::isPowerOf2_64))
+    return product<int64_t>(getAllocationShapePerCTA(encoding, allocShape));
+  auto layout = isPaddedEncoding(encoding)
+                    ? paddedLinearLayout(allocationShape, encoding)
+                    : toLinearLayout(allocationShape, encoding);
+  auto offsetDim = StringAttr::get(encoding.getContext(), "offset");
+  int64_t stages = product<int64_t>(shape.drop_back(layoutShape.size()));
+  int64_t elems = stages * layout.getInDimSize(offsetDim);
+  if (layoutShape != allocationShape) {
+    auto logicalDims = llvm::to_vector(layout.getOutDimNames());
+    LinearLayout identity = LinearLayout::empty();
+    for (auto [dim, size] : llvm::zip_equal(logicalDims, layoutShape))
+      identity *= LinearLayout::identity1D(size, dim, dim);
+    auto view = identity.invertAndCompose(layout);
+    uint64_t zeroMask = (layout.getInDimSize(offsetDim) - 1) &
+                        ~getInputBasisMask(layout, offsetDim, logicalDims);
+    int64_t viewElems =
+        (getOutputBasisMask(view, logicalDims, offsetDim) | zeroMask) + 1;
+    elems = (stages - 1) * layout.getInDimSize(offsetDim) + viewElems;
+  }
+  if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
+    elems *= partitioned.getNumPartitions();
+  return elems;
 }
 
 SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
@@ -2898,18 +2928,11 @@ SmallVector<unsigned> DotOperandEncodingAttr::getRepOrder() const {
 
 CGAEncodingAttr DotOperandEncodingAttr::getCGALayout() const {
   const auto &layout = ::getCGALayout(getParent()).getLinearLayout();
-  auto bases = layout.getBases();
-  auto kBlock = StringAttr::get(getContext(), "block");
-  auto &blockBases = bases[kBlock];
   auto rank = layout.getNumOutDims();
   auto kDim = getOpIdx() == 0 ? rank - 1 : rank - 2;
-  for (auto &basis : blockBases) {
-    basis[kDim] = 0;
-  }
   auto dims = layout.getOutDims();
-  dims[kDim].second = 1;
   return CGAEncodingAttr::get(getContext(),
-                              LinearLayout(std::move(bases), dims, true));
+                              layout.resizeOutDim(dims[kDim].first, 1));
 }
 LogicalResult DotOperandEncodingAttr::verify(
     function_ref<::mlir::InFlightDiagnostic()> emitError, unsigned opIdx,
@@ -3970,8 +3993,7 @@ struct TritonGPUVerifyTensorLayoutInterface
       return failure();
 
     if (auto sharedLinearEnc = dyn_cast<SharedLinearEncodingAttr>(layout)) {
-      auto rank = cast<LayoutEncodingTrait>(layout).getRank();
-      auto shape = memDescTy.getAllocShape().take_back(rank);
+      auto shape = dropPipeliningDim(memDescTy.getAllocShape(), layout);
       auto layoutShape = sharedLinearEnc.getLinearLayout().getOutDimSizes();
       if (!llvm::equal(shape, layoutShape)) {
         return makeErr() << layout << ".\nLayout has shape " << layoutShape

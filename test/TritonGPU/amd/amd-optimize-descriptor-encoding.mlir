@@ -1,4 +1,46 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-optimize-descriptor-encoding | FileCheck %s
+
+// Reusing a descriptor across differently sized allocations preserves the
+// common non-default padding. The slice has the same physical tile strides.
+#large = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [64, 128]}>
+#tile = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+#smem = #ttg.shared_memory
+// CHECK-DAG: #[[$REUSE_LOAD:.*]] = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_load_reused_descriptor
+  // CHECK-SAME: !tt.tensordesc<32x128xf16, #[[$REUSE_LOAD]]>
+  tt.func @tdm_load_reused_descriptor(%desc: !tt.tensordesc<32x128xf16>) {
+    %large = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #large, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    %slice = ttg.memdesc_subslice %large[0, 0] : !ttg.memdesc<64x128xf16, #large, #smem, mutable> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>
+    %token0 = amdg.async_tdm_copy_global_to_local %desc into %slice : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>
+    %token1 = amdg.async_tdm_copy_global_to_local %desc into %small : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Reusing a descriptor across differently sized allocations preserves the
+// common non-default padding. The slice has the same physical tile strides.
+#large = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [64, 128]}>
+#tile = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+#smem = #ttg.shared_memory
+// CHECK-DAG: #[[$REUSE_FUSED:.*]] = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_fused_reused_descriptor
+  // CHECK-SAME: !tt.tensordesc<32x128xf16, #[[$REUSE_FUSED]]>
+  tt.func @tdm_fused_reused_descriptor(%desc: !tt.tensordesc<32x128xf16>) {
+    %large = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #large, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    %slice = ttg.memdesc_subslice %large[0, 0] : !ttg.memdesc<64x128xf16, #large, #smem, mutable> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>
+    %token = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %slice, %small {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<32x128xf16>, !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>, !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Test that gather/scatter are assigned padded encodings
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

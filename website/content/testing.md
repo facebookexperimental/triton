@@ -4,13 +4,11 @@
 |---|---|
 | TLX tutorial kernels | `pytest third_party/tlx/tutorials/testing/test_correctness.py` |
 | TLX language | `pytest python/test/unit/language/test_tlx_*.py` |
-| AutoWS | `pytest python/test/unit/language/test_autows_*.py` |
 | TorchTLX | `pytest python/test/unit/language/test_torchtlx_*.py` |
 
 Every suite is arch-gated, so cases that do not apply to the GPU you are on skip
-rather than fail. The `test_tlx_*.py` glob covers manual TLX (`tlx.async_tasks`)
-and structurally excludes the AutoWS suites, which are tested separately. Which
-of these run in CI, and on which runners, is described under [CI](ci.html).
+rather than fail. The `test_tlx_*.py` glob covers manual TLX (`tlx.async_tasks`).
+Which of these run in CI, and on which runners, is described under [CI](ci.html).
 
 ## Correctness
 

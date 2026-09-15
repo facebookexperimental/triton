@@ -4,15 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Production-ready TLX kernels, one blessed implementation per op and architecture.">
-  <title>tlx.ops · FBTriton</title>
+  <title>High-performance kernels · FBTriton</title>
   <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
-<a href="tlx.html">TLX</a>
-<a href="tlx-ops.html" data-current="true">tlx.ops</a>
+<a href="tlx.html" data-current="true">TLX</a>
 <a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
@@ -20,16 +19,29 @@
   </header>
   <div class="shell">
 <aside class="sidebar">
-      <p class="eyebrow">TLX op library</p>
-      <nav><a href="tlx-ops.html" aria-current="page">tlx.ops</a>
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Tutorial kernels</a>
+<a href="tlx-ops.html" aria-current="page">High-performance kernels</a>
 <a class="sub" href="#what-tlx-ops-is">What tlx.ops is</a>
 <a class="sub" href="#interface">Interface</a>
 <a class="sub" href="#structure">Structure</a>
-<a class="sub" href="#current-availability">Current availability</a></nav>
+<a class="sub" href="#current-availability">Current availability</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
-      <p class="eyebrow">TLX op library</p>
-      <h1>tlx.ops</h1>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>High-performance kernels</h1>
       <p class="lede">Production-ready TLX kernels, one blessed implementation per op and architecture.</p>
       <article><p>Production-ready kernels promoted from the TLX tutorials into the FBTriton op library.</p>
 <h2 id="what-tlx-ops-is">What tlx.ops is</h2>
@@ -74,7 +86,7 @@ kda/sm100.py</code></pre>
     multi_cta_layernorm/  sm100.py
     cross_attention/      sm100.py
     bmm_shared_a/         gfx950.py</code></pre></article>
-<footer class="pager"><a href="tlx.html">← TLX</a><a class="next" href="torchtlx.html">TorchTLX →</a></footer>
+<footer class="pager"><a href="kernels.html">← Tutorial kernels</a><a class="next" href="testing.html">Testing →</a></footer>
     </main>
   </div>
 </body>

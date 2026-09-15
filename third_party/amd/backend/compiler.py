@@ -12,6 +12,8 @@ import functools
 import warnings
 from pathlib import Path
 
+from .amdgc_hazard_repair import insert_scheduled_mfma_hazard_nops
+
 MAX_INT_32 = 2**31 - 1
 
 
@@ -114,6 +116,7 @@ class HIPOptions:
     max_num_imprecise_acc_default: int = 0
     backend_name: str = "hip"
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -296,7 +299,24 @@ class HIPBackend(BaseBackend):
         }
 
     def get_codegen_implementation(self, options):
-        return {"min_dot_size": get_min_dot_size(self.target)}
+
+        def post_ast_lowering(mod):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            tlx.tlx_passes.add_triton_tlx_fixup(
+                pm,
+                f"hip:{options.arch}",
+                options.num_warps,
+                options.warp_size,
+                options.num_ctas,
+                [1, 1, 1],
+            )
+            pm.run(mod, "post_ast_lowering")
+
+        return {
+            "min_dot_size": get_min_dot_size(self.target),
+            "post_ast_lowering": post_ast_lowering,
+        }
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.hip import libdevice
@@ -356,14 +376,6 @@ class HIPBackend(BaseBackend):
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        tlx.tlx_passes.add_triton_tlx_fixup(
-            pm,
-            f"hip:{options.arch}",
-            options.num_warps,
-            64,
-            options.num_ctas,
-            list((1, 1, 1)),
-        )
         passes.common.add_inliner(pm)
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -511,7 +523,7 @@ class HIPBackend(BaseBackend):
             )
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
         tlx.tlx_passes.add_tlx_dump_layout(pm)
@@ -537,7 +549,7 @@ class HIPBackend(BaseBackend):
 
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm, options.fpsan_homomorphic_casts)
 
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -550,6 +562,16 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
+        # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
+        tlx_dump_dir = None
+        tlx_saved_fd = None
+        tlx_capture_file = None
+        if knobs.compilation.dump_tlx_benchmark:
+            from triton.tools.tlx_benchmark_gen import setup_tlx_dump
+
+            tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
+        elif knobs.compilation.dump_ttgir_to_tlx:
+            tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
@@ -599,7 +621,15 @@ class HIPBackend(BaseBackend):
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.convert.add_reconcile_unrealized_casts(pm)
-        pm.run(mod, "make_llir")
+        try:
+            pm.run(mod, "make_llir")
+        finally:
+            # finalize_tlx_dump restores the stdout fd setup_tlx_dump redirected,
+            # so it has to run even when the pipeline raises.
+            if tlx_dump_dir is not None:
+                from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
+
+                finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
@@ -784,6 +814,7 @@ class HIPBackend(BaseBackend):
                 False,
                 False,
             )
+        amdgcn = insert_scheduled_mfma_hazard_nops(amdgcn, options.arch)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)

@@ -29,25 +29,6 @@ namespace tt = mlir::triton;
 constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
     "ttg.atomic_broadcast_copies";
 
-// Boolean opt-in switches carried by the `tt.autows` JSON annotation
-// (tt::kAutoWSAnnotationAttrName). Named here so every pass that reads one
-// shares a single source of truth for the spelling.
-constexpr llvm::StringLiteral kAutoWSFuseFinalStatsKey =
-    "two_cta_fuse_final_stats";
-constexpr llvm::StringLiteral kAutoWSFuseAccSlicesKey =
-    "two_cta_fuse_acc_slices";
-constexpr llvm::StringLiteral kAutoWSTwoCTADirectWaitKey =
-    "two_cta_tma_direct_wait";
-
-// Answer a set of `tt.autows` boolean switches with one walk over funcOp: each
-// annotated op's JSON is parsed once for all keys, and the walk stops as soon
-// as every key has been seen set. Returns one entry per requested key, in the
-// order the keys were given. A switch is on when any annotation in the
-// function sets it to true.
-SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
-                                        ArrayRef<StringRef> keys);
-bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key);
-
 // Strip every warp-specialization metadata attribute that AutoWS stamps on
 // ops/loops. Every graceful-reject path must call this so the downstream
 // tritongpu-pipeline pass sees a plain, compilable non-WS kernel; a leftover WS
@@ -357,8 +338,7 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                  Value phase, Operation *headProducer, Operation *headConsumer,
                  Operation *headConsumerSameLevel,
                  ArrayRef<int> additionalConsumerTaskIds = {},
-                 DictionaryAttr consumerWaitConstraints = {},
-                 bool twoCTADirectWait = false);
+                 DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
@@ -469,6 +449,26 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group);
 // order (partition-internal ordering guarantees correctness).
 // Returns true otherwise (explicit synchronization needed).
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
+
+// Packed start column of a TMEM allocation within its reuse group's physical
+// slot. Reusers carry `buffer.offset`; the group's space owner has no such
+// attribute and starts at column 0.
+int64_t getTmemBufferOffset(Operation *allocOp);
+
+// The `[begin, end)` TMEM column range `allocOp` occupies within that slot.
+// Reuse-group membership is what makes two ranges comparable: members share one
+// physical allocation, so intersecting column ranges mean the same storage.
+std::pair<int64_t, int64_t> getTmemColumnRange(Operation *allocOp);
+// Same, for a channel's allocation. A TMEM reuse channel always has one.
+std::pair<int64_t, int64_t> getTmemColumnRange(Channel *channel);
+
+// Whether two TMEM allocations in the same reuse group occupy overlapping
+// columns. Callers must have established that they share a physical slot.
+bool tmemColumnRangesOverlap(Operation *allocA, Operation *allocB);
+// Same, for ranges already obtained from getTmemColumnRange, so a loop over
+// siblings can hoist the invariant side out.
+bool tmemColumnRangesOverlap(std::pair<int64_t, int64_t> rangeA,
+                             std::pair<int64_t, int64_t> rangeB);
 
 // Returns true when `ownerCh` is the space owner of a reuse group and its
 // producer overwrites the whole physical allocation before writing, not just
