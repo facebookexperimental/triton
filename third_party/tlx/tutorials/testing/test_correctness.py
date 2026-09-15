@@ -88,17 +88,11 @@ if is_hopper_or_newer():
         matmul as _hopper_gemm_pipelined, )
     from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
         matmul as _hopper_gemm_ws, )
-    from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
-        attention as _hopper_fa_ws_pipelined_pingpong_persistent, )
     from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
         _select_forward_policy as _hopper_fa_select_forward_policy,
         _select_row_schedule as _hopper_fa_select_row_schedule,
         attention as _hopper_fa_ws_pipelined_pingpong,
     )
-    from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
-        attention as _hopper_fa_ws_pipelined, )
-    from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
-        attention as _hopper_fa_ws, )
 
 if is_hip():
     from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
@@ -427,32 +421,10 @@ class FlashAttention:
             "GROUP_SIZE_N": 1,
             "RESCALE_OPT": True,
         },
-        "hopper_fa_ws": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS": 2,
-            "NUM_MMA_WARPS": 8,
-            "NUM_MMA_GROUPS": 2,
-        },
-        "hopper_fa_ws_pipelined": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS": 2,
-            "NUM_MMA_WARPS": 8,
-            "NUM_MMA_GROUPS": 2,
-        },
         "hopper_fa_ws_pipelined_pingpong": {
             "BLOCK_M": 128,
             "BLOCK_N": 128,
             "NUM_BUFFERS": 2,
-            "NUM_MMA_WARPS": 8,
-            "NUM_MMA_GROUPS": 2,
-        },
-        "hopper_fa_ws_pipelined_pingpong_persistent": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 2,
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
         },
@@ -1120,30 +1092,6 @@ def test_hopper_gemm_ws():
 # =============================================================================
 
 
-@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws():
-    config = FlashAttention.CONFIGS["hopper_fa_ws"]
-    sm_scale = 0.5
-    causal = False
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
-        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
-        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws(q, k, v, sm_scale, config=config)
-        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
-
-
-@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined():
-    config = FlashAttention.CONFIGS["hopper_fa_ws_pipelined"]
-    sm_scale = 0.5
-    causal = False
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
-        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
-        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws_pipelined(q, k, v, sm_scale, config=config)
-        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
-
-
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
 def test_hopper_fa_ws_pipelined_pingpong_row_schedule_policy():
     disabled = _hopper_fa_select_row_schedule(False, 4096, 128)
@@ -1296,18 +1244,6 @@ def test_hopper_fa_ws_pipelined_pingpong_bwd(causal):
     assert all(torch.isfinite(grad).all() for grad in result)
     for grad, ref_grad in zip(result, reference):
         torch.testing.assert_close(grad, ref_grad, atol=2e-1, rtol=1e-1)
-
-
-@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined_pingpong_persistent():
-    config = FlashAttention.CONFIGS["hopper_fa_ws_pipelined_pingpong_persistent"]
-    sm_scale = 0.5
-    causal = False
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
-        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
-        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws_pipelined_pingpong_persistent(q, k, v, sm_scale, config=config)
-        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
 # =============================================================================
