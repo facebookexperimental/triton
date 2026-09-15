@@ -31,9 +31,73 @@ struct OffsetRange {
 struct PeelCandidate {
   arith::CmpIOp predicate;
   int64_t iterations;
+  // An optional loop-invariant condition that forces every iteration down the
+  // masked path. This represents target-overlapping HSTU K/V tiles. When it is
+  // false, the ordinary causal prefix can be peeled; when it is true, the
+  // original loop must remain fully masked.
+  Value forceMask;
 };
 
 static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp);
+
+// Match a scalar prefix boundary of the form `lb + K * step`, where K is a
+// small positive compile-time constant. Canonicalization commonly folds the
+// product to a single constant, so accept both the explicit multiply and the
+// folded constant-offset forms.
+static std::optional<int64_t> matchScalarPeelIterations(scf::ForOp forOp,
+                                                        Value boundary) {
+  auto add = boundary.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return std::nullopt;
+
+  Value offset;
+  if (add.getLhs() == forOp.getLowerBound())
+    offset = add.getRhs();
+  else if (add.getRhs() == forOp.getLowerBound())
+    offset = add.getLhs();
+  else
+    return std::nullopt;
+
+  // Preserve the legacy `iv < lb + step` match even when the loop step is
+  // dynamic. Generalizing the boundary to K steps only requires a constant
+  // step for the folded constant-offset form.
+  if (offset == forOp.getStep())
+    return 1;
+
+  APInt stepValue;
+  if (!matchPattern(forOp.getStep(), m_ConstantInt(&stepValue)))
+    return std::nullopt;
+  int64_t step = stepValue.getSExtValue();
+  if (step <= 0)
+    return std::nullopt;
+
+  int64_t iterations = 0;
+  APInt offsetValue;
+  if (matchPattern(offset, m_ConstantInt(&offsetValue))) {
+    int64_t distance = offsetValue.getSExtValue();
+    if (distance <= 0 || distance % step != 0)
+      return std::nullopt;
+    iterations = distance / step;
+  } else if (auto mul = offset.getDefiningOp<arith::MulIOp>()) {
+    Value factor;
+    if (mul.getLhs() == forOp.getStep())
+      factor = mul.getRhs();
+    else if (mul.getRhs() == forOp.getStep())
+      factor = mul.getLhs();
+    else
+      return std::nullopt;
+    APInt factorValue;
+    if (!matchPattern(factor, m_ConstantInt(&factorValue)))
+      return std::nullopt;
+    iterations = factorValue.getSExtValue();
+  } else {
+    return std::nullopt;
+  }
+
+  if (iterations <= 0 || iterations > kMaxPeeledIterations)
+    return std::nullopt;
+  return iterations;
+}
 
 static Value stripBroadcastAndExpandDims(Value value) {
   while (true) {
@@ -258,48 +322,71 @@ static bool materializeFirstIterationsMaskBranch(scf::ForOp forOp) {
 // has exactly one.
 static std::optional<PeelCandidate> getPeelCandidate(scf::ForOp forOp) {
   arith::CmpIOp candidate;
+  int64_t candidateIterations = 1;
+  Value candidateForceMask;
   forOp.getBody()->walk([&](arith::CmpIOp cmp) {
     if (cmp.getPredicate() != arith::CmpIPredicate::slt ||
         cmp.getLhs() != forOp.getInductionVar() ||
         cmp->getBlock() != forOp.getBody())
       return WalkResult::advance();
 
+    std::optional<int64_t> matchedIterations;
     if (auto count = cmp->getAttrOfType<IntegerAttr>(kPeelIterationsAttrName)) {
-      int64_t iterations = count.getInt();
-      if (iterations > 0 && iterations <= kMaxPeeledIterations) {
-        candidate = cmp;
-        return WalkResult::interrupt();
+      int64_t countValue = count.getInt();
+      if (countValue > 0 && countValue <= kMaxPeeledIterations) {
+        candidateIterations = countValue;
+      } else {
+        return WalkResult::advance();
       }
-      return WalkResult::advance();
+    } else {
+      matchedIterations = matchScalarPeelIterations(forOp, cmp.getRhs());
+      if (!matchedIterations)
+        return WalkResult::advance();
+      candidateIterations = *matchedIterations;
     }
 
-    auto add = cmp.getRhs().getDefiningOp<arith::AddIOp>();
-    if (!add)
-      return WalkResult::advance();
-    bool isFirstIterationBoundary = (add.getLhs() == forOp.getLowerBound() &&
-                                     add.getRhs() == forOp.getStep()) ||
-                                    (add.getRhs() == forOp.getLowerBound() &&
-                                     add.getLhs() == forOp.getStep());
-    if (!isFirstIterationBoundary)
-      return WalkResult::advance();
-
-    bool controlsIf = llvm::any_of(cmp->getUsers(), [&](Operation *user) {
+    bool controlsIf = false;
+    Value forceMask;
+    for (Operation *user : cmp->getUsers()) {
       auto ifOp = dyn_cast<scf::IfOp>(user);
-      return ifOp && ifOp.getCondition() == cmp.getResult();
-    });
+      if (ifOp && ifOp.getCondition() == cmp.getResult()) {
+        controlsIf = true;
+        break;
+      }
+
+      // Target-aware HSTU masks spell the condition as
+      //   forceMask || iv < causalBoundary
+      // where forceMask is invariant for the M loop. Recognize only this
+      // direct OR-to-if shape; arbitrary boolean expressions deliberately do
+      // not participate in peeling.
+      auto orOp = dyn_cast<arith::OrIOp>(user);
+      if (!orOp || orOp->getBlock() != forOp.getBody())
+        continue;
+      Value other =
+          orOp.getLhs() == cmp.getResult() ? orOp.getRhs() : orOp.getLhs();
+      if (!forOp.isDefinedOutsideOfLoop(other))
+        continue;
+      bool orControlsIf =
+          llvm::any_of(orOp->getUsers(), [&](Operation *orUser) {
+            auto orIfOp = dyn_cast<scf::IfOp>(orUser);
+            return orIfOp && orIfOp.getCondition() == orOp.getResult();
+          });
+      if (!orControlsIf)
+        continue;
+      controlsIf = true;
+      forceMask = other;
+      break;
+    }
     if (!controlsIf)
       return WalkResult::advance();
 
     candidate = cmp;
+    candidateForceMask = forceMask;
     return WalkResult::interrupt();
   });
   if (!candidate)
     return std::nullopt;
-  int64_t iterations = 1;
-  if (auto count =
-          candidate->getAttrOfType<IntegerAttr>(kPeelIterationsAttrName))
-    iterations = count.getInt();
-  return PeelCandidate{candidate, iterations};
+  return PeelCandidate{candidate, candidateIterations, candidateForceMask};
 }
 
 static SmallVector<Value>
@@ -479,6 +566,62 @@ static void peelIterations(scf::ForOp forOp, arith::CmpIOp predicate,
   rewriter.replaceOp(forOp, peeled.getResults());
 }
 
+// A target-overlapping K/V tile cannot use the unmasked remainder at all. Keep
+// that decision outside the M loop: the true arm runs one fully masked loop,
+// while the false arm uses the ordinary peeled causal prefix. Because this
+// rewrite runs after physical code partitioning, only the computation
+// partition receives the branch and no load channels or operand buffers are
+// duplicated.
+static void peelIterationsWithInvariantForceMask(scf::ForOp forOp,
+                                                 arith::CmpIOp predicate,
+                                                 int64_t iterations,
+                                                 Value forceMask) {
+  IRRewriter rewriter(forOp);
+  Location loc = forOp.getLoc();
+  auto conditional =
+      scf::IfOp::create(rewriter, loc, forOp.getResultTypes(), forceMask,
+                        /*withElseRegion=*/true);
+  copyTaskId(forOp, conditional);
+  for (Block *block : {conditional.thenBlock(), conditional.elseBlock()})
+    eraseDefaultYield(rewriter, block);
+
+  // forceMask == true: clone the original loop and fold its prefix predicate
+  // to true, which in turn folds `forceMask || prefixPredicate` and the mask
+  // branch during canonicalization.
+  rewriter.setInsertionPointToStart(conditional.thenBlock());
+  IRMapping maskedMapping;
+  auto maskedLoop = cast<scf::ForOp>(rewriter.clone(*forOp, maskedMapping));
+  auto maskedPredicate = maskedMapping.lookup(predicate.getResult())
+                             .getDefiningOp<arith::CmpIOp>();
+  rewriter.setInsertionPoint(maskedPredicate);
+  auto truePredicate = arith::ConstantIntOp::create(
+      rewriter, predicate.getLoc(), /*value=*/true, /*width=*/1);
+  truePredicate->setAttrs(maskedPredicate->getAttrs());
+  rewriter.replaceOp(maskedPredicate, truePredicate.getResult());
+  rewriter.setInsertionPointToEnd(conditional.thenBlock());
+  auto maskedYield =
+      scf::YieldOp::create(rewriter, loc, maskedLoop.getResults());
+  copyTaskId(forOp, maskedYield);
+
+  // forceMask == false: clone first so the outer scf.if owns both alternatives,
+  // then apply the existing zero-trip-safe peeling transform to the clone.
+  rewriter.setInsertionPointToStart(conditional.elseBlock());
+  auto falseForceMask = arith::ConstantIntOp::create(
+      rewriter, forceMask.getLoc(), /*value=*/false, /*width=*/1);
+  copyTaskId(forOp, falseForceMask);
+  IRMapping peelMapping;
+  peelMapping.map(forceMask, falseForceMask.getResult());
+  auto peelLoop = cast<scf::ForOp>(rewriter.clone(*forOp, peelMapping));
+  auto peelPredicate =
+      peelMapping.lookup(predicate.getResult()).getDefiningOp<arith::CmpIOp>();
+  rewriter.setInsertionPointToEnd(conditional.elseBlock());
+  auto peelYield = scf::YieldOp::create(rewriter, loc, peelLoop.getResults());
+  copyTaskId(forOp, peelYield);
+
+  rewriter.replaceOp(forOp, conditional.getResults());
+  peelIterations(peelLoop, peelPredicate, iterations);
+}
+
 } // namespace
 
 void peelPartitionLoops(ModuleOp moduleOp) {
@@ -510,8 +653,14 @@ void peelPartitionLoops(ModuleOp moduleOp) {
   // with an scf.if and erases the original, so an outer loop must be peeled
   // after the inner ones it contains -- the other way round the outer clone
   // erases the inner loop and leaves the remaining entries dangling.
-  for (auto [forOp, candidate] : candidates)
-    peelIterations(forOp, candidate.predicate, candidate.iterations);
+  for (auto [forOp, candidate] : candidates) {
+    if (candidate.forceMask)
+      peelIterationsWithInvariantForceMask(forOp, candidate.predicate,
+                                           candidate.iterations,
+                                           candidate.forceMask);
+    else
+      peelIterations(forOp, candidate.predicate, candidate.iterations);
+  }
 }
 
 } // namespace mlir::triton::gpu
