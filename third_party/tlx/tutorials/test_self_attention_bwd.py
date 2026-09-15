@@ -26,13 +26,48 @@ _C.set_config(autows=False, pin=True)
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
+import triton  # noqa: E402
 from triton._internal_testing import is_blackwell  # noqa: E402
 
 import bench_self as bs  # noqa: E402
 
-
-
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
+
+
+def _run_tlx_raw_bwd(q, k, v, do, so, asc, L, num_targets, use_persistent):
+    """Run one TLX backward variant without coupling the test to TLX forward."""
+    dq = torch.empty_like(q, dtype=torch.float32)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    # SiLU backward does not consume M/Delta, but the common wrapper requires
+    # stable pointer arguments.
+    M = torch.empty((1, ), device=q.device, dtype=torch.float32)
+    Delta = torch.empty((1, ), device=q.device, dtype=torch.float32)
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = False
+        triton.knobs.nvidia.disable_wsbarrier_reorder = True
+        return bs.T.tlx_hstu_attention_bwd(
+            dout=do,
+            q=q,
+            k=k,
+            v=v,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            seq_offsets=so,
+            attn_scale=asc,
+            max_seq_len=L,
+            alpha=1.0 / bs.D,
+            M=M,
+            Delta=Delta,
+            stride_mm=1,
+            num_softmax_heads=0,
+            num_targets=num_targets,
+            causal=True,
+            use_persistent=use_persistent,
+        )
+
+
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
 def test_self_attention_bwd_triton_vs_tlx(L, Z):
     if not torch.cuda.is_available():
@@ -62,3 +97,23 @@ def test_self_attention_bwd_triton_vs_tlx(L, Z):
     for name, a, b in (("dq", dq_x, dq_t), ("dk", dk_x, dk_t), ("dv", dv_x, dv_t)):
         rl2 = bs.rel_l2(a, b)
         assert rl2 < 1e-2, f"tlx-vs-triton {name} rel-L2 {rl2:.2e} too high (L={L} Z={Z})"
+
+
+@pytest.mark.parametrize("use_persistent", [True, False], ids=["persistent", "non-persistent"])
+@pytest.mark.parametrize("L,target_count", [(257, 20), (384, 200)])
+def test_self_attention_bwd_tlx_targets(L, target_count, use_persistent):
+    """PART 2 must retain the target clamp when its K/V tile reaches targets."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    Z = 2
+    torch.manual_seed(0)
+    q, k, v, do, so, asc = bs.make(L, Z)
+    num_targets = torch.full((Z, ), target_count, device=q.device, dtype=torch.int64)
+    rq, rk, rv = bs.torch_ref(q, k, v, do, so, asc, causal=True, num_targets=num_targets)
+    dq, dk, dv = _run_tlx_raw_bwd(q, k, v, do, so, asc, L, num_targets, use_persistent)
+
+    for name, got, want in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv)):
+        rl2 = bs.rel_l2(got, want)
+        assert rl2 < 1e-2, (f"TLX {name} rel-L2 {rl2:.2e} too high "
+                            f"(L={L}, targets={target_count}, persistent={use_persistent})")

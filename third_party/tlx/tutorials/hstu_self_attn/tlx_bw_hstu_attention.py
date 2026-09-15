@@ -1639,10 +1639,10 @@ def _hstu_bwd_calculate_offsets(
                   low1               |         |                       |
                    |                 |         |                      high2
                    |<-- PART 1 ----->|  (gap)  |<------ PART 2 ------->|
-                   |    MASKED       |  skip   |       NO MASK         |
+                   |    MASKED       |  skip   |   NO CAUSAL/LOCAL     |
                    |                 |         |                       |
                    |  semi-local     |         | global UIH + targets  |
-                   |  + causal       |         | (all see everything)  |
+                   |  + causal       |         | target clamp retained |
 
 
         Boundaries:
@@ -1665,7 +1665,7 @@ def _hstu_bwd_calculate_offsets(
 
 
     ==========================================================================
-        PART 2: NO MASK (global UIH + all targets)
+        PART 2: NO CAUSAL/SEMI-LOCAL MASK (global UIH + targets)
     ==========================================================================
 
         Range: [low2, seq_len) = [uih_len - full_attn_size, seq_len)
@@ -1676,9 +1676,10 @@ def _hstu_bwd_calculate_offsets(
              - Last full_attn_size positions of UIH
              - Can see ALL of UIH
 
-          b) All targets: [uih_len, seq_len)
-             - All n_targets positions
-             - Targets attend to ENTIRE sequence
+          b) Targets: [uih_len, seq_len)
+             - Targets attend to all UIH positions and to themselves
+             - Targets do not attend to other targets, so a target-only mask is
+               still required when the K/V tile overlaps the target suffix
 
         → Both can see K/V at start_n without any mask!
 
@@ -1691,8 +1692,8 @@ def _hstu_bwd_calculate_offsets(
         start_n: K/V block start position
         low1: start of PART 1 (masked region)
         high1: end of PART 1 (masked region), also start of gap
-        low2: start of PART 2 (unmasked region)
-        high2: end of PART 2 (unmasked region) = seq_len
+        low2: start of PART 2 (no causal/semi-local mask)
+        high2: end of PART 2 = seq_len
         num_steps_masked: number of BLOCK_M1 steps in PART 1
         num_steps_unmasked: number of BLOCK_M1 steps in PART 2
     """
@@ -1735,12 +1736,13 @@ def _hstu_bwd_calculate_offsets(
 
     high1 = high1 if high1 < seq_len else seq_len
 
-    # PART 2: Unmasked region
-    # This region has no masking because:
+    # PART 2: No causal/semi-local mask
+    # This region omits causal/semi-local masking because:
     #   a) For positions beyond the diagonal block (>= start_n + BLOCK_N1), all K/V in the
     #      block are causally visible (no causal mask needed)
     #   b) Global UIH zone: last full_attn_size positions of UIH can see ALL of UIH
-    #   c) All targets: targets attend to ENTIRE sequence
+    #   c) Targets attend to all UIH positions and to themselves, but not to
+    #      other targets. PART 2 applies that target-only mask separately.
     #
     # low2 = high1 (continue from where PART 1 ended)
     # high2 = seq_len (extends to end of sequence)
@@ -1753,8 +1755,8 @@ def _hstu_bwd_calculate_offsets(
                 # Start of global attention zone in UIH
                 low2 = uih_len - full_attn_size
             else:
-                # No global attention, but targets still have no mask
-                # Targets start at uih_len
+                # No global attention, but target queries still cover PART 2.
+                # The inner helper retains the target-only mask.
                 low2 = uih_len
 
             # Ensure low2 doesn't overlap with PART 1 (must be >= high1)
@@ -2031,7 +2033,9 @@ def _hstu_bwd_compute_inner_loop_silu(
         low: Start of M range to process
         high: End of M range to process (exclusive)
         blk_idx: Current block index for buffer management
-        APPLY_MASK: Whether to apply causal/semi-local masking in this range
+        APPLY_MASK: Whether to apply the full HSTU mask in this range. When
+            false, PART 2 still applies the target-only rule if the K/V tile
+            overlaps the target suffix.
 
     Returns:
         blk_idx: Updated block index
@@ -2105,20 +2109,34 @@ def _hstu_bwd_compute_inner_loop_silu(
                 masked_alpha = tl.where(valid_mask_trans, alpha, 0.0)
                 qkT_scaled = qkT * masked_alpha
         else:
-            # Unmasked region: only need boundary mask for last Q/dO and K/V blocks
-            # Interior tiles (all elements in bounds): skip masking entirely
+            # PART 2 omits causal/semi-local masking. It is fully unmasked only
+            # while the K/V tile is inside UIH. If it reaches the target suffix,
+            # UIH keys remain visible to every PART-2 query, while a target key is
+            # visible only to the matching target query.
             is_interior = (curr_m + BLOCK_M1 <= seq_len and start_block_n + BLOCK_N1 <= seq_len)
+            needs_target_mask = False
+            if HAS_NUM_TARGETS:
+                uih_len = seq_len - n_targets
+                needs_target_mask = start_block_n + BLOCK_N1 > uih_len
             mask_m = offs_m < seq_len
             qkT_scaled = qkT * alpha
             if ALPHA_BWD_PRESCALE:
                 one_plus_tanh = _fma_f32x2(tanh_approx_fp32(qkT_scaled), 1.0, 1.0)
-                if not is_interior:
+                if not is_interior or needs_target_mask:
                     boundary_mask_trans = mask_n[:, None] & mask_m[None, :]
-                    one_plus_tanh = tl.where(boundary_mask_trans, one_plus_tanh, 0.0)
+                    valid_mask_trans = boundary_mask_trans
+                    if HAS_NUM_TARGETS:
+                        target_mask_trans = ((offs_n[:, None] < uih_len) | (offs_m[None, :] == offs_n[:, None]))
+                        valid_mask_trans = valid_mask_trans & target_mask_trans
+                    one_plus_tanh = tl.where(valid_mask_trans, one_plus_tanh, 0.0)
             else:
-                if not is_interior:
+                if not is_interior or needs_target_mask:
                     boundary_mask_trans = mask_n[:, None] & mask_m[None, :]
-                    masked_alpha = tl.where(boundary_mask_trans, alpha, 0.0)
+                    valid_mask_trans = boundary_mask_trans
+                    if HAS_NUM_TARGETS:
+                        target_mask_trans = ((offs_n[:, None] < uih_len) | (offs_m[None, :] == offs_n[:, None]))
+                        valid_mask_trans = valid_mask_trans & target_mask_trans
+                    masked_alpha = tl.where(valid_mask_trans, alpha, 0.0)
                     qkT_scaled = qkT * masked_alpha
 
         if ALPHA_BWD_PRESCALE:
@@ -2174,10 +2192,10 @@ def _hstu_bwd_compute_inner_loop_silu(
                 dsT = tl.where(valid_mask_trans, dsT, 0.0)
             else:
                 # pyre-fixme[61]: `is_interior` is undefined, or not always defined.
-                if not is_interior:
-                    # pyre-fixme[61]: `boundary_mask_trans` is undefined, or not
+                if not is_interior or needs_target_mask:
+                    # pyre-fixme[61]: `valid_mask_trans` is undefined, or not
                     #  always defined.
-                    dsT = tl.where(boundary_mask_trans, dsT, 0.0)
+                    dsT = tl.where(valid_mask_trans, dsT, 0.0)
         dsT = dsT.to(q_out_dtype)
         # pyrefly: ignore [missing-attribute]
         tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
@@ -2944,7 +2962,7 @@ def _hstu_attn_bwd_ws(
                             )
                         blk_idx += 1
 
-                    # PART 2: Unmasked region [low2, high2)
+                    # PART 2: No causal/semi-local mask [low2, high2)
                     for curr_m in tl.range(low2, high2, BLOCK_M1):
                         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                         # pyrefly: ignore [missing-attribute]
@@ -3166,7 +3184,7 @@ def _hstu_attn_bwd_ws(
                         APPLY_MASK=True,
                         ALPHA_BWD_PRESCALE=ALPHA_BWD_PRESCALE,
                     )
-                    # PART 2: Unmasked region [low2, high2)
+                    # PART 2: No causal/semi-local mask [low2, high2)
                     blk_idx = _hstu_bwd_compute_inner_loop_silu(
                         start_n,
                         qk_fulls,
@@ -3643,7 +3661,7 @@ def _hstu_attn_bwd_ws(
                         )
                         blk_idx += 1
 
-                    # PART 2: Load Q and dO for unmasked region [low2, high2)
+                    # PART 2: Load Q and dO for [low2, high2)
                     for curr_m in tl.range(low2, high2, BLOCK_M1):
                         q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -4146,7 +4164,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                         )
                     blk_idx += 1
 
-                # PART 2: Unmasked region [low2, high2)
+                # PART 2: No causal/semi-local mask [low2, high2)
                 for curr_m in tl.range(low2, high2, BLOCK_M1):
                     tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     # pyrefly: ignore [missing-attribute]
@@ -4363,7 +4381,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                     APPLY_MASK=True,
                     ALPHA_BWD_PRESCALE=ALPHA_BWD_PRESCALE,
                 )
-                # PART 2: Unmasked region [low2, high2)
+                # PART 2: No causal/semi-local mask [low2, high2)
                 blk_idx = _hstu_bwd_compute_inner_loop_silu(
                     start_n,
                     qk_fulls,
@@ -4804,7 +4822,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                     )
                     blk_idx += 1
 
-                # PART 2: Load Q and dO for unmasked region [low2, high2)
+                # PART 2: Load Q and dO for [low2, high2)
                 for curr_m in tl.range(low2, high2, BLOCK_M1):
                     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)

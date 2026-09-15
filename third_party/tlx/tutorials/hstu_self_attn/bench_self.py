@@ -81,7 +81,7 @@ def make(L, Z, dtype=torch.bfloat16, sparsity=None, seed=1001):
     return q, k, v, do, so, asc
 
 
-def torch_ref(q, k, v, do, so, asc, causal):
+def torch_ref(q, k, v, do, so, asc, causal, num_targets=None):
     """Float autograd HSTU-SiLU self-attention reference."""
     qf = q.detach().float().requires_grad_(True)
     kf = k.detach().float().requires_grad_(True)
@@ -96,7 +96,13 @@ def torch_ref(q, k, v, do, so, asc, causal):
         sig = qk * torch.sigmoid(qk) * scale  # SiLU(qk) * attn_scale
         if causal:
             i = torch.arange(n, device=qk.device)
-            valid = (i[:, None] >= i[None, :]).float()  # lower-tri incl diagonal
+            if num_targets is None:
+                valid = i[:, None] >= i[None, :]
+            else:
+                max_id = n - int(num_targets[z])
+                clamped_i = torch.minimum(i, torch.tensor(max_id, device=i.device))
+                valid = (i[:, None] == i[None, :]) | (clamped_i[:, None] > clamped_i[None, :])
+            valid = valid.float()
             sig = sig * valid[None]
         outs.append(torch.einsum("hqk,khd->qhd", sig, vf[s:e]))
     torch.cat(outs, 0).backward(do.float())
