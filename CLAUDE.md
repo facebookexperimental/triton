@@ -62,8 +62,7 @@ Always validate correctness before anything else.
 
 Available kernels: `blackwell_gemm_clc`, `blackwell_gemm_pipelined`, `blackwell_gemm_2cta`,
 `blackwell_fa_ws`, `blackwell_fa_ws_persistent`, `blackwell_fa_ws_pipelined`, `blackwell_fa_clc`,
-`hopper_gemm_pipelined`, `hopper_gemm_ws`, `hopper_fa_ws`, `hopper_fa_ws_pipelined`, `hopper_fa_ws_pipelined_pingpong`,
-`hopper_fa_ws_pipelined_pingpong_persistent`
+`hopper_gemm_pipelined`, `hopper_gemm_ws`, `hopper_fa_ws_pipelined_pingpong`
 
 This suite is a sanity check: one smoke case per kernel. It is not where an op's
 correctness is established. For example, `blackwell_gemm_ws` and

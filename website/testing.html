@@ -53,7 +53,7 @@
 <p>(on gfx950 the gfx1250-only GEMM cases skip automatically).</p>
 <h2 id="performance">Performance</h2>
 <p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]</code></p>
-<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version ws_pipelined_pingpong]</code></p>
 <p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]</code></p>
 <p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_persistent|ws_pipelined|ws_pipelined_persistent|clc}]</code></p>
 <p><code>denoise.sh</code> wraps AMD runs too (it applies NUMA pinning and runs the benchmark; the GPU clock/power lock is NVIDIA-only and is simply skipped on AMD). gfx950 / CDNA4:</p>

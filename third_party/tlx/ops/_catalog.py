@@ -74,6 +74,15 @@ CATALOG: tuple[OpSpec, ...] = (
     ),
     OpSpec(
         op="flash_attn",
+        arch="sm90",
+        variant="ws_pipelined_pingpong",
+        impl="kernels.flash_attn.sm90:flash_attn",
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        requires=frozenset({"tma"}),
+    ),
+    OpSpec(
+        op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
         impl="kernels.flash_attn.sm100:flash_attn",
