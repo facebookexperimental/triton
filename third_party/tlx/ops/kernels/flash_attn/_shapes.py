@@ -16,6 +16,15 @@ SYNTHETIC: list[list] = [
     [1, 1, 8192, 128, True, "fp16"],
 ]
 
+SM90_FOCUS: list[list] = [
+    [4, 48, 1024, 128, False, "bf16"],
+    [4, 48, 2048, 128, True, "bf16"],
+    [4, 48, 4096, 128, False, "bf16"],
+    [4, 48, 4096, 128, True, "bf16"],
+    [4, 48, 8192, 128, True, "bf16"],
+    [4, 48, 4096, 128, False, "fp16"],
+]
+
 #: TODO: placeholder shapes, not a capture. Awaiting real ones.
 SM100_FOCUS: list[list] = [
     [4, 32, 4096, 128, False, "bf16"],

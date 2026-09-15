@@ -1,9 +1,9 @@
 """
-Test: Compare Hopper autoWS FA forward against all 4 TLX reference kernels.
+Test: Compare Hopper autoWS FA forward against the TLX ping-pong kernel.
 
 Runs:
-  1. Accuracy comparison (autoWS vs TLX hopper_fa_ws vs PyTorch)
-  2. Performance benchmark (autoWS SWP on/off vs all 4 TLX variants)
+  1. Accuracy comparison (autoWS vs TLX ping-pong vs PyTorch)
+  2. Performance benchmark (autoWS SWP on/off vs TLX ping-pong)
 
 Usage:
   TRITON_USE_META_WS=1 python test_hopper_fwd_autows_vs_tlx.py
@@ -35,13 +35,7 @@ def _import(name, path):
 
 
 # TLX kernels
-tlx_ws = _import("hopper_fa_ws", os.path.join(_tlx_dir, "hopper_fa_ws.py"))
-tlx_pipe = _import("hopper_fa_ws_pipelined", os.path.join(_tlx_dir, "hopper_fa_ws_pipelined.py"))
 tlx_pp = _import("hopper_fa_ws_pipelined_pingpong", os.path.join(_tlx_dir, "hopper_fa_ws_pipelined_pingpong.py"))
-tlx_pp_persist = _import(
-    "hopper_fa_ws_pipelined_pingpong_persistent",
-    os.path.join(_tlx_dir, "hopper_fa_ws_pipelined_pingpong_persistent.py"),
-)
 
 
 def load_autows(swp=True):
@@ -70,7 +64,7 @@ def test_accuracy(Z, H, N_CTX, D, dtype=torch.float16, atol=2e-2):
     v = torch.randn((Z, H, N_CTX, D), dtype=dtype, device=DEVICE)
 
     ref = pytorch_ref(q, k, v, sm)
-    tlx_out = tlx_ws.attention(q, k, v, sm).to(dtype)
+    tlx_out = tlx_pp.attention(q, k, v, sm).to(dtype)
     autows = load_autows(swp=True)
     aws_out = autows.attention(q, k, v, False, sm, "ws_persistent", False, 0, False).to(dtype)
 
@@ -103,13 +97,13 @@ def bench_one(fn, warmup=5, rep=20):
 
 def run_benchmark():
     print("\n" + "=" * 100)
-    print("Performance Benchmark: AutoWS (SWP on/off) vs 4 TLX variants")
+    print("Performance Benchmark: AutoWS (SWP on/off) vs TLX ping-pong")
     print("=" * 100)
 
     aws_swp = load_autows(swp=True)
     aws_no = load_autows(swp=False)
 
-    labels = ["AutoWS+SWP", "AutoWS-SWP", "TLX-ws", "TLX-pipe", "TLX-pp", "TLX-pp-persist"]
+    labels = ["AutoWS+SWP", "AutoWS-SWP", "TLX-pp"]
     header = f"{'Config':<28}" + "".join(f"{l:>14}" for l in labels)
     print(header)
     print("-" * (28 + 14 * len(labels)))
@@ -126,10 +120,7 @@ def run_benchmark():
         fns = [
             lambda: aws_swp.attention(q, k, v, False, sm, "ws_persistent", False, 0, False),
             lambda: aws_no.attention(q, k, v, False, sm, "ws_persistent", False, 0, False),
-            lambda: tlx_ws.attention(q, k, v, sm),
-            lambda: tlx_pipe.attention(q, k, v, sm),
             lambda: tlx_pp.attention(q, k, v, sm),
-            lambda: tlx_pp_persist.attention(q, k, v, sm),
         ]
 
         tflops = []
