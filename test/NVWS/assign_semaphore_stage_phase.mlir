@@ -2,6 +2,7 @@
 // RUN: triton-opt %t/assign.mlir -split-input-file --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase | FileCheck %t/assign.mlir
 // RUN: triton-opt %t/circular.mlir -split-input-file --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase --cse | FileCheck %t/circular.mlir
 // RUN: triton-opt %t/from-insert.mlir -split-input-file --allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --cse | FileCheck %t/from-insert.mlir
+// RUN: triton-opt %t/from-insert.mlir -split-input-file --allow-unregistered-dialect --nvws-insert-semas --nvws-assign-semaphore-stage-phase --cse | FileCheck %t/from-insert.mlir
 
 //--- assign.mlir
 
