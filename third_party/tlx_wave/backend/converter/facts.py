@@ -293,14 +293,11 @@ def _derived_ranges_for_op(source_program, facts, op):
             if not _fits_signed_range(lower, upper, bounds):
                 return
     elif op.name in {"arith.divsi", "arith.divui"}:
-        # A strictly positive divisor excludes division by zero and the
-        # signed INT_MIN / -1 overflow case. Signed division truncates toward
-        # zero, so all extrema for finite intervals occur at interval ends.
-        if _has_bounds(lhs) and _has_bounds(rhs) and rhs[0] > 0:
-            if op.name == "arith.divsi":
-                lower, upper = _positive_divisor_signed_div_range(lhs, rhs)
-            elif _is_nonnegative(lhs):
-                lower = lhs[0] // rhs[1]
+        # Poison may refine to any result, so derive a range only when the
+        # positive-divisor precondition excludes it.
+        if _is_nonnegative(lhs) and rhs[0] is not None and rhs[0] > 0:
+            lower = 0
+            if lhs[1] is not None:
                 upper = lhs[1] // rhs[0]
     elif op.name in {"arith.remsi", "arith.remui"}:
         if _is_nonnegative(lhs) and rhs[0] is not None and rhs[0] > 0:
@@ -503,18 +500,6 @@ def _has_bounds(value_range):
 
 def _is_nonnegative(value_range):
     return value_range[0] is not None and value_range[0] >= 0
-
-
-def _trunc_signed_div(lhs, rhs):
-    quotient = abs(lhs) // rhs
-    return -quotient if lhs < 0 else quotient
-
-
-def _positive_divisor_signed_div_range(lhs, rhs):
-    values = [_trunc_signed_div(dividend, divisor) for dividend in lhs for divisor in rhs]
-    if lhs[0] <= 0 <= lhs[1]:
-        values.append(0)
-    return min(values), max(values)
 
 
 def _signed_bounds(width):
