@@ -153,7 +153,7 @@ class TLXInductorChoices(InductorChoices):
     ) -> list[Any]:
         from .flex_attention_templates import append_tlx_flex
 
-        append_tlx_flex(
+        return append_tlx_flex(
             choices,
             configs,
             input_nodes,
@@ -163,7 +163,33 @@ class TLXInductorChoices(InductorChoices):
             sparse_q_block_size,
             sparse_kv_block_size,
         )
-        return choices
+
+    def append_flex_attention_backward_choices(
+        self,
+        choices: list[Any],
+        configs: list[Any],
+        input_nodes: list[Any],
+        subgraphs: list[Any],
+        layout: Any,
+        kernel_options: dict[str, Any],
+        sparse_q_block_size: int,
+        sparse_kv_block_size: int,
+        *,
+        mutated_inputs: list[Any],
+    ) -> list[Any]:
+        from .flex_attention_templates import append_tlx_flex_backward
+
+        return append_tlx_flex_backward(
+            choices,
+            configs,
+            input_nodes,
+            subgraphs,
+            layout,
+            kernel_options,
+            sparse_q_block_size,
+            sparse_kv_block_size,
+            mutated_inputs=mutated_inputs,
+        )
 
 
 def maybe_override_best_choice(

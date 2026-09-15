@@ -113,6 +113,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttng.arrive_barrier_named", "tlx.named_barrier_arrive",
      "Arrive at named hardware barrier"},
 
+    // Takes (mask, pred) in both spellings, so the generic operand order holds.
+    {"ttng.vote_ballot_sync", "tlx.vote_ballot_sync",
+     "Warp-level vote ballot"},
+
     // Memory allocation operations - local_alloc is handled specially
     // ttng.tmem_alloc: handled specially in printSimplifiedOp
 
@@ -379,6 +383,21 @@ bool isConstantTrue(Value v) {
   if (auto intAttr = def->getAttrOfType<IntegerAttr>("value"))
     return intAttr.getValue().isOne();
   return false;
+}
+
+// Split a memdesc shape into the `num` and `shape` arguments of tlx.local_alloc.
+// A buffer is up to 2-D, so only a rank above that is multi-buffering; this is the
+// same rule analyzeLocalAlloc applies, and the two must agree or an alias and its
+// base describe different buffer counts.
+static void splitAllocShape(ArrayRef<int64_t> shape, int64_t &count,
+                            SmallVectorImpl<int64_t> &tileShape) {
+  if (shape.size() > 2) {
+    count = shape[0];
+    tileShape.assign(shape.begin() + 1, shape.end());
+    return;
+  }
+  count = 1;
+  tileShape.assign(shape.begin(), shape.end());
 }
 
 // Build a lookup map for fast operation name lookup
@@ -1431,6 +1450,40 @@ void printLocComment(Operation *op, llvm::raw_ostream &os) {
   os << "\n";
 }
 
+// Emit `s` as a double-quoted Python string literal. Assertion messages carry
+// source text, so they can contain quotes, backslashes and newlines.
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os) {
+  os << '"';
+  for (char c : s) {
+    switch (c) {
+    case '"':
+      os << "\\\"";
+      break;
+    case '\\':
+      os << "\\\\";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      // Bytes >= 0x80 are left alone: they are UTF-8 continuation bytes, and
+      // escaping them individually would turn one character into several.
+      unsigned char b = static_cast<unsigned char>(c);
+      if (b < 0x20 || b == 0x7f)
+        os << llvm::format("\\x%02x", b);
+      else
+        os << c;
+    }
+  }
+  os << '"';
+}
+
 // Resolve an operand of an AttrSizedOperandSegments op by declared position.
 // Absent optional groups have size 0, so positional reads shift.
 static Value getSegmentOperand(Operation *op, unsigned segmentIdx) {
@@ -1597,6 +1650,89 @@ void printSimplifiedOp(
   }
 
   // === Special-case handlers for ops needing custom printing ===
+
+  // ttng.tmem_subslice: `offset` is an attribute the generic printer drops, and
+  // `size` is not an operand at all -- it is the extent of the sliced dimension in
+  // the result type.
+  if (opName == "ttng.tmem_subslice") {
+    // Asserted rather than tested: falling through would re-emit the very
+    // one-argument call this handler exists to replace, so a silent default
+    // would restore the aliasing bug without a diagnostic.
+    assert(op->getNumOperands() > 0 && op->getNumResults() > 0 &&
+           "tmem_subslice takes one memdesc and yields one");
+    auto resType = cast<ttg::MemDescType>(op->getResult(0).getType());
+    ArrayRef<int64_t> resShape = resType.getShape();
+    auto offAttr = op->getAttrOfType<IntegerAttr>("offset");
+    assert(!resShape.empty() && offAttr &&
+           "tmem_subslice requires a ranked result and an offset");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.subslice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << offAttr.getInt() << ", " << resShape.back() << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.elementwise_inline_asm carries the asm text, constraints, purity and
+  // packing as attributes, so the generic printer emits only the operands and the
+  // call is missing four of its six arguments.
+  if (opName == "tt.elementwise_inline_asm") {
+    unsigned nres = op->getNumResults();
+    for (unsigned i = 0; i < nres; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getResult(i), argSubstitutionMap);
+    if (nres > 0)
+      os << " = ";
+    os << "tl.inline_asm_elementwise(";
+    auto asmAttr = op->getAttrOfType<StringAttr>("asm_string");
+    printPythonStringLiteral(asmAttr ? asmAttr.getValue() : "", os);
+    os << ", ";
+    auto consAttr = op->getAttrOfType<StringAttr>("constraints");
+    printPythonStringLiteral(consAttr ? consAttr.getValue() : "", os);
+    // `args` is a sequence parameter, not varargs.
+    os << ", [";
+    for (unsigned i = 0; i < op->getNumOperands(); ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
+    os << "], ";
+    // dtype is the result element type, and a list of them when the asm returns
+    // more than one value.
+    auto elemName = [&](Type t) {
+      if (auto rt = dyn_cast<RankedTensorType>(t))
+        return getElementTypeName(rt.getElementType());
+      return getElementTypeName(t);
+    };
+    if (nres == 1) {
+      os << elemName(op->getResult(0).getType());
+    } else {
+      os << "[";
+      for (unsigned i = 0; i < nres; ++i)
+        os << (i ? ", " : "") << elemName(op->getResult(i).getType());
+      os << "]";
+    }
+    // Default to impure when the attribute is missing: marking side-effecting
+    // asm pure would let the recompiled kernel hoist or delete it.
+    auto pureAttr = op->getAttrOfType<BoolAttr>("pure");
+    auto packAttr = op->getAttrOfType<IntegerAttr>("packed_element");
+    os << ", " << ((pureAttr && pureAttr.getValue()) ? "True" : "False") << ", "
+       << (packAttr ? packAttr.getInt() : 1) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is a
+  // syntax error rather than an undefined name, and it drops the message.
+  if (opName == "tt.assert") {
+    os << "tl.device_assert("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto msgAttr = op->getAttrOfType<StringAttr>("message")) {
+      os << ", ";
+      printPythonStringLiteral(msgAttr.getValue(), os);
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
 
   // tt.get_program_id: emit tl.program_id(axis=N)
   if (opName == "tt.get_program_id") {
@@ -1982,17 +2118,14 @@ void printSimplifiedOp(
       bool dtypeDiffers = srcType.getElementType() != dstType.getElementType();
       bool shapeDiffers = srcType.getShape() != dstType.getShape();
       if (dtypeDiffers || shapeDiffers) {
-        ArrayRef<int64_t> shape = dstType.getShape();
         Type elemType = dstType.getElementType();
         int64_t count = 1;
         SmallVector<int64_t> actualShape;
-        if (shape.size() >= 2) {
-          count = shape[0];
-          for (size_t i = 1; i < shape.size(); ++i)
-            actualShape.push_back(shape[i]);
-        } else if (shape.size() == 1) {
-          actualShape.push_back(shape[0]);
-        }
+        // This op is legal on shared memory too, so name the storage kind from the
+        // memory space rather than assuming tensor memory.
+        bool isTmem = isa_and_nonnull<ttng::TensorMemorySpaceAttr>(
+            dstType.getMemorySpace());
+        splitAllocShape(dstType.getShape(), count, actualShape);
         // Emit local_alloc with reuse= for dtype or shape changes
         os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         os << "tlx.local_alloc((";
@@ -2003,9 +2136,11 @@ void printSimplifiedOp(
         }
         if (actualShape.size() == 1)
           os << ","; // trailing comma for single-element tuple
-        os << "), " << getElementTypeName(elemType) << ", " << count
-           << ", tlx.storage_kind.tmem, reuse="
-           << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+        os << "), " << getElementTypeName(elemType) << ", " << count;
+        if (isTmem)
+          os << ", tlx.storage_kind.tmem";
+        os << ", reuse=" << getValueName(op->getOperand(0), argSubstitutionMap)
+           << ")";
       } else {
         // Same dtype and shape: emit as alias
         os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
@@ -2022,17 +2157,10 @@ void printSimplifiedOp(
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
     if (auto memDescType =
             dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
-      ArrayRef<int64_t> shape = memDescType.getShape();
       Type elemType = memDescType.getElementType();
       int64_t count = 1;
       SmallVector<int64_t> actualShape;
-      if (shape.size() >= 2) {
-        count = shape[0];
-        for (size_t i = 1; i < shape.size(); ++i)
-          actualShape.push_back(shape[i]);
-      } else if (shape.size() == 1) {
-        actualShape.push_back(shape[0]);
-      }
+      splitAllocShape(memDescType.getShape(), count, actualShape);
       os << "tlx.local_alloc((";
       for (size_t i = 0; i < actualShape.size(); ++i) {
         if (i > 0)
