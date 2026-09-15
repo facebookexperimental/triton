@@ -1651,6 +1651,28 @@ void printSimplifiedOp(
 
   // === Special-case handlers for ops needing custom printing ===
 
+  // ttng.tmem_subslice: `offset` is an attribute the generic printer drops, and
+  // `size` is not an operand at all -- it is the extent of the sliced dimension in
+  // the result type.
+  if (opName == "ttng.tmem_subslice") {
+    // Asserted rather than tested: falling through would re-emit the very
+    // one-argument call this handler exists to replace, so a silent default
+    // would restore the aliasing bug without a diagnostic.
+    assert(op->getNumOperands() > 0 && op->getNumResults() > 0 &&
+           "tmem_subslice takes one memdesc and yields one");
+    auto resType = cast<ttg::MemDescType>(op->getResult(0).getType());
+    ArrayRef<int64_t> resShape = resType.getShape();
+    auto offAttr = op->getAttrOfType<IntegerAttr>("offset");
+    assert(!resShape.empty() && offAttr &&
+           "tmem_subslice requires a ranked result and an offset");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.subslice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << offAttr.getInt() << ", " << resShape.back() << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // tt.elementwise_inline_asm carries the asm text, constraints, purity and
   // packing as attributes, so the generic printer emits only the operands and the
   // call is missing four of its six arguments.
