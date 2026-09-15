@@ -269,6 +269,12 @@
 - **Lit test**: `ws_code_partition_epilogue_dp_staging_slots.mlir` (new) — the real pre-WS IR of the failing config through `--nvgpu-warp-specialization`; pins slot 0 then slot 1 on both shared barrier arrays and distinct staging views for the two stores. Verified discriminating: rewriting the DP1 indices back to slot 0 makes FileCheck fail.
 - **Regression**: `test_op[64-ws]` passes in 12s (was a 600s timeout) with synccheck 0 errors (was 24); `[128-ws]` unregressed. FA/autoWS suites 128 pass / 0 fail; tut09 + addmm + quantized-matmul + self-attn-bwd + cross-attn-bwd + fa-compiler-dp 392 pass / 0 fail; WarpSpecialization + TwoCTA lit 162 pass / 0 fail.
 
+### 35. Empty final sibling loop drops an outer-produced operand release (2026-09-12, fixed; T288013887)
+- **Symptom**: Splitting HSTU self-attention backward into a masked Q loop followed by an unmasked Q loop is correct for a single CLC wave but deadlocks as soon as physical CTAs are reused. Uniform input reproduces it; jagged holes are not required. The last KV tile has an empty unmasked range.
+- **Root cause**: K/V are loaded once per persistent KV tile and consumed by MMAs in two sequential sibling `scf.for` loops. Code partitioning selected the lexically last MMA as the EMPTY completion and predicated it on that loop's last iteration. When the final sibling loop had zero iterations, no completion fired, so the next CLC transaction blocked forever acquiring the single-copy operand buffer.
+- **Fix**: When one outer-produced operand channel has MMAv5 consumers in multiple sibling loops, emit a single `tcgen5.commit` after the final sibling loop instead of an inline MMA completion. The post-loop commit drains every MMA issued by any nonempty sibling and still executes when the final loop is empty, restoring the one-load/one-release outer cadence.
+- **Validation**: HSTU CLC backward passes `L=128, Z=80` (160 tiles, empty unmasked loop, reused CTAs), `L=256, Z=120` uniform, and the 480-tile jagged production case. Relative-L2 for dQ/dK/dV is about `2.34e-3 / 2.34e-3 / 2.35e-3`. The existing high-grid jagged E2E is the deadlock regression.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
