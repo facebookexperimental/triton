@@ -17,6 +17,12 @@ on:
       - '!python/test/unit/language/test_tlx_*_hip.py'
       - '!python/test/unit/tlx_ops/*_gfx950.py'
       - '!python/test/unit/language/test_tlx_*_sm90.py'
+      # Agent instructions and skills do not affect generated code.
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!AGENTS.md'
+      - '!third_party/tlx/tools/agents/skills/**'
   pull_request:
     paths:
       - '**'
@@ -32,6 +38,12 @@ on:
       - '!python/test/unit/language/test_tlx_*_hip.py'
       - '!python/test/unit/tlx_ops/*_gfx950.py'
       - '!python/test/unit/language/test_tlx_*_sm90.py'
+      # Agent instructions and skills do not affect generated code.
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!AGENTS.md'
+      - '!third_party/tlx/tools/agents/skills/**'
   schedule:
     - cron: '30 */6 * * *'
 

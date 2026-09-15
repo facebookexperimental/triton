@@ -439,6 +439,11 @@ class compilation_knobs(base_knobs):
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
     fpsan_homomorphic_casts: env_bool = env_bool("TRITON_FPSAN_HOMOMORPHIC_CASTS")
+    # os.pathsep-separated plugin extension shared objects. loadPlugins()
+    # (lib/Tools/PluginUtils.cpp) reads the environment directly and is memoized on
+    # the first call, which happens while libtriton is being imported, so assigning
+    # this afterwards records the value but loads nothing.
+    plugin_paths: env_opt_str = env_opt_str("TRITON_PLUGIN_PATHS")
     listener: Union[CompilationListener, None] = None
 
 

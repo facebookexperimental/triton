@@ -23,6 +23,12 @@ on:
       - '!python/test/unit/tlx_ops/*_gfx942.py'
       - '!python/test/unit/language/test_tlx_*_sm100.py'
       - '!python/test/unit/tlx_ops/*_sm100.py'
+      # Agent instructions and skills do not affect generated code.
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!AGENTS.md'
+      - '!third_party/tlx/tools/agents/skills/**'
   pull_request:
     paths:
       - '**'
@@ -44,6 +50,12 @@ on:
       - '!python/test/unit/tlx_ops/*_gfx942.py'
       - '!python/test/unit/language/test_tlx_*_sm100.py'
       - '!python/test/unit/tlx_ops/*_sm100.py'
+      # Agent instructions and skills do not affect generated code.
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!AGENTS.md'
+      - '!third_party/tlx/tools/agents/skills/**'
   schedule:
     - cron: '30 */6 * * *'
 
@@ -300,6 +312,7 @@ jobs:
         timeout-minutes: 30
         run: |
           . "${SETUP_SCRIPT}"
+          . ./.ci/tritonbench/setup-ld-library.sh
           python -m pytest python/test/unit/runtime/ -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (runtime)
         id: parse

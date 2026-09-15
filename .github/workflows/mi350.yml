@@ -21,6 +21,12 @@ on:
       - '!python/test/unit/tlx_ops/*_sm100.py'
       - '!python/test/unit/tlx_ops/*_gfx942.py'
       - '!third_party/proton/test/**'
+      # Agent instructions and skills do not affect generated code.
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!AGENTS.md'
+      - '!third_party/tlx/tools/agents/skills/**'
   pull_request:
     paths:
       - '**'
@@ -40,6 +46,12 @@ on:
       - '!python/test/unit/tlx_ops/*_sm100.py'
       - '!python/test/unit/tlx_ops/*_gfx942.py'
       - '!third_party/proton/test/**'
+      # Agent instructions and skills do not affect generated code.
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!AGENTS.md'
+      - '!third_party/tlx/tools/agents/skills/**'
   schedule:
     - cron: '0 */6 * * *'
 

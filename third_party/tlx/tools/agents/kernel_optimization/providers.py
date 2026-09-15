@@ -26,6 +26,27 @@ _BLACKWELL_CLC_SKILL = _NVIDIA_TARGET_SKILLS / "blackwell-persistent-clc-schedul
 _NVIDIA_PERSISTENT_PIPELINE_SKILL = (
     _NVIDIA_TARGET_SKILLS / "nvidia-persistent-pipeline-efficiency.md"
 )
+_AMD_TARGET_SKILLS = _SKILLS_ROOT / "targets/amd"
+_AMD_GENERAL_SKILL = _AMD_TARGET_SKILLS / "amd-kernel-optimization.md"
+_AMD_ATTENTION_SKILL = _AMD_TARGET_SKILLS / "amd-attention-optimization.md"
+_AMD_ATTENTION_REFERENCE = (
+    _AMD_TARGET_SKILLS / "references/attention-variant-study.md"
+)
+_AMD_LIVE_RANGE_SKILL = _AMD_TARGET_SKILLS / "amd-ir-live-range-analysis.md"
+_AMD_LIVE_RANGE_REFERENCE = (
+    _AMD_TARGET_SKILLS / "references/live-range-interpretation.md"
+)
+_AMD_OPTIONAL_SKILLS = {
+    "optimize-amd-tlx-attention": (
+        _AMD_ATTENTION_SKILL,
+        _AMD_ATTENTION_REFERENCE,
+    ),
+    "analyze-amd-ir-live-ranges": (
+        _AMD_LIVE_RANGE_SKILL,
+        _AMD_LIVE_RANGE_REFERENCE,
+    ),
+}
+_AMD_BACKENDS = frozenset({"amd", "hip", "rocm"})
 _BLACKWELL_ARCHITECTURES = frozenset(
     {"blackwell", "sm100", "sm_100", "b200", "b200a", "gb200", "gb300"}
 )
@@ -405,14 +426,35 @@ def _read_target_skill(path: Path) -> str:
 def _target_skill_paths(target: KernelTarget) -> tuple[Path, ...]:
     skills = [_LAYOUT_CONVERSION_SKILL]
     backend = target.backend.strip().lower()
-    if backend not in {"cuda", "nvidia"}:
+    if backend in {"cuda", "nvidia"}:
+        architecture = target.architecture.strip().lower()
+        skills.extend((_ASYNC_TMA_OUTPUT_SKILL, _NVIDIA_WARP_BARRIER_SKILL))
+        if architecture in _BLACKWELL_ARCHITECTURES:
+            skills.append(_BLACKWELL_CLC_SKILL)
+        if architecture in _PERSISTENT_PIPELINE_ARCHITECTURES:
+            skills.append(_NVIDIA_PERSISTENT_PIPELINE_SKILL)
+        if target.optimization_skills:
+            raise ValueError(
+                "optimization_skills are not supported for NVIDIA targets"
+            )
         return tuple(skills)
-    architecture = target.architecture.strip().lower()
-    skills.extend((_ASYNC_TMA_OUTPUT_SKILL, _NVIDIA_WARP_BARRIER_SKILL))
-    if architecture in _BLACKWELL_ARCHITECTURES:
-        skills.append(_BLACKWELL_CLC_SKILL)
-    if architecture in _PERSISTENT_PIPELINE_ARCHITECTURES:
-        skills.append(_NVIDIA_PERSISTENT_PIPELINE_SKILL)
+    if backend in _AMD_BACKENDS:
+        skills.append(_AMD_GENERAL_SKILL)
+        unknown = [
+            name for name in target.optimization_skills if name not in _AMD_OPTIONAL_SKILLS
+        ]
+        if unknown:
+            supported = ", ".join(sorted(_AMD_OPTIONAL_SKILLS))
+            raise ValueError(
+                f"unsupported AMD optimization skill {unknown[0]!r}; "
+                f"supported skills: {supported}"
+            )
+        for name in target.optimization_skills:
+            skills.extend(_AMD_OPTIONAL_SKILLS[name])
+    elif target.optimization_skills:
+        raise ValueError(
+            "optimization_skills are only supported for AMD targets"
+        )
     return tuple(skills)
 
 

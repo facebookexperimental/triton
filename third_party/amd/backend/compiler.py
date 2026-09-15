@@ -12,6 +12,8 @@ import functools
 import warnings
 from pathlib import Path
 
+from .amdgc_hazard_repair import insert_scheduled_mfma_hazard_nops
+
 MAX_INT_32 = 2**31 - 1
 
 
@@ -231,6 +233,7 @@ class HIPBackend(BaseBackend):
         )
 
     def get_codegen_implementation(self, options):
+
         def post_ast_lowering(mod):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
@@ -238,7 +241,7 @@ class HIPBackend(BaseBackend):
                 pm,
                 f"hip:{options.arch}",
                 options.num_warps,
-                64,
+                options.warp_size,
                 options.num_ctas,
                 [1, 1, 1],
             )
@@ -745,6 +748,7 @@ class HIPBackend(BaseBackend):
                 False,
                 False,
             )
+        amdgcn = insert_scheduled_mfma_hazard_nops(amdgcn, options.arch)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)

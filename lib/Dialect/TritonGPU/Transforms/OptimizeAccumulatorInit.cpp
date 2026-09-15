@@ -24,31 +24,78 @@ public:
                                 PatternRewriter &rewriter) const override {
     if (op.getSrc() == nullptr)
       return failure();
+    Block *block = op->getBlock();
     SmallVector<Operation *> users(op.getResult().getUsers().begin(),
                                    op.getResult().getUsers().end());
-    if (users.size() > 2)
+    if (users.empty())
       return failure();
-    triton::nvidia_gpu::MMAv5OpInterface mmaOp = nullptr;
-    triton::nvidia_gpu::TMEMLoadOp tmemLoad = nullptr;
-    for (auto user : users) {
-      if (auto load = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(user)) {
-        tmemLoad = load;
-      } else if (auto mma =
-                     dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user)) {
-        mmaOp = mma;
-      }
+    // Only track accesses we understand, all in the same block as the alloc.
+    // Anything else (e.g. a store, which may preserve lanes under a mask)
+    // keeps the init.
+    for (Operation *user : users) {
+      if (user->getBlock() != block)
+        return failure();
+      if (!isa<triton::nvidia_gpu::TMEMLoadOp>(user) &&
+          !isa<triton::nvidia_gpu::MMAv5OpInterface>(user))
+        return failure();
     }
-    if (!mmaOp)
+    // Walk the token chain from the alloc. The init is dead iff the first
+    // accessor unconditionally overwrites the whole tile and every other
+    // accessor is ordered behind it.
+    //
+    // In general the first accessor in *every* possible execution order must
+    // overwrite (e.g. an `scf.if` with a use_acc=false MMA in each arm would
+    // also qualify). The walk below only proves one linear order -- same-block
+    // accessors chained on a single token -- so anything else keeps the init.
+    Value tok = op.getToken();
+    if (!tok)
       return failure();
-    if (tmemLoad && !mmaOp->isBeforeInBlock(tmemLoad))
-      return failure();
-    Value useAccFlag = mmaOp.useAccumulator();
-    if (!useAccFlag)
-      return failure();
-    auto flagConstOp = useAccFlag.getDefiningOp<arith::ConstantOp>();
-    if (!flagConstOp)
-      return failure();
-    if (cast<IntegerAttr>(flagConstOp.getValue()).getInt() != 0)
+    llvm::SmallDenseSet<Operation *, 4> remaining(users.begin(), users.end());
+    bool overwritten = false;
+    Value cur = tok;
+    while (!remaining.empty()) {
+      // Find the single remaining accessor consuming the current token.
+      Operation *next = nullptr;
+      for (Operation *user : cur.getUsers()) {
+        if (!remaining.contains(user))
+          continue;
+        Value dep;
+        if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user))
+          dep = mma.getAccDep();
+        else
+          dep = cast<triton::nvidia_gpu::TMEMLoadOp>(user).getDep();
+        if (dep != cur)
+          continue;
+        if (next)
+          return failure(); // Token fans out: order is ambiguous.
+        next = user;
+      }
+      if (!next)
+        return failure(); // Accessor not ordered behind the token chain.
+      if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(next)) {
+        if (!overwritten) {
+          auto useAcc = getBoolFromConstant(mma.useAccumulator());
+          if (!useAcc || *useAcc)
+            return failure();
+          auto pred = getBoolFromConstant(mma.getPredicate());
+          if (!pred || !*pred)
+            return failure();
+          overwritten = true;
+        }
+      } else if (!overwritten) {
+        return failure(); // Read before any overwrite.
+      }
+      remaining.erase(next);
+      Value nextTok;
+      if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(next))
+        nextTok = mma.getToken();
+      else
+        nextTok = cast<triton::nvidia_gpu::TMEMLoadOp>(next).getToken();
+      if (!nextTok)
+        break;
+      cur = nextTok;
+    }
+    if (!remaining.empty())
       return failure();
     op.getSrcMutable().clear();
     return success();
@@ -318,14 +365,17 @@ public:
     if (!useAcc2 || *useAcc2 == false)
       return failure();
 
-    // Walk init2 back through single-use, data-preserving ops to a tmem_load.
+    // Walk init2 back through single-use layout conversions to a tmem_load.
+    // The rewrite erases this chain, so every op in it must be elementwise
+    // identity -- only `convert_layout` qualifies. The wider list used by
+    // `findZeroInitOp` preserves all-zeros, not values, and the tile-type
+    // check below does not catch a square-tile `tt.trans`.
     SmallVector<Operation *> chain;
     Value v = init2;
     while (Operation *d = v.getDefiningOp()) {
       if (isa<triton::nvidia_gpu::TMEMLoadOp>(d))
         break;
-      if (!v.hasOneUse() || !isa<ConvertLayoutOp, ReshapeOp, TransOp,
-                                 BroadcastOp, ExpandDimsOp, SplitOp>(d))
+      if (!v.hasOneUse() || !isa<ConvertLayoutOp>(d))
         return failure();
       chain.push_back(d);
       v = d->getOperand(0);

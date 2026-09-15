@@ -1,5 +1,5 @@
 set(LLVM_TARGET_DEFINITIONS Passes.td)
-mlir_tablegen(Passes.h.inc -gen-pass-decls -name Plugins)
+mlir_tablegen(PluginPasses.h.inc -gen-pass-decls -name Plugins)
 add_public_tablegen_target(TritonPluginsIncGen)
 
 llvm_canonicalize_cmake_booleans(
@@ -39,5 +39,12 @@ foreach( plugin ${TRITON_PLUGIN_PASSES} )
       "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/../plugins")
     endif(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
 
-    target_compile_options(${plugin} PRIVATE -fvisibility=hidden ${TRITON_DISABLE_EH_RTTI_FLAGS})
+    # A plugin resolves its MLIR/LLVM symbols against the already-loaded
+    # libtriton. Under -fvisibility=hidden it keeps private copies of the
+    # vague-linkage ones -- TypeID statics, vtables, RTTI -- instead of binding
+    # to libtriton's, and segfaults when its pass is added to a PassManager.
+    # This target only exists when TRITON_EXT_ENABLED is ON, i.e. when libtriton
+    # itself is built with default visibility, so hidden is never the right
+    # choice here. Buck's :TritonPluginsTestLib pins the same flag.
+    target_compile_options(${plugin} PRIVATE -fvisibility=default ${TRITON_DISABLE_EH_RTTI_FLAGS})
 endforeach()

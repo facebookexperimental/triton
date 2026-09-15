@@ -27,6 +27,80 @@ def test_entropy_warmup_sample_budget(probe_ms, expected):
     assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
 
 
+@pytest.mark.parametrize(
+    "rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms, expected",
+    [
+        # Wall-clock denominator: 0.06s over 550 sampling launches ~= 0.109ms/iter.
+        # The kernel average (0.027ms) must NOT be used here: the old formula
+        # sized 100/0.027 = 3703 repeats, overshooting the rep budget ~4x.
+        (100, 0.06, 550, 0.027, 916),
+        # No sampling launches: fall back to the kernel average.
+        (100, 0.0, 0, 0.027, 3703),
+        # Non-positive denominator: fixed fallback count.
+        (100, 0.0, 10, 0.0, 100),
+        # Floor of 10 repeats for slow kernels.
+        (100, 2.0, 10, 50.0, 10),
+        # Ceiling of 10000 repeats for tiny per-iteration costs (bounds the
+        # 2*n_repeat event pre-allocation in _timed_measurement).
+        (100, 0.001, 1000, 0.027, 10000),
+    ],
+)
+def test_entropy_repeat_uses_wall_clock_denominator(
+    rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms, expected
+):
+    assert (
+        _autotuner._entropy_repeat_count(
+            rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms
+        )
+        == expected
+    )
+
+
+def test_entropy_sampling_syncs_tail_on_early_convergence(monkeypatch):
+    # Fast convergence stops consuming partway through a 50-launch batch, but
+    # all 50 launches were issued and count toward the repeat denominator, so
+    # the final event must be synchronized before returning: otherwise the
+    # caller's wall-clock span excludes the tail's GPU time while the
+    # denominator includes it, underestimating per-iteration cost.
+    created = []
+    synced = []
+
+    class FakeEvent:
+
+        def __init__(self, enable_timing=True):
+            created.append(self)
+
+        def record(self):
+            pass
+
+        def synchronize(self):
+            synced.append(self)
+
+        def elapsed_time(self, other):
+            return 0.027
+
+    class FakeCuda:
+        Event = FakeEvent
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    monkeypatch.setattr(
+        _autotuner._EntropyCriterion, "is_finished",
+        lambda self: self.total_samples >= 20)
+
+    counter, avg_ms, launched = _autotuner._entropy_sampling(
+        lambda: None, lambda: None, FakeTorch)
+
+    assert counter == 20
+    assert launched == 50
+    assert avg_ms == pytest.approx(0.027)
+    # 20 in-loop syncs plus the final tail event; the skipped middle events
+    # need no sync since the last event orders the whole batch on the stream.
+    assert len(synced) == 21
+    assert synced[-1] is created[-1]
+
+
 def test_cpu_backend_skips_cuda_entropy_benchmark(monkeypatch, fresh_knobs):
     expected = [1.0, 0.5, 1.5]
     calls = []

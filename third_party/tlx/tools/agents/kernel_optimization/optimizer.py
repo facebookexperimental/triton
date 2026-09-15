@@ -12,21 +12,22 @@ from .artifacts import ArtifactStore, CandidateArtifactPaths
 from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
     AutoCommitResult,
+    CaseEvaluation,
     ExperimentSummary,
     InputCase,
+    is_promotable,
     KernelOptimizationRequest,
     KernelOptimizationResult,
-    PerformanceSummary,
-    is_promotable,
     passes_protected_cases,
     per_case_speedups,
+    PerformanceSummary,
     weighted_geometric_speedup,
 )
 from .profiling import (
-    ProfileRequest,
     compact_profile_summary,
-    extract_ncu_duration_us,
-    ncu_regression_diagnostic,
+    extract_native_profiler_duration_us,
+    native_profiler_regression_diagnostic,
+    ProfileRequest,
 )
 from .providers import CandidateContext, CandidateProvider, CodexCandidateProvider
 from .source import source_digest
@@ -60,7 +61,10 @@ def _profile_request(
         level=level,
         tools=_PROFILE_TOOLS,
         experiment_id=experiment_id,
-        artifacts_dir=artifacts_dir / "experiments" / experiment_id / "profile_artifacts",
+        artifacts_dir=artifacts_dir
+        / "experiments"
+        / experiment_id
+        / "profile_artifacts",
         reason=reason,
     )
 
@@ -86,15 +90,16 @@ def _diagnostic_profile_request(
 
 
 def _profiles_by_case(performance: PerformanceSummary) -> dict[str, dict[str, Any]]:
-    return {evaluation.case_id: dict(evaluation.profile) for evaluation in performance.cases}
+    return {
+        evaluation.case_id: dict(evaluation.profile) for evaluation in performance.cases
+    }
 
 
 def _diagnostic_error_profiles(
     cases: tuple[InputCase, ...], error: Exception
 ) -> dict[str, dict[str, Any]]:
     return {
-        case.case_id: {"error": f"{type(error).__name__}: {error}"}
-        for case in cases
+        case.case_id: {"error": f"{type(error).__name__}: {error}"} for case in cases
     }
 
 
@@ -150,9 +155,10 @@ def _report_candidate_summary(experiment_id: str, proposal: object) -> None:
         ("expected", getattr(proposal, "expected_effect", "")),
         ("risk", getattr(proposal, "risk", "")),
     )
-    details = " ".join(
-        f"{name}={value!r}" for name, value in fields if value
-    ) or "change='candidate source edited'"
+    details = (
+        " ".join(f"{name}={value!r}" for name, value in fields if value)
+        or "change='candidate source edited'"
+    )
     print(f"[tlx-agent] {experiment_id} {details}", file=sys.stderr, flush=True)
 
 
@@ -199,7 +205,7 @@ def _report_performance(
 
 def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
     if not profile:
-        return ["ncu=unavailable"]
+        return ["native_profiler=unavailable"]
     compact = compact_profile_summary(profile)
     parts: list[str] = []
     proton_totals = _find_mapping_with_keys(
@@ -218,13 +224,25 @@ def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
             value = _coerce_float(proton_totals.get(key))
             if value is not None:
                 parts.append(f"{label}={value:.3f}")
-    ncu_duration = extract_ncu_duration_us(compact)
-    if ncu_duration is None:
-        ncu_duration = extract_ncu_duration_us(profile)
-    if ncu_duration is not None:
-        parts.append(f"ncu.duration_us={ncu_duration:.3f}")
+    profiler_name, profiler_duration = extract_native_profiler_duration_us(compact)
+    if profiler_duration is None:
+        profiler_name, profiler_duration = extract_native_profiler_duration_us(profile)
+    if profiler_name is not None and profiler_duration is not None:
+        parts.append(f"{profiler_name.lower()}.duration_us={profiler_duration:.3f}")
     else:
-        parts.append("ncu=unavailable")
+        parts.append("native_profiler=unavailable")
+    att = compact.get("fb_att")
+    if isinstance(att, Mapping):
+        valid = att.get("valid")
+        if isinstance(valid, bool):
+            parts.append(f"fb_att.valid={str(valid).lower()}")
+        att_artifacts = att.get("artifacts")
+        if isinstance(att_artifacts, Mapping):
+            ui_directories = att_artifacts.get("ui_directories")
+            if isinstance(ui_directories, list) and ui_directories:
+                parts.append(f"fb_att.ui={ui_directories[0]}")
+        if att.get("error"):
+            parts.append(f"fb_att.error={att['error']}")
     diagnostic = compact.get(_DIAGNOSTIC_PROFILE_KEY)
     if not isinstance(diagnostic, Mapping):
         diagnostic = profile.get(_DIAGNOSTIC_PROFILE_KEY)
@@ -360,10 +378,14 @@ def _is_correct_and_stable(
 
 
 def _is_near_threshold(speedup: float, threshold: float) -> bool:
-    return threshold - _NEAR_THRESHOLD_WINDOW <= speedup <= threshold + _NEAR_THRESHOLD_WINDOW
+    return (
+        threshold - _NEAR_THRESHOLD_WINDOW
+        <= speedup
+        <= threshold + _NEAR_THRESHOLD_WINDOW
+    )
 
 
-def _ncu_regression_diagnostics(
+def _native_profiler_regression_diagnostics(
     baseline: PerformanceSummary,
     candidate: PerformanceSummary,
 ) -> str:
@@ -373,7 +395,11 @@ def _ncu_regression_diagnostics(
         baseline_evaluation = baseline_by_case.get(evaluation.case_id)
         if baseline_evaluation is None:
             continue
-        diagnostic = ncu_regression_diagnostic(
+        if _benchmark_uses_native_profiler(
+            baseline_evaluation
+        ) and _benchmark_uses_native_profiler(evaluation):
+            continue
+        diagnostic = native_profiler_regression_diagnostic(
             baseline_evaluation.profile,
             evaluation.profile,
         )
@@ -415,6 +441,16 @@ def _report_candidate_artifacts(
     )
 
 
+def _benchmark_uses_native_profiler(evaluation: CaseEvaluation) -> bool:
+    tool, duration = extract_native_profiler_duration_us(evaluation.profile)
+    return (
+        tool is not None
+        and duration is not None
+        and evaluation.timing is not None
+        and tool.lower() in evaluation.timing.cache_policy.lower()
+    )
+
+
 class KernelOptimizer:
     def __init__(self, provider: CandidateProvider | None = None) -> None:
         self._provider = provider or CodexCandidateProvider()
@@ -434,6 +470,7 @@ class KernelOptimizer:
             ref_path.write_text(request.reference_kernel_source)
             # Expose to harness workers via env var
             import os
+
             os.environ["TLX_REFERENCE_KERNEL_PATH"] = str(ref_path)
         harness = SubprocessHarness(
             request.harness_path, request.budget.max_candidate_seconds
@@ -597,10 +634,12 @@ class KernelOptimizer:
                     # Persist per-case profiles for this candidate regardless of promotion.
                     perf_profiles = _profiles_by_case(performance)
                     profile_path = store.write_profile(experiment_id, perf_profiles)
-                    ncu_diagnostics = _ncu_regression_diagnostics(baseline, performance)
+                    profiler_diagnostics = _native_profiler_regression_diagnostics(
+                        baseline, performance
+                    )
                     status = (
                         "promoted"
-                        if not ncu_diagnostics
+                        if not profiler_diagnostics
                         and is_promotable(performance, request.budget, request.cases)
                         and speedup > best_performance.aggregate_speedup
                         else "rejected"
@@ -632,7 +671,7 @@ class KernelOptimizer:
                     decision = (
                         "correct and exceeded speedup threshold"
                         if status == "promoted"
-                        else ncu_diagnostics
+                        else profiler_diagnostics
                         or rejection_diagnostics
                         or f"speedup below {request.budget.min_speedup:.4f}x threshold"
                     )
@@ -715,9 +754,7 @@ class KernelOptimizer:
                         diagnostics=message,
                     )
                 experiments.append(experiment)
-                store.write_json(
-                    f"experiments/{experiment_id}/result.json", experiment
-                )
+                store.write_json(f"experiments/{experiment_id}/result.json", experiment)
             if exhausted:
                 break
             if not promoted_this_round:
@@ -741,13 +778,15 @@ class KernelOptimizer:
                 baseline, final_profile, request.cases
             ),
         )
-        final_ncu_diagnostics = _ncu_regression_diagnostics(baseline, final_profile)
+        final_profiler_diagnostics = _native_profiler_regression_diagnostics(
+            baseline, final_profile
+        )
         if best_experiment_id != "baseline" and (
-            final_ncu_diagnostics
+            final_profiler_diagnostics
             or not is_promotable(final_profile, request.budget, request.cases)
         ):
-            if final_ncu_diagnostics:
-                diagnostics.append(f"final: rejected: {final_ncu_diagnostics}")
+            if final_profiler_diagnostics:
+                diagnostics.append(f"final: rejected: {final_profiler_diagnostics}")
             best_source = request.kernel_source
             final_profile = baseline
             final_profiles = baseline_profiles
@@ -788,7 +827,7 @@ class KernelOptimizer:
             final_profile,
             baseline=baseline,
             cases=request.cases,
-            diagnostics=final_ncu_diagnostics,
+            diagnostics=final_profiler_diagnostics,
         )
         store.write_aggregated_profile("best_profile", best_profiles)
         # Doc-compatible alias: experiments.json mirrors the experiments list.
