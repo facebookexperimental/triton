@@ -166,7 +166,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}" --no-build
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
       - name: Download prebuilt Triton wheel
         uses: actions/download-artifact@v4
         with:
@@ -237,7 +237,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}" --no-build
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
       - name: Download prebuilt Triton wheel
         uses: actions/download-artifact@v4
         with:
@@ -338,7 +338,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}" --no-build
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
       - name: Download prebuilt Triton wheel
         uses: actions/download-artifact@v4
         with:
