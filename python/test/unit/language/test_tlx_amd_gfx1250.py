@@ -7,7 +7,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
 from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
-from triton.language.extra.tlx.tutorials import amd_grouped_gemm_gfx1250 as _gfx1250_grouped
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
+    amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton.tools.mxfp import MXScaleTensor
 from triton._internal_testing import is_hip_gfx1250
 

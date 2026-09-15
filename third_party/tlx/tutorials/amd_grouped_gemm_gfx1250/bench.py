@@ -86,7 +86,7 @@ def _parse_case(value: str) -> BenchCase:
 
 def _child_env() -> dict[str, str]:
     env = os.environ.copy()
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[4]
     local_paths = [str(repo_root / "python"), str(repo_root)]
     if env.get("PYTHONPATH"):
         local_paths.append(env["PYTHONPATH"])
@@ -95,7 +95,7 @@ def _child_env() -> dict[str, str]:
 
 
 def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
-    kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250.py")
+    kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250_test.py")
     command = [
         sys.executable,
         str(kernel),
