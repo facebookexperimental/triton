@@ -28,7 +28,7 @@ def _host_descriptor_pre_hook(nargs):
 
 _DEFAULT_BLOCK_M = 128
 # Profile-selected on H100 to avoid consumer spills without reducing CTA residency.
-_FWD_CONSUMER_REGISTERS = 240
+_FWD_CONSUMER_REGISTERS = tl.constexpr(240)
 _DEFAULT_ROW_SCHEDULE = {
     "ROW_REVERSE_HEAD_GROUP": 0,
     "ROW_REVERSE_MAX": 0,
