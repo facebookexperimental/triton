@@ -269,6 +269,13 @@ jobs:
             python/test/unit/tlx_ops/test_*hip*.py
             python/test/unit/tlx_ops/test_*gfx950*.py
           )
+          # TorchTLX depends on floating PyTorch Inductor APIs and runs in
+          # torchtlx-mi350.yml, not this pinned-PyTorch TLX job.
+          TLX_FILES=()
+          for file in "${FILES[@]}"; do
+            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
+          done
+          FILES=("${TLX_FILES[@]}")
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
           echo "mi350 collects:" "${FILES[@]}"
           pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml

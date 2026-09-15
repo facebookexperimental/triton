@@ -1,0 +1,145 @@
+name: Meta Triton TorchTLX B200 Tests
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
+  pull_request:
+    paths-ignore:
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
+  schedule:
+    - cron: '15 */6 * * *'
+
+# TorchTLX follows floating-nightly PyTorch Inductor APIs. Keep it separate from
+# b200.yml, whose pre-provisioned torch is intentionally stable for the wider suite.
+
+jobs:
+  b200-torchtlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: nvidia-dgx-b200
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      TORCHTLX_ARCH: sm100
+    timeout-minutes: 90
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install nightly PyTorch
+        run: |
+          . "${SETUP_SCRIPT}"
+          # torchTLX plugs into the newest Inductor internals (config.triton.tlx_mode,
+          # template/fusion hooks), so force the freshest floating nightly wheel.
+          # The uninstall is load-bearing: a stable version sorts ABOVE a nightly of
+          # the same number (2.12.0 > 2.12.0.dev20260912), so --pre --upgrade over an
+          # installed release is a silent no-op.
+          uv pip uninstall torch pytorch-triton || true
+          uv pip install --pre --upgrade torch --index-url https://download.pytorch.org/whl/nightly/cu128
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          # Install the fork Triton on top of nightly torch's pinned pytorch-triton.
+          install_triton $PWD
+          uv pip install pytest expecttest
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 40
+        run: |
+          . "${SETUP_SCRIPT}"
+          bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
+      - name: Run TorchTLX mm perf bench
+        id: run_torchtlx_perf
+        if: always() && github.event_name == 'schedule'
+        timeout-minutes: 40
+        run: |
+          . "${SETUP_SCRIPT}"
+          bash scripts/run_torchtlx_tests.sh --perf \
+            --json /tmp/mm_torchtlx.json --junitxml=/tmp/torchtlx_perf.xml
+      - name: Upload TorchTLX perf artifact
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: b200-torchtlx-mm-perf
+          path: /tmp/mm_torchtlx.json
+          if-no-files-found: ignore
+      - name: Collect nightly failures (TorchTLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
+                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-torchtlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "b200-torchtlx-test" \
+            ${FAILED_FLAG}
+
+  # ----- Nightly issue filing (schedule only) -----
+  report-b200-torchtlx:
+    needs: b200-torchtlx-test
+    if: always() && github.event_name == 'schedule' && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-torchtlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-b200-torchtlx:
+    needs: b200-torchtlx-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-torchtlx-test.result == 'success' || needs.b200-torchtlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: b200-torchtlx-test
+      failures: ${{ needs.b200-torchtlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true

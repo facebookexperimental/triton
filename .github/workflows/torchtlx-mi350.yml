@@ -1,0 +1,155 @@
+name: Meta Triton TorchTLX MI350X Tests
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
+  pull_request:
+    paths-ignore:
+      - '.agents/**'
+      - '.claude/**'
+      - '.llms/**'
+      - 'AGENTS.md'
+      - 'third_party/tlx/tools/agents/skills/**'
+  schedule:
+    - cron: '45 */6 * * *'
+
+# TorchTLX follows floating-nightly PyTorch Inductor APIs. Keep it separate from
+# mi350.yml, whose pinned torch wheel is intentionally stable for the wider suite.
+
+jobs:
+  mi350-torchtlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: linux-fb-triton-mi350-1
+    env:
+      CONDA_ENV: pytorch
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      MAX_JOBS: 16
+      TORCHTLX_ARCH: gfx950
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Install nightly PyTorch
+        run: |
+          . "${SETUP_SCRIPT}"
+          PYTHON_BIN="$(command -v python3)"
+          # Force the freshest floating ROCm nightly. A stable release sorts
+          # above a nightly with the same version, so uninstall it first.
+          uv pip uninstall --python "${PYTHON_BIN}" \
+            torch pytorch-triton pytorch-triton-rocm triton-rocm triton || true
+          uv pip install --python "${PYTHON_BIN}" --pre --upgrade torch \
+            --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+          "${PYTHON_BIN}" - <<'PY'
+          import torch
+          from torch._inductor import config
+
+          print(f"torch -> {torch.__version__} ({torch.__file__})")
+          if not hasattr(config.triton, "tlx_mode"):
+              raise RuntimeError(
+                  "the installed PyTorch nightly has no TorchTLX Inductor support "
+                  "(torch._inductor.config.triton.tlx_mode)"
+              )
+          PY
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          PYTHON_BIN="$(command -v python3)"
+          # Install this checkout on top of nightly torch's bundled Triton.
+          uv pip uninstall --python "${PYTHON_BIN}" \
+            pytorch-triton pytorch-triton-rocm triton-rocm triton || true
+          uv pip install --python "${PYTHON_BIN}" \
+            -r python/requirements.txt -r python/test-requirements.txt
+          uv pip install --python "${PYTHON_BIN}" -e . --no-build-isolation
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 60
+        run: |
+          . "${SETUP_SCRIPT}"
+          bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
+      - name: Run TorchTLX L2 perf
+        id: run_torchtlx_perf
+        if: always() && github.event_name == 'schedule'
+        timeout-minutes: 50
+        run: |
+          . "${SETUP_SCRIPT}"
+          bash scripts/run_torchtlx_tests.sh --perf \
+            --junitxml=/tmp/torchtlx_perf.xml
+      - name: Upload TorchTLX perf artifacts
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi350-torchtlx-gemm-perf
+          path: /tmp/tlx_benchmark/*_torchtlx.gfx950.json
+          if-no-files-found: ignore
+      - name: Collect nightly failures (TorchTLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
+                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket mi350-torchtlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "mi350-torchtlx-test" \
+            ${FAILED_FLAG}
+
+  # ----- Nightly issue filing (schedule only) -----
+  report-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always() && github.event_name == 'schedule' && needs.mi350-torchtlx-test.outputs.failures != '' && needs.mi350-torchtlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-torchtlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-torchtlx-test.result == 'success' || needs.mi350-torchtlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-torchtlx-test
+      failures: ${{ needs.mi350-torchtlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
