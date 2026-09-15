@@ -4,6 +4,11 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
+from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
+from triton.language.extra.tlx.tutorials import amd_grouped_gemm_gfx1250 as _gfx1250_grouped
+from triton.tools.mxfp import MXScaleTensor
 from triton._internal_testing import is_hip_gfx1250
 
 
@@ -58,9 +63,7 @@ def _async_amd_desc_store_kernel(
 ):
     desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
     desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
-    # Separate buffers for load vs store — they get different encodings
-    # (padded for load, swizzled for store) and can't share a buffer
-    # until alignTDMDescriptorEncodings is ported.
+    # Exercise separate input and output staging allocations.
     load_buf = tlx.local_alloc((M, N), tl.float16, 1)
     store_buf = tlx.local_alloc((M, N), tl.float16, 1)
     load_view = tlx.local_view(load_buf, 0)
@@ -379,3 +382,263 @@ def test_tdm_descriptor_reuse_different_allocations_gfx1250(device, fused):
     output = torch.empty_like(x)
     _tdm_reused_descriptor_kernel[(1, )](x, output, FUSED=fused)
     torch.testing.assert_close(output, x + x, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("M,N,K", [(128, 128, 64), (256, 256, 128), (512, 512, 256)])
+def test_gfx1250_matmul_tdm_pipelined(M, N, K):
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=triton.runtime.driver.active.get_active_torch_device(), dtype=torch.float16)
+    b = torch.randn((K, N), device=triton.runtime.driver.active.get_active_torch_device(), dtype=torch.float16)
+
+    triton_out = _gfx1250_gemm.matmul(a, b, config={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32})
+    torch_out = torch.matmul(a, b)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_gfx1250_matmul_tdm_pipelined_single_warp_per_simd_schedule(TRANSPOSE_B):
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 512
+    a = torch.randn((M, K), device=triton.runtime.driver.active.get_active_torch_device(), dtype=torch.float16)
+    b = torch.randn((K, N), device=triton.runtime.driver.active.get_active_torch_device(), dtype=torch.float16)
+    if TRANSPOSE_B:
+        b = b.T.contiguous()
+
+    triton_out = _gfx1250_gemm.matmul_tdm_pipelined_single_warp_per_simd_schedule(
+        a,
+        b,
+        TRANSPOSE_B=TRANSPOSE_B,
+    )
+    b_ref = b.T if TRANSPOSE_B else b
+    torch_out = torch.matmul(a.to(torch.float32), b_ref.to(torch.float32)).to(torch.bfloat16)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+@pytest.mark.parametrize("SEED", [0, 7])
+@pytest.mark.parametrize(
+    "M,N,K,SCHEDULE,DTYPE_A,DTYPE_B,BLOCK_M,BLOCK_N,BLOCK_K,NUM_BUFFERS,SCALE_PRESHUFFLE,WITH_A_SCALE,"
+    "TDM_FUSION,L2_PREFETCH_DISTANCE,TDM_SPLIT",
+    [
+        (256, 256, 512, "baseline", "float8_e5m2", "float8_e5m2", 128, 128, 128, 2, True, True, "none", -1, False),
+        (256, 256, 512, "baseline", "float8_e4m3", "float8_e5m2", 128, 128, 128, 2, False, False, "none", 2, False),
+        (256, 256, 512, "sliceK", "float8_e4m3", "float8_e5m2", 128, 128, 256, 2, True, True, "2way", 2, False),
+        (256, 512, 512, "sliceNK", "float8_e5m2", "float4", 256, 256, 256, 2, True, True, "2way", 2, False),
+        (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "none", 2, False),
+        (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "2way", 2, False),
+        (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "4way", 2, False),
+        (256, 256, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "partial", 2, False),
+        (256, 256, 512, "sliceMNK", "float8_e4m3", "float4", 256, 256, 256, 2, True, True, "partial", -1, True),
+        (256, 512, 512, "sliceMNK", "float8_e4m3", "float8_e5m2", 128, 256, 256, 2, True, True, "4way", 2, False),
+        (256, 256, 512, "baseline", "float4", "float4", 128, 128, 128, 2, True, True, "4way", 2, False),
+        (384, 384, 512, "sliceMNK", "float8_e4m3", "float8_e4m3", 256, 256, 256, 2, True, True, "4way", 2, False),
+        (384, 512, 768, "sliceMNK", "float8_e5m2", "float8_e4m3", 256, 256, 256, 2, True, True, "2way", 2, False),
+    ],
+)
+def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYPE_A, DTYPE_B, BLOCK_M, BLOCK_N, BLOCK_K,
+                                      NUM_BUFFERS, SCALE_PRESHUFFLE, WITH_A_SCALE, TDM_FUSION, L2_PREFETCH_DISTANCE,
+                                      TDM_SPLIT):
+    torch.manual_seed(SEED)
+    a = _gfx1250_mxfp._init_data(DTYPE_A, M, K)
+    b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
+    if WITH_A_SCALE:
+        a_scale = MXScaleTensor(size=(M, triton.cdiv(K, 32))).random(high=32.0).data
+    else:
+        a_scale = None
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, 32))).random(high=32.0).data
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+
+    a_scale_input = _gfx1250_mxfp.pack_scale(a_scale) if SCALE_PRESHUFFLE else a_scale
+    b_scale_input = _gfx1250_mxfp.pack_scale(b_scale) if SCALE_PRESHUFFLE else b_scale
+    if DTYPE_A == "float4":
+        a = a.to_packed_tensor(dim=1)
+    if DTYPE_B == "float4":
+        b = b.to_packed_tensor(dim=0)
+
+    a_d = a.data.contiguous().cuda() if DTYPE_A == "float4" else a.contiguous().cuda()
+    if DTYPE_B == "float4":
+        b_d = b.data.T.contiguous().cuda() if TRANSPOSE_B else b.data.contiguous().cuda()
+    else:
+        b_d = b.T.contiguous().cuda() if TRANSPOSE_B else b.contiguous().cuda()
+    if a_scale_input is not None:
+        a_scale_d = a_scale_input.cuda()
+    else:
+        a_scale_d = None
+    out = _gfx1250_mxfp.mxgemm_tdm_pipelined(a_d, b_d, a_scale_d, b_scale_input.cuda(), BLOCK_M, BLOCK_N, BLOCK_K,
+                                             TRANSPOSE_B, NUM_BUFFERS, _gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_A],
+                                             _gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], SCALE_PRESHUFFLE, WITH_A_SCALE,
+                                             SCHEDULE, L2_PREFETCH_DISTANCE, M, N, K, TDM_FUSION, TDM_SPLIT)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("BATCH,H,SEQLEN", [(1, 8, 1024),  # multi-head
+                                            (2, 4, 1024),  # multi-batch + multi-head
+                                            (1, 16, 2048),  # many heads, longer seqlen
+                                            (1, 2, 896),  # non-128-multiple -> masked remainder path
+                                            (1, 1, 640),  # small -> remainder peel path
+                                            ])
+def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN):
+    torch.manual_seed(0)
+    D = 128
+    q = torch.randn((BATCH, H, SEQLEN, D), device=triton.runtime.driver.active.get_active_torch_device(),
+                    dtype=torch.bfloat16)
+    k = torch.randn((BATCH, H, SEQLEN, D), device=triton.runtime.driver.active.get_active_torch_device(),
+                    dtype=torch.bfloat16)
+    v = torch.randn((BATCH, H, SEQLEN, D), device=triton.runtime.driver.active.get_active_torch_device(),
+                    dtype=torch.bfloat16)
+    sm_scale = 1.0 / (D**0.5)
+    out = _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, sm_scale)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
+    torch.testing.assert_close(out.cpu(), ref.cpu(), atol=5e-2, rtol=5e-2)
+
+
+def _gfx1250_make_groups(shapes: list[tuple[int, int, int]], device: torch.device):
+    group_a = []
+    group_b = []
+    for m, n, k in shapes:
+        group_a.append(torch.randn((m, k), device=device, dtype=torch.float16))
+        group_b.append(torch.randn((k, n), device=device, dtype=torch.float16))
+    return group_a, group_b
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_gfx1250_grouped_gemm_phase0_ragged():
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    shapes = [
+        (17, 33, 31),
+        (64, 70, 64),
+        (95, 128, 96),
+        (128, 65, 129),
+    ]
+    group_a, group_b = _gfx1250_make_groups(shapes, device)
+
+    actual = _gfx1250_grouped.grouped_gemm_phase0(group_a, group_b, block_m=32, block_n=32, block_k=32)
+    expected = [a @ b for a, b in zip(group_a, group_b)]
+
+    for ref, out in zip(expected, actual):
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TDM_PIPELINE_DEPTH", [2, 3, 4])
+def test_gfx1250_grouped_gemm_tdm_packed_ragged_m(TDM_PIPELINE_DEPTH):
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    m_list = [128, 256, 384]
+    n = 256
+    k = 512
+    a_packed, b_t, group_offsets, group_a = _gfx1250_grouped._make_packed_ragged_m(m_list, n, k, device)
+
+    actual = _gfx1250_grouped.grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=128,
+        block_n=128,
+        block_k=128,
+        group_m=4,
+        tdm_pipeline_depth=TDM_PIPELINE_DEPTH,
+        l2_prefetch_distance=0,
+    )
+
+    start = 0
+    for i, m in enumerate(m_list):
+        ref = group_a[i] @ b_t[i].T
+        torch.testing.assert_close(actual[start:start + m], ref, atol=1e-2, rtol=1e-2)
+        start += m
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_gfx1250_grouped_gemm_tdm_asymmetric_depth3():
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    m_list = [128, 256]
+    n = 512
+    k = 384
+    a_packed, b_t, group_offsets, group_a = _gfx1250_grouped._make_packed_ragged_m(m_list, n, k, device)
+
+    actual = _gfx1250_grouped.grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=128,
+        block_n=256,
+        block_k=128,
+        group_m=4,
+        tdm_pipeline_depth=3,
+        l2_prefetch_distance=0,
+    )
+
+    start = 0
+    for i, m in enumerate(m_list):
+        ref = group_a[i] @ b_t[i].T
+        torch.testing.assert_close(actual[start:start + m], ref, atol=1e-2, rtol=1e-2)
+        start += m
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch():
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    # The first group has four tiles for two persistent programs, so each
+    # program consumes one tile whose first two K blocks were prefetched.
+    m_list = [256, 128]
+    n = 512
+    k = 512
+    a_packed, b_t, group_offsets, group_a = _gfx1250_grouped._make_packed_ragged_m(m_list, n, k, device)
+
+    actual = _gfx1250_grouped.grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=128,
+        block_n=256,
+        block_k=128,
+        group_m=4,
+        tdm_pipeline_depth=2,
+        l2_prefetch_distance=0,
+        num_programs=2,
+        c_staging_mode=1,
+        cross_tile_prefetch=True,
+    )
+
+    start = 0
+    for i, m in enumerate(m_list):
+        ref = group_a[i] @ b_t[i].T
+        torch.testing.assert_close(actual[start:start + m], ref, atol=1e-2, rtol=1e-2)
+        start += m
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("XCD_REMAP_MODE", ["balanced", "chunked"])
+def test_gfx1250_grouped_gemm_tdm_xcd_remap(XCD_REMAP_MODE):
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    m_list = [1024]
+    n = 512
+    k = 512
+    a_packed, b_t, group_offsets, group_a = _gfx1250_grouped._make_packed_ragged_m(m_list, n, k, device)
+    actual = _gfx1250_grouped.grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=128,
+        block_n=256,
+        block_k=128,
+        num_programs=16,
+        c_staging_mode=1,
+        xcd_remap_mode=XCD_REMAP_MODE,
+        num_xcds=8,
+        xcd_chunk=2,
+    )
+    torch.testing.assert_close(actual, group_a[0] @ b_t[0].T, atol=1e-2, rtol=1e-2)
