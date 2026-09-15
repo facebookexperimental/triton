@@ -1332,7 +1332,7 @@ class tensor(base_value):
     def reduce(self, axis, combine_fn, keep_dims=False) -> tensor:
         ...
 
-    def associative_scan(self, axis, combine_fn, reverse=False) -> tensor:
+    def associative_scan(self, axis, combine_fn, reverse=False, reduction_ordering=None) -> tensor:
         ...
 
     def gather(self, indices, axis) -> tensor:
@@ -1386,10 +1386,10 @@ class tensor(base_value):
     def reduce_or(self, axis=None, keep_dims=False) -> tensor:
         ...
 
-    def cumsum(self, axis=0, reverse=False) -> tensor:
+    def cumsum(self, axis=0, reverse=False, dtype=None, reduction_ordering=None) -> tensor:
         ...
 
-    def cumprod(self, axis=0, reverse=False) -> tensor:
+    def cumprod(self, axis=0, reverse=False, reduction_ordering=None) -> tensor:
         ...
 
     def sort(self, dim: constexpr = None, descending: constexpr = CONSTEXPR_0) -> tensor:
@@ -3536,7 +3536,9 @@ def _add_scan_docstr(name: str, dtype_arg: str = None) -> Callable[[T], T]:
     :param axis: the dimension along which the scan should be done
     :type axis: int
     :param reverse: if true, the scan is performed in the reverse direction
-    :type reverse: bool"""
+    :type reverse: bool
+    :param reduction_ordering: optional ordering strategy; see :func:`associative_scan`
+    :type reduction_ordering: None | ReductionOrdering"""
 
         if dtype_arg is not None:
             docstr += f"""
@@ -3551,7 +3553,7 @@ def _add_scan_docstr(name: str, dtype_arg: str = None) -> Callable[[T], T]:
 
 @_tensor_member_fn
 @builtin
-def associative_scan(input, axis, combine_fn, reverse=False, _semantic=None, _generator=None):
+def associative_scan(input, axis, combine_fn, reverse=False, reduction_ordering=None, _semantic=None, _generator=None):
     """Applies the combine_fn to each elements with a carry in :code:`input` tensors along the provided :code:`axis` and update the carry
 
     :param input: the input tensor, or tuple of tensors
@@ -3562,6 +3564,12 @@ def associative_scan(input, axis, combine_fn, reverse=False, _semantic=None, _ge
     :type combine_fn: Callable
     :param reverse: whether to apply the associative scan in the reverse direction along axis
     :type reverse: bool
+    :param reduction_ordering: ``ReductionOrdering.INNER_TREE`` evaluates each prefix
+        using an adjacent-pair tree, independent of the thread layout. The default
+        (``None`` or ``ReductionOrdering.UNORDERED``) uses a layout-dependent tree.
+        The guarantee applies to a fixed scan extent and combine function within
+        one CTA; it does not specify how separate scan tiles are combined.
+    :type reduction_ordering: None | ReductionOrdering
 
     """
     if isinstance(input, tensor):
@@ -3570,6 +3578,7 @@ def associative_scan(input, axis, combine_fn, reverse=False, _semantic=None, _ge
             axis,
             combine_fn,
             reverse,
+            reduction_ordering=reduction_ordering,
             _semantic=_semantic,
             _generator=_generator,
         )[0]
@@ -3593,6 +3602,14 @@ def associative_scan(input, axis, combine_fn, reverse=False, _semantic=None, _ge
     reverse = _unwrap_if_constexpr(reverse)
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
+    reduction_ordering = _unwrap_if_constexpr(reduction_ordering)
+    if reduction_ordering is not None:
+        if not isinstance(reduction_ordering, ReductionOrdering):
+            raise TypeError("scan reduction_ordering must be None or a ReductionOrdering")
+        if reduction_ordering not in (ReductionOrdering.UNORDERED, ReductionOrdering.INNER_TREE):
+            raise ValueError(f"unsupported scan reduction_ordering: {reduction_ordering}")
+        return _semantic.associative_scan(input, axis, make_combine_region, reverse,
+                                          reduction_ordering=reduction_ordering)
     return _semantic.associative_scan(input, axis, make_combine_region, reverse)
 
 
