@@ -20,7 +20,7 @@ compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
 second. On implementations that provide it, pass `space="full"` explicitly to
 buy back the tuned configs, which are worth up to ~4x on small shapes. The
-gfx950 LocalSplitU implementation currently provides only `"heuristic"`.
+gfx950 implementation currently provides only `"heuristic"`.
 
 Ops with no heuristic yet -- flash_attn, hstu_attn, kimi_delta_attention --
 still default to "full". Their remaining space is "smoke", which selects for
@@ -36,8 +36,10 @@ from __future__ import annotations
 
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
-__all__ = ["mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-           "UnsupportedOp", "InvalidInput"]
+__all__ = [
+    "mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "UnsupportedOp", "InvalidInput"
+]
 
 
 def mm(a, b, *, arch=None, space="heuristic"):
@@ -49,20 +51,14 @@ def mm(a, b, *, arch=None, space="heuristic"):
     docstring.
     """
     if a.ndim != 2 or b.ndim != 2:
-        raise InvalidInput(
-            "tlx.ops.mm expects two rank-2 tensors; "
-            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
-        )
+        raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     if a.shape[1] != b.shape[0]:
-        raise InvalidInput(
-            "tlx.ops.mm reduction dimensions must match; "
-            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
-        )
+        raise InvalidInput("tlx.ops.mm reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     if a.dtype != b.dtype or a.device != b.device:
-        raise InvalidInput(
-            "tlx.ops.mm operands must have the same dtype and device; "
-            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})"
-        )
+        raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
+                           f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
     fn, spec = impl_for("mm", arch)
     # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
     # descriptor transposed, so that is the stride TMA must find aligned.
