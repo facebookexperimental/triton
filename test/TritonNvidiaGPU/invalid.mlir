@@ -1,5 +1,120 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+module {
+  tt.func @user_named_barrier_id_zero() {
+    %c0 = arith.constant 0 : i32
+    // expected-error @below {{ID 0 is reserved for the compiler}}
+    %bar = ttng.user_named_barrier_id %c0 : i32
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @user_named_barrier_id_one() {
+    %c1 = arith.constant 1 : i32
+    // expected-error @below {{IDs 1 and 2 are reserved for special lowering}}
+    %bar = ttng.user_named_barrier_id %c1 : i32
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @user_named_barrier_id_two() {
+    %c2 = arith.constant 2 : i32
+    // expected-error @below {{IDs 1 and 2 are reserved for special lowering}}
+    %bar = ttng.user_named_barrier_id %c2 : i32
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @user_named_barrier_id_out_of_range() {
+    %c16 = arith.constant 16 : i32
+    // expected-error @below {{named barrier ID must be in the range [0, 15]}}
+    %bar = ttng.user_named_barrier_id %c16 : i32
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @compiler_named_barrier_id_dynamic(%id: i32) {
+    // expected-error @below {{requires a constant named barrier ID}}
+    %bar = ttng.compiler_named_barrier_id %id : i32
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @compiler_named_barrier_id_out_of_range() {
+    %cneg1 = arith.constant -1 : i32
+    // expected-error @below {{named barrier ID must be in the range [0, 15]}}
+    %bar = ttng.compiler_named_barrier_id %cneg1 : i32
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @user_named_barrier_id_dynamic(%id: i32) {
+    %bar = ttng.user_named_barrier_id %id : i32
+    tt.return
+  }
+}
+
+// -----
+
+// A reserved ID entering the partition as a `ttg.warp_specialize` capture is a
+// block argument, so the verifier must resolve the capture before matching the
+// constant. Without that it reads as dynamic and escapes validation entirely.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @user_named_barrier_id_reserved_through_capture() {
+    %c1 = arith.constant 1 : i32
+    ttg.warp_specialize(%c1)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: i32) num_warps(1) {
+      // expected-error @below {{IDs 1 and 2 are reserved for special lowering}}
+      %bar = ttng.user_named_barrier_id %arg0 : i32
+      ttg.warp_return
+    } : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// The same resolution in the opposite direction: a genuinely constant compiler
+// ID reaching the op through a capture must be accepted, not rejected as
+// dynamic by `requires a constant named barrier ID`.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @compiler_named_barrier_id_constant_through_capture() {
+    %c7 = arith.constant 7 : i32
+    ttg.warp_specialize(%c7)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: i32) num_warps(1) {
+      %bar = ttng.compiler_named_barrier_id %arg0 : i32
+      ttg.warp_return
+    } : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 // expected-error @below {{fp4Padded tensor memory layout requires colStride 1 but got 2}}
 #bad_fp4_padded_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 2, fp4Padded = true>
 

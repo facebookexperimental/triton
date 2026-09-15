@@ -4,7 +4,9 @@ import torch
 import re
 import triton
 import triton.language as tl
+from triton._filecheck import run_parser
 from triton._internal_testing import is_hopper_or_newer
+from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 
 
@@ -399,6 +401,40 @@ def test_named_wait_arrive(BLOCK_SIZE, device):
     ref_out1, ref_out2 = dual_add(x, y, a, b)
     torch.testing.assert_close(output1, ref_out1, check_dtype=False)
     torch.testing.assert_close(output2, ref_out2, check_dtype=False)
+
+
+@pytest.mark.parametrize("use_wait", [False, True])
+@pytest.mark.parametrize(
+    ("barrier_id", "message"),
+    [
+        (-1, "named barrier ID must be in the range [0, 15]"),
+        (0, "named barrier ID 0 is reserved for the compiler"),
+        (1, "named barrier IDs 1 and 2 are reserved for special lowering"),
+        (2, "named barrier IDs 1 and 2 are reserved for special lowering"),
+        (16, "named barrier ID must be in the range [0, 15]"),
+    ],
+)
+def test_named_barrier_id_validation(use_wait, barrier_id, message):
+
+    @triton.jit
+    def kernel(BARRIER_ID: tl.constexpr, USE_WAIT: tl.constexpr):
+        if USE_WAIT:
+            tlx.named_barrier_wait(BARRIER_ID, 32)
+        else:
+            tlx.named_barrier_arrive(BARRIER_ID, 32)
+
+    with pytest.raises(triton.CompilationError, match=re.escape(message)):
+        run_parser(kernel, args=(barrier_id, use_wait), target=GPUTarget("cuda", 90, 32))
+
+
+def test_named_barrier_dynamic_user_id():
+
+    @triton.jit
+    def kernel(barrier_id):
+        tlx.named_barrier_wait(barrier_id, 32)
+
+    module = run_parser(kernel, args=(3, ), target=GPUTarget("cuda", 90, 32))
+    assert "ttng.user_named_barrier_id" in str(module)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
