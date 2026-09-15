@@ -1,4 +1,4 @@
-"""gfx950 TLX local-buffer retention integration for TorchInductor."""
+"""TLX local-buffer retention integration for TorchInductor."""
 
 from __future__ import annotations
 
@@ -32,10 +32,12 @@ from torch._inductor.utils import get_dtype_size, IndentedBuffer
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from ...hw.target import target_for_device
+
 
 @dataclasses.dataclass(frozen=True)
 class LocalBufferRetentionSpec:
-    """One global buffer access interval that can be backed by CTA-local LDS."""
+    """One global buffer access interval that can use CTA-local memory."""
 
     name: str
     dtype: torch.dtype
@@ -46,6 +48,36 @@ class LocalBufferRetentionSpec:
 
 
 @dataclasses.dataclass(frozen=True)
+class LocalBufferRetentionPolicy:
+    """Architecture policy for a local-retention kernel candidate."""
+
+    max_local_bytes: int
+    reduction_block_limit: int
+    num_warps: int
+    backend_options: tuple[tuple[str, int], ...] = ()
+    round_reduction_block_up: bool = False
+
+
+# These are conservative retention budgets, not hardware capacities. They
+# protect occupancy; larger budgets should be separate MultiKernel candidates
+# so Inductor can benchmark and select them only when profitable.
+_LOCAL_BUFFER_RETENTION_POLICIES = {
+    "gfx950": LocalBufferRetentionPolicy(
+        max_local_bytes=32 * 1024,
+        reduction_block_limit=2048,
+        num_warps=4,
+        backend_options=(("waves_per_eu", 4),),
+    ),
+    "sm90": LocalBufferRetentionPolicy(
+        max_local_bytes=32 * 1024,
+        reduction_block_limit=8192,
+        num_warps=8,
+        round_reduction_block_up=True,
+    ),
+}
+
+
+@dataclasses.dataclass(frozen=True)
 class LocalBufferRetentionPlan:
     """Structured scheduler-to-codegen contract for local buffer retention."""
 
@@ -53,7 +85,7 @@ class LocalBufferRetentionPlan:
     reduction_numel: int
     reduction_block: int
     num_warps: int
-    waves_per_eu: int
+    backend_options: tuple[tuple[str, int], ...]
 
     @property
     def total_bytes(self) -> int:
@@ -62,28 +94,36 @@ class LocalBufferRetentionPlan:
             for spec in self.buffers
         )
 
+    @property
+    def triton_config(self) -> dict[str, int]:
+        return {
+            "XBLOCK": 1,
+            "R0_BLOCK": self.reduction_block,
+            "num_warps": self.num_warps,
+            "num_stages": 1,
+            **dict(self.backend_options),
+        }
+
 
 class LocalBufferRetention:
-    """Find cross-phase values that can stay in LDS instead of round-tripping HBM."""
-
-    _MAX_LOCAL_BYTES = 32 * 1024
+    """Find cross-phase values that can stay on-chip instead of round-tripping HBM."""
 
     @staticmethod
-    def _is_enabled() -> bool:
-        if config.triton.tlx_mode != "allow" or torch.version.hip is None:
-            return False
+    def _policy() -> LocalBufferRetentionPolicy | None:
+        if config.triton.tlx_mode != "allow":
+            return None
         try:
-            # Gate on the device being compiled for rather than device 0: a
-            # multi-GPU host can mix architectures.  Pass the device itself --
-            # its index is None for a bare "cuda", which resolves to the
-            # current device, whereas int(None) would not.
             device = V.graph.get_current_device_or_throw()
             if device.type != "cuda":
-                return False
-            properties = torch.cuda.get_device_properties(device)
-        except (AssertionError, RuntimeError):
-            return False
-        return "gfx950" in getattr(properties, "gcnArchName", "")
+                return None
+            target = target_for_device(device)
+        except (AssertionError, RuntimeError, ValueError):
+            return None
+        return _LOCAL_BUFFER_RETENTION_POLICIES.get(target.key)
+
+    @classmethod
+    def _is_enabled(cls) -> bool:
+        return cls._policy() is not None
 
     @staticmethod
     def _next_power_of_2(value: int) -> int:
@@ -165,7 +205,8 @@ class LocalBufferRetention:
     def plan_for(
         cls, node_schedule: Sequence[object]
     ) -> LocalBufferRetentionPlan | None:
-        if not cls._is_enabled():
+        policy = cls._policy()
+        if policy is None:
             return None
 
         scheduled_nodes = list(NodeScheduleMarker.only_nodes(node_schedule))
@@ -278,7 +319,7 @@ class LocalBufferRetention:
                     continue
 
                 spec_bytes = padded_numel * get_dtype_size(dtype)
-                if used_bytes + spec_bytes > cls._MAX_LOCAL_BYTES:
+                if used_bytes + spec_bytes > policy.max_local_bytes:
                     continue
                 specs.append(
                     LocalBufferRetentionSpec(
@@ -296,17 +337,22 @@ class LocalBufferRetention:
         if not specs:
             return None
 
+        reduction_block = (
+            cls._next_power_of_2(reduction_numel)
+            if policy.round_reduction_block_up
+            else 1 << (reduction_numel.bit_length() - 1)
+        )
         return LocalBufferRetentionPlan(
             buffers=tuple(specs),
             reduction_numel=reduction_numel,
-            reduction_block=min(2048, 1 << (reduction_numel.bit_length() - 1)),
-            num_warps=4,
-            waves_per_eu=4,
+            reduction_block=min(policy.reduction_block_limit, reduction_block),
+            num_warps=policy.num_warps,
+            backend_options=policy.backend_options,
         )
 
 
 class LocalBufferRetentionKernel(TritonKernel):
-    """Triton kernel candidate that retains cross-phase values in TLX LDS."""
+    """Triton kernel candidate that retains cross-phase values in local memory."""
 
     def __init__(
         self,
@@ -400,6 +446,14 @@ class LocalBufferRetentionKernel(TritonKernel):
 
         allocation_shape = ["1"] * self.triton_tensor_ndim()
         allocation_shape[reduction_tree.tensor_dim] = str(spec.padded_element_count)
+        if (
+            self.local_buffer_retention_plan.reduction_block
+            == spec.padded_element_count
+        ):
+            return (
+                f"({', '.join(allocation_shape)},)",
+                self.local_buffer_retention_names[name],
+            )
         offsets = ["0"] * self.triton_tensor_ndim()
         offsets[reduction_tree.tensor_dim] = self.index_to_str(
             reduction_tree.block_offset()
@@ -585,7 +639,7 @@ def get_extra_kernel_choices(
     kernel_args: list[Any],
     kernel_kwargs: dict[str, Any],
 ) -> list[TritonKernel]:
-    """Return the opt-in retained-LDS candidate for a compatible schedule."""
+    """Return the opt-in local-retention candidate for a compatible schedule."""
     if kernel_cls is not TritonKernel or "fixed_config" in kernel_kwargs:
         return []
     plan = LocalBufferRetention.plan_for(features.node_schedule)
@@ -597,14 +651,6 @@ def get_extra_kernel_choices(
         "local_buffer_retention_plan": plan,
         "override_persistent_reduction": False,
         "override_cooperative_reduction": False,
-        "fixed_config": FixedTritonConfig(
-            {
-                "XBLOCK": 1,
-                "R0_BLOCK": plan.reduction_block,
-                "num_warps": plan.num_warps,
-                "num_stages": 1,
-                "waves_per_eu": plan.waves_per_eu,
-            }
-        ),
+        "fixed_config": FixedTritonConfig(plan.triton_config),
     }
     return [LocalBufferRetentionKernel(*kernel_args, **retained_kwargs)]
