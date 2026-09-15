@@ -9,7 +9,8 @@
 // RUN: triton-opt %t/insert-completion.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore -cse | FileCheck %t/insert-completion.mlir --implicit-check-not=nvws.descriptor_load
 // RUN: triton-opt %t/insert-tma-completion.mlir -split-input-file -allow-unregistered-dialect --verify-each=false --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --triton-nvidia-tma-lowering -cse | FileCheck %t/insert-tma-completion.mlir
 // RUN: triton-opt %t/insert-post-ws-partition.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --tritongpu-partition-loops | FileCheck %t/insert-post-ws-partition.mlir
-// RUN: triton-opt %t/insert-pipeline-two-stages.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops=num-stages=2 --tritongpu-pipeline=num-stages=2 | FileCheck %t/insert-pipeline-two-stages.mlir
+// RUN: triton-opt %t/insert-pipeline-two-stages.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops=num-stages=2 --tritongpu-pipeline=num-stages=2 -cse | FileCheck %t/insert-pipeline-two-stages.mlir
+// RUN: triton-opt %t/insert-pipeline-two-stages.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas='num-stages=2 use-meta-partitioner=true' --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops='num-stages=2 use-meta-ws=true' --tritongpu-pipeline=num-stages=2 -cse | FileCheck %t/insert-pipeline-two-stages.mlir
 // RUN: triton-opt %t/insert-pipeline-four-stages.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=4 --nvws-semaphore-optimize=num-stages=4 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=4 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops=num-stages=4 --tritongpu-pipeline=num-stages=4 | FileCheck %t/insert-pipeline-four-stages.mlir
 
 //--- lowering.mlir
@@ -2205,6 +2206,450 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   }
 }
 
+// -----
+
+// Nested entry handoffs lower to matching arrivals and waits before the
+// recurrence, retaining initialization and completion counts.
+
+#reg1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#reg = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#smem = #ttg.shared_memory
+#tm = #ttng.tensor_memory
+!acc = !ttg.memdesc<128x128xf32, #tmem, #tm, mutable>
+!tile = tensor<128x128xf32, #reg>
+!lhs = !ttg.memdesc<128x64xf16, #shared, #smem>
+!rhs = !ttg.memdesc<64x128xf16, #shared, #smem>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @reader_first_depth_1
+  // The post-inner acquisition is the next outer iteration's incoming token.
+  // The entry mask and selected bit produce phase 1 for initial availability.
+  // The relay does not select a new slot or reset the carried phase word.
+  // Returning the token AND evolved slot/phase state re-arms the next outer trip.
+  // CHECK: [[READY_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: ttng.init_barrier
+  // CHECK: scf.for
+  // CHECK: [[RELAY_VIEW:%.*]] = ttg.memdesc_index [[READY_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[RELAY_VIEW]], 1
+  // CHECK-NEXT: {{.*}}scf.for
+  // CHECK: [[FIRST_WAIT_VIEW:%.*]] = ttg.memdesc_index [[READY_STORAGE]][
+  // CHECK: ttng.wait_barrier [[FIRST_WAIT_VIEW]],
+  // CHECK: ttng.tmem_load
+  tt.func @reader_first_depth_1(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @reader_first_depth_2
+  // The post-inner acquisition is the next outer iteration's incoming token.
+  // The entry mask and selected bit produce phase 1 for initial availability.
+  // The relay does not select a new slot or reset the carried phase word.
+  // Returning the token AND evolved slot/phase state re-arms the next outer trip.
+  // CHECK: [[READY_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64,
+  // CHECK: ttng.init_barrier
+  // CHECK: scf.for
+  // CHECK: [[RELAY_VIEW:%.*]] = ttg.memdesc_index [[READY_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[RELAY_VIEW]], 1
+  // CHECK-NEXT: {{.*}}scf.for
+  // CHECK: [[FIRST_WAIT_VIEW:%.*]] = ttg.memdesc_index [[READY_STORAGE]][
+  // CHECK: ttng.wait_barrier [[FIRST_WAIT_VIEW]],
+  // CHECK: ttng.tmem_load
+  tt.func @reader_first_depth_2(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 2 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c4 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %false, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @reader_first_depth_3
+  // The post-inner acquisition is the next outer iteration's incoming token.
+  // The entry mask and selected bit produce phase 1 for initial availability.
+  // The relay does not select a new slot or reset the carried phase word.
+  // Returning the token AND evolved slot/phase state re-arms the next outer trip.
+  // CHECK: [[READY_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64,
+  // CHECK: ttng.init_barrier
+  // CHECK: scf.for
+  // CHECK: [[RELAY_VIEW:%.*]] = ttg.memdesc_index [[READY_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[RELAY_VIEW]], 1
+  // CHECK-NEXT: {{.*}}scf.for
+  // CHECK: [[FIRST_WAIT_VIEW:%.*]] = ttg.memdesc_index [[READY_STORAGE]][
+  // CHECK: ttng.wait_barrier [[FIRST_WAIT_VIEW]],
+  // CHECK: ttng.tmem_load
+  tt.func @reader_first_depth_3(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 3 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c4 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %false, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @reader_first_all_mmas_fresh
+  // The post-inner acquisition is the next outer iteration's incoming token.
+  // CHECK: ttng.init_barrier
+  tt.func @reader_first_all_mmas_fresh(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %false, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @initialized_reader_first
+  // The real initializer already supplies entry; do not add another arrival.
+  // CHECK: ttng.init_barrier
+  tt.func @initialized_reader_first(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %init = ttng.tmem_store %zero, %acc[%alloc_tok], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+      %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %init, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @initialized_zero_inner
+  // The real initializer already supplies entry; do not add another arrival.
+  // CHECK: ttng.init_barrier
+  tt.func @initialized_zero_inner(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %init = ttng.tmem_store %zero, %acc[%alloc_tok], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+      %inner:2 = scf.for %j = %c0 to %c0 step %c1 iter_args(%carry = %init, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @initialized_zero_outer
+  // The zero-trip result must forward the initialized incoming token.
+  // CHECK: ttng.init_barrier
+  tt.func @initialized_zero_outer(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    %init = ttng.tmem_store %zero, %acc[%alloc_tok], %true {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !tile -> !acc
+    scf.for %i = %c0 to %c0 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %init, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    %final, %final_token = ttng.tmem_load %acc[%init] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : !acc -> !tile
+    "consume_final"(%final) {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : (!tile) -> ()
+    tt.return
+  }
+
+  // CHECK-LABEL: @write_first_control
+  // CHECK: ttng.init_barrier
+  tt.func @write_first_control(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%carry], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        %value, %read = ttng.tmem_load %acc[%mma] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        "consume_inner"(%value) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+        scf.yield {ttg.partition = array<i32: 0, 1>} %read, %true : !ttg.async.token, i1
+      } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // No enclosing reservation is needed for this write-first control.
+  // CHECK-LABEL: @write_first_fresh_depth_2
+  // CHECK: ttng.init_barrier
+  tt.func @write_first_fresh_depth_2(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 2 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    %inner:2 = scf.for %j = %c0 to %c4 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%carry], %false, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+      %value, %read = ttng.tmem_load %acc[%mma] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume_inner"(%value) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %read, %true : !ttg.async.token, i1
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 1>], ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // No enclosing reservation is needed for this write-first control.
+  // CHECK-LABEL: @write_first_fresh_depth_3
+  // CHECK: ttng.init_barrier
+  tt.func @write_first_fresh_depth_3(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 3 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    %inner:2 = scf.for %j = %c0 to %c4 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%carry], %false, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+      %value, %read = ttng.tmem_load %acc[%mma] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume_inner"(%value) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %read, %true : !ttg.async.token, i1
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0>, array<i32: 1>], ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+
+  // CHECK-LABEL: @reader_first_three_levels
+  // CHECK: [[NESTED_READY_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: ttng.init_barrier
+  // CHECK: scf.for
+  // CHECK: scf.for
+  // CHECK: [[NESTED_RELAY_VIEW:%.*]] = ttg.memdesc_index [[NESTED_READY_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[NESTED_RELAY_VIEW]], 1
+  // CHECK-NEXT: {{.*}}scf.for
+  // CHECK: [[NESTED_WAIT_VIEW:%.*]] = ttg.memdesc_index [[NESTED_READY_STORAGE]][
+  // CHECK: ttng.wait_barrier [[NESTED_WAIT_VIEW]],
+  // CHECK: ttng.tmem_load
+  tt.func @reader_first_three_levels(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      scf.for %middle = %c0 to %c2 step %c1 : i32 {
+        %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+          %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+          %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+          %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+          %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+          scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+        } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+        %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+        "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+      } {ttg.partition = array<i32: 0, 1>}
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // Supply belongs to the taken branch, never to the unchanged alternative.
+  // CHECK-LABEL: @reader_first_conditional
+  // CHECK: [[NESTED_READY_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: ttng.init_barrier
+  // CHECK: scf.for
+  // CHECK: scf.if
+  // CHECK: scf.for
+  // CHECK: [[NESTED_RELAY_VIEW:%.*]] = ttg.memdesc_index [[NESTED_READY_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[NESTED_RELAY_VIEW]], 1
+  // CHECK-NEXT: {{.*}}scf.for
+  // CHECK: [[NESTED_WAIT_VIEW:%.*]] = ttg.memdesc_index [[NESTED_READY_STORAGE]][
+  // CHECK: ttng.wait_barrier [[NESTED_WAIT_VIEW]],
+  // CHECK: ttng.tmem_load
+  // CHECK: } else {
+  // CHECK-NOT: ttng.arrive_barrier
+  // CHECK: scf.yield
+  tt.func @reader_first_conditional(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      scf.if %guard {
+        scf.for %middle = %c0 to %c2 step %c1 : i32 {
+          %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+            %value, %read = ttng.tmem_load %acc[%carry] {ttg.partition = array<i32: 0>} : !acc -> !tile
+            %corrected = math.exp2 %value {ttg.partition = array<i32: 0>} : !tile
+            %written = ttng.tmem_store %corrected, %acc[%read], %true {ttg.partition = array<i32: 0>} : !tile -> !acc
+            %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+            scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+          } {ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+          %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+          "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+        } {ttg.partition = array<i32: 0, 1>}
+      } {ttg.partition = array<i32: 0, 1>}
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @smem_reader_first
+  // CHECK: [[SMEM_READY_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: ttng.init_barrier
+  // CHECK: scf.for
+  // CHECK: [[SMEM_RELAY_VIEW:%.*]] = ttg.memdesc_index [[SMEM_READY_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[SMEM_RELAY_VIEW]], 1
+  // CHECK-NEXT: scf.for
+  // CHECK: [[SMEM_WAIT_VIEW:%.*]] = ttg.memdesc_index [[SMEM_READY_STORAGE]][
+  // CHECK: ttng.wait_barrier [[SMEM_WAIT_VIEW]],
+  // CHECK: ttg.local_load
+  tt.func @smem_reader_first(%value: tensor<1xi32, #reg1>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %buffer = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 101 : i32} : () -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      scf.for %j = %c0 to %c2 step %c1 : i32 {
+        %before = ttg.local_load %buffer {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
+        "observe_before_overwrite"(%before) {ttg.partition = array<i32: 0>} : (tensor<1xi32, #reg1>) -> ()
+        ttg.local_store %value, %buffer {ttg.partition = array<i32: 1>} : tensor<1xi32, #reg1> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
+      } {ttg.partition = array<i32: 0, 1>}
+      %after = ttg.local_load %buffer {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
+      "consume_final"(%after) {ttg.partition = array<i32: 0>} : (tensor<1xi32, #reg1>) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+  // A real incoming token can also require the new deferred handoff. The
+  // initial store is outside both loops; each inner recurrence must receive
+  // two arrivals, matching its two independent completion sources.
+  // CHECK-LABEL: @smem_nested_fanin
+  // CHECK: [[FANIN_STORAGE:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: ttng.init_barrier {{.*}}, 2
+  // CHECK: scf.for
+  // CHECK: [[FANIN_RELAY:%.*]] = ttg.memdesc_index [[FANIN_STORAGE]][
+  // CHECK: ttng.arrive_barrier [[FANIN_RELAY]], 2
+  // CHECK-NEXT: scf.for
+  // CHECK: ttng.wait_barrier
+  // CHECK: ttg.local_load
+  tt.func @smem_nested_fanin(%value: tensor<1xi32, #reg1>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %buffer = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 102 : i32} : () -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
+    ttg.local_store %value, %buffer {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32} : tensor<1xi32, #reg1> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      scf.for %j = %c0 to %c2 step %c1 : i32 {
+        %first = ttg.local_load %buffer {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
+        "consume_first"(%first) {ttg.partition = array<i32: 2>} : (tensor<1xi32, #reg1>) -> ()
+        %second = ttg.local_load %buffer {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
+        %corrected = arith.addi %second, %second {ttg.partition = array<i32: 1>} : tensor<1xi32, #reg1>
+        ttg.local_store %corrected, %buffer {ttg.partition = array<i32: 1>} : tensor<1xi32, #reg1> -> !ttg.memdesc<1xi32, #shared1, #smem, mutable>
+        %last = ttg.local_load %buffer {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
+        "consume_last"(%last) {ttg.partition = array<i32: 0>} : (tensor<1xi32, #reg1>) -> ()
+      } {ttg.partition = array<i32: 0, 1, 2>}
+      %after = ttg.local_load %buffer {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
+      "consume_final"(%after) {ttg.partition = array<i32: 2>} : (tensor<1xi32, #reg1>) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
 
 //--- insert-tma-completion.mlir
 // Descriptor-store completion from raw accesses through TMA lowering.
@@ -2435,6 +2880,90 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   }
 }
 
+// -----
+
+// The nested entry arrival precedes the inner recurrence after partitioning
+// and scheduling with either the ordinary or Meta partitioner.
+
+#reg = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#smem = #ttg.shared_memory
+#tm = #ttng.tensor_memory
+!acc = !ttg.memdesc<128x128xf32, #tmem, #tm, mutable>
+!tile = tensor<128x128xf32, #reg>
+!lhs = !ttg.memdesc<128x64xf16, #shared, #smem>
+!rhs = !ttg.memdesc<64x128xf16, #shared, #smem>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @scheduled_reader_first
+  // CHECK: [[PIPE_TMEM:%.*]] = ttng.tmem_alloc
+  // CHECK: [[PIPE_READY:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: [[PIPE_TO_MMA:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64,
+  // CHECK: ttg.warp_specialize
+  // CHECK: default {
+  // CHECK: [[PIPE_ENTRY:%.*]] = ttg.memdesc_index [[PIPE_READY]][
+  // CHECK-NEXT: ttng.wait_barrier [[PIPE_ENTRY]],
+  // CHECK-NEXT: {{.*}}scf.for
+  // The pipeliner peels the first correction into the prologue. The enclosing
+  // reservation must arrive before its first wait/read, not just a later wait
+  // inside the recurrence. CSE reuses the entry arrival's barrier view.
+  // CHECK-NOT: ttng.wait_barrier
+  // CHECK-NOT: ttng.tmem_load
+  // CHECK: [[PIPE_RELAY:%.*]] = ttg.memdesc_index [[PIPE_READY]][
+  // CHECK-NEXT: ttng.arrive_barrier [[PIPE_RELAY]], 1
+  // CHECK-NOT: scf.for
+  // CHECK-NOT: ttng.wait_barrier
+  // CHECK-NOT: ttng.tmem_load
+  // CHECK: ttng.wait_barrier [[PIPE_RELAY]],
+  // CHECK-NEXT: [[PIPE_FIRST_TILE:%.*]] = ttg.memdesc_index [[PIPE_TMEM]][
+  // CHECK-NEXT: {{.*}}ttng.tmem_load [[PIPE_FIRST_TILE]][]
+  // CHECK-NEXT: [[PIPE_FIRST_VALUE:%.*]] = math.exp2
+  // CHECK-NEXT: {{.*}}ttng.tmem_store [[PIPE_FIRST_VALUE]], [[PIPE_FIRST_TILE]][]
+  // CHECK-NEXT: [[PIPE_FIRST_DONE:%.*]] = ttg.memdesc_index [[PIPE_TO_MMA]][
+  // CHECK-NEXT: ttng.arrive_barrier [[PIPE_FIRST_DONE]], 1
+  // The inner recurrence keeps the same wait/correction/completion protocol.
+  // CHECK-NEXT: [[PIPE_INNER:%[a-zA-Z0-9_]+]]:2 = scf.for
+  // CHECK: [[PIPE_WAIT:%.*]] = ttg.memdesc_index [[PIPE_READY]][
+  // CHECK-NEXT: ttng.wait_barrier [[PIPE_WAIT]],
+  // CHECK-NEXT: [[PIPE_TILE:%.*]] = ttg.memdesc_index [[PIPE_TMEM]][
+  // CHECK-NEXT: {{.*}}ttng.tmem_load [[PIPE_TILE]][]
+  // CHECK-NEXT: [[PIPE_VALUE:%.*]] = math.exp2
+  // CHECK-NEXT: {{.*}}ttng.tmem_store [[PIPE_VALUE]], [[PIPE_TILE]][]
+  // CHECK-NEXT: [[PIPE_DONE:%.*]] = ttg.memdesc_index [[PIPE_TO_MMA]][
+  // CHECK-NEXT: ttng.arrive_barrier [[PIPE_DONE]], 1
+  // CHECK: scf.yield
+  // The final observer reacquires READY at the returned slot before the next
+  // outer iteration inherits that slot and the updated phase state.
+  // CHECK: [[PIPE_FINAL_WAIT:%.*]] = ttg.memdesc_index [[PIPE_READY]][[[PIPE_INNER]]#0]
+  // CHECK-NEXT: ttng.wait_barrier [[PIPE_FINAL_WAIT]],
+  // CHECK-NEXT: [[PIPE_FINAL_TILE:%.*]] = ttg.memdesc_index [[PIPE_TMEM]][[[PIPE_INNER]]#0]
+  // CHECK-NEXT: [[PIPE_FINAL_VALUE:%.*]], {{%.*}} = ttng.tmem_load [[PIPE_FINAL_TILE]][]
+  // CHECK-NEXT: "consume"([[PIPE_FINAL_VALUE]])
+  // CHECK-NEXT: scf.yield {{%.*}}, [[PIPE_INNER]]#0, {{%.*}} : !ttg.async.token, i32, i32
+  tt.func @scheduled_reader_first(%lhs: !lhs, %rhs: !rhs, %guard: i1) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c4 = arith.constant 4 : i32
+    %true = arith.constant true
+    %false = arith.constant false
+    %zero = arith.constant dense<0.0> : !tile
+    %acc, %alloc_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 100 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %c0 to %c2 step %c1 : i32 {
+      %inner:2 = scf.for %j = %c0 to %c2 step %c1 iter_args(%carry = %alloc_tok, %use_acc = %false) -> (!ttg.async.token, i1) : i32 {
+        %value, %read = ttng.tmem_load %acc[%carry] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : !acc -> !tile
+        %corrected = math.exp2 %value {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : !tile
+        %written = ttng.tmem_store %corrected, %acc[%read], %true {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : !tile -> !acc
+        %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[%written], %use_acc, %true {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+        scf.yield {ttg.partition = array<i32: 0, 1>} %mma, %true : !ttg.async.token, i1
+      } {tt.scheduled_max_stage = 1 : i32, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 1>, array<i32: 1>]}
+      %out, %read_out = ttng.tmem_load %acc[%inner#0] {ttg.partition = array<i32: 0>} : !acc -> !tile
+      "consume"(%out) {ttg.partition = array<i32: 0>} : (!tile) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
 
 //--- insert-pipeline-four-stages.mlir
 // Owner-cycle scheduling through a four-stage pipeline.
