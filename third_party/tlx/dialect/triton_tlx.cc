@@ -579,8 +579,8 @@ void init_triton_tlx_ir(py::module_ &m) {
               std::vector<unsigned> order, Type &elemType,
               std::vector<unsigned> CTAsPerCGA,
               std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
-              bool fp4Padded, bool swizzled,
-              std::vector<int64_t> tileShape, unsigned alignment) {
+              bool fp4Padded, bool swizzled, std::vector<int64_t> tileShape,
+              unsigned alignment) {
              assert(atomShape.size() == order.size());
              assert(order.size() == CTAsPerCGA.size());
              assert(CTAsPerCGA.size() == CTASplitNum.size());
@@ -592,10 +592,10 @@ void init_triton_tlx_ir(py::module_ &m) {
                  makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              ttg::NVMMASharedEncodingAttr atomLayout;
              // swizzlingByteWidth is not passed through: for the swizzled
-             // path the (shape, order) builder overload derives it (0/32/64/128)
-             // from the contiguous dim size in bytes, so it is implied by
-             // atomShape; the explicit-width overload is only needed for the
-             // unswizzled path where width is definitionally 0.
+             // path the (shape, order) builder overload derives it
+             // (0/32/64/128) from the contiguous dim size in bytes, so it is
+             // implied by atomShape; the explicit-width overload is only needed
+             // for the unswizzled path where width is definitionally 0.
              if (swizzled) {
                atomLayout = ttg::NVMMASharedEncodingAttr::get(
                    context, atomShape, order, CTALayout, elemType, fp4Padded);
@@ -610,32 +610,31 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
                  context, std::move(linearLayout), alignment));
            })
-      .def("make_nv_mma_layout_attr",
-           [](TritonOpBuilder &self, std::vector<unsigned> version,
-              std::vector<unsigned> warpsPerCTA,
-              std::vector<unsigned> instrShape,
-              std::vector<std::vector<int32_t>> cgaBases) {
-             if (version.size() != 2 || version[0] != 3)
-               throw std::invalid_argument(
-                   "nv_mma_layout currently supports version (3, 0) only");
-             if (warpsPerCTA.size() != 2 ||
-                 llvm::any_of(warpsPerCTA, [](unsigned warps) {
-                   return warps == 0;
-                 }))
-               throw std::invalid_argument(
-                   "warps_per_cta must contain two positive entries");
-             if (instrShape.size() != 3 ||
-                 llvm::any_of(instrShape,
-                              [](unsigned dim) { return dim == 0; }))
-               throw std::invalid_argument(
-                   "instr_shape must contain three positive entries");
-             auto context = self.getBuilder().getContext();
-             auto cgaLayout =
-                 makeCGALayoutFromBases(context, cgaBases, /*rank=*/2);
-             return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
-                 context, version[0], version[1], warpsPerCTA, cgaLayout,
-                 instrShape));
-           })
+      .def(
+          "make_nv_mma_layout_attr",
+          [](TritonOpBuilder &self, std::vector<unsigned> version,
+             std::vector<unsigned> warpsPerCTA,
+             std::vector<unsigned> instrShape,
+             std::vector<std::vector<int32_t>> cgaBases) {
+            if (version.size() != 2 || version[0] != 3)
+              throw std::invalid_argument(
+                  "nv_mma_layout currently supports version (3, 0) only");
+            if (warpsPerCTA.size() != 2 ||
+                llvm::any_of(warpsPerCTA,
+                             [](unsigned warps) { return warps == 0; }))
+              throw std::invalid_argument(
+                  "warps_per_cta must contain two positive entries");
+            if (instrShape.size() != 3 ||
+                llvm::any_of(instrShape, [](unsigned dim) { return dim == 0; }))
+              throw std::invalid_argument(
+                  "instr_shape must contain three positive entries");
+            auto context = self.getBuilder().getContext();
+            auto cgaLayout =
+                makeCGALayoutFromBases(context, cgaBases, /*rank=*/2);
+            return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
+                context, version[0], version[1], warpsPerCTA, cgaLayout,
+                instrShape));
+          })
       .def("make_nv_mma_encoding_attr",
            [](TritonOpBuilder &self, Value opndA, Value opndAcc,
               unsigned versionMajor, unsigned versionMinor,
@@ -914,11 +913,13 @@ void init_triton_tlx_ir(py::module_ &m) {
           py::arg("pred").none())
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
-             self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);
+             Value barrierId = self.create<ttng::UserNamedBarrierIdOp>(barrier);
+             self.create<ttng::NamedBarrierWaitOp>(barrierId, numThreads);
            })
       .def("create_named_barrier_arrive",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
-             self.create<ttng::NamedBarrierArriveOp>(barrier, numThreads);
+             Value barrierId = self.create<ttng::UserNamedBarrierIdOp>(barrier);
+             self.create<ttng::NamedBarrierArriveOp>(barrierId, numThreads);
            })
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {
@@ -1530,8 +1531,8 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_workgroup_barrier",
            [](TritonOpBuilder &self) -> void {
              // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
-             // bracketed by SchedBarrier(0) guards so the scheduler cannot hoist
-             // ops across the ping-pong cluster border.
+             // bracketed by SchedBarrier(0) guards so the scheduler cannot
+             // hoist ops across the ping-pong cluster border.
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
              self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
