@@ -1,0 +1,10 @@
+{
+  "priority": 20,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": [],
+  "selection": "optimize-amd-tlx-attention",
+  "documents": [
+    "amd-attention-optimization.md",
+    "references/attention-variant-study.md"
+  ]
+}
