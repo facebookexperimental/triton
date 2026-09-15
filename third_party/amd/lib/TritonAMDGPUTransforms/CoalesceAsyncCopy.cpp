@@ -298,6 +298,102 @@ private:
   const DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> &asyncCopyContiguity;
 };
 
+// Native buffer-to-LDS loads carry scalar base pointers and distributed tensor
+// offsets.  Unlike AsyncCopyGlobalToLocalOp, there is no source pointer tensor
+// to rewrite, so make the offsets (and the shape-matched mask/other operands)
+// own the packet layout required by a padded LDS destination.
+struct CoalesceBufferLoadToLocalWrites
+    : public OpRewritePattern<triton::amdgpu::BufferLoadToLocalOp> {
+  CoalesceBufferLoadToLocalWrites(const triton::AMD::TargetInfo &targetInfo,
+                                  MLIRContext *ctx)
+      : OpRewritePattern(ctx), targetInfo(targetInfo) {}
+
+  LogicalResult matchAndRewrite(triton::amdgpu::BufferLoadToLocalOp loadOp,
+                                PatternRewriter &rewriter) const override {
+    auto dstTy = loadOp.getDest().getType();
+    auto paddedEnc =
+        dyn_cast<ttg::PaddedSharedEncodingAttr>(dstTy.getEncoding());
+    if (!paddedEnc)
+      return rewriter.notifyMatchFailure(loadOp, "dst encoding is not #padded");
+
+    auto offsetTy = cast<RankedTensorType>(loadOp.getOffsets().getType());
+    auto ptrTy =
+        cast<RankedTensorType>(mlir::LLVM::AMD::getPointerTypeWithShape(
+            loadOp.getPtr(), loadOp.getOffsets()));
+
+    unsigned loadContig = loadOp.getContiguity();
+    if (!targetInfo.supportsDirectToLdsScatter()) {
+      unsigned paddedLimit =
+          paddedEnc.getMinInterval() / targetInfo.getWarpSize();
+      loadContig = std::min(loadContig, paddedLimit);
+    }
+    loadContig = fitToValidDirectToLdsVecSize(
+        loadContig, dstTy.getElementTypeBitWidth(), targetInfo);
+    if (loadContig == 0)
+      return rewriter.notifyMatchFailure(
+          loadOp, "no supported direct-to-LDS vector width");
+
+    unsigned currentVec = loadContig;
+    if (LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrTy, paddedEnc,
+                                      dstTy.getAllocShape(), currentVec)) {
+      loadOp.setContiguity(currentVec);
+      return rewriter.notifyMatchFailure(loadOp, "already writes coalesced");
+    }
+
+    auto *ctx = loadOp.getContext();
+    auto mod = loadOp->getParentOfType<ModuleOp>();
+    int numWarps = ttg::lookupNumWarps(loadOp);
+    int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+    LinearLayout sharedLayout = paddedEnc.getLinearComponent();
+    auto newRegLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
+        sharedLayout, loadContig, threadsPerWarp, numWarps, offsetTy.getShape(),
+        ttg::getCGALayout(offsetTy.getEncoding()), ctx);
+    if (failed(newRegLayout))
+      return rewriter.notifyMatchFailure(
+          loadOp, "could not derive padded direct-to-LDS packet ownership");
+
+    auto newEnc = ttg::LinearEncodingAttr::get(ctx, std::move(*newRegLayout));
+    if (newEnc == offsetTy.getEncoding())
+      return rewriter.notifyMatchFailure(loadOp,
+                                         "derived ownership is unchanged");
+
+    auto newPtrTy = ptrTy.cloneWithEncoding(newEnc);
+    unsigned verifiedVec = loadContig;
+    if (!LLVM::AMD::canLoadDirectToLDS(targetInfo, newPtrTy, paddedEnc,
+                                       dstTy.getAllocShape(), verifiedVec))
+      return loadOp.emitError(
+          "derived padded packet ownership cannot lower direct-to-LDS");
+
+    auto convertLayout = [&rewriter, newEnc](Location loc, Value old) {
+      auto oldTy = cast<RankedTensorType>(old.getType());
+      return ttg::ConvertLayoutOp::create(rewriter, loc,
+                                          oldTy.cloneWithEncoding(newEnc), old);
+    };
+
+    Location loc = loadOp.getLoc();
+    Value offsets = convertLayout(loc, loadOp.getOffsets());
+    Value mask = loadOp.getMask();
+    Value other = loadOp.getOther();
+    if (mask)
+      mask = convertLayout(loc, mask);
+    if (other)
+      other = convertLayout(loc, other);
+
+    rewriter.modifyOpInPlace(loadOp, [&]() {
+      loadOp.getOffsetsMutable().assign(offsets);
+      if (mask)
+        loadOp.getMaskMutable().assign(mask);
+      if (other)
+        loadOp.getOtherMutable().assign(other);
+      loadOp.setContiguity(verifiedVec);
+    });
+    return success();
+  }
+
+private:
+  const triton::AMD::TargetInfo &targetInfo;
+};
+
 } // anonymous namespace
 
 class TritonAMDGPUCoalesceAsyncCopyPass
@@ -314,33 +410,59 @@ public:
                             targetInfo.getISAFamily()))
       return; // This pass is CDNA3 and CDNA4 specific.
 
-    if (!useAsyncCopy) {
-      bool hasAsyncCopy = m->walk([](ttg::AsyncCopyGlobalToLocalOp) {
-                             return WalkResult::interrupt();
-                           }).wasInterrupted();
-      if (!hasAsyncCopy)
-        return;
-    }
-
     MLIRContext *context = &getContext();
     mlir::RewritePatternSet patterns(context);
 
-    // Precompute the contiguity of all AsyncCopy ops based on the src and
-    // mask contiguity/alignment to avoid rebuilding ModuleAxisInfoAnalysis
-    // after every IR change.
+    // Collect both direct-to-LDS forms in one traversal. Precompute AsyncCopy
+    // contiguity before rewriting and preserve the corresponding proof on
+    // native buffer loads for alternate lowerings.
     AMD::ModuleAxisInfoAnalysis axisAnalysis(m);
     DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> asyncCopyContiguity;
-    m->walk([&](ttg::AsyncCopyGlobalToLocalOp copyOp) {
-      unsigned contiguity =
-          mlir::LLVM::AMD::getContiguity(copyOp.getSrc(), axisAnalysis);
-      if (auto mask = copyOp.getMask()) {
+    bool hasDirectToLdsCopy = false;
+    m->walk([&](Operation *op) {
+      if (auto copyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
+        hasDirectToLdsCopy = true;
+        unsigned contiguity =
+            mlir::LLVM::AMD::getContiguity(copyOp.getSrc(), axisAnalysis);
+        if (auto mask = copyOp.getMask())
+          contiguity = std::min<unsigned>(contiguity,
+                                          axisAnalysis.getMaskAlignment(mask));
+        asyncCopyContiguity.insert({copyOp, contiguity});
+        return;
+      }
+
+      auto loadOp = dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op);
+      if (!loadOp)
+        return;
+      hasDirectToLdsCopy = true;
+      unsigned contiguity = mlir::LLVM::AMD::getVectorSize(
+          loadOp.getPtr(), loadOp.getOffsets(), axisAnalysis);
+      if (auto mask = loadOp.getMask())
         contiguity =
             std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
+      loadOp.setContiguity(
+          std::max<unsigned>(loadOp.getContiguity(), contiguity));
+
+      Type pointerType = mlir::LLVM::AMD::getPointerTypeWithShape(
+          loadOp.getPtr(), loadOp.getOffsets());
+      auto freeVariableMasks = mlir::getFreeVariableMasks(pointerType);
+      int32_t redundantWaveMask =
+          freeVariableMasks.lookup(StringAttr::get(context, "warp"));
+      if (redundantWaveMask != 0) {
+        loadOp->setAttr(
+            "amdgpu.redundant_wave_mask",
+            IntegerAttr::get(IntegerType::get(context, 32), redundantWaveMask));
+      } else {
+        loadOp->removeAttr("amdgpu.redundant_wave_mask");
       }
-      asyncCopyContiguity.insert({copyOp, contiguity});
     });
+
+    if (!useAsyncCopy && !hasDirectToLdsCopy)
+      return;
+
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
                                           context);
+    patterns.add<CoalesceBufferLoadToLocalWrites>(targetInfo, context);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();

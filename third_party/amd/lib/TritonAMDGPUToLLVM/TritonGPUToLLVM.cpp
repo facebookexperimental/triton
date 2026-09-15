@@ -194,7 +194,8 @@ public:
 
 class TritonLLVMConversionTarget : public ConversionTarget {
 public:
-  explicit TritonLLVMConversionTarget(MLIRContext &ctx)
+  explicit TritonLLVMConversionTarget(MLIRContext &ctx,
+                                      bool requireBufferLoadToLocalLowering)
       : ConversionTarget(ctx) {
     addLegalDialect<LLVM::LLVMDialect>();
     addLegalDialect<ROCDL::ROCDLDialect>();
@@ -217,6 +218,8 @@ public:
     // These have no lowering after this pass, so a pattern that bails out
     // must fail the conversion instead of leaving the op behind. The rest of
     // the dialect stays unmarked: some of it is lowered later.
+    if (requireBufferLoadToLocalLowering)
+      addIllegalOp<triton::amdgpu::BufferLoadToLocalOp>();
     addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
     addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
@@ -297,7 +300,9 @@ struct ConvertTritonAMDGPUToLLVM
     option.overrideIndexBitwidth(32);
 
     TritonAMDGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);
-    TritonLLVMConversionTarget convTarget(*context);
+    TritonLLVMConversionTarget convTarget(*context,
+                                          targetInfo.getISAFamily() ==
+                                              triton::amdgpu::ISAFamily::CDNA4);
 
     // Allocate shared memory and set barrier
     auto allocationFn = [&targetInfo](Operation *op) {

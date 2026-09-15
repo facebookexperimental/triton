@@ -426,7 +426,7 @@ class CMakeBuild(build_ext):
                                   cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu"]), *BackendInstaller.copy_externals()]
+backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu", "tlx_wave"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():

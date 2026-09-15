@@ -1,3 +1,6 @@
 [submodule "sleef"]
 	path = third_party/sleef
 	url = https://github.com/shibatch/sleef
+[submodule "third_party/wave"]
+	path = third_party/wave
+	url = https://github.com/hardcode84/7
