@@ -30,6 +30,9 @@ TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
       [ctx](nvidia_gpu::TensorDescIm2ColType type) -> std::optional<Type> {
         return LLVM::LLVMPointerType::get(ctx, 0);
       });
+  addConversion([ctx](nvidia_gpu::NamedBarrierIdType type) -> Type {
+    return IntegerType::get(ctx, 32);
+  });
   addConversion([&](RankedTensorType type) -> std::optional<Type> {
     return convertTritonTensorType(type, targetInfo);
   });
