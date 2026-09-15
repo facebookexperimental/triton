@@ -262,6 +262,12 @@
 - **Fix**: Treat either `scf.for` or `scf.while` as the nearest enclosing producer loop when deciding `releaseOnLastIterOnly`. Separately, thread every guarded data-channel accumulation counter through the persistent while and merge it through the collective `scf.if`: taken advances, skipped preserves. The unconditional CLC broadcast counter remains distinct.
 - **Tests**: `metaws_reduce_dq_kv_release_last_iter.mlir` runs its HSTU fixture with both outer-loop forms and checks the last-inner-iteration predicate. `ws_while_loop_autows.mlir` checks direct and nested counters through `scf.if` and the `scf.while` backedge. The HSTU jagged E2E includes a 480-tile case so physical CTAs are reused; dQ/dK/dV relative-L2 is `2.72e-3 / 2.34e-3 / 2.35e-3`.
 
+### 35. Empty final sibling loop drops an outer-produced operand release (2026-09-12, fixed; T288013887)
+- **Symptom**: Splitting HSTU self-attention backward into a masked Q loop followed by an unmasked Q loop is correct for a single CLC wave but deadlocks as soon as physical CTAs are reused. Uniform input reproduces it; jagged holes are not required. The last KV tile has an empty unmasked range.
+- **Root cause**: K/V are loaded once per persistent KV tile and consumed by MMAs in two sequential sibling `scf.for` loops. Code partitioning selected the lexically last MMA as the EMPTY completion and predicated it on that loop's last iteration. When the final sibling loop had zero iterations, no completion fired, so the next CLC transaction blocked forever acquiring the single-copy operand buffer.
+- **Fix**: When one outer-produced operand channel has MMAv5 consumers in multiple sibling loops, emit a single `tcgen5.commit` after the final sibling loop instead of an inline MMA completion. The post-loop commit drains every MMA issued by any nonempty sibling and still executes when the final loop is empty, restoring the one-load/one-release outer cadence.
+- **Validation**: HSTU CLC backward passes `L=128, Z=80` (160 tiles, empty unmasked loop, reused CTAs), `L=256, Z=120` uniform, and the 480-tile jagged production case. Relative-L2 for dQ/dK/dV is about `2.34e-3 / 2.34e-3 / 2.35e-3`. The existing high-grid jagged E2E is the deadlock regression.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

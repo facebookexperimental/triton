@@ -202,6 +202,13 @@ causes multiple phase flips per outer transaction. A skipped while iteration
 then gives those asynchronous flips time to overtake the preserved counter, so
 the next valid tile can wait forever on an already-passed phase.
 
+A related zero-trip case occurs when an outer-produced operand feeds multiple
+sequential sibling loops. Predicating the EMPTY completion on the last
+iteration of the lexically final loop is insufficient because that loop may be
+empty. Such channels use one `tcgen5.commit` after the final sibling loop, so
+the outer-cadence release occurs exactly once regardless of which inner loops
+execute.
+
 Two kinds of counters can live on a persistent while:
 
 - **Nested-loop counter** — for the inner warp-specialized `scf.for` (e.g. the

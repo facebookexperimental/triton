@@ -3822,6 +3822,60 @@ void insertAsyncComm(
           producerAcquirePoint = producerAcquireForChannelLoop;
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
+        // An outer-produced operand can be consumed by multiple sequential
+        // inner loops (for example HSTU's masked loop followed by an optional
+        // unmasked loop). An inline EMPTY completion on the last loop's MMA is
+        // insufficient: when that loop has zero iterations, no completion is
+        // emitted and the next persistent tile deadlocks acquiring the input.
+        // Commit once after the last sibling loop instead. The commit follows
+        // all MMAs from every nonempty sibling and still arrives when all of
+        // them are empty, matching the one-load/one-release outer cadence.
+        SmallVector<scf::ForOp> siblingConsumerLoops;
+        if (addCompletionBarrier) {
+          Operation *siblingParent = nullptr;
+          bool areSiblings = true;
+          for (Operation *consumer : filteredOps) {
+            auto loop = consumer->getParentOfType<scf::ForOp>();
+            if (!loop) {
+              areSiblings = false;
+              break;
+            }
+            if (!siblingParent)
+              siblingParent = loop->getParentOp();
+            else if (loop->getParentOp() != siblingParent) {
+              areSiblings = false;
+              break;
+            }
+            if (!llvm::is_contained(siblingConsumerLoops, loop))
+              siblingConsumerLoops.push_back(loop);
+          }
+          if (!areSiblings)
+            siblingConsumerLoops.clear();
+        }
+        if (siblingConsumerLoops.size() > 1) {
+          llvm::sort(siblingConsumerLoops, [](scf::ForOp lhs, scf::ForOp rhs) {
+            return lhs->isBeforeInBlock(rhs);
+          });
+          Operation *prodLoop = headProducer->getParentOp();
+          while (prodLoop && !isa<scf::ForOp, scf::WhileOp>(prodLoop))
+            prodLoop = prodLoop->getParentOp();
+          bool producerLoopEnclosesConsumers = false;
+          for (Operation *anc = siblingConsumerLoops.front()->getParentOp();
+               anc && !isa<triton::FuncOp>(anc); anc = anc->getParentOp()) {
+            if (anc == prodLoop) {
+              producerLoopEnclosesConsumers = true;
+              break;
+            }
+          }
+          if (producerLoopEnclosesConsumers) {
+            nestedInsertionTarget = siblingConsumerLoops.back();
+            addCompletionBarrier = false;
+            LDBG("outer-produced channel "
+                 << masterChannel->uniqID << " spans "
+                 << siblingConsumerLoops.size()
+                 << " sibling MMA loops; commit after the final loop");
+          }
+        }
         if (!addCompletionBarrier) {
           // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
