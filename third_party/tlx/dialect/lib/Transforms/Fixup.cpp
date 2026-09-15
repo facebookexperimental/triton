@@ -53,44 +53,28 @@ static SmallVector<int32_t> invertPermutation(ArrayRef<int32_t> order) {
 // verifiable. The concrete layout is still resolved later.
 static bool isEncodingUniformArithOp(Operation *op) {
   if (isa<arith::ConstantOp>(op))
-    return false; // handled as a leaf when retyped, not as a consumer
-  // Propagate the placeholder across ops whose generic MLIR verifier compares
-  // operand/result *types* (ignoring the TLX wrapper) and would otherwise
-  // reject a placeholder meeting a null/concrete sibling: same-type elementwise
-  // (SameOperandsAndResultType), select/cmp (whose condition / i1 result differ
-  // in type), and the arith cast ops (which change the element type but
-  // preserve shape/layout). Keyed on the trait + explicit op list rather than a
-  // hard-coded dialect name. NB: deliberately NOT the broad Elementwise trait
-  // -- it also matches ops that legitimately mix a pinned and an unpinned
-  // operand, which would over-propagate the pin. The element type may differ
-  // across the op (casts); only the encoding is propagated.
+    return false;
   if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultType>() &&
       !isa<arith::SelectOp, arith::CmpFOp, arith::CmpIOp, arith::ExtFOp,
            arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp,
            arith::SIToFPOp, arith::FPToSIOp, arith::BitcastOp>(op))
     return false;
-  // Encoding-uniform == every ranked-tensor operand/result shares one shape
-  // (true for elementwise / select / cmp). Scalars are ignored.
+
   ArrayRef<int64_t> shape;
   bool haveShape = false;
-  auto sameShape = [&](Type ty) -> bool {
-    if (auto t = dyn_cast<RankedTensorType>(ty)) {
-      if (!haveShape) {
-        shape = t.getShape();
-        haveShape = true;
-      } else if (t.getShape() != shape) {
-        return false;
-      }
+  auto hasSameShape = [&](Type type) {
+    auto tensorType = dyn_cast<RankedTensorType>(type);
+    if (!tensorType)
+      return true;
+    if (!haveShape) {
+      shape = tensorType.getShape();
+      haveShape = true;
+      return true;
     }
-    return true;
+    return tensorType.getShape() == shape;
   };
-  for (Type ty : op->getOperandTypes())
-    if (!sameShape(ty))
-      return false;
-  for (Type ty : op->getResultTypes())
-    if (!sameShape(ty))
-      return false;
-  return haveShape;
+  return llvm::all_of(op->getOperandTypes(), hasSameShape) &&
+         llvm::all_of(op->getResultTypes(), hasSameShape) && haveShape;
 }
 
 static bool hasSameOperandsEncodingTrait(Operation *op) {
