@@ -7539,6 +7539,51 @@ def test_tlx_wave_converter_does_not_carry_implicit_lds_token_across_for(
     del ctx
 
 
+def test_tlx_wave_converter_carries_loop_tail_memory_issue_to_source_barrier(tmp_path, ):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_loop_tail_issue(
+      %value: tensor<64xf32, #blocked>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #shared, #smem, mutable>
+    scf.for %i = %c0 to %c2 step %c1 {
+      ttg.barrier all
+      ttg.local_store %value, %alloc : tensor<64xf32, #blocked> -> !ttg.memdesc<64xf32, #shared, #smem, mutable>
+    }
+    ttg.barrier all
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (loop_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    (store_op, ) = [op for op in output.target_program.ops if op.kind == "local_store"]
+    barriers = [op for op in output.target_program.ops if op.kind == "barrier"]
+    body = output.target_program.regions[loop_op.region_ids[0]]
+    assert converter_target_ir.attrs_dict(loop_op)["init_arg_count"] == 1
+    assert len(loop_op.results) == len(body.yield_value_ids) == 1
+    assert len(body.block_arg_ids) == 2
+    assert converter_target_ir.attrs_dict(store_op)["issue_order_result_count"] == 1
+    assert output.target_program.values[store_op.results[-1]].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_MEMORY_COMPLETION)
+    assert all(converter_target_ir.attrs_dict(op)["barrier_order_dependency_count"] == 1 for op in barriers)
+    wave = output.emitted_module.text
+    assert wave.count("wave.scatter") == 1
+    assert wave.count("wave.barrier") == 2
+    _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.ds_store") == 1
+    del ctx
+
+
 @pytest.mark.parametrize(
     "waves_per_eu,expected_target_waves",
     [(1, 2), (4, 4)],
@@ -9483,6 +9528,9 @@ def test_tlx_wave_converter_pipeline_keeps_if_stores_in_branches(tmp_path):
     wave = output.emitted_module.text
     assert "wave.store" not in wave.split("scf.if", 1)[0]
     assert wave.count("wave.scatter") == 2
+    assert "scf.if" in wave and "!wave.mem.token" in wave
+    canonical = _run_wave_canonicalize(wave)
+    assert canonical.count("wave.scatter") == 2
     _run_wave_verify(wave)
     del ctx
 
@@ -9511,7 +9559,41 @@ def test_tlx_wave_converter_pipeline_lowers_result_free_if_without_else(tmp_path
     assert [output.target_program.ops[op_id].kind for op_id in then_region.op_ids] == ["store"]
     assert else_region.op_ids == ()
     assert output.emitted_module.text.count("wave.scatter") == 1
+    canonical = _run_wave_canonicalize(output.emitted_module.text)
+    assert canonical.count("wave.scatter") == 1
     _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_keeps_store_in_result_free_loop(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_loop_store(
+      %ptr: tensor<64x!tt.ptr<f32>, #blocked>,
+      %value: tensor<64xf32, #blocked>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    scf.for %i = %c0 to %c2 step %c1 {
+      tt.store %ptr, %value : tensor<64x!tt.ptr<f32>, #blocked>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    loop_line = next(line for line in wave.splitlines() if "scf.for" in line)
+    assert "iter_args" in loop_line
+    assert "!wave.mem.token" in loop_line
+    assert wave.count("wave.scatter") == 1
+    canonical = _run_wave_canonicalize(wave)
+    assert canonical.count("wave.scatter") == 1
+    _run_wave_verify(wave)
     del ctx
 
 
@@ -16540,8 +16622,10 @@ def test_tlx_wave_converter_pipeline_lowers_raw_masked_load_store(tmp_path):
     assert all('bit_offset = <"32*item">' in line for line in memory_lines), memory_lines
     assert all("packet_bindings" not in line for line in memory_lines)
     assert wave.count("wave.where") == 2
-    assert wave.count("otherwise") == 1
+    assert wave.count("otherwise") == 2
     assert "wave.select" not in wave
+    canonical = _run_wave_canonicalize(wave)
+    assert canonical.count("wave.scatter") == 1
     binary_module = _run_wave_compile_kernels(wave)
     assert "gpu.binary @kernels" in binary_module
     del ctx

@@ -22,8 +22,9 @@ def thread_barrier_issue_order(target_program):
     ordinary SSA dependency. The barrier result is projected before reaching
     following memory issuers.
 
-    Structured operations carry only the LDS-read completion frontier needed
-    by a nested source barrier. DMA completion is never part of that frontier.
+    Structured operations carry the LDS-read completion and memory-issue
+    frontiers that a nested or following source barrier needs. DMA completion
+    remains owned by the explicit wait protocol.
     """
     values = list(target_program.values)
     ops = list(target_program.ops)
@@ -188,7 +189,267 @@ def thread_barrier_issue_order(target_program):
         ops=tuple(ops),
         regions=tuple(regions),
     )
-    return _thread_structured_lds_read_completion(ordered_program)
+    ordered_program = _thread_structured_lds_read_completion(ordered_program)
+    return _thread_structured_memory_issue(ordered_program)
+
+
+def _thread_structured_memory_issue(target_program):
+    """Carry memory issue to source barriers across structured control flow."""
+    values = list(target_program.values)
+    ops = list(target_program.ops)
+    regions = list(target_program.regions)
+    producer_by_result = {int(result_id): op for op in ops for result_id in op.results}
+
+    def add_value(domain, debug_name, resource_target_ids=()):
+        value_id = len(values)
+        values.append(
+            target_ir.TargetValue(
+                value_id,
+                target_ir.TargetType("token", "token"),
+                debug_name=debug_name,
+                event_domain=domain,
+                resource_target_ids=tuple(resource_target_ids),
+            ))
+        return value_id
+
+    def resource_targets(target_value_ids):
+        return tuple(
+            dict.fromkeys(resource_target_id for target_value_id in target_value_ids
+                          for resource_target_id in values[int(target_value_id)].resource_target_ids))
+
+    def join_frontier(op_ids, operands, source_op_index, debug_name):
+        operands = tuple(dict.fromkeys(int(value) for value in operands))
+        if len(operands) == 1:
+            return operands[0]
+        domain = (target_ir.EVENT_DOMAIN_MEMORY_COMPLETION if operands else target_ir.EVENT_DOMAIN_EMPTY)
+        result_id = add_value(
+            domain,
+            debug_name,
+            resource_targets(operands),
+        )
+        op_id = len(ops)
+        ops.append(
+            target_ir.TargetOp(
+                op_id,
+                "token_join" if operands else "token",
+                operands,
+                (result_id, ),
+                target_ir._attrs_tuple(
+                    ({
+                        "event_domain": target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+                        "input_count": len(operands),
+                    } if operands else {
+                        "event_domain": target_ir.EVENT_DOMAIN_EMPTY,
+                    }),
+                    op_id,
+                ),
+                source_op_index=source_op_index,
+            ))
+        producer_by_result[result_id] = ops[-1]
+        op_ids.append(op_id)
+        return result_id
+
+    def project_frontier(op_ids, operands, source_op_index, debug_name):
+        operands = tuple(dict.fromkeys(int(value) for value in operands))
+        if not operands:
+            fail(
+                "TLXW_BARRIER_ORDER_EMPTY_PROJECTION",
+                STAGE,
+                "structured issue-order projection requires an input token",
+                source_op_index=source_op_index,
+            )
+        result_id = add_value(
+            target_ir.EVENT_DOMAIN_MEMORY_ISSUE,
+            debug_name,
+            resource_targets(operands),
+        )
+        op_id = len(ops)
+        ops.append(
+            target_ir.TargetOp(
+                op_id,
+                "issue_token",
+                operands,
+                (result_id, ),
+                target_ir._attrs_tuple(
+                    {
+                        "input_count": len(operands),
+                        "projection_domain": target_ir.EVENT_DOMAIN_MEMORY_ISSUE,
+                        "projection_provenance": _PRE_BARRIER_PROVENANCE,
+                    }, op_id),
+                source_op_index=source_op_index,
+            ))
+        producer_by_result[result_id] = ops[-1]
+        op_ids.append(op_id)
+        return result_id
+
+    has_barrier_cache = {}
+
+    def has_barrier(region_id):
+        region_id = int(region_id)
+        if region_id not in has_barrier_cache:
+            has_barrier_cache[region_id] = any(
+                _orders_memory_issue(op) or any(has_barrier(child)
+                                                for child in op.region_ids)
+                for op_id in regions[region_id].op_ids
+                for op in (ops[int(op_id)], ))
+        return has_barrier_cache[region_id]
+
+    def append_barrier_frontier(op_ids, op, frontier):
+        attrs = target_ir.attrs_dict(op)
+        count = int(attrs.get("barrier_order_dependency_count", 0))
+        existing_dependencies = op.operands[-count:] if count else ()
+        existing_inputs = set()
+        for dependency_id in existing_dependencies:
+            producer = producer_by_result.get(int(dependency_id))
+            if producer is None:
+                continue
+            producer_attrs = target_ir.attrs_dict(producer)
+            if (producer.kind == "issue_token"
+                    and producer_attrs.get("projection_domain") == target_ir.EVENT_DOMAIN_MEMORY_ISSUE):
+                existing_inputs.update(int(value_id) for value_id in producer.operands)
+        frontier = tuple(dict.fromkeys(int(value_id) for value_id in frontier))
+        if set(frontier).issubset(existing_inputs):
+            return op
+        dependency = project_frontier(
+            op_ids,
+            frontier,
+            op.source_op_index,
+            f"structured_memory_issue_barrier_{op.target_op_id}",
+        )
+        attrs["barrier_order_dependency_count"] = count + 1
+        return replace(
+            op,
+            operands=(*op.operands, dependency),
+            attrs=target_ir._attrs_tuple(attrs, op.target_op_id),
+        )
+
+    processed = set()
+
+    def process_region(region_id, incoming=(), carry_out=False):
+        region_id = int(region_id)
+        if region_id in processed:
+            fail("TLXW_BARRIER_ORDER_REGION_REENTRY", STAGE, "structured issue region was reached more than once",
+                 target_region_id=region_id)
+        processed.add(region_id)
+        region = regions[region_id]
+        original_ids = tuple(int(op_id) for op_id in region.op_ids)
+        later_barrier = _suffix_matches(
+            original_ids,
+            ops,
+            lambda op: (_orders_memory_issue(op) or any(has_barrier(child) for child in op.region_ids)),
+        )
+        op_ids = []
+        frontier = list(dict.fromkeys(int(value) for value in incoming))
+
+        for position, op_id in enumerate(original_ids):
+            op = ops[op_id]
+            needs_result = carry_out or later_barrier[position]
+            if op.kind in target_ir.MEMORY_ISSUER_OP_KINDS:
+                # The LDS-read completion pass already carries local-load
+                # completion through structured SSA and attaches it directly
+                # to the barrier. That stronger edge also orders issue.
+                if needs_result and not _requires_barrier_completion(op):
+                    op, result_id = _ensure_memory_completion_result(op, values)
+                    ops[op_id] = op
+                    frontier.append(result_id)
+                op_ids.append(op_id)
+                continue
+
+            if _orders_memory_issue(op):
+                if frontier:
+                    op = append_barrier_frontier(op_ids, op, frontier)
+                    ops[op_id] = op
+                frontier = []
+                op_ids.append(op_id)
+                continue
+
+            if op.kind == "for_loop" and len(op.region_ids) == 1:
+                body_id = int(op.region_ids[0])
+                needs_carry = bool(frontier) or needs_result or has_barrier(body_id)
+                if not needs_carry:
+                    process_region(body_id)
+                    op_ids.append(op_id)
+                    continue
+                init_id = join_frontier(op_ids, frontier, op.source_op_index,
+                                        f"loop_memory_issue_init_{op.target_op_id}")
+                arg_id = add_value(target_ir.EVENT_DOMAIN_MEMORY_COMPLETION, f"loop_memory_issue_arg_{op.target_op_id}")
+                result_id = add_value(target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+                                      f"loop_memory_issue_result_{op.target_op_id}")
+                body = regions[body_id]
+                regions[body_id] = replace(body, block_arg_ids=(*body.block_arg_ids, arg_id))
+                outgoing = process_region(body_id, (arg_id, ), carry_out=True)
+                body_ids = list(regions[body_id].op_ids)
+                yield_id = join_frontier(body_ids, outgoing, op.source_op_index,
+                                         f"loop_memory_issue_yield_{op.target_op_id}")
+                body = regions[body_id]
+                regions[body_id] = replace(
+                    body,
+                    op_ids=tuple(body_ids),
+                    yield_value_ids=(*body.yield_value_ids, yield_id),
+                )
+                attrs = target_ir.attrs_dict(op)
+                attrs["init_arg_count"] = int(attrs.get("init_arg_count", 0)) + 1
+                ops[op_id] = replace(
+                    op,
+                    operands=(*op.operands, init_id),
+                    results=(*op.results, result_id),
+                    attrs=target_ir._attrs_tuple(attrs, op.target_op_id),
+                )
+                frontier = [result_id]
+                op_ids.append(op_id)
+                continue
+
+            if op.kind == "if" and len(op.region_ids) == 2:
+                branch_ids = tuple(int(value) for value in op.region_ids)
+                needs_merge = bool(frontier) or needs_result or any(has_barrier(branch_id) for branch_id in branch_ids)
+                if not needs_merge:
+                    for branch_id in branch_ids:
+                        process_region(branch_id)
+                    op_ids.append(op_id)
+                    continue
+                yields = []
+                for branch_id in branch_ids:
+                    outgoing = process_region(branch_id, frontier, carry_out=True)
+                    branch_op_ids = list(regions[branch_id].op_ids)
+                    yield_id = join_frontier(
+                        branch_op_ids,
+                        outgoing,
+                        op.source_op_index,
+                        f"if_memory_issue_yield_{op.target_op_id}_{branch_id}",
+                    )
+                    branch = regions[branch_id]
+                    regions[branch_id] = replace(
+                        branch,
+                        op_ids=tuple(branch_op_ids),
+                        yield_value_ids=(*branch.yield_value_ids, yield_id),
+                    )
+                    yields.append(yield_id)
+                result_id = add_value(
+                    target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+                    f"if_memory_issue_result_{op.target_op_id}",
+                )
+                attrs = target_ir.attrs_dict(op)
+                ops[op_id] = replace(
+                    op,
+                    results=(*op.results, result_id),
+                    attrs=target_ir._attrs_tuple(attrs, op.target_op_id),
+                )
+                frontier = [result_id]
+                op_ids.append(op_id)
+                continue
+
+            for child in op.region_ids:
+                process_region(child)
+            op_ids.append(op_id)
+
+        regions[region_id] = replace(region, op_ids=tuple(op_ids))
+        return tuple(dict.fromkeys(frontier))
+
+    process_region(0)
+    for region in regions:
+        if int(region.target_region_id) not in processed:
+            process_region(region.target_region_id)
+    return replace(target_program, values=tuple(values), ops=tuple(ops), regions=tuple(regions))
 
 
 def _thread_structured_lds_read_completion(target_program):
@@ -323,11 +584,11 @@ def _thread_structured_lds_read_completion(target_program):
             return cached
         # Break impossible malformed recursive-region cycles defensively.
         region_has_local_read_cache[region_id] = False
-        result = any(op.kind == "local_load" or any(
-            region_has_local_read(child_region_id)
-            for child_region_id in op.region_ids)
-                     for op_id in regions[region_id].op_ids
-                     for op in (ops[int(op_id)], ))
+        result = any(
+            op.kind == "local_load" or any(region_has_local_read(child_region_id)
+                                           for child_region_id in op.region_ids)
+            for op_id in regions[region_id].op_ids
+            for op in (ops[int(op_id)], ))
         region_has_local_read_cache[region_id] = result
         return result
 
@@ -663,12 +924,20 @@ def _existing_memory_completion_result(op, values):
             )
         return int(op.results[0])
 
-    if op.kind not in {
-            "local_load",
-            "local_store",
-    }:
-        return None
-    completion_count = int(target_ir.attrs_dict(op).get("completion_result_count", 0))
+    attrs = target_ir.attrs_dict(op)
+    completion_count = int(attrs.get("completion_result_count", 0))
+    issue_count = int(attrs.get("issue_order_result_count", 0))
+    if op.kind not in {"local_load", "local_store"}:
+        if issue_count == 0:
+            return None
+        if issue_count != 1 or not op.results:
+            fail(
+                "TLXW_BARRIER_ORDER_RESULT_SEGMENT",
+                STAGE,
+                f"target {op.kind} has a malformed issue-order result segment",
+                target_op_id=op.target_op_id,
+            )
+        return int(op.results[-1])
     if completion_count == 0:
         return None
     if completion_count != 1 or not op.results:
