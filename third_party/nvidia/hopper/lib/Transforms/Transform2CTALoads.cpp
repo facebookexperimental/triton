@@ -129,6 +129,28 @@ struct BLoadTrace {
   unsigned splitDim = 1;
 };
 
+// Descriptor loads may drop leading unit block dimensions from their tensor
+// result.  BMM uses this to keep one rank-3 [B, K, N] descriptor while feeding
+// the rank-2 [K, N] tile expected by dot.  Map the MMA/result dimension back
+// to the descriptor dimension, accepting only this unambiguous prefix-unit
+// form.
+static FailureOr<unsigned> mapResultDimToDescriptor(tt::TensorDescType descType,
+                                                    RankedTensorType resultType,
+                                                    unsigned resultDim) {
+  auto blockShape = descType.getBlockType().getShape();
+  auto resultShape = resultType.getShape();
+  if (resultDim >= resultShape.size() || blockShape.size() < resultShape.size())
+    return failure();
+
+  unsigned rankDelta = blockShape.size() - resultShape.size();
+  if (!llvm::all_of(blockShape.take_front(rankDelta),
+                    [](int64_t dim) { return dim == 1; }))
+    return failure();
+  if (!llvm::equal(blockShape.drop_front(rankDelta), resultShape))
+    return failure();
+  return rankDelta + resultDim;
+}
+
 // Trace B operand from MMA back through LocalAllocOp and cheap layout/view ops
 // to find the DescriptorLoadOp. When B is transposed, either before allocation
 // with tt.trans or after allocation with ttg.memdesc_trans, split the
@@ -219,10 +241,11 @@ struct Transform2CTALoads
     }
 
     // A 2-CTA TMA load is issued by both CTAs as one hardware CTA-group
-    // transaction. Mark every rank-2 descriptor load in the cooperative
-    // kernel, including A operands (K/V) that are not visited by B splitting.
-    // Rank-1 metadata loads remain ordinary per-CTA loads, matching TLX's raw
-    // M/D bulk-copy path.
+    // transaction. Mark every descriptor load producing a rank-2 MMA tile in
+    // the cooperative kernel, including rank-3 descriptors with a leading
+    // unit block dimension and A operands (K/V) that are not visited by B
+    // splitting. Rank-1 metadata loads remain ordinary per-CTA loads, matching
+    // TLX's raw M/D bulk-copy path.
     //
     // Cooperative marking is a performance choice, not a correctness
     // requirement: leaving a load unmarked keeps the pre-existing per-CTA
@@ -428,12 +451,20 @@ struct Transform2CTALoads
     assert(descType && "expected descriptor load type to be captured before "
                        "2-CTA load transformation");
     auto blockShape = descType.getBlockType().getShape();
-    assert(blockShape.size() == 2 && "Expected 2D block shape");
+    auto origResultType =
+        cast<RankedTensorType>(descLoad.getResult().getType());
+    auto descriptorSplitDim =
+        mapResultDimToDescriptor(descType, origResultType, splitDim);
+    if (failed(descriptorSplitDim)) {
+      LDBG("descriptor/result ranks do not have a supported unit-prefix "
+           "relationship");
+      return failure();
+    }
     SmallVector<int64_t> newBlockShape(blockShape.begin(), blockShape.end());
-    int64_t blockN = blockShape[splitDim];
+    int64_t blockN = blockShape[*descriptorSplitDim];
     assert(blockN % 2 == 0 && "BLOCK_N must be even for 2-CTA B splitting");
     int64_t halfN = blockN / 2;
-    newBlockShape[splitDim] = halfN;
+    newBlockShape[*descriptorSplitDim] = halfN;
 
     if (halfN < 16) {
       LDBG("halfN=" << halfN << " too small, skipping");
@@ -491,18 +522,19 @@ struct Transform2CTALoads
 
     // New N-dimension index = original + CTA offset.
     SmallVector<Value> newIndices(descLoad.getIndices());
-    newIndices[splitDim] =
-        arith::AddIOp::create(builder, loc, newIndices[splitDim], offset);
+    newIndices[*descriptorSplitDim] = arith::AddIOp::create(
+        builder, loc, newIndices[*descriptorSplitDim], offset);
 
     // --- Step 3: Create new DescriptorLoadOp with half-width result ---
-    auto origResultType =
-        cast<RankedTensorType>(descLoad.getResult().getType());
     auto origEncoding =
         cast<ttg::BlockedEncodingAttr>(origResultType.getEncoding());
+    SmallVector<int64_t> newResultShape(origResultType.getShape().begin(),
+                                        origResultType.getShape().end());
+    newResultShape[splitDim] = halfN;
     auto newEncoding =
-        getCompatibleEncoding(origEncoding, newBlockShape, splitDim, ctx);
+        getCompatibleEncoding(origEncoding, newResultShape, splitDim, ctx);
     auto halfResultType =
-        RankedTensorType::get(newBlockShape, elemType, newEncoding);
+        RankedTensorType::get(newResultShape, elemType, newEncoding);
 
     auto newDescLoad = tt::DescriptorLoadOp::create(
         builder, loc, halfResultType, newDesc, newIndices);

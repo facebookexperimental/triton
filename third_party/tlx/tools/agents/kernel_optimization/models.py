@@ -32,6 +32,20 @@ class KernelTarget:
     device: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     optimization_guidance: str = ""
+    optimization_skills: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        raw_skills = self.optimization_skills
+        if not isinstance(raw_skills, (list, tuple)):
+            raise ValueError("optimization_skills must be a sequence of names")
+        normalized: list[str] = []
+        for raw_name in raw_skills:
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError("optimization_skills must contain non-empty strings")
+            name = raw_name.strip().lower()
+            if name not in normalized:
+                normalized.append(name)
+        object.__setattr__(self, "optimization_skills", tuple(normalized))
 
 
 @dataclass(frozen=True)

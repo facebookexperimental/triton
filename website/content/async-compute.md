@@ -259,9 +259,13 @@ when a transient source needs an explicit allocation point. Set
 earlier accumulated value will be discarded.
 
 Because LLVM cannot model the latency or hazards of an MFMA hidden in inline
-assembly, persistent lowering currently adds target-specific input wait padding
-and a result drain. Those waits and the inline-assembly representation are
-implementation details and should be included when comparing the two roles.
+assembly, unproven persistent chains retain target-specific input padding and
+per-update result drains. On gfx950, the compiler may defer those drains for a
+proven persistent AGPR chain ending at `amd_mfma_commit`; after scheduling and
+register allocation it repairs source and EXEC hazards and drains outstanding
+results before physical AGPR reads or overwrites. Those waits and the
+inline-assembly representation are implementation details and should be
+included when comparing the two roles.
 
 | Target | MFMA layout | Native instruction shapes | Persistent accumulator |
 |--------|-------------|---------------------------|------------------------|
@@ -294,10 +298,13 @@ it is not another numerical MFMA operand.
 | `amd_mfma_commit(acc, live)` | `(committed_acc, live_out)` |
 | `amd_mfma_commit((acc0, acc1), live)` | `(committed0, committed1, live_out)` |
 
-Each F32 input must be consumed only by this boundary, and downstream code must
-use the returned result. When a `preserve` dependency remains live after the
-boundary, its downstream uses must similarly use the returned `live_out`; the
-returned dependency may be discarded when it is no longer needed.
+Each F32 chain must reach this boundary without an ordinary SSA fork. The
+verifier also accepts the narrow runtime-loop form where a block argument has
+mutually exclusive body and exit uses, because only one use executes on each
+dynamic iteration. Downstream code must use the returned result. When a
+`preserve` dependency remains live after the boundary, its downstream uses
+must similarly use the returned `live_out`; the returned dependency may be
+discarded when it is no longer needed.
 
 The current lowering constrains a results-only boundary to AGPRs. A boundary
 with `preserve` constrains its F32 results to VGPRs and the preserved dot

@@ -113,6 +113,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"ttng.arrive_barrier_named", "tlx.named_barrier_arrive",
      "Arrive at named hardware barrier"},
 
+    // Takes (mask, pred) in both spellings, so the generic operand order holds.
+    {"ttng.vote_ballot_sync", "tlx.vote_ballot_sync",
+     "Warp-level vote ballot"},
+
     // Memory allocation operations - local_alloc is handled specially
     // ttng.tmem_alloc: handled specially in printSimplifiedOp
 
@@ -381,6 +385,21 @@ bool isConstantTrue(Value v) {
   return false;
 }
 
+// Split a memdesc shape into the `num` and `shape` arguments of tlx.local_alloc.
+// A buffer is up to 2-D, so only a rank above that is multi-buffering; this is the
+// same rule analyzeLocalAlloc applies, and the two must agree or an alias and its
+// base describe different buffer counts.
+static void splitAllocShape(ArrayRef<int64_t> shape, int64_t &count,
+                            SmallVectorImpl<int64_t> &tileShape) {
+  if (shape.size() > 2) {
+    count = shape[0];
+    tileShape.assign(shape.begin() + 1, shape.end());
+    return;
+  }
+  count = 1;
+  tileShape.assign(shape.begin(), shape.end());
+}
+
 // Build a lookup map for fast operation name lookup
 llvm::StringMap<StringRef> buildOpNameMap() {
   llvm::StringMap<StringRef> map;
@@ -480,6 +499,17 @@ static bool isPythonIdentifier(StringRef s) {
   });
 }
 
+// Whether getValueName spells an element-type cast or erases it: erased when
+// TLX cannot name the dtype, or the operand is `None`. Shared with the resolver.
+static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
+  return castOp && castOp->getNumOperands() > 0 &&
+         castOp->getNumResults() > 0 &&
+         elementTypeCastOps.contains(castOp->getName().getStringRef()) &&
+         isNameableElementType(
+             getElementType(castOp->getResult(0).getType())) &&
+         operandName != "None";
+}
+
 // Get simplified name for a value (just the SSA name)
 // If argSubstitutionMap is provided, substitute block args with their mapped
 // values
@@ -531,31 +561,18 @@ getValueName(Value v,
     // so unlike the layout-only casts below it is re-emitted, inline at each use.
     if (elementTypeCastOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
-      Type resultType = v.getType();
-      if (auto tensorType = dyn_cast<RankedTensorType>(resultType))
-        resultType = tensorType.getElementType();
-      // Only spell the cast when the dtype has a TLX name. getElementTypeName
-      // otherwise falls back to raw MLIR (`f8E4M3FN`), which is not a Triton
-      // dtype; leave those to the transparent list below rather than emit a
-      // call that cannot compile.
-      if (isNameableElementType(resultType)) {
-        std::string operand = getValueName(defOp->getOperand(0),
-                                           argSubstitutionMap, inlineConstants);
-        std::string dtype = getElementTypeName(resultType);
+      std::string operand = getValueName(defOp->getOperand(0),
+                                         argSubstitutionMap, inlineConstants);
+      if (spellsElementTypeCast(defOp, operand)) {
+        std::string dtype = getElementTypeName(getElementType(v.getType()));
         // `.to` is a method on a tensor, so it only works when the operand
         // names one: an inlined constant reaches here as a Python literal and
         // `(0).to(tl.float32)` raises AttributeError at kernel compile time.
-        // tl.cast accepts those, with one exception -- ub.poison prints as
-        // `None`, which tl.cast rejects outright. That value is undefined, so
-        // erasing its cast (below) costs nothing.
-        if (operand == "None") {
-          // fall through to the transparent list
-        } else if (!isPythonIdentifier(operand)) {
+        if (!isPythonIdentifier(operand))
           return "tl.cast(" + operand + ", " + dtype + ")";
-        } else {
-          return operand + ".to(" + dtype + ")";
-        }
+        return operand + ".to(" + dtype + ")";
       }
+      // Otherwise the cast is erased: fall through to the transparent list.
     }
 
     // Layout- and shape-only ops, plus the width/index casts Triton leaves
@@ -965,11 +982,9 @@ static Value resolveThroughNonElementCasts(Value v) {
     StringRef name = op->getName().getStringRef();
     if (!castOpsSet.contains(name) || op->getNumOperands() == 0)
       break;
-    // Stop only where getValueName actually spells the cast. An element cast
-    // to a dtype TLX cannot name is erased there, so walking past it here
-    // keeps the two in agreement and lets the store re-add the conversion.
-    if (elementTypeCastOps.contains(name) &&
-        isNameableElementType(getElementType(v.getType())))
+    // Stop where getValueName spells the cast; walking past one it erased would
+    // report a dtype the emitted name does not carry.
+    if (spellsElementTypeCast(op, getValueName(op->getOperand(0))))
       break;
     v = op->getOperand(0);
   }
@@ -1290,6 +1305,42 @@ bool regionHasMeaningfulOps(
   return false;
 }
 
+// Print an async_task body, or `pass` if it turns out to be empty.
+// A partition can hold nothing the printer emits -- the "default" partition of a
+// warp_specialize often holds only ops that are skipped -- and Python needs a
+// body, so an empty one has to be spelled rather than omitted.
+static void printTaskBody(Region &region, llvm::raw_ostream &os,
+                          const llvm::StringMap<StringRef> &opNameMap,
+                          const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                          llvm::DenseSet<Operation *> &skippedOps,
+                          unsigned indent,
+                          DenseMap<Value, Value> *argSubstitutionMap) {
+  std::string body;
+  llvm::raw_string_ostream bodyOs(body);
+  printRegion(region, bodyOs, opNameMap, allocInfoMap, skippedOps, indent,
+              argSubstitutionMap);
+  bodyOs.flush();
+
+  // A comment does not count: the printer emits standalone `# unsupported: ...`
+  // markers, and a block holding only those is as unparseable as an empty one.
+  bool hasStatement = false;
+  for (StringRef line : llvm::split(StringRef(body), '\n')) {
+    StringRef trimmed = line.ltrim();
+    if (trimmed.empty() || trimmed.starts_with("#"))
+      continue;
+    hasStatement = true;
+    break;
+  }
+
+  os << body;
+  if (hasStatement)
+    return;
+  // Keep any markers that were emitted and give the block something to run.
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "pass\n";
+}
+
 // Print warp_specialize operation in TLX async_tasks format
 void printWarpSpecialize(
     Operation *op, llvm::raw_ostream &os,
@@ -1327,8 +1378,8 @@ void printWarpSpecialize(
       os << "with tlx.async_task(\"default\"):\n";
 
       // Print region contents with extra indentation and substitution map
-      printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
-                  &argSubstitutionMap);
+      printTaskBody(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
+                    &argSubstitutionMap);
     } else {
       // Subsequent regions contain ttg.warp_specialize.partitions
       // which has multiple regions (one per partition)
@@ -1379,8 +1430,8 @@ void printWarpSpecialize(
               os << "):\n";
 
               // Print partition contents
-              printRegion(partitionRegion, os, opNameMap, allocInfoMap,
-                          skippedOps, indent + 2, &argSubstitutionMap);
+              printTaskBody(partitionRegion, os, opNameMap, allocInfoMap,
+                            skippedOps, indent + 2, &argSubstitutionMap);
               partitionIdx++;
             }
           }
@@ -1433,6 +1484,40 @@ void printLocComment(Operation *op, llvm::raw_ostream &os) {
       os << "  # " << loc;
   }
   os << "\n";
+}
+
+// Emit `s` as a double-quoted Python string literal. Assertion messages carry
+// source text, so they can contain quotes, backslashes and newlines.
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os) {
+  os << '"';
+  for (char c : s) {
+    switch (c) {
+    case '"':
+      os << "\\\"";
+      break;
+    case '\\':
+      os << "\\\\";
+      break;
+    case '\n':
+      os << "\\n";
+      break;
+    case '\r':
+      os << "\\r";
+      break;
+    case '\t':
+      os << "\\t";
+      break;
+    default:
+      // Bytes >= 0x80 are left alone: they are UTF-8 continuation bytes, and
+      // escaping them individually would turn one character into several.
+      unsigned char b = static_cast<unsigned char>(c);
+      if (b < 0x20 || b == 0x7f)
+        os << llvm::format("\\x%02x", b);
+      else
+        os << c;
+    }
+  }
+  os << '"';
 }
 
 // Resolve an operand of an AttrSizedOperandSegments op by declared position.
@@ -1602,6 +1687,89 @@ void printSimplifiedOp(
 
   // === Special-case handlers for ops needing custom printing ===
 
+  // ttng.tmem_subslice: `offset` is an attribute the generic printer drops, and
+  // `size` is not an operand at all -- it is the extent of the sliced dimension in
+  // the result type.
+  if (opName == "ttng.tmem_subslice") {
+    // Asserted rather than tested: falling through would re-emit the very
+    // one-argument call this handler exists to replace, so a silent default
+    // would restore the aliasing bug without a diagnostic.
+    assert(op->getNumOperands() > 0 && op->getNumResults() > 0 &&
+           "tmem_subslice takes one memdesc and yields one");
+    auto resType = cast<ttg::MemDescType>(op->getResult(0).getType());
+    ArrayRef<int64_t> resShape = resType.getShape();
+    auto offAttr = op->getAttrOfType<IntegerAttr>("offset");
+    assert(!resShape.empty() && offAttr &&
+           "tmem_subslice requires a ranked result and an offset");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.subslice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << offAttr.getInt() << ", " << resShape.back() << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // tt.elementwise_inline_asm carries the asm text, constraints, purity and
+  // packing as attributes, so the generic printer emits only the operands and the
+  // call is missing four of its six arguments.
+  if (opName == "tt.elementwise_inline_asm") {
+    unsigned nres = op->getNumResults();
+    for (unsigned i = 0; i < nres; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getResult(i), argSubstitutionMap);
+    if (nres > 0)
+      os << " = ";
+    os << "tl.inline_asm_elementwise(";
+    auto asmAttr = op->getAttrOfType<StringAttr>("asm_string");
+    printPythonStringLiteral(asmAttr ? asmAttr.getValue() : "", os);
+    os << ", ";
+    auto consAttr = op->getAttrOfType<StringAttr>("constraints");
+    printPythonStringLiteral(consAttr ? consAttr.getValue() : "", os);
+    // `args` is a sequence parameter, not varargs.
+    os << ", [";
+    for (unsigned i = 0; i < op->getNumOperands(); ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
+    os << "], ";
+    // dtype is the result element type, and a list of them when the asm returns
+    // more than one value.
+    auto elemName = [&](Type t) {
+      if (auto rt = dyn_cast<RankedTensorType>(t))
+        return getElementTypeName(rt.getElementType());
+      return getElementTypeName(t);
+    };
+    if (nres == 1) {
+      os << elemName(op->getResult(0).getType());
+    } else {
+      os << "[";
+      for (unsigned i = 0; i < nres; ++i)
+        os << (i ? ", " : "") << elemName(op->getResult(i).getType());
+      os << "]";
+    }
+    // Default to impure when the attribute is missing: marking side-effecting
+    // asm pure would let the recompiled kernel hoist or delete it.
+    auto pureAttr = op->getAttrOfType<BoolAttr>("pure");
+    auto packAttr = op->getAttrOfType<IntegerAttr>("packed_element");
+    os << ", " << ((pureAttr && pureAttr.getValue()) ? "True" : "False") << ", "
+       << (packAttr ? packAttr.getInt() : 1) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is a
+  // syntax error rather than an undefined name, and it drops the message.
+  if (opName == "tt.assert") {
+    os << "tl.device_assert("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (auto msgAttr = op->getAttrOfType<StringAttr>("message")) {
+      os << ", ";
+      printPythonStringLiteral(msgAttr.getValue(), os);
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // tt.get_program_id: emit tl.program_id(axis=N)
   if (opName == "tt.get_program_id") {
     if (op->getNumResults() > 0)
@@ -1688,6 +1856,8 @@ void printSimplifiedOp(
       resolvedSrcElemType = resolvedType.getElementType();
 
     os << "tlx.local_store(" << dstName << ", " << srcName;
+    // dstElemType is always nameable: local_store requires src and dst element
+    // types to match, and TT_Float is exactly what isNameableElementType covers.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
@@ -1714,6 +1884,7 @@ void printSimplifiedOp(
 
     os << "tlx.local_store(" << getValueName(dst, argSubstitutionMap) << ", "
        << srcName;
+    // dstElemType is always nameable here, as in ttg.local_store above.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
@@ -1983,17 +2154,14 @@ void printSimplifiedOp(
       bool dtypeDiffers = srcType.getElementType() != dstType.getElementType();
       bool shapeDiffers = srcType.getShape() != dstType.getShape();
       if (dtypeDiffers || shapeDiffers) {
-        ArrayRef<int64_t> shape = dstType.getShape();
         Type elemType = dstType.getElementType();
         int64_t count = 1;
         SmallVector<int64_t> actualShape;
-        if (shape.size() >= 2) {
-          count = shape[0];
-          for (size_t i = 1; i < shape.size(); ++i)
-            actualShape.push_back(shape[i]);
-        } else if (shape.size() == 1) {
-          actualShape.push_back(shape[0]);
-        }
+        // This op is legal on shared memory too, so name the storage kind from the
+        // memory space rather than assuming tensor memory.
+        bool isTmem = isa_and_nonnull<ttng::TensorMemorySpaceAttr>(
+            dstType.getMemorySpace());
+        splitAllocShape(dstType.getShape(), count, actualShape);
         // Emit local_alloc with reuse= for dtype or shape changes
         os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         os << "tlx.local_alloc((";
@@ -2004,9 +2172,11 @@ void printSimplifiedOp(
         }
         if (actualShape.size() == 1)
           os << ","; // trailing comma for single-element tuple
-        os << "), " << getElementTypeName(elemType) << ", " << count
-           << ", tlx.storage_kind.tmem, reuse="
-           << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+        os << "), " << getElementTypeName(elemType) << ", " << count;
+        if (isTmem)
+          os << ", tlx.storage_kind.tmem";
+        os << ", reuse=" << getValueName(op->getOperand(0), argSubstitutionMap)
+           << ")";
       } else {
         // Same dtype and shape: emit as alias
         os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
@@ -2023,17 +2193,10 @@ void printSimplifiedOp(
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
     if (auto memDescType =
             dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
-      ArrayRef<int64_t> shape = memDescType.getShape();
       Type elemType = memDescType.getElementType();
       int64_t count = 1;
       SmallVector<int64_t> actualShape;
-      if (shape.size() >= 2) {
-        count = shape[0];
-        for (size_t i = 1; i < shape.size(); ++i)
-          actualShape.push_back(shape[i]);
-      } else if (shape.size() == 1) {
-        actualShape.push_back(shape[0]);
-      }
+      splitAllocShape(memDescType.getShape(), count, actualShape);
       os << "tlx.local_alloc((";
       for (size_t i = 0; i < actualShape.size(); ++i) {
         if (i > 0)
