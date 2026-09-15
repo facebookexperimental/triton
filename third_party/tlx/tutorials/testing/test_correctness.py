@@ -1772,14 +1772,12 @@ def test_amd_gemm_input_offset_width_selection(monkeypatch):
         def __getitem__(self, grid):
 
             def launch(*args, **kwargs):
-                launches.append(
-                    (
-                        kwargs["USE_I64_A_OFFSETS"],
-                        kwargs["USE_I64_B_OFFSETS"],
-                        kwargs["HAS_M_TAIL"],
-                        kwargs["HAS_N_TAIL"],
-                    )
-                )
+                launches.append((
+                    kwargs["USE_I64_A_OFFSETS"],
+                    kwargs["USE_I64_B_OFFSETS"],
+                    kwargs["HAS_M_TAIL"],
+                    kwargs["HAS_N_TAIL"],
+                ))
 
             return launch
 
@@ -1797,6 +1795,27 @@ def test_amd_gemm_input_offset_width_selection(monkeypatch):
         _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
 
     assert launches == [expected for _, expected in cases]
+
+
+def test_amd_gemm_irregular_shape_policy():
+    assert _amd_gemm.choose_tile(677, 4096, 8192) == (256, 256, 4)
+
+    deep_k = _amd_gemm._intermediate_register_config(677, 2048, 4096)
+    assert (
+        deep_k["BLOCK_M"],
+        deep_k["BLOCK_N"],
+        deep_k["BLOCK_K"],
+        deep_k["matrix_instr_nonkdim"],
+        deep_k["num_warps"],
+        deep_k["num_stages"],
+    ) == (128, 64, 128, 32, 8, 3)
+
+    high_padding = _amd_gemm._intermediate_register_config(279, 2048, 4096)
+    assert (
+        high_padding["BLOCK_M"],
+        high_padding["BLOCK_N"],
+        high_padding["matrix_instr_nonkdim"],
+    ) == (64, 32, 16)
 
 
 @pytest.mark.parametrize(

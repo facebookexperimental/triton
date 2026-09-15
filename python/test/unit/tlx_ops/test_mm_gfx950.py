@@ -1,4 +1,4 @@
-"""gfx950 correctness coverage for ``tlx.ops.mm`` LocalSplitU GEMM."""
+"""gfx950 correctness coverage for ``tlx.ops.mm``."""
 
 import time
 
@@ -8,10 +8,7 @@ from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops import InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import GFX950_FOCUS, operand
 
-
-pytestmark = pytest.mark.skipif(
-    not is_hip_cdna4(), reason="Requires gfx950"
-)
+pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
 MAX_SECONDS_PER_CASE = 60
 
@@ -19,14 +16,10 @@ MAX_SECONDS_PER_CASE = 60
 def _assert_strides(tensor, wanted):
     for dim, (got, expected) in enumerate(zip(tensor.stride(), wanted)):
         if tensor.shape[dim] != 1:
-            assert got == expected, (
-                f"dim {dim}: stride {got}, recorded {expected}"
-            )
+            assert got == expected, (f"dim {dim}: stride {got}, recorded {expected}")
 
 
-@pytest.mark.parametrize(
-    "m,n,k,a_strides,b_strides,dtype_name", GFX950_FOCUS
-)
+@pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", GFX950_FOCUS)
 def test_mm(m, n, k, a_strides, b_strides, dtype_name):
     dtype = {"fp16": torch.float16}[dtype_name]
     from triton.tlx.ops import mm as tlx_mm
@@ -44,10 +37,8 @@ def test_mm(m, n, k, a_strides, b_strides, dtype_name):
         pytest.fail(f"gfx950 declines its focus shape: {declined}")
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
-    assert elapsed < MAX_SECONDS_PER_CASE, (
-        f"mm({m}x{n}x{k}, {dtype}) took {elapsed:.1f}s, "
-        f"over the {MAX_SECONDS_PER_CASE}s budget"
-    )
+    assert elapsed < MAX_SECONDS_PER_CASE, (f"mm({m}x{n}x{k}, {dtype}) took {elapsed:.1f}s, "
+                                            f"over the {MAX_SECONDS_PER_CASE}s budget")
 
     expected = torch.matmul(a, b)
     torch.testing.assert_close(
@@ -58,10 +49,34 @@ def test_mm(m, n, k, a_strides, b_strides, dtype_name):
     )
 
 
+@pytest.mark.parametrize(
+    "m,n,k,dtype",
+    [
+        (279, 256, 4096, torch.float16),
+        (1024, 4096, 800, torch.bfloat16),
+    ],
+    ids=["intermediate-fp16", "full-grid-bf16"],
+)
+def test_mm_register_fallback(m, n, k, dtype):
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype)
+    b = torch.randn((n, k), device="cuda", dtype=dtype).T
+
+    out = tlx_mm(a, b, arch="gfx950", space="heuristic")
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(
+        out,
+        expected,
+        atol=1e-2 * expected.abs().max().item(),
+        rtol=1e-2,
+    )
+
+
 def test_mm_rejects_invalid_rank():
     from triton.tlx.ops import mm as tlx_mm
 
-    a = torch.randn((16,), device="cuda", dtype=torch.float16)
+    a = torch.randn((16, ), device="cuda", dtype=torch.float16)
     b = torch.randn((16, 16), device="cuda", dtype=torch.float16)
     with pytest.raises(InvalidInput, match="rank-2"):
         tlx_mm(a, b, arch="gfx950")
@@ -108,14 +123,12 @@ def test_mm_rejects_unsupported_operands():
 
     a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
     b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
-    unsupported_a = torch.randn(
-        (17, 2048), device="cuda", dtype=torch.float16
-    )
+    unsupported_a = torch.randn((17, 2048), device="cuda", dtype=torch.float16)
     assert supports(a, b)
     assert not supports(unsupported_a, b)
     assert not supports(a.to(torch.float32), b.to(torch.float32))
     assert not supports(a, b.contiguous())
-    with pytest.raises(InvalidInput, match="no legal plan"):
+    with pytest.raises(InvalidInput, match="does not support"):
         mm(unsupported_a, b)
     with pytest.raises(InvalidInput, match="does not support"):
         matmul(unsupported_a, b)
@@ -175,9 +188,7 @@ def test_mm_supports_unaligned_contiguous_k_views():
     "n,k,pattern_period,segment_k",
     [(8192, 2048, 512, 128), (2048, 4096, 1024, 256)],
 )
-def test_mm_matches_aten_for_cancellation(
-    n, k, pattern_period, segment_k
-):
+def test_mm_matches_aten_for_cancellation(n, k, pattern_period, segment_k):
     """Exercise cancellation-sensitive ordered partial reduction."""
     from triton.tlx.ops.kernels.mm.gfx950 import matmul
 
