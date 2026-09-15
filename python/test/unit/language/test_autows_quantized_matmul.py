@@ -68,6 +68,46 @@ def _make_unit_scale_5d(scale_kind, rows, k, vec_size, device):
     return raw_scale.reshape(1, rows // 128, scale_cols // 4, 2, 256).contiguous()
 
 
+def _make_varied_e8m0_scale_5d(rows, k, vec_size, device):
+    """A 5D MXFP8 scale whose value differs per (row, K-group).
+
+    Unit scales cannot validate scale *addressing*: every element is the same,
+    so reading the wrong row or K-group still yields the right answer. This
+    matters most for the 2-CTA path, where the B operand is split across the
+    pair but the B scale is deliberately kept full width and each CTA addresses
+    its own N-half out of it.
+
+    Exponents stay in [125, 130] (0.25x .. 8x) so the reference stays
+    well-conditioned against an e5m2 MMA.
+    """
+    scale_cols = k // vec_size
+    raw = torch.randint(125, 131, (rows, scale_cols), dtype=torch.uint8, device=device)
+    return raw.reshape(1, rows // 128, scale_cols // 4, 2, 256).contiguous()
+
+
+def _decode_e8m0_scale_5d(scale_5d, rows, k, vec_size):
+    """Undo the 5D blocked layout the same way the kernel does.
+
+    Mirrors the in-kernel `reshape(REP, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4)`
+    exactly, so the reference consumes whatever the kernel consumes rather than
+    a separately re-derived swizzle.
+    """
+    scale_cols = k // vec_size
+    rep = rows // 128
+    rep_k = scale_cols // 4
+    logical = (scale_5d.reshape(rep, rep_k, 32, 4, 4).permute(0, 3, 2, 1, 4).reshape(rows, scale_cols))
+    return torch.exp2(logical.to(torch.float32) - 127.0)
+
+
+def _scaled_reference(a_ref, b_ref, scale_a_5d, scale_b_5d, k, vec_size):
+    """Row-scaled fp32 reference: (a * sa) @ (b * sb).T with per-K-group scales."""
+    sa = _decode_e8m0_scale_5d(scale_a_5d, a_ref.shape[0], k, vec_size)
+    sb = _decode_e8m0_scale_5d(scale_b_5d, b_ref.shape[0], k, vec_size)
+    a_scaled = a_ref * sa.repeat_interleave(vec_size, dim=1)
+    b_scaled = b_ref * sb.repeat_interleave(vec_size, dim=1)
+    return torch.matmul(a_scaled, b_scaled.T)
+
+
 def _make_quantized_input(data_kind, size, device):
     if data_kind in ("mxfp4", "nvfp4"):
         tensor = MXFP4Tensor(size=size, device=device).random()
@@ -181,8 +221,11 @@ def test_autows_quantized_matmul_tma_2cta(device):
         torch.manual_seed(42)
         a, a_ref = _make_quantized_input("mxfp8", (M, K), device)
         b, b_ref = _make_quantized_input("mxfp8", (N, K), device)
-        scale_a = _make_unit_scale_5d("mxfp8", M, K, vec_size, device)
-        scale_b = _make_unit_scale_5d("mxfp8", N, K, vec_size, device)
+        # Nonuniform scales: the compiler splits B across the CTA pair but keeps
+        # the B scale full width, so a wrong N-half or K-group in the scale
+        # addressing must change the result. Unit scales cannot show that.
+        scale_a = _make_varied_e8m0_scale_5d(M, K, vec_size, device)
+        scale_b = _make_varied_e8m0_scale_5d(N, K, vec_size, device)
         c = torch.empty((M, N), dtype=torch.float32, device=device)
 
         def alloc_fn(size, _align, _stream):
@@ -218,11 +261,6 @@ def test_autows_quantized_matmul_tma_2cta(device):
             "e5m2",
             "e5m2",
             1,
-            # Keep the software pipeline shallow. The cross-CTA rendezvous
-            # barrier that Insert2CTASync emits is a single slot with a one-bit
-            # parity phase, so it only tolerates a follower-CTA drift of one
-            # iteration. Deepening the operand pipeline here will deadlock until
-            # that barrier is multi-buffered to the operand depth.
             NUM_STAGES=2,
             TWO_CTAS=True,
             num_warps=4,
@@ -235,5 +273,7 @@ def test_autows_quantized_matmul_tma_2cta(device):
         assert "two_ctas" in ttgir, "Expected the scaled MMA to stay 2-CTA (no 1-CTA fallback)"
         assert "cta_group::2" in kernel.asm["ptx"], "Expected a collective 2-CTA MMA in PTX"
 
-        ref = torch.matmul(a_ref, b_ref.T)
-        torch.testing.assert_close(ref, c, atol=1e-2, rtol=1e-2)
+        ref = _scaled_reference(a_ref, b_ref, scale_a, scale_b, K, vec_size)
+        # Scales span 0.25x..8x per side, so the magnitude range is much wider
+        # than in the unit-scale tests; scale the absolute tolerance with it.
+        torch.testing.assert_close(ref, c, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
