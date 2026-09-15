@@ -37,6 +37,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
 
 #define DEBUG_TYPE "nvgpu-ping-pong-sync"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -51,17 +52,7 @@ namespace { // anonymous namespace
 /// Manages expensive operations for critical region identification and
 /// assigns unique barrier IDs to each operation type.
 class CriticalRegionManager {
-private:
-  /// Barrier ID range constants
-  /// This pass only uses named barriers 7 - 15 and reserves 0 - 6 for other
-  /// uses.
-  static constexpr unsigned MIN_BARRIER_ID = 7;
-  static constexpr unsigned MAX_BARRIER_ID = 15;
-
 public:
-  /// Current barrier ID to assign (range [MIN_BARRIER_ID, MAX_BARRIER_ID])
-  unsigned barrierId = MIN_BARRIER_ID;
-
   /// Map from pingpong region id to its barrier ID
   llvm::DenseMap<int, std::pair<unsigned, unsigned>> pingpongIdToBarrierId;
 
@@ -108,7 +99,8 @@ public:
 
   /// Assign barrier IDs for a pingpong region.
   /// Sets barrier IDs to -1 if we have exhausted available barriers.
-  void assignBarrierId(int pingpongId) {
+  void assignBarrierId(int pingpongId,
+                       ttng::NamedBarrierIdAllocator &allocator) {
     if (pingpongIdToBarrierId.count(pingpongId) > 0) {
       LDBG("Barrier ID {" << pingpongIdToBarrierId[pingpongId].first << ", "
                           << pingpongIdToBarrierId[pingpongId].second
@@ -117,23 +109,16 @@ public:
       return;
     }
 
-    // Assign barrier ID to the pingpong region
-    unsigned barrierId = this->barrierId;
-    unsigned barrierId_1 = this->barrierId + 1;
-
-    // Check if we would exceed the maximum barrier ID
-    if (this->barrierId + 1 > MAX_BARRIER_ID) {
+    std::optional<SmallVector<int32_t>> ids = allocator.allocate(2);
+    if (!ids) {
       LDBG("Barrier IDs exhausted for pingpong region '" << pingpongId << "'.");
       return;
     }
 
-    pingpongIdToBarrierId[pingpongId] = {barrierId, barrierId_1};
-    LDBG("Assigned barrier ID {" << barrierId << ", " << barrierId_1
+    pingpongIdToBarrierId[pingpongId] = {(*ids)[0], (*ids)[1]};
+    LDBG("Assigned barrier ID {" << (*ids)[0] << ", " << (*ids)[1]
                                  << "} to pingpong region '" << pingpongId
                                  << "'.");
-
-    // Increment the barrier ID counter
-    this->barrierId = barrierId + 2;
   }
 
   bool hasPingPongBoundary(int pingpongRegionId) const {
@@ -444,7 +429,8 @@ int arrivesFirst(
 /// Finds ops with pingpong_id attributes, computes their boundaries, assigns
 /// named barrier IDs, and inserts arrive/wait barriers to enforce mutual
 /// exclusion between ping and pong partitions.
-static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
+static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability,
+                           ttng::NamedBarrierIdAllocator &allocator) {
   // Get the function op
   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
   assert(funcOp != nullptr);
@@ -502,7 +488,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
                          << pingpongId);
         // Prepare CriticalRegionManager for this pingpong region
         crManager.pingpongIdToKeyOps[pingpongId].push_back(op);
-        crManager.assignBarrierId(pingpongId);
+        crManager.assignBarrierId(pingpongId, allocator);
       }
     });
   }
@@ -629,14 +615,10 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     OpBuilder builder(&pingRegionBlock, pingRegionBlock.begin());
     auto pingRegionLoc = pingRegionBlock.front().getLoc();
     // Prepare values
-    Value pingBarrier = ttng::CompilerNamedBarrierIdOp::create(
-        builder, pingRegionLoc,
-        arith::ConstantIntOp::create(builder, pingRegionLoc, pingBarrierId,
-                                     32));
-    Value pongBarrier = ttng::CompilerNamedBarrierIdOp::create(
-        builder, pingRegionLoc,
-        arith::ConstantIntOp::create(builder, pingRegionLoc, pongBarrierId,
-                                     32));
+    Value pingBarrier = ttng::createCompilerNamedBarrierId(
+        builder, pingRegionLoc, pingBarrierId);
+    Value pongBarrier = ttng::createCompilerNamedBarrierId(
+        builder, pingRegionLoc, pongBarrierId);
     Value pingNumThreads =
         arith::ConstantIntOp::create(builder, pingRegionLoc, numThreads, 32);
     // Insert arrive barrier for the ping partition to allow the initial entry
@@ -657,14 +639,10 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     Block &pongRegionBlock = pongRegion->front();
     OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
     auto pongRegionLoc = pongRegionBlock.front().getLoc();
-    Value pingBarrier2 = ttng::CompilerNamedBarrierIdOp::create(
-        builder2, pongRegionLoc,
-        arith::ConstantIntOp::create(builder2, pongRegionLoc, pingBarrierId,
-                                     32));
-    Value pongBarrier2 = ttng::CompilerNamedBarrierIdOp::create(
-        builder2, pongRegionLoc,
-        arith::ConstantIntOp::create(builder2, pongRegionLoc, pongBarrierId,
-                                     32));
+    Value pingBarrier2 = ttng::createCompilerNamedBarrierId(
+        builder2, pongRegionLoc, pingBarrierId);
+    Value pongBarrier2 = ttng::createCompilerNamedBarrierId(
+        builder2, pongRegionLoc, pongBarrierId);
     Value pingNumThreads2 =
         arith::ConstantIntOp::create(builder2, pongRegionLoc, numThreads, 32);
     builder2.setInsertionPoint(pongStart);
@@ -681,11 +659,18 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 /// doPingPongSync pass: Insert pingpong barriers to the IR
 void doPingPongSync(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability) {
+  ModuleOp module = funcOp->getParentOfType<ModuleOp>();
+  ttng::NamedBarrierIdAllocator allocator(module);
+  // Ping-pong is an optional optimization: when no ID can be proven free it
+  // must decline silently rather than fail the compile, so use the non-erroring
+  // variant. See `PingPongScheduling.md` and `named_barrier_api_changes.md` 4.1.
+  if (failed(ttng::tryEnsureWarpSpecializeBarrierIds(module, allocator)))
+    return;
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &bodyOp : block.getOperations()) {
       Operation *op = &bodyOp;
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        handleWarpSpec(wsOp, capability);
+        handleWarpSpec(wsOp, capability, allocator);
       }
     }
   }

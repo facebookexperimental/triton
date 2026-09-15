@@ -21,6 +21,7 @@
 #include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
 #include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
@@ -111,6 +112,11 @@ struct ConvertTritonGPUToLLVM
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
     TargetInfo targetInfo(computeCapability, ptxVersion);
+
+    mlir::triton::nvidia_gpu::NamedBarrierIdAllocator barrierAllocator(mod);
+    if (failed(mlir::triton::nvidia_gpu::ensureWarpSpecializeBarrierIds(
+            mod, barrierAllocator)))
+      return signalPassFailure();
 
     // Allocate shared memory and set barrier
     ModuleAllocation allocation(
