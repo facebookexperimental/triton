@@ -25,6 +25,7 @@
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUAttrDefs.td"
 include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.td"
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUTypes.td"
 include "mlir/Dialect/Arith/IR/ArithBase.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
@@ -677,10 +678,29 @@ def TTNG_AsyncCopyMbarrierArriveOp
   let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
 }
 
+def TTNG_UserNamedBarrierIdOp : TTNG_Op<"user_named_barrier_id", [Pure]> {
+  let summary = "wrap a user-provided named barrier identifier";
+
+  let arguments = (ins I32:$value);
+  let results = (outs TTNG_NamedBarrierIdType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
+def TTNG_CompilerNamedBarrierIdOp
+    : TTNG_Op<"compiler_named_barrier_id", [Pure]> {
+  let summary = "wrap a compiler-allocated named barrier identifier";
+
+  let arguments = (ins I32:$value);
+  let results = (outs TTNG_NamedBarrierIdType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 def TTNG_NamedBarrierArriveOp : TTNG_Op<"arrive_barrier_named", []> {
   let summary = "named barrier arrive";
 
-  let arguments = (ins I32:$bar, I32:$numThreads);
+  let arguments = (ins TTNG_NamedBarrierIdType:$bar, I32:$numThreads);
 
   let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
 }
@@ -688,7 +708,7 @@ def TTNG_NamedBarrierArriveOp : TTNG_Op<"arrive_barrier_named", []> {
 def TTNG_NamedBarrierWaitOp : TTNG_Op<"wait_barrier_named", []> {
   let summary = "named barrier wait";
 
-  let arguments = (ins I32:$bar, I32:$numThreads);
+  let arguments = (ins TTNG_NamedBarrierIdType:$bar, I32:$numThreads);
 
   let assemblyFormat = "$bar `,` $numThreads attr-dict `:` type(operands)";
 }
