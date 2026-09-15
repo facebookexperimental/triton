@@ -103,14 +103,16 @@ tt.func @two_stage_example(%n: index) {
 // CHECK:     async_copy_global_to_local
 // CHECK:     async_commit_group
 // CHECK:     scf.yield
-// CHECK:   triton.warp_pipeline.stage
+// CHECK:   triton.warp_pipeline.allow_memory_reorder
+// CHECK-SAME: triton.warp_pipeline.stage
 // CHECK:   ttg.async_wait
 // CHECK:   scf.execute_region
 // CHECK:     async_copy_global_to_local
 // CHECK:     async_commit_group
 // CHECK:     tt.dot
 // CHECK:     scf.yield
-// CHECK:   triton.warp_pipeline.stage
+// CHECK:   triton.warp_pipeline.allow_memory_reorder
+// CHECK-SAME: triton.warp_pipeline.stage
 // CHECK: triton.warp_pipeline.pipelined_for
 // CHECK-NOT: rocdl.sched.barrier
 // CHECK: tt.return
@@ -130,12 +132,12 @@ tt.func public @triple_buf_two_stages(%arg0: i32, %arg1: i32, %arg2: i32, %arg3:
     %40 = ttg.local_load %arg30 token %arg29 : !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable> -> tensor<32x256xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
     %41 = ttg.async_copy_global_to_local %32, %37 : tensor<256x32x!tt.ptr<bf16>, #linear> -> <256x32xbf16, #shared, #smem, mutable>
     %42 = ttg.async_commit_group tokens %41
-    rocdl.sched.barrier none {triton.warp_pipeline.border = "stage"}
+    rocdl.sched.barrier none {triton.warp_pipeline.allow_memory_reorder, triton.warp_pipeline.border = "stage"}
     %43 = ttg.async_wait %arg32, %arg33 {num = 0 : i32}
     %44 = ttg.async_copy_global_to_local %33, %38 : tensor<32x256x!tt.ptr<bf16>, #linear1> -> <32x256xbf16, #shared1, #smem, mutable>
     %45 = ttg.async_commit_group tokens %44
     %46 = tt.dot %39, %40, %arg25 : tensor<256x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x256xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<256x256xf32, #mma>
-    rocdl.sched.barrier none {triton.warp_pipeline.border = "stage"}
+    rocdl.sched.barrier none {triton.warp_pipeline.allow_memory_reorder, triton.warp_pipeline.border = "stage"}
     scf.yield %46, %36, %arg28, %37, %43, %arg31, %38, %42, %45, %32, %33 : tensor<256x256xf32, #mma>, i32, !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>, !ttg.memdesc<256x32xbf16, #shared, #smem, mutable>, !ttg.async.token, !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>, !ttg.memdesc<32x256xbf16, #shared1, #smem, mutable>, !ttg.async.token, !ttg.async.token, tensor<256x32x!tt.ptr<bf16>, #linear>, tensor<32x256x!tt.ptr<bf16>, #linear1>
   }
   ttg.local_dealloc %1 : !ttg.memdesc<3x32x256xbf16, #shared1, #smem, mutable>
