@@ -95,10 +95,10 @@ def _child_env() -> dict[str, str]:
 
 
 def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
-    runner = Path(__file__).with_name("run.py")
+    kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250_test.py")
     command = [
         sys.executable,
-        str(runner),
+        str(kernel),
         "--m_list",
         case.m_list,
         "-N",

@@ -7,7 +7,6 @@ its correctness and compile tests, and a regular-shape benchmark sweep.
 
 - `amd_grouped_gemm_gfx1250_test.py`: pointer-table baseline, optimized TDM
   kernel, tests, and single-shape benchmark CLI.
-- `run.py`: single-shape correctness and benchmark CLI used by `bench.py`.
 - `bench.py`: multi-shape benchmark runner with process isolation and CSV
   output.
 
@@ -96,7 +95,7 @@ Run one shape and compare against `torch.matmul`:
 
 ```bash
 python3 \
-  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/run.py \
+  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py \
   --m_list 512,256 \
   -N 512 -K 2048 \
   --num_programs 4 \
@@ -108,7 +107,7 @@ python3 \
 
 ```bash
 python3 \
-  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/run.py \
+  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py \
   --m_list 512,512,512,512 \
   -N 1024 -K 2048 \
   -BM 256 -BN 256 -BK 128 \
@@ -124,7 +123,7 @@ Use `--benchmark_mode graph` to remove launch overhead from the timing.
 
 ```bash
 python3 \
-  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/run.py \
+  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py \
   --m_list 512,256 \
   -N 1024 -K 1024 \
   -BM 256 -BN 256 -BK 128 \
