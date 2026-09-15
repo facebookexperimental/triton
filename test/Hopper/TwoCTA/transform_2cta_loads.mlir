@@ -96,6 +96,76 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+// Rank-3 BMM descriptors use a leading unit block dimension so a globally
+// persistent worker can change batches without reconstructing descriptors.
+// The descriptor load still produces the rank-2 tile consumed by dot.  The B
+// transform must split the descriptor's last dimension, not the result's
+// dimension number, and preserve the leading batch index.
+// CHECK-LABEL: @matmul_2cta_rank3_descriptors
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<1x128x64xf16>
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<1x64x64xf16>
+// CHECK: tt.descriptor_load %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] {{.*}}two_cta_load{{.*}} : !tt.tensordesc<1x128x64xf16>
+// CHECK: %[[CTA_ID_3D:.*]] = nvg.cluster_id
+// CHECK: %[[MOD_3D:.*]] = arith.remsi %[[CTA_ID_3D]], %{{.*}}
+// CHECK: %[[OFF_3D:.*]] = arith.muli %[[MOD_3D]], %{{.*}}
+// CHECK: %[[N_3D:.*]] = arith.addi %{{.*}}, %[[OFF_3D]]
+// CHECK: tt.descriptor_load %{{.*}}[%{{.*}}, %{{.*}}, %[[N_3D]]] {{.*}}two_cta_load{{.*}} : !tt.tensordesc<1x64x64xf16> -> tensor<64x64xf16
+// CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+
+#blocked_r3 = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1_r3 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3_r3 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared_r3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem_r3 = #ttg.shared_memory
+#tmem_r3 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_2cta_rank3_descriptors(
+      %a_ptr: !tt.ptr<f16>,
+      %b_ptr: !tt.ptr<f16>,
+      %B: i32 {tt.divisibility = 16 : i32},
+      %M: i32 {tt.divisibility = 16 : i32},
+      %N: i32 {tt.divisibility = 16 : i32},
+      %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %true = arith.constant true
+    %c128_i32 = arith.constant 128 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c128_i64 = arith.constant 128 : i64
+    %stride_b = arith.extsi %K : i32 to i64
+    %n_i64 = arith.extsi %N : i32 to i64
+    %stride_a_batch = arith.muli %stride_b, %c128_i64 : i64
+    %stride_b_batch = arith.muli %stride_b, %n_i64 : i64
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked_r3>
+    %batch = tt.get_program_id y : i32
+    %pid = tt.get_program_id x : i32
+    %offs_am = arith.muli %pid, %c128_i32 : i32
+    %offs_bn = arith.muli %pid, %c128_i32 : i32
+
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%B, %M, %K], [%stride_a_batch, %stride_b, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1x128x64xf16>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%B, %K, %N], [%stride_b_batch, %n_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1x64x128xf16>
+
+    %accumulator = scf.for %k = %c0_i32 to %c1_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked_r3>) : i32 {
+      %offs_k = arith.muli %k, %c64_i32 : i32
+      %a = tt.descriptor_load %a_desc[%batch, %offs_am, %offs_k] : !tt.tensordesc<1x128x64xf16> -> tensor<128x64xf16, #blocked1_r3>
+      %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_r3>) -> !ttg.memdesc<128x64xf16, #shared_r3, #smem_r3>
+      %b = tt.descriptor_load %b_desc[%batch, %offs_k, %offs_bn] : !tt.tensordesc<1x64x128xf16> -> tensor<64x128xf16, #blocked1_r3>
+      %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked1_r3>) -> !ttg.memdesc<64x128xf16, #shared_r3, #smem_r3>
+      %acc_layout = ttg.convert_layout %acc : tensor<128x128xf32, #blocked_r3> -> tensor<128x128xf32, #blocked3_r3>
+      %acc_tmem, %token = ttng.tmem_alloc %acc_layout : (tensor<128x128xf32, #blocked3_r3>) -> (!ttg.memdesc<128x128xf32, #tmem_r3, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %mma_token = ttng.tc_gen5_mma %a_smem, %b_smem, %acc_tmem[%token], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_r3, #smem_r3>, !ttg.memdesc<64x128xf16, #shared_r3, #smem_r3>, !ttg.memdesc<128x128xf32, #tmem_r3, #ttng.tensor_memory, mutable>
+      %result, %load_token = ttng.tmem_load %acc_tmem[%mma_token] : !ttg.memdesc<128x128xf32, #tmem_r3, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked3_r3>
+      %result_layout = ttg.convert_layout %result : tensor<128x128xf32, #blocked3_r3> -> tensor<128x128xf32, #blocked_r3>
+      scf.yield %result_layout : tensor<128x128xf32, #blocked_r3>
+    }
+    tt.return
+  }
+}
+
+// -----
+
 // Test: A single full V descriptor load split between two 2-CTA PV MMAs must
 // become one cooperative half-width load and two zero-copy shared-memory
 // views. This avoids two TMA loads without staging V through registers.
