@@ -55,6 +55,31 @@ def _async_amd_desc_load_fused_kernel(
 
 
 @triton.jit
+def _tdm_fused_positioned_kernel(a, b, output, row_offset, col_offset, pred, CLAMP: tl.constexpr,
+                                 SET_BOUNDS: tl.constexpr):
+    # Leave backing storage before and after the descriptor's logical extent
+    # so unclamped backward/forward updates are valid memory accesses.
+    a_desc = tl.make_tensor_descriptor(a + 32 * 256, [128, 128], [256, 1], [64, 64])
+    b_desc = tl.make_tensor_descriptor(b + 32 * 256, [128, 128], [256, 1], [64, 64])
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[row_offset, col_offset], pred=pred, clamp_bounds=CLAMP)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[row_offset, col_offset], clamp_bounds=CLAMP)
+    if SET_BOUNDS:
+        a_desc = tlx.update_tensor_descriptor(a_desc, set_bounds=[16, 32])
+        b_desc = tlx.update_tensor_descriptor(b_desc, set_bounds=[16, 32])
+    a_buf = tlx.local_alloc((64, 64), tl.float16, 1)
+    b_buf = tlx.local_alloc((64, 64), tl.float16, 1)
+    a_view = tlx.local_view(a_buf, 0)
+    b_view = tlx.local_view(b_buf, 0)
+    # A false predicate must preserve the old LDS contents.
+    tlx.local_store(a_view, tl.full((64, 64), -3, tl.float16))
+    token = tlx.async_amd_descriptor_load_fused([(a_desc, a_view, 3), (b_desc, b_view, 12)])
+    tlx.async_amd_descriptor_wait(tokens=[token])
+    offsets = tl.arange(0, 64)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    tl.store(output + offsets, tlx.local_load(a_view))
+    tl.store(output + 64 * 64 + offsets, tlx.local_load(b_view))
+
+
+@triton.jit
 def _async_amd_desc_store_kernel(
     x_ptr,
     y_ptr,
@@ -175,6 +200,30 @@ def test_async_amd_desc_load_fused_correctness_gfx1250(device):
     output = torch.empty_like(a)
     _async_amd_desc_load_fused_kernel[(1, )](a, b, output, M=rows, N=cols)
     torch.testing.assert_close(output, a + b)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("row_offset,col_offset", [(-32, 0), (0, 64), (96, 96)])
+@pytest.mark.parametrize("clamp,set_bounds,pred", [(False, False, True), (True, False, True), (False, True, True),
+                                                   (False, False, False)])
+def test_tdm_fused_positioned_offsets(device, row_offset, col_offset, clamp, set_bounds, pred):
+    a = torch.randn((192, 256), device=device, dtype=torch.float16)
+    b = torch.randn_like(a)
+    output = torch.empty((2, 64, 64), device=device, dtype=torch.float16)
+    _tdm_fused_positioned_kernel[(1, )](a, b, output, row_offset, col_offset, pred, clamp, set_bounds)
+    for index, source in enumerate((a, b)):
+        expected = source[32 + row_offset:96 + row_offset, col_offset:64 + col_offset].clone()
+        if set_bounds:
+            expected[16:, :] = 0
+            expected[:, 32:] = 0
+        elif clamp:
+            rows = 0 if row_offset < 0 else min(64, max(0, 128 - row_offset))
+            cols = min(64, max(0, 128 - col_offset))
+            expected[rows:, :] = 0
+            expected[:, cols:] = 0
+        if index == 0 and not pred:
+            expected.fill_(-3)
+        torch.testing.assert_close(output[index], expected)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")

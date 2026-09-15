@@ -764,9 +764,12 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        Value barrierPtr,
                        const triton::LinearLayout &sharedLayout, Value ctaId,
                        bool isStore, ArrayRef<unsigned> warpsPerCTA,
-                       std::optional<uint32_t> warpUsedHint, bool isPureForm) {
+                       std::optional<uint32_t> warpUsedHint, bool isPureForm,
+                       ArrayRef<Value> descriptorOffsets) {
   size_t numDims = offset.size();
   assert(numDims >= 1 && numDims <= 5 && "TDM supports 1D to 5D tensors.");
+  assert((descriptorOffsets.empty() || descriptorOffsets.size() == numDims) &&
+         "descriptor offsets must match the tensor rank");
   assert(!dstPtrs.empty() && "dstPtrs cannot be empty");
   assert(warpsPerCTA.size() == numDims &&
          "warpsPerCTA must have one entry per tensor dim");
@@ -828,6 +831,12 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   for (size_t i = 0; i < numDims; ++i) {
     Value dimOffset = b.mul(b.zext(i64_ty, offset[i]), tensorStride[i]);
     baseOffset = b.add(baseOffset, dimOffset);
+    // A folded update advances the address without changing bounds. Keep its
+    // signed i32 offsets separate from the per-warp offsets until after
+    // extension to i64: adding in i32 would change overflow/negative offsets.
+    if (!descriptorOffsets.empty())
+      baseOffset = b.add(baseOffset, b.mul(b.sext(i64_ty, descriptorOffsets[i]),
+                                           tensorStride[i]));
   }
 
   auto tdmToShared = tdmLayout.invertAndCompose(sharedLayout);
@@ -1688,7 +1697,8 @@ fillFusedTDMDescriptorMember(RewriterBase &rewriter, Location loc,
                     member.padAmount, filled, offsets, member.dstPtrs,
                     member.pred, member.multicastMask,
                     /*barrierPtr=*/Value(), member.sharedLayout, ctaId,
-                    /*isStore=*/false, warpsPerCTA, hint);
+                    /*isStore=*/false, warpsPerCTA, hint,
+                    /*isPureForm=*/false, member.descriptorOffsets);
   return filled;
 }
 
