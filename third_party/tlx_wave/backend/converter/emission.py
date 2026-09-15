@@ -136,6 +136,8 @@ class _EmissionState:
     target_program: target_ir.TargetProgram
     values: dict[int, object]
     execution_item: object
+    output_effect_regions: frozenset[int]
+    output_effects: list[object]
 
 
 def emit_wave_module(
@@ -182,10 +184,14 @@ def emit_wave_module(
                     target_program,
                     {},
                     execution_item,
+                    _output_effect_regions(target_program),
+                    [],
                 )
                 for target_value_id, arg in zip(kernel.arg_target_ids, builder.args):
                     state.values[target_value_id] = arg
                 _emit_region(state, 0)
+                if state.output_effects:
+                    builder.observe(_join_memory_tokens(state, state.output_effects))
         return EmittedWaveModule(str(module_builder), lds_size)
 
 
@@ -210,6 +216,35 @@ def _emit_region(state, region_id):
             )
         _emit_target_op(state, op)
     return tuple(_require_value(state, target_value_id, None) for target_value_id in region.yield_value_ids)
+
+
+def _output_effect_regions(target_program):
+    result = set()
+
+    def classify(region_id):
+        region = target_program.regions[region_id]
+        observes_output = False
+        for target_op_id in region.op_ids:
+            op = target_program.ops[target_op_id]
+            observes_output |= op.kind in {"buffer_store", "store"}
+            observes_output |= any(classify(nested) for nested in op.region_ids)
+        if observes_output:
+            result.add(region_id)
+        return observes_output
+
+    classify(0)
+    return frozenset(result)
+
+
+def _emit_observed_region(state, region_id):
+    outer_output_effects = state.output_effects
+    state.output_effects = []
+    try:
+        yielded = _emit_region(state, region_id)
+        observed = _join_memory_tokens(state, state.output_effects)
+    finally:
+        state.output_effects = outer_output_effects
+    return yielded, observed
 
 
 def _emit_target_op(state, op):
@@ -1482,6 +1517,9 @@ def _emit_if_structural_only(state, op):
         op.results,
         op,
     )
+    observes_output = any(region_id in state.output_effect_regions for region_id in op.region_ids)
+    if observes_output:
+        result_types = (*result_types, state.dsl.mem_token_type())
     outer_values = dict(state.values)
     with state.builder.if_(condition, result_types, otherwise=True) as ifop:
         _restore_structural_emission_state(
@@ -1495,6 +1533,7 @@ def _emit_if_structural_only(state, op):
             result_shapes,
             "if then",
             op,
+            observe_output=observes_output,
         )
         if then_yields:
             state.builder.yield_(then_yields)
@@ -1510,6 +1549,7 @@ def _emit_if_structural_only(state, op):
                 result_shapes,
                 "if else",
                 op,
+                observe_output=observes_output,
             )
             if else_yields:
                 state.builder.yield_(else_yields)
@@ -1525,6 +1565,9 @@ def _emit_if_structural_only(state, op):
             "if result component count must match its explicit result types",
             target_op_id=op.target_op_id,
         )
+    if observes_output:
+        state.output_effects.append(flat_results[-1])
+        flat_results = flat_results[:-1]
     cursor = 0
     for result_id, shape in zip(op.results, result_shapes):
         state.values[result_id] = _pack_structured_value_components(
@@ -1574,6 +1617,8 @@ def _emit_for_loop_literal(state, op):
         preserve_mma_packet_payloads=True,
         pack_four_f32_simd_tuples=True,
     )
+    observes_output = op.region_ids[0] in state.output_effect_regions
+    loop_init_values = ((*flat_init_values, state.builder.token()) if observes_output else flat_init_values)
     region = state.target_program.regions[op.region_ids[0]]
     if len(region.block_arg_ids) != 1 + init_arg_count:
         fail(
@@ -1596,12 +1641,13 @@ def _emit_for_loop_literal(state, op):
             lower,
             upper,
             step,
-            init_args=flat_init_values,
+            init_args=loop_init_values,
             nonzero_trip=bool(attrs.get("nonzero_trip", False)),
     ) as loop:
-        if flat_init_values:
+        if loop_init_values:
             induction_value = loop.induction_variable
-            flat_iter_values = tuple(loop.inner_iter_args)
+            flat_iter_values = tuple(loop.inner_iter_args[:len(flat_init_values)])
+            observed_iter = loop.inner_iter_args[-1] if observes_output else None
         else:
             induction_value = loop
             flat_iter_values = ()
@@ -1613,7 +1659,13 @@ def _emit_for_loop_literal(state, op):
             init_shapes,
             op=op,
         )
-        yielded_values = _emit_region(state, op.region_ids[0])
+        if observes_output:
+            yielded_values, observed = _emit_observed_region(
+                state,
+                op.region_ids[0],
+            )
+        else:
+            yielded_values = _emit_region(state, op.region_ids[0])
         flat_yield_values, yield_shapes = _flatten_structured_values(
             state,
             yielded_values,
@@ -1631,7 +1683,13 @@ def _emit_for_loop_literal(state, op):
                 "for_loop yielded component shape must match init args",
                 target_op_id=op.target_op_id,
             )
-        if flat_init_values:
+        if loop_init_values:
+            if observes_output:
+                observed = _join_memory_tokens(
+                    state,
+                    (observed_iter, observed),
+                )
+                flat_yield_values = (*flat_yield_values, observed)
             state.builder.yield_(flat_yield_values)
         elif flat_yield_values:
             fail(
@@ -1645,14 +1703,17 @@ def _emit_for_loop_literal(state, op):
         outer_values,
     )
 
-    flat_results = tuple(loop.results) if flat_init_values else ()
-    if len(flat_results) != len(flat_init_values):
+    flat_results = tuple(loop.results) if loop_init_values else ()
+    if len(flat_results) != len(loop_init_values):
         fail(
             "TLXW_EMIT_FOR_RESULT_COMPONENTS",
             STAGE,
             "for_loop result component count must match explicit init args",
             target_op_id=op.target_op_id,
         )
+    if observes_output:
+        state.output_effects.append(flat_results[-1])
+        flat_results = flat_results[:-1]
     if len(op.results) != init_arg_count:
         fail(
             "TLXW_EMIT_FOR_RESULT_COUNT",
@@ -1682,6 +1743,8 @@ def _emit_structured_branch(
     result_shapes,
     label,
     op,
+    *,
+    observe_output=False,
 ):
     region = state.target_program.regions[region_id]
     if region.block_arg_ids:
@@ -1698,7 +1761,10 @@ def _emit_structured_branch(
             "if branch yield count must match result count",
             target_op_id=op.target_op_id,
         )
-    yielded_values = _emit_region(state, region_id)
+    if observe_output:
+        yielded_values, observed = _emit_observed_region(state, region_id)
+    else:
+        yielded_values = _emit_region(state, region_id)
     flat_yield_values, yield_shapes = _flatten_structured_values(
         state,
         yielded_values,
@@ -1715,7 +1781,7 @@ def _emit_structured_branch(
             "if branch yielded component shape must match result types",
             target_op_id=op.target_op_id,
         )
-    return flat_yield_values
+    return (*flat_yield_values, observed) if observe_output else flat_yield_values
 
 
 def _structured_result_types_and_shapes(state, target_value_ids, op):
@@ -3874,8 +3940,6 @@ def _emit_buffer_store(state, op):
     binding_count = int(attrs.get("index_binding_count", 0))
     expected_operand_count = ordinary_operand_count + binding_count
     dependency = _barrier_order_dependency(state, op, expected_operand_count)
-    _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
-    capture_token = bool(issue_result_ids)
     value = _require_value(state, op.operands[0], op)
     source_base = _require_value(state, op.operands[1], op)
     offsets = _require_value(state, op.operands[2], op)
@@ -3967,23 +4031,17 @@ def _emit_buffer_store(state, op):
                 state,
                 mask_components,
             )
-        if capture_token:
-            token = _emit_masked_token_region(
-                state,
-                predicate_conditions,
-                dependency or state.builder.token(),
-                emit_scatter,
-            )
-        else:
-            token = _emit_masked_effect_region(
-                state,
-                predicate_conditions,
-                emit_scatter,
-            )
+        token = _emit_masked_token_region(
+            state,
+            predicate_conditions,
+            dependency or state.builder.token(),
+            emit_scatter,
+        )
+    state.output_effects.append(token)
     _finish_issue_order_result(
         state,
         op,
-        () if token is None else (token, ),
+        (token, ),
     )
 
 
@@ -4250,8 +4308,6 @@ def _emit_store(state, op):
             f"unsupported store mask mode {mask_mode}",
             target_op_id=op.target_op_id,
         )
-    _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
-    capture_token = bool(issue_result_ids)
     lane_width = int(attrs["lane_width"])
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     packet_type = state.dsl.simd_type(
@@ -4291,17 +4347,14 @@ def _emit_store(state, op):
         token = emit_store()
     else:
         condition = _symbolic_mask_conditions(state, mask_components)
-        if capture_token:
-            token = _emit_masked_token_region(
-                state,
-                condition,
-                dependency or state.builder.token(),
-                emit_store,
-            )
-        else:
-            _emit_masked_effect_region(state, condition, emit_store)
-            token = None
-    _finish_issue_order_result(state, op, () if token is None else (token, ))
+        token = _emit_masked_token_region(
+            state,
+            condition,
+            dependency or state.builder.token(),
+            emit_store,
+        )
+    state.output_effects.append(token)
+    _finish_issue_order_result(state, op, (token, ))
 
 
 def _emit_load(state, op):

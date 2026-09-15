@@ -559,16 +559,25 @@ def _verify_issue_projection_structure(op, target_program, projection_domain):
         return
     if projection_domain == target_ir.EVENT_DOMAIN_MEMORY_ISSUE:
         for operand in op.operands:
-            producer = _target_value_producer(target_program, operand)
-            if producer.kind not in target_ir.MEMORY_ISSUER_OP_KINDS:
+            producers = tuple(producer for producer in target_program.ops if int(operand) in producer.results)
+            block_arg_regions = tuple(region for region in target_program.regions
+                                      if int(operand) in region.block_arg_ids)
+            is_memory_issuer = (len(producers) == 1 and producers[0].kind in target_ir.MEMORY_ISSUER_OP_KINDS)
+            is_structured_completion = (len(producers) == 1 and producers[0].kind in {
+                "for_loop",
+                "if",
+                "token_join",
+            }) or (not producers and len(block_arg_regions) == 1)
+            if not is_memory_issuer and not is_structured_completion:
                 fail(
                     "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
                     STAGE,
-                    "pre-barrier issue projection must come from memory issuers",
+                    "pre-barrier issue projection must come from memory "
+                    "issuers or an explicit structured SSA carry",
                     target_op_id=op.target_op_id,
                     target_value_id=int(operand),
                 )
-            _require_precedes_in_same_region(target_program, producer, op)
+            _require_value_dominates_op(target_program, operand, op)
         return
     if projection_domain == target_ir.EVENT_DOMAIN_BARRIER_ISSUE:
         if len(op.operands) != 1:
@@ -856,7 +865,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         dependency_count = int(attrs.get("dependency_count", -1))
         lds_read_dependency_count = int(attrs.get("lds_read_dependency_count", 0))
         issue_dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
-        if (dependency_count not in {0, 1} or lds_read_dependency_count < 0 or issue_dependency_count not in {0, 1}
+        if (dependency_count not in {0, 1} or lds_read_dependency_count < 0 or issue_dependency_count < 0
                 or dependency_count + lds_read_dependency_count + issue_dependency_count != len(op.operands)):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
