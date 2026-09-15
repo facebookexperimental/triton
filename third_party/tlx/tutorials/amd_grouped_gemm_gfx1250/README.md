@@ -1,13 +1,12 @@
 # FP16 gfx1250 Grouped GEMM
 
-This directory contains a persistent grouped GEMM implementation for gfx1250
-and a regular-shape benchmark sweep. Correctness and compile tests live in the
-existing TLX test files under `python/test/unit/language/`.
+This directory contains a persistent grouped GEMM implementation for gfx1250,
+its correctness and compile tests, and a regular-shape benchmark sweep.
 
 ## Files
 
 - `amd_grouped_gemm_gfx1250_test.py`: pointer-table baseline, optimized TDM
-  kernel and single-shape benchmark CLI.
+  kernel, tests, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with process isolation and CSV
   output.
 
@@ -85,13 +84,11 @@ Persistent program remapping is independently selectable with
 
 ## Correctness
 
-From the repository root, run the grouped GEMM compile and correctness tests:
+Run the complete grouped GEMM test file:
 
 ```bash
-pytest -s --tb=short python/test/unit/language/test_tlx_codegen.py \
-  -k gfx1250_grouped_gemm
-pytest -s --tb=short python/test/unit/language/test_tlx_amd_gfx1250.py \
-  -k gfx1250_grouped_gemm
+pytest -s --tb=short \
+  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py
 ```
 
 Run one shape and compare against `torch.matmul`:
