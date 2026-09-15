@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from . import optimizer as optimizer_module
 from .artifacts import load_prior_run_evidence
 from .cli import (
+    _budget_from_args,
     _commit_body,
     _parse_args,
     _resolve_harness_paths,
@@ -31,6 +32,8 @@ from .models import (
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
+    ResearchEvidence,
+    SourceExcerpt,
     TimingSamples,
     VerificationResult,
     weighted_geometric_speedup,
@@ -38,13 +41,17 @@ from .models import (
 from .optimizer import _profile_log_parts, KernelOptimizer
 from .profiling import ProfileRequest
 from .providers import (
-    _build_prompt,
-    _read_candidate_metadata,
+    AgentDiagnosticRequest,
+    AgentSourceResearchRequest,
     CandidateContext,
     CandidateProposal,
+    DiagnosticInstrumentationProposal,
     FixedCandidateProvider,
     MockLLMProvider,
+    _build_prompt,
+    _read_candidate_metadata,
 )
+from .source_research import SourceResearchContext
 from .source import (
     apply_candidate_diff,
     extract_python_source,
@@ -784,6 +791,27 @@ class PriorRunEvidenceTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_source_research_saturation_threshold_defaults_to_one(self) -> None:
+        args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
+        self.assertEqual(
+            _budget_from_args(args).source_research_saturation_threshold, 1
+        )
+
+    def test_source_research_saturation_threshold_can_be_overridden(self) -> None:
+        args = _parse_args(
+            [
+                "--kernel",
+                "kernel.py",
+                "--output-dir",
+                "/tmp/out",
+                "--source-research-saturation-threshold",
+                "3",
+            ]
+        )
+        self.assertEqual(
+            _budget_from_args(args).source_research_saturation_threshold, 3
+        )
+
     def test_commit_winner_is_enabled_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertTrue(args.commit_winner)
@@ -1338,6 +1366,60 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(profiles, {"a": {"scope": "task.kernel"}})
         harness.profile_only.assert_called_once()
         harness.evaluate.assert_not_called()
+    def test_instrumented_diagnostic_collection_uses_profile_only(self) -> None:
+        source = "VALUE = 1\n"
+        instrumented_source = "VALUE = 1\n# diagnostic scope\n"
+        request = KernelOptimizationRequest(
+            kernel_source=source,
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}),),
+            target=KernelTarget("fake", "fake"),
+        )
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    profile={"scope": "task.kernel"},
+                ),
+            )
+        )
+        harness = Mock()
+        harness.profile_only.return_value = performance
+        harness.evaluate.side_effect = AssertionError("evaluate must not run")
+        instrumenter = Mock()
+        instrumenter.instrument.return_value = DiagnosticInstrumentationProposal(
+            source=instrumented_source,
+            mapping={"schema_version": 1},
+            summary="test",
+        )
+        collection_metadata: dict[str, str] = {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            optimizer_module, "validate_diagnostic_instrumentation_source"
+        ) as validate:
+            profiles = optimizer_module._collect_diagnostic_profiles(
+                harness,
+                source,
+                request,
+                Path(tmp),
+                "diagnostic",
+                reason="test",
+                instrumentation_provider=instrumenter,
+                collection_metadata=collection_metadata,
+            )
+
+        self.assertEqual(profiles, {"a": {"scope": "task.kernel"}})
+        validate.assert_called_once()
+        harness.evaluate.assert_not_called()
+        profile_args = harness.profile_only.call_args.args
+        self.assertEqual(profile_args[0], instrumented_source)
+        self.assertEqual(profile_args[3].source_digest, source_digest(instrumented_source))
+        self.assertEqual(
+            collection_metadata["instrumented_source_digest"],
+            source_digest(instrumented_source),
+        )
+        self.assertIn("instrumentation_mapping_digest", collection_metadata)
 
     def test_prior_source_is_rejected_without_adopting_prior_winner(self) -> None:
         baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
@@ -2349,6 +2431,635 @@ class KernelOptimizerTest(unittest.TestCase):
                 )
                 # Optimizer should complete without error even with oversized profile.
                 self.assertIsNotNone(result)
+
+
+    def test_final_agent_action_cannot_be_spent_on_research(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+
+        class ResearchOnlyProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest:
+                del request
+                return AgentSourceResearchRequest(
+                    source_digest=context.current_source_digest,
+                    question="How do analogous kernels decompose work?",
+                    rationale="The current evidence is insufficient.",
+                )
+
+        class UnexpectedResearchProvider:
+            calls = 0
+
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                del request, context
+                self.calls += 1
+                raise AssertionError("final action must not execute research")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            researcher = UnexpectedResearchProvider()
+            result = KernelOptimizer(
+                ResearchOnlyProvider(),
+                source_research_provider=researcher,
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=1,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(researcher.calls, 0)
+        self.assertIn("final agent action", result.experiments[1].diagnostics)
+
+    def test_research_sees_promoted_in_memory_source(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\nTAG = 0\n"
+        promoted_source = "LATENCY_US = 80\nCORRECT = True\nTAG = 1\n"
+        rejected_source = "LATENCY_US = 90\nCORRECT = True\nTAG = 2\n"
+
+        class PromoteThenResearchProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest | CandidateProposal:
+                del request
+                if context.candidate_index == 0:
+                    return CandidateProposal(promoted_source, "promote first source")
+                if not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest=context.current_source_digest,
+                        question="How do references improve the promoted pipeline?",
+                        rationale="The promoted source still has a structural evidence gap.",
+                    )
+                return CandidateProposal(rejected_source, "follow-up candidate")
+
+        class CapturingResearchProvider:
+            def __init__(self) -> None:
+                self.contexts: list[SourceResearchContext] = []
+
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                self.contexts.append(context)
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="collected",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    findings=("No stronger reference was found.",),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            researcher = CapturingResearchProvider()
+            KernelOptimizer(
+                PromoteThenResearchProvider(),
+                source_research_provider=researcher,
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=2,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertEqual(len(researcher.contexts), 1)
+        self.assertEqual(researcher.contexts[0].current_source, promoted_source)
+        self.assertEqual(
+            source_digest(researcher.contexts[0].current_source),
+            source_digest(promoted_source),
+        )
+
+    def test_unresearched_rejections_raise_escalation_signal(self) -> None:
+        contexts: list[CandidateContext] = []
+        candidates = iter(
+            (
+                CandidateProposal(
+                    "LATENCY_US = 120\nCORRECT = True\nTAG = 1\n",
+                    "first local pipeline change",
+                    hypothesis_kind="pipeline",
+                ),
+                CandidateProposal(
+                    "LATENCY_US = 130\nCORRECT = True\nTAG = 2\n",
+                    "second local synchronization change",
+                    hypothesis_kind="synchronization",
+                ),
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nTAG = 3\n",
+                    "topology change",
+                    hypothesis_kind="topology",
+                    escalation_reason="Two unresearched candidates were rejected.",
+                ),
+            )
+        )
+
+        class RecordingProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> CandidateProposal:
+                del request
+                contexts.append(context)
+                return next(candidates)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(RecordingProvider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\nTAG = 0\n",
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=3,
+                        benchmark_repetitions=1,
+                        max_diagnostic_proton_passes=0,
+                    ),
+                    output_dir=Path(directory) / "out",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            [context.local_search_failure_streak for context in contexts],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            [context.source_research_saturation_threshold for context in contexts],
+            [1, 1, 1],
+        )
+        self.assertEqual(result.experiments[-1].hypothesis_kind, "topology")
+
+    def test_failed_research_citation_does_not_reset_saturation(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\nTAG = 0\n"
+        contexts: list[CandidateContext] = []
+
+        class FailedResearchThenCandidateProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest | CandidateProposal:
+                del request
+                if context.candidate_index == 0 and not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest=context.current_source_digest,
+                        question="How do analogous kernels decompose work?",
+                        rationale="The local topology lacks evidence.",
+                    )
+                if context.candidate_index == 0:
+                    return CandidateProposal(
+                        "LATENCY_US = 120\nCORRECT = True\nTAG = 1\n",
+                        "research attempt failed before this local candidate",
+                        research_evidence_ids=(
+                            context.research_evidence[0].action_id,
+                        ),
+                    )
+                contexts.append(context)
+                return CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\nTAG = 2\n",
+                    "follow-up candidate",
+                )
+
+        class FailedResearchProvider:
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="failed",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    limitations=("repository query failed",),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            result = KernelOptimizer(
+                FailedResearchThenCandidateProvider(),
+                source_research_provider=FailedResearchProvider(),
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=2,
+                        max_diagnostic_proton_passes=0,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0].local_search_failure_streak, 1)
+
+    def test_denied_research_does_not_consume_per_candidate_budget(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        contexts: list[CandidateContext] = []
+
+        class RetryResearchProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest | CandidateProposal:
+                del request
+                contexts.append(context)
+                if not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest="0" * 64,
+                        question="This stale request should be denied.",
+                        rationale="Exercise pre-execution validation.",
+                    )
+                if len(context.research_evidence) == 1:
+                    return AgentSourceResearchRequest(
+                        source_digest=context.current_source_digest,
+                        question="How do analogous kernels decompose work?",
+                        rationale="Retry with the authoritative source digest.",
+                    )
+                return CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\n",
+                    "research-backed candidate",
+                    research_evidence_ids=(
+                        context.research_evidence[-1].action_id,
+                    ),
+                )
+
+        class CollectingResearchProvider:
+            calls = 0
+
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                self.calls += 1
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="collected",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    findings=("A transferable pattern exists.",),
+                )
+
+        researcher = CollectingResearchProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            result = KernelOptimizer(
+                RetryResearchProvider(),
+                source_research_provider=researcher,
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=3,
+                        max_source_research_actions_per_candidate=1,
+                        max_diagnostic_proton_passes=0,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(researcher.calls, 1)
+        self.assertEqual(
+            [evidence.status for evidence in contexts[-1].research_evidence],
+            ["denied", "collected"],
+        )
+
+    def test_failed_research_consumes_execution_budget(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        contexts: list[CandidateContext] = []
+
+        class RetryResearchProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest | CandidateProposal:
+                del request
+                contexts.append(context)
+                if len(context.research_evidence) < 2:
+                    return AgentSourceResearchRequest(
+                        source_digest=context.current_source_digest,
+                        question="How do analogous kernels decompose work?",
+                        rationale="Verify executed research remains bounded.",
+                    )
+                return CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\n",
+                    "research-backed candidate",
+                    research_evidence_ids=(
+                        context.research_evidence[-1].action_id,
+                    ),
+                )
+
+        class FailedResearchProvider:
+            calls = 0
+
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                self.calls += 1
+                raise RuntimeError("transient repository failure")
+
+        researcher = FailedResearchProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            result = KernelOptimizer(
+                RetryResearchProvider(),
+                source_research_provider=researcher,
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=3,
+                        max_source_research_actions_per_candidate=1,
+                        max_source_research_actions_total=1,
+                        max_diagnostic_proton_passes=0,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(researcher.calls, 1)
+        self.assertEqual(
+            [evidence.status for evidence in contexts[-1].research_evidence],
+            ["failed", "denied"],
+        )
+
+    def test_provider_failure_after_research_is_logged(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+
+        class FailingAfterResearchProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest | CandidateProposal:
+                del request
+                if not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest=context.current_source_digest,
+                        question="How do analogous kernels decompose work?",
+                        rationale="Collect evidence before the provider failure.",
+                    )
+                raise RuntimeError("provider exploded after research")
+
+        class CollectingResearchProvider:
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="collected",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    findings=("A transferable pattern exists.",),
+                )
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, redirect_stderr(stderr):
+            root = Path(directory)
+            (root / ".git").mkdir()
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            result = KernelOptimizer(
+                FailingAfterResearchProvider(),
+                source_research_provider=CollectingResearchProvider(),
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=2,
+                        max_diagnostic_proton_passes=0,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn(
+            "RuntimeError: provider exploded after research",
+            stderr.getvalue(),
+        )
+        self.assertIn(
+            "RuntimeError: provider exploded after research",
+            result.experiments[-1].diagnostics,
+        )
+
+    def test_source_research_returns_to_same_candidate_slot(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
+        contexts: list[CandidateContext] = []
+
+        class ResearchThenCandidateProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> AgentSourceResearchRequest | AgentDiagnosticRequest | CandidateProposal:
+                del request
+                contexts.append(context)
+                if not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest=context.current_source_digest,
+                        question="How do analogous kernels reduce repeated work?",
+                        rationale="Local parameter evidence cannot answer the topology question.",
+                        search_terms=("repeated work", "topology"),
+                        goals=("Find a transferable decomposition",),
+                    )
+                if not context.diagnostic_evidence:
+                    return AgentDiagnosticRequest(
+                        tool="ncu",
+                        source_digest=context.current_source_digest,
+                        case_ids=("a",),
+                        question="Do counters support the researched topology hypothesis?",
+                        rationale="Repository structure alone does not identify the runtime bottleneck.",
+                        ncu_level="summary",
+                    )
+                evidence_id = context.research_evidence[0].action_id
+                return CandidateProposal(
+                    source=candidate_source,
+                    summary="remove repeated work",
+                    hypothesis="A different work decomposition avoids repeated work.",
+                    hypothesis_kind="topology",
+                    escalation_reason="Repository evidence identifies a reusable decomposition.",
+                    research_evidence_ids=(evidence_id,),
+                )
+
+        class FakeResearchProvider:
+            def __init__(self) -> None:
+                self.calls: list[SourceResearchContext] = []
+
+            def research(
+                self,
+                request: AgentSourceResearchRequest,
+                context: SourceResearchContext,
+            ) -> ResearchEvidence:
+                self.calls.append(context)
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="collected",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    findings=("The reference reuses one input across two outputs.",),
+                    excerpts=(
+                        SourceExcerpt(
+                            path="reference.py",
+                            start_line=1,
+                            end_line=1,
+                            symbol="reference",
+                            text="REFERENCE = 1",
+                        ),
+                    ),
+                    inspected_paths=("reference.py",),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "reference.py").write_text("REFERENCE = 1\n")
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            research_provider = FakeResearchProvider()
+            output_dir = root / "out"
+            result = KernelOptimizer(
+                ResearchThenCandidateProvider(),
+                source_research_provider=research_provider,
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=1,
+                        max_agent_actions_per_candidate=3,
+                        max_diagnostic_actions_per_candidate=1,
+                        max_diagnostic_proton_passes=0,
+                        max_diagnostic_ncu_collections=1,
+                        max_source_research_actions_per_candidate=1,
+                        max_source_research_actions_total=1,
+                    ),
+                    output_dir=output_dir,
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(len(contexts), 3)
+            self.assertTrue(
+                all(context.candidate_index == contexts[0].candidate_index for context in contexts)
+            )
+            self.assertEqual(len(contexts[1].research_evidence), 1)
+            self.assertEqual(len(contexts[2].diagnostic_evidence), 1)
+            self.assertEqual(len(research_provider.calls), 1)
+            self.assertTrue(
+                (output_dir / "research" / "history.json").is_file()
+            )
+            self.assertEqual(result.experiments[1].hypothesis_kind, "topology")
+            self.assertEqual(
+                result.experiments[1].research_evidence_ids,
+                ("r001-c000-a00",),
+            )
 
 
 def _write_policy_harness(directory: Path) -> Path:

@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .models import PriorExperimentEvidence, PriorRunEvidence, JsonValue, to_json_value
+from .models import (
+    DiagnosticEvidence,
+    JsonValue,
+    PriorExperimentEvidence,
+    PriorRunEvidence,
+    ResearchEvidence,
+    to_json_value,
+)
 from .source import source_digest, source_diff
 
 _INLINE_PROFILE_LIMIT_BYTES = 1_000_000
@@ -153,6 +160,33 @@ class ArtifactStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(to_json_value(value), indent=2, sort_keys=True) + "\n")
         return path
+
+    def write_diagnostic_request(self, action_id: str, request: object) -> Path:
+        return self.write_json(f"diagnostics/actions/{action_id}/request.json", request)
+
+    def write_diagnostic_evidence(
+        self, action_id: str, evidence: DiagnosticEvidence
+    ) -> Path:
+        return self.write_json(
+            f"diagnostics/actions/{action_id}/evidence.json", evidence
+        )
+
+    def write_diagnostic_history(
+        self,
+        evidence: tuple[DiagnosticEvidence, ...],
+    ) -> Path:
+        return self.write_json("diagnostics/history.json", evidence)
+
+    def write_research_request(self, action_id: str, request: object) -> Path:
+        return self.write_json(f"research/actions/{action_id}/request.json", request)
+
+    def write_research_evidence(
+        self, action_id: str, evidence: ResearchEvidence
+    ) -> Path:
+        return self.write_json(f"research/actions/{action_id}/evidence.json", evidence)
+
+    def write_research_history(self, evidence: tuple[ResearchEvidence, ...]) -> Path:
+        return self.write_json("research/history.json", evidence)
 
     def write_profile(self, experiment_id: str, profile: Mapping[str, JsonValue]) -> Path:
         """Write a per-experiment profile, spilling large payloads to artifacts/."""
