@@ -274,7 +274,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
 
 // -----
 
-module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32} {
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32, "ttng.warp_specialize_barrier_ids" = array<i32: 2, 4, 5>} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
@@ -313,8 +313,8 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // CHECK-DAG: [[CST:%.*]] = llvm.mlir.constant({{.*}}) : f32
   // CHECK-DAG: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
   // CHECK-DAG: [[C2:%.*]] = llvm.mlir.constant(2 : i32)
-  // CHECK-DAG: [[C3:%.*]] = llvm.mlir.constant(3 : i32)
   // CHECK-DAG: [[C4:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: [[C5:%.*]] = llvm.mlir.constant(5 : i32)
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
   default {
     llvm.call @inner_func_nw4() : () -> ()
@@ -328,13 +328,13 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
     ttg.warp_return
   }
   partition1() num_warps(2) {
-    // CHECK: call @inner_func_nw2_ws([[CST]], [[C3]]) : (f32, i32) -> ()
+    // CHECK: call @inner_func_nw2_ws([[CST]], [[C4]]) : (f32, i32) -> ()
     %cst = llvm.mlir.constant(4.2 : f32) : f32
     llvm.call @inner_func_nw2(%cst) : (f32) -> ()
     ttg.warp_return
   }
   partition2() num_warps(1) {
-    // CHECK: call @inner_func_nw1_ws([[C4]]) : (i32) -> ()
+    // CHECK: call @inner_func_nw1_ws([[C5]]) : (i32) -> ()
     llvm.call @inner_func_nw1() : () -> ()
     ttg.warp_return
   } : () -> ()

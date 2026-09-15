@@ -15,6 +15,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/WarpSpecializeUtility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NamedBarrier.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTWARPSPECIALIZETOLLVM
@@ -32,20 +33,12 @@ static constexpr const char kDisableSetMaxRegisterAttr[] =
 // Utilities
 //===----------------------------------------------------------------------===//
 
-// Reserve one barrier for the default warp group, one for the start barrier,
-// and one for the end barrier.
-enum BarrierIndex {
-  kDefaultWarpGroupBarrierIdx,
-  kSwitchLoopBarrierIdx,
-
-  kNumReservedBarriers,
-  kNumBarriers = 16
-};
-
 class NVIDIAWarpSpecializeBarrierHelper : public WarpSpecializeBarrierHelper {
 public:
-  NVIDIAWarpSpecializeBarrierHelper(unsigned numThreadsPerWarp)
-      : numThreadsPerWarp(numThreadsPerWarp) {}
+  NVIDIAWarpSpecializeBarrierHelper(unsigned numThreadsPerWarp,
+                                    ArrayRef<int32_t> partitionBarrierIds)
+      : numThreadsPerWarp(numThreadsPerWarp),
+        partitionBarrierIds(partitionBarrierIds) {}
 
   bool isBarrierOp(Operation *op) const override {
     return isa<NVVM::BarrierOp>(op);
@@ -64,14 +57,14 @@ public:
                    std::optional<unsigned> partitionIdx) override {
     unsigned barIdx;
     if (!partitionIdx) {
-      barIdx = kDefaultWarpGroupBarrierIdx;
+      barIdx = nvidia_gpu::kDefaultWarpGroupBarrierId;
     } else {
-      barIdx = *partitionIdx + kNumReservedBarriers;
-      if (barIdx >= kNumBarriers) {
-        return mlir::emitError(b.getLoc(), "cannot support more than ")
-               << (kNumBarriers - kNumReservedBarriers)
-               << " warp group partitions";
-      }
+      if (*partitionIdx >= partitionBarrierIds.size())
+        return mlir::emitError(b.getLoc(),
+                               "missing named barrier ID for warp group "
+                               "partition ")
+               << *partitionIdx;
+      barIdx = partitionBarrierIds[*partitionIdx];
     }
     return b.i32_val(barIdx);
   }
@@ -89,6 +82,7 @@ public:
 
 private:
   unsigned numThreadsPerWarp;
+  SmallVector<int32_t> partitionBarrierIds;
 };
 
 //===----------------------------------------------------------------------===//
@@ -217,7 +211,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
 
   WarpSpecializeCallbacks callbacks;
   callbacks.createAllBarrier = [](TritonLLVMIRRewriter &b, unsigned barIdx) {
-    assert(barIdx < kNumBarriers && "not enough barriers");
+    assert(barIdx <= nvidia_gpu::kLastNamedBarrierId && "not enough barriers");
     LLVM::createLLVMIntrinsicCallOp(
         b, b.getLoc(), "llvm.nvvm.barrier.cta.sync.all", {}, b.i32_val(barIdx));
   };
@@ -262,7 +256,8 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
 
   return lowerWarpSpecializeCommon(
       func, wsOps, entry, header, switchLoop, wid, ctx, defaultNumWarps,
-      totalNumWarpsAttr.getInt(), targetInfo, callbacks, kSwitchLoopBarrierIdx);
+      totalNumWarpsAttr.getInt(), targetInfo, callbacks,
+      nvidia_gpu::kSwitchLoopBarrierId);
 }
 
 //===----------------------------------------------------------------------===//
@@ -293,7 +288,26 @@ struct ConvertWarpSpecializeToLLVM
       return signalPassFailure();
 
     unsigned threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
-    NVIDIAWarpSpecializeBarrierHelper barrierHelper(threadsPerWarp);
+    SmallVector<int32_t> partitionBarrierIds =
+        nvidia_gpu::getWarpSpecializeBarrierIds(mod);
+    if (partitionBarrierIds.empty()) {
+      unsigned maxPartitions = 0;
+      mod.walk([&](WarpSpecializeOp op) {
+        maxPartitions = std::max<unsigned>(
+            maxPartitions, op.getPartitionRegions().size());
+      });
+      if (nvidia_gpu::kFirstPartitionBarrierId + maxPartitions - 1 >
+          nvidia_gpu::kLastNamedBarrierId) {
+        mod.emitError("not enough named barriers for warp-specialize "
+                      "partitions");
+        return signalPassFailure();
+      }
+      for (unsigned i = 0; i < maxPartitions; ++i)
+        partitionBarrierIds.push_back(
+            nvidia_gpu::kFirstPartitionBarrierId + i);
+    }
+    NVIDIAWarpSpecializeBarrierHelper barrierHelper(threadsPerWarp,
+                                                     partitionBarrierIds);
     if (failed(lowerWarpSpecializeBarriers(mod, barrierHelper)))
       return signalPassFailure();
 
