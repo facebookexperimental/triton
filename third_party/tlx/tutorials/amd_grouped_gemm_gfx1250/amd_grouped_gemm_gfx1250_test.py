@@ -490,12 +490,15 @@ def grouped_gemm_tdm_kernel(
     """
     tl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
     tl.static_assert(C_STAGING_MODE == 0 or C_STAGING_MODE == 1, "C_STAGING_MODE must be 0 or 1")
-    tl.static_assert(not CROSS_TILE_PREFETCH or C_STAGING_MODE == 1, "cross-tile prefetch requires dedicated C staging")
+    tl.static_assert(not CROSS_TILE_PREFETCH or C_STAGING_MODE == 1 or (BLOCK_M == 256 and BLOCK_N == 256),
+                     "alias-C cross-tile prefetch requires a 256x256 tile")
     tl.static_assert(not CROSS_TILE_PREFETCH or NUM_BUFFERS == 2, "cross-tile prefetch currently requires depth 2")
     tl.static_assert(NUM_XCDS >= 1, "NUM_XCDS must be positive")
     # The square tile uses one third fewer LDS reads per WMMA than 128x256.
     # Limit operand lifetimes and K-loop scope to keep it free of scratch spills.
     OPTIMIZE_CROSS_TILE: tl.constexpr = CROSS_TILE_PREFETCH and BLOCK_M == 256 and BLOCK_N == 256
+    HYBRID_TILE_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and C_STAGING_MODE == 0
+    CROSS_GROUP_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and not HYBRID_TILE_PREFETCH
     OPTIMIZE_ALIAS_C: tl.constexpr = C_STAGING_MODE == 0 and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 2
     LIMIT_DOT_LIFETIME: tl.constexpr = OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
     if LIMIT_DOT_LIFETIME:
@@ -510,7 +513,7 @@ def grouped_gemm_tdm_kernel(
             pack=1,
         )
     DIRECT_LOAD_OFFSETS: tl.constexpr = OPTIMIZE_CROSS_TILE and L2_PREFETCH_DISTANCE == 0
-    K_BLOCKS_PER_LOOP: tl.constexpr = 1 if OPTIMIZE_CROSS_TILE else NUM_BUFFERS
+    K_BLOCKS_PER_LOOP: tl.constexpr = 1 if CROSS_GROUP_PREFETCH else NUM_BUFFERS
     NUM_SUBTILES: tl.constexpr = 4
     SUBTILE_LEN: tl.constexpr = BLOCK_K // NUM_SUBTILES
     K_ITERS: tl.constexpr = K // BLOCK_K
@@ -542,7 +545,7 @@ def grouped_gemm_tdm_kernel(
         c_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(c_packed), 1, reuse=a_buf)
 
     group_primed = False
-    if OPTIMIZE_CROSS_TILE:
+    if CROSS_GROUP_PREFETCH:
         # Keep four upcoming boundaries available across output stores. Refill
         # the window in a tile's tail so group entry needs no metadata load.
         carried_m_start = tl.load(group_offsets)
@@ -551,7 +554,7 @@ def grouped_gemm_tdm_kernel(
         carried_third_m_end = tl.load(group_offsets + tl.minimum(3, group_size))
         carried_fourth_m_end = tl.load(group_offsets + tl.minimum(4, group_size))
     for g in range(group_size):
-        if OPTIMIZE_CROSS_TILE:
+        if CROSS_GROUP_PREFETCH:
             m_start, m_end = carried_m_start, carried_m_end
             following_m_end = carried_following_m_end
             third_m_end = carried_third_m_end
@@ -602,9 +605,13 @@ def grouped_gemm_tdm_kernel(
 
         if CROSS_TILE_PREFETCH:
             # Prime only when the predecessor did not provide K0/K1. The
-            # square schedule carries those inputs across group boundaries.
-            if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles and (not OPTIMIZE_CROSS_TILE
+            # cross-group mode also carries inputs across group boundaries.
+            if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles and (not CROSS_GROUP_PREFETCH
                                                                                              or not group_primed):
+                if HYBRID_TILE_PREFETCH:
+                    # The previous group's last tile stored C through the A
+                    # ring. Retire that store before priming the new group.
+                    tlx.async_amd_descriptor_wait(0)
                 first_off_m, first_off_n = _grouped_tile_offsets(tile_idx, last_problem_end, num_m_tiles, num_n_tiles,
                                                                  GROUP_M, BLOCK_M, BLOCK_N)
                 _tdm_issue_loads_unpredicated(
@@ -654,7 +661,7 @@ def grouped_gemm_tdm_kernel(
             producer = 0
             consumer = 0
 
-            if C_STAGING_MODE == 0:
+            if C_STAGING_MODE == 0 and not HYBRID_TILE_PREFETCH:
                 # The previous tile's async C store may still be reading from
                 # c_buf, which aliases a_buf. Delay the drain until the next
                 # actual LDS overwrite hazard instead of waiting immediately
@@ -705,8 +712,8 @@ def grouped_gemm_tdm_kernel(
                 steady_end = K_ITERS - NUM_BUFFERS
                 # Producer and consumer are affine functions of the canonical
                 # loop IV; deriving them avoids two scalar loop-carried values.
-                # The square tile keeps one K block per loop to limit live
-                # state. Other tiles retain explicit ring-sized chunks; the
+                # Cross-group lookahead keeps one K block per loop to limit
+                # live state. Other paths retain ring-sized chunks; the
                 # host contract makes steady_end divisible by NUM_BUFFERS.
                 chunk_end = steady_end // K_BLOCKS_PER_LOOP
                 for chunk in tl.range(0, chunk_end):
@@ -730,7 +737,7 @@ def grouped_gemm_tdm_kernel(
                         acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, i + 1, NUM_BUFFERS,
                                                                    BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
 
-                if OPTIMIZE_CROSS_TILE:
+                if CROSS_GROUP_PREFETCH:
                     if not prefetched_boundary:
                         carried_fourth_m_end = tl.load(group_offsets + g + 5)
                         prefetched_boundary = True
@@ -780,6 +787,19 @@ def grouped_gemm_tdm_kernel(
                                                                      tl.constexpr(1)], block_shape=[BLOCK_N, BLOCK_K])
                     next_load_m, next_load_n = next_off_m, next_off_n
                     group_primed = has_next
+                    tlx.amd_sched_barrier()
+                elif HYBRID_TILE_PREFETCH:
+                    # Keep only the current group's descriptors alive. Its
+                    # final tile uses alias-C storage and drains at group entry.
+                    tlx.amd_sched_barrier()
+                    next_tile_idx = tile_idx + NUM_PROGRAMS
+                    group_end = last_problem_end + num_tiles
+                    has_next = next_tile_idx < group_end
+                    safe_next_tile_idx = min(next_tile_idx, group_end - 1)
+                    next_off_m, next_off_n = _grouped_tile_offsets(safe_next_tile_idx, last_problem_end, num_m_tiles,
+                                                                   num_n_tiles, GROUP_M, BLOCK_M, BLOCK_N)
+                    next_a_desc, next_b_desc = a_desc_base, b_desc_base
+                    next_load_m, next_load_n = next_off_m, next_off_n
                     tlx.amd_sched_barrier()
 
                 # Peel one full ring rotation. Once a current-tile slot has
@@ -833,7 +853,7 @@ def grouped_gemm_tdm_kernel(
                     acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer, NUM_BUFFERS,
                                                                BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
 
-            if OPTIMIZE_CROSS_TILE:
+            if OPTIMIZE_CROSS_TILE and (not HYBRID_TILE_PREFETCH or has_next):
                 # Direct C stores leave both input rings intact without a
                 # full C tile in LDS or serialized stores through a small one.
                 tlx.amd_sched_barrier()
@@ -871,7 +891,7 @@ def grouped_gemm_tdm_kernel(
             tile_idx += NUM_PROGRAMS
 
         last_problem_end += num_tiles
-        if OPTIMIZE_CROSS_TILE:
+        if CROSS_GROUP_PREFETCH:
             if not prefetched_boundary:
                 # Groups with no tile still advance the boundary pipeline.
                 carried_fourth_m_end = tl.load(group_offsets + g + 5)
@@ -916,8 +936,10 @@ def grouped_gemm_tdm(
     ``tdm_pipeline_depth`` maps to the TDM LDS ring-buffer depth; the f16 and
     MXFP gfx1250 kernels use the same 2/3/4-buffer tuning space.
     ``cross_tile_prefetch`` recycles the final two K-loop slots for the next
-    tile. The 256x256 schedule also crosses group boundaries and stores C
-    directly; smaller tiles use dedicated LDS for C within each group.
+    tile. With alias-C storage, the 256x256 hybrid prefetches within a group,
+    stores C directly between tiles, and uses a TDM store at group boundaries.
+    With dedicated C staging, the square schedule also prefetches across
+    groups; smaller tiles use dedicated LDS for C within each group.
     ``auto_config`` scores the validated tile seeds using saturated rate, CU
     utilization, and padding efficiency.
     """
@@ -952,7 +974,8 @@ def grouped_gemm_tdm(
     assert block_k == 128, "first TDM schedule requires BLOCK_K=128"
     assert tdm_pipeline_depth in (2, 3, 4), "tdm_pipeline_depth must be 2, 3, or 4"
     assert c_staging_mode in (0, 1)
-    assert (not cross_tile_prefetch or c_staging_mode == 1), "cross_tile_prefetch requires dedicated C staging"
+    assert (not cross_tile_prefetch or c_staging_mode == 1
+            or (block_m == 256 and block_n == 256)), "alias-C cross-tile prefetch requires a 256x256 tile"
     assert (not cross_tile_prefetch or tdm_pipeline_depth == 2), "cross_tile_prefetch currently requires depth 2"
     assert n % block_n == 0 and k % block_k == 0
     assert k // block_k >= tdm_pipeline_depth
@@ -1195,9 +1218,10 @@ def test_grouped_gemm_tdm_asymmetric_dedicated_c_compiles_gfx1250(BLOCK_M, BLOCK
 
 
 @pytest.mark.parametrize("XCD_REMAP_MODE", [0, 1, 2])
-@pytest.mark.parametrize("BLOCK_M", [128, 256])
+@pytest.mark.parametrize("BLOCK_M,C_STAGING_MODE", [(128, 1), (256, 1), (256, 0)])
 @pytest.mark.parametrize("L2_PREFETCH_DISTANCE", [0, 2])
-def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, BLOCK_M, L2_PREFETCH_DISTANCE):
+def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, BLOCK_M, C_STAGING_MODE,
+                                                               L2_PREFETCH_DISTANCE):
     """The peeled depth-2 tail should retain the next-tile TDM load path."""
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
@@ -1213,7 +1237,7 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
             "GROUP_M": 4,
             "NUM_BUFFERS": 2,
             "L2_PREFETCH_DISTANCE": L2_PREFETCH_DISTANCE,
-            "C_STAGING_MODE": 1,
+            "C_STAGING_MODE": C_STAGING_MODE,
             "CROSS_TILE_PREFETCH": True,
             "XCD_REMAP_MODE": XCD_REMAP_MODE,
             "NUM_XCDS": 8,
@@ -1235,13 +1259,18 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
     if BLOCK_M == 256:
         # A full dedicated C tile exceeds the LDS budget at this size.
         assert "buffer_store_b128" in amdgcn
-        assert "tensor_store_from_lds" not in amdgcn
+        if C_STAGING_MODE == 0:
+            # The hybrid retains a TDM alias-C store for each group's last tile.
+            assert "tensor_store_from_lds" in amdgcn
+        else:
+            assert "tensor_store_from_lds" not in amdgcn
     else:
         assert "amdg.async_tdm_copy_local_to_global" in ttgir
         assert "tensor_store_from_lds" in amdgcn
         last_dot = ttgir.rfind("tt.dot")
         late_barrier = ttgir.find("rocdl.sched.barrier", last_dot)
-        late_c_desc = ttgir.find("amdg.update_tensor_descriptor %c_desc_base", late_barrier)
+        # SSA names depend on whether line information is enabled.
+        late_c_desc = ttgir.find("amdg.update_tensor_descriptor", late_barrier)
         closing_barrier = ttgir.find("rocdl.sched.barrier", late_c_desc)
         assert last_dot < late_barrier < late_c_desc < closing_barrier
 
@@ -1329,10 +1358,10 @@ def test_grouped_gemm_tdm_asymmetric_depth3_gfx1250():
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-@pytest.mark.parametrize("block_m", [128, 256])
-@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("block_m,c_staging_mode,k", [(128, 1, 256), (128, 1, 512), (256, 1, 256), (256, 1, 512),
+                                                      (256, 0, 256), (256, 0, 512), (256, 0, 4096)])
 @pytest.mark.parametrize("m_tiles", [[2, 0, 1, 0], [0, 1, 0, 0, 0, 2, 0, 1, 0]])
-def test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250(block_m, k, m_tiles):
+def test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250(block_m, c_staging_mode, k, m_tiles):
     device = triton.runtime.driver.active.get_active_torch_device()
     torch.manual_seed(0)
 
@@ -1353,7 +1382,7 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250(block_m, k, m_tiles):
         tdm_pipeline_depth=2,
         l2_prefetch_distance=0,
         num_programs=2,
-        c_staging_mode=1,
+        c_staging_mode=c_staging_mode,
         cross_tile_prefetch=True,
     )
 
@@ -1412,7 +1441,7 @@ if __name__ == "__main__":
     parser.add_argument("--dedicated_c_buffer", action=argparse.BooleanOptionalAction, default=False,
                         help="keep C separate from the A ring (direct stores for 256x256 cross-tile)")
     parser.add_argument("--cross_tile_prefetch", action=argparse.BooleanOptionalAction, default=False,
-                        help="prefetch the next tile in the peeled K-loop tail")
+                        help="prefetch the next tile; alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto_config", action=argparse.BooleanOptionalAction, default=False,
                         help="select a validated tile config using the host cost model")
     parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none",

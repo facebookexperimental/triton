@@ -4,6 +4,10 @@ Each shape is ``(G, M_per_group, N, K)``. Every group has the same M.
 Each case runs in a separate process so its large GPU allocations are released
 before the next case starts. Subprocesses use the current Python interpreter
 and inherit its environment.
+
+The standard sweep selects the within-group hybrid for the large allocation
+cases and alias-C for 16x4096x4096x4096. Explicit prefetch flags override this
+selection; --auto-config selects the kernel's general cost model instead.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ DEFAULT_CASES = (
     (8, 65536, 4096, 4096),
     (16, 4096, 4096, 4096),
 )
+
+# Use the hybrid for large-allocation cases and alias-C for the small case.
+_HYBRID_CASES = frozenset(case for case in DEFAULT_CASES if case[1] >= 32768)
 
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS", )
 
@@ -84,6 +91,16 @@ def _parse_case(value: str) -> BenchCase:
     return BenchCase(groups, m, n, k)
 
 
+def _use_cross_tile_prefetch(args: argparse.Namespace, case: BenchCase) -> bool:
+    if args.cross_tile_prefetch is not None:
+        return args.cross_tile_prefetch
+    if args.auto_config or args.dedicated_c_buffer:
+        return False
+    standard_schedule = ((args.block_m, args.block_n, args.block_k, args.tdm_pipeline_depth) == (256, 256, 128, 2)
+                         and args.group_m == 4 and args.l2_prefetch_distance == 0 and args.xcd_remap == "none")
+    return standard_schedule and (case.groups, case.m, case.n, case.k) in _HYBRID_CASES
+
+
 def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
     kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250_test.py")
     command = [
@@ -124,7 +141,7 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         command.extend(["--num_programs", str(args.num_programs)])
     if args.dedicated_c_buffer:
         command.append("--dedicated_c_buffer")
-    if args.cross_tile_prefetch:
+    if _use_cross_tile_prefetch(args, case):
         command.append("--cross_tile_prefetch")
     if args.auto_config:
         command.append("--auto_config")
@@ -212,7 +229,8 @@ def main() -> int:
     parser.add_argument("--l2-prefetch-distance", type=int, default=0)
     parser.add_argument("--num-programs", type=int, default=None)
     parser.add_argument("--dedicated-c-buffer", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
+                        help="override per-shape defaults; alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto-config", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none")
     parser.add_argument("--num-xcds", type=int, default=8)
