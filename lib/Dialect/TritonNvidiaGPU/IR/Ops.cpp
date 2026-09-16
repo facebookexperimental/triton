@@ -413,6 +413,50 @@ LogicalResult InitBarrierOp::verify() {
 
 TypedValue<MemDescType> InitBarrierOp::getBarrier() { return getAlloc(); }
 
+namespace {
+std::optional<int64_t> getConstantNamedBarrierId(Value value) {
+  // A statically known ID reaches the wrapper as a block argument when it is
+  // passed into a partition as a `ttg.warp_specialize` capture, so resolve
+  // through the capture before matching the constant. Without this, a reserved
+  // user ID would escape validation and a constant compiler ID would be
+  // misreported as dynamic.
+  auto constant = mlir::triton::gpu::resolveWarpSpecializeCapture(value)
+                      .getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  auto valueAttr = dyn_cast<IntegerAttr>(constant.getValue());
+  if (!valueAttr)
+    return std::nullopt;
+  return valueAttr.getInt();
+}
+
+LogicalResult verifyNamedBarrierIdInHardwareRange(Operation *op, int64_t id) {
+  if (id < 0 || id > 15)
+    return op->emitOpError("named barrier ID must be in the range [0, 15]");
+  return success();
+}
+} // namespace
+
+LogicalResult UserNamedBarrierIdOp::verify() {
+  std::optional<int64_t> id = getConstantNamedBarrierId(getValue());
+  if (!id)
+    return success();
+  if (failed(verifyNamedBarrierIdInHardwareRange(getOperation(), *id)))
+    return failure();
+  if (*id == 0)
+    return emitOpError("ID 0 is reserved for the compiler");
+  if (*id == 1 || *id == 2)
+    return emitOpError("IDs 1 and 2 are reserved for special lowering");
+  return success();
+}
+
+LogicalResult CompilerNamedBarrierIdOp::verify() {
+  std::optional<int64_t> id = getConstantNamedBarrierId(getValue());
+  if (!id)
+    return emitOpError("requires a constant named barrier ID");
+  return verifyNamedBarrierIdInHardwareRange(getOperation(), *id);
+}
+
 // -- InvalBarrierOp --
 LogicalResult InvalBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
