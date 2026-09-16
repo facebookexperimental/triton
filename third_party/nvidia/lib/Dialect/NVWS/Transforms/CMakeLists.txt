@@ -1,4 +1,5 @@
 add_triton_library(NVWSTransforms
+  BufferGroups.cpp
   AssignSemaphoreStagePhase.cpp
   OptimizeSemaphore.cpp
   LowerSemaphore.cpp
