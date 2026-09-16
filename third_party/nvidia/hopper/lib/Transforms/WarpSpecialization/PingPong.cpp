@@ -629,10 +629,14 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     OpBuilder builder(&pingRegionBlock, pingRegionBlock.begin());
     auto pingRegionLoc = pingRegionBlock.front().getLoc();
     // Prepare values
-    Value pingBarrier =
-        arith::ConstantIntOp::create(builder, pingRegionLoc, pingBarrierId, 32);
-    Value pongBarrier =
-        arith::ConstantIntOp::create(builder, pingRegionLoc, pongBarrierId, 32);
+    Value pingBarrier = ttng::CompilerNamedBarrierIdOp::create(
+        builder, pingRegionLoc,
+        arith::ConstantIntOp::create(builder, pingRegionLoc, pingBarrierId,
+                                     32));
+    Value pongBarrier = ttng::CompilerNamedBarrierIdOp::create(
+        builder, pingRegionLoc,
+        arith::ConstantIntOp::create(builder, pingRegionLoc, pongBarrierId,
+                                     32));
     Value pingNumThreads =
         arith::ConstantIntOp::create(builder, pingRegionLoc, numThreads, 32);
     // Insert arrive barrier for the ping partition to allow the initial entry
@@ -653,10 +657,14 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     Block &pongRegionBlock = pongRegion->front();
     OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
     auto pongRegionLoc = pongRegionBlock.front().getLoc();
-    Value pingBarrier2 = arith::ConstantIntOp::create(builder2, pongRegionLoc,
-                                                      pingBarrierId, 32);
-    Value pongBarrier2 = arith::ConstantIntOp::create(builder2, pongRegionLoc,
-                                                      pongBarrierId, 32);
+    Value pingBarrier2 = ttng::CompilerNamedBarrierIdOp::create(
+        builder2, pongRegionLoc,
+        arith::ConstantIntOp::create(builder2, pongRegionLoc, pingBarrierId,
+                                     32));
+    Value pongBarrier2 = ttng::CompilerNamedBarrierIdOp::create(
+        builder2, pongRegionLoc,
+        arith::ConstantIntOp::create(builder2, pongRegionLoc, pongBarrierId,
+                                     32));
     Value pingNumThreads2 =
         arith::ConstantIntOp::create(builder2, pongRegionLoc, numThreads, 32);
     builder2.setInsertionPoint(pongStart);
