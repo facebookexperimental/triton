@@ -326,7 +326,8 @@ equal-readiness stability.
 | `third_party/nvidia/lib/Dialect/NVWS/Transforms/OrderBufferGroups.cpp` | Eligibility, exact-piece memory predecessors, readiness scoring, pairwise preferences, stable topological ordering, safety checks, and allocation movement. |
 | `third_party/nvidia/include/Dialect/NVWS/Transforms/Passes.td` | Pass registration, command-line name, summary, and dependent dialects. |
 | `lib/Dialect/TritonGPU/Transforms/WarpSpecialization/AutomaticWarpSpecialization.cpp` | Placement after final `MetaToNVWSConvert`; its partition verifier runs before `NVWSInsertSemas`. |
-| `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasAccessDag.cpp` | Shared group discovery and access-DAG construction whose first-sighting order the pass controls. |
+| `third_party/nvidia/lib/Dialect/NVWS/Transforms/BufferGroups.cpp` | Shared allocation-group discovery whose first-sighting order the pass controls. |
+| `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasAccessDag.cpp` | Group DAG member and access-DAG construction. |
 | `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemas.cpp` | Re-collects groups and constructs synchronization plans in discovery order. |
 | `third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertSemasEmitIR.cpp` | Renders active groups sequentially, preserving that order for co-located acquires. |
 | `third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/LatencyModel.h` | Latency model used by readiness scoring. |

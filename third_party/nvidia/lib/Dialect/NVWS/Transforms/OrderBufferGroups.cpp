@@ -1,5 +1,5 @@
+#include "BufferGroups.h"
 #include "InsertSemas.h"
-#include "MetaToNVWSConvert.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/LatencyModel.h"
@@ -342,7 +342,7 @@ static LogicalResult orderGroups(FuncOp func) {
   });
   if (!hasWarpSpecializeLoop)
     return success();
-  if (failed(validateNVWSManagedAllocationLocality(
+  if (failed(nvws::buffer::validateManagedAllocationLocality(
           func, "nvws-order-buffer-groups")))
     return failure();
   for (Block &functionBlock : func.getBody())

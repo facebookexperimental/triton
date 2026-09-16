@@ -165,3 +165,43 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @reject_conflicting_tmem_group_copies(
+      %lb: i32, %ub: i32, %step: i32) {
+    // Group metadata errors retain the shared collector's diagnostic prefix.
+    // expected-note @below {{first buffer.copy value is 1}}
+    %a = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 77 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // expected-error @below {{nvws-insert-semas: TMEM allocations sharing buffer.id 77 have conflicting buffer.copy values 1 and 2}}
+    %b = ttng.tmem_alloc {buffer.copy = 2 : i32, buffer.id = 77 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+      scf.yield {async_task_id = array<i32: 0>}
+    } {async_task_id = array<i32: 0>, tt.warp_specialize,
+       ttg.partition.stages = [0 : i32],
+       ttg.partition.types = ["default"], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @reject_circular_group_without_start(
+      %lb: i32, %ub: i32, %step: i32) {
+    // expected-error @below {{nvws-insert-semas: circular local alloc requires buffer.start}}
+    %alloc = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 78 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+      scf.yield {async_task_id = array<i32: 0>}
+    } {async_task_id = array<i32: 0>, tt.warp_specialize,
+       ttg.partition.stages = [0 : i32],
+       ttg.partition.types = ["default"], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}

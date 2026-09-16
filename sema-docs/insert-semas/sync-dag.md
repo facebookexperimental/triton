@@ -5652,7 +5652,7 @@ implementation. The earlier sections do not require these names.
 The function driver in `InsertSemas.cpp` builds one plan as follows:
 
 ```text
-validateNVWSManagedAllocationLocality
+nvws::buffer::validateManagedAllocationLocality
   -> for each top-level function block
        collectGroups(func, block)
        buildAccessDag(group, func, block) for every block-local group
@@ -5684,9 +5684,9 @@ Source map:
 | Responsibility | Implementation |
 | --- | --- |
 | Build, schedule, and emit driver | `InsertSemas.cpp` |
-| Function-CFG locality contract | `validateNVWSManagedAllocationLocality` in `MetaToNVWSConvert.cpp` |
+| Function-CFG locality contract | `nvws::buffer::validateManagedAllocationLocality` in `BufferGroups.cpp` |
 | Shared `Node`, `RegionFlow`, `Sema`, `GroupDag` model | `InsertSemas.h` |
-| Groups, pieces, owners, accesses, region summaries | `InsertSemasAccessDag.cpp` |
+| Group DAG members, pieces, owners, accesses, region summaries | `InsertSemasAccessDag.cpp` |
 | Initial synchronization edges | `ChainWalker`, `applyTouch` in `InsertSemasSyncDag.cpp` |
 | Remove unnecessary synchronization edges | `reduceStraightEdges`, `reduceLoopCloses`, `reduceEdges` |
 | Place acquires and releases | `DirectBuilder` |

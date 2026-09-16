@@ -5,104 +5,34 @@ namespace mlir::triton::nvws_semas {
 
 FailureOr<SmallVector<GroupDag, 0>> collectGroups(triton::FuncOp funcOp,
                                                   Block *functionBlock) {
-  using Buckets = llvm::MapVector<int64_t, SmallVector<Operation *, 2>>;
-  Buckets tmemBuckets, localBuckets;
-  SmallVector<Operation *, 4> circularLocals;
-  int64_t nextSynthetic = -1;
-  auto add = [&](Buckets &buckets, Operation *op, std::optional<int64_t> id) {
-    int64_t key = id ? *id : nextSynthetic--;
-    buckets[key].push_back(op);
-  };
-  LogicalResult result = success();
-  auto collect = [&](Operation *op) {
-    std::optional<int64_t> id = getI64Attr(op, kBufferIdAttrName);
-    if (isa<nvidia_gpu::TMEMAllocOp>(op)) {
-      add(tmemBuckets, op, id);
-      return;
-    }
-    auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
-    if (!alloc || !cast<gpu::MemDescType>(alloc.getType()).getMutableMemory())
-      return;
-    if (!op->hasAttr(kBufferCircularAttrName)) {
-      add(localBuckets, op, id);
-      return;
-    }
-    if (!id) {
-      result = semaError(op) << "circular local alloc requires buffer.id";
-      return;
-    }
-    for (StringRef name : {kBufferCopyAttrName, kBufferStartAttrName})
-      if (!op->hasAttr(name)) {
-        result = semaError(op) << "circular local alloc requires " << name;
-        return;
-      }
-    if (op->hasAttr(kBufferOffsetAttrName)) {
-      result = semaError(op) << "circular local alloc must not carry buffer.offset";
-      return;
-    }
-    circularLocals.push_back(op);
-  };
-  if (functionBlock) {
-    for (Operation &op : *functionBlock)
-      op.walk(collect);
-  } else {
-    funcOp.walk(collect);
-  }
-  if (failed(result))
+  auto allocationGroups = nvws::buffer::collectGroups(funcOp, functionBlock);
+  if (failed(allocationGroups))
     return failure();
 
   SmallVector<GroupDag, 0> groups;
-  auto makeGroup = [&](MemKind memory, int64_t id, ArrayRef<Operation *> allocs,
-                       bool circular = false) {
+  for (const nvws::buffer::Group &allocationGroup : *allocationGroups) {
     GroupDag &g = groups.emplace_back();
-    g.bufferId = id;
-    g.memory = memory;
-    g.circular = circular;
-    for (Operation *op : allocs) {
+    g.bufferId = allocationGroup.bufferId;
+    g.memory = allocationGroup.memory;
+    g.circular = allocationGroup.circular;
+    for (Operation *op : allocationGroup.allocations) {
       auto type = cast<gpu::MemDescType>(op->getResult(0).getType());
-      int64_t extent = memory == MemKind::Tmem
-                           ? static_cast<int64_t>(mlir::triton::getMemDescSize(type))
-                           : (type.getShape().empty() ? 1 : type.getShape().front());
-      Member member{op, type,
-                    circular ? 0 : getI64Attr(op, kBufferOffsetAttrName).value_or(0),
-                    extent,
-                    getI64Attr(op, kBufferCopyAttrName).value_or(1),
-                    getI64Attr(op, kBufferStartAttrName).value_or(0)};
+      int64_t extent =
+          g.isTmem() ? static_cast<int64_t>(mlir::triton::getMemDescSize(type))
+                     : (type.getShape().empty() ? 1 : type.getShape().front());
+      Member member{
+          op,
+          type,
+          g.circular ? 0 : getI64Attr(op, kBufferOffsetAttrName).value_or(0),
+          extent,
+          getI64Attr(op, kBufferCopyAttrName).value_or(1),
+          getI64Attr(op, kBufferStartAttrName).value_or(0)};
       MemberId index = g.pieceTable.members.size();
       g.pieceTable.members.push_back(member);
       g.aliases.try_emplace(op->getResult(0),
                             std::make_pair(index, SmallVector<AliasStep, 2>()));
     }
-  };
-  for (auto &[id, allocs] : tmemBuckets) {
-    std::optional<int64_t> expectedCopy;
-    Operation *expectedCopyOp = nullptr;
-    for (Operation *op : allocs) {
-      std::optional<int64_t> copy = getI64Attr(op, kBufferCopyAttrName);
-      if (!copy)
-        continue;
-      if (!expectedCopy) {
-        expectedCopy = copy;
-        expectedCopyOp = op;
-        continue;
-      }
-      if (copy == expectedCopy)
-        continue;
-      InFlightDiagnostic diag = semaError(op)
-                                << "TMEM allocations sharing buffer.id " << id
-                                << " have conflicting buffer.copy values "
-                                << *expectedCopy << " and " << *copy;
-      diag.attachNote(expectedCopyOp->getLoc())
-          << "first buffer.copy value is " << *expectedCopy;
-      return failure();
-    }
-    makeGroup(MemKind::Tmem, id, allocs);
   }
-  for (auto &[id, allocs] : localBuckets)
-    makeGroup(MemKind::Local, id, allocs);
-  for (Operation *op : circularLocals)
-    makeGroup(MemKind::Local, *getI64Attr(op, kBufferIdAttrName),
-              ArrayRef<Operation *>(op), true);
   return groups;
 }
 

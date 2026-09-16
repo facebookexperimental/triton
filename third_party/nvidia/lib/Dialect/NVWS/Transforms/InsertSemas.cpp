@@ -1,5 +1,5 @@
 #include "InsertSemas.h"
-#include "MetaToNVWSConvert.h"
+#include "BufferGroups.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 
@@ -45,8 +45,8 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
   if (!walkResult.wasInterrupted())
     return success();
 
-  if (failed(validateNVWSManagedAllocationLocality(funcOp,
-                                                    "nvws-insert-semas")))
+  if (failed(nvws::buffer::validateManagedAllocationLocality(
+          funcOp, "nvws-insert-semas")))
     return failure();
 
   SmallVector<GroupDag, 0> candidate;

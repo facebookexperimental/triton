@@ -555,8 +555,9 @@ the exact token supplied by each path.
 ## Construction algorithm
 
 The shared locality validator runs once for the function. The driver then
-iterates its top-level blocks. For each block, `collectGroups` classifies the
-allocations nested there, creates each group's members, and seeds each
+iterates its top-level blocks. For each block, `nvws::buffer::collectGroups`
+classifies the allocations nested there. The `nvws_semas::collectGroups` adapter
+creates each group's members, computes their extents, and seeds each
 allocation-result alias map. Then, for each block-local group:
 
 1. `buildPieces` partitions the covered span and validates connectivity.
@@ -597,12 +598,13 @@ starts from exactly these facts.
 
 ## Code map
 
-- Group formation: `collectGroups`
+- Allocation grouping: `nvws::buffer::collectGroups` in `BufferGroups.cpp`
+- Group DAG member construction: `nvws_semas::collectGroups`
 - Piece partition and connectivity: `buildPieces`
 - Alias and access recognition: `collectTouches`
 - Descriptor-store completion: `deriveCompletionAnchor`
 - Function-CFG locality and validation:
-  `validateNVWSManagedAllocationLocality` in `MetaToNVWSConvert`
+  `nvws::buffer::validateManagedAllocationLocality` in `BufferGroups.cpp`
 - Effect/owner accumulation: `appendNode`
 - Recursive regions and boundaries: `buildChainForBlock`
 - Per-group entry point: `buildAccessDag`

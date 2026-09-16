@@ -1,9 +1,7 @@
-#include "InsertSemas.h"
-#include "MetaToNVWSConvert.h"
+#include "BufferGroups.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
-#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
@@ -16,11 +14,15 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include <algorithm>
 #include <cassert>
+#include <iterator>
+#include <optional>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -375,7 +377,7 @@ static bool isManagedMemdescValue(Value value, DenseSet<Value> &seen) {
     return true;
   if (auto alloc = dyn_cast<LocalAllocOp>(def))
     return cast<MemDescType>(alloc.getType()).getMutableMemory();
-  if (!nvws_semas::isSupportedAliasOp(def))
+  if (!nvws::buffer::isSupportedAliasOp(def))
     return false;
   return llvm::any_of(def->getOperands(), [&](Value operand) {
     return isa<MemDescType>(operand.getType()) &&
@@ -395,7 +397,7 @@ collectExternalAliasesFeedingWarpSpecialize(FuncOp func) {
   SmallVector<Operation *, 8> worklist;
   auto enqueueExternalAlias = [&](Value value) {
     Operation *def = value.getDefiningOp();
-    if (def && nvws_semas::isSupportedAliasOp(def) &&
+    if (def && nvws::buffer::isSupportedAliasOp(def) &&
         !isWarpSpecializeLoop(def) && !isNestedInWarpSpecializeLoop(def))
       worklist.push_back(def);
   };
@@ -672,123 +674,6 @@ static bool isSourceFreeManagedAlloc(Operation *op) {
   return false;
 }
 
-static Block *getTopLevelFunctionBlock(Operation *op, FuncOp func) {
-  Block *block = op->getBlock();
-  while (block && block->getParent() != &func.getBody()) {
-    Operation *parent = block->getParentOp();
-    block = parent ? parent->getBlock() : nullptr;
-  }
-  return block;
-}
-
-static InFlightDiagnostic managedBlockError(Operation *op,
-                                            StringRef diagnosticPrefix) {
-  return op->emitError() << diagnosticPrefix << ": ";
-}
-
-static FailureOr<Block *>
-getManagedGroupUseBlock(const nvws_semas::GroupDag &group, FuncOp func,
-                        StringRef diagnosticPrefix) {
-  Operation *anchor = group.pieceTable.members.front().allocOp;
-  Block *fallbackBlock = nullptr;
-  Block *useBlock = nullptr;
-  SmallVector<Value, 8> worklist;
-  DenseSet<Value> seen;
-  for (const nvws_semas::Member &member : group.pieceTable.members) {
-    Block *block = getTopLevelFunctionBlock(member.allocOp, func);
-    if (!block)
-      return managedBlockError(member.allocOp, diagnosticPrefix)
-             << "managed allocation is not nested in the function body";
-    if (!fallbackBlock)
-      fallbackBlock = block;
-    for (Value result : member.allocOp->getResults())
-      worklist.push_back(result);
-  }
-
-  while (!worklist.empty()) {
-    Value value = worklist.pop_back_val();
-    if (!seen.insert(value).second)
-      continue;
-    for (OpOperand &use : value.getUses()) {
-      Operation *user = use.getOwner();
-      if (isa<BranchOpInterface>(user))
-        return managedBlockError(anchor, diagnosticPrefix)
-               << "managed memdesc flow through function CFG block arguments "
-                  "is unsupported";
-      Block *block = getTopLevelFunctionBlock(user, func);
-      if (!block)
-        return managedBlockError(anchor, diagnosticPrefix)
-               << "managed use is not nested in the function body";
-      if (useBlock && useBlock != block)
-        return managedBlockError(anchor, diagnosticPrefix)
-               << "managed memdesc flow across function CFG blocks is "
-                  "unsupported";
-      useBlock = block;
-
-      if (nvws_semas::isSupportedAliasOp(user))
-        for (Value result : user->getResults())
-          if (isa<MemDescType>(result.getType()))
-            worklist.push_back(result);
-      for (Value result : user->getResults())
-        if (isa<AsyncTokenType>(result.getType()))
-          worklist.push_back(result);
-
-      if (auto yield = dyn_cast<scf::YieldOp>(user)) {
-        Operation *parent = yield->getParentOp();
-        unsigned index = use.getOperandNumber();
-        if (index < parent->getNumResults() &&
-            isa<AsyncTokenType>(parent->getResult(index).getType()))
-          worklist.push_back(parent->getResult(index));
-      } else if (auto condition = dyn_cast<scf::ConditionOp>(user)) {
-        unsigned index = use.getOperandNumber();
-        auto whileOp = dyn_cast<scf::WhileOp>(condition->getParentOp());
-        if (whileOp && index > 0 && index - 1 < whileOp->getNumResults() &&
-            isa<AsyncTokenType>(whileOp->getResult(index - 1).getType()))
-          worklist.push_back(whileOp->getResult(index - 1));
-      }
-    }
-  }
-  return useBlock ? useBlock : fallbackBlock;
-}
-
-static LogicalResult verifyManagedGroupBlockLocality(
-    const nvws_semas::GroupDag &group, FuncOp func, Block *expectedBlock,
-    StringRef diagnosticPrefix) {
-  Operation *anchor = group.pieceTable.members.front().allocOp;
-  Block *definitionBlock = nullptr;
-  for (const nvws_semas::Member &member : group.pieceTable.members) {
-    Block *block = getTopLevelFunctionBlock(member.allocOp, func);
-    if (!block)
-      return managedBlockError(member.allocOp, diagnosticPrefix)
-             << "managed allocation is not nested in the function body";
-    if (definitionBlock && definitionBlock != block)
-      return managedBlockError(anchor, diagnosticPrefix)
-             << "one buffer group spans function CFG blocks";
-    definitionBlock = block;
-  }
-  if (definitionBlock != expectedBlock)
-    return managedBlockError(anchor, diagnosticPrefix)
-           << "managed memdesc flow across function CFG blocks is unsupported";
-  return success();
-}
-
-static LogicalResult validateManagedAllocationLocalityImpl(
-    FuncOp func, StringRef diagnosticPrefix) {
-  FailureOr<SmallVector<nvws_semas::GroupDag, 0>> groupsOr =
-      nvws_semas::collectGroups(func);
-  if (failed(groupsOr))
-    return failure();
-  for (const nvws_semas::GroupDag &group : *groupsOr) {
-    FailureOr<Block *> useBlock =
-        getManagedGroupUseBlock(group, func, diagnosticPrefix);
-    if (failed(useBlock) ||
-        failed(verifyManagedGroupBlockLocality(
-            group, func, *useBlock, diagnosticPrefix)))
-      return failure();
-  }
-  return success();
-}
-
 // Canonical Meta materializes communication buffers at function entry. NVWS
 // semaphore planning intentionally requires each managed buffer lifetime to be
 // contained in one top-level function CFG block. Localize only complete,
@@ -798,7 +683,7 @@ static LogicalResult localizeManagedAllocGroups(FuncOp func) {
   bool hasCompletedPlan = false;
   func.walk([&](Operation *op) {
     if (isa<LocalAllocOp, TMEMAllocOp>(op) &&
-        op->hasAttr(nvws_semas::kBufferIdAttrName))
+        op->hasAttr(nvws::buffer::kBufferIdAttrName))
       hasCompletedPlan = true;
   });
   // The bridge may run once before NVWSInsertAllocas and again after memory
@@ -806,8 +691,8 @@ static LogicalResult localizeManagedAllocGroups(FuncOp func) {
   if (!hasCompletedPlan)
     return success();
 
-  FailureOr<SmallVector<nvws_semas::GroupDag, 0>> groupsOr =
-      nvws_semas::collectGroups(func);
+  FailureOr<SmallVector<nvws::buffer::Group, 0>> groupsOr =
+      nvws::buffer::collectGroups(func);
   if (failed(groupsOr))
     return failure();
   auto &groups = *groupsOr;
@@ -819,19 +704,18 @@ static LogicalResult localizeManagedAllocGroups(FuncOp func) {
 
   llvm::MapVector<Block *, SmallVector<Operation *, 4>> movesByBlock;
   DenseSet<Operation *> scheduled;
-  for (const nvws_semas::GroupDag &group : groups) {
+  for (const nvws::buffer::Group &group : groups) {
     FailureOr<Block *> useBlock =
-        getManagedGroupUseBlock(group, func, "MetaToNVWSConvert");
+        nvws::buffer::getManagedGroupUseBlock(group, func, "MetaToNVWSConvert");
     if (failed(useBlock))
       return failure();
 
     Block *definitionBlock = nullptr;
     bool movable = true;
-    for (const nvws_semas::Member &member : group.pieceTable.members) {
-      Block *block = getTopLevelFunctionBlock(member.allocOp, func);
+    for (Operation *alloc : group.allocations) {
+      Block *block = nvws::buffer::getTopLevelFunctionBlock(alloc, func);
       if (!block || (definitionBlock && definitionBlock != block) ||
-          member.allocOp->getBlock() != block ||
-          !isSourceFreeManagedAlloc(member.allocOp)) {
+          alloc->getBlock() != block || !isSourceFreeManagedAlloc(alloc)) {
         movable = false;
         break;
       }
@@ -839,9 +723,9 @@ static LogicalResult localizeManagedAllocGroups(FuncOp func) {
     }
     if (!movable || definitionBlock == *useBlock)
       continue;
-    for (const nvws_semas::Member &member : group.pieceTable.members)
-      if (scheduled.insert(member.allocOp).second)
-        movesByBlock[*useBlock].push_back(member.allocOp);
+    for (Operation *alloc : group.allocations)
+      if (scheduled.insert(alloc).second)
+        movesByBlock[*useBlock].push_back(alloc);
   }
 
   for (auto &[targetBlock, moves] : movesByBlock) {
@@ -857,7 +741,8 @@ static LogicalResult localizeManagedAllocGroups(FuncOp func) {
     }
   }
 
-  return validateManagedAllocationLocalityImpl(func, "MetaToNVWSConvert");
+  return nvws::buffer::validateManagedAllocationLocality(func,
+                                                         "MetaToNVWSConvert");
 }
 
 // Meta buffer allocation rewrites a sourceful local_alloc into a source-free
@@ -1024,8 +909,3 @@ public:
 };
 
 } // namespace
-
-LogicalResult mlir::triton::validateNVWSManagedAllocationLocality(
-    FuncOp func, StringRef diagnosticPrefix) {
-  return validateManagedAllocationLocalityImpl(func, diagnosticPrefix);
-}

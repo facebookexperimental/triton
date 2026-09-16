@@ -170,7 +170,7 @@ Nested `scf` regions belong to their enclosing top-level function block;
 allocations are not sunk into a loop or conditional region.
 
 The converter then runs the strict locality validator exposed by
-`MetaToNVWSConvert.h`. `NVWSOrderBufferGroups` and `NVWSInsertSemas` call the
+`BufferGroups.h`. `NVWSOrderBufferGroups` and `NVWSInsertSemas` call the
 same validator at their boundaries. After it succeeds, both discover groups
 and construct access DAGs independently for each top-level function block;
 OrderBufferGroups also reorders within each block independently. InsertSemas
@@ -203,8 +203,8 @@ or storage carried by a function CFG block argument is also an error.
 
 | Resource | Coverage |
 |---|---|
-| [`MetaToNVWSConvert.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/MetaToNVWSConvert.cpp) | WS-root promotion, ownership, external managed aliases, descriptor and allocation completion, memory-plan conversion, managed-group localization, and locality validation |
-| [`MetaToNVWSConvert.h`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/MetaToNVWSConvert.h) | Locality-validator contract called by NVWS planning boundaries |
+| [`MetaToNVWSConvert.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/MetaToNVWSConvert.cpp) | WS-root promotion, ownership, external managed aliases, descriptor and allocation completion, memory-plan conversion and managed-group localization |
+| [`BufferGroups.h`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/BufferGroups.h) / [`BufferGroups.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/BufferGroups.cpp) | Shared allocation grouping, alias recognition, and locality validation used by the bridge and NVWS planning boundaries |
 | [`AutomaticWarpSpecialization.cpp`](../lib/Dialect/TritonGPU/Transforms/WarpSpecialization/AutomaticWarpSpecialization.cpp) | Bridge selection and conversion points |
 | [`InsertAllocas.cpp`](../third_party/nvidia/lib/Dialect/NVWS/Transforms/InsertAllocas.cpp) | Optional allocation route |
 | [`meta_to_nvws_convert_partitions.mlir`](../test/NVWS/meta_to_nvws_convert_partitions.mlir) | Ownership, result-owner mapping, external-alias ownership, nested WS-root promotion, and conversion idempotence |

@@ -312,14 +312,14 @@ all routing and placement decisions remain sealed.
 ## Code map
 
 - Shared model: `InsertSemas.h`
-- Groups, pieces, accesses, owners, and boundaries:
+- Allocation grouping, alias recognition, and function-CFG locality:
+  `BufferGroups.cpp` / `BufferGroups.h`
+- Group DAG members, pieces, accesses, owners, and boundaries:
   `InsertSemasAccessDag.cpp`
 - Synchronization edges, direct placement, semaphore formation, verification,
   and scheduling: `InsertSemasSyncDag.cpp`
 - Symbolic dump and IR materialization: `InsertSemasEmitIR.cpp`
 - Pass driver and the single build, schedule, and emit sequence:
   `InsertSemas.cpp`
-- Function-CFG locality validator and public contract:
-  `MetaToNVWSConvert.cpp` / `MetaToNVWSConvert.h`
 
 [↑ Back to contents](#contents)
