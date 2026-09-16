@@ -61,7 +61,7 @@ on:
 
 env:
   MAX_JOBS: 16
-  TORCHINDUCTOR_TLX_MODE: ""
+  TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
 

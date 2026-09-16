@@ -2291,7 +2291,6 @@ def _hstu_attn_bwd_clc(  # noqa C901
     DQ,
     DK,
     DV,
-    TILE_IDS,
     LOCK,
     stride_qm,
     stride_qh,
@@ -2382,7 +2381,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
             tmem_alloc_algo=2,
             smem_alloc_algo=CLC_SMEM_ALGO,
     ):
-        tile_id = tl.load(TILE_IDS + sched.tile_id[0])
+        tile_id = sched.tile_id[0]
         off_hz = tile_id // num_n_tiles
         start_n = (tile_id % num_n_tiles) * BLOCK_N
         off_z = off_hz // H
@@ -2403,7 +2402,9 @@ def _hstu_attn_bwd_clc(  # noqa C901
         dk_base = DK + seq_start_kv * stride_dkn
         dv_base = DV + seq_start_kv * stride_dvn
 
-        if tl.constexpr(True):
+        # Every partition evaluates the same validity predicate. Invalid
+        # rectangular-grid tiles skip the complete partitioned body.
+        if start_n < seq_len_kv:
             _hstu_attn_bwd_one_col_block(
                 start_n=start_n,
                 desc_row_q=seq_start_q,
@@ -2602,37 +2603,15 @@ def triton_hstu_attention_bwd(
     if _AUTOWS_CFG.clc:
         assert enable_tma and _AUTOWS_CFG.autows and _AUTOWS_CFG.dq_reduce
         assert sort_by_length_indices is None
-        # Compact the rectangular max-length grid to valid jagged tiles. Empty
-        # tail tiles cannot enter the partitioned body: their divergent inner
-        # loop trip counts break cross-partition barrier cadence.
-        #
-        # num_n_tiles is the radix of the tile_id encoding below, and the kernel
-        # decodes with tl.cdiv(max_q_len, BLOCK_N). Both sides must use the same
-        # (length, block) pair or tile_id // and % yield different (off_hz,
-        # start_n) pairs, so use max_q_len here too -- it is also the bound that
-        # matches seq_offsets_q, which blocks_per_seq is derived from. BLOCK_N
-        # agrees because the CLC path asserts _AUTOWS_CFG.autows above, and
-        # _get_bw_configs() then pins the single config to BLOCK_N = bwd_bn.
+        # Run the full rectangular grid. A collective in-kernel guard skips
+        # jagged tail tiles while preserving each channel's accumulation count.
         block_n = _AUTOWS_CFG.bwd_bn
         num_n_tiles = triton.cdiv(max_q_len, block_n)
-        seq_lens = seq_offsets_q[1:] - seq_offsets_q[:-1]
-        blocks_per_seq = torch.div(seq_lens + block_n - 1, block_n, rounding_mode="floor")
-        counts = blocks_per_seq.repeat_interleave(H)
-        tile_count = int(counts.sum().item())
-        tile_starts = torch.cumsum(counts, dim=0) - counts
-        compact_ids = torch.arange(tile_count, device=q.device, dtype=torch.int64)
-        off_hz = torch.repeat_interleave(torch.arange(Z * H, device=q.device, dtype=torch.int64), counts)
-        local_n = compact_ids - torch.repeat_interleave(tile_starts, counts)
-        tile_ids = (off_hz * num_n_tiles + local_n).to(torch.int32)
-        # 1D by construction: the CLC tile scheduler hands out a linear tile id
-        # that indexes the compacted TILE_IDS list, which then decodes to
-        # (off_hz, start_n) in the kernel. The compacted list is ragged across
-        # heads/batches, so the (Z * H, n_tiles) rectangle the non-CLC path
-        # launches cannot express it without re-introducing the empty tiles.
+        tile_count = Z * H * num_n_tiles
         grid = lambda meta: (  # noqa E731
             tile_count, )
         bwd_kernel = _hstu_attn_bwd_clc
-        clc_kwargs = {"TILE_IDS": tile_ids, "CLC_SMEM_ALGO": _AUTOWS_CFG.clc_smem_algo}
+        clc_kwargs = {"CLC_SMEM_ALGO": _AUTOWS_CFG.clc_smem_algo}
     else:
         grid = lambda meta: (  # noqa E731
             Z * H,
@@ -2651,7 +2630,7 @@ def triton_hstu_attention_bwd(
     HAS_NUM_TARGETS = num_targets is not None
     HAS_MAX_ATTN_LEN = max_attn_len != 0
     HAS_CONTEXTUAL_SEQ_LEN = contextual_seq_len != 0
-    bwd_kernel[grid](
+    launch_args = dict(
         Q=q,
         K=k,
         V=v,
@@ -2705,6 +2684,19 @@ def triton_hstu_attention_bwd(
         DKDV_SUBTILE=_AUTOWS_CFG.dkdv_subtile,
         **clc_kwargs,
     )
+    if _AUTOWS_CFG.clc:
+        bwd_kernel[grid](**launch_args)
+    elif _AUTOWS_CFG.autows and not _AUTOWS_CFG.dq_reduce:
+        # Direct dQ RMW uses a program-wide lock and is not partition-safe. The
+        # default configuration still exercises AutoWS forward, but compile its
+        # backward with the ordinary pipeline instead of feeding an unannotated
+        # direct-RMW schedule to MetaWS.
+        launch_args["AUTOWS"] = False
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = False
+            bwd_kernel[grid](**launch_args)
+    else:
+        bwd_kernel[grid](**launch_args)
 
     return dq, dk, dv
 
