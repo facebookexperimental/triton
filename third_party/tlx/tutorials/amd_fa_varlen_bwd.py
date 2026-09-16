@@ -9,11 +9,11 @@ owners combine dQ contributions with BF16 atomics in a guarded native layout,
 followed by a conversion to packed THD order.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
-:func:`fa_varlen_backward`. When token metadata is supplied, plan creation builds
-compact schedules asynchronously without copying offsets or task counts to the
-host. The legacy two-argument path copies offsets to the CPU to infer metadata.
-Prepare and consume a plan on the same CUDA stream, and treat every plan-owned
-offset and schedule tensor as immutable after preparation.
+:func:`fa_varlen_backward` on the same CUDA stream. When token metadata is
+supplied, plan creation builds compact schedules asynchronously without copying
+offsets or task counts to the host. The legacy two-argument path copies offsets
+to the CPU to infer metadata. Treat every plan-owned offset and schedule tensor
+as immutable after preparation.
 """
 
 from __future__ import annotations
@@ -54,24 +54,29 @@ _NUM_TASK_COUNTS = tl.constexpr(6)
 
 @dataclass(frozen=True)
 class VarlenBackwardPlan:
-    """Reusable launch metadata for immutable packed sequence offsets.
+    """Reusable device-built launch metadata for immutable packed offsets.
 
-    ``cu_seqlens_q`` and ``cu_seqlens_k`` are the cumulative packed-token
-    offsets consumed by every kernel. ``q_block_*`` identifies BM16 query
-    tiles; ``full_kv_block_*`` and ``tail_kv_block_*`` identify complete and
-    partial BN128 KV owners. ``wide_*`` describes masked BN256 owners for the
-    split-GQA path, including their Q scratch bases, logical Q lengths, and
-    valid KV rows.
+    ``cu_seqlens_q`` and ``cu_seqlens_k`` are prefix sums delimiting each
+    sequence in the packed Q and KV tensors. The compact schedules are parallel
+    arrays: ``q_block_*`` maps each dQ-conversion task to a sequence and a
+    sequence-local Q row, while ``full_kv_block_*`` and ``tail_kv_block_*`` do
+    the same for complete and masked-tail KV tiles.
 
-    Schedule tensors are capacity-sized. ``task_counts`` stores their device-
-    produced logical lengths followed by general and causal validation flags.
-    The integer fields provide host-known launch bounds and shape metadata;
-    ``qk_offsets_equal`` is ``None`` when equality remains device-validated.
-    The optional dQ fields retain compatibility with optimized legacy plans.
+    The ``wide_*`` arrays describe one split-GQA task per wide KV tile: its
+    packed KV and Q starts, its padded dQ-scratch start, the Q length, and the
+    number of valid KV rows. Schedule buffers are allocated to conservative
+    capacity bounds; ``task_counts`` holds their device-produced valid lengths
+    as well as general and causal offset-validation flags.
+
+    ``batch``, token totals, and maximum sequence lengths are host launch
+    metadata. ``qk_offsets_equal`` is ``True`` or ``False`` when equality was
+    established on the host, and ``None`` when causal compatibility remains
+    device-validated. The optional dQ fields retain compatibility with optimized
+    legacy plans.
 
     ``frozen=True`` prevents field rebinding, but tensor contents remain
-    mutable. Do not modify plan-owned tensors, and prepare and consume the plan
-    on the same CUDA stream.
+    mutable. Prepare and consume the plan on the same CUDA stream, and do not
+    modify its offset, schedule, or count tensors after preparation.
     """
 
     cu_seqlens_q: torch.Tensor
