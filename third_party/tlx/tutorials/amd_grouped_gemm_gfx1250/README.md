@@ -59,14 +59,42 @@ of the A ring while retaining a finer M tile for smaller expert groups.
 
 Cross-tile prefetch peels the final TDM-ring rotation and reuses released input
 slots for K0/K1 of the next tile assigned to the same persistent program. It
-currently requires dedicated C staging, a depth-2 ring, and an even number of
-`BLOCK_K` iterations. It only helps groups with more tiles than persistent
-programs.
+requires `--dedicated_c_buffer`, a depth-2 ring, and an even number of
+`BLOCK_K` iterations. The asymmetric tiles prefetch within each group, so
+they need more tiles per group than persistent programs.
 
-Each persistent program primes its first tile once in the group preheader.
-Later tiles are fed by the preceding tile's peeled tail. The preheader issues
-K0 before constructing the tile-adjusted descriptors used for K1, overlapping
-descriptor setup with K0 movement.
+The `256x256x128` cross-tile schedule also prefetches across group boundaries,
+skipping empty groups. It uses vector stores for C, leaving the two input
+rings intact. Keeping one K block per loop and bounding operand lifetimes at
+each dot limits register pressure. With L2 prefetch disabled, it folds tile
+offsets directly into fused TDM loads to shorten descriptor lifetimes.
+
+The square schedule keeps four upcoming group boundaries in scalar state,
+refilling them in the preceding tile's tail. It specializes the group count
+known from B's shape to eliminate unused refill state. It also enables CDNA5
+`SCHED_MODE[2]` to overlap queued WMMAs with independent instructions.
+
+Run the square cross-tile configuration with:
+
+```bash
+python3 \
+  third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py \
+  --m_list 2048,2048,2048,2048 -N 1024 -K 2048 \
+  -BM 256 -BN 256 -BK 128 --num_programs 32 --group_m 4 \
+  --tdm_pipeline_depth 2 --l2_prefetch_distance 0 \
+  --dedicated_c_buffer --cross_tile_prefetch --benchmark_mode none --check
+```
+
+For example, `M=2048, N=1024` gives 32 square tiles. With 32 persistent
+programs, each program handles one tile per group and prefetches its tile
+from the following nonempty group. At `M=4096`, each program also prefetches
+a second tile within the same group.
+
+Each persistent program primes its first tile in the group preheader.
+Later tiles are fed by the preceding tile's peeled tail. The square schedule
+also skips priming at later group boundaries. For the asymmetric tiles, the
+preheader issues K0 before constructing the tile-adjusted descriptors used for
+K1, overlapping descriptor setup with K0 movement.
 
 The mirrored `256x128x128` configuration also supports dedicated C staging,
 but `128x256x128` is the preferred asymmetric seed.
