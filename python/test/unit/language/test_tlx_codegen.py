@@ -1702,6 +1702,19 @@ def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
     tl.store(y_ptr + offsets, values)
 
 
+@triton.jit
+def _amd_iglp_opt_kernel(x_ptr, y_ptr, VARIANT: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_iglp_opt(VARIANT)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _amd_iglp_opt_dynamic_kernel(variant):
+    tlx.amd_iglp_opt(variant)
+
+
 def test_amd_ttgir_schedule_env_is_cache_keyed_and_overridable(monkeypatch):
     backend = amd_compiler.HIPBackend(GFX950)
     monkeypatch.delenv("TRITON_AMD_TTGIR_SCHEDULE", raising=False)
@@ -3755,6 +3768,45 @@ def test_amd_sched_barrier_compiles_gfx950():
         constexprs={"BLOCK": 64},
     )
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
+
+
+def test_amd_iglp_opt_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_iglp_opt_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "VARIANT": "constexpr"},
+        constexprs={"VARIANT": 3},
+    )
+    calls = re.findall(r"call void @llvm\.amdgcn\.iglp\.opt\(i32 3\)", compiled.asm["llir"])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("variant", [False, 3.0, "3", -1, 4, 1 << 32])
+def test_amd_iglp_opt_rejects_invalid_variant(variant):
+    # Exercise frontend validation even when a string and integer constant
+    # have the same textual ASTSource cache key.
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        with pytest.raises(CompilationError, match="variant must be"):
+            compile_for_gfx950(
+                _amd_iglp_opt_kernel,
+                signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "VARIANT": "constexpr"},
+                constexprs={"VARIANT": variant},
+            )
+
+
+def test_amd_iglp_opt_rejects_runtime_variant():
+    with pytest.raises(CompilationError, match="variant must be a constexpr integer"):
+        compile_for_gfx950(_amd_iglp_opt_dynamic_kernel, signature={"variant": "i32"}, constexprs={})
+
+
+def test_amd_iglp_opt_rejects_cuda_backend():
+    with pytest.raises(CompilationError, match="only supported on AMD"):
+        compile_for_target(
+            _amd_iglp_opt_kernel,
+            signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "VARIANT": "constexpr"},
+            constexprs={"VARIANT": 3},
+            target=GPUTarget("cuda", 90, 32),
+        )
 
 
 def test_d64_causal_stat_conventions_are_equivalent():
