@@ -535,8 +535,9 @@ static LogicalResult materializeGather(ttng::TwoCTAPeerGatherOp gather,
     if (failed(stagingBarrierId))
       return gather.emitError(
           "no named-barrier slot remains for the 2-CTA staging rendezvous");
-    Value stagingBarrier =
-        arith::ConstantIntOp::create(builder, loc, *stagingBarrierId, 32);
+    Value stagingBarrier = ttng::CompilerNamedBarrierIdOp::create(
+        builder, loc,
+        arith::ConstantIntOp::create(builder, loc, *stagingBarrierId, 32));
     int numThreads =
         32 * ttg::lookupNumWarps(builder.getInsertionBlock()->getParentOp());
     Value stagingThreads =

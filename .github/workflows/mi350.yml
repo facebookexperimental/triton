@@ -59,7 +59,6 @@ env:
   MAX_JOBS: 16
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
-  TORCH_NIGHTLY_URL: https://download-r2.pytorch.org/whl/nightly/rocm7.2/torch-2.13.0.dev20260513%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl
   TORCHINDUCTOR_TLX_MODE: ""
 
 jobs:
@@ -99,7 +98,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}"
       - name: Build wheel
         run: |
           . "${SETUP_SCRIPT}"
@@ -167,7 +166,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}" --no-build
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
       - name: Download prebuilt Triton wheel
         uses: actions/download-artifact@v4
         with:
@@ -238,7 +237,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}" --no-build
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
       - name: Download prebuilt Triton wheel
         uses: actions/download-artifact@v4
         with:
@@ -339,7 +338,7 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}" --no-build
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
       - name: Download prebuilt Triton wheel
         uses: actions/download-artifact@v4
         with:
