@@ -9,10 +9,11 @@ owners combine dQ contributions with BF16 atomics in a guarded native layout,
 followed by a conversion to packed THD order.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
-:func:`fa_varlen_backward`.  Plan creation performs one device-to-host
-synchronization to construct compact schedules; execution itself does not copy
-offsets to the host.  Treat every plan-owned offset and schedule tensor as
-immutable after preparation.
+:func:`fa_varlen_backward`. When token metadata is supplied, plan creation builds
+compact schedules asynchronously without copying offsets or task counts to the
+host. The legacy two-argument path copies offsets to the CPU to infer metadata.
+Prepare and consume a plan on the same CUDA stream, and treat every plan-owned
+offset and schedule tensor as immutable after preparation.
 """
 
 from __future__ import annotations
@@ -40,171 +41,344 @@ _I32_BUFFER_FP32_ELEMENTS = _I32_BUFFER_BF16_ELEMENTS // 2
 # amortized the BM32/BN256 split kernel and its dK/dV reduction overhead.
 _VARLEN_GQA_SPLIT_WORK_THRESHOLD = 1024
 
+# Slots in the device-resident task_counts vector: schedule lengths first,
+# followed by general and causal offset-validation flags.
+_Q_TASK_COUNT = tl.constexpr(0)
+_FULL_KV_TASK_COUNT = tl.constexpr(1)
+_TAIL_KV_TASK_COUNT = tl.constexpr(2)
+_WIDE_KV_TASK_COUNT = tl.constexpr(3)
+_PLAN_ERROR = tl.constexpr(4)
+_CAUSAL_PLAN_ERROR = tl.constexpr(5)
+_NUM_TASK_COUNTS = tl.constexpr(6)
+
 
 @dataclass(frozen=True)
 class VarlenBackwardPlan:
-    """Reusable launch metadata whose tensor contents are caller-immutable.
+    """Reusable launch metadata for immutable packed sequence offsets.
 
-    ``frozen=True`` prevents field rebinding, but PyTorch tensors remain
-    mutable.  Do not modify any plan-owned offset or schedule tensor after
-    preparation.
+    ``cu_seqlens_q`` and ``cu_seqlens_k`` are the cumulative packed-token
+    offsets consumed by every kernel. ``q_block_*`` identifies BM16 query
+    tiles; ``full_kv_block_*`` and ``tail_kv_block_*`` identify complete and
+    partial BN128 KV owners. ``wide_*`` describes masked BN256 owners for the
+    split-GQA path, including their Q scratch bases, logical Q lengths, and
+    valid KV rows.
+
+    Schedule tensors are capacity-sized. ``task_counts`` stores their device-
+    produced logical lengths followed by general and causal validation flags.
+    The integer fields provide host-known launch bounds and shape metadata;
+    ``qk_offsets_equal`` is ``None`` when equality remains device-validated.
+    The optional dQ fields retain compatibility with optimized legacy plans.
+
+    ``frozen=True`` prevents field rebinding, but tensor contents remain
+    mutable. Do not modify plan-owned tensors, and prepare and consume the plan
+    on the same CUDA stream.
     """
 
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     q_block_sequence: torch.Tensor
     q_block_start: torch.Tensor
-    kv_block_sequence: torch.Tensor
-    kv_block_start: torch.Tensor
+    full_kv_block_sequence: torch.Tensor
+    full_kv_block_start: torch.Tensor
+    tail_kv_block_sequence: torch.Tensor
+    tail_kv_block_start: torch.Tensor
     wide_kv_start: torch.Tensor
     wide_q_start: torch.Tensor
     wide_dq_start: torch.Tensor
     wide_q_len: torch.Tensor
     wide_kv_valid: torch.Tensor
+    task_counts: torch.Tensor
     batch: int
     total_q: int
     total_kv: int
     max_q: int
-    num_full_kv_blocks: int
-    qk_offsets_equal: bool
-    # Query tiles without a partial KV owner still need the separate dQ
-    # converter. None keeps directly constructed or long-sequence plans on
-    # the original path.
+    max_kv: int
+    qk_offsets_equal: bool | None
+    # Device-built plans do not materialize the optional tail-finalization
+    # schedule, so they retain the separate dQ conversion path.
     dq_full_kv_sequence: torch.Tensor | None = None
     dq_full_kv_start: torch.Tensor | None = None
-    # Preparation proves that every partial KV tail fits in three K32 bands.
     dq_tail_k96: bool = False
-    # Candidate-only metadata makes the rolling scratch experiment opt-in
-    # for its exact shape; older/manually constructed plans retain fallback.
-    max_kv: int | None = None
+    # Exact host-known count used only by the legacy rolling-owner candidate.
+    wide_task_count: int | None = None
 
 
-def _copy_and_validate_cu_seqlens(name: str, value: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
+@triton.jit
+def _varlen_validate_offsets(
+    CuQ,
+    CuK,
+    TaskCounts,
+    TOTAL_Q,
+    TOTAL_KV,
+    MAX_Q,
+    MAX_KV,
+    PLAN_ERROR_INDEX: tl.constexpr,
+    CAUSAL_PLAN_ERROR_INDEX: tl.constexpr,
+):
+    sequence = tl.program_id(0)
+    q_start = tl.load(CuQ + sequence)
+    q_end = tl.load(CuQ + sequence + 1)
+    kv_start = tl.load(CuK + sequence)
+    kv_end = tl.load(CuK + sequence + 1)
+    q_len = q_end - q_start
+    kv_len = kv_end - kv_start
+    is_first = sequence == 0
+    is_last = sequence == tl.num_programs(0) - 1
+    invalid = ((q_start < 0)
+               | (kv_start < 0)
+               | (q_len <= 0)
+               | (kv_len <= 0)
+               | (q_end > TOTAL_Q)
+               | (kv_end > TOTAL_KV)
+               | (q_len > MAX_Q)
+               | (kv_len > MAX_KV)
+               | (is_first & ((q_start != 0) | (kv_start != 0)))
+               | (is_last & ((q_end != TOTAL_Q) | (kv_end != TOTAL_KV))))
+    qk_mismatch = (q_start != kv_start) | (q_end != kv_end)
+    if invalid:
+        tl.atomic_xchg(TaskCounts + PLAN_ERROR_INDEX, 1, sem="relaxed")
+    if invalid | qk_mismatch:
+        tl.atomic_xchg(TaskCounts + CAUSAL_PLAN_ERROR_INDEX, 1, sem="relaxed")
+
+
+@triton.jit
+def _varlen_build_compact_schedules(
+    CuQ,
+    CuK,
+    QBlockSequence,
+    QBlockStart,
+    FullKVBlockSequence,
+    FullKVBlockStart,
+    TailKVBlockSequence,
+    TailKVBlockStart,
+    WideKVStart,
+    WideQStart,
+    WideDQStart,
+    WideQLen,
+    WideKVValid,
+    TaskCounts,
+    Q_TASK_COUNT_INDEX: tl.constexpr,
+    FULL_KV_TASK_COUNT_INDEX: tl.constexpr,
+    TAIL_KV_TASK_COUNT_INDEX: tl.constexpr,
+    WIDE_KV_TASK_COUNT_INDEX: tl.constexpr,
+    PLAN_ERROR_INDEX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    WIDE_BLOCK_N: tl.constexpr,
+):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    sequence = tl.program_id(0)
+    q_start = tl.load(CuQ + sequence)
+    q_end = tl.load(CuQ + sequence + 1)
+    kv_start = tl.load(CuK + sequence)
+    kv_end = tl.load(CuK + sequence + 1)
+    q_len = q_end - q_start
+    kv_len = kv_end - kv_start
+    q_blocks = tl.cdiv(q_len, BLOCK_M)
+    full_kv_blocks = kv_len // BLOCK_N
+    has_kv_tail = kv_len % BLOCK_N != 0
+    wide_kv_blocks = tl.cdiv(kv_len, WIDE_BLOCK_N)
+
+    q_base = tl.atomic_add(TaskCounts + Q_TASK_COUNT_INDEX, q_blocks, sem="relaxed")
+    for block in range(0, q_blocks):
+        tl.store(QBlockSequence + q_base + block, sequence)
+        tl.store(QBlockStart + q_base + block, block * BLOCK_M)
+
+    full_kv_base = tl.atomic_add(TaskCounts + FULL_KV_TASK_COUNT_INDEX, full_kv_blocks, sem="relaxed")
+    for block in range(0, full_kv_blocks):
+        tl.store(FullKVBlockSequence + full_kv_base + block, sequence)
+        tl.store(FullKVBlockStart + full_kv_base + block, block * BLOCK_N)
+
+    if has_kv_tail:
+        tail_kv_task = tl.atomic_add(TaskCounts + TAIL_KV_TASK_COUNT_INDEX, 1, sem="relaxed")
+        tl.store(TailKVBlockSequence + tail_kv_task, sequence)
+        tl.store(TailKVBlockStart + tail_kv_task, full_kv_blocks * BLOCK_N)
+
+    wide_base = tl.atomic_add(TaskCounts + WIDE_KV_TASK_COUNT_INDEX, wide_kv_blocks, sem="relaxed")
+    for block in range(0, wide_kv_blocks):
+        block_start = block * WIDE_BLOCK_N
+        task = wide_base + block
+        tl.store(WideKVStart + task, kv_start + block_start)
+        tl.store(WideQStart + task, q_start)
+        tl.store(WideDQStart + task, q_start + sequence * (BLOCK_M - 1))
+        tl.store(WideQLen + task, q_len)
+        tl.store(WideKVValid + task, tl.minimum(WIDE_BLOCK_N, kv_len - block_start))
+
+
+def _validate_cu_seqlens_metadata(name: str, value: torch.Tensor) -> None:
     if value.ndim != 1 or value.numel() < 2:
         raise ValueError(f"{name} must be a rank-1 tensor with at least two elements")
     if value.dtype is not torch.int32:
         raise ValueError(f"{name} must have dtype torch.int32")
     if value.device.type != "cuda":
         raise ValueError(f"{name} must be on a CUDA device")
-    owned = value.detach().clone(memory_format=torch.contiguous_format)
-    offsets = owned.cpu().tolist()
+
+
+def _read_cu_seqlens(name: str, value: torch.Tensor) -> tuple[list[int], list[int]]:
+    offsets = value.detach().cpu().tolist()
     if offsets[0] != 0:
         raise ValueError(f"{name} must start at zero")
-    if any(end <= begin for begin, end in zip(offsets, offsets[1:])):
+    lengths = [end - begin for begin, end in zip(offsets, offsets[1:])]
+    if any(length <= 0 for length in lengths):
         raise ValueError(f"{name} must be strictly increasing")
-    return owned, offsets
+    return offsets, lengths
 
 
-def _make_block_schedule(lengths: list[int], block: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    sequences: list[int] = []
-    starts: list[int] = []
-    for sequence, length in enumerate(lengths):
-        for start in range(0, length, block):
-            sequences.append(sequence)
-            starts.append(start)
-    return (
-        torch.tensor(sequences, dtype=torch.int32, device=device),
-        torch.tensor(starts, dtype=torch.int32, device=device),
-    )
+def prepare_varlen_backward(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    total_q: int | None = None,
+    total_kv: int | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+) -> VarlenBackwardPlan:
+    """Build compact schedules, using a device-only path when metadata is supplied.
 
-
-def _make_partitioned_block_schedule(lengths: list[int], block: int,
-                                     device: torch.device) -> tuple[torch.Tensor, torch.Tensor, int]:
-    full_sequences: list[int] = []
-    full_starts: list[int] = []
-    tail_sequences: list[int] = []
-    tail_starts: list[int] = []
-    for sequence, length in enumerate(lengths):
-        full_end = length // block * block
-        for start in range(0, full_end, block):
-            full_sequences.append(sequence)
-            full_starts.append(start)
-        if full_end < length:
-            tail_sequences.append(sequence)
-            tail_starts.append(full_end)
-    return (
-        torch.tensor(full_sequences + tail_sequences, dtype=torch.int32, device=device),
-        torch.tensor(full_starts + tail_starts, dtype=torch.int32, device=device),
-        len(full_sequences),
-    )
-
-
-def _make_wide_kv_schedule(q_offsets: list[int], k_offsets: list[int],
-                           device: torch.device) -> tuple[torch.Tensor, ...]:
-    """Build masked BN256 tasks, front-loading sequences with the most Q work."""
-    tasks: list[tuple[int, int, int, int, int]] = []
-    sequences = sorted(
-        range(len(q_offsets) - 1),
-        key=lambda sequence: q_offsets[sequence + 1] - q_offsets[sequence],
-        reverse=True,
-    )
-    for sequence in sequences:
-        q_start = q_offsets[sequence]
-        q_len = q_offsets[sequence + 1] - q_start
-        kv_start = k_offsets[sequence]
-        kv_len = k_offsets[sequence + 1] - kv_start
-        dq_start = q_start + sequence * (_BLOCK_M - 1)
-        for block_start in range(0, kv_len, _WIDE_BLOCK_N):
-            tasks.append((
-                kv_start + block_start,
-                q_start,
-                dq_start,
-                q_len,
-                min(_WIDE_BLOCK_N, kv_len - block_start),
-            ))
-    columns = tuple(zip(*tasks, strict=True))
-    return tuple(torch.tensor(column, dtype=torch.int32, device=device) for column in columns)
-
-
-def prepare_varlen_backward(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor) -> VarlenBackwardPlan:
-    """Prepare reusable compact schedules for immutable packed offsets."""
+    The legacy two-argument path clones strided offsets into contiguous plan
+    storage. The metadata-supplied path requires contiguous offsets so its
+    validation and schedule kernels can address them directly.
+    """
     if cu_seqlens_q.device != cu_seqlens_k.device:
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be on the same device")
-    owned_q, q_offsets = _copy_and_validate_cu_seqlens("cu_seqlens_q", cu_seqlens_q)
-    owned_k, k_offsets = _copy_and_validate_cu_seqlens("cu_seqlens_k", cu_seqlens_k)
-    if len(q_offsets) != len(k_offsets):
+    _validate_cu_seqlens_metadata("cu_seqlens_q", cu_seqlens_q)
+    _validate_cu_seqlens_metadata("cu_seqlens_k", cu_seqlens_k)
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError("cu_seqlens_q and cu_seqlens_k must describe the same batch")
 
-    q_lengths = [end - begin for begin, end in zip(q_offsets, q_offsets[1:])]
-    k_lengths = [end - begin for begin, end in zip(k_offsets, k_offsets[1:])]
-    q_block_sequence, q_block_start = _make_block_schedule(q_lengths, _BLOCK_M, cu_seqlens_q.device)
-    kv_block_sequence, kv_block_start, num_full_kv_blocks = _make_partitioned_block_schedule(
-        k_lengths, _BLOCK_N, cu_seqlens_q.device)
-    wide_kv_start, wide_q_start, wide_dq_start, wide_q_len, wide_kv_valid = _make_wide_kv_schedule(
-        q_offsets, k_offsets, cu_seqlens_q.device)
+    metadata = (total_q, total_kv, max_seqlen_q, max_seqlen_k)
+    if all(value is None for value in metadata):
+        shared_offsets = cu_seqlens_q is cu_seqlens_k
+        cu_seqlens_q = cu_seqlens_q.detach().clone(memory_format=torch.contiguous_format)
+        cu_seqlens_k = (cu_seqlens_q if shared_offsets else cu_seqlens_k.detach().clone(
+            memory_format=torch.contiguous_format))
+        q_offsets, q_lengths = _read_cu_seqlens("cu_seqlens_q", cu_seqlens_q)
+        if shared_offsets:
+            k_offsets, k_lengths = q_offsets, q_lengths
+        else:
+            k_offsets, k_lengths = _read_cu_seqlens("cu_seqlens_k", cu_seqlens_k)
+        total_q = q_offsets[-1]
+        total_kv = k_offsets[-1]
+        max_seqlen_q = max(q_lengths)
+        max_seqlen_k = max(k_lengths)
+        qk_offsets_equal = q_offsets == k_offsets
+        wide_task_count = sum(triton.cdiv(length, _WIDE_BLOCK_N) for length in k_lengths)
+    elif any(value is None for value in metadata):
+        raise ValueError("token totals and maximum sequence lengths must be supplied together")
+    else:
+        for name, value in (
+            ("cu_seqlens_q", cu_seqlens_q),
+            ("cu_seqlens_k", cu_seqlens_k),
+        ):
+            if not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous when token metadata is supplied")
+        qk_offsets_equal = True if cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr() else None
+        wide_task_count = None
+
     dq_full_kv_sequence = dq_full_kv_start = None
     dq_tail_k96 = False
-    if max(q_lengths) <= 512 and num_full_kv_blocks < kv_block_sequence.numel():
-        dq_tail_k96 = max(k_len % _BLOCK_N for k_len in k_lengths) <= 96
-        dq_full_kv_sequence, dq_full_kv_start = _make_block_schedule(
-            [q_len if k_len % _BLOCK_N == 0 else 0 for q_len, k_len in zip(q_lengths, k_lengths)],
-            _BLOCK_M,
-            cu_seqlens_q.device,
-        )
 
+    assert total_q is not None
+    assert total_kv is not None
+    assert max_seqlen_q is not None
+    assert max_seqlen_k is not None
+    if total_q <= 0 or total_kv <= 0:
+        raise ValueError("packed token counts must be positive")
+    if max_seqlen_q <= 0 or max_seqlen_k <= 0:
+        raise ValueError("maximum sequence lengths must be positive")
+
+    batch = cu_seqlens_q.numel() - 1
+    q_capacity = triton.cdiv(total_q, _BLOCK_M) + batch
+    full_kv_capacity = total_kv // _BLOCK_N
+    tail_kv_capacity = batch
+    wide_kv_capacity = triton.cdiv(total_kv, _WIDE_BLOCK_N) + batch
+    device = cu_seqlens_q.device
+    q_block_sequence = torch.empty(q_capacity, dtype=torch.int32, device=device)
+    q_block_start = torch.empty_like(q_block_sequence)
+    full_kv_block_sequence = torch.empty(full_kv_capacity, dtype=torch.int32, device=device)
+    full_kv_block_start = torch.empty_like(full_kv_block_sequence)
+    tail_kv_block_sequence = torch.empty(tail_kv_capacity, dtype=torch.int32, device=device)
+    tail_kv_block_start = torch.empty_like(tail_kv_block_sequence)
+    wide_kv_start = torch.empty(wide_kv_capacity, dtype=torch.int32, device=device)
+    wide_q_start = torch.empty_like(wide_kv_start)
+    wide_dq_start = torch.empty_like(wide_kv_start)
+    wide_q_len = torch.empty_like(wide_kv_start)
+    wide_kv_valid = torch.empty_like(wide_kv_start)
+    task_counts = torch.zeros(_NUM_TASK_COUNTS, dtype=torch.int32, device=device)
+
+    _varlen_validate_offsets[(batch, )](
+        cu_seqlens_q,
+        cu_seqlens_k,
+        task_counts,
+        total_q,
+        total_kv,
+        max_seqlen_q,
+        max_seqlen_k,
+        PLAN_ERROR_INDEX=_PLAN_ERROR,
+        CAUSAL_PLAN_ERROR_INDEX=_CAUSAL_PLAN_ERROR,
+        num_warps=1,
+    )
+    _varlen_build_compact_schedules[(batch, )](
+        cu_seqlens_q,
+        cu_seqlens_k,
+        q_block_sequence,
+        q_block_start,
+        full_kv_block_sequence,
+        full_kv_block_start,
+        tail_kv_block_sequence,
+        tail_kv_block_start,
+        wide_kv_start,
+        wide_q_start,
+        wide_dq_start,
+        wide_q_len,
+        wide_kv_valid,
+        task_counts,
+        Q_TASK_COUNT_INDEX=_Q_TASK_COUNT,
+        FULL_KV_TASK_COUNT_INDEX=_FULL_KV_TASK_COUNT,
+        TAIL_KV_TASK_COUNT_INDEX=_TAIL_KV_TASK_COUNT,
+        WIDE_KV_TASK_COUNT_INDEX=_WIDE_KV_TASK_COUNT,
+        PLAN_ERROR_INDEX=_PLAN_ERROR,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_N=_BLOCK_N,
+        WIDE_BLOCK_N=_WIDE_BLOCK_N,
+        num_warps=1,
+    )
     return VarlenBackwardPlan(
-        cu_seqlens_q=owned_q,
-        cu_seqlens_k=owned_k,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
         q_block_sequence=q_block_sequence,
         q_block_start=q_block_start,
-        kv_block_sequence=kv_block_sequence,
-        kv_block_start=kv_block_start,
+        full_kv_block_sequence=full_kv_block_sequence,
+        full_kv_block_start=full_kv_block_start,
+        tail_kv_block_sequence=tail_kv_block_sequence,
+        tail_kv_block_start=tail_kv_block_start,
         wide_kv_start=wide_kv_start,
         wide_q_start=wide_q_start,
         wide_dq_start=wide_dq_start,
         wide_q_len=wide_q_len,
         wide_kv_valid=wide_kv_valid,
-        batch=len(q_lengths),
-        total_q=q_offsets[-1],
-        total_kv=k_offsets[-1],
-        max_q=max(q_lengths),
-        max_kv=max(k_lengths),
-        num_full_kv_blocks=num_full_kv_blocks,
-        qk_offsets_equal=q_offsets == k_offsets,
+        task_counts=task_counts,
+        batch=batch,
+        total_q=total_q,
+        total_kv=total_kv,
+        max_q=max_seqlen_q,
+        max_kv=max_seqlen_k,
+        qk_offsets_equal=qk_offsets_equal,
         dq_full_kv_sequence=dq_full_kv_sequence,
         dq_full_kv_start=dq_full_kv_start,
         dq_tail_k96=dq_tail_k96,
+        wide_task_count=wide_task_count,
     )
+
+
+def validate_varlen_backward_plan(plan: VarlenBackwardPlan, *, causal: bool = False) -> None:
+    """Synchronize once and raise if device-side offset validation failed."""
+    error_index = _CAUSAL_PLAN_ERROR if causal else _PLAN_ERROR
+    if plan.task_counts[error_index.value].item() != 0:
+        requirement = " and match between Q and KV" if causal else ""
+        raise ValueError("cu_seqlens must start at zero, be strictly increasing, end at "
+                         "the packed token total, respect the maximum sequence length"
+                         f"{requirement}")
 
 
 def _validate_i32_buffer_offsets(*, total_q: int, total_kv: int, batch: int, q_heads: int, kv_heads: int) -> None:
@@ -247,6 +421,8 @@ def _varlen_bwd_preprocess(
     CuQ,
     DQ_ACC,
     TOTAL_Q_PADDED,
+    TaskCounts,
+    PLAN_ERROR_INDEX: tl.constexpr,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -256,6 +432,8 @@ def _varlen_bwd_preprocess(
     TOTAL_Q=None,
     PACK_STATS: tl.constexpr = False,
 ):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
     pid_m = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch = batch_head // HEADS
@@ -1147,6 +1325,7 @@ def _varlen_bwd_interleaved_bm32_kernel(
     DQ_ACC,
     DK,
     DV,
+    TaskCounts,
     SM_SCALE: tl.constexpr,
     TOTAL_Q,
     TOTAL_Q_PADDED,
@@ -1155,6 +1334,8 @@ def _varlen_bwd_interleaved_bm32_kernel(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TASK_COUNT_INDEX: tl.constexpr,
+    PLAN_ERROR_INDEX: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     PAD_DQ_TO_BM32: tl.constexpr = False,
     PACK_STATS: tl.constexpr = False,
@@ -1171,10 +1352,8 @@ def _varlen_bwd_interleaved_bm32_kernel(
     tl.static_assert((HQ // HKV) % KV_SPLITS == 0)
     tl.static_assert(not PACK_STATS or PAD_DQ_TO_BM32)
 
-    # Arrange head/split work for eight XCDs in groups of up to 32 compact
-    # KV tasks. The group width was chosen by measurement on gfx950.
-    # For W=8q+r, residue xcd owns q+(xcd<r) consecutive mapped entries;
-    # min(xcd,r) keeps their segments adjacent in an incomplete final group.
+    # Arrange head/split work for eight XCDs in groups of up to 32 schedule
+    # slots. Capacity-launched slots beyond the device-built count exit below.
     HS: tl.constexpr = HKV * KV_SPLITS
     w = tl.program_id(0) + HS * tl.program_id(1)
     group = w // (HS * 32)
@@ -1187,6 +1366,10 @@ def _varlen_bwd_interleaved_bm32_kernel(
     mapped = xcd * (W // 8) + tl.minimum(xcd, W % 8) + local
     kv_head_split = mapped // count
     task = first_task + mapped % count
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    if task >= tl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
     kv_head = kv_head_split // KV_SPLITS
     split = kv_head_split % KV_SPLITS
     group_size: tl.constexpr = HQ // HKV
@@ -1634,7 +1817,7 @@ def _varlen_bwd_interleaved_kernel(
     DQ_ACC,
     DK,
     DV,
-    TASK_OFFSET,
+    TaskCounts,
     SM_SCALE: tl.constexpr,
     TOTAL_Q,
     TOTAL_Q_PADDED,
@@ -1643,6 +1826,8 @@ def _varlen_bwd_interleaved_kernel(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TASK_COUNT_INDEX: tl.constexpr,
+    PLAN_ERROR_INDEX: tl.constexpr,
     FULL_KV_TILE: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -1669,11 +1854,15 @@ def _varlen_bwd_interleaved_kernel(
                      or (NONCAUSAL_MHA and KV_SPLITS == 1 and not FULL_KV_TILE and CACHE_MHA_STATS and QDO_ALIGNED))
     tl.static_assert(not DQ_TAIL_K96 or FINALIZE_DQ)
     if NONCAUSAL_MHA:
-        task = tl.program_id(1) + TASK_OFFSET
+        task = tl.program_id(1)
         kv_head_split = tl.program_id(0)
     else:
-        task = tl.program_id(0) + TASK_OFFSET
+        task = tl.program_id(0)
         kv_head_split = tl.program_id(1)
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    if task >= tl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
     kv_head = kv_head_split // KV_SPLITS
     split = kv_head_split % KV_SPLITS
     group_size: tl.constexpr = HQ // HKV
@@ -2150,7 +2339,9 @@ def _varlen_dkdv_reduce_kernel(
     DV_PART,
     DK,
     DV,
+    TaskCounts,
     TOTAL_KV,
+    PLAN_ERROR_INDEX: tl.constexpr,
     HKV: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
@@ -2158,6 +2349,8 @@ def _varlen_dkdv_reduce_kernel(
 ):
     tl.static_assert(KV_SPLITS > 1)
     tl.static_assert(KV_SPLITS <= 4)
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
     pid_n = tl.program_id(0)
     kv_head = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -2183,13 +2376,20 @@ def _varlen_dq_convert_kernel(
     CuQ,
     QBlockSequence,
     QBlockStart,
+    TaskCounts,
     DQ,
     TOTAL_Q_PADDED,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    TASK_COUNT_INDEX: tl.constexpr,
+    PLAN_ERROR_INDEX: tl.constexpr,
 ):
     task = tl.program_id(0)
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    if task >= tl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
     head = tl.program_id(1)
     batch = tl.load(QBlockSequence + task)
     start_m = tl.load(QBlockStart + task)
@@ -2222,16 +2422,23 @@ def _varlen_mha_dq_convert_coalesced_kernel(
     CuQ,
     QBlockSequence,
     QBlockStart,
+    TaskCounts,
     DQ,
     TOTAL_Q_PADDED,
     HEADS: ttgl.constexpr,
     D: ttgl.constexpr,
     BLOCK_M: ttgl.constexpr,
+    TASK_COUNT_INDEX: ttgl.constexpr,
+    PLAN_ERROR_INDEX: ttgl.constexpr,
     DQ_PAD_ROWS: ttgl.constexpr = 16,
 ):
     ttgl.static_assert(BLOCK_M == 16 and D == 128)
     ttgl.static_assert(DQ_PAD_ROWS == 16 or DQ_PAD_ROWS == 32)
     task = ttgl.program_id(0)
+    if ttgl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    if task >= ttgl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
     head = ttgl.program_id(1)
     batch = ttgl.load(QBlockSequence + task)
     start_m = ttgl.load(QBlockStart + task)
@@ -2275,7 +2482,7 @@ def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal):
         raise ValueError("packed backward requires positive Q and KV head counts")
     if heads % kv_heads != 0:
         raise ValueError("packed D128 backward requires Q heads divisible by KV heads")
-    if causal and not plan.qk_offsets_equal:
+    if causal and plan.qk_offsets_equal is False:
         raise ValueError("causal packed backward requires identical Q and KV cumulative offsets")
     if causal and heads != kv_heads:
         raise ValueError("causal packed backward currently requires equal Q and KV head counts")
@@ -2330,8 +2537,10 @@ def _varlen_bwd_preprocess_dynamic_owner_queue(
     CuQ,
     DQ_ACC,
     TOTAL_Q_PADDED,
+    TaskCounts,
     OWNER_NEXT,
     INITIAL_OWNER,
+    PLAN_ERROR_INDEX: tl.constexpr,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -2341,6 +2550,8 @@ def _varlen_bwd_preprocess_dynamic_owner_queue(
     TOTAL_Q=None,
     PACK_STATS: tl.constexpr = False,
 ):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
     if (tl.program_id(0) == 0) & (tl.program_id(1) == 0):
         tl.store(OWNER_NEXT, INITIAL_OWNER)
     pid_m = tl.program_id(0)
@@ -3136,6 +3347,7 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3(
     DQ_ACC,
     DK,
     DV,
+    TaskCounts,
     DK_FINAL,
     DV_FINAL,
     OWNER_NEXT,
@@ -3149,6 +3361,8 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TASK_COUNT_INDEX: tl.constexpr,
+    PLAN_ERROR_INDEX: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     PAD_DQ_TO_BM32: tl.constexpr = False,
     PACK_STATS: tl.constexpr = False,
@@ -3157,6 +3371,10 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3(
     tl.static_assert(HQ == 12)
     tl.static_assert(HKV == 4)
     tl.static_assert(KV_SPLITS == 3)
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    if NUM_TASKS != tl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
     k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [1, 0, 0], [2, 0, 0],
                       [4, 0, 0], [8, 0, 0], [16, 0, 0], [32, 0, 0], [64, 0, 0], [128, 0, 0]],
@@ -3836,6 +4054,7 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4(
     DQ_ACC,
     DK,
     DV,
+    TaskCounts,
     DK_FINAL,
     DV_FINAL,
     OWNER_NEXT,
@@ -3849,6 +4068,8 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TASK_COUNT_INDEX: tl.constexpr,
+    PLAN_ERROR_INDEX: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     PAD_DQ_TO_BM32: tl.constexpr = False,
     PACK_STATS: tl.constexpr = False,
@@ -3857,6 +4078,10 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4(
     tl.static_assert(HQ == 64)
     tl.static_assert(HKV == 8)
     tl.static_assert(KV_SPLITS == 4)
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    if NUM_TASKS != tl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
     k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [1, 0, 0], [2, 0, 0],
                       [4, 0, 0], [8, 0, 0], [16, 0, 0], [32, 0, 0], [64, 0, 0], [128, 0, 0]],
@@ -3927,6 +4152,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     remain dense, as in TritonBench's ``v_storage[:, 0]`` view.
     """
     _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal)
+    plan_error_index = _CAUSAL_PLAN_ERROR if causal else _PLAN_ERROR
     total_q, heads, head_dim = q.shape
     total_kv, kv_heads, _ = k.shape
     group_size = heads // kv_heads
@@ -3936,8 +4162,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     dv = torch.empty_like(k)
     rolling_fp32_case = (not causal and
                          (total_q, total_kv, plan.max_q, getattr(plan, "max_kv", None)) == (50754, 100696, 5662, 10414)
-                         and plan.batch == 19 and (heads, kv_heads, head_dim, kv_splits) in ((12, 4, 128, 3),
-                                                                                             (64, 8, 128, 4))
+                         and plan.wide_task_count is not None and plan.batch == 19
+                         and (heads, kv_heads, head_dim, kv_splits) in ((12, 4, 128, 3), (64, 8, 128, 4))
                          and q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16
                          and _select_varlen_kernel_blocks(group_size, kv_splits) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
                          and k.numel() <= _I32_BUFFER_FP32_ELEMENTS)
@@ -3966,7 +4192,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     allocate_dq_acc = torch.empty if use_dq_aux else torch.zeros
     dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=torch.bfloat16, device=q.device)
 
-    owner_tasks = plan.wide_kv_start.numel() if rolling_fp32_case else 0
+    owner_tasks = plan.wide_task_count if rolling_fp32_case and plan.wide_task_count is not None else 0
     owner_groups = kv_heads * owner_tasks
     owner_workers = min(256, owner_groups)
     owner_next = torch.empty((1, ), dtype=torch.int32, device=q.device) if rolling_fp32_case else None
@@ -3980,6 +4206,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
         plan.cu_seqlens_q,
         dq_acc,
         total_q_padded,
+        plan.task_counts,
+        PLAN_ERROR_INDEX=plan_error_index,
         HEADS=heads,
         D=head_dim,
         BLOCK_M=64,
@@ -4020,6 +4248,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
             dq_acc,
             dk_target,
             dv_target,
+            plan.task_counts,
             SM_SCALE=sm_scale,
             TOTAL_Q=total_q,
             TOTAL_Q_PADDED=total_q_padded,
@@ -4028,6 +4257,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
             D=head_dim,
             BLOCK_M=_WIDE_BLOCK_M,
             BLOCK_N=_WIDE_BLOCK_N,
+            TASK_COUNT_INDEX=_WIDE_KV_TASK_COUNT,
+            PLAN_ERROR_INDEX=plan_error_index,
             KV_SPLITS=kv_splits,
             PAD_DQ_TO_BM32=pad_dq_to_bm32,
             PACK_STATS=pack_stats,
@@ -4047,14 +4278,25 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
         # The peeled MHA loop exposes independent score/dP and gradient work.
         core_llvm_attrs = (("amdgpu-sched-strategy", "max-ilp"), ) if cache_mha_stats else ()
         kv_launches = (
-            (0, plan.num_full_kv_blocks, True),
-            (plan.num_full_kv_blocks, plan.kv_block_sequence.numel() - plan.num_full_kv_blocks, False),
+            (
+                plan.full_kv_block_sequence,
+                plan.full_kv_block_start,
+                _FULL_KV_TASK_COUNT,
+                True,
+            ),
+            (
+                plan.tail_kv_block_sequence,
+                plan.tail_kv_block_start,
+                _TAIL_KV_TASK_COUNT,
+                False,
+            ),
         )
-        for task_offset, task_count, full_kv_tile in kv_launches:
-            if task_count == 0:
+        for block_sequence, block_start, task_count_index, full_kv_tile in kv_launches:
+            task_capacity = block_sequence.numel()
+            if task_capacity == 0:
                 continue
-            grid = (kv_heads * kv_splits, task_count) if group_size == 1 and not causal else (task_count,
-                                                                                              kv_heads * kv_splits)
+            grid = ((kv_heads * kv_splits, task_capacity) if group_size == 1 and not causal else
+                    (task_capacity, kv_heads * kv_splits))
             _varlen_bwd_interleaved_kernel[grid](
                 q,
                 k,
@@ -4064,12 +4306,12 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
                 delta,
                 plan.cu_seqlens_q,
                 plan.cu_seqlens_k,
-                plan.kv_block_sequence,
-                plan.kv_block_start,
+                block_sequence,
+                block_start,
                 dq_acc,
                 dk_target,
                 dv_target,
-                task_offset,
+                plan.task_counts,
                 SM_SCALE=sm_scale,
                 TOTAL_Q=total_q,
                 TOTAL_Q_PADDED=total_q_padded,
@@ -4078,6 +4320,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
                 D=head_dim,
                 BLOCK_M=_BLOCK_M,
                 BLOCK_N=_BLOCK_N,
+                TASK_COUNT_INDEX=task_count_index,
+                PLAN_ERROR_INDEX=plan_error_index,
                 FULL_KV_TILE=full_kv_tile,
                 KV_SPLITS=kv_splits,
                 IS_CAUSAL=causal,
@@ -4098,7 +4342,9 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
             dv_part,
             dk,
             dv,
+            plan.task_counts,
             total_kv,
+            PLAN_ERROR_INDEX=plan_error_index,
             HKV=kv_heads,
             D=head_dim,
             KV_SPLITS=kv_splits,
@@ -4108,17 +4354,20 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     if use_dq_aux:
         dq_sequence = plan.dq_full_kv_sequence if finalize_tail_dq else plan.q_block_sequence
         dq_start = plan.dq_full_kv_start if finalize_tail_dq else plan.q_block_start
-        if dq_sequence.numel():
+        if dq_sequence is not None and dq_start is not None and dq_sequence.numel():
             _varlen_mha_dq_convert_coalesced_kernel[(dq_sequence.numel(), heads)](
                 dq_acc,
                 plan.cu_seqlens_q,
                 dq_sequence,
                 dq_start,
+                plan.task_counts,
                 dq,
                 TOTAL_Q_PADDED=total_q_padded,
                 HEADS=heads,
                 D=head_dim,
                 BLOCK_M=_BLOCK_M,
+                TASK_COUNT_INDEX=_Q_TASK_COUNT,
+                PLAN_ERROR_INDEX=plan_error_index,
                 DQ_PAD_ROWS=dq_pad_rows,
                 num_warps=4,
             )
@@ -4128,11 +4377,14 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
             plan.cu_seqlens_q,
             plan.q_block_sequence,
             plan.q_block_start,
+            plan.task_counts,
             dq,
             TOTAL_Q_PADDED=total_q_padded,
             HEADS=heads,
             D=head_dim,
             BLOCK_M=_BLOCK_M,
+            TASK_COUNT_INDEX=_Q_TASK_COUNT,
+            PLAN_ERROR_INDEX=plan_error_index,
             num_warps=4,
             matrix_instr_nonkdim=16,
         )
