@@ -1,0 +1,7 @@
+{
+  "operation": "gemm",
+  "vendor": "nvidia",
+  "architecture": "hopper",
+  "aliases": ["h100", "sm90", "sm_90"],
+  "cuda_major": 9
+}
