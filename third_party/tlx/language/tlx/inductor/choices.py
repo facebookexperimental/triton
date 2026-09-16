@@ -81,11 +81,10 @@ class TLXInductorChoices(InductorChoices):
             return True
         return super()._need_to_fix_layout(adjusted_choices, op_name)
 
-    # Ops that use prefix_args (bias passed separately from mat1/mat2).
-    # The blackwell WS template only supports plain mm (2 named kernel args: A, B),
-    # so skip TLX injection for these ops. addmm IS supported: the AMD warp-pipe
-    # template handles the bias epilogue (prefix_args=1), injected via append_tlx.
-    _UNSUPPORTED_OPS = frozenset({"baddbmm"})
+    # The Blackwell template accepts only the two plain-mm inputs. baddbmm has a
+    # bias prefix argument, while scaled_mm has two additional scale arguments.
+    # AMD addmm remains supported by its warp-pipe template.
+    _UNSUPPORTED_OPS = frozenset({"baddbmm", "scaled_mm"})
 
     def get_template_configs(
         self,
