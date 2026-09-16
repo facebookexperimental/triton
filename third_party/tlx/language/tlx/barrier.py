@@ -288,15 +288,21 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
 
 @tl.builtin
 def amd_iglp_opt(variant: tl.constexpr, _semantic=None):
-    """Select an AMD instruction-group scheduling strategy for the current region.
+    """Emit LLVM's ``llvm.amdgcn.iglp.opt`` scheduling hint for AMD GPUs.
 
+    The variant meanings are defined by LLVM's AMDGPU instruction scheduler.
     Variants 0 and 1 interleave LDS and MFMA operations for small GEMMs, with
     variant 1 targeting a single wave. Variants 2 and 3 interleave transcendental
-    and MFMA operations; variant 2 also schedules their predecessors.
+    and MFMA operations for attention; variant 2 also interleaves their VALU and
+    LDS predecessors.
 
-    Use one hint per scheduling region. The region must not also contain
-    :func:`amd_sched_barrier`. Strategies follow LLVM's experimental IGLP
-    implementation. This hint adds no memory or workgroup synchronization.
+    Use at most one hint per LLVM scheduling region. The region must not also
+    contain :func:`amd_sched_barrier` or ``llvm.amdgcn.sched.group.barrier``.
+    Strategies are experimental and may change with LLVM versions. This hint
+    adds no memory or workgroup synchronization.
+
+    See `LLVM AMDGPU intrinsics
+    <https://llvm.org/docs/AMDGPUUsage.html#llvm-ir-intrinsics>`_.
     """
     if _semantic.builder.options.backend_name != "hip":
         raise NotImplementedError("tlx.amd_iglp_opt is only supported on AMD (HIP) backends")
