@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from unittest import mock
@@ -112,6 +114,19 @@ class ProfileRequestTest(unittest.TestCase):
             ProfileRequest(level="diagnostic")
         with self.assertRaisesRegex(ValueError, "absolute"):
             ProfileRequest(artifacts_dir=Path("relative"))
+        with self.assertRaisesRegex(TypeError, "mapping must be a mapping"):
+            ProfileRequest.from_mapping({"instrumentation_mapping": []})
+        with self.assertRaisesRegex(ValueError, "mapping requires proton_intra_kernel"):
+            ProfileRequest(instrumentation_mapping={"scope": "task"})
+        with self.assertRaisesRegex(ValueError, "digest requires a mapping"):
+            ProfileRequest(instrumentation_mapping_digest="digest")
+        with self.assertRaisesRegex(ValueError, "mapping digest mismatch"):
+            ProfileRequest(
+                tools=("proton_intra_kernel",),
+                diagnostic_only=True,
+                instrumentation_mapping={"scope": "task"},
+                instrumentation_mapping_digest="wrong-digest",
+            )
         with self.assertRaisesRegex(ValueError, "diagnostic_only"):
             ProfileRequest(tools=("proton_intra_kernel",))
         with self.assertRaisesRegex(ValueError, "warp"):
@@ -175,7 +190,15 @@ class ProfileRequestTest(unittest.TestCase):
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            payload = ProfileRequest(artifacts_dir=Path(directory)).to_json()
+            mapping = {"expected_kernel": "^kernel$"}
+            mapping_digest = _instrumentation_mapping_digest(mapping)
+            payload = ProfileRequest(
+                tools=("proton_intra_kernel",),
+                artifacts_dir=Path(directory),
+                instrumentation_mapping=mapping,
+                instrumentation_mapping_digest=mapping_digest,
+                diagnostic_only=True,
+            ).to_json()
             request = per_case_profile_request(payload, "shape/128?case")
             assert request is not None
             artifacts_dir = Path(str(request["artifacts_dir"]))
@@ -183,17 +206,25 @@ class ProfileRequestTest(unittest.TestCase):
             self.assertTrue(artifacts_dir.exists())
             self.assertEqual(artifacts_dir.parent, Path(directory))
             self.assertNotIn("/", artifacts_dir.name)
+            self.assertEqual(request["instrumentation_mapping"], mapping)
+            self.assertEqual(
+                request["instrumentation_mapping_digest"], mapping_digest
+            )
 
 
 class ProfileMetadataTest(unittest.TestCase):
     def test_profile_request_json_round_trip_preserves_diagnostic_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            mapping = {"expected_kernel": "^kernel$"}
+            mapping_digest = _instrumentation_mapping_digest(mapping)
             request = ProfileRequest(
                 level="deep",
                 tools=("proton_intra_kernel",),
                 passes=("role", "wait"),
                 experiment_id="exp-1",
                 artifacts_dir=Path(directory),
+                instrumentation_mapping=mapping,
+                instrumentation_mapping_digest=mapping_digest,
                 reason="collect diagnostic profile",
                 source_digest="digest-123",
                 policy_reason="targeted_diagnostic",
@@ -214,6 +245,11 @@ class ProfileMetadataTest(unittest.TestCase):
         self.assertTrue(restored.diagnostic_only)
         self.assertEqual(restored.granularity, "warp")
         self.assertEqual(restored.artifacts_dir, Path(directory))
+        self.assertEqual(restored.instrumentation_mapping, mapping)
+        self.assertEqual(
+            restored.instrumentation_mapping_digest,
+            mapping_digest,
+        )
 
     def test_rejects_passes_without_intra_kernel_tool(self) -> None:
         with self.assertRaisesRegex(ValueError, "passes require proton_intra_kernel"):
@@ -1444,6 +1480,11 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertNotIn("trace_events", diagnostic)
         self.assertEqual(diagnostic["artifacts"]["trace"], "/tmp/proton.trace")
         self.assertEqual(compact["artifacts"]["csv"], "/tmp/profile.csv")
+
+
+def _instrumentation_mapping_digest(mapping: Mapping[str, object]) -> str:
+    mapping_text = json.dumps(mapping, indent=2, sort_keys=True) + "\n"
+    return hashlib.sha256(mapping_text.encode()).hexdigest()
 
 
 if __name__ == "__main__":

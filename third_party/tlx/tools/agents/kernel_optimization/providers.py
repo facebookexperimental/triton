@@ -26,7 +26,13 @@ from .profiling import (
     is_profile_fresh,
     is_valid_intra_kernel_evidence,
 )
-from .source import source_digest, validate_replacement_source
+from .source import (
+    canonicalize_diagnostic_task_warps,
+    INSTRUMENTATION_MAPPING_SCHEMA_VERSION,
+    source_digest,
+    validate_diagnostic_instrumentation_source,
+    validate_replacement_source,
+)
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 _LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
@@ -114,7 +120,6 @@ _AGENT_EXECUTION_CONTROL_FIELDS = frozenset(
         "granularity",
         "instrumentation_id",
         "instrumentation_mapping_digest",
-        "instrumentation_mapping_path",
         "instrumented_source_digest",
         "kernel_filter",
         "kernel_name",
@@ -156,7 +161,6 @@ VALID_NCU_FOCUS: frozenset[str] = frozenset(
 VALID_PROTON_PASSES: frozenset[str] = frozenset(
     {"role", "coarse", "wait", "compute"}
 )
-INSTRUMENTATION_MAPPING_SCHEMA_VERSION = 1
 
 
 TLX_PROMPT_PREAMBLE = """You are optimizing one Triton or TLX kernel against an external deterministic harness.
@@ -843,26 +847,6 @@ def _read_instrumentation_mapping(path: Path) -> dict[str, object]:
     return payload
 
 
-def validate_diagnostic_instrumentation_source(
-    instrumented: str,
-    current: str,
-    mapping: Mapping[str, object],
-    *,
-    pass_capabilities: Mapping[str, tuple[str, ...]] | None = None,
-) -> None:
-    del pass_capabilities
-    validate_replacement_source(instrumented, current)
-    if mapping.get("schema_version") != INSTRUMENTATION_MAPPING_SCHEMA_VERSION:
-        raise ValueError(
-            "instrumentation mapping schema_version must be "
-            f"{INSTRUMENTATION_MAPPING_SCHEMA_VERSION}"
-        )
-    if mapping.get("diagnostic_only") is not True:
-        raise ValueError("instrumentation mapping must set diagnostic_only=true")
-    if not isinstance(mapping.get("passes"), Mapping):
-        raise ValueError("instrumentation mapping passes must be a JSON object")
-
-
 def _instrumentation_summary(mapping: Mapping[str, object]) -> str:
     passes = mapping.get("passes")
     if not isinstance(passes, Mapping):
@@ -1034,12 +1018,18 @@ class CodexDiagnosticInstrumentationProvider:
                 raise RuntimeError(
                     "instrumentation generator modified immutable original.py"
                 )
-            mapping = _read_instrumentation_mapping(mapping_path)
+            mapping = canonicalize_diagnostic_task_warps(
+                source,
+                context.current_source,
+                _read_instrumentation_mapping(mapping_path),
+                environment=request.target.environment,
+            )
         validate_diagnostic_instrumentation_source(
             source,
             context.current_source,
             mapping,
             pass_capabilities=dict(context.pass_capabilities),
+            environment=request.target.environment,
         )
         return DiagnosticInstrumentationProposal(
             source=source,
@@ -1128,7 +1118,6 @@ _PROMPT_OMIT_PROFILE_KEYS = frozenset(
         "artifacts",
         "command",
         "commands",
-        "instrumentation_mapping_path",
         "instrumented_source_path",
         "profile_metadata",
         "stderr",
@@ -1152,6 +1141,7 @@ def _prompt_safe_profile_value(value: object) -> object:
             str(key): _prompt_safe_profile_value(item)
             for key, item in value.items()
             if str(key) not in _PROMPT_OMIT_PROFILE_KEYS
+            and not str(key).endswith("_path")
         }
     if isinstance(value, (list, tuple)):
         return [_prompt_safe_profile_value(item) for item in value]
@@ -1466,6 +1456,9 @@ Instrumentation rules:
 4. Prefer predicated scopes over control-flow wrappers. If you need a guard block, it may contain only Proton scope calls or `_tlx_agent_proton_*` helper assignments, never original computation.
 5. Do not add imports other than `triton.profiler.language as pl`. Do not call `proton`, `subprocess`, `os`, `open`, `eval`, `exec`, or any profiling/analysis tool.
 6. Scope selected source regions that answer the requested diagnostic passes. Common roles are load, compute/mma, wait/barrier, store/epilogue, and whole loop/tile regions. Keep the number of scopes small and names stable.
+7. Derive every task's physical CTA warp IDs from the enclosing TLX async-task topology. A default task owns all launch `num_warps` starting at warp 0. Implicit non-default tasks are packed consecutively afterward in lexical order, `replicate` repeats the task's full warp range, and `warp_group_start_id` is an explicit physical start. Map every physical warp that executes the scope; never use task indices, logical role ordinals, or only one representative warp of a multi-warp task.
+
+For example, with `triton.Config(..., num_warps=4)`, a default task followed by three `tlx.async_task(num_warps=1)` blocks owns physical warp ranges `[0, 1, 2, 3]`, `[4]`, `[5]`, and `[6]`. Mapping those four roles to `[0]`, `[1]`, `[2]`, and `[3]` is incorrect.
 
 `instrumentation_mapping.json` schema:
 ```json
@@ -1481,7 +1474,8 @@ Instrumentation rules:
   "expected_kernel": "nonempty regex matching the kernel name",
   "selected_cta": 0,
   "tasks": {{
-    "load": {{"scope": "scope_name_present_in_source", "warps": [0]}}
+    "default": {{"scope": "default_scope", "warps": [0, 1, 2, 3]}},
+    "load": {{"scope": "load_scope", "warps": [4]}}
   }},
   "required_scopes": ["scope_name_present_in_source"],
   "scope_kinds": {{"scope_name_present_in_source": "work_or_wait_or_other"}},
@@ -1497,7 +1491,9 @@ Instrumentation rules:
 
 Strict mapping constraints:
 - Use only requested diagnostic pass names and pass capability region names supplied below when a pass has nonempty capabilities.
-- `tasks` must be nonempty, task scopes must be unique, and warp ownership must not overlap.
+- `tasks` must be nonempty, task scopes must be unique, and physical warp ownership must not overlap.
+- Derive `tasks.*.warps` from the actual launch `num_warps`, lexical `tlx.async_task` layout, `num_warps`, `replicate`, and `warp_group_start_id`; never infer it from role order or the number of tasks.
+- If physical ownership is not statically provable, record that limitation instead of inventing warp IDs.
 - Every task scope, required scope, `scope_kinds` key, and pass `scope_names` entry must exactly match a literal Proton scope name in `instrumented.py`.
 - Include `scope_kinds`, not `wait_scopes`, unless every listed scope is a wait scope.
 - Keep all names ASCII, short, and stable. Do not include raw traces or benchmark claims.

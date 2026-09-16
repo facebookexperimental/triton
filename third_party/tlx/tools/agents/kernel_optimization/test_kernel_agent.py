@@ -44,7 +44,9 @@ from .providers import (
     AgentDiagnosticRequest,
     AgentSourceResearchRequest,
     CandidateContext,
+    CandidateProfilingHint,
     CandidateProposal,
+    DiagnosticInstrumentationContext,
     DiagnosticInstrumentationProposal,
     FixedCandidateProvider,
     MockLLMProvider,
@@ -54,11 +56,86 @@ from .providers import (
 from .source_research import SourceResearchContext
 from .source import (
     apply_candidate_diff,
+    canonicalize_diagnostic_task_warps,
     extract_python_source,
     source_digest,
+    validate_diagnostic_instrumentation_source,
     validate_kernel_source,
     validate_replacement_source,
 )
+
+
+_TLX_TASK_SOURCE = """import triton
+
+
+def kernel():
+    configs = [triton.Config({}, num_warps=4)]
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            default_work()
+        with tlx.async_task(num_warps=1):
+            compute_work()
+        with tlx.async_task(num_warps=1):
+            load_work()
+        with tlx.async_task(num_warps=1):
+            store_work()
+"""
+
+
+def _instrument_tlx_task_source(source: str) -> str:
+    instrumented = source.replace(
+        "import triton\n",
+        "import triton\nimport triton.profiler.language as pl\n"
+        'pl.enable_semantic("triton")\n',
+        1,
+    )
+    for work, scope in (
+        ("default_work", "wait_scope"),
+        ("compute_work", "compute_scope"),
+        ("load_work", "load_scope"),
+        ("store_work", "store_scope"),
+    ):
+        statement = f"            {work}()\n"
+        replacement = (
+            f'            pl.enter_scope("{scope}", predicate=pid == 0)\n'
+            f"{statement}"
+            f'            pl.exit_scope("{scope}", predicate=pid == 0)\n'
+        )
+        instrumented = instrumented.replace(statement, replacement, 1)
+    return instrumented
+
+
+def _tlx_task_mapping(warps: tuple[tuple[int, ...], ...]) -> dict[str, object]:
+    scopes = ("wait_scope", "compute_scope", "load_scope", "store_scope")
+    return {
+        "schema_version": 1,
+        "diagnostic_only": True,
+        "instrumentation": {
+            "backend": "instrumentation",
+            "data": "trace",
+            "granularity": "warp",
+            "triton_semantic": True,
+        },
+        "expected_kernel": "kernel",
+        "selected_cta": 0,
+        "tasks": {
+            name: {"scope": scope, "warps": list(task_warps)}
+            for name, scope, task_warps in zip(
+                ("wait", "compute", "load", "store"),
+                scopes,
+                warps,
+            )
+        },
+        "required_scopes": list(scopes),
+        "scope_kinds": {scope: "work" for scope in scopes},
+        "passes": {
+            "role": {
+                "expected_regions": [],
+                "scope_names": list(scopes),
+            }
+        },
+        "limitations": [],
+    }
 
 
 class ScoringTest(unittest.TestCase):
@@ -743,6 +820,204 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(source_digest("VALUE = 1\n"), source_digest("VALUE = 1\n  \n"))
 
 
+class DiagnosticTaskWarpMappingTest(unittest.TestCase):
+    def test_canonicalizes_logical_ordinals_to_physical_warps(self) -> None:
+        instrumented = _instrument_tlx_task_source(_TLX_TASK_SOURCE)
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+
+        canonical = canonicalize_diagnostic_task_warps(
+            instrumented,
+            _TLX_TASK_SOURCE,
+            mapping,
+        )
+
+        tasks = canonical["tasks"]
+        assert isinstance(tasks, dict)
+        self.assertEqual(tasks["wait"]["warps"], [0, 1, 2, 3])
+        self.assertEqual(tasks["compute"]["warps"], [4])
+        self.assertEqual(tasks["load"]["warps"], [5])
+        self.assertEqual(tasks["store"]["warps"], [6])
+        original_tasks = mapping["tasks"]
+        assert isinstance(original_tasks, dict)
+        self.assertEqual(original_tasks["compute"]["warps"], [1])
+        validate_diagnostic_instrumentation_source(
+            instrumented,
+            _TLX_TASK_SOURCE,
+            canonical,
+        )
+
+    def test_rejects_statically_incorrect_physical_warps(self) -> None:
+        instrumented = _instrument_tlx_task_source(_TLX_TASK_SOURCE)
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"task 'wait'.*physical warps \[0\], expected \[0, 1, 2, 3\]",
+        ):
+            validate_diagnostic_instrumentation_source(
+                instrumented,
+                _TLX_TASK_SOURCE,
+                mapping,
+            )
+
+    def test_canonicalizes_replicated_implicit_task_ranges(self) -> None:
+        source = _TLX_TASK_SOURCE.replace(
+            "tlx.async_task(num_warps=1):\n            compute_work()",
+            "tlx.async_task(num_warps=2, replicate=2):\n"
+            "            compute_work()",
+        )
+        canonical = canonicalize_diagnostic_task_warps(
+            _instrument_tlx_task_source(source),
+            source,
+            _tlx_task_mapping(((0,), (1,), (2,), (3,))),
+        )
+
+        tasks = canonical["tasks"]
+        assert isinstance(tasks, dict)
+        self.assertEqual(tasks["compute"]["warps"], [4, 5, 6, 7])
+        self.assertEqual(tasks["load"]["warps"], [8])
+        self.assertEqual(tasks["store"]["warps"], [9])
+
+    def test_canonicalizes_explicit_task_start_ids(self) -> None:
+        source = _TLX_TASK_SOURCE.replace(
+            "tlx.async_task(num_warps=1):\n            compute_work()",
+            "tlx.async_task(\n"
+            "            num_warps=2, replicate=2, warp_group_start_id=8\n"
+            "        ):\n"
+            "            compute_work()",
+        ).replace(
+            "tlx.async_task(num_warps=1):\n            load_work()",
+            "tlx.async_task(num_warps=1, warp_group_start_id=12):\n"
+            "            load_work()",
+        ).replace(
+            "tlx.async_task(num_warps=1):\n            store_work()",
+            "tlx.async_task(num_warps=1, warp_group_start_id=13):\n"
+            "            store_work()",
+        )
+        canonical = canonicalize_diagnostic_task_warps(
+            _instrument_tlx_task_source(source),
+            source,
+            _tlx_task_mapping(((0,), (1,), (2,), (3,))),
+        )
+
+        tasks = canonical["tasks"]
+        assert isinstance(tasks, dict)
+        self.assertEqual(tasks["compute"]["warps"], [8, 9, 10, 11])
+        self.assertEqual(tasks["load"]["warps"], [12])
+        self.assertEqual(tasks["store"]["warps"], [13])
+
+    def test_resolves_default_environment_config_branch(self) -> None:
+        source = _TLX_TASK_SOURCE.replace(
+            "import triton\n\n\ndef kernel():\n"
+            "    configs = [triton.Config({}, num_warps=4)]",
+            "import os\nimport triton\n\n\n"
+            'CONFIG_SET = os.environ.get("CONFIG_SET", "default")\n\n\n'
+            "def configs():\n"
+            '    if CONFIG_SET == "sweep":\n'
+            "        return [\n"
+            "            triton.Config({}, num_warps=num_warps)\n"
+            "            for num_warps in (4, 8)\n"
+            "        ]\n"
+            "    return [triton.Config({}, num_warps=4)]\n\n\n"
+            "def kernel():\n"
+            "    configs()",
+        )
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+        instrumented = _instrument_tlx_task_source(source)
+
+        default_mapping = canonicalize_diagnostic_task_warps(
+            instrumented,
+            source,
+            mapping,
+        )
+        sweep_mapping = canonicalize_diagnostic_task_warps(
+            instrumented,
+            source,
+            mapping,
+            environment={"CONFIG_SET": "sweep"},
+        )
+
+        default_tasks = default_mapping["tasks"]
+        assert isinstance(default_tasks, dict)
+        self.assertEqual(default_tasks["wait"]["warps"], [0, 1, 2, 3])
+        self.assertEqual(default_tasks["compute"]["warps"], [4])
+        self.assertEqual(sweep_mapping, mapping)
+
+    def test_resolves_direct_environment_condition(self) -> None:
+        source = _TLX_TASK_SOURCE.replace(
+            "import triton\n",
+            "import os\nimport triton\n",
+            1,
+        ).replace(
+            "configs = [triton.Config({}, num_warps=4)]",
+            'if os.environ.get("WARP_MODE", "default") == "wide":\n'
+            "        configs = [triton.Config({}, num_warps=8)]\n"
+            "    else:\n"
+            "        configs = [triton.Config({}, num_warps=4)]",
+        )
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+        canonical = canonicalize_diagnostic_task_warps(
+            _instrument_tlx_task_source(source),
+            source,
+            mapping,
+            environment={"WARP_MODE": "wide"},
+        )
+
+        tasks = canonical["tasks"]
+        assert isinstance(tasks, dict)
+        self.assertEqual(tasks["wait"]["warps"], list(range(8)))
+        self.assertEqual(tasks["compute"]["warps"], [8])
+        self.assertEqual(tasks["load"]["warps"], [9])
+        self.assertEqual(tasks["store"]["warps"], [10])
+
+    def test_preserves_mapping_when_direct_launch_conflicts(self) -> None:
+        source = _TLX_TASK_SOURCE + "\nkernel[(1,)](num_warps=8)\n"
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+
+        canonical = canonicalize_diagnostic_task_warps(
+            _instrument_tlx_task_source(source),
+            source,
+            mapping,
+        )
+
+        self.assertEqual(canonical, mapping)
+
+    def test_preserves_mapping_for_conditional_async_tasks(self) -> None:
+        source = _TLX_TASK_SOURCE.replace(
+            "with tlx.async_task(num_warps=1):\n            compute_work()",
+            "if ENABLE_COMPUTE:\n"
+            "            with tlx.async_task(num_warps=1):\n"
+            "                compute_work()",
+        )
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+
+        canonical = canonicalize_diagnostic_task_warps(
+            _instrument_tlx_task_source(source),
+            source,
+            mapping,
+        )
+
+        self.assertEqual(canonical, mapping)
+
+    def test_preserves_mapping_when_launch_width_is_ambiguous(self) -> None:
+        source = _TLX_TASK_SOURCE.replace(
+            "configs = [triton.Config({}, num_warps=4)]",
+            "configs = [\n"
+            "        triton.Config({}, num_warps=4),\n"
+            "        triton.Config({}, num_warps=8),\n"
+            "    ]",
+        )
+        mapping = _tlx_task_mapping(((0,), (1,), (2,), (3,)))
+
+        canonical = canonicalize_diagnostic_task_warps(
+            _instrument_tlx_task_source(source),
+            source,
+            mapping,
+        )
+
+        self.assertEqual(canonical, mapping)
+
+
 class PriorRunEvidenceTest(unittest.TestCase):
     def test_loads_sources_and_sanitized_evidence_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1419,10 +1694,150 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertEqual(profile_args[0], instrumented_source)
         self.assertEqual(profile_args[3].source_digest, source_digest(instrumented_source))
         self.assertEqual(
+            profile_args[3].instrumentation_mapping,
+            {"schema_version": 1},
+        )
+        self.assertEqual(
+            profile_args[3].instrumentation_mapping_digest,
+            collection_metadata["instrumentation_mapping_digest"],
+        )
+        self.assertEqual(
             collection_metadata["instrumented_source_digest"],
             source_digest(instrumented_source),
         )
         self.assertIn("instrumentation_mapping_digest", collection_metadata)
+
+    def test_diagnostic_instrumentation_provider_failure_is_advisory(self) -> None:
+        source = "VALUE = 1\n"
+        request = KernelOptimizationRequest(
+            kernel_source=source,
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}),),
+            target=KernelTarget("fake", "fake"),
+        )
+        harness = Mock()
+        instrumenter = Mock()
+        instrumenter.instrument.side_effect = RuntimeError("instrumentation unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp, redirect_stderr(io.StringIO()):
+            profiles = optimizer_module._collect_diagnostic_profiles(
+                harness,
+                source,
+                request,
+                Path(tmp),
+                "diagnostic",
+                reason="test",
+                instrumentation_provider=instrumenter,
+            )
+
+        self.assertEqual(
+            profiles,
+            {"a": {"error": "RuntimeError: instrumentation unavailable"}},
+        )
+        harness.profile_only.assert_not_called()
+        harness.evaluate.assert_not_called()
+
+    def test_targeted_diagnostic_threads_instrumentation_provider(self) -> None:
+        source = "LATENCY_US = 80\nCORRECT = True\n"
+        baseline_digest = source_digest("LATENCY_US = 100\nCORRECT = True\n")
+        baseline = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((100.0, 100.0)),
+                    profile={"baseline": True},
+                ),
+            )
+        )
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((80.0, 80.0)),
+                ),
+            )
+        )
+        request = KernelOptimizationRequest(
+            kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}),),
+            target=KernelTarget("fake", "fake"),
+        )
+        proposal = CandidateProposal(
+            source,
+            "candidate",
+            profiling_hint=CandidateProfilingHint(
+                pass_name="wait",
+                expected_regions=("input_wait",),
+                case_ids=("a",),
+                rationale="inspect input wait",
+            ),
+        )
+        diagnostic_request = ProfileRequest(
+            level="deep",
+            tools=("proton_intra_kernel",),
+            passes=("role", "wait"),
+            experiment_id="r001-c000",
+            source_digest=source_digest(source),
+            diagnostic_only=True,
+            granularity="warp",
+        )
+        decision = Mock(request=diagnostic_request, reason="requested")
+        instrumenter = Mock()
+        harness = Mock()
+
+        with patch.object(
+            optimizer_module,
+            "is_profile_fresh",
+            return_value=True,
+        ), patch.object(
+            optimizer_module,
+            "is_valid_intra_kernel_evidence",
+            return_value=True,
+        ), patch.object(
+            optimizer_module,
+            "diagnostic_capabilities",
+            return_value={"role": ("tasks",), "wait": ("input_wait",)},
+        ), patch.object(
+            optimizer_module,
+            "targeted_diagnostic_decision",
+            return_value=decision,
+        ), patch.object(
+            optimizer_module,
+            "_collect_diagnostic_profiles",
+            return_value={"a": {"diagnostic": True}},
+        ) as collect:
+            merged, passes_used, reason = (
+                optimizer_module._collect_targeted_diagnostic(
+                    harness,
+                    source,
+                    performance,
+                    proposal,
+                    request,
+                    baseline,
+                    baseline_digest,
+                    Path("/tmp/artifacts"),
+                    "r001-c000",
+                    0,
+                    instrumentation_provider=instrumenter,
+                )
+            )
+
+        self.assertEqual(passes_used, 2)
+        self.assertEqual(reason, "requested")
+        self.assertEqual(merged.cases[0].timing, performance.cases[0].timing)
+        self.assertTrue(
+            merged.cases[0].profile["diagnostic_proton_intra_kernel"]["diagnostic"]
+        )
+        kwargs = collect.call_args.kwargs
+        self.assertIs(kwargs["instrumentation_provider"], instrumenter)
+        self.assertEqual(
+            kwargs["pass_capabilities"],
+            {"role": ("tasks",), "wait": ("input_wait",)},
+        )
+        self.assertEqual(kwargs["instrumentation_rationale"], "inspect input wait")
 
     def test_prior_source_is_rejected_without_adopting_prior_winner(self) -> None:
         baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
@@ -1811,11 +2226,22 @@ class KernelOptimizerTest(unittest.TestCase):
                 ),
             )
         )
+        diagnostic = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    profile={"diagnostic": True},
+                ),
+            )
+        )
         harness = Mock()
         harness.evaluate.side_effect = [baseline, candidate, rejected_final]
+        harness.profile_only.return_value = diagnostic
         provider = FixedCandidateProvider(
             [CandidateProposal(candidate_source, "faster before final revalidation")]
         )
+        instrumenter = _RecordingDiagnosticInstrumentationProvider()
 
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
@@ -1823,8 +2249,13 @@ class KernelOptimizerTest(unittest.TestCase):
                 optimizer_module,
                 "SubprocessHarness",
                 return_value=harness,
+            ), patch.object(
+                optimizer_module, "validate_diagnostic_instrumentation_source"
             ):
-                result = KernelOptimizer(provider).optimize(
+                result = KernelOptimizer(
+                    provider,
+                    diagnostic_instrumentation_provider=instrumenter,
+                ).optimize(
                     KernelOptimizationRequest(
                         kernel_source=baseline_source,
                         harness_path=output_dir / "unused_harness.py",
@@ -1838,6 +2269,7 @@ class KernelOptimizerTest(unittest.TestCase):
                         ),
                         output_dir=output_dir,
                         profiling_policy="legacy",
+                        diagnostic_proton_intra_kernel=True,
                     )
                 )
             baseline_profile = _read_json(output_dir / "baseline_profile.json")
@@ -1853,6 +2285,21 @@ class KernelOptimizerTest(unittest.TestCase):
             )
             self.assertEqual(best_profile, baseline_profile)
             self.assertEqual(final_profile, baseline_profile)
+            self.assertEqual(
+                [context.rationale for context in instrumenter.contexts],
+                ["baseline_diagnostic", "rejected_finalist_diagnostic"],
+            )
+            self.assertEqual(
+                [context.current_source for context in instrumenter.contexts],
+                [baseline_source, candidate_source],
+            )
+            self.assertEqual(
+                [call.args[0] for call in harness.profile_only.call_args_list],
+                instrumenter.sources,
+            )
+            self.assertTrue(
+                all(source != result.best_kernel for source in instrumenter.sources)
+            )
 
     def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
         provider = FixedCandidateProvider(
@@ -2309,6 +2756,81 @@ class KernelOptimizerTest(unittest.TestCase):
             ],
             "warp",
         )
+
+    def test_diagnostic_provider_instruments_automatic_baseline_and_final(
+        self,
+    ) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n"
+        candidate_source = "LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n"
+        provider = FixedCandidateProvider(
+            [CandidateProposal(candidate_source, "faster")]
+        )
+        instrumenter = _RecordingDiagnosticInstrumentationProvider()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            optimizer_module, "validate_diagnostic_instrumentation_source"
+        ) as validate:
+            root = Path(tmp)
+            output_dir = root / "out"
+            result = KernelOptimizer(
+                provider,
+                diagnostic_instrumentation_provider=instrumenter,
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=_write_policy_harness(root),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("cuda", "blackwell"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=output_dir,
+                )
+            )
+            requests = _read_profile_requests(root)
+            best_kernel = (output_dir / "best_kernel.py").read_text()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.best_kernel, candidate_source)
+        self.assertEqual(best_kernel, candidate_source)
+        self.assertEqual(
+            [context.rationale for context in instrumenter.contexts],
+            ["baseline_diagnostic", "final_winner_diagnostic"],
+        )
+        self.assertEqual(
+            [context.current_source for context in instrumenter.contexts],
+            [baseline_source, candidate_source],
+        )
+        diagnostic_requests = [
+            request
+            for request in requests
+            if request["tools"] == ["proton_intra_kernel"]
+        ]
+        self.assertEqual(
+            [request["source_digest"] for request in diagnostic_requests],
+            [source_digest(source) for source in instrumenter.sources],
+        )
+        self.assertTrue(
+            all(
+                request["instrumentation_mapping"] == {"schema_version": 1}
+                for request in diagnostic_requests
+            )
+        )
+        self.assertTrue(
+            all(request["instrumentation_mapping_digest"] for request in diagnostic_requests)
+        )
+        self.assertNotEqual(
+            diagnostic_requests[0]["source_digest"],
+            source_digest(baseline_source),
+        )
+        self.assertNotEqual(
+            diagnostic_requests[1]["source_digest"],
+            source_digest(candidate_source),
+        )
+        self.assertEqual(validate.call_count, 2)
 
     def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(
         self,
@@ -3133,6 +3655,27 @@ def _read_json(path: Path) -> dict[str, object]:
     payload = json.loads(path.read_text())
     assert isinstance(payload, dict)
     return payload
+
+
+class _RecordingDiagnosticInstrumentationProvider:
+    def __init__(self) -> None:
+        self.contexts: list[DiagnosticInstrumentationContext] = []
+        self.sources: list[str] = []
+
+    def instrument(
+        self,
+        request: KernelOptimizationRequest,
+        context: DiagnosticInstrumentationContext,
+    ) -> DiagnosticInstrumentationProposal:
+        del request
+        self.contexts.append(context)
+        source = context.current_source + f"# proton diagnostic {len(self.sources)}\n"
+        self.sources.append(source)
+        return DiagnosticInstrumentationProposal(
+            source=source,
+            mapping={"schema_version": 1},
+            summary="test instrumentation",
+        )
 
 
 def _performance(*values: tuple[str, float]) -> PerformanceSummary:

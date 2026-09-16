@@ -183,6 +183,8 @@ class ProfileRequest:
     passes: tuple[str, ...] = ()
     experiment_id: str = ""
     artifacts_dir: Path | None = None
+    instrumentation_mapping: Mapping[str, Any] | None = None
+    instrumentation_mapping_digest: str = ""
     reason: str = ""
     source_digest: str = ""
     policy_reason: str = ""
@@ -203,6 +205,29 @@ class ProfileRequest:
             if not artifacts_dir.is_absolute():
                 raise ValueError("profile artifacts_dir must be absolute")
             object.__setattr__(self, "artifacts_dir", artifacts_dir)
+        if self.instrumentation_mapping is not None:
+            if not isinstance(self.instrumentation_mapping, Mapping):
+                raise TypeError("instrumentation mapping must be a mapping")
+            if "proton_intra_kernel" not in self.tools:
+                raise ValueError(
+                    "instrumentation mapping requires proton_intra_kernel"
+                )
+            mapping = json.loads(json.dumps(self.instrumentation_mapping))
+            if not isinstance(mapping, dict):
+                raise TypeError("instrumentation mapping must be a JSON object")
+            object.__setattr__(self, "instrumentation_mapping", mapping)
+        if self.instrumentation_mapping_digest:
+            if self.instrumentation_mapping is None:
+                raise ValueError(
+                    "instrumentation mapping digest requires a mapping"
+                )
+            mapping_text = (
+                json.dumps(self.instrumentation_mapping, indent=2, sort_keys=True)
+                + "\n"
+            )
+            mapping_digest = hashlib.sha256(mapping_text.encode()).hexdigest()
+            if mapping_digest != self.instrumentation_mapping_digest:
+                raise ValueError("instrumentation mapping digest mismatch")
         if "proton_intra_kernel" in self.tools:
             if not self.diagnostic_only:
                 raise ValueError("proton_intra_kernel requires diagnostic_only=True")
@@ -216,6 +241,8 @@ class ProfileRequest:
             "passes": list(self.passes),
             "experiment_id": self.experiment_id,
             "artifacts_dir": str(self.artifacts_dir) if self.artifacts_dir else None,
+            "instrumentation_mapping": self.instrumentation_mapping,
+            "instrumentation_mapping_digest": self.instrumentation_mapping_digest,
             "reason": self.reason,
             "source_digest": self.source_digest,
             "policy_reason": self.policy_reason,
@@ -229,12 +256,21 @@ class ProfileRequest:
         passes = _string_tuple(payload.get("passes", ()), "passes")
         artifacts_dir_raw = payload.get("artifacts_dir")
         artifacts_dir = Path(str(artifacts_dir_raw)) if artifacts_dir_raw else None
+        mapping_raw = payload.get("instrumentation_mapping")
+        if mapping_raw is not None and not isinstance(mapping_raw, Mapping):
+            raise TypeError("instrumentation mapping must be a mapping")
         return cls(
             level=str(payload.get("level", "summary")),
             tools=tools,
             passes=passes,
             experiment_id=str(payload.get("experiment_id", "")),
             artifacts_dir=artifacts_dir,
+            instrumentation_mapping=(
+                dict(mapping_raw) if isinstance(mapping_raw, Mapping) else None
+            ),
+            instrumentation_mapping_digest=str(
+                payload.get("instrumentation_mapping_digest", "")
+            ),
             reason=str(payload.get("reason", "")),
             source_digest=str(payload.get("source_digest", "")),
             policy_reason=str(payload.get("policy_reason", "")),
@@ -277,7 +313,7 @@ def annotate_profile(
     if request_obj is None:
         raise TypeError("profile metadata requires a profile request")
     annotated = dict(profile)
-    annotated["profile_metadata"] = {
+    metadata: dict[str, Any] = {
         "source_digest": request_obj.source_digest,
         "case_id": str(case_id),
         "experiment_id": request_obj.experiment_id,
@@ -288,6 +324,11 @@ def annotate_profile(
         "diagnostic_only": request_obj.diagnostic_only,
         "granularity": request_obj.granularity,
     }
+    if request_obj.instrumentation_mapping is not None:
+        metadata["instrumentation_mapping_digest"] = (
+            request_obj.instrumentation_mapping_digest
+        )
+    annotated["profile_metadata"] = metadata
     return annotated
 
 

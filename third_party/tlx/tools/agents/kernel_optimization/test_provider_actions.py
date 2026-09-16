@@ -24,6 +24,9 @@ from .providers import (
     CandidateContext,
     CandidateProposal,
     CodexCandidateProvider,
+    CodexDiagnosticInstrumentationProvider,
+    DiagnosticInstrumentationContext,
+    _build_diagnostic_instrumentation_prompt,
     _build_prompt,
     _parse_agent_action,
     _read_candidate_metadata,
@@ -355,8 +358,64 @@ class CodexProviderActionTest(unittest.TestCase):
         self.assertEqual(action.hypothesis_kind, "pipeline")
         self.assertEqual(action.research_evidence_ids, ("research-1",))
 
+    def test_instrumentation_provider_returns_canonicalized_mapping(self) -> None:
+        raw_mapping = {"schema_version": 1, "tasks": {"compute": {"warps": [1]}}}
+        canonical_mapping = {
+            "schema_version": 1,
+            "tasks": {"compute": {"warps": [4]}},
+        }
+
+        def write_instrumentation(command: list[str], **kwargs: object) -> Mock:
+            del kwargs
+            workspace = Path(command[command.index("--cd") + 1])
+            (workspace / "instrumentation_mapping.json").write_text(
+                json.dumps(raw_mapping)
+            )
+            return Mock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "third_party.tlx.tools.agents.kernel_optimization.providers.subprocess.run",
+                side_effect=write_instrumentation,
+            ),
+            patch(
+                "third_party.tlx.tools.agents.kernel_optimization.providers.canonicalize_diagnostic_task_warps",
+                return_value=canonical_mapping,
+            ) as canonicalize,
+            patch(
+                "third_party.tlx.tools.agents.kernel_optimization.providers.validate_diagnostic_instrumentation_source"
+            ) as validate,
+        ):
+            proposal = CodexDiagnosticInstrumentationProvider().instrument(
+                _request(),
+                DiagnosticInstrumentationContext(current_source=_CURRENT_SOURCE),
+            )
+
+        self.assertEqual(proposal.mapping, canonical_mapping)
+        canonicalize.assert_called_once_with(
+            _CURRENT_SOURCE,
+            _CURRENT_SOURCE,
+            raw_mapping,
+            environment={},
+        )
+        validate.assert_called_once()
+
 
 class AgentActionPromptTest(unittest.TestCase):
+    def test_instrumentation_prompt_requires_physical_warp_ranges(self) -> None:
+        prompt = _build_diagnostic_instrumentation_prompt(
+            _request(),
+            DiagnosticInstrumentationContext(current_source=_CURRENT_SOURCE),
+        )
+
+        self.assertIn("physical CTA warp IDs", prompt)
+        self.assertIn("never use task indices, logical role ordinals", prompt)
+        self.assertIn("warp_group_start_id", prompt)
+        self.assertIn("[0, 1, 2, 3]", prompt)
+        self.assertIn("[4]", prompt)
+        self.assertIn("[5]", prompt)
+        self.assertIn("[6]", prompt)
+
     def test_prompt_contains_exact_schemas_selection_rules_and_budgets(self) -> None:
         evidence = DiagnosticEvidence(
             action_id="diag-1",

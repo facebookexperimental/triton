@@ -180,8 +180,11 @@ non-null when those tools are available.
   then call `export_ncu_report_details()` to persist and parse the details CSV; collection
   stdout contains status messages rather than metric rows when `--export` is used. Explicit
   `ncu` remains a compatible NVIDIA-only request.
-- **Diagnostic instrumentation:** `proton_intra_kernel` requires a target-supplied instrumented
-  replay. Instrumented source and timing must never be benchmarked, promoted, or committed.
+- **Diagnostic instrumentation:** when an instrumentation provider is available,
+  `proton_intra_kernel` uses provider-generated temporary source and passes its matching
+  mapping inline with `instrumentation_mapping_digest`. Harnesses may supply their own
+  instrumented replay when no provider is configured.
+  Instrumented source and timing must never be benchmarked, promoted, or committed.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
 `sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the
