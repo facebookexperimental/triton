@@ -2,14 +2,14 @@
 
 Each shape is ``(G, M_per_group, N, K)``. Every group has the same M.
 Each case runs in a separate process so its large GPU allocations are released
-before the next case starts.
+before the next case starts. Subprocesses use the current Python interpreter
+and inherit its environment.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import os
 import re
 import shlex
 import subprocess
@@ -84,16 +84,6 @@ def _parse_case(value: str) -> BenchCase:
     return BenchCase(groups, m, n, k)
 
 
-def _child_env() -> dict[str, str]:
-    env = os.environ.copy()
-    repo_root = Path(__file__).resolve().parents[4]
-    local_paths = [str(repo_root / "python"), str(repo_root)]
-    if env.get("PYTHONPATH"):
-        local_paths.append(env["PYTHONPATH"])
-    env["PYTHONPATH"] = os.pathsep.join(local_paths)
-    return env
-
-
 def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
     kernel = Path(__file__).with_name("amd_grouped_gemm_gfx1250_test.py")
     command = [
@@ -153,7 +143,6 @@ def _run_case(args: argparse.Namespace, case: BenchCase, index: int, total: int)
 
     process = subprocess.Popen(
         command,
-        env=_child_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
