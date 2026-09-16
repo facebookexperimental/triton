@@ -40,9 +40,7 @@ _XCD_REMAP_MODES = {
     "chunked": 2,
 }
 
-# Relative saturated rates for the validated gfx1250 TDM seeds. The large
-# 256x256 tile is the reference; asymmetric rates reflect matched full-tile
-# measurements in the local profiling notes.
+# Tile-selection weights relative to the 256x256 configuration.
 _GROUPED_GEMM_CONFIGS = (
     dict(name="256x256-alias", block_m=256, block_n=256, block_k=128, group_m=4, tdm_pipeline_depth=2, c_staging_mode=0,
          cross_tile_prefetch=False, relative_rate=1.0),
@@ -85,7 +83,7 @@ def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
         cross_tile_prefetch &= (k // bk) % int(cfg["tdm_pipeline_depth"]) == 0
         cross_tile_prefetch &= any(tiles > launch_programs for tiles in group_tiles)
         if cfg["cross_tile_prefetch"] and not cross_tile_prefetch:
-            # The measured asymmetric rate includes the cross-tile overlap.
+            # The asymmetric weight accounts for cross-tile overlap.
             cfg["relative_rate"] = float(cfg["relative_rate"]) / 1.02
         cfg["cross_tile_prefetch"] = cross_tile_prefetch
 
