@@ -5260,10 +5260,13 @@ class _AttentionFunction(torch.autograd.Function):
         else:
             num_targets = None
         causal = ctx.causal
-        Z, H, DimQ = q.shape
-        _, _, DimV = v.shape
-        d_qkv = torch.zeros((Z, H, DimQ * 2 + DimV), device=q.device, dtype=q.dtype)
-        dq, dk, dv = d_qkv.split([DimQ, DimQ, DimV], dim=-1)
+        # dQ is reduced into a zeroed FP32 destination by the launch pre-hook;
+        # dK/dV are fully overwritten.  Separate empty allocations avoid
+        # zero-filling a large combined BF16 buffer whose dQ slice would be
+        # discarded by tlx_hstu_attention_bwd anyway.
+        dq = torch.empty_like(q, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
         M, Delta, stride_mm = backward_custom_vars(dout, num_softmax_heads, idx, saved_tensors)
         dq, dk, dv = tlx_hstu_attention_bwd(
             dout=dout,
