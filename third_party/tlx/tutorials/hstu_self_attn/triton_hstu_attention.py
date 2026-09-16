@@ -64,6 +64,7 @@ class HSTUAutoWSConfig:
     dp: int = 1  # data-partition factor (MMA groups)
     manual_dp: bool = False  # manual fwd data partition (split-M, shared K/V)
     dq_reduce: bool = False  # bwd dq via TMA reduce-add (vs in-loop RMW)
+    dq_fp32: bool = False  # accumulate/store dq in fp32, matching TLX
     dq_reuse: bool = False  # FA-style TMEM reuse for the dq-reduce bwd
     dq_iters: int = 1  # dq TMA-reduce column subtiles
     dkdv_subtile: int = 1  # dK/dV output-store column subtiles
@@ -86,6 +87,7 @@ class HSTUAutoWSConfig:
             dp=int(g("HSTU_SELF_DP", "2" if autows else "1")),
             manual_dp=bool(int(g("HSTU_SELF_MANUAL_DP", "0"))),
             dq_reduce=g("HSTU_SELF_DQ_REDUCE") == "1",
+            dq_fp32=g("HSTU_SELF_DQ_FP32") == "1",
             dq_reuse=g("HSTU_SELF_DQ_REUSE", "0") == "1",
             dq_iters=int(g("HSTU_SELF_DQ_ITERS", "1")),
             dkdv_subtile=int(g("HSTU_SELF_BWD_DKDV_SUBTILE", "1")),
@@ -156,8 +158,8 @@ def configure_autows(cfg=None, **kwargs) -> "HSTUAutoWSConfig":
     return _AUTOWS_CFG
 
 
-# The autoWS structural knobs (autows / dp / manual_dp / dq_reduce / dq_iters /
-# dq_reuse) are passed to the kernels as tl.constexpr ARGUMENTS from the fwd/bwd
+# The autoWS structural knobs (autows / dp / manual_dp / dq_reduce / dq_fp32 /
+# dq_iters / dq_reuse) are passed to the kernels as tl.constexpr ARGUMENTS from the fwd/bwd
 # Python wrappers (sourced from _AUTOWS_CFG), so they are part of the JIT/autotune
 # cache key -- switching config recompiles a distinct, correctly-keyed kernel with
 # no module-level constexpr globals and no cache-invalidation dance. dq_reuse is
@@ -992,6 +994,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     BLOCK_D_Q: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
     DQ_REDUCE: tl.constexpr = False,
+    DQ_FP32: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
 ):
@@ -1103,7 +1106,9 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
                 # post-pass spends on a second dV accumulator copy.
                 attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
             ) * alpha)
-        dq = tl.trans(dq_trans).to(k.dtype)
+        dq = tl.trans(dq_trans)
+        if not DQ_FP32:
+            dq = dq.to(k.dtype)
         # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
         # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
         # compiler stages separately (the source-level analog of TLX's subtiled +
@@ -1786,6 +1791,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr = False,
     DQ_REDUCE: tl.constexpr = False,
+    DQ_FP32: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
     DKDV_SUBTILE: tl.constexpr = 1,
@@ -1861,6 +1867,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 BLOCK_D_Q=BLOCK_D_Q,
                 BLOCK_D_V=BLOCK_D_V,
                 DQ_REDUCE=DQ_REDUCE,
+                DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
             )
@@ -1942,6 +1949,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             BLOCK_D_Q=BLOCK_D_Q,
             BLOCK_D_V=BLOCK_D_V,
             DQ_REDUCE=DQ_REDUCE,
+            DQ_FP32=DQ_FP32,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
         )
@@ -2033,6 +2041,7 @@ def _hstu_attn_bwd(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr = False,
     DQ_REDUCE: tl.constexpr = False,
+    DQ_FP32: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
     DKDV_SUBTILE: tl.constexpr = 1,
@@ -2205,6 +2214,7 @@ def _hstu_attn_bwd(  # noqa C901
             ENABLE_TMA=ENABLE_TMA,
             AUTOWS=AUTOWS,
             DQ_REDUCE=DQ_REDUCE,
+            DQ_FP32=DQ_FP32,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
             DKDV_SUBTILE=DKDV_SUBTILE,
@@ -2269,6 +2279,7 @@ def _hstu_attn_bwd(  # noqa C901
                 ENABLE_TMA=ENABLE_TMA,
                 AUTOWS=AUTOWS,
                 DQ_REDUCE=DQ_REDUCE,
+                DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
                 DKDV_SUBTILE=DKDV_SUBTILE,
@@ -2333,6 +2344,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr,
     DQ_REDUCE: tl.constexpr,
+    DQ_FP32: tl.constexpr,
     DQ_ITERS: tl.constexpr,
     DQ_REUSE: tl.constexpr,
     DKDV_SUBTILE: tl.constexpr,
@@ -2463,6 +2475,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
                 ENABLE_TMA=True,
                 AUTOWS=False,
                 DQ_REDUCE=DQ_REDUCE,
+                DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
                 DKDV_SUBTILE=DKDV_SUBTILE,
@@ -2580,8 +2593,13 @@ def triton_hstu_attention_bwd(
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
     dv = switch_to_contiguous_if_needed(dv)
+    assert not _AUTOWS_CFG.dq_fp32 or (_AUTOWS_CFG.dq_reduce and enable_tma), (
+        "dq_fp32 requires the dQ TMA reduce path (dq_reduce=True, enable_tma=True)")
+    if _AUTOWS_CFG.dq_fp32:
+        assert dq.dtype == torch.float32, (
+            "dq_fp32=True requires a caller-provided FP32 dQ buffer")
     if dout.shape[0] == 0:
-        return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        return torch.zeros_like(dq), torch.zeros_like(k), torch.zeros_like(v)
     if enable_tma:
         triton.set_allocator(_allocate_tma_workspace)
     Z = seq_offsets.numel() - 1
@@ -2679,6 +2697,7 @@ def triton_hstu_attention_bwd(
         ENABLE_TMA=enable_tma,
         AUTOWS=_AUTOWS_CFG.autows,
         DQ_REDUCE=_AUTOWS_CFG.dq_reduce,
+        DQ_FP32=_AUTOWS_CFG.dq_fp32,
         DQ_ITERS=_AUTOWS_CFG.dq_iters,
         DQ_REUSE=_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse,
         DKDV_SUBTILE=_AUTOWS_CFG.dkdv_subtile,
@@ -2803,7 +2822,7 @@ class _AttentionFunction(torch.autograd.Function):
         max_attn_len = ctx.max_attn_len
         contextual_seq_len = ctx.contextual_seq_len
 
-        dq = torch.empty_like(q)
+        dq = torch.empty_like(q, dtype=torch.float32 if _AUTOWS_CFG.dq_fp32 else q.dtype)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         dq, dk, dv = triton_hstu_attention_bwd(

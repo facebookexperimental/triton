@@ -210,9 +210,10 @@ _PERF_ENV = {
     "autows_clc": {
         "HSTU_SELF_AUTOWS": "1",
         "HSTU_SELF_DQ_REDUCE": "1",
+        "HSTU_SELF_DQ_FP32": "1",
         "HSTU_SELF_DQ_REUSE": "1",
         "HSTU_SELF_AUTOWS_CLC": "1",
-        "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "2",
+        "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "1",
         "HSTU_SELF_BWD_DKDV_SUBTILE": "2",
         "HSTU_SELF_DP": "1",
         "HSTU_SELF_AUTOWS_BWD_BM": "64",
@@ -231,13 +232,10 @@ def _clc_bwd(q, k, v, do, so, asc, L, num_targets):
     wrapper directly so forward compilation/autotuning is excluded from both
     setup and timing while retaining backward-side allocations and preprocessing.
 
-    dq is zeroed rather than left uninitialized: the CLC path writes it with
-    store_reduce="add", so garbage (possibly inf/NaN) would be accumulated into.
-    The buffers are still reused across calls, so dq keeps summing across
-    repetitions -- this closure is for timing only and its gradients are not
-    meaningful. Zeroing per call would put a memset inside the timed region and
-    bias the CLC number against the other variants."""
-    dq = torch.zeros_like(q)
+    The launch pre-hook zeroes dQ before every reduce-add launch, matching TLX.
+    Allocate it as FP32 when the aligned mode is selected so both raw variants
+    time the same output contract."""
+    dq = torch.empty_like(q, dtype=torch.float32 if A._AUTOWS_CFG.dq_fp32 else q.dtype)
     dk, dv = torch.empty_like(k), torch.empty_like(v)
 
     def bwd():
