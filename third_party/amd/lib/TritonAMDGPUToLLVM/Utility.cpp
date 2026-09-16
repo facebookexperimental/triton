@@ -10,6 +10,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "llvm/ADT/DenseSet.h"
 namespace tt = mlir::triton;
 using mlir::triton::ModuleAxisInfoAnalysis;
 using mlir::triton::amdgpu::ISAFamily;
@@ -924,6 +925,49 @@ static Value resolveLoopBackedge(BlockArgument bbArg) {
   return yieldOp.getOperand(iterArgIdx);
 }
 
+// Follow tensor values through region boundaries without conflating independent
+// loop results. An accumulator carried beside the next A/B operands does not
+// make those operands depend on the accumulator's dot.
+static bool
+hasDotDependency(Value value,
+                 llvm::function_ref<bool(tt::DotOpInterface)> matches) {
+  SmallVector<Value> worklist{value};
+  llvm::DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (auto arg = dyn_cast<BlockArgument>(current)) {
+      if (Value backedge = resolveLoopBackedge(arg)) {
+        auto forOp = cast<scf::ForOp>(arg.getOwner()->getParentOp());
+        unsigned index = arg.getArgNumber() - forOp.getNumInductionVars();
+        worklist.push_back(forOp.getInitArgs()[index]);
+        worklist.push_back(backedge);
+      }
+      continue;
+    }
+    Operation *producer = current.getDefiningOp();
+    if (auto dot = dyn_cast<tt::DotOpInterface>(producer)) {
+      if (matches(dot))
+        return true;
+    }
+    unsigned index = cast<OpResult>(current).getResultNumber();
+    if (auto forOp = dyn_cast<scf::ForOp>(producer)) {
+      worklist.push_back(forOp.getInitArgs()[index]);
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      worklist.push_back(yield.getOperand(index));
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(producer)) {
+      for (Region &region : ifOp->getRegions()) {
+        if (!region.empty())
+          worklist.push_back(region.front().getTerminator()->getOperand(index));
+      }
+    } else {
+      llvm::append_range(worklist, producer->getOperands());
+    }
+  }
+  return false;
+}
+
 bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
   auto isInSameRegion = [&dotOp](Operation *op) {
     return op->getParentRegion() == dotOp->getParentRegion();
@@ -937,7 +981,10 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
       assert(dOp != dotOp);
       Operation *dotOperand = (opIdx == 0) ? dOp.getA().getDefiningOp()
                                            : dOp.getB().getDefiningOp();
-      if (dotOperand && fwdSlices.contains(dotOperand)) {
+      if (dotOperand && fwdSlices.contains(dotOperand) &&
+          hasDotDependency(
+              opIdx == 0 ? dOp.getA() : dOp.getB(),
+              [&](tt::DotOpInterface producer) { return producer == dotOp; })) {
         return true;
       }
     }
@@ -965,9 +1012,12 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
           if (!dOp || dOp == dotOp)
             continue;
           Value dotOperand = (opIdx == 0) ? dOp.getA() : dOp.getB();
-          if (dotOperand == nextIterArg ||
-              (dotOperand.getDefiningOp() &&
-               argFwdSlices.contains(dotOperand.getDefiningOp())))
+          if ((dotOperand == nextIterArg ||
+               (dotOperand.getDefiningOp() &&
+                argFwdSlices.contains(dotOperand.getDefiningOp()))) &&
+              hasDotDependency(dotOperand, [&](tt::DotOpInterface producer) {
+                return producer == dotOp;
+              }))
             return true;
         }
       }
@@ -977,53 +1027,9 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
 }
 
 bool isChainDotTail(tt::DotOpInterface dotOp) {
-  auto isInSameRegion = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion();
-  };
-  BackwardSliceOptions bwdOpt;
-  bwdOpt.omitBlockArguments = true;
-  bwdOpt.filter = isInSameRegion;
-  SetVector<Operation *> bwdSlices;
-  Operation *opA = dotOp.getA().getDefiningOp();
-  if (opA) {
-    (void)getBackwardSlice(opA, &bwdSlices, bwdOpt);
-    if (llvm::find_if(bwdSlices, [](Operation *op) {
-          return isa<tt::DotOpInterface>(op);
-        }) != bwdSlices.end())
-      return true;
-  }
-
-  // Cross-iteration: if operand A (or its backward slice) touches a block
-  // arg, resolve via the yield back-edge and check the backward slice of
-  // the yielded value for a dot (mirrors the intra-iteration check above).
-  SmallVector<BlockArgument, 4> bbArgs;
-  if (auto bbArg = dyn_cast<BlockArgument>(dotOp.getA())) {
-    bbArgs.push_back(bbArg);
-  } else if (opA) {
-    bwdSlices.insert(opA);
-    for (Operation *sliceOp : bwdSlices)
-      for (Value operand : sliceOp->getOperands())
-        if (auto bbArg = dyn_cast<BlockArgument>(operand))
-          bbArgs.push_back(bbArg);
-  }
-
-  for (BlockArgument bbArg : bbArgs) {
-    Value yieldVal = resolveLoopBackedge(bbArg);
-    if (!yieldVal)
-      continue;
-    Operation *yieldDef = yieldVal.getDefiningOp();
-    if (!yieldDef)
-      continue;
-    SetVector<Operation *> yieldBwdSlices;
-    (void)getBackwardSlice(yieldDef, &yieldBwdSlices, bwdOpt);
-    yieldBwdSlices.insert(yieldDef);
-    if (llvm::find_if(yieldBwdSlices, [&dotOp](Operation *op) {
-          return isa<tt::DotOpInterface>(op) && op != dotOp;
-        }) != yieldBwdSlices.end())
-      return true;
-  }
-
-  return false;
+  return hasDotDependency(dotOp.getA(), [&](tt::DotOpInterface producer) {
+    return producer != dotOp;
+  });
 }
 
 Value convertF8ToF32_SW(RewriterBase &rewriter, Location loc, Value fp8Val,
