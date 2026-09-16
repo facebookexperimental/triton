@@ -33,7 +33,7 @@ it. For an asynchronous structural candidate, state the producer, consumer, owne
 visibility point, reuse point, and proof that storage is not overwritten while still live.
 
 Choose one coherent hypothesis. Classify it as parameter, memory_layout, pipeline, topology,
-synchronization, compiler_layout, or algorithmic. When moving beyond local tuning, record why
+synchronization, compiler_layout, algorithmic, or unknown. When moving beyond local tuning, record why
 the previous level was insufficient and cite the source-research evidence that supports the
 new level. Repository research and profiler evidence guide candidate generation; only the
 external correctness and uninstrumented benchmark harness may promote a candidate.

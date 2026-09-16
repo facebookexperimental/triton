@@ -32,7 +32,11 @@ from ..decision_maker.profiling import (
     is_valid_intra_kernel_evidence,
 )
 from .knowledge import load_knowledge
-from .source import source_digest, validate_replacement_source
+from .source import (
+    source_digest,
+    validate_diagnostic_instrumentation_source,
+    validate_replacement_source,
+)
 from .strategy import OPTIMIZATION_STRATEGY
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
@@ -980,26 +984,6 @@ def _read_instrumentation_mapping(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("instrumentation mapping must be a JSON object")
     return payload
-
-
-def validate_diagnostic_instrumentation_source(
-    instrumented: str,
-    current: str,
-    mapping: Mapping[str, object],
-    *,
-    pass_capabilities: Mapping[str, tuple[str, ...]] | None = None,
-) -> None:
-    del pass_capabilities
-    validate_replacement_source(instrumented, current)
-    if mapping.get("schema_version") != INSTRUMENTATION_MAPPING_SCHEMA_VERSION:
-        raise ValueError(
-            "instrumentation mapping schema_version must be "
-            f"{INSTRUMENTATION_MAPPING_SCHEMA_VERSION}"
-        )
-    if mapping.get("diagnostic_only") is not True:
-        raise ValueError("instrumentation mapping must set diagnostic_only=true")
-    if not isinstance(mapping.get("passes"), Mapping):
-        raise ValueError("instrumentation mapping passes must be a JSON object")
 
 
 def _instrumentation_summary(mapping: Mapping[str, object]) -> str:
