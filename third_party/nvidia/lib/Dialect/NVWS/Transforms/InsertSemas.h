@@ -1,5 +1,6 @@
 #ifndef NVWS_TRANSFORMS_INSERT_SEMAS_H_
 #define NVWS_TRANSFORMS_INSERT_SEMAS_H_
+#include "BufferGroups.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -178,7 +179,7 @@ struct Sema {
   const Sema *physicalPrimary = nullptr;
 };
 
-enum class MemKind { Tmem, Local };
+using MemKind = nvws::buffer::MemoryKind;
 
 struct GroupDag {
   int64_t bufferId = 0;
@@ -237,16 +238,13 @@ inline gpu::MemDescType backingType(const GroupDag &g, const Member &member) {
                                type.getMemorySpace(), true);
 }
 using ScheduleUpdate = std::pair<Operation *, gpu::StageCluster>;
-inline constexpr StringLiteral kBufferIdAttrName = "buffer.id";
-inline constexpr StringLiteral kBufferOffsetAttrName = "buffer.offset";
-inline constexpr StringLiteral kBufferCopyAttrName = "buffer.copy";
-inline constexpr StringLiteral kBufferCircularAttrName = "buffer.circular";
-inline constexpr StringLiteral kBufferStartAttrName = "buffer.start";
-inline std::optional<int64_t> getI64Attr(Operation *op, StringRef name) {
-  if (auto attr = op->getAttrOfType<IntegerAttr>(name))
-    return attr.getInt();
-  return std::nullopt;
-}
+using nvws::buffer::getI64Attr;
+using nvws::buffer::isSupportedAliasOp;
+using nvws::buffer::kBufferCircularAttrName;
+using nvws::buffer::kBufferCopyAttrName;
+using nvws::buffer::kBufferIdAttrName;
+using nvws::buffer::kBufferOffsetAttrName;
+using nvws::buffer::kBufferStartAttrName;
 inline InFlightDiagnostic semaError(Operation *op) {
   return op->emitError() << "nvws-insert-semas: ";
 }
@@ -295,12 +293,6 @@ inline AsyncOp asyncPayloadOf(Operation *op) {
   if (name == "nvws.descriptor_load" || name == "nvws.descriptor_gather")
     return AsyncOp::TMALoad;
   return AsyncOp::NONE;
-}
-inline bool isSupportedAliasOp(Operation *op) {
-  StringRef name = op->getName().getStringRef();
-  return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
-         name == "ttg.memdesc_subslice" || name == "ttg.memdesc_trans" ||
-         name == "ttg.memdesc_reinterpret" || name == "ttg.memdesc_reshape";
 }
 template <typename Fn> inline void forEachNode(Node *head, Fn &&fn) {
   for (Node *n = head; n; n = n->next) {

@@ -1136,3 +1136,144 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+!ty = tensor<1xi32, #blocked>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @managed_group_in_non_entry_block
+  // META-LABEL: @managed_group_in_non_entry_block
+  tt.func @managed_group_in_non_entry_block(%early: i1, %lb: i32, %ub: i32, %step: i32) {
+    // CHECK-NOT: nvws.semaphore.create
+    // CHECK: ^bb2:
+    // META-NOT: nvws.semaphore.create
+    // META: ^bb2:
+    cf.cond_br %early, ^exit, ^work
+  ^exit:
+    tt.return
+  ^work:
+    // CHECK: [[CFG_BACKING:%.*]] = ttg.local_alloc {buffer.id = 1200 : i32}
+    // CHECK: nvws.semaphore.create [[CFG_BACKING]] released = 1
+    // CHECK: nvws.semaphore.create [[CFG_BACKING]]
+    // META: [[CFG_BACKING:%.*]] = ttg.local_alloc {buffer.id = 1200 : i32}
+    // META: nvws.semaphore.create [[CFG_BACKING]] released = 1
+    // META: nvws.semaphore.create [[CFG_BACKING]]
+    %alloc = ttg.local_alloc {buffer.id = 1200 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+      %value = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
+      // CHECK: nvws.semaphore.acquire
+      // CHECK: ttg.local_store
+      // CHECK: nvws.semaphore.release
+      // CHECK: nvws.semaphore.acquire
+      // CHECK: ttg.local_load
+      // META: nvws.semaphore.acquire
+      // META: ttg.local_store
+      // META: nvws.semaphore.release
+      // META: nvws.semaphore.acquire
+      // META: ttg.local_load
+      ttg.local_store %value, %alloc {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+      %loaded = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !ty
+      "consume"(%loaded) {ttg.partition = array<i32: 1>} : (!ty) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+!ty = tensor<1xi32, #blocked>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @reject_managed_flow_across_cfg_blocks(%early: i1, %lb: i32, %ub: i32, %step: i32) {
+    // expected-error @below {{nvws-insert-semas: managed memdesc flow across function CFG blocks is unsupported}}
+    %alloc = ttg.local_alloc {buffer.id = 1201 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    cf.cond_br %early, ^exit, ^work
+  ^exit:
+    tt.return
+  ^work:
+    scf.for %i = %lb to %ub step %step : i32 {
+      %value = "producer"() {ttg.partition = array<i32: 0>} : () -> !ty
+      ttg.local_store %value, %alloc {ttg.partition = array<i32: 0>} : !ty -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
+    } {tt.warp_specialize, ttg.partition = array<i32: 0>, ttg.partition.stages = [0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @reject_conflicting_tmem_copies(%lb: i32, %ub: i32, %step: i32) {
+    // expected-note @below {{first buffer.copy value is 1}}
+    %a = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 77 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    // expected-error @below {{nvws-insert-semas: TMEM allocations sharing buffer.id 77 have conflicting buffer.copy values 1 and 2}}
+    %b = ttng.tmem_alloc {buffer.copy = 2 : i32, buffer.id = 77 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+    } {tt.warp_specialize}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @reject_circular_missing_id(%lb: i32, %ub: i32, %step: i32) {
+    // expected-error @below {{nvws-insert-semas: circular local alloc requires buffer.id}}
+    %alloc = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #ttg.shared_memory, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+    } {tt.warp_specialize}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @reject_circular_missing_copy(%lb: i32, %ub: i32, %step: i32) {
+    // expected-error @below {{nvws-insert-semas: circular local alloc requires buffer.copy}}
+    %alloc = ttg.local_alloc {buffer.circular, buffer.id = 1202 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #ttg.shared_memory, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+    } {tt.warp_specialize}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @reject_circular_missing_start(%lb: i32, %ub: i32, %step: i32) {
+    // expected-error @below {{nvws-insert-semas: circular local alloc requires buffer.start}}
+    %alloc = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 1203 : i32} : () -> !ttg.memdesc<1xi32, #shared, #ttg.shared_memory, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+    } {tt.warp_specialize}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @reject_circular_offset(%lb: i32, %ub: i32, %step: i32) {
+    // expected-error @below {{nvws-insert-semas: circular local alloc must not carry buffer.offset}}
+    %alloc = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 1204 : i32, buffer.offset = 0 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #ttg.shared_memory, mutable>
+    scf.for %i = %lb to %ub step %step : i32 {
+    } {tt.warp_specialize}
+    tt.return
+  }
+}
