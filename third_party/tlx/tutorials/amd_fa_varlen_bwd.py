@@ -407,8 +407,7 @@ def _store_dkdv_tail_n96(
     global_n = kv_start + offs_n
     output_offsets = (global_n[:, None] * HKV + kv_head) * D + offs_d[None, :]
     output_offsets = tlx.require_layout(output_offsets.to(tl.int32), store_layout, pin=False)
-    output_mask = tlx.require_layout(
-        tl.broadcast_to(offs_n[:, None] < kv_len, (CHUNK_N, D)), store_layout, pin=False)
+    output_mask = tlx.require_layout(tl.broadcast_to(offs_n[:, None] < kv_len, (CHUNK_N, D)), store_layout, pin=False)
     tlx.buffer_store(dk, DK, output_offsets, mask=output_mask)
     tlx.buffer_store(dv, DV, output_offsets, mask=output_mask)
 
@@ -461,14 +460,13 @@ def _store_dq_tail_final_preloaded(
     # Keep the parent's two BF16 roundings and final packed-output layout.
     # previous is a required BF16 tensor, never a None-valued loop input.
     dq = tlx.require_layout(dq, MMA_MD, pin=False)
-    scale = tlx.require_layout(
-        tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), MMA_MD, pin=False)
+    scale = tlx.require_layout(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), MMA_MD, pin=False)
     partial = (dq * scale).to(tl.bfloat16)
     partial = tlx.require_layout(partial, MMA_MD, pin=True)
     combined = (previous.to(tl.float32) + partial.to(tl.float32)).to(tl.bfloat16)
     combined = tlx.require_layout(combined, MMA_MD, pin=True)
 
-    store_layout: tl.constexpr = tlx.layout(shape=((2, 16, 2, 4), (8,)), stride=((8, 128, 64, 16), (1,)))
+    store_layout: tl.constexpr = tlx.layout(shape=((2, 16, 2, 4), (8, )), stride=((8, 128, 64, 16), (1, )))
     combined = tlx.require_layout(tlx.release_layout(combined), store_layout, pin=False)
     store_m = tlx.rematerialized_range(0, BLOCK_M, 52, placement=step)
     store_d = tlx.rematerialized_range(0, D, 53, placement=step)
@@ -476,10 +474,8 @@ def _store_dq_tail_final_preloaded(
     output_base = (q_start * HQ + q_head.to(tl.int64)) * D
     output_offsets = (rows[:, None] * HQ * D + store_d[None, :]).to(tl.int32)
     output_offsets = tlx.require_layout(output_offsets, store_layout, pin=False)
-    output_mask = tlx.require_layout(
-        tl.broadcast_to((rows < q_len)[:, None], (BLOCK_M, D)), store_layout, pin=False)
-    tlx.buffer_store(
-        combined, tl.multiple_of(DQ_OUTPUT + output_base, 16), output_offsets, mask=output_mask)
+    output_mask = tlx.require_layout(tl.broadcast_to((rows < q_len)[:, None], (BLOCK_M, D)), store_layout, pin=False)
+    tlx.buffer_store(combined, tl.multiple_of(DQ_OUTPUT + output_base, 16), output_offsets, mask=output_mask)
 
 
 @triton.jit
@@ -502,8 +498,7 @@ def _store_dq_tail_final(
     # Earlier full-KV launches have finished. This MHA tail CTA is the only
     # remaining owner of this sequence/head, so it can write final dQ.
     dq = tlx.require_layout(dq, MMA_MD, pin=False)
-    scale = tlx.require_layout(
-        tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), MMA_MD, pin=False)
+    scale = tlx.require_layout(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), MMA_MD, pin=False)
     # Match the atomic path's first rounding before adding its BF16 partial.
     partial = (dq * scale).to(tl.bfloat16)
     partial = tlx.require_layout(partial, MMA_MD, pin=True)
@@ -531,7 +526,7 @@ def _store_dq_tail_final(
     combined = tlx.require_layout(combined, MMA_MD, pin=True)
 
     # Keep each wave's two native 16-column D stripes during final output.
-    store_layout: tl.constexpr = tlx.layout(shape=((2, 16, 2, 4), (8,)), stride=((8, 128, 64, 16), (1,)))
+    store_layout: tl.constexpr = tlx.layout(shape=((2, 16, 2, 4), (8, )), stride=((8, 128, 64, 16), (1, )))
     combined = tlx.require_layout(tlx.release_layout(combined), store_layout, pin=False)
     store_m = tlx.rematerialized_range(0, BLOCK_M, 52, placement=step)
     store_d = tlx.rematerialized_range(0, D, 53, placement=step)
@@ -539,10 +534,8 @@ def _store_dq_tail_final(
     output_base = (q_start * HQ + q_head.to(tl.int64)) * D
     output_offsets = (rows[:, None] * HQ * D + store_d[None, :]).to(tl.int32)
     output_offsets = tlx.require_layout(output_offsets, store_layout, pin=False)
-    output_mask = tlx.require_layout(
-        tl.broadcast_to((rows < q_len)[:, None], (BLOCK_M, D)), store_layout, pin=False)
-    tlx.buffer_store(
-        combined, tl.multiple_of(DQ_OUTPUT + output_base, 16), output_offsets, mask=output_mask)
+    output_mask = tlx.require_layout(tl.broadcast_to((rows < q_len)[:, None], (BLOCK_M, D)), store_layout, pin=False)
+    tlx.buffer_store(combined, tl.multiple_of(DQ_OUTPUT + output_base, 16), output_offsets, mask=output_mask)
 
 
 @triton.jit
@@ -619,7 +612,7 @@ def _bm32_cat_rows(low, high, LAYOUT: tl.constexpr):
 @triton.jit
 def _bm32_cat_stats(low, high, STATS_LAYOUT: tl.constexpr):
     joined = tl.permute(tl.join(low, high), (1, 0))
-    values = tl.reshape(joined, (32,), can_reorder=False)
+    values = tl.reshape(joined, (32, ), can_reorder=False)
     return tlx.require_layout(values, STATS_LAYOUT, pin=False)
 
 
@@ -632,7 +625,10 @@ def _bm32_qdo_stage_slice(buffers, slot, QDO_SLICE_LAYOUT: tl.constexpr):
 
 @triton.jit
 def _bm32_load_stat_half(
-    tile, HALF: tl.constexpr, STATS_LAYOUT: tl.constexpr, BASE_OFFSET: tl.constexpr = 0,
+    tile,
+    HALF: tl.constexpr,
+    STATS_LAYOUT: tl.constexpr,
+    BASE_OFFSET: tl.constexpr = 0,
 ):
     # Packed Delta uses the second 32-word field of the same 64-word stage.
     return tlx.local_load(
@@ -663,8 +659,8 @@ def _bm32_score_with_prefix(tile, prefix_lo, prefix_hi, QT_LAYOUT: tl.constexpr)
     band1 = _bm32_load_score_band(tile, 1, QT_LAYOUT)
     band2 = _bm32_load_score_band(tile, 2, QT_LAYOUT)
     band3 = _bm32_load_score_band(tile, 3, QT_LAYOUT)
-    operand = _bm32_cat_rows(
-        _bm32_cat_rows(band0, band1, QT_LAYOUT), _bm32_cat_rows(band2, band3, QT_LAYOUT), QT_LAYOUT)
+    operand = _bm32_cat_rows(_bm32_cat_rows(band0, band1, QT_LAYOUT), _bm32_cat_rows(band2, band3, QT_LAYOUT),
+                             QT_LAYOUT)
     return tlx.require_layout(operand, QT_LAYOUT, pin=False)
 
 
@@ -832,7 +828,7 @@ def _issue_qdo_bm32_async(
     # A packed stage has one full wave: log2 LSE then Delta, 32 words each.
     # The fallback retains two separate stages with their original masks.
     stats_i = tl.arange(0, 64)
-    stats_zero = tlx.zeros((64,), tl.float32, layout=STATS_ASYNC_LAYOUT)
+    stats_zero = tlx.zeros((64, ), tl.float32, layout=STATS_ASYNC_LAYOUT)
     if PACK_STATS:
         tl.static_assert(BLOCK_M == 32)
         stats_rows = outer_block * BLOCK_M + stats_i % BLOCK_M
@@ -845,28 +841,29 @@ def _issue_qdo_bm32_async(
             stats_offsets = (outer_block * 64 + stats_i).to(tl.int32)
         stats_offsets = tlx.require_layout(stats_offsets, STATS_ASYNC_LAYOUT, pin=False)
         # lse_dst is the whole 64-word allocation, not its 32-word consumer view.
-        stats_token = tlx.buffer_load_to_local(
-            lse_dst, Delta + stats_base, stats_offsets, mask=stats_valid, other=stats_zero)
+        stats_token = tlx.buffer_load_to_local(lse_dst, Delta + stats_base, stats_offsets, mask=stats_valid,
+                                               other=stats_zero)
     else:
         stats_rows = outer_block * BLOCK_M + stats_i
-        stats_valid = tlx.require_layout(
-            (stats_i < BLOCK_M) & (stats_rows < q_len), STATS_ASYNC_LAYOUT, pin=False)
+        stats_valid = tlx.require_layout((stats_i < BLOCK_M) & (stats_rows < q_len), STATS_ASYNC_LAYOUT, pin=False)
         if REUSE_HEAD_BASE:
-            lse_offsets = tlx.require_layout((stats_rows + head_delta * TOTAL_Q).to(tl.int32), STATS_ASYNC_LAYOUT, pin=False)
-            delta_offsets = tlx.require_layout((stats_rows * HQ + head_delta).to(tl.int32), STATS_ASYNC_LAYOUT, pin=False)
+            lse_offsets = tlx.require_layout((stats_rows + head_delta * TOTAL_Q).to(tl.int32), STATS_ASYNC_LAYOUT,
+                                             pin=False)
+            delta_offsets = tlx.require_layout((stats_rows * HQ + head_delta).to(tl.int32), STATS_ASYNC_LAYOUT,
+                                               pin=False)
         else:
             lse_offsets = tlx.require_layout(stats_rows.to(tl.int32), STATS_ASYNC_LAYOUT, pin=False)
             delta_offsets = tlx.require_layout((stats_rows * HQ).to(tl.int32), STATS_ASYNC_LAYOUT, pin=False)
         if REUSE_HEAD_BASE:
-            lse_token = tlx.buffer_load_to_local(
-                lse_dst, LSE + base_q_head * TOTAL_Q + q_start, lse_offsets, mask=stats_valid, other=stats_zero)
-            delta_token = tlx.buffer_load_to_local(
-                delta_dst, Delta + q_start * HQ + base_q_head, delta_offsets, mask=stats_valid, other=stats_zero)
+            lse_token = tlx.buffer_load_to_local(lse_dst, LSE + base_q_head * TOTAL_Q + q_start, lse_offsets,
+                                                 mask=stats_valid, other=stats_zero)
+            delta_token = tlx.buffer_load_to_local(delta_dst, Delta + q_start * HQ + base_q_head, delta_offsets,
+                                                   mask=stats_valid, other=stats_zero)
         else:
-            lse_token = tlx.buffer_load_to_local(
-                lse_dst, LSE + q_head * TOTAL_Q + q_start, lse_offsets, mask=stats_valid, other=stats_zero)
-            delta_token = tlx.buffer_load_to_local(
-                delta_dst, Delta + q_start * HQ + q_head, delta_offsets, mask=stats_valid, other=stats_zero)
+            lse_token = tlx.buffer_load_to_local(lse_dst, LSE + q_head * TOTAL_Q + q_start, lse_offsets,
+                                                 mask=stats_valid, other=stats_zero)
+            delta_token = tlx.buffer_load_to_local(delta_dst, Delta + q_start * HQ + q_head, delta_offsets,
+                                                   mask=stats_valid, other=stats_zero)
     do_token = tlx.buffer_load_to_local(
         do_dst,
         tl.multiple_of(DO + qdo_base, 16),
@@ -1028,8 +1025,8 @@ def _varlen_gqa_dq_bm32(
     # LSE loads stay at source MFMA ordinals 23/24 (zero-based). Raw fallbacks
     # retain their scalar scales at 28/29; packed values were scaled in PRE.
     for band in tl.static_range(0, 8):
-        c00 = tlx.amd_scheduled_mfma(
-            s0, k0, c00, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c00 = tlx.amd_scheduled_mfma(s0, k0, c00, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 6:
             next_lse1 = _bm32_load_stat_half(next_lse_tile, 1, STATS_LAYOUT)
         if band == 7:
@@ -1040,7 +1037,7 @@ def _varlen_gqa_dq_bm32(
                 next_lse0 = tl.inline_asm_elementwise(
                     "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
                     "=v,v",
-                    [next_lse0],
+                    [next_lse0],  # noqa: F821 - Loaded in static band 5 before use in band 7.
                     dtype=tl.float32,
                     is_pure=True,
                     pack=1,
@@ -1050,11 +1047,10 @@ def _varlen_gqa_dq_bm32(
             future_k0 = _bm32_load_dq_k(k_buffer, band + 2, 0, K_MD_LAYOUT)
             tlx.amd_sched_barrier(0)
 
-        c01 = tlx.amd_scheduled_mfma(
-            s0, k1, c01, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c01 = tlx.amd_scheduled_mfma(s0, k1, c01, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 6:
-            next_delta0 = _bm32_load_stat_half(
-                next_delta_tile, 0, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
+            next_delta0 = _bm32_load_stat_half(next_delta_tile, 0, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
         if band == 7:
             next_do0 = _bm32_load_score_prefix(next_do_slice, 0, QT_LAYOUT)
             if not LSE_PRESCALED:
@@ -1071,11 +1067,10 @@ def _varlen_gqa_dq_bm32(
             future_k1 = _bm32_load_dq_k(k_buffer, band + 2, 1, K_MD_LAYOUT)
             tlx.amd_sched_barrier(0)
 
-        c10 = tlx.amd_scheduled_mfma(
-            s1, k0, c10, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c10 = tlx.amd_scheduled_mfma(s1, k0, c10, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 6:
-            next_delta1 = _bm32_load_stat_half(
-                next_delta_tile, 1, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
+            next_delta1 = _bm32_load_stat_half(next_delta_tile, 1, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
         if band == 7:
             next_do1 = _bm32_load_score_prefix(next_do_slice, 1, QT_LAYOUT)
         tlx.amd_sched_barrier(0)
@@ -1083,8 +1078,8 @@ def _varlen_gqa_dq_bm32(
             future_s0 = _bm32_load_dq_s(ds_buffer, band + 2, 0, DS_MD_LAYOUT)
             tlx.amd_sched_barrier(0)
 
-        c11 = tlx.amd_scheduled_mfma(
-            s1, k1, c11, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c11 = tlx.amd_scheduled_mfma(s1, k1, c11, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 5:
             next_lse0 = _bm32_load_stat_half(next_lse_tile, 0, STATS_LAYOUT)
         if band == 6:
@@ -1295,11 +1290,11 @@ def _varlen_bwd_interleaved_bm32_kernel(
     q_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
     do_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
     ds_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, 1, layout=ds_smem_layout)
-    lse_buffers = tlx.local_alloc((64,), tl.float32, 2, layout=stats_smem_layout)
+    lse_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
     if PACK_STATS:
         delta_buffers = lse_buffers
     else:
-        delta_buffers = tlx.local_alloc((64,), tl.float32, 2, layout=stats_smem_layout)
+        delta_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
 
     raw_n = tl.arange(0, BLOCK_N)
     raw_dg = tl.arange(0, D // 8)
@@ -1389,28 +1384,23 @@ def _varlen_bwd_interleaved_bm32_kernel(
         relaxed=True,
     )
     k_prefix32 = tlx.require_layout(k_prefix32, k_nm_layout, pin=True)
-    k_prefix32 = tlx.amd_register_resident(
-        k_prefix32, register_class="agpr", registers_per_group=4)
+    k_prefix32 = tlx.amd_register_resident(k_prefix32, register_class="agpr", registers_per_group=4)
 
     # Reuse immutable band0 K directly in the dQ operand layout on every phase.
     dq_k_band0_panel0 = _bm32_load_dq_k(k_buffer, 0, 0, k_md_layout)
     dq_k_band0_panel0 = tlx.require_layout(dq_k_band0_panel0, k_md_layout, pin=True)
-    dq_k_band0_panel0 = tlx.amd_register_resident(
-        dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
+    dq_k_band0_panel0 = tlx.amd_register_resident(dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
     dq_k_band0_panel1 = _bm32_load_dq_k(k_buffer, 0, 1, k_md_layout)
     dq_k_band0_panel1 = tlx.require_layout(dq_k_band0_panel1, k_md_layout, pin=True)
-    dq_k_band0_panel1 = tlx.amd_register_resident(
-        dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
+    dq_k_band0_panel1 = tlx.amd_register_resident(dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
 
     # Extend the immutable dQ cache to band1 with the same prologue layout pins.
     dq_k_band1_panel0 = _bm32_load_dq_k(k_buffer, 1, 0, k_md_layout)
     dq_k_band1_panel0 = tlx.require_layout(dq_k_band1_panel0, k_md_layout, pin=True)
-    dq_k_band1_panel0 = tlx.amd_register_resident(
-        dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
+    dq_k_band1_panel0 = tlx.amd_register_resident(dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
     dq_k_band1_panel1 = _bm32_load_dq_k(k_buffer, 1, 1, k_md_layout)
     dq_k_band1_panel1 = tlx.require_layout(dq_k_band1_panel1, k_md_layout, pin=True)
-    dq_k_band1_panel1 = tlx.amd_register_resident(
-        dq_k_band1_panel1, register_class="agpr", registers_per_group=4)
+    dq_k_band1_panel1 = tlx.amd_register_resident(dq_k_band1_panel1, register_class="agpr", registers_per_group=4)
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D)
@@ -1434,10 +1424,8 @@ def _varlen_bwd_interleaved_bm32_kernel(
     initial_delta_tile = tlx.local_view(delta_buffers, 0)
     lse0 = _bm32_load_stat_half(initial_lse_tile, 0, stats_layout)
     lse1 = _bm32_load_stat_half(initial_lse_tile, 1, stats_layout)
-    delta0 = _bm32_load_stat_half(
-        initial_delta_tile, 0, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
-    delta1 = _bm32_load_stat_half(
-        initial_delta_tile, 1, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
+    delta0 = _bm32_load_stat_half(initial_delta_tile, 0, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
+    delta1 = _bm32_load_stat_half(initial_delta_tile, 1, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
     q0 = _bm32_load_score_prefix(initial_q_slice, 0, qt_layout)
     q1 = _bm32_load_score_prefix(initial_q_slice, 1, qt_layout)
     do0 = _bm32_load_score_prefix(initial_do_slice, 0, qt_layout)
@@ -1550,28 +1538,28 @@ def _varlen_bwd_interleaved_bm32_kernel(
         next_do_slice = _bm32_qdo_stage_slice(do_buffers, next_stage, qdo_slice_smem_layout)
         next_lse_tile = tlx.local_view(lse_buffers, next_stage)
         next_delta_tile = tlx.local_view(delta_buffers, next_stage)
-        (dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1,
-         next_q0, next_q1, next_do0, next_do1) = _varlen_gqa_dq_bm32(
-            tlx.local_view(ds_buffers, 0),
-            k_buffer,
-            dq_k_band0_panel0,
-            dq_k_band0_panel1,
-            dq_k_band1_panel0,
-            dq_k_band1_panel1,
-            v_operand,
-            next_q_slice,
-            next_do_slice,
-            next_lse_tile,
-            next_delta_tile,
-            mma_md,
-            ds_md_layout,
-            k_md_layout,
-            k_nm_layout,
-            qt_layout,
-            stats_layout,
-            DELTA_OFFSET=32 if PACK_STATS else 0,
-            LSE_PRESCALED=PACK_STATS,
-        )
+        (dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1, next_q0, next_q1, next_do0,
+         next_do1) = _varlen_gqa_dq_bm32(
+             tlx.local_view(ds_buffers, 0),
+             k_buffer,
+             dq_k_band0_panel0,
+             dq_k_band0_panel1,
+             dq_k_band1_panel0,
+             dq_k_band1_panel1,
+             v_operand,
+             next_q_slice,
+             next_do_slice,
+             next_lse_tile,
+             next_delta_tile,
+             mma_md,
+             ds_md_layout,
+             k_md_layout,
+             k_nm_layout,
+             qt_layout,
+             stats_layout,
+             DELTA_OFFSET=32 if PACK_STATS else 0,
+             LSE_PRESCALED=PACK_STATS,
+         )
         _store_dq_bm32_native(
             dq_lo,
             dq_hi,
@@ -1620,15 +1608,14 @@ def _varlen_bwd_interleaved_bm32_kernel(
 def _issue_mha_stats_async(lse_dst, delta_dst, LSE, Delta, q_start, q_len, q_head, TOTAL_Q, HQ: tl.constexpr):
     """Stage one short MHA sequence's immutable statistics before its Q loop."""
     rows = tl.arange(0, 512)
-    load_layout: tl.constexpr = tlx.layout(shape=((256,), (2,)), stride=((1,), (256,)))
+    load_layout: tl.constexpr = tlx.layout(shape=((256, ), (2, )), stride=((1, ), (256, )))
     lse_offsets = tlx.require_layout(rows.to(tl.int32), load_layout, pin=False)
     delta_offsets = tlx.require_layout((rows * HQ).to(tl.int32), load_layout, pin=False)
     valid = tlx.require_layout(rows < q_len, load_layout, pin=False)
-    zero = tlx.zeros((512,), tl.float32, layout=load_layout)
-    lse_token = tlx.buffer_load_to_local(
-        lse_dst, LSE + q_head * TOTAL_Q + q_start, lse_offsets, mask=valid, other=zero)
-    delta_token = tlx.buffer_load_to_local(
-        delta_dst, Delta + q_start * HQ + q_head, delta_offsets, mask=valid, other=zero)
+    zero = tlx.zeros((512, ), tl.float32, layout=load_layout)
+    lse_token = tlx.buffer_load_to_local(lse_dst, LSE + q_head * TOTAL_Q + q_start, lse_offsets, mask=valid, other=zero)
+    delta_token = tlx.buffer_load_to_local(delta_dst, Delta + q_start * HQ + q_head, delta_offsets, mask=valid,
+                                           other=zero)
     tlx.async_load_commit_group([lse_token, delta_token])
 
 
@@ -1678,8 +1665,8 @@ def _varlen_bwd_interleaved_kernel(
     # Preserve the established causal LDS layout and copy schedule.
     NONCAUSAL_MHA: tl.constexpr = HQ == HKV and not IS_CAUSAL
     tl.static_assert(not CACHE_MHA_STATS or NONCAUSAL_MHA)
-    tl.static_assert(not FINALIZE_DQ or
-                     (NONCAUSAL_MHA and not IS_CAUSAL and KV_SPLITS == 1 and not FULL_KV_TILE and CACHE_MHA_STATS and QDO_ALIGNED))
+    tl.static_assert(not FINALIZE_DQ
+                     or (NONCAUSAL_MHA and KV_SPLITS == 1 and not FULL_KV_TILE and CACHE_MHA_STATS and QDO_ALIGNED))
     tl.static_assert(not DQ_TAIL_K96 or FINALIZE_DQ)
     if NONCAUSAL_MHA:
         task = tl.program_id(1) + TASK_OFFSET
@@ -1755,10 +1742,9 @@ def _varlen_bwd_interleaved_kernel(
 
     if CACHE_MHA_STATS:
         stats_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
-            offset_bases=[[1], [2], [4], [8], [16], [32], [64], [128], [256]],
-            block_bases=[], alignment=16)
-        lse_buffer = tlx.local_alloc((512,), tl.float32, 1, layout=stats_layout)
-        delta_buffer = tlx.local_alloc((512,), tl.float32, 1, layout=stats_layout)
+            offset_bases=[[1], [2], [4], [8], [16], [32], [64], [128], [256]], block_bases=[], alignment=16)
+        lse_buffer = tlx.local_alloc((512, ), tl.float32, 1, layout=stats_layout)
+        delta_buffer = tlx.local_alloc((512, ), tl.float32, 1, layout=stats_layout)
     k_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=k_layout)
     q_buffers = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_layout)
     do_buffers = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_layout)
@@ -1792,9 +1778,8 @@ def _varlen_bwd_interleaved_kernel(
         QDO_BANKPERM,
     )
     if CACHE_MHA_STATS:
-        _issue_mha_stats_async(
-            tlx.local_view(lse_buffer, 0), tlx.local_view(delta_buffer, 0),
-            LSE, Delta, q_start, q_len, kv_head, TOTAL_Q, HQ)
+        _issue_mha_stats_async(tlx.local_view(lse_buffer, 0), tlx.local_view(delta_buffer, 0), LSE, Delta, q_start,
+                               q_len, kv_head, TOTAL_Q, HQ)
     initial_wait = tlx.async_load_wait_group(0)
     tl.debug_barrier()
 
@@ -1882,8 +1867,8 @@ def _varlen_bwd_interleaved_kernel(
                 # Cached MHA has one query head per owner. Define this tensor
                 # inside each steady iteration, after the current Q/dO wait.
                 preload_dq_base = ((q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
-                preloaded_previous = _load_dq_tail_previous(
-                    DQ_ACC, preload_dq_base, q_len, step - 1, D, BLOCK_M, mma_md)
+                preloaded_previous = _load_dq_tail_previous(DQ_ACC, preload_dq_base, q_len, step - 1, D, BLOCK_M,
+                                                            mma_md)
                 # Pin VMEM reads before subsequent MFMA work; allow ALU/LDS.
                 # Native review must also verify these reads stay below the
                 # preceding wait/barrier and do not force an early wait.
@@ -1961,16 +1946,16 @@ def _varlen_bwd_interleaved_kernel(
                 tlx.local_store(p_shared, tl.trans(p_t.to(tl.bfloat16)))
                 tl.debug_barrier()
                 if DQ_TAIL_K96:
-                    p_nd64 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(p_shared, (0, 0), (BLOCK_M, 64))), layout=p_nd_layout)
-                    ds_nd64 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(current_ds, (0, 0), (BLOCK_M, 64))), layout=p_nd_layout)
+                    p_nd64 = tlx.local_load(tlx.local_trans(tlx.local_slice(p_shared, (0, 0), (BLOCK_M, 64))),
+                                            layout=p_nd_layout)
+                    ds_nd64 = tlx.local_load(tlx.local_trans(tlx.local_slice(current_ds, (0, 0), (BLOCK_M, 64))),
+                                             layout=p_nd_layout)
                     dv64 = tl.dot(p_nd64, do_tile, acc=dv64, out_dtype=dv64.dtype)
                     dk64 = tl.dot(ds_nd64, q_tile, acc=dk64, out_dtype=dk64.dtype)
-                    p_nd32 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(p_shared, (0, 64), (BLOCK_M, 32))), layout=p_nd_layout)
-                    ds_nd32 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(current_ds, (0, 64), (BLOCK_M, 32))), layout=p_nd_layout)
+                    p_nd32 = tlx.local_load(tlx.local_trans(tlx.local_slice(p_shared, (0, 64), (BLOCK_M, 32))),
+                                            layout=p_nd_layout)
+                    ds_nd32 = tlx.local_load(tlx.local_trans(tlx.local_slice(current_ds, (0, 64), (BLOCK_M, 32))),
+                                             layout=p_nd_layout)
                     dv32 = tl.dot(p_nd32, do_tile, acc=dv32, out_dtype=dv32.dtype)
                     dk32 = tl.dot(ds_nd32, q_tile, acc=dk32, out_dtype=dk32.dtype)
                 else:
@@ -1993,11 +1978,11 @@ def _varlen_bwd_interleaved_kernel(
                         previous_group_index = previous_step // active_q_blocks
                         previous_q_step = first_q_block + previous_step % active_q_blocks
                         previous_q_head = kv_head * group_size + split * heads_per_split + previous_group_index
-                    previous_dq_acc_base = ((previous_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
+                    previous_dq_acc_base = ((previous_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(
+                        tl.int32)
                     if DQ_TAIL_K96:
-                        dq_part = _compute_dq_tail_k96(
-                            tlx.local_view(ds_buffers, 1 - current_slot),
-                            tlx.local_view(k_buffer, 0), mma_md, initial_wait)
+                        dq_part = _compute_dq_tail_k96(tlx.local_view(ds_buffers, 1 - current_slot),
+                                                       tlx.local_view(k_buffer, 0), mma_md, initial_wait)
                     else:
                         previous_ds = tlx.local_load(tlx.local_view(ds_buffers, 1 - current_slot), layout=ds_md_layout)
                         k_for_dq = tlx.local_load(tlx.local_view(k_buffer, 0), token=initial_wait, layout=k_md_layout)
@@ -2006,15 +1991,34 @@ def _varlen_bwd_interleaved_kernel(
                     if FINALIZE_DQ:
                         if DQ_TAIL_K96 and phase > 0:
                             _store_dq_tail_final_preloaded(
-                                dq_part, preloaded_previous, DQ_OUTPUT,
-                                q_start, previous_q_head, q_len, previous_q_step,
-                                SM_SCALE, HQ, D, BLOCK_M, mma_md,
+                                dq_part,
+                                preloaded_previous,
+                                DQ_OUTPUT,
+                                q_start,
+                                previous_q_head,
+                                q_len,
+                                previous_q_step,
+                                SM_SCALE,
+                                HQ,
+                                D,
+                                BLOCK_M,
+                                mma_md,
                             )
                         else:
                             _store_dq_tail_final(
-                                dq_part, DQ_ACC, DQ_OUTPUT, previous_dq_acc_base,
-                                q_start, previous_q_head, q_len, previous_q_step,
-                                SM_SCALE, HQ, D, BLOCK_M, mma_md,
+                                dq_part,
+                                DQ_ACC,
+                                DQ_OUTPUT,
+                                previous_dq_acc_base,
+                                q_start,
+                                previous_q_head,
+                                q_len,
+                                previous_q_step,
+                                SM_SCALE,
+                                HQ,
+                                D,
+                                BLOCK_M,
+                                mma_md,
                                 DEFER_SCRATCH=not DQ_TAIL_K96,
                             )
                     else:
@@ -2043,9 +2047,7 @@ def _varlen_bwd_interleaved_kernel(
         last_q_head = kv_head * group_size + split * heads_per_split + last_group_index
     last_dq_acc_base = ((last_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
     if DQ_TAIL_K96:
-        dq_part = _compute_dq_tail_k96(
-            tlx.local_view(ds_buffers, last_step % 2),
-            tlx.local_view(k_buffer, 0), mma_md)
+        dq_part = _compute_dq_tail_k96(tlx.local_view(ds_buffers, last_step % 2), tlx.local_view(k_buffer, 0), mma_md)
     else:
         last_ds = tlx.local_load(tlx.local_view(ds_buffers, last_step % 2), layout=ds_md_layout)
         k_for_dq = tlx.local_load(tlx.local_view(k_buffer, 0), layout=k_md_layout)
@@ -2053,9 +2055,19 @@ def _varlen_bwd_interleaved_kernel(
         dq_part = tl.dot(last_ds, k_for_dq, acc=dq_acc, out_dtype=dq_acc.dtype)
     if FINALIZE_DQ:
         _store_dq_tail_final(
-            dq_part, DQ_ACC, DQ_OUTPUT, last_dq_acc_base,
-            q_start, last_q_head, q_len, last_q_step,
-            SM_SCALE, HQ, D, BLOCK_M, mma_md,
+            dq_part,
+            DQ_ACC,
+            DQ_OUTPUT,
+            last_dq_acc_base,
+            q_start,
+            last_q_head,
+            q_len,
+            last_q_step,
+            SM_SCALE,
+            HQ,
+            D,
+            BLOCK_M,
+            mma_md,
             DEFER_SCRATCH=not DQ_TAIL_K96,
         )
     else:
@@ -2073,12 +2085,36 @@ def _varlen_bwd_interleaved_kernel(
 
     if DQ_TAIL_K96:
         _store_dkdv_tail_n96(
-            dk64, dv64, DK, DV, kv_start, n0, kv_len, kv_head,
-            SM_SCALE, HKV, D, 64, 0, mma_nd,
+            dk64,
+            dv64,
+            DK,
+            DV,
+            kv_start,
+            n0,
+            kv_len,
+            kv_head,
+            SM_SCALE,
+            HKV,
+            D,
+            64,
+            0,
+            mma_nd,
         )
         _store_dkdv_tail_n96(
-            dk32, dv32, DK, DV, kv_start, n0, kv_len, kv_head,
-            SM_SCALE, HKV, D, 32, 64, mma_nd,
+            dk32,
+            dv32,
+            DK,
+            DV,
+            kv_start,
+            n0,
+            kv_len,
+            kv_head,
+            SM_SCALE,
+            HKV,
+            D,
+            32,
+            64,
+            mma_nd,
         )
     else:
         dk_scale = tlx.require_layout(tl.full((BLOCK_N, D), SM_SCALE, dtype=tl.float32), mma_nd, pin=False)
@@ -2359,7 +2395,9 @@ def _varlen_bwd_preprocess_dynamic_owner_queue(
 def _bm32_load_initial_score_prefix_owner(tile, HALF: tl.constexpr, QT_LAYOUT: tl.constexpr):
     prefix = tlx.local_slice(tile, [16 * HALF, 0], [16, 32])
     value = tlx.local_load(
-        tlx.local_trans(prefix), layout=QT_LAYOUT, relaxed=True,
+        tlx.local_trans(prefix),
+        layout=QT_LAYOUT,
+        relaxed=True,
         rematerialize_coordinates_group=200,
     )
     return tlx.require_layout(value, QT_LAYOUT, pin=True)
@@ -2400,8 +2438,7 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
     s0 = _bm32_load_dq_s(ds_buffer, 0, 0, DS_MD_LAYOUT)
     s1 = _bm32_load_dq_s(ds_buffer, 0, 1, DS_MD_LAYOUT)
     next_k0 = tlx.require_layout(k_band1_panel0, K_MD_LAYOUT, pin=False)
-    next_k1 = tlx.require_layout(
-        _bm32_load_dq_k(k_buffer, 1, 1, K_MD_LAYOUT), K_MD_LAYOUT, pin=False)
+    next_k1 = tlx.require_layout(_bm32_load_dq_k(k_buffer, 1, 1, K_MD_LAYOUT), K_MD_LAYOUT, pin=False)
     next_s0 = _bm32_load_dq_s(ds_buffer, 1, 0, DS_MD_LAYOUT)
     next_s1 = _bm32_load_dq_s(ds_buffer, 1, 1, DS_MD_LAYOUT)
     tlx.amd_sched_barrier(0)
@@ -2411,8 +2448,8 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
     # LSE loads stay at source MFMA ordinals 23/24 (zero-based). Raw fallbacks
     # retain their scalar scales at 28/29; packed values were scaled in PRE.
     for band in tl.static_range(0, 8):
-        c00 = tlx.amd_scheduled_mfma(
-            s0, k0, c00, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c00 = tlx.amd_scheduled_mfma(s0, k0, c00, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 6:
             next_lse1 = _bm32_load_stat_half(next_lse_tile, 1, STATS_LAYOUT)
         if band == 7:
@@ -2423,7 +2460,7 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
                 next_lse0 = tl.inline_asm_elementwise(
                     "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
                     "=v,v",
-                    [next_lse0],
+                    [next_lse0],  # noqa: F821 - Loaded in static band 5 before use in band 7.
                     dtype=tl.float32,
                     is_pure=True,
                     pack=1,
@@ -2433,11 +2470,10 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
             future_k0 = _bm32_load_dq_k(k_buffer, band + 2, 0, K_MD_LAYOUT)
             tlx.amd_sched_barrier(0)
 
-        c01 = tlx.amd_scheduled_mfma(
-            s0, k1, c01, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c01 = tlx.amd_scheduled_mfma(s0, k1, c01, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 6:
-            next_delta0 = _bm32_load_stat_half(
-                next_delta_tile, 0, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
+            next_delta0 = _bm32_load_stat_half(next_delta_tile, 0, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
         if band == 7:
             next_do0 = _bm32_load_score_prefix(next_do_slice, 0, QT_LAYOUT)
             if not LSE_PRESCALED:
@@ -2454,11 +2490,10 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
             future_k1 = _bm32_load_dq_k(k_buffer, band + 2, 1, K_MD_LAYOUT)
             tlx.amd_sched_barrier(0)
 
-        c10 = tlx.amd_scheduled_mfma(
-            s1, k0, c10, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c10 = tlx.amd_scheduled_mfma(s1, k0, c10, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 6:
-            next_delta1 = _bm32_load_stat_half(
-                next_delta_tile, 1, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
+            next_delta1 = _bm32_load_stat_half(next_delta_tile, 1, STATS_LAYOUT, BASE_OFFSET=DELTA_OFFSET)
         if band == 7:
             next_do1 = _bm32_load_score_prefix(next_do_slice, 1, QT_LAYOUT)
         tlx.amd_sched_barrier(0)
@@ -2466,8 +2501,8 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
             future_s0 = _bm32_load_dq_s(ds_buffer, band + 2, 0, DS_MD_LAYOUT)
             tlx.amd_sched_barrier(0)
 
-        c11 = tlx.amd_scheduled_mfma(
-            s1, k1, c11, resident_operand=1, accumulator_role="transient", initialize=band == 0)
+        c11 = tlx.amd_scheduled_mfma(s1, k1, c11, resident_operand=1, accumulator_role="transient",
+                                     initialize=band == 0)
         if band == 5:
             next_lse0 = _bm32_load_stat_half(next_lse_tile, 0, STATS_LAYOUT)
         if band == 6:
@@ -2504,14 +2539,12 @@ def _varlen_gqa_dq_bm32_owner_reload_panel(
 def _group_owner_rolling_fp32_boundary_s3(STATE):
     """Complete ordinary VMEM on every wave, then expose a CTA-wide boundary."""
     tlx.async_load_wait_group(0)
-    drained_state = tl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0);", "=s,0,~{memory}", [STATE],
-        dtype=tl.int32, is_pure=False, pack=1)
+    drained_state = tl.inline_asm_elementwise("s_waitcnt vmcnt(0);", "=s,0,~{memory}", [STATE], dtype=tl.int32,
+                                              is_pure=False, pack=1)
     tl.debug_barrier()
     # Consumers use a scalar made opaque after all waves reach the boundary.
-    return tl.inline_asm_elementwise(
-        "s_mov_b32 $0, $1;", "=s,s,~{memory}", [drained_state],
-        dtype=tl.int32, is_pure=False, pack=1)
+    return tl.inline_asm_elementwise("s_mov_b32 $0, $1;", "=s,s,~{memory}", [drained_state], dtype=tl.int32,
+                                     is_pure=False, pack=1)
 
 
 @triton.jit
@@ -2538,13 +2571,10 @@ def _group_owner_rolling_fp32_chunk_s3(
     current_part = tlx.require_layout(current_part, CHUNK_LAYOUT, pin=False)
     # Each owner's dK scale must round to FP32 before any owner-fold addition.
     # This opaque register identity also leaves dV's original FP32 value intact.
-    current_part = tl.inline_asm_elementwise(
-        "", "=v,0", [current_part], dtype=tl.float32, is_pure=False, pack=1)
+    current_part = tl.inline_asm_elementwise("", "=v,0", [current_part], dtype=tl.float32, is_pure=False, pack=1)
     current_part = tlx.require_layout(current_part, CHUNK_LAYOUT, pin=False)
-    local_n = tlx.rematerialized_range(
-        0, 128, 300 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
-    local_d = tlx.rematerialized_range(
-        0, 64, 310 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
+    local_n = tlx.rematerialized_range(0, 128, 300 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
+    local_d = tlx.rematerialized_range(0, 64, 310 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
     local_n = local_n + 128 * ROW_HALF
     local_d = local_d + 64 * COL_HALF
     output_base = (kv_global_start * HKV + kv_head.to(tl.int64)) * D
@@ -2599,18 +2629,14 @@ def _group_owner_rolling_fp32_gradient_s3(
     cols0, cols1 = tl.split(quadrants)
     rows0_cols0, rows1_cols0 = tl.split(cols0)
     rows0_cols1, rows1_cols1 = tl.split(cols1)
-    _group_owner_rolling_fp32_chunk_s3(
-        rows0_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        0, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
-    _group_owner_rolling_fp32_chunk_s3(
-        rows0_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        0, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
-    _group_owner_rolling_fp32_chunk_s3(
-        rows1_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        1, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
-    _group_owner_rolling_fp32_chunk_s3(
-        rows1_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        1, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s3(rows0_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       0, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s3(rows0_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       0, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s3(rows1_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       1, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s3(rows1_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       1, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
 
 
 @triton.jit
@@ -2781,11 +2807,11 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s3(
     q_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
     do_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
     ds_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, 1, layout=ds_smem_layout)
-    lse_buffers = tlx.local_alloc((64,), tl.float32, 2, layout=stats_smem_layout)
+    lse_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
     if PACK_STATS:
         delta_buffers = lse_buffers
     else:
-        delta_buffers = tlx.local_alloc((64,), tl.float32, 2, layout=stats_smem_layout)
+        delta_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
 
     raw_n = tlx.rematerialized_range(0, BLOCK_N, 100, placement=OWNER_ID)
     raw_dg = tlx.rematerialized_range(0, D // 8, 101, placement=OWNER_ID)
@@ -2877,24 +2903,20 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s3(
         relaxed=True,
     )
     k_prefix32 = tlx.require_layout(k_prefix32, k_nm_layout, pin=True)
-    k_prefix32 = tlx.amd_register_resident(
-        k_prefix32, register_class="agpr", registers_per_group=4)
+    k_prefix32 = tlx.amd_register_resident(k_prefix32, register_class="agpr", registers_per_group=4)
 
     # Reuse immutable band0 K directly in the dQ operand layout on every phase.
     dq_k_band0_panel0 = _bm32_load_dq_k(k_buffer, 0, 0, k_md_layout)
     dq_k_band0_panel0 = tlx.require_layout(dq_k_band0_panel0, k_md_layout, pin=True)
-    dq_k_band0_panel0 = tlx.amd_register_resident(
-        dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
+    dq_k_band0_panel0 = tlx.amd_register_resident(dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
     dq_k_band0_panel1 = _bm32_load_dq_k(k_buffer, 0, 1, k_md_layout)
     dq_k_band0_panel1 = tlx.require_layout(dq_k_band0_panel1, k_md_layout, pin=True)
-    dq_k_band0_panel1 = tlx.amd_register_resident(
-        dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
+    dq_k_band0_panel1 = tlx.amd_register_resident(dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
 
     # Extend the immutable dQ cache to band1 with the same prologue layout pins.
     dq_k_band1_panel0 = _bm32_load_dq_k(k_buffer, 1, 0, k_md_layout)
     dq_k_band1_panel0 = tlx.require_layout(dq_k_band1_panel0, k_md_layout, pin=True)
-    dq_k_band1_panel0 = tlx.amd_register_resident(
-        dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
+    dq_k_band1_panel0 = tlx.amd_register_resident(dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
 
     offs_n = tlx.rematerialized_range(0, BLOCK_N, 103, placement=OWNER_ID)
     offs_d = tlx.rematerialized_range(0, D, 104, placement=OWNER_ID)
@@ -2920,10 +2942,8 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s3(
     initial_delta_tile = tlx.local_view(delta_buffers, 0)
     lse0 = _bm32_load_stat_half(initial_lse_tile, 0, stats_layout)
     lse1 = _bm32_load_stat_half(initial_lse_tile, 1, stats_layout)
-    delta0 = _bm32_load_stat_half(
-        initial_delta_tile, 0, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
-    delta1 = _bm32_load_stat_half(
-        initial_delta_tile, 1, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
+    delta0 = _bm32_load_stat_half(initial_delta_tile, 0, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
+    delta1 = _bm32_load_stat_half(initial_delta_tile, 1, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
     q0 = _bm32_load_initial_score_prefix_owner(initial_q_slice, 0, qt_layout)
     q1 = _bm32_load_initial_score_prefix_owner(initial_q_slice, 1, qt_layout)
     do0 = _bm32_load_initial_score_prefix_owner(initial_do_slice, 0, qt_layout)
@@ -3036,27 +3056,27 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s3(
         next_do_slice = _bm32_qdo_stage_slice(do_buffers, next_stage, qdo_slice_smem_layout)
         next_lse_tile = tlx.local_view(lse_buffers, next_stage)
         next_delta_tile = tlx.local_view(delta_buffers, next_stage)
-        (dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1,
-         next_q0, next_q1, next_do0, next_do1) = _varlen_gqa_dq_bm32_owner_reload_panel(
-            tlx.local_view(ds_buffers, 0),
-            k_buffer,
-            dq_k_band0_panel0,
-            dq_k_band0_panel1,
-            dq_k_band1_panel0,
-            v_operand,
-            next_q_slice,
-            next_do_slice,
-            next_lse_tile,
-            next_delta_tile,
-            mma_md,
-            ds_md_layout,
-            k_md_layout,
-            k_nm_layout,
-            qt_layout,
-            stats_layout,
-            DELTA_OFFSET=32 if PACK_STATS else 0,
-            LSE_PRESCALED=PACK_STATS,
-        )
+        (dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1, next_q0, next_q1, next_do0,
+         next_do1) = _varlen_gqa_dq_bm32_owner_reload_panel(
+             tlx.local_view(ds_buffers, 0),
+             k_buffer,
+             dq_k_band0_panel0,
+             dq_k_band0_panel1,
+             dq_k_band1_panel0,
+             v_operand,
+             next_q_slice,
+             next_do_slice,
+             next_lse_tile,
+             next_delta_tile,
+             mma_md,
+             ds_md_layout,
+             k_md_layout,
+             k_nm_layout,
+             qt_layout,
+             stats_layout,
+             DELTA_OFFSET=32 if PACK_STATS else 0,
+             LSE_PRESCALED=PACK_STATS,
+         )
         _store_dq_bm32_native(
             dq_lo,
             dq_hi,
@@ -3091,15 +3111,13 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s3(
     # No rolling FP32 state enters a query loop. All owners finish their
     # independent MFMA chains and separately rounded dK scale above this point.
     ready_owner = _group_owner_rolling_fp32_boundary_s3(OWNER_ID)
-    _group_owner_rolling_fp32_gradient_s3(
-        dk, R_DK, DK_FINAL, kv_global_start, kv_head, kv_valid_rows,
-        split, ready_owner, 0, HKV, D, KV_SPLITS)
+    _group_owner_rolling_fp32_gradient_s3(dk, R_DK, DK_FINAL, kv_global_start, kv_head, kv_valid_rows, split,
+                                          ready_owner, 0, HKV, D, KV_SPLITS)
     # dK and dV use disjoint compact buffers. Drain dK stores on every wave
     # before entering dV's chunks; this boundary also closes dK VMEM lifetimes.
     ready_dv = _group_owner_rolling_fp32_boundary_s3(ready_owner)
-    _group_owner_rolling_fp32_gradient_s3(
-        dv, R_DV, DV_FINAL, kv_global_start, kv_head, kv_valid_rows,
-        split, ready_dv, 1, HKV, D, KV_SPLITS)
+    _group_owner_rolling_fp32_gradient_s3(dv, R_DV, DV_FINAL, kv_global_start, kv_head, kv_valid_rows, split, ready_dv,
+                                          1, HKV, D, KV_SPLITS)
 
 
 @triton.jit
@@ -3218,14 +3236,12 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3(
 def _group_owner_rolling_fp32_boundary_s4(STATE):
     """Complete ordinary VMEM on every wave, then expose a CTA-wide boundary."""
     tlx.async_load_wait_group(0)
-    drained_state = tl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0);", "=s,0,~{memory}", [STATE],
-        dtype=tl.int32, is_pure=False, pack=1)
+    drained_state = tl.inline_asm_elementwise("s_waitcnt vmcnt(0);", "=s,0,~{memory}", [STATE], dtype=tl.int32,
+                                              is_pure=False, pack=1)
     tl.debug_barrier()
     # Consumers use a scalar made opaque after all waves reach the boundary.
-    return tl.inline_asm_elementwise(
-        "s_mov_b32 $0, $1;", "=s,s,~{memory}", [drained_state],
-        dtype=tl.int32, is_pure=False, pack=1)
+    return tl.inline_asm_elementwise("s_mov_b32 $0, $1;", "=s,s,~{memory}", [drained_state], dtype=tl.int32,
+                                     is_pure=False, pack=1)
 
 
 @triton.jit
@@ -3252,13 +3268,10 @@ def _group_owner_rolling_fp32_chunk_s4(
     current_part = tlx.require_layout(current_part, CHUNK_LAYOUT, pin=False)
     # Each owner's dK scale must round to FP32 before any owner-fold addition.
     # This opaque register identity also leaves dV's original FP32 value intact.
-    current_part = tl.inline_asm_elementwise(
-        "", "=v,0", [current_part], dtype=tl.float32, is_pure=False, pack=1)
+    current_part = tl.inline_asm_elementwise("", "=v,0", [current_part], dtype=tl.float32, is_pure=False, pack=1)
     current_part = tlx.require_layout(current_part, CHUNK_LAYOUT, pin=False)
-    local_n = tlx.rematerialized_range(
-        0, 128, 300 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
-    local_d = tlx.rematerialized_range(
-        0, 64, 310 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
+    local_n = tlx.rematerialized_range(0, 128, 300 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
+    local_d = tlx.rematerialized_range(0, 64, 310 + 100 * GRAD_ID + 2 * ROW_HALF + COL_HALF, placement=READY_OWNER)
     local_n = local_n + 128 * ROW_HALF
     local_d = local_d + 64 * COL_HALF
     output_base = (kv_global_start * HKV + kv_head.to(tl.int64)) * D
@@ -3316,18 +3329,14 @@ def _group_owner_rolling_fp32_gradient_s4(
     cols0, cols1 = tl.split(quadrants)
     rows0_cols0, rows1_cols0 = tl.split(cols0)
     rows0_cols1, rows1_cols1 = tl.split(cols1)
-    _group_owner_rolling_fp32_chunk_s4(
-        rows0_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        0, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
-    _group_owner_rolling_fp32_chunk_s4(
-        rows0_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        0, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
-    _group_owner_rolling_fp32_chunk_s4(
-        rows1_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        1, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
-    _group_owner_rolling_fp32_chunk_s4(
-        rows1_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
-        1, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s4(rows0_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       0, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s4(rows0_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       0, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s4(rows1_cols0, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       1, 0, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
+    _group_owner_rolling_fp32_chunk_s4(rows1_cols1, R, OUT, kv_global_start, kv_head, kv_valid_rows, split, READY_OWNER,
+                                       1, 1, GRAD_ID, HKV, D, KV_SPLITS, chunk_layout)
 
 
 @triton.jit
@@ -3498,11 +3507,11 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s4(
     q_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
     do_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
     ds_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, 1, layout=ds_smem_layout)
-    lse_buffers = tlx.local_alloc((64,), tl.float32, 2, layout=stats_smem_layout)
+    lse_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
     if PACK_STATS:
         delta_buffers = lse_buffers
     else:
-        delta_buffers = tlx.local_alloc((64,), tl.float32, 2, layout=stats_smem_layout)
+        delta_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
 
     raw_n = tlx.rematerialized_range(0, BLOCK_N, 100, placement=OWNER_ID)
     raw_dg = tlx.rematerialized_range(0, D // 8, 101, placement=OWNER_ID)
@@ -3594,24 +3603,20 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s4(
         relaxed=True,
     )
     k_prefix32 = tlx.require_layout(k_prefix32, k_nm_layout, pin=True)
-    k_prefix32 = tlx.amd_register_resident(
-        k_prefix32, register_class="agpr", registers_per_group=4)
+    k_prefix32 = tlx.amd_register_resident(k_prefix32, register_class="agpr", registers_per_group=4)
 
     # Reuse immutable band0 K directly in the dQ operand layout on every phase.
     dq_k_band0_panel0 = _bm32_load_dq_k(k_buffer, 0, 0, k_md_layout)
     dq_k_band0_panel0 = tlx.require_layout(dq_k_band0_panel0, k_md_layout, pin=True)
-    dq_k_band0_panel0 = tlx.amd_register_resident(
-        dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
+    dq_k_band0_panel0 = tlx.amd_register_resident(dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
     dq_k_band0_panel1 = _bm32_load_dq_k(k_buffer, 0, 1, k_md_layout)
     dq_k_band0_panel1 = tlx.require_layout(dq_k_band0_panel1, k_md_layout, pin=True)
-    dq_k_band0_panel1 = tlx.amd_register_resident(
-        dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
+    dq_k_band0_panel1 = tlx.amd_register_resident(dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
 
     # Extend the immutable dQ cache to band1 with the same prologue layout pins.
     dq_k_band1_panel0 = _bm32_load_dq_k(k_buffer, 1, 0, k_md_layout)
     dq_k_band1_panel0 = tlx.require_layout(dq_k_band1_panel0, k_md_layout, pin=True)
-    dq_k_band1_panel0 = tlx.amd_register_resident(
-        dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
+    dq_k_band1_panel0 = tlx.amd_register_resident(dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
 
     offs_n = tlx.rematerialized_range(0, BLOCK_N, 103, placement=OWNER_ID)
     offs_d = tlx.rematerialized_range(0, D, 104, placement=OWNER_ID)
@@ -3637,10 +3642,8 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s4(
     initial_delta_tile = tlx.local_view(delta_buffers, 0)
     lse0 = _bm32_load_stat_half(initial_lse_tile, 0, stats_layout)
     lse1 = _bm32_load_stat_half(initial_lse_tile, 1, stats_layout)
-    delta0 = _bm32_load_stat_half(
-        initial_delta_tile, 0, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
-    delta1 = _bm32_load_stat_half(
-        initial_delta_tile, 1, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
+    delta0 = _bm32_load_stat_half(initial_delta_tile, 0, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
+    delta1 = _bm32_load_stat_half(initial_delta_tile, 1, stats_layout, BASE_OFFSET=32 if PACK_STATS else 0)
     q0 = _bm32_load_initial_score_prefix_owner(initial_q_slice, 0, qt_layout)
     q1 = _bm32_load_initial_score_prefix_owner(initial_q_slice, 1, qt_layout)
     do0 = _bm32_load_initial_score_prefix_owner(initial_do_slice, 0, qt_layout)
@@ -3753,27 +3756,27 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s4(
         next_do_slice = _bm32_qdo_stage_slice(do_buffers, next_stage, qdo_slice_smem_layout)
         next_lse_tile = tlx.local_view(lse_buffers, next_stage)
         next_delta_tile = tlx.local_view(delta_buffers, next_stage)
-        (dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1,
-         next_q0, next_q1, next_do0, next_do1) = _varlen_gqa_dq_bm32_owner_reload_panel(
-            tlx.local_view(ds_buffers, 0),
-            k_buffer,
-            dq_k_band0_panel0,
-            dq_k_band0_panel1,
-            dq_k_band1_panel0,
-            v_operand,
-            next_q_slice,
-            next_do_slice,
-            next_lse_tile,
-            next_delta_tile,
-            mma_md,
-            ds_md_layout,
-            k_md_layout,
-            k_nm_layout,
-            qt_layout,
-            stats_layout,
-            DELTA_OFFSET=32 if PACK_STATS else 0,
-            LSE_PRESCALED=PACK_STATS,
-        )
+        (dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1, next_q0, next_q1, next_do0,
+         next_do1) = _varlen_gqa_dq_bm32_owner_reload_panel(
+             tlx.local_view(ds_buffers, 0),
+             k_buffer,
+             dq_k_band0_panel0,
+             dq_k_band0_panel1,
+             dq_k_band1_panel0,
+             v_operand,
+             next_q_slice,
+             next_do_slice,
+             next_lse_tile,
+             next_delta_tile,
+             mma_md,
+             ds_md_layout,
+             k_md_layout,
+             k_nm_layout,
+             qt_layout,
+             stats_layout,
+             DELTA_OFFSET=32 if PACK_STATS else 0,
+             LSE_PRESCALED=PACK_STATS,
+         )
         _store_dq_bm32_native(
             dq_lo,
             dq_hi,
@@ -3808,15 +3811,13 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s4(
     # No rolling FP32 state enters a query loop. All owners finish their
     # independent MFMA chains and separately rounded dK scale above this point.
     ready_owner = _group_owner_rolling_fp32_boundary_s4(OWNER_ID)
-    _group_owner_rolling_fp32_gradient_s4(
-        dk, R_DK, DK_FINAL, kv_global_start, kv_head, kv_valid_rows,
-        split, ready_owner, 0, HKV, D, KV_SPLITS)
+    _group_owner_rolling_fp32_gradient_s4(dk, R_DK, DK_FINAL, kv_global_start, kv_head, kv_valid_rows, split,
+                                          ready_owner, 0, HKV, D, KV_SPLITS)
     # dK and dV use disjoint compact buffers. Drain dK stores on every wave
     # before entering dV's chunks; this boundary also closes dK VMEM lifetimes.
     ready_dv = _group_owner_rolling_fp32_boundary_s4(ready_owner)
-    _group_owner_rolling_fp32_gradient_s4(
-        dv, R_DV, DV_FINAL, kv_global_start, kv_head, kv_valid_rows,
-        split, ready_dv, 1, HKV, D, KV_SPLITS)
+    _group_owner_rolling_fp32_gradient_s4(dv, R_DV, DV_FINAL, kv_global_start, kv_head, kv_valid_rows, split, ready_dv,
+                                          1, HKV, D, KV_SPLITS)
 
 
 @triton.jit
@@ -3933,15 +3934,13 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(k)
-    rolling_fp32_case = (
-        not causal
-        and (total_q, total_kv, plan.max_q, getattr(plan, "max_kv", None)) == (50754, 100696, 5662, 10414)
-        and plan.batch == 19
-        and (heads, kv_heads, head_dim, kv_splits) in ((12, 4, 128, 3), (64, 8, 128, 4))
-        and q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16
-        and _select_varlen_kernel_blocks(group_size, kv_splits) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
-        and k.numel() <= _I32_BUFFER_FP32_ELEMENTS
-    )
+    rolling_fp32_case = (not causal and
+                         (total_q, total_kv, plan.max_q, getattr(plan, "max_kv", None)) == (50754, 100696, 5662, 10414)
+                         and plan.batch == 19 and (heads, kv_heads, head_dim, kv_splits) in ((12, 4, 128, 3),
+                                                                                             (64, 8, 128, 4))
+                         and q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16
+                         and _select_varlen_kernel_blocks(group_size, kv_splits) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
+                         and k.numel() <= _I32_BUFFER_FP32_ELEMENTS)
     if rolling_fp32_case:
         # These compact FP32 buffers replace the three- or four-slot partials.
         # Their public-launch locals keep the established positional plumbing.
@@ -3954,11 +3953,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     block_m, block_n = _select_varlen_kernel_blocks(group_size, kv_splits)
     # Retain masked BM16 scratch if the larger footprint exceeds the existing
     # signed-byte-offset limit. Input validation already proved the BM16 size.
-    pad_dq_to_bm32 = (
-        (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
-        and (total_q + plan.batch * (_WIDE_BLOCK_M - 1)) * heads * head_dim
-        <= _I32_BUFFER_BF16_ELEMENTS
-    )
+    pad_dq_to_bm32 = ((block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
+                      and (total_q + plan.batch * (_WIDE_BLOCK_M - 1)) * heads * head_dim <= _I32_BUFFER_BF16_ELEMENTS)
     dq_pad_rows = _WIDE_BLOCK_M if pad_dq_to_bm32 else _BLOCK_M
     total_q_padded = total_q + plan.batch * (dq_pad_rows - 1)
     use_dq_aux = group_size == 1 or (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
@@ -3973,7 +3969,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     owner_tasks = plan.wide_kv_start.numel() if rolling_fp32_case else 0
     owner_groups = kv_heads * owner_tasks
     owner_workers = min(256, owner_groups)
-    owner_next = torch.empty((1,), dtype=torch.int32, device=q.device) if rolling_fp32_case else None
+    owner_next = torch.empty((1, ), dtype=torch.int32, device=q.device) if rolling_fp32_case else None
     preprocess_fn = _varlen_bwd_preprocess_dynamic_owner_queue if rolling_fp32_case else _varlen_bwd_preprocess
     preprocess_extra = {"OWNER_NEXT": owner_next, "INITIAL_OWNER": owner_workers} if rolling_fp32_case else {}
 
@@ -3999,12 +3995,15 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     if (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N):
         wide_core = _varlen_bwd_interleaved_bm32_kernel
         if rolling_fp32_case:
-            wide_core = (_varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3 if kv_splits == 3
-                         else _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4)
+            wide_core = (_varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3
+                         if kv_splits == 3 else _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4)
         wide_grid = (owner_workers, 1, 1) if rolling_fp32_case else (kv_heads * kv_splits, plan.wide_kv_start.numel())
         wide_extra = {
-            "DK_FINAL": dk, "DV_FINAL": dv, "OWNER_NEXT": owner_next,
-            "NUM_TASKS": owner_tasks, "NUM_GROUPS": owner_groups,
+            "DK_FINAL": dk,
+            "DV_FINAL": dv,
+            "OWNER_NEXT": owner_next,
+            "NUM_TASKS": owner_tasks,
+            "NUM_GROUPS": owner_groups,
         } if rolling_fp32_case else {}
         wide_core[wide_grid](
             q,
@@ -4042,13 +4041,11 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
         # Contiguous views with shifted storage retain the generic copy path.
         qdo_aligned = not causal and group_size == 1 and q.data_ptr() % 16 == 0 and do.data_ptr() % 16 == 0
         cache_mha_stats = not causal and group_size == 1 and plan.max_q <= 512
-        finalize_tail_dq = (
-            not causal and cache_mha_stats and qdo_aligned
-            and plan.dq_full_kv_sequence is not None
-            and plan.dq_full_kv_start is not None
-        )
+        # Causal tail owners skip earlier Q rows, which still need conversion.
+        finalize_tail_dq = (not causal and cache_mha_stats and qdo_aligned and plan.dq_full_kv_sequence is not None
+                            and plan.dq_full_kv_start is not None)
         # The peeled MHA loop exposes independent score/dP and gradient work.
-        core_llvm_attrs = (("amdgpu-sched-strategy", "max-ilp"),) if cache_mha_stats else ()
+        core_llvm_attrs = (("amdgpu-sched-strategy", "max-ilp"), ) if cache_mha_stats else ()
         kv_launches = (
             (0, plan.num_full_kv_blocks, True),
             (plan.num_full_kv_blocks, plan.kv_block_sequence.numel() - plan.num_full_kv_blocks, False),
@@ -4056,7 +4053,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
         for task_offset, task_count, full_kv_tile in kv_launches:
             if task_count == 0:
                 continue
-            grid = (kv_heads * kv_splits, task_count) if group_size == 1 and not causal else (task_count, kv_heads * kv_splits)
+            grid = (kv_heads * kv_splits, task_count) if group_size == 1 and not causal else (task_count,
+                                                                                              kv_heads * kv_splits)
             _varlen_bwd_interleaved_kernel[grid](
                 q,
                 k,

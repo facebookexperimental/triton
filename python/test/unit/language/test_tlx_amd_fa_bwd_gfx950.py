@@ -368,12 +368,8 @@ def test_varlen_d128_kv_partial_workspace_shapes():
         pytest.param([1, 17, 33], [127, 255, 128], 4, 4, (0, 0), id="mha-tail-127"),
         pytest.param([1, 17, 33], [224, 225, 128], 4, 4, (0, 0), id="mha-mixed-96-97"),
         pytest.param([1, 17, 33], [192, 193, 224], 4, 4, (0, 0), id="mha-mixed-64-65-96"),
-        pytest.param(
-            [1, 16, 17, 511, 512], [1, 128, 129, 257, 256], 4, 4, (0, 0),
-            id="mha-stats-cache-boundary"),
-        pytest.param(
-            [1, 17, 513, 1025], [1, 129, 257, 256], 2, 2, (0, 0),
-            id="mha-stats-cache-fallback"),
+        pytest.param([1, 16, 17, 511, 512], [1, 128, 129, 257, 256], 4, 4, (0, 0), id="mha-stats-cache-boundary"),
+        pytest.param([1, 17, 513, 1025], [1, 129, 257, 256], 2, 2, (0, 0), id="mha-stats-cache-fallback"),
         pytest.param([17], [129], 2, 2, (1, 0), id="mha-unaligned-q"),
         pytest.param([17], [129], 2, 2, (0, 4), id="mha-unaligned-do"),
         pytest.param([7, 31, 65], [33, 257, 7], 6, 2, (0, 0), id="gqa3-mixed"),
@@ -598,13 +594,15 @@ def test_varlen_d128_bm32_boundaries_gfx950(q_lengths, q_heads, kv_heads):
 @pytest.mark.parametrize("metadata", ("legacy", "missing_sequence", "missing_start", "default_k96"))
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_varlen_d128_tail_finalizer_plan_defaults_gfx950(metadata):
-    case = _make_varlen_d128_reference_case(
-        [1, 17, 33], [1, 225, 256], q_heads=4, kv_heads=4, seed=1901)
+    case = _make_varlen_d128_reference_case([1, 17, 33], [1, 225, 256], q_heads=4, kv_heads=4, seed=1901)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
     plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
     if metadata == "legacy":
-        fields = {key: value for key, value in vars(plan).items()
-                  if key not in ("dq_full_kv_sequence", "dq_full_kv_start", "dq_tail_k96")}
+        fields = {
+            key: value
+            for key, value in vars(plan).items()
+            if key not in ("dq_full_kv_sequence", "dq_full_kv_start", "dq_tail_k96")
+        }
         plan = amd_fa_varlen_bwd.VarlenBackwardPlan(**fields)
         assert plan.dq_full_kv_sequence is plan.dq_full_kv_start is None
     elif metadata == "missing_sequence":
@@ -613,7 +611,9 @@ def test_varlen_d128_tail_finalizer_plan_defaults_gfx950(metadata):
         plan = replace(plan, dq_full_kv_start=None)
     else:
         plan = amd_fa_varlen_bwd.VarlenBackwardPlan(
-            **{key: value for key, value in vars(plan).items() if key != "dq_tail_k96"})
+            **{key: value
+               for key, value in vars(plan).items()
+               if key != "dq_tail_k96"})
     assert plan.dq_tail_k96 is False
 
     actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
