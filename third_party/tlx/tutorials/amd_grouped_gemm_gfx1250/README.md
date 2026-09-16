@@ -63,11 +63,19 @@ of the A ring while retaining a finer M tile for smaller expert groups.
 
 Cross-tile prefetch peels the final TDM-ring rotation and reuses released input
 slots for K0/K1 of the next tile assigned to the same persistent program. It
-requires `--dedicated_c_buffer`, a depth-2 ring, and an even number of
-`BLOCK_K` iterations. The asymmetric tiles prefetch within each group, so
-they need more tiles per group than persistent programs.
+requires a depth-2 ring and an even number of `BLOCK_K` iterations. The
+asymmetric tiles require `--dedicated_c_buffer` and prefetch within each
+group, so they need more tiles per group than persistent programs.
 
-The `256x256x128` cross-tile schedule also prefetches across group boundaries,
+For `256x256x128` with `--cross_tile_prefetch` and dedicated C staging off,
+the within-group hybrid pipelines output through two `32x256` LDS slots.
+It splits C into eight row chunks and issues TDM stores, waiting only for
+the older store before reusing its slot. The final two stores can overlap
+the next tile's entry while the prefetched A/B tiles remain intact. TDM output
+avoids per-lane output address calculations, and the small staging slots fit
+alongside the input rings. With cross-tile prefetch off, C aliases the A ring.
+
+With `--dedicated_c_buffer`, the square schedule also prefetches across group boundaries,
 skipping empty groups. It uses vector stores for C, leaving the two input
 rings intact. Keeping one K block per loop and bounding operand lifetimes at
 each dot limits register pressure. With L2 prefetch disabled, it folds tile
@@ -180,6 +188,13 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py
 Each tuple is `(G, M_per_group, N, K)`. The default cases cover the requested
 `G=8/32`, `M_per_group=32768/65536`, `N=4096/8192`, `K=4096`
 combinations plus the `16x4096x4096x4096` reference.
+
+The sweep defaults to `256x256x128`, depth 2, alias-C, and cross-tile prefetch
+disabled for every shape. Use
+`--cross-tile-prefetch` to compare the revised hybrid with TDM output stores.
+`--auto-config`
+instead lets the kernel's general cost model select the configuration,
+including whether to use cross-tile prefetch.
 
 Each case runs in a separate process so large GPU allocations are released
 before the next case. Useful options:

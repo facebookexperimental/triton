@@ -409,6 +409,18 @@ def _tdm_wait_and_finish_k_block(
 
 
 @triton.jit
+def _tdm_c_store_chunk(acc, part: tl.constexpr):
+    """Select 32 rows without keeping a second full output tile in registers."""
+    width: tl.constexpr = acc.shape[1]
+    lo, hi = tl.split(tl.reshape(acc, (2, 128, width)).permute(1, 2, 0))
+    half = lo if part < 4 else hi
+    lo2, hi2 = tl.split(tl.reshape(half, (2, 64, width)).permute(1, 2, 0))
+    quarter = lo2 if part % 4 < 2 else hi2
+    lo3, hi3 = tl.split(tl.reshape(quarter, (2, 32, width)).permute(1, 2, 0))
+    return lo3 if part % 2 == 0 else hi3
+
+
+@triton.jit
 def _grouped_tile_offsets(
     tile_idx,
     last_problem_end,
@@ -535,7 +547,11 @@ def grouped_gemm_tdm_kernel(
     # are each small enough to alias A.  Reusing B can satisfy the size check
     # for asymmetric tiles, but B's TDM-load/dot-transpose layout constraints
     # conflict with C's TDM-store layout constraints.
-    if C_STAGING_MODE == 1:
+    if HYBRID_TILE_PREFETCH:
+        # Two 16-KiB output slots fit alongside the input rings. TDM drains
+        # one chunk while the other is filled, leaving prefetched A/B intact.
+        c_buf = tlx.local_alloc((32, BLOCK_N), tlx.dtype_of(c_packed), 2)
+    elif C_STAGING_MODE == 1:
         tl.static_assert(USE_FULL_C_TILE, "dedicated C staging currently requires a full C buffer")
         c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_packed), 1)
     elif USE_FULL_C_TILE:
@@ -590,7 +606,7 @@ def grouped_gemm_tdm_kernel(
                 c_packed + group_base_c,
                 shape=[gm, N],
                 strides=[stride_cm, tl.constexpr(1)],
-                block_shape=[BLOCK_M, BLOCK_N],
+                block_shape=[32 if HYBRID_TILE_PREFETCH else BLOCK_M, BLOCK_N],
             )
         else:
             c_desc_base = tl.make_tensor_descriptor(
@@ -609,8 +625,7 @@ def grouped_gemm_tdm_kernel(
             if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles and (not CROSS_GROUP_PREFETCH
                                                                                              or not group_primed):
                 if HYBRID_TILE_PREFETCH:
-                    # The previous group's last tile stored C through the A
-                    # ring. Retire that store before priming the new group.
+                    # Retire the previous group's outstanding output chunks.
                     tlx.async_amd_descriptor_wait(0)
                 first_off_m, first_off_n = _grouped_tile_offsets(tile_idx, last_problem_end, num_m_tiles, num_n_tiles,
                                                                  GROUP_M, BLOCK_M, BLOCK_N)
@@ -789,8 +804,7 @@ def grouped_gemm_tdm_kernel(
                     group_primed = has_next
                     tlx.amd_sched_barrier()
                 elif HYBRID_TILE_PREFETCH:
-                    # Keep only the current group's descriptors alive. Its
-                    # final tile uses alias-C storage and drains at group entry.
+                    # Keep only the current group's descriptors alive.
                     tlx.amd_sched_barrier()
                     next_tile_idx = tile_idx + NUM_PROGRAMS
                     group_end = last_problem_end + num_tiles
@@ -853,7 +867,22 @@ def grouped_gemm_tdm_kernel(
                     acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer, NUM_BUFFERS,
                                                                BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
 
-            if OPTIMIZE_CROSS_TILE and (not HYBRID_TILE_PREFETCH or has_next):
+            if HYBRID_TILE_PREFETCH:
+                tlx.amd_sched_barrier()
+                for part in tl.static_range(BLOCK_M // 32):
+                    if part >= 2:
+                        # The older output must finish before its slot is
+                        # overwritten. Keep the newer chunk in flight.
+                        tlx.async_amd_descriptor_wait(1)
+                    c_part = _tdm_c_store_chunk(acc, part)
+                    c_part = c_part.to(tlx.dtype_of(c_packed))
+                    c_view = c_buf[part % 2]
+                    c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m + part * 32, off_n])
+                    tlx.local_store(c_view, c_part)
+                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0], clamp_bounds=False)
+                # The last two output stores overlap the next tile's entry.
+                # Its input waits also retire them before C staging is reused.
+            elif OPTIMIZE_CROSS_TILE:
                 # Direct C stores leave both input rings intact without a
                 # full C tile in LDS or serialized stores through a small one.
                 tlx.amd_sched_barrier()
@@ -936,8 +965,8 @@ def grouped_gemm_tdm(
     ``tdm_pipeline_depth`` maps to the TDM LDS ring-buffer depth; the f16 and
     MXFP gfx1250 kernels use the same 2/3/4-buffer tuning space.
     ``cross_tile_prefetch`` recycles the final two K-loop slots for the next
-    tile. With alias-C storage, the 256x256 hybrid prefetches within a group,
-    stores C directly between tiles, and uses a TDM store at group boundaries.
+    tile. With ``c_staging_mode=0``, the 256x256 hybrid prefetches within a
+    group and pipelines TDM output stores through two small dedicated slots.
     With dedicated C staging, the square schedule also prefetches across
     groups; smaller tiles use dedicated LDS for C within each group.
     ``auto_config`` scores the validated tile seeds using saturated rate, CU
@@ -1257,12 +1286,15 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
     amdgcn = compiled.asm["amdgcn"]
     assert amdgcn.count("tensor_load_to_lds") >= 4
     if BLOCK_M == 256:
-        # A full dedicated C tile exceeds the LDS budget at this size.
-        assert "buffer_store_b128" in amdgcn
         if C_STAGING_MODE == 0:
-            # The hybrid retains a TDM alias-C store for each group's last tile.
-            assert "tensor_store_from_lds" in amdgcn
+            # The hybrid pipelines eight row chunks through two small slots.
+            assert amdgcn.count("tensor_store_from_lds") == 8
+            assert "buffer_store_b128" not in amdgcn
+            assert "global_store_b128" not in amdgcn
         else:
+            # The cross-group schedule retains direct stores; a full
+            # dedicated C tile would exceed the LDS budget at this size.
+            assert "buffer_store_b128" in amdgcn
             assert "tensor_store_from_lds" not in amdgcn
     else:
         assert "amdg.async_tdm_copy_local_to_global" in ttgir
