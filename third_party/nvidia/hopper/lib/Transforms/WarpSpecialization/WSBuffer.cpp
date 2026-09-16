@@ -112,6 +112,52 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
                                    DenseSet<Operation *> &regionsWithChannels,
                                    ReuseConfig *config);
 
+struct AccumLoopCarrier {
+  Operation *op;
+  Block *block;
+};
+
+// Find the nearest enclosing loop and the block that carries its accumulation
+// counter arguments. scf.for carries them in its body; scf.while carries them
+// in the region containing the nested op (normally the persistent after
+// region). Walking by immediate parents preserves the nearest-loop rule when
+// for/while loops are nested.
+static std::optional<AccumLoopCarrier>
+getEnclosingAccumLoopCarrier(Operation *nestedOp) {
+  Operation *child = nestedOp;
+  for (Operation *parent = child->getParentOp(); parent;
+       child = parent, parent = parent->getParentOp()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(parent))
+      return AccumLoopCarrier{parent, forOp.getBody()};
+    if (auto whileOp = dyn_cast<scf::WhileOp>(parent)) {
+      Region *childRegion = child->getParentRegion();
+      if (childRegion == &whileOp.getAfter())
+        return AccumLoopCarrier{parent, whileOp.getAfterBody()};
+      if (childRegion == &whileOp.getBefore())
+        return AccumLoopCarrier{parent, whileOp.getBeforeBody()};
+      llvm_unreachable("nested op must be in an scf.while region");
+    }
+  }
+  return std::nullopt;
+}
+
+static Value getIncomingAccum(scf::IfOp ifOp, Operation *counterRegion,
+                              DenseSet<Operation *> &regionsWithChannels,
+                              ReuseConfig *config, unsigned offset = 0) {
+  auto carrier = getEnclosingAccumLoopCarrier(ifOp);
+  if (!carrier)
+    return {};
+  unsigned argSize = carrier->block->getNumArguments();
+  unsigned counterCount =
+      getAccumCnts(carrier->op, regionsWithChannels, config);
+  unsigned counterIdx = getAccumArgIdx(carrier->op, counterRegion,
+                                       regionsWithChannels, config, -1);
+  assert(counterIdx + offset < counterCount &&
+         "if accumulation counter index exceeds enclosing loop counters");
+  return carrier->block->getArgument(argSize - counterCount + counterIdx +
+                                     offset);
+}
+
 // If there is a channel directly inside IfOp, update endAccum and endAccumElse.
 static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
                                      Value &endAccumElse,
@@ -119,23 +165,9 @@ static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
                                      ReuseConfig *config,
                                      OpBuilderWithAsyncTaskIds &ifBuilder,
                                      OpBuilderWithAsyncTaskIds &elseBuilder) {
-  auto parentForOp = ifOp->getParentOfType<scf::ForOp>();
-  auto *op = ifOp.getOperation();
   auto loc = ifOp.getLoc();
-  if (parentForOp) {
-    unsigned parentArgSize = parentForOp.getBody()->getArguments().size();
-    // Get corresponding argument of accumCnt for "op" in parentForOp.
-    unsigned accumArgId = getAccumArgIdx(parentForOp, ifOp.getOperation(),
-                                         regionsWithChannels, config, -1);
-    unsigned parentTCnts =
-        getAccumCnts(parentForOp.getOperation(), regionsWithChannels, config);
-    LDBG("rewrite ifOp: ifOp itself parentArg " << parentArgSize << " "
-                                                << accumArgId);
-    // All the accumCnts are at the end of argument list. When accumArgId
-    // is parentTCnts - 1, the corresponding accumCnt will be the last
-    // argument.
-    Value arg = parentForOp.getBody()->getArgument(parentArgSize - parentTCnts +
-                                                   accumArgId);
+  if (Value arg = getIncomingAccum(ifOp, ifOp.getOperation(),
+                                   regionsWithChannels, config)) {
     // Either parent[accumCnt] + 1 or parent[accumCnt].
     Value one =
         ifBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
@@ -172,16 +204,6 @@ static void generateYieldCntsForThenBlock(
   unsigned tCntsTotal = getAccumCnts(regionOp, regionsWithChannels, config);
   LDBG("rewrite ifOp: thenBlock " << tCnts << " accumCnts");
 
-  unsigned accumArgId, parentArgSize, parentTCnts;
-  auto parentForOp = ifOp->getParentOfType<scf::ForOp>();
-  if (parentForOp) {
-    parentArgSize = parentForOp.getBody()->getArguments().size();
-    // Find accumArgId for preOrderOps[0] in parentForOp.
-    accumArgId = getAccumArgIdx(parentForOp, preOrderOps[0],
-                                regionsWithChannels, config, -1);
-    parentTCnts =
-        getAccumCnts(parentForOp.getOperation(), regionsWithChannels, config);
-  }
   auto loc = ifOp.getLoc();
 
   // Set up value for thenYield and elseYield for accumCnts nested under "op".
@@ -193,14 +215,10 @@ static void generateYieldCntsForThenBlock(
     Value endAccum = regionOp->getResult(numRes - tCntsTotal + i);
     thenYields.push_back(endAccum);
 
-    // Find the corresponding accumArgId from parentForOp.
-    Value elseVal;
-    if (parentForOp) {
-      elseVal = parentForOp.getBody()->getArgument(parentArgSize - parentTCnts +
-                                                   accumArgId + i);
-      LDBG("rewrite ifOp: elseYield parentArg " << parentArgSize << " "
-                                                << accumArgId << " " << i);
-    } else
+    // The branch without this nested region preserves its incoming counter.
+    Value elseVal =
+        getIncomingAccum(ifOp, preOrderOps[0], regionsWithChannels, config, i);
+    if (!elseVal)
       elseVal =
           elseBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64);
     elseYields.push_back(elseVal);
@@ -476,7 +494,11 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
   if (tmpIter3 != regionsWithChannels.end()) {
     LDBG("rewrite ifOp: update regionsWithChannels "
          << ifOp.getOperation() << " --> " << newIfOp.getOperation());
-    *tmpIter3 = newIfOp.getOperation();
+    // DenseSet keys must be rehashed when the operation pointer changes.
+    // Otherwise getAccumCntRegion can miss a rewritten nested guard and fall
+    // through to the enclosing loop's counter.
+    regionsWithChannels.erase(ifOp.getOperation());
+    regionsWithChannels.insert(newIfOp.getOperation());
   }
 
   // Go through region ops in the thenBlock. updateAccumLoopCount takes current
@@ -895,7 +917,12 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       std::find(regionsWithChannels.begin(), regionsWithChannels.end(),
                 origForOp.getOperation());
   if (tmpIter3 != regionsWithChannels.end()) {
-    *tmpIter3 = newForOp.getOperation();
+    // DenseSet keys must be rehashed when the operation pointer changes.
+    // Mutating the key in place makes contains(newForOp) depend on the old
+    // pointer's bucket, so nested channels can be attributed to an enclosing
+    // if/while counter instead of this loop's counter.
+    regionsWithChannels.erase(origForOp.getOperation());
+    regionsWithChannels.insert(newForOp.getOperation());
   }
 
   // Handle ops in loop body, only IfOps and ForOps.

@@ -131,6 +131,22 @@ mmaOp.setIsAsync(true);
 When the MMA completes, it signals this barrier. No explicit
 `ConsumerReleaseOp` is emitted — the MMA lowering handles it.
 
+If the input producer is outside the consumer's inner `scf.for`, the input is
+loop-invariant for that inner loop. Its EMPTY completion barrier must therefore
+be predicated on the last inner iteration. This applies when the enclosing
+producer loop is either `scf.for` or persistent `scf.while` (including a
+producer nested in a collective `scf.if` in the while body). Otherwise every
+inner MMA flips a barrier whose accumulation counter advances only once per
+outer transaction; a skipped persistent iteration can expose the phase skew as
+a deadlock on the next valid tile.
+
+If the same outer-produced operand is consumed by multiple sequential sibling
+loops, the final sibling may have zero iterations. In that case an inline
+completion on its last MMA cannot provide the outer-cadence EMPTY transition.
+AutoWS instead emits one `tcgen5.commit` after the final sibling loop. The
+commit follows all MMAs issued by any nonempty sibling and executes even when
+the final sibling is empty.
+
 ## Path for gen5 as Producer (`producerBarrier` set)
 
 When the **producer** is gen5, `desyncTCGen5MMAOp()` is called with
