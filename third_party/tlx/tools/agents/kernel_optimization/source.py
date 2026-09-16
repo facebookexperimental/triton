@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -179,12 +180,49 @@ def _is_proton_api_call(node: ast.Call) -> bool:
     )
 
 
+def canonicalize_diagnostic_task_warps(
+    instrumented: str,
+    current: str,
+    mapping: Mapping[str, Any],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Replace model-provided task ordinals with provable physical warp IDs."""
+    canonical = copy.deepcopy(dict(mapping))
+    tasks = canonical.get("tasks")
+    if not isinstance(tasks, Mapping):
+        return canonical
+    try:
+        instrumented_tree = ast.parse(instrumented)
+        current_tree = ast.parse(current)
+    except SyntaxError:
+        return canonical
+    inferred = _infer_tlx_scope_warps(
+        instrumented_tree,
+        current_tree,
+        environment or {},
+    )
+    canonical_tasks: dict[Any, Any] = {}
+    for raw_name, raw_task in tasks.items():
+        if not isinstance(raw_task, Mapping):
+            canonical_tasks[raw_name] = raw_task
+            continue
+        task = dict(raw_task)
+        scope = task.get("scope")
+        if isinstance(scope, str) and scope in inferred:
+            task["warps"] = list(inferred[scope])
+        canonical_tasks[raw_name] = task
+    canonical["tasks"] = canonical_tasks
+    return canonical
+
+
 def validate_diagnostic_instrumentation_source(
     instrumented: str,
     current: str,
     mapping: Mapping[str, Any],
     *,
     pass_capabilities: Mapping[str, tuple[str, ...]] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> None:
     """Validate source-only Proton instrumentation against the original source.
 
@@ -203,6 +241,12 @@ def validate_diagnostic_instrumentation_source(
         raise ValueError("instrumented source must contain Proton scope calls")
     _validate_scope_balance(instrumented_tree)
     _validate_mapping_references(mapping, {name for _, name, _ in scope_calls})
+    _validate_static_tlx_task_warps(
+        instrumented_tree,
+        current_tree,
+        mapping,
+        environment or {},
+    )
     _validate_only_allowed_instrumentation(current_tree, instrumented_tree)
 
 
@@ -273,6 +317,377 @@ def _top_level_signatures(tree: ast.Module) -> dict[str, str]:
 
 def _dump_optional_ast(node: ast.AST | None) -> str:
     return "" if node is None else ast.dump(node, include_attributes=False)
+
+
+@dataclass(frozen=True)
+class _TlxAsyncTask:
+    node: ast.With
+    is_default: bool
+    num_warps: int
+    replicate: int
+    warp_group_start_id: int | None
+
+
+def _infer_tlx_scope_warps(
+    instrumented_tree: ast.Module,
+    current_tree: ast.Module,
+    environment: Mapping[str, str],
+) -> dict[str, tuple[int, ...]]:
+    default_num_warps = _unique_literal_launch_num_warps(
+        current_tree,
+        environment,
+    )
+    if default_num_warps is None:
+        return {}
+    candidates: dict[str, set[tuple[int, ...]]] = {}
+    for node in ast.walk(instrumented_tree):
+        if not isinstance(node, ast.With) or not _is_tlx_async_tasks_with(node):
+            continue
+        tasks = _parse_tlx_async_task_block(node, default_num_warps)
+        if tasks is None:
+            continue
+        for task, warps in tasks:
+            for scope in _literal_proton_scopes(task.node):
+                candidates.setdefault(scope, set()).add(warps)
+    return {
+        scope: next(iter(warp_sets))
+        for scope, warp_sets in candidates.items()
+        if len(warp_sets) == 1
+    }
+
+
+def _unique_literal_launch_num_warps(
+    tree: ast.Module,
+    environment: Mapping[str, str],
+) -> int | None:
+    constants = _module_string_constants(tree, environment)
+    collector = _ReachableTritonConfigCollector(constants, environment)
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            collector.visit_statements(statement.body)
+        elif not isinstance(statement, ast.ClassDef):
+            collector.visit(statement)
+    if not collector.complete or len(collector.num_warps) != 1:
+        return None
+    return next(iter(collector.num_warps))
+
+
+def _module_string_constants(
+    tree: ast.Module,
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = _static_string_value(statement.value, constants, environment)
+        if value is not None:
+            constants[target.id] = value
+    return constants
+
+
+def _static_string_value(
+    node: ast.AST,
+    constants: Mapping[str, str],
+    environment: Mapping[str, str],
+) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if not isinstance(node, ast.Call) or len(node.args) not in {1, 2}:
+        return None
+    if not (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "environ"
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "os"
+    ):
+        return None
+    key = _static_string_value(node.args[0], constants, environment)
+    default = (
+        _static_string_value(node.args[1], constants, environment)
+        if len(node.args) == 2
+        else None
+    )
+    if key is None:
+        return None
+    return environment.get(key, default)
+
+
+class _ReachableTritonConfigCollector(ast.NodeVisitor):
+    def __init__(
+        self,
+        constants: Mapping[str, str],
+        environment: Mapping[str, str],
+    ) -> None:
+        self.constants = constants
+        self.environment = environment
+        self.num_warps: set[int] = set()
+        self.complete = True
+
+    def visit_statements(self, statements: list[ast.stmt]) -> None:
+        for statement in statements:
+            self.visit(statement)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_If(self, node: ast.If) -> None:
+        condition = _static_boolean_value(
+            node.test,
+            self.constants,
+            self.environment,
+        )
+        if condition is True:
+            self.visit_statements(node.body)
+        elif condition is False:
+            self.visit_statements(node.orelse)
+        else:
+            self.visit_statements(node.body)
+            self.visit_statements(node.orelse)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if _is_triton_config_call(node) or _is_kernel_launch_call(node):
+            value = _literal_positive_int_keyword(node, "num_warps")
+            if value is None:
+                self.complete = False
+            else:
+                self.num_warps.add(value)
+        self.generic_visit(node)
+
+
+def _is_kernel_launch_call(node: ast.Call) -> bool:
+    return isinstance(node.func, ast.Subscript) and any(
+        keyword.arg == "num_warps" for keyword in node.keywords
+    )
+
+
+def _static_boolean_value(
+    node: ast.AST,
+    constants: Mapping[str, str],
+    environment: Mapping[str, str],
+) -> bool | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return node.value
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+        return None
+    left = _static_string_value(node.left, constants, environment)
+    right = _static_string_value(node.comparators[0], constants, environment)
+    if left is None or right is None:
+        return None
+    operator = node.ops[0]
+    if isinstance(operator, ast.Eq):
+        return left == right
+    if isinstance(operator, ast.NotEq):
+        return left != right
+    return None
+
+
+def _is_triton_config_call(node: ast.Call) -> bool:
+    return (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "triton"
+        and node.func.attr == "Config"
+    )
+
+
+def _is_tlx_async_tasks_with(node: ast.With) -> bool:
+    return len(node.items) == 1 and _is_tlx_call(
+        node.items[0].context_expr,
+        "async_tasks",
+    )
+
+
+def _is_tlx_call(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tlx"
+        and node.func.attr == name
+    )
+
+
+def _parse_tlx_async_task_block(
+    node: ast.With,
+    default_num_warps: int,
+) -> tuple[tuple[_TlxAsyncTask, tuple[int, ...]], ...] | None:
+    tasks: list[_TlxAsyncTask] = []
+    for statement in node.body:
+        if not isinstance(statement, ast.With) or len(statement.items) != 1:
+            return None
+        task = _parse_tlx_async_task(statement, default_num_warps)
+        if task is None:
+            return None
+        tasks.append(task)
+    if sum(task.is_default for task in tasks) != 1:
+        return None
+    explicit_starts = [
+        task.warp_group_start_id for task in tasks if not task.is_default
+    ]
+    if any(start is not None for start in explicit_starts):
+        if any(start is None for start in explicit_starts):
+            return None
+        if any(task.is_default and task.replicate != 1 for task in tasks):
+            return None
+        return tuple(
+            (task, _explicit_task_warps(task, default_num_warps))
+            for task in tasks
+        )
+    cursor = default_num_warps
+    result: list[tuple[_TlxAsyncTask, tuple[int, ...]]] = []
+    for task in tasks:
+        if task.is_default:
+            warps = list(range(default_num_warps))
+            extra_warps = default_num_warps * (task.replicate - 1)
+            warps.extend(range(cursor, cursor + extra_warps))
+            cursor += extra_warps
+        else:
+            task_warps = task.num_warps * task.replicate
+            warps = list(range(cursor, cursor + task_warps))
+            cursor += task_warps
+        result.append((task, tuple(warps)))
+    return tuple(result)
+
+
+def _parse_tlx_async_task(
+    node: ast.With,
+    default_num_warps: int,
+) -> _TlxAsyncTask | None:
+    call = node.items[0].context_expr
+    if not _is_tlx_call(call, "async_task"):
+        return None
+    assert isinstance(call, ast.Call)
+    is_default = (
+        len(call.args) == 1
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == "default"
+    )
+    if call.args and not is_default:
+        return None
+    num_warps = (
+        default_num_warps
+        if is_default
+        else _literal_positive_int_keyword(call, "num_warps")
+    )
+    replicate = _literal_positive_int_keyword(call, "replicate", default=1)
+    has_start_id = any(
+        keyword.arg == "warp_group_start_id" for keyword in call.keywords
+    )
+    start_id = _literal_nonnegative_int_keyword(call, "warp_group_start_id")
+    if (
+        num_warps is None
+        or replicate is None
+        or (has_start_id and start_id is None)
+    ):
+        return None
+    return _TlxAsyncTask(
+        node=node,
+        is_default=is_default,
+        num_warps=num_warps,
+        replicate=replicate,
+        warp_group_start_id=start_id,
+    )
+
+
+def _explicit_task_warps(
+    task: _TlxAsyncTask,
+    default_num_warps: int,
+) -> tuple[int, ...]:
+    if task.is_default:
+        return tuple(range(default_num_warps))
+    assert task.warp_group_start_id is not None
+    return tuple(
+        range(
+            task.warp_group_start_id,
+            task.warp_group_start_id + task.num_warps * task.replicate,
+        )
+    )
+
+
+def _literal_positive_int_keyword(
+    call: ast.Call,
+    name: str,
+    *,
+    default: int | None = None,
+) -> int | None:
+    value = _literal_int_keyword(call, name)
+    if value is None:
+        return default
+    return value if value > 0 else None
+
+
+def _literal_nonnegative_int_keyword(
+    call: ast.Call,
+    name: str,
+) -> int | None:
+    value = _literal_int_keyword(call, name)
+    if value is None:
+        return None
+    return value if value >= 0 else None
+
+
+def _literal_int_keyword(call: ast.Call, name: str) -> int | None:
+    values = [keyword.value for keyword in call.keywords if keyword.arg == name]
+    if len(values) != 1:
+        return None
+    value = values[0]
+    if not isinstance(value, ast.Constant) or isinstance(value.value, bool):
+        return None
+    return value.value if isinstance(value.value, int) else None
+
+
+def _literal_proton_scopes(node: ast.AST) -> set[str]:
+    scopes: set[str] = set()
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call) or not _is_proton_scope_call(child):
+            continue
+        scope = _literal_scope_name(child)
+        if scope is not None:
+            scopes.add(scope)
+    return scopes
+
+
+def _validate_static_tlx_task_warps(
+    instrumented_tree: ast.Module,
+    current_tree: ast.Module,
+    mapping: Mapping[str, Any],
+    environment: Mapping[str, str],
+) -> None:
+    inferred = _infer_tlx_scope_warps(
+        instrumented_tree,
+        current_tree,
+        environment,
+    )
+    tasks = mapping.get("tasks")
+    if not inferred or not isinstance(tasks, Mapping):
+        return
+    for raw_name, raw_task in tasks.items():
+        if not isinstance(raw_task, Mapping):
+            continue
+        scope = raw_task.get("scope")
+        if not isinstance(scope, str) or scope not in inferred:
+            continue
+        actual = tuple(sorted(_parse_warp_list(raw_task.get("warps"), str(raw_name))))
+        expected = inferred[scope]
+        if actual != expected:
+            raise ValueError(
+                f"task {str(raw_name)!r} scope {scope!r} maps physical warps "
+                f"{list(actual)}, expected {list(expected)} from TLX async-task topology"
+            )
 
 
 def _validate_instrumentation_mapping(

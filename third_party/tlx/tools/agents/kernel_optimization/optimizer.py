@@ -79,7 +79,6 @@ _DIAGNOSTIC_SUMMARY_OMIT_KEYS = frozenset(
         "commands",
         "environment",
         "instrumentation_mapping",
-        "instrumentation_mapping_path",
         "instrumented_source",
         "instrumented_source_path",
         "kernel_source",
@@ -231,6 +230,7 @@ def _collect_diagnostic_profiles(
             source,
             proposal.mapping,
             pass_capabilities=capabilities,
+            environment=request.target.environment,
         )
         mapping_text = json.dumps(proposal.mapping, indent=2, sort_keys=True) + "\n"
         mapping_root = diagnostic_request.artifacts_dir
@@ -256,6 +256,8 @@ def _collect_diagnostic_profiles(
         instrumented_request = replace(
             diagnostic_request,
             source_digest=instrumented_digest,
+            instrumentation_mapping=proposal.mapping,
+            instrumentation_mapping_digest=mapping_digest,
         )
         if check_deadline is not None:
             check_deadline()
@@ -668,6 +670,8 @@ def _collect_targeted_diagnostic(
     artifacts_dir: Path,
     experiment_id: str,
     diagnostic_passes_used: int,
+    *,
+    instrumentation_provider: DiagnosticInstrumentationProvider | None = None,
 ) -> tuple[PerformanceSummary, int, str]:
     if not proposal.profiling_hint.pass_name:
         return performance, diagnostic_passes_used, ""
@@ -717,8 +721,11 @@ def _collect_targeted_diagnostic(
         artifacts_dir,
         experiment_id,
         reason="targeted_diagnostic",
+        instrumentation_provider=instrumentation_provider,
         profile_request=decision.request,
         cases=(selected_case,),
+        pass_capabilities=capabilities,
+        instrumentation_rationale=proposal.profiling_hint.rationale,
     )
     return (
         _merge_diagnostic_profiles(performance, profiles),
@@ -864,7 +871,7 @@ def _compact_diagnostic_value(value: object, depth: int = 0) -> JsonValue:
         compact: dict[str, JsonValue] = {}
         for key, item in sorted(value.items(), key=lambda entry: str(entry[0])):
             name = str(key)
-            if name in _DIAGNOSTIC_SUMMARY_OMIT_KEYS:
+            if name in _DIAGNOSTIC_SUMMARY_OMIT_KEYS or name.endswith("_path"):
                 continue
             compact[name] = _compact_diagnostic_value(item, depth + 1)
             if len(compact) >= 64:
@@ -1585,6 +1592,9 @@ class KernelOptimizer:
                     artifacts_dir,
                     "baseline",
                     reason="baseline_diagnostic",
+                    instrumentation_provider=(
+                        self._diagnostic_instrumentation_provider
+                    ),
                     profile_request=baseline_diagnostic_request,
                 )
                 baseline = _merge_diagnostic_profiles(baseline, baseline_diagnostics)
@@ -1810,6 +1820,9 @@ class KernelOptimizer:
                             artifacts_dir,
                             experiment_id,
                             diagnostic_passes_used,
+                            instrumentation_provider=(
+                                self._diagnostic_instrumentation_provider
+                            ),
                         )
                         perf_profiles = _profiles_by_case(performance)
                         profile_path = store.write_profile(
@@ -2021,6 +2034,9 @@ class KernelOptimizer:
                         artifacts_dir,
                         "finalist_revalidation",
                         reason="rejected_finalist_diagnostic",
+                        instrumentation_provider=(
+                            self._diagnostic_instrumentation_provider
+                        ),
                         profile_request=rejected_request,
                     )
                     finalist_revalidation = _merge_diagnostic_profiles(
@@ -2072,6 +2088,9 @@ class KernelOptimizer:
                         artifacts_dir,
                         "final",
                         reason="final_winner_diagnostic",
+                        instrumentation_provider=(
+                            self._diagnostic_instrumentation_provider
+                        ),
                         profile_request=final_diagnostic_request,
                     )
                     final_profile = _merge_diagnostic_profiles(

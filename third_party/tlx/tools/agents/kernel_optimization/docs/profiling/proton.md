@@ -79,10 +79,23 @@ data = "trace"
 granularity = "warp"
 ```
 
-Enable Triton semantic explicitly for source-level scopes. Group warp lanes by
-known async-task warp ranges from the kernel source, generated metadata, or a
-saved mapping artifact. Persist the mapping and the instrumentation command as
-absolute artifact paths so another agent can reproduce the grouping.
+Enable Triton semantic explicitly for source-level scopes. When an
+instrumentation provider is available, automatic baseline, targeted-candidate,
+and finalist diagnostics must ask it to analyze the current source and generate
+temporary instrumentation plus a matching mapping. The diagnostic profile
+request carries that mapping inline and includes
+`instrumentation_mapping_digest`; the harness must use that mapping for the
+instrumented replay. A target-supplied instrumented replay remains the fallback
+when no provider is configured. Group warp lanes by physical CTA warp IDs from
+known async-task ranges, never by logical role order or task index. For example,
+with `triton.Config(..., num_warps=4)`, the default task owns physical warps
+`[0, 1, 2, 3]`; three following one-warp tasks without explicit starts own
+`[4]`, `[5]`, and `[6]`. Account for `replicate` and use
+`warp_group_start_id` when present. The provider canonicalizes these ranges from
+the source when the topology is statically provable and otherwise leaves the
+mapping for strict trace-time ownership validation. Persist the mapping and the
+instrumentation command as absolute artifact paths so another agent can
+reproduce the grouping.
 
 Do not request `warp_group` granularity because the runtime rejects it today.
 Do not infer async-task overlap from CTA-level or kernel-level scopes.
