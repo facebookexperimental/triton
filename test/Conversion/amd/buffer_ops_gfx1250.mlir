@@ -1,44 +1,5 @@
 // RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 | FileCheck %s
 
-// A scheduling boundary before a tensor store must also follow the address
-// calculations introduced when that store is expanded into vector stores.
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: buffer_store_scheduling_boundary
-  tt.func @buffer_store_scheduling_boundary(%ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %values: tensor<256xf32, #blocked>) {
-    %offsets = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked>
-    // CHECK: llvm.mul
-    // CHECK: llvm.mul
-    // CHECK: rocdl.sched.barrier none
-    // CHECK-NEXT: rocdl.raw.ptr.buffer.store
-    // CHECK-NEXT: rocdl.raw.ptr.buffer.store
-    // CHECK-NEXT: llvm.return
-    rocdl.sched.barrier none
-    amdg.buffer_store %values, %ptr[%offsets] : tensor<256xf32, #blocked>
-    tt.return
-  }
-}
-
-// -----
-
-// Do not move a boundary past an intervening memory operation.
-#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: buffer_store_boundary_before_load
-  tt.func @buffer_store_boundary_before_load(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>, %offsets: tensor<128xi32, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 4 : i32}) {
-    // CHECK: rocdl.sched.barrier none
-    // CHECK: rocdl.raw.ptr.buffer.load
-    // CHECK-NOT: rocdl.sched.barrier
-    // CHECK: rocdl.raw.ptr.buffer.store
-    rocdl.sched.barrier none
-    %values = amdg.buffer_load %src[%offsets] : tensor<128xf32, #blocked>
-    amdg.buffer_store %values, %dst[%offsets] : tensor<128xf32, #blocked>
-    tt.return
-  }
-}
-
-// -----
-
 // Test buffer atomic RMW fadd with f32 on gfx1250
 // Verifies correct cache policy with SCOPE_DEV and fence generation
 

@@ -12,7 +12,6 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/ValueRange.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -2091,20 +2090,6 @@ struct BufferStoreOpConversion
   LogicalResult
   matchAndRewrite(triton::amdgpu::BufferStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // A source scheduling boundary before a store should also separate its
-    // address calculations from the machine stores. Those calculations are
-    // partly introduced here, after the source boundary has been lowered.
-    ROCDL::SchedBarrier storeBoundary;
-    for (Operation *prev = op->getPrevNode(); prev;
-         prev = prev->getPrevNode()) {
-      if (auto barrier = dyn_cast<ROCDL::SchedBarrier>(prev)) {
-        if (barrier.getMask() == ROCDL::SchedGroupMask::none)
-          storeBoundary = barrier;
-        break;
-      }
-      if (!isMemoryEffectFree(prev))
-        break;
-    }
     auto loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     LLVM::AMD::BufferEmitter bufferEmitter(rewriter, loc, targetInfo);
@@ -2150,7 +2135,6 @@ struct BufferStoreOpConversion
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
-    SmallVector<ROCDL::RawPtrBufferStoreOp> stores;
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
       if (!isCanonicalIndex(vecStart, regMask)) {
         // Don't emit store ops for redundant elements within a thread
@@ -2167,17 +2151,8 @@ struct BufferStoreOpConversion
           valueElems, vecStart);
       bufferEmitter.emitStore(rsrcDesc, offsetElems[vecStart], storeVal, pred,
                               cacheMod);
-      stores.push_back(cast<ROCDL::RawPtrBufferStoreOp>(op->getPrevNode()));
     } // end vec
 
-    if (storeBoundary && !stores.empty()) {
-      // Finish every address and packed value before issuing any store. In
-      // particular, gfx1250 must wait when an address calculation reuses a
-      // VGPR still read by an outstanding store.
-      for (Operation *store : stores)
-        rewriter.moveOpBefore(store, op);
-      rewriter.moveOpBefore(storeBoundary, stores.front());
-    }
     rewriter.eraseOp(op);
     return success();
   }
