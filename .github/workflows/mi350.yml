@@ -59,7 +59,7 @@ env:
   MAX_JOBS: 16
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
-  TORCHINDUCTOR_TLX_MODE: ""
+  TORCHINDUCTOR_TLX_MODE: "off"
 
 jobs:
   mi350-build:
