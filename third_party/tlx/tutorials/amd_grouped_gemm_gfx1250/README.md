@@ -189,10 +189,9 @@ Each tuple is `(G, M_per_group, N, K)`. The default cases cover the requested
 `G=8/32`, `M_per_group=32768/65536`, `N=4096/8192`, `K=4096`
 combinations plus the `16x4096x4096x4096` reference.
 
-The sweep defaults to `256x256x128`, depth 2, alias-C, and cross-tile prefetch
-disabled for every shape. Use
-`--cross-tile-prefetch` to compare the revised hybrid with TDM output stores.
-`--auto-config`
+The sweep defaults to `256x256x128`, depth 2, and the within-group hybrid with
+cross-tile prefetch and TDM output stores enabled for every shape. Use
+`--no-cross-tile-prefetch` to compare the alias-C schedule. `--auto-config`
 instead lets the kernel's general cost model select the configuration,
 including whether to use cross-tile prefetch.
 
