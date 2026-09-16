@@ -1069,14 +1069,13 @@ class HarnessTest(unittest.TestCase):
             kernel, None, None, None, "hopper"
         )
         self.assertEqual(
-            harness,
-            Path(__file__).with_name("harnesses")
-            / "hopper"
-            / "targets"
-            / "gemm"
-            / "harness.py",
+            harness.parts[-5:],
+            ("harnesses", "hopper", "targets", "gemm", "harness.py"),
         )
+        self.assertTrue(harness.is_file())
+        self.assertEqual(cases.parent, harness.parent)
         self.assertEqual(cases.name, "cases.json")
+        self.assertEqual(target.parent, harness.parent)
         self.assertEqual(target.name, "target.json")
 
     def test_resolves_gfx950_gemm_harness(self) -> None:
@@ -1088,23 +1087,27 @@ class HarnessTest(unittest.TestCase):
             "gfx950",
             "gemm",
         )
-        expected = Path(__file__).with_name("harnesses") / "gfx950" / "targets" / "gemm"
-        self.assertEqual(harness, expected / "harness.py")
-        self.assertEqual(cases, expected / "cases.json")
-        self.assertEqual(target, expected / "target.json")
+        self.assertEqual(
+            harness.parts[-5:],
+            ("harnesses", "gfx950", "targets", "gemm", "harness.py"),
+        )
+        self.assertTrue(harness.is_file())
+        self.assertEqual(cases.parent, harness.parent)
+        self.assertEqual(cases.name, "cases.json")
+        self.assertEqual(target.parent, harness.parent)
+        self.assertEqual(target.name, "target.json")
 
     def test_default_arch_only_uses_arches_with_matching_target(self) -> None:
         kernel = Path("vector_add.py")
         harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
-            harness,
-            Path(__file__).with_name("harnesses")
-            / "host"
-            / "targets"
-            / "vector_add"
-            / "harness.py",
+            harness.parts[-5:],
+            ("harnesses", "host", "targets", "vector_add", "harness.py"),
         )
+        self.assertTrue(harness.is_file())
+        self.assertEqual(cases.parent, harness.parent)
         self.assertEqual(cases.name, "cases.json")
+        self.assertEqual(target.parent, harness.parent)
         self.assertEqual(target.name, "target.json")
 
     def test_standalone_harness_evaluates_fake_kernel(self) -> None:
