@@ -496,7 +496,9 @@ def grouped_gemm_tdm_kernel(
     # The square tile uses one third fewer LDS reads per WMMA than 128x256.
     # Limit operand lifetimes and K-loop scope to keep it free of scratch spills.
     OPTIMIZE_CROSS_TILE: tl.constexpr = CROSS_TILE_PREFETCH and BLOCK_M == 256 and BLOCK_N == 256
-    if OPTIMIZE_CROSS_TILE:
+    OPTIMIZE_ALIAS_C: tl.constexpr = C_STAGING_MODE == 0 and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 2
+    LIMIT_DOT_LIFETIME: tl.constexpr = OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
+    if LIMIT_DOT_LIFETIME:
         # CDNA5 SCHED_MODE[2] lets this single-wave-per-SIMD schedule queue
         # WMMAs while independent scalar and memory instructions execute.
         tl.inline_asm_elementwise(
@@ -713,7 +715,7 @@ def grouped_gemm_tdm_kernel(
                         producer_i = i + NUM_BUFFERS
                         acc, a3, b3 = _tdm_accumulate_subtiles(acc, a0, b0, a_desc, b_desc, a_buf, b_buf, i, producer_i,
                                                                L2_PREFETCH_DISTANCE, BLOCK_K, NUM_BUFFERS, BLOCK_M,
-                                                               BLOCK_N, SUBTILE_LEN, OPTIMIZE_CROSS_TILE)
+                                                               BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
                         _tdm_issue_loads_unpredicated(
                             a_desc,
                             b_desc,
@@ -726,7 +728,7 @@ def grouped_gemm_tdm_kernel(
                             NUM_BUFFERS,
                         )
                         acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, i + 1, NUM_BUFFERS,
-                                                                   BLOCK_M, BLOCK_N, SUBTILE_LEN, OPTIMIZE_CROSS_TILE)
+                                                                   BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
 
                 if OPTIMIZE_CROSS_TILE:
                     if not prefetched_boundary:
@@ -790,7 +792,7 @@ def grouped_gemm_tdm_kernel(
                     consumer_j = steady_end + j
                     acc, a3, b3 = _tdm_accumulate_subtiles(acc, a0, b0, a_desc, b_desc, a_buf, b_buf, consumer_j, j, 0,
                                                            BLOCK_K, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN,
-                                                           OPTIMIZE_CROSS_TILE)
+                                                           LIMIT_DOT_LIFETIME)
                     _tdm_issue_loads(
                         next_a_desc,
                         next_b_desc,
@@ -804,12 +806,12 @@ def grouped_gemm_tdm_kernel(
                         NUM_BUFFERS,
                     )
                     acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer_j + 1, NUM_BUFFERS,
-                                                               BLOCK_M, BLOCK_N, SUBTILE_LEN, OPTIMIZE_CROSS_TILE)
+                                                               BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
             else:
                 for i in tl.range(0, K_ITERS):
                     acc, a3, b3 = _tdm_accumulate_subtiles(acc, a0, b0, a_desc, b_desc, a_buf, b_buf, consumer,
                                                            producer, L2_PREFETCH_DISTANCE, BLOCK_K, NUM_BUFFERS,
-                                                           BLOCK_M, BLOCK_N, SUBTILE_LEN, OPTIMIZE_CROSS_TILE)
+                                                           BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
                     consumer += 1
                     pred = (i + 1) - epilogue_lb
                     pred = (pred >> 31) & 1
@@ -829,7 +831,7 @@ def grouped_gemm_tdm_kernel(
                     # final WMMA, then wait until the older consumer group is
                     # complete.
                     acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer, NUM_BUFFERS,
-                                                               BLOCK_M, BLOCK_N, SUBTILE_LEN, OPTIMIZE_CROSS_TILE)
+                                                               BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
 
             if OPTIMIZE_CROSS_TILE:
                 # Direct C stores leave both input rings intact without a
@@ -1084,8 +1086,8 @@ def test_grouped_gemm_cost_model_selects_small_m_tile():
     assert (cfg["block_m"], cfg["block_n"]) == (128, 256)
 
 
-@pytest.mark.parametrize("TDM_PIPELINE_DEPTH", [2, 3, 4])
-def test_grouped_gemm_tdm_compiles_gfx1250(TDM_PIPELINE_DEPTH):
+@pytest.mark.parametrize("BLOCK_SIZE,TDM_PIPELINE_DEPTH", [(128, 2), (128, 3), (128, 4), (256, 2)])
+def test_grouped_gemm_tdm_compiles_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH):
     """The packed ragged-M path should lower to gfx1250 TDM ops."""
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
@@ -1095,8 +1097,8 @@ def test_grouped_gemm_tdm_compiles_gfx1250(TDM_PIPELINE_DEPTH):
         signature=_grouped_gemm_tdm_compile_signature(),
         constexprs={
             "NUM_PROGRAMS": 8,
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
+            "BLOCK_M": BLOCK_SIZE,
+            "BLOCK_N": BLOCK_SIZE,
             "BLOCK_K": 128,
             "GROUP_M": 4,
             "NUM_BUFFERS": TDM_PIPELINE_DEPTH,
@@ -1265,26 +1267,29 @@ def test_grouped_gemm_phase0_ragged_gfx1250():
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-@pytest.mark.parametrize("TDM_PIPELINE_DEPTH", [2, 3, 4])
-def test_grouped_gemm_tdm_packed_ragged_m_gfx1250(TDM_PIPELINE_DEPTH):
+@pytest.mark.parametrize("BLOCK_SIZE,TDM_PIPELINE_DEPTH,K", [(128, 2, 512), (128, 3, 512), (128, 4, 512), (256, 2, 256),
+                                                             (256, 2, 384), (256, 2, 512)])
+def test_grouped_gemm_tdm_packed_ragged_m_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH, K):
     device = triton.runtime.driver.active.get_active_torch_device()
     torch.manual_seed(0)
 
-    m_list = [128, 256, 384]
-    n = 256
-    k = 512
+    # The square tile also exercises repeated C/A alias reuse and empty groups.
+    m_list = [0, 256, 512, 0, 768] if BLOCK_SIZE == 256 else [128, 256, 384]
+    n = 2 * BLOCK_SIZE
+    k = K
     a_packed, b_t, group_offsets, group_a = _make_packed_ragged_m(m_list, n, k, device)
 
     actual = grouped_gemm_tdm(
         a_packed,
         b_t,
         group_offsets,
-        block_m=128,
-        block_n=128,
+        block_m=BLOCK_SIZE,
+        block_n=BLOCK_SIZE,
         block_k=128,
         group_m=4,
         tdm_pipeline_depth=TDM_PIPELINE_DEPTH,
         l2_prefetch_distance=0,
+        num_programs=2 if BLOCK_SIZE == 256 else None,
     )
 
     start = 0
