@@ -40,6 +40,10 @@ num_warps = 4
 waves_per_eu = 1
 ```
 
+This default aliases the C staging tile onto the A ring. The square depth-2
+schedule bounds operand lifetimes at each dot and enables CDNA5
+`SCHED_MODE[2]` so queued WMMAs overlap independent instructions.
+
 Preferred smaller-M configuration:
 
 ```text
