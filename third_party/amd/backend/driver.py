@@ -184,8 +184,6 @@ class HIPUtils(object):
         self.create_tdm_descriptor = mod.create_tdm_descriptor
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
-        self._TritonDispatcher = mod._TritonDispatcher
-        self.register_tensor_bridge = mod.register_tensor_bridge
         global PyTDMDescriptor
         global PyKernelArg
         global ARG_CONSTEXPR
