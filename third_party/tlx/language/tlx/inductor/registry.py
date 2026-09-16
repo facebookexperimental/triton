@@ -2831,3 +2831,10 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 
 
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
+
+
+# Register graph-level GEMM + normalization rewrites when the TLX integration
+# is installed early by TorchInductor's post-grad pass.
+from .gemm_norm_gfx950 import register_gemm_norm_patterns
+
+register_gemm_norm_patterns()
