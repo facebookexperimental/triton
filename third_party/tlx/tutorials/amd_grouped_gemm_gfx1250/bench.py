@@ -5,9 +5,9 @@ Each case runs in a separate process so its large GPU allocations are released
 before the next case starts. Subprocesses use the current Python interpreter
 and inherit its environment.
 
-The standard sweep uses alias-C with cross-tile prefetch disabled.
---cross-tile-prefetch enables the within-group hybrid; --auto-config selects
-the kernel's general cost model instead.
+The standard sweep uses the within-group hybrid with cross-tile prefetch enabled.
+--no-cross-tile-prefetch selects alias-C; --auto-config selects the kernel's
+general cost model instead.
 """
 
 from __future__ import annotations
@@ -216,8 +216,8 @@ def main() -> int:
     parser.add_argument("--l2-prefetch-distance", type=int, default=0)
     parser.add_argument("--num-programs", type=int, default=None)
     parser.add_argument("--dedicated-c-buffer", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=False,
-                        help="enable cross-tile prefetch (default: off); alias-C uses the 256x256 within-group hybrid")
+    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=True,
+                        help="enable cross-tile prefetch (default: on); alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto-config", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none")
     parser.add_argument("--num-xcds", type=int, default=8)
