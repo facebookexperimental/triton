@@ -55,8 +55,7 @@ waves_per_eu = 1
 ```
 
 The dedicated C buffer keeps the asynchronous output store from blocking reuse
-of the A ring. It performed better than aliasing C onto A while retaining a
-finer M tile for smaller expert groups.
+of the A ring while retaining a finer M tile for smaller expert groups.
 
 Cross-tile prefetch peels the final TDM-ring rotation and reuses released input
 slots for K0/K1 of the next tile assigned to the same persistent program. It
