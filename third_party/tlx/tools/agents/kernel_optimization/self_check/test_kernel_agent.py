@@ -20,6 +20,7 @@ from ..decision_maker.cli import (
     _validate_host_matches_target,
 )
 from ..decision_maker.harness import StandaloneHarness, SubprocessHarness
+from ..decision_maker.targets import registry as target_registry
 from ..contracts import (
     AutoCommitResult,
     BlastRadius,
@@ -64,6 +65,10 @@ from ..optimizer.source import (
     validate_kernel_source,
     validate_replacement_source,
 )
+
+# Derive from the registry module, not from this test file: under Buck the
+# link-tree sources are symlinks, and the registry resolves them.
+_TARGETS_ROOT = Path(target_registry.__file__).resolve().parent
 
 
 class ScoringTest(unittest.TestCase):
@@ -1004,13 +1009,7 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(
             harness,
-            Path(__file__).parents[1]
-            / "decision_maker"
-            / "targets"
-            / "nvidia"
-            / "hopper"
-            / "gemm"
-            / "harness.py",
+            _TARGETS_ROOT / "nvidia" / "hopper" / "gemm" / "harness.py",
         )
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
@@ -1024,14 +1023,7 @@ class HarnessTest(unittest.TestCase):
             "gfx950",
             "gemm",
         )
-        expected = (
-            Path(__file__).parents[1]
-            / "decision_maker"
-            / "targets"
-            / "amd"
-            / "gfx950"
-            / "gemm"
-        )
+        expected = _TARGETS_ROOT / "amd" / "gfx950" / "gemm"
         self.assertEqual(harness, expected / "harness.py")
         self.assertEqual(cases, expected / "cases.json")
         self.assertEqual(target, expected / "target.json")
@@ -1041,12 +1033,7 @@ class HarnessTest(unittest.TestCase):
         harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
-            Path(__file__).parents[1]
-            / "decision_maker"
-            / "targets"
-            / "host"
-            / "vector_add"
-            / "harness.py",
+            _TARGETS_ROOT / "host" / "vector_add" / "harness.py",
         )
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
