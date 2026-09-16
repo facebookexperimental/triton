@@ -284,3 +284,23 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+@tl.builtin
+def amd_iglp_opt(variant: tl.constexpr, _semantic=None):
+    """Select an AMD instruction-group scheduling strategy for the current region.
+
+    Variants 0 and 1 interleave LDS and MFMA operations for small GEMMs, with
+    variant 1 targeting a single wave. Variants 2 and 3 interleave transcendental
+    and MFMA operations; variant 2 also schedules their predecessors.
+
+    Use one hint per scheduling region. The region must not also contain
+    :func:`amd_sched_barrier`. Strategies follow LLVM's experimental IGLP
+    implementation. This hint adds no memory or workgroup synchronization.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_iglp_opt is only supported on AMD (HIP) backends")
+    variant = tl._unwrap_if_constexpr(variant)
+    assert isinstance(variant, int) and not isinstance(variant, bool), "variant must be a constexpr integer"
+    assert 0 <= variant <= 3, f"variant must be one of 0, 1, 2, or 3, got {variant}"
+    _semantic.builder.create_amd_iglp_opt(variant)
