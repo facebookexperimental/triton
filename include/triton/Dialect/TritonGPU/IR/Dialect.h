@@ -102,6 +102,14 @@ int lookupPhysicalNumCTAs(OpBuilder &rewriter);
 void setHasSingleWarpSpecialize(ModuleOp module, bool value);
 bool hasSingleWarpSpecialize(ModuleOp module);
 
+// Walk a value back through any `ttg.warp_specialize` explicit captures it
+// entered a partition region through, returning the value as defined outside.
+// A captured value is a block argument with no defining op, so callers that
+// inspect the defining op (constant matching, uniformity analysis) see nothing
+// unless they resolve through the capture first. Returns `value` unchanged when
+// it is not a capture.
+Value resolveWarpSpecializeCapture(Value value);
+
 template <typename Key, typename Value> class Cache {
 public:
   std::optional<Value> get(const Key &key) {

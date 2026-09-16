@@ -114,8 +114,7 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Arrive at named hardware barrier"},
 
     // Takes (mask, pred) in both spellings, so the generic operand order holds.
-    {"ttng.vote_ballot_sync", "tlx.vote_ballot_sync",
-     "Warp-level vote ballot"},
+    {"ttng.vote_ballot_sync", "tlx.vote_ballot_sync", "Warp-level vote ballot"},
 
     // Memory allocation operations - local_alloc is handled specially
     // ttng.tmem_alloc: handled specially in printSimplifiedOp
@@ -385,10 +384,10 @@ bool isConstantTrue(Value v) {
   return false;
 }
 
-// Split a memdesc shape into the `num` and `shape` arguments of tlx.local_alloc.
-// A buffer is up to 2-D, so only a rank above that is multi-buffering; this is the
-// same rule analyzeLocalAlloc applies, and the two must agree or an alias and its
-// base describe different buffer counts.
+// Split a memdesc shape into the `num` and `shape` arguments of
+// tlx.local_alloc. A buffer is up to 2-D, so only a rank above that is
+// multi-buffering; this is the same rule analyzeLocalAlloc applies, and the two
+// must agree or an alias and its base describe different buffer counts.
 static void splitAllocShape(ArrayRef<int64_t> shape, int64_t &count,
                             SmallVectorImpl<int64_t> &tileShape) {
   if (shape.size() > 2) {
@@ -468,7 +467,6 @@ static const llvm::StringSet<> elementTypeCastOps = {
     "arith.uitofp", "arith.fptosi", "arith.fptoui",
 };
 
-
 // Element types getElementTypeName can spell as a TLX dtype. Anything else it
 // renders as raw MLIR, which is not usable in emitted Python.
 static bool isNameableElementType(Type type) {
@@ -500,7 +498,8 @@ static bool isPythonIdentifier(StringRef s) {
 }
 
 // Whether getValueName spells an element-type cast or erases it: erased when
-// TLX cannot name the dtype, or the operand is `None`. Shared with the resolver.
+// TLX cannot name the dtype, or the operand is `None`. Shared with the
+// resolver.
 static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
   return castOp && castOp->getNumOperands() > 0 &&
          castOp->getNumResults() > 0 &&
@@ -558,7 +557,8 @@ getValueName(Value v,
     }
 
     // An element-type cast is user-visible -- the kernel wrote `x.to(dtype)` --
-    // so unlike the layout-only casts below it is re-emitted, inline at each use.
+    // so unlike the layout-only casts below it is re-emitted, inline at each
+    // use.
     if (elementTypeCastOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
       std::string operand = getValueName(defOp->getOperand(0),
@@ -580,11 +580,23 @@ getValueName(Value v,
     // intercepts them whenever their dtype is nameable, so reaching one here
     // means it is not, and erasing it beats emitting an uncompilable dtype.
     static const llvm::StringSet<> transparentOps = {
-        "ttg.convert_layout", "arith.extui",   "arith.extsi",
-        "arith.extf",         "arith.trunci",  "arith.truncf",
-        "arith.sitofp",       "arith.uitofp",  "arith.fptosi",
-        "arith.fptoui",       "arith.bitcast", "arith.index_cast",
-        "arith.index_castui", "tt.splat",      "tt.broadcast",
+        "ttg.convert_layout",
+        "arith.extui",
+        "arith.extsi",
+        "arith.extf",
+        "arith.trunci",
+        "arith.truncf",
+        "arith.sitofp",
+        "arith.uitofp",
+        "arith.fptosi",
+        "arith.fptoui",
+        "arith.bitcast",
+        "arith.index_cast",
+        "arith.index_castui",
+        "tt.splat",
+        "tt.broadcast",
+        "ttng.user_named_barrier_id",
+        "ttng.compiler_named_barrier_id",
     };
     if (transparentOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
@@ -917,6 +929,8 @@ bool shouldSkipOp(
       "arith.bitcast",
       "arith.index_cast",
       "arith.index_castui",
+      "ttng.user_named_barrier_id",
+      "ttng.compiler_named_barrier_id",
       "ttng.inval_barrier",
       "tt.splat",
       "tt.broadcast",
@@ -1305,6 +1319,42 @@ bool regionHasMeaningfulOps(
   return false;
 }
 
+// Print an async_task body, or `pass` if it turns out to be empty.
+// A partition can hold nothing the printer emits -- the "default" partition of
+// a warp_specialize often holds only ops that are skipped -- and Python needs a
+// body, so an empty one has to be spelled rather than omitted.
+static void
+printTaskBody(Region &region, llvm::raw_ostream &os,
+              const llvm::StringMap<StringRef> &opNameMap,
+              const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+              llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+              DenseMap<Value, Value> *argSubstitutionMap) {
+  std::string body;
+  llvm::raw_string_ostream bodyOs(body);
+  printRegion(region, bodyOs, opNameMap, allocInfoMap, skippedOps, indent,
+              argSubstitutionMap);
+  bodyOs.flush();
+
+  // A comment does not count: the printer emits standalone `# unsupported: ...`
+  // markers, and a block holding only those is as unparseable as an empty one.
+  bool hasStatement = false;
+  for (StringRef line : llvm::split(StringRef(body), '\n')) {
+    StringRef trimmed = line.ltrim();
+    if (trimmed.empty() || trimmed.starts_with("#"))
+      continue;
+    hasStatement = true;
+    break;
+  }
+
+  os << body;
+  if (hasStatement)
+    return;
+  // Keep any markers that were emitted and give the block something to run.
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "pass\n";
+}
+
 // Print warp_specialize operation in TLX async_tasks format
 void printWarpSpecialize(
     Operation *op, llvm::raw_ostream &os,
@@ -1342,8 +1392,8 @@ void printWarpSpecialize(
       os << "with tlx.async_task(\"default\"):\n";
 
       // Print region contents with extra indentation and substitution map
-      printRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
-                  &argSubstitutionMap);
+      printTaskBody(region, os, opNameMap, allocInfoMap, skippedOps, indent + 2,
+                    &argSubstitutionMap);
     } else {
       // Subsequent regions contain ttg.warp_specialize.partitions
       // which has multiple regions (one per partition)
@@ -1394,8 +1444,8 @@ void printWarpSpecialize(
               os << "):\n";
 
               // Print partition contents
-              printRegion(partitionRegion, os, opNameMap, allocInfoMap,
-                          skippedOps, indent + 2, &argSubstitutionMap);
+              printTaskBody(partitionRegion, os, opNameMap, allocInfoMap,
+                            skippedOps, indent + 2, &argSubstitutionMap);
               partitionIdx++;
             }
           }
@@ -1652,8 +1702,8 @@ void printSimplifiedOp(
   // === Special-case handlers for ops needing custom printing ===
 
   // ttng.tmem_subslice: `offset` is an attribute the generic printer drops, and
-  // `size` is not an operand at all -- it is the extent of the sliced dimension in
-  // the result type.
+  // `size` is not an operand at all -- it is the extent of the sliced dimension
+  // in the result type.
   if (opName == "ttng.tmem_subslice") {
     // Asserted rather than tested: falling through would re-emit the very
     // one-argument call this handler exists to replace, so a silent default
@@ -1674,8 +1724,8 @@ void printSimplifiedOp(
   }
 
   // tt.elementwise_inline_asm carries the asm text, constraints, purity and
-  // packing as attributes, so the generic printer emits only the operands and the
-  // call is missing four of its six arguments.
+  // packing as attributes, so the generic printer emits only the operands and
+  // the call is missing four of its six arguments.
   if (opName == "tt.elementwise_inline_asm") {
     unsigned nres = op->getNumResults();
     for (unsigned i = 0; i < nres; ++i)
@@ -1720,8 +1770,8 @@ void printSimplifiedOp(
     return;
   }
 
-  // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is a
-  // syntax error rather than an undefined name, and it drops the message.
+  // `assert` is a Python keyword, so the generic `tt.assert(cond)` spelling is
+  // a syntax error rather than an undefined name, and it drops the message.
   if (opName == "tt.assert") {
     os << "tl.device_assert("
        << getValueName(op->getOperand(0), argSubstitutionMap);
@@ -1821,7 +1871,8 @@ void printSimplifiedOp(
 
     os << "tlx.local_store(" << dstName << ", " << srcName;
     // dstElemType is always nameable: local_store requires src and dst element
-    // types to match, and TT_Float is exactly what isNameableElementType covers.
+    // types to match, and TT_Float is exactly what isNameableElementType
+    // covers.
     if (dstElemType && resolvedSrcElemType &&
         resolvedSrcElemType != dstElemType) {
       os << ".to(" << getElementTypeName(dstElemType) << ")";
@@ -2121,8 +2172,8 @@ void printSimplifiedOp(
         Type elemType = dstType.getElementType();
         int64_t count = 1;
         SmallVector<int64_t> actualShape;
-        // This op is legal on shared memory too, so name the storage kind from the
-        // memory space rather than assuming tensor memory.
+        // This op is legal on shared memory too, so name the storage kind from
+        // the memory space rather than assuming tensor memory.
         bool isTmem = isa_and_nonnull<ttng::TensorMemorySpaceAttr>(
             dstType.getMemorySpace());
         splitAllocShape(dstType.getShape(), count, actualShape);
@@ -2401,7 +2452,8 @@ void printMapElementwise(
       for (unsigned k = 0; k < indent; ++k)
         os << "  ";
       // One tuple assignment so a multi-result map binds every result; result i
-      // is named in the enclosing scope, returned operand i in the inlined body.
+      // is named in the enclosing scope, returned operand i in the inlined
+      // body.
       assert(op->getNumResults() == bodyOp.getNumOperands() &&
              "map_elementwise must return one value per result");
       unsigned n = std::min(op->getNumResults(), bodyOp.getNumOperands());

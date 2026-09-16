@@ -11,9 +11,19 @@ from types import ModuleType
 from typing import Any
 
 try:
-    from .profiling import compact_profile_output, invoke_profile, per_case_profile_request
+    from .profiling import (
+        annotate_profile,
+        compact_profile_output,
+        invoke_profile,
+        per_case_profile_request,
+    )
 except ImportError:  # pragma: no cover - subprocess script execution path
-    from profiling import compact_profile_output, invoke_profile, per_case_profile_request
+    from profiling import (
+        annotate_profile,
+        compact_profile_output,
+        invoke_profile,
+        per_case_profile_request,
+    )
 
 
 def _load_harness(path: Path) -> ModuleType:
@@ -65,12 +75,98 @@ def _normalize_timing(result: Any) -> dict[str, Any]:
     }
 
 
+def _profile_case(
+    harness: ModuleType,
+    artifact: object,
+    case: Mapping[str, Any],
+    request_payload: Mapping[str, Any] | bool | None,
+) -> dict[str, Any]:
+    if not request_payload or not hasattr(harness, "profile"):
+        return {}
+    try:
+        profile_request = per_case_profile_request(
+            request_payload,
+            case["case_id"],
+        )
+        raw_profile = invoke_profile(harness.profile, artifact, case, profile_request)
+        annotated_profile = annotate_profile(
+            raw_profile,
+            profile_request,
+            case["case_id"],
+        )
+        return compact_profile_output(annotated_profile, profile_request)
+    except Exception as error:  # noqa: BLE001
+        return {"error": f"{type(error).__name__}: {error}"}
+
+
+def _base_case_result(
+    case: Mapping[str, Any], verification: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "case_id": case["case_id"],
+        "verification": verification,
+        "timing": None,
+        "profile": {},
+    }
+
+
+def _evaluate_cases(
+    harness: ModuleType,
+    artifact: object,
+    request: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    repetitions = int(request["benchmark_repetitions"])
+    results: list[dict[str, Any]] = []
+    for case in request["cases"]:
+        verification = _normalize_verification(harness.verify(artifact, case))
+        case_result = _base_case_result(case, verification)
+        if verification["passed"]:
+            case_result["timing"] = _normalize_timing(
+                harness.benchmark(artifact, case, repetitions)
+            )
+            case_result["profile"] = _profile_case(
+                harness,
+                artifact,
+                case,
+                request.get("profile"),
+            )
+        results.append(case_result)
+    return results
+
+
+def _profile_only_cases(
+    harness: ModuleType,
+    artifact: object,
+    request: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if not request.get("profile"):
+        raise TypeError("profile_only requires a profile request")
+    if not hasattr(harness, "profile"):
+        raise TypeError("profile_only requires harness profile()")
+    results: list[dict[str, Any]] = []
+    for case in request["cases"]:
+        verification = _normalize_verification(harness.verify(artifact, case))
+        case_result = _base_case_result(case, verification)
+        if verification["passed"]:
+            case_result["profile"] = _profile_case(
+                harness,
+                artifact,
+                case,
+                request.get("profile"),
+            )
+        results.append(case_result)
+    return results
+
+
 def _main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--harness", type=Path, required=True)
     parser.add_argument("--response", type=Path, required=True)
     args = parser.parse_args()
     request = json.load(sys.stdin)
+    mode = str(request.get("mode", "evaluate"))
+    if mode not in {"evaluate", "profile_only"}:
+        raise ValueError(f"unsupported worker mode: {mode}")
     harness = _load_harness(args.harness)
     target = request["target"]
     experiment = request.get("experiment")
@@ -92,35 +188,10 @@ def _main() -> int:
         args.response.write_text(json.dumps(response))
         return 0
 
-    repetitions = int(request["benchmark_repetitions"])
-    for case in request["cases"]:
-        verification = _normalize_verification(harness.verify(artifact, case))
-        case_result: dict[str, Any] = {
-            "case_id": case["case_id"],
-            "verification": verification,
-            "timing": None,
-            "profile": {},
-        }
-        if verification["passed"]:
-            case_result["timing"] = _normalize_timing(
-                harness.benchmark(artifact, case, repetitions)
-            )
-            if request.get("profile") and hasattr(harness, "profile"):
-                try:
-                    profile_request = per_case_profile_request(
-                        request.get("profile"), case["case_id"]
-                    )
-                    raw_profile = invoke_profile(
-                        harness.profile, artifact, case, profile_request
-                    )
-                    case_result["profile"] = compact_profile_output(
-                        raw_profile, profile_request
-                    )
-                except Exception as error:  # noqa: BLE001
-                    case_result["profile"] = {
-                        "error": f"{type(error).__name__}: {error}"
-                    }
-        response["cases"].append(case_result)
+    if mode == "profile_only":
+        response["cases"] = _profile_only_cases(harness, artifact, request)
+    else:
+        response["cases"] = _evaluate_cases(harness, artifact, request)
     args.response.write_text(json.dumps(response))
     return 0
 
