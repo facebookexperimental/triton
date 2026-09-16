@@ -5,8 +5,14 @@
 // and has partition annotations on key operations.
 
 // CHECK-LABEL: @matmul_kernel_tma_ws
+// Independent channels have independent full/empty barrier rings.
+// CHECK-DAG: ttg.local_alloc {{.*}} -> !ttg.memdesc<3x1xi64
+// CHECK-DAG: ttg.local_alloc {{.*}} -> !ttg.memdesc<2x1xi64
 // CHECK: ttg.barrier local
 // CHECK-NOT: ttg.barrier local
+// The requested A3/B2 channels remain separate physical rings.
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<3x128x64xf16
+// CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<2x128x64xf16
 // CHECK: ttg.warp_specialize
 // Default group: MMA operations
 // CHECK: default
@@ -72,9 +78,9 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %accumulator_20, %accumulator_21 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %accumulator_23:2 = scf.for %accumulator_27 = %c0_i32 to %k_tiles_19 step %c1_i32 iter_args(%accumulator_28 = %accumulator, %accumulator_29 = %accumulator_21) -> (i1, !ttg.async.token)  : i32 {
       %offs_k = arith.muli %accumulator_27, %c64_i32 {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i32
-      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, two_cta_load} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, tt.requested_buffer_depth = 3 : i32, ttg.partition = array<i32: 2>, two_cta_load} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
       %a_30 = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, two_cta_load} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
+      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 1 : i32, tt.requested_buffer_depth = 2 : i32, ttg.partition = array<i32: 2>, two_cta_load} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
       %accumulator_31 = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
       %accumulator_32 = ttg.memdesc_trans %accumulator_31 {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem> -> !ttg.memdesc<64x128xf16, #shared1, #smem>
       %accumulator_33 = ttng.tc_gen5_mma %a_30, %accumulator_32, %accumulator_20[%accumulator_29], %accumulator_28, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
