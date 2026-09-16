@@ -108,6 +108,39 @@ round-tripping, CLC-shaped ordered-subset carry, condition/task replication,
 warp-budget cleanup, and graceful rejection of reordered or computed
 condition forwarding.
 
+### Collective per-tile guards
+
+A CLC body may be wrapped in a zero-result bounds guard such as
+`if start_n < seq_len`. AutoWS treats this as collective control flow:
+
+- nearest-loop discovery crosses the `scf.if`, so the guarded K-loop remains
+  the persistent loop's compute loop;
+- scalar address/load chains feeding the condition are replicated into every
+  participating task, and each specialized partition clones the same `if`;
+- post-compute epilogue propagation crosses the guard, preserving accumulator
+  channels and dK/dV stores; and
+- reuse-group ordering uses the nearest enclosing `for`/`if`/`while`, so
+  guarded channels use the same accumulation counter and staging rotation.
+
+The guard is also a state merge. Each data-channel accumulation counter is
+looked up from the persistent while's after-region arguments, advanced only by
+the taken branch, returned unchanged by the skipped branch, and then yielded by
+the while into the next scheduler iteration. CLC broadcast counters remain
+unconditional because the scheduler itself advances on every tile, including a
+hole. Conflating these two cadences is a barrier-phase bug.
+
+An outer-produced input used by an inner MMAv5 loop has one more cadence
+requirement: its EMPTY completion fires only on the last inner iteration. The
+outer producer can be enclosed by this `scf.while` rather than an `scf.for`;
+failing to recognize that shape releases the input once per inner iteration
+while its counter advances once per valid tile. A hole can then expose an
+already-passed barrier phase on the next valid tile.
+
+This requires a collective predicate: all partitions must compute the same
+boolean. It permits rectangular CLC scheduling for jagged inputs, where an
+invalid tail tile skips the complete partitioned body in every task without
+changing cross-partition barrier cadence.
+
 The atomic-broadcast half of the outer-while path is now also validated in
 isolation (`ws_atomic_broadcast_from_psm.mlir`): starting from an
 **unpartitioned** dynamic-persistent GEMM `scf.while` with a scalar
