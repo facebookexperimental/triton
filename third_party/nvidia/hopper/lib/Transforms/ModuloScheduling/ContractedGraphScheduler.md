@@ -128,6 +128,13 @@ SMEM/TMEM headroom are excluded.
 contracted nodes, stage assignments considered/rejected, and the GEMM plus
 GEMM-reaching-load signature for each retained top-K schedule.
 
+`TRITON_WS_SEARCH_MANIFEST=<path>` appends one JSON-line record per retained
+candidate with its rank, selected bit, structural II, load-order variant, and
+canonical schedule signature. The memory planner appends its candidates to the
+same file later in compilation, allowing an external harness to enumerate the
+schedule×memory product without passing scheduler data structures between
+passes.
+
 ## Testing
 
 `test/TritonGPU/modulo-exhaustive-fa-bwd-bm64-tmem.mlir` is the primary lit
@@ -156,6 +163,7 @@ without operand-specific annotations.
 - [x] Exact two-stage GEMM assignment enumeration.
 - [x] Original-DDG placement and validation.
 - [x] GEMM-signature top-K deduplication and diagnostics.
+- [x] JSON-lines manifest for external schedule×memory composition.
 - [x] FA backward lit coverage for the target schedule.
 
 Keep this section synchronized with implementation changes.

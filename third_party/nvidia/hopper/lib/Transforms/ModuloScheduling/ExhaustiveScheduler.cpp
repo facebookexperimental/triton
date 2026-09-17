@@ -20,6 +20,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -702,11 +704,9 @@ static uint64_t hashStageSig(const llvm::SmallVector<int> &s) {
   return h;
 }
 
-FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
-                                                int maxII, int smemBudget,
-                                                int tmemColLimit,
-                                                int numSamples,
-                                                int minIIOverride) {
+FailureOr<ModuloScheduleResult>
+runRandomSearch(const DataDependenceGraph &ddg, int maxII, int smemBudget,
+                int tmemColLimit, int numSamples, int minIIOverride) {
   const int minII = std::max(ddg.computeMinII(), minIIOverride);
   if (minII <= 0)
     return failure();
@@ -1435,6 +1435,25 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   });
 
   int pick = std::min(getModuloPick(), nTop - 1);
+  auto manifestPath =
+      ::mlir::triton::tools::getStrEnv("TRITON_WS_SEARCH_MANIFEST");
+  if (!manifestPath.empty()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(manifestPath, ec, llvm::sys::fs::OF_Append);
+    if (!ec) {
+      for (int rank = 0; rank < nTop; ++rank) {
+        const auto &candidate = candidates[frontier[rank]];
+        os << "{\"kind\": \"schedule\", \"rank\": " << rank
+           << ", \"selected\": " << (rank == pick ? "true" : "false")
+           << ", \"ii\": " << candidate.II
+           << ", \"load_order_variant\": " << candidate.loadOrderVariant
+           << ", \"signature\": [";
+        for (unsigned i = 0; i < candidate.signature.size(); ++i)
+          os << (i ? ", " : "") << candidate.signature[i];
+        os << "]}\n";
+      }
+    }
+  }
   DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
     llvm::dbgs() << "[modulo-scheduling-contracted]: top-" << nTop
                  << " applying pick " << pick << " from " << candidates.size()

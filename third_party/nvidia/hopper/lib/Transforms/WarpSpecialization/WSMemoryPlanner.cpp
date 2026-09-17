@@ -2331,17 +2331,25 @@ static unsigned getMemPlanPick(triton::FuncOp funcOp) {
 // id/copy/member-count) to TRITON_WS_MEM_PLAN_TOPK_DUMP so a harness can see
 // what each PICK rank does. `pool` is "smem" or "tmem".
 static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
-                         unsigned firstId) {
+                         unsigned firstId, unsigned selectedRank) {
   auto path = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_TOPK_DUMP");
+  if (path.empty())
+    path = triton::tools::getStrEnv("TRITON_WS_SEARCH_MANIFEST");
   if (path.empty() || plans.empty())
     return;
+  int schedulePick = 0;
+  auto schedulePickValue = triton::tools::getStrEnv("TRITON_MODULO_PICK");
+  if (!schedulePickValue.empty())
+    schedulePick = std::max(0, std::atoi(schedulePickValue.c_str()));
   std::error_code ec;
   llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Append);
   if (ec)
     return;
   for (unsigned r = 0; r < plans.size(); ++r) {
     const wsplan::Plan &p = plans[r];
-    os << "{\"pool\": \"" << pool << "\", \"rank\": " << r
+    os << "{\"kind\": \"memory\", \"schedule_pick\": " << schedulePick
+       << ", \"pool\": \"" << pool << "\", \"rank\": " << r
+       << ", \"selected\": " << (r == selectedRank ? "true" : "false")
        << ", \"score\": " << llvm::format("%.3f", p.score) << ", \"blocks\": [";
     for (unsigned bi = 0; bi < p.blocks.size(); ++bi) {
       const wsplan::Block &blk = p.blocks[bi];
@@ -2552,9 +2560,10 @@ static bool refineFixedSmemPlan(
       break;
   }
 
-  dumpMemPlans(plans, "smem-fixed", /*firstId=*/0);
-  const wsplan::Plan &selected =
-      plans[std::min<size_t>(getMemPlanPick(funcOp), plans.size() - 1)];
+  unsigned selectedRank =
+      std::min<unsigned>(getMemPlanPick(funcOp), plans.size() - 1);
+  dumpMemPlans(plans, "smem-fixed", /*firstId=*/0, selectedRank);
+  const wsplan::Plan &selected = plans[selectedRank];
   auto i32 = IntegerType::get(funcOp.getContext(), 32);
   for (const wsplan::Block &block : selected.blocks)
     for (wsplan::BufferId member : block.members)
@@ -2668,9 +2677,10 @@ static unsigned allocateSmemBuffersViaSearch(
     }
   }
 
-  dumpMemPlans(plans, "smem", annotationMaxId);
-  const wsplan::Plan &plan =
-      plans[std::min<size_t>(getMemPlanPick(funcOp), plans.size() - 1)];
+  unsigned selectedRank =
+      std::min<unsigned>(getMemPlanPick(funcOp), plans.size() - 1);
+  dumpMemPlans(plans, "smem", annotationMaxId, selectedRank);
+  const wsplan::Plan &plan = plans[selectedRank];
   auto *ctx = funcOp.getContext();
   auto i32 = IntegerType::get(ctx, 32);
   unsigned nextId = annotationMaxId;
@@ -5722,9 +5732,10 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
     for (wsplan::Block &blk : p.blocks)
       blk.copies = 1;
 
-  dumpMemPlans(plans, "tmem", bufferId);
-  const wsplan::Plan &plan =
-      plans[std::min<size_t>(getMemPlanPick(funcOp), plans.size() - 1)];
+  unsigned selectedRank =
+      std::min<unsigned>(getMemPlanPick(funcOp), plans.size() - 1);
+  dumpMemPlans(plans, "tmem", bufferId, selectedRank);
+  const wsplan::Plan &plan = plans[selectedRank];
   auto *ctx = funcOp.getContext();
   auto i32 = IntegerType::get(ctx, 32);
 

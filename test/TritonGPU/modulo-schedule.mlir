@@ -7,6 +7,9 @@
 // RUN: env TRITON_MODULO_BASELINE_REPORT=1 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule 2>&1 | FileCheck %s --check-prefix=BASELINE
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted TRITON_MODULO_TOPK=2 TRITON_MODULO_PICK=0 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=CONTRACTED-A
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted TRITON_MODULO_TOPK=2 TRITON_MODULO_PICK=1 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=CONTRACTED-B
+// RUN: rm -f %t
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted TRITON_MODULO_TOPK=2 TRITON_MODULO_PICK=1 TRITON_WS_SEARCH_MANIFEST=%t triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule > /dev/null
+// RUN: FileCheck %s --check-prefix=MANIFEST --input-file=%t
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -85,6 +88,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CONTRACTED-B: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CONTRACTED-B: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32}
 // CONTRACTED-B: tt.scheduled_max_stage = 2 : i32
+
+// MANIFEST: {"kind": "schedule", "rank": 0, "selected": false, "ii": {{[0-9]+}}, "load_order_variant": 0, "signature": [
+// MANIFEST-NEXT: {"kind": "schedule", "rank": 1, "selected": true, "ii": {{[0-9]+}}, "load_order_variant": {{[1-9][0-9]*}}, "signature": [
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<128x64xf16>,
   %b_desc: !tt.tensordesc<64x128xf16>

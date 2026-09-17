@@ -41,7 +41,7 @@
 // The fixed-group dump accounts reuse-source ids as logical blocks backed by
 // another allocation. Their copies remain pinned, but they consume zero extra
 // budget and therefore do not block searching unrelated singleton operands.
-// FIXED-DUMP: {"pool": "smem-fixed", "rank": 0
+// FIXED-DUMP: {"kind": "memory", "schedule_pick": 0, "pool": "smem-fixed", "rank": 0
 // FIXED-DUMP-SAME: {"id": 20, "copy": 2, "members": 2, "allocated": false}
 // FIXED-DUMP-SAME: {"id": 22, "copy": 2, "members": 2, "allocated": false}
 

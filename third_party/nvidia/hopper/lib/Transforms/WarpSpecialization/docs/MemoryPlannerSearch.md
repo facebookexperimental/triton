@@ -214,6 +214,7 @@ full story.
 | `TRITON_WS_MEM_PLAN_TOPK=K` | Enumerate K ranked TMEM packings (opt-in search). |
 | `tt.mem_plan_pick` (IR attr, from `tl.range(mem_plan_pick=...)`) / `TRITON_WS_MEM_PLAN_PICK` | Apply ranked plan `pick` (0 = cost-best; autotune-native via the constexpr). |
 | `TRITON_WS_MEM_PLAN_TOPK_DUMP=<path>` | Dump the ranked plans (JSON) for an external sweep harness. |
+| `TRITON_WS_SEARCH_MANIFEST=<path>` | When the dedicated memory dump is unset, append memory candidates, selected state, and active schedule pick to the shared schedule×memory JSON-lines manifest. |
 | `TRITON_WS_SMEM_PLAN_SEARCH` | Enable the SMEM plan-space beam search. |
 
 ## 7. Debugging

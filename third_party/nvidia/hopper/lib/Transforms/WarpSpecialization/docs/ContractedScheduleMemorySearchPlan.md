@@ -41,6 +41,14 @@ operand depths. Cross-id `allocation.reuseTarget` sources remain distinct
 logical blocks but are excluded from the budget because their backing is owned
 by a pinned target block.
 
+**Implemented sixth slice:** Contracted scheduling and memory planning append
+independent JSON-lines records to `TRITON_WS_SEARCH_MANIFEST`. Schedule records
+contain rank, selected state, II, load-order variant, and signature; memory
+records contain the active schedule pick, memory rank and selected state, pool,
+score, and block layout. This is the pass-boundary contract for an external
+Cartesian-product harness; no in-process scheduler object is passed to the
+memory planner.
+
 **Primary implementation areas:**
 
 - `third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/`
@@ -570,6 +578,10 @@ Emit a manifest containing:
 
 Use generic schedule and memory picks; do not expose per-operand controls.
 
+The compiler-side manifest is now implemented via
+`TRITON_WS_SEARCH_MANIFEST`. The external compile/measure harness that consumes
+the JSON-lines records and sweeps the Cartesian product remains to be added.
+
 #### D120426461 example
 
 The measured set includes at least:
@@ -730,6 +742,9 @@ as a hard correctness floor.
       kernel.
 - [x] Cross-id `allocation.reuseTarget` footprint is modeled by fixed-group
       search without changing alias depth or topology.
+- [x] Compiler emits schedule and memory JSON-lines records for external
+      Cartesian-product search.
+- [ ] External harness compiles, validates, and measures the bounded product.
 - [ ] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [ ] FA-backward target schedule exists without stage/order annotations.
