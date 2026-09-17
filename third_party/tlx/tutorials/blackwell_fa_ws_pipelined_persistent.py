@@ -3304,17 +3304,19 @@ _configs_bwd_1cta_runtime = [
 ]
 _configs_bwd_2cta_runtime = [
     _make_bwd_runtime_config(2, epilogue_subtile, dq_stage_count)
-    for epilogue_subtile, dq_stage_count in ((4, 2), (8, 2), (8, 4))
+    for epilogue_subtile, dq_stage_count in ((2, 1), (4, 2), (8, 2), (8, 4))
 ]
 BWD_CONFIGS = _configs_bwd_1cta_runtime + _configs_bwd_2cta_runtime
 
 
 def prune_bwd_configs(configs, named_args, **kwargs):
-    n_ctx = kwargs["N_CTX"] if "N_CTX" in kwargs else named_args["N_CTX"]
+    kwargs = {**named_args, **kwargs}
+    n_ctx = kwargs["N_CTX"]
     configs = [
         config
         for config in configs
-        if (
+        if (config.kwargs["EPILOGUE_SUBTILE"] != 2 or kwargs.get("PRENORMALIZED_DO", False))
+        and (
             (n_ctx + config.kwargs["BLOCK_N1"] - 1)
             // config.kwargs["BLOCK_N1"]
         )
@@ -3332,7 +3334,15 @@ def prune_bwd_configs(configs, named_args, **kwargs):
                 and config.kwargs.get("DQ_STAGE_COUNT", 2) == 2
             ]
         else:
-            _, epilogue_subtile, dq_stage_count = BWD_DIRECT_DQ_CONFIG
+            if kwargs.get("PRENORMALIZED_DO", False):
+                if kwargs.get("BSHD_CONFIG", False) and n_ctx == 8192:
+                    epilogue_subtile, dq_stage_count = 4, 2
+                elif n_ctx >= 4096 and kwargs.get("STAGE") == 1:
+                    epilogue_subtile, dq_stage_count = 8, 2
+                else:
+                    epilogue_subtile, dq_stage_count = 2, 1
+            else:
+                _, epilogue_subtile, dq_stage_count = BWD_DIRECT_DQ_CONFIG
             configs = [
                 config
                 for config in configs
@@ -4532,7 +4542,8 @@ def _cold_head_stripe_io(
 
 @triton.autotune(
     configs=BWD_CONFIGS,
-    key=["N_CTX", "HEAD_DIM", "H", "Z", "STAGE", "PERSISTENT_BWD"],
+    key=["N_CTX", "HEAD_DIM", "H", "Z", "STAGE", "PERSISTENT_BWD",
+         "SCALE_QK_IN_KERNEL", "PRENORMALIZED_DO", "BSHD_CONFIG"],
     prune_configs_by={"early_config_prune": prune_bwd_configs},
     pre_hook=_bwd_tuning_reset_pre_hook,
 )
@@ -4588,6 +4599,7 @@ def _attn_bwd_ws(
     DQ64=None,
     DQ64_STRIDES: tl.constexpr = None,
     DQ_OUT=None,
+    BSHD_CONFIG: tl.constexpr = False,
 ):
     _RCP_LN2: tl.constexpr = 1.4426950408889634
     if Failure is not None:
@@ -6093,6 +6105,7 @@ class _attention(torch.autograd.Function):
             RangeFailure=range_failure,
             PACKED_N_CTX=N_CTX if packed_dq_output else 0,
             RangeBudget=range_budget,
+            BSHD_CONFIG=paper_backward,
         )
         _attn_bwd_ws[grid_bwd](*bwd_args, **bwd_kwargs)
 
