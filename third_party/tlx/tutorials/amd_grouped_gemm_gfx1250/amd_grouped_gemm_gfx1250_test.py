@@ -954,6 +954,10 @@ def grouped_gemm_tdm(
     xcd_remap_mode: str = "none",
     num_xcds: int = 8,
     xcd_chunk: int = 2,
+    cluster_size: int = 1,
+    cluster_multicast: bool = True,
+    cluster_sync: str = "all",
+    operand_reuse: bool = False,
 ) -> torch.Tensor:
     """Compute packed ragged-M grouped GEMM with gfx1250 TDM.
 
@@ -971,6 +975,12 @@ def grouped_gemm_tdm(
     groups; smaller tiles use dedicated LDS for C within each group.
     ``auto_config`` scores the validated tile seeds using saturated rate, CU
     utilization, and padding efficiency.
+    ``cluster_size=2|4`` enables an experimental cluster launch for aligned,
+    equal-sized groups using the square hybrid. ``cluster_multicast=False``
+    retains cluster synchronization as a comparison control. ``cluster_sync``
+    selects all handoffs or only input-refill handoffs. ``operand_reuse``
+    enables conservative WMMA operand-cache hints. Both experiments are off
+    by default and use a scoped, cache-keyed code-generation hook.
     """
     assert a_packed.dtype == torch.float16 and b_t.dtype == torch.float16
     assert a_packed.device == b_t.device == group_offsets.device
@@ -979,6 +989,8 @@ def grouped_gemm_tdm(
     assert group_offsets.dtype == torch.int32
     assert xcd_remap_mode in _XCD_REMAP_MODES
     assert num_xcds >= 1 and xcd_chunk >= 1
+    if cluster_size not in (1, 2, 4) or cluster_sync not in ("all", "refill"):
+        raise ValueError("cluster_size must be 1, 2, or 4; cluster_sync must be all or refill")
 
     group_size, n, k = b_t.shape
     total_m, a_k = a_packed.shape
@@ -1030,13 +1042,35 @@ def grouped_gemm_tdm(
         num_programs = _active_num_cus(a_packed.device)
     num_programs = max(1, min(int(num_programs), total_tiles))
 
+    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import (
+        experimental_codegen, validate_cluster_config)
+
+    if cluster_size > 1:
+        validate_cluster_config(
+            m_list,
+            n,
+            num_programs,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            group_m=group_m,
+            tdm_pipeline_depth=tdm_pipeline_depth,
+            l2_prefetch_distance=l2_prefetch_distance,
+            c_staging_mode=c_staging_mode,
+            cross_tile_prefetch=cross_tile_prefetch,
+            auto_config=auto_config,
+            xcd_remap_mode=xcd_remap_mode,
+            num_xcds=num_xcds,
+            xcd_chunk=xcd_chunk,
+        )
+
     # The group count is known from B's shape. Specializing the square
     # cross-tile schedule removes unused boundary-refill state for small groups.
     kernel_group_size = (tl.constexpr(group_size)
                          if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
 
     def run_kernel():
-        return grouped_gemm_tdm_kernel[(num_programs, )](
+        return grouped_gemm_tdm_kernel[(num_programs // cluster_size, )](
             a_packed,
             b_t,
             c_packed,
@@ -1064,14 +1098,16 @@ def grouped_gemm_tdm(
             waves_per_eu=1,
         )
 
-    if benchmark == "graph":
-        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
-        print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
-    elif benchmark == "eager":
-        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
-        print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
-    else:
-        run_kernel()
+    with experimental_codegen(cluster_size, cluster_multicast, cluster_sync, operand_reuse,
+                              jit_kernel=grouped_gemm_tdm_kernel):
+        if benchmark == "graph":
+            ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
+            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+        elif benchmark == "eager":
+            ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
+            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+        else:
+            run_kernel()
     return c_packed
 
 
@@ -1480,6 +1516,14 @@ if __name__ == "__main__":
                         help="persistent program-id mapping across gfx1250 XCDs")
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)
+    parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4), default=1,
+                        help="experimental workgroup cluster size (default: 1, disabled)")
+    parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share inputs within a cluster; disable for a synchronization-only control")
+    parser.add_argument("--cluster_sync", choices=("all", "refill"), default="all",
+                        help="cluster rendezvous at all handoffs or only before input refills")
+    parser.add_argument("--operand_reuse", action=argparse.BooleanOptionalAction, default=False,
+                        help="experimental WMMA operand-cache reuse hints")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
@@ -1526,6 +1570,10 @@ if __name__ == "__main__":
         xcd_remap_mode=args.xcd_remap,
         num_xcds=args.num_xcds,
         xcd_chunk=args.xcd_chunk,
+        cluster_size=args.cluster_size,
+        cluster_multicast=args.cluster_multicast,
+        cluster_sync=args.cluster_sync,
+        operand_reuse=args.operand_reuse,
         benchmark=benchmark,
         benchmark_num_iters=args.benchmark_num_iters,
     )
