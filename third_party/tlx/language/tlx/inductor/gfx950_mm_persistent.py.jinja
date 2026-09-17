@@ -1,0 +1,277 @@
+from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.matmul_kernel_persistent import (
+    _C_STORE_32X128_LAYOUT as _GFX950_PERSISTENT_C_STORE_32X128_LAYOUT,
+    _commit_accumulators as _gfx950_persistent_commit_accumulators,
+    _compute_full_tile as _gfx950_persistent_compute_full_tile,
+    _global_loads as _gfx950_persistent_global_loads,
+    _local_alloc_stage as _gfx950_persistent_local_alloc_stage,
+    _make_global_tile_load_addresses as _gfx950_persistent_make_global_tile_load_addresses,
+)
+
+
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    TILE: tl.constexpr = 32
+    N_GROUP_FRAGMENTS: tl.constexpr = 4
+{% if BLOCK_N == 160 %}
+    TILE_SPEC: tl.constexpr = (256, 160, 128, 256, 2)
+    PIPELINE_SPEC: tl.constexpr = (
+        (
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 3),
+            (3, 3),
+            (6, 2),
+            (0, 0),
+        ),
+        4,
+        (
+            ((2, 0, 3), (-1, 0, 0)),
+            ((2, 3, 2), (3, 0, 1)),
+            ((3, 1, 4), (-1, 0, 0)),
+            ((4, 0, 3), (-1, 0, 0)),
+            ((1, 0, 2), (4, 3, 2)),
+        ),
+        (7, 8, 9, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34),
+    )
+{% else %}
+    TILE_SPEC: tl.constexpr = (256, 192, 128, 256, 2)
+    PIPELINE_SPEC: tl.constexpr = (
+        (
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 3),
+            (3, 3),
+            (6, 2),
+            (0, 0),
+        ),
+        5,
+        (
+            ((1, 0, 4), (-1, 0, 0)),
+            ((1, 4, 2), (2, 0, 2)),
+            ((2, 2, 4), (-1, 0, 0)),
+            ((3, 0, 4), (-1, 0, 0)),
+            ((3, 4, 2), (4, 0, 2)),
+            ((4, 2, 2), (-1, 0, 0)),
+        ),
+        (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41),
+    )
+{% endif %}
+
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 2],
+    )
+    dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    a_layout: tl.constexpr = (
+        tlx.padded_shared_layout_encoding.with_identity_for(
+            [(64, 16)],
+            [TILE, BLOCK_K],
+            order=[1, 0],
+        )
+    )
+    b_main_layout: tl.constexpr = (
+        tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)],
+            [
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+                [16, 0],
+                [32, 0],
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+            ],
+            [BLOCK_K, 128],
+        )
+    )
+    b_tail_layout: tl.constexpr = (
+        tlx.padded_shared_layout_encoding.with_identity_for(
+            [(256, 16)],
+            [BLOCK_K, TILE],
+            order=[0, 1],
+        )
+    )
+    stage0 = _gfx950_persistent_local_alloc_stage(
+        a_layout,
+        b_main_layout,
+        b_tail_layout,
+        TILE_SPEC,
+    )
+    stage1 = _gfx950_persistent_local_alloc_stage(
+        a_layout,
+        b_main_layout,
+        b_tail_layout,
+        TILE_SPEC,
+    )
+
+    program = tl.program_id(0)
+    num_pid_n: tl.constexpr = tl.constexpr(TILE_SPEC[2])
+    tiles_per_program: tl.constexpr = tl.constexpr(TILE_SPEC[4])
+    programs_per_m = num_pid_n // tiles_per_program
+    program_m = program // programs_per_m
+    program_n = program % programs_per_m
+    first_tile = program_m * num_pid_n + program_n * tiles_per_program
+
+    tile_load_addresses = _gfx950_persistent_make_global_tile_load_addresses(
+        A,
+        B,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        first_tile,
+        TILE_SPEC,
+    )
+    prefetched_k0 = _gfx950_persistent_global_loads(
+        tile_load_addresses,
+        0,
+        TILE_SPEC,
+    )
+
+    m_fragments: tl.constexpr = 256 // TILE
+    n_fragments: tl.constexpr = BLOCK_N // TILE
+    n_main_groups: tl.constexpr = n_fragments // N_GROUP_FRAGMENTS
+    n_main_fragments: tl.constexpr = n_main_groups * N_GROUP_FRAGMENTS
+    n_tail_fragments: tl.constexpr = n_fragments - n_main_fragments
+
+    for tile_offset in tl.static_range(tiles_per_program):
+        tile_id = first_tile + tile_offset
+        acc_tile = _gfx950_persistent_compute_full_tile(
+            tile_load_addresses,
+            prefetched_k0,
+            stage0,
+            stage1,
+            mma,
+            dot_a,
+            dot_b,
+            PIPELINE_SPEC,
+            TILE_SPEC,
+        )
+
+        if tile_offset + 1 < tiles_per_program:
+            next_tile_load_addresses = (
+                _gfx950_persistent_make_global_tile_load_addresses(
+                    A,
+                    B,
+                    stride_am,
+                    stride_ak,
+                    stride_bk,
+                    stride_bn,
+                    tile_id + 1,
+                    TILE_SPEC,
+                )
+            )
+            next_prefetched_k0 = _gfx950_persistent_global_loads(
+                next_tile_load_addresses,
+                0,
+                TILE_SPEC,
+            )
+
+        acc_tile = _gfx950_persistent_commit_accumulators(
+            acc_tile,
+            mma,
+            TILE_SPEC,
+        )
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        rm = pid_m * 256 + tl.arange(0, TILE)
+        rn = pid_n * BLOCK_N + tl.arange(0, TILE)
+
+        for mi in tl.static_range(m_fragments):
+            idx_m = (rm + mi * TILE)[:, None]
+            for group in tl.static_range(n_main_groups):
+                idx_n = (
+                    pid_n * BLOCK_N
+                    + group * N_GROUP_FRAGMENTS * TILE
+                    + tl.arange(0, N_GROUP_FRAGMENTS * TILE)
+                )[None, :]
+                lo = tl.cat(
+                    tlx.require_layout(
+                        acc_tile[
+                            mi * n_fragments + group * N_GROUP_FRAGMENTS
+                        ],
+                        mma,
+                        pin=False,
+                    ),
+                    tlx.require_layout(
+                        acc_tile[
+                            mi * n_fragments
+                            + group * N_GROUP_FRAGMENTS
+                            + 1
+                        ],
+                        mma,
+                        pin=False,
+                    ),
+                    dim=1,
+                )
+                hi = tl.cat(
+                    tlx.require_layout(
+                        acc_tile[
+                            mi * n_fragments
+                            + group * N_GROUP_FRAGMENTS
+                            + 2
+                        ],
+                        mma,
+                        pin=False,
+                    ),
+                    tlx.require_layout(
+                        acc_tile[
+                            mi * n_fragments
+                            + group * N_GROUP_FRAGMENTS
+                            + 3
+                        ],
+                        mma,
+                        pin=False,
+                    ),
+                    dim=1,
+                )
+                value = tl.cat(lo, hi, dim=1)
+                value = tlx.require_layout(
+                    value,
+                    _GFX950_PERSISTENT_C_STORE_32X128_LAYOUT,
+                )
+                mask = (idx_m < M) & (idx_n < N)
+                {{store_output(("idx_m", "idx_n"), "value", "mask", indent_width=16, val_shape=("TILE", "N_GROUP_FRAGMENTS * TILE"), output_layout="_GFX950_PERSISTENT_C_STORE_32X128_LAYOUT")}}
+
+            for tail in tl.static_range(n_tail_fragments):
+                idx_n = (
+                    rn
+                    + (n_main_fragments + tail) * TILE
+                )[None, :]
+                value = tlx.require_layout(
+                    acc_tile[
+                        mi * n_fragments + n_main_fragments + tail
+                    ],
+                    mma,
+                    pin=False,
+                )
+                mask = (idx_m < M) & (idx_n < N)
+                {{store_output(("idx_m", "idx_n"), "value", "mask", indent_width=16, val_shape=("TILE", "TILE"), output_layout="mma")}}
+
+        if tile_offset + 1 < tiles_per_program:
+            tile_load_addresses = next_tile_load_addresses
+            prefetched_k0 = next_prefetched_k0
