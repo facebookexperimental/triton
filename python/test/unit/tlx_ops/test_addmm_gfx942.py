@@ -1,5 +1,3 @@
-"""Correctness coverage for the gfx942 ``tlx.ops.addmm`` primitive."""
-
 import pytest
 import torch
 
