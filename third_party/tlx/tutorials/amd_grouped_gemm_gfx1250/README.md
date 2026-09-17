@@ -119,7 +119,8 @@ relative saturated rate * CU utilization * useful/padded FLOPs
 ```
 
 Persistent program remapping is independently selectable with
-`--xcd_remap none|balanced|chunked`. The default is `none`.
+`--xcd_remap none|balanced|chunked`. The standalone kernel script defaults to
+`none`; the `bench.py` sweep defaults to `chunked`.
 
 ## Correctness
 
@@ -190,7 +191,8 @@ Each tuple is `(G, M_per_group, N, K)`. The default cases cover the requested
 combinations plus the `16x4096x4096x4096` reference.
 
 The sweep defaults to `256x256x128`, depth 2, and the within-group hybrid with
-cross-tile prefetch and TDM output stores enabled for every shape. Use
+cross-tile prefetch and TDM output stores enabled for every shape. XCD remapping
+defaults to `chunked`; use `--xcd-remap none` to disable it. Use
 `--no-cross-tile-prefetch` to compare the alias-C schedule. `--auto-config`
 instead lets the kernel's general cost model select the configuration,
 including whether to use cross-tile prefetch.

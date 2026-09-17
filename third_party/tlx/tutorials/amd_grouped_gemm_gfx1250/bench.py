@@ -5,7 +5,8 @@ Each case runs in a separate process so its large GPU allocations are released
 before the next case starts. Subprocesses use the current Python interpreter
 and inherit its environment.
 
-The standard sweep uses the within-group hybrid with cross-tile prefetch enabled.
+The standard sweep uses the within-group hybrid with cross-tile prefetch enabled
+and chunked XCD remapping.
 --no-cross-tile-prefetch selects alias-C; --auto-config selects the kernel's
 general cost model instead.
 """
@@ -219,7 +220,8 @@ def main() -> int:
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=True,
                         help="enable cross-tile prefetch (default: on); alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto-config", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none")
+    parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="chunked",
+                        help="persistent program remapping (default: chunked)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
