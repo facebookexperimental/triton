@@ -14,8 +14,9 @@ must be fixed or rejected before evaluating the full frontier.
 
 The remaining work is:
 
-1. Add the post-memory, schedule-aware channel-cycle validator and use it to
-   reject the unsafe D120 B-early candidates before GPU execution.
+1. Connect the implemented weighted-cycle solver to a post-memory,
+   schedule-aware protocol builder and use it to reject the unsafe D120
+   B-early candidates before GPU execution.
 2. Measure D120 candidates on the target shapes and confirm whether A3/B2 wins.
 3. Validate annotation-free FA backward over its supported correctness matrix,
    then compare it with the annotated baseline under sanitizers and performance
@@ -88,6 +89,15 @@ the frontend pipeline depth and WSMemoryPlanner remain authoritative for
 physical buffering. This prevents structural schedules from turning a large
 modeled lifetime/II ratio (182 stages in the D120 oracle) into an unsafe
 software-pipeline depth.
+
+**Implemented ninth slice:** `WSChannelCycleAnalysis` now provides the common,
+synchronization-independent protocol graph and deterministic weighted-cycle
+solver. It decomposes the graph into strongly connected components, applies
+the exact integer transform `d * (N + 1) - 1`, and reconstructs a stable edge
+witness for every non-positive-distance recurrence. Direct lit coverage pins a
+zero-credit rejection, its positive-credit neighbor, an acyclic negative edge,
+and malformed-graph `unsupported` handling. The post-memory IR graph builder
+and candidate rejection are the next unit.
 
 **Current Milestone D status:** The annotation-free BM128 FA-backward candidate
 compiles through software-pipeline expansion. Pre-lowered
@@ -1091,11 +1101,11 @@ increasing one relay depth or changing task order would break the cycle.
 Land the post-memory validator before adding the materialized-protocol audit.
 The implementation sequence is:
 
-1. Add `WSChannelCycleAnalysis.{h,cpp}` and register the source in the Hopper
-   transforms CMake target. Keep the normalized graph and weighted-cycle solver
-   independent of MLIR synchronization op classes.
-2. Move the schedule-order predicate currently local to `insertAsyncComm` into
-   a shared utility. Its contract is
+1. **Implemented:** add `WSChannelCycleAnalysis.{h,cpp}` and register the source
+   in the Hopper transforms CMake target. The normalized graph and
+   weighted-cycle solver are independent of MLIR synchronization op classes.
+2. **Implemented:** move the schedule-order predicate formerly local to
+   `insertAsyncComm` into a shared utility. Its contract is
    `before(i) -> after(i + distance)` under the serialized
    `loop.stage`/`loop.cluster` schedule; missing metadata returns unknown rather
    than lexical-order fallback across tasks.

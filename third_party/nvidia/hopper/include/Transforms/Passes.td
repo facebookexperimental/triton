@@ -169,6 +169,17 @@ def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::Module
   ];
 }
 
+def NVGPUTestWSChannelCycleAnalysis : Pass<"nvgpu-test-ws-channel-cycle-analysis", "mlir::ModuleOp"> {
+  let summary = "test warp-specialization channel cycle analysis";
+
+  let description = [{
+    Test-only harness for the normalized channel-protocol weighted-cycle
+    solver. The input module supplies an event count and a flat edge array of
+    (from, to, iteration distance, channel id) records. The pass annotates the
+    module with the validation result and any deterministic cycle witness.
+  }];
+}
+
 def NVGPUTestPingPongSync : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> {
   let summary = "test ping pong sync";
 

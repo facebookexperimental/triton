@@ -44,6 +44,7 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/TMEMAlloc1D.cpp
   WarpSpecialization/Utility.cpp
   WarpSpecialization/WSBuffer.cpp
+  WarpSpecialization/WSChannelCycleAnalysis.cpp
   WarpSpecialization/WSHoistTMEMStore.cpp
   WarpSpecialization/WSCodePartition.cpp
   WarpSpecialization/WSDataPartition.cpp

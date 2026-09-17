@@ -14,6 +14,7 @@ For the physical allocator in more detail, see
 - `third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlan*`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlanner.cpp`
+- `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSChannelCycleAnalysis.{h,cpp}`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSCodePartition.cpp`
 - `python/triton/tools/autows_search.py`
 
@@ -83,7 +84,7 @@ WSMemoryPlanner remain authoritative for physical buffering.
 | Logical memory space | Which ambiguous values use SMEM or TMEM | Representability and explicit annotation overrides | Heuristic rank zero; deterministic subset order | Implemented for direct/transposed LHS siblings |
 | SMEM plan | Copy count per logical block | Safety floors and byte budget | Heuristic plan rank zero; structural copy neighbors | Implemented, including fixed-group mode |
 | TMEM plan | Reuse groups and column placement | Dependency order and 512-column capacity | Heuristic rank zero; low-aliasing representative; remaining score order | Implemented for ordinary allocations |
-| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Planned |
+| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Common graph/solver implemented; IR builder planned |
 
 Ranks are local enumeration positions, not stable semantic identities. Tests,
 manifests, and result databases should retain canonical signatures as well as
@@ -500,11 +501,14 @@ Implemented:
   external Cartesian-product driver.
 - Production-shaped D120 and FA-backward pass-local fixtures.
 - Focused correctness for D120 A-early/A3-B2 and annotation-free FA backward.
+- A synchronization-independent protocol graph and deterministic weighted-cycle
+  solver, including direct lit coverage for zero-credit, positive-credit,
+  acyclic, and unsupported graphs.
 
 Next:
 
-1. Implement the post-memory planned-protocol channel-cycle validator and
-   reject D120 B-early before launch.
+1. Build the post-memory protocol graph from reconstructed channels and reject
+   D120 B-early before launch.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.
@@ -520,7 +524,8 @@ Current limitations:
 - Scaled-MMA and subtiled TMEM cases may use the legacy allocator.
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
-- The channel-cycle validator is designed but not implemented.
+- The common cycle solver is implemented, but the post-memory and
+  post-insertion IR graph builders are not yet connected.
 
 ## 12. Controls and diagnostics
 

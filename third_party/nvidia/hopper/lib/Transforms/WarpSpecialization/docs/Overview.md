@@ -115,6 +115,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
+| `WSChannelCycleAnalysis.cpp` | `validateProtocolCycles` | Normalized channel-protocol graph and deterministic non-positive-distance cycle solver |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
 | `PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a bounded partition-local masked prefix, folding its predicates and leaving an unmasked remainder |
 | `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `optimizeTMALoads` | Converts `tt.descriptor_load` to buffered `nvws.descriptor_load` before buffer hoisting, then lowers it to async TMA copies after planning |
@@ -138,6 +139,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `Utility.h` | `AsyncTaskId` typedef, `OpBuilderWithAsyncTaskIds`, `LoopScheduleInfo`, task ID helpers |
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
 | `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
+| `WSChannelCycleAnalysis.h` | Synchronization-independent protocol events/edges and `safe`/`unsafe`/`unsupported` validation result |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
 | `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `buildWSBarrierOrderedRegionRanges`, `injectChannelGraph` — channel graph and ordered-region construction for barrier constraints |
 | `WSBarrierReorder.h` | `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
