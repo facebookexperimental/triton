@@ -38,13 +38,14 @@ Expensive ops are further classified as:
 
 ## Named Barrier Allocation
 
-Named barriers use indices **7 through 15** (indices 0-6 are reserved for
-producer-consumer mbarriers and warp group sync). Each ping-pong region
-consumes **two** barrier indices — one for "ping" and one for "pong".
+Ping-pong uses the shared compiler named-barrier pool. IDs 0 and 1 are fixed
+for the default warp group and switch loop, and ID 2 is fixed for the first
+worker partition. Additional worker partitions reserve IDs from the pool
+before optional optimizations. User and existing compiler IDs are then
+removed, and each ping-pong region atomically requests two remaining IDs.
 
-Maximum concurrent ping-pong regions: **(15 - 7 + 1) / 2 = 4** (pairs
-`{7,8}`, `{9,10}`, `{11,12}`, `{13,14}`). If barriers are exhausted, the
-region is silently skipped.
+If the pool is exhausted, or if a dynamic user ID prevents the compiler from
+proving which IDs are free, the region is silently skipped.
 
 ## `doPingPongPrep` Algorithm
 

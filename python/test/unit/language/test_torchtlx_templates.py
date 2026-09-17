@@ -495,6 +495,45 @@ class TestLocalBufferRetention(TestCase):
 class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_scaled_mm_delegates_to_standard_choices(self):
+        from torch._inductor.choices import InductorChoices
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        expected = [object()]
+        for mode in ("allow", "force"):
+            with self.subTest(mode=mode), config.patch(
+                {"triton.tlx_mode": mode}
+            ), mock.patch.object(
+                InductorChoices,
+                "get_template_configs",
+                return_value=expected,
+            ) as base_get_configs:
+                actual = TLXInductorChoices().get_template_configs(
+                    mock.sentinel.kernel_inputs,
+                    [mock.sentinel.template],
+                    "scaled_mm",
+                )
+
+            self.assertIs(actual, expected)
+            base_get_configs.assert_called_once()
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_nvidia_only_appends_blackwell_template_to_mm(self):
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        existing_template = object()
+        scaled_mm_templates = [existing_template]
+        with mock.patch.object(_tlx_mm, "is_rocm", return_value=False):
+            scaled_mm_result = _tlx_mm.append_tlx(
+                scaled_mm_templates, op_name="scaled_mm"
+            )
+            mm_result = _tlx_mm.append_tlx([], op_name="mm")
+
+        self.assertIs(scaled_mm_result, scaled_mm_templates)
+        self.assertEqual(scaled_mm_templates, [existing_template])
+        self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_bmm_shared_a_rejects_non_gfx950(self):
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
 

@@ -1,5 +1,8 @@
 # Working on Triton
 
+## Vendored code
+- `third_party/cpu` is vendored from [triton-lang/triton-cpu](https://github.com/triton-lang/triton-cpu), not developed in-tree. See `third_party/cpu/README.md` for the sync/port procedure.
+
 ## Build and Testing Guidelines
 - Before running tests for native/compiler changes, run `make` in the triton directory to rebuild triton. DO NOT RUN `make` if you only changed Python code or code in `python/triton_kernels`.
 - For compiler changes, add tests in `python/test/` (pytest) or test (lit). Keep GPU-only tests in `python/test/unit/` or `python/test/gluon/`, name them `test_<feature>_<condition>`, and avoid creating new test files unless requested.

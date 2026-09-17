@@ -20,6 +20,7 @@ add_triton_library(TritonGPUModuloCore
   LINK_LIBS PUBLIC
   TritonIR
   TritonGPUIR
+  TritonNvidiaGPUIR
   MLIRTransformUtils
 )
 

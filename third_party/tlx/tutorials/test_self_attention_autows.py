@@ -71,12 +71,13 @@ _DQREDUCE_CFG = dict(
 )
 _CLC_CFG = dict(
     _DQREDUCE_CFG,
+    dq_fp32=True,
     clc=True,
     bwd_bm=64,
     bwd_bn=128,
     bwd_stages=2,
     dkdv_subtile=2,
-    clc_smem_algo=2,
+    clc_smem_algo=1,
 )
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
@@ -88,7 +89,9 @@ _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
 # select the config (before the kernel import below) from argv.
 if "--run-clc" in sys.argv or "--run-clc-jagged" in sys.argv:
-    _C.set_config(**_CLC_CFG)
+    clc_cfg = dict(_CLC_CFG)
+    clc_cfg["dq_fp32"] = os.environ.get("HSTU_SELF_TEST_DQ_FP32", "1") == "1"
+    _C.set_config(**clc_cfg)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
 elif "--run-dqreduce" in sys.argv:
     _C.set_config(**_DQREDUCE_CFG)
@@ -117,6 +120,12 @@ def _subprocess_env():
     # A Buck par's sys.executable does not reconstruct the parent test
     # runner's link-tree paths when it launches a script directly.
     env["PYTHONPATH"] = os.pathsep.join(sys.path)
+    return env
+
+
+def _clc_subprocess_env(dq_fp32):
+    env = _subprocess_env()
+    env["HSTU_SELF_TEST_DQ_FP32"] = str(int(dq_fp32))
     return env
 
 
@@ -261,14 +270,15 @@ def test_self_attention_bwd_autows_dqreduce(L, Z):
     assert r.returncode == 0, (f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
+@pytest.mark.parametrize("dq_fp32", [False, True], ids=["dq-bf16", "dq-fp32"])
 @pytest.mark.parametrize("L,Z", [(256, 2)])
-def test_self_attention_bwd_autows_clc(L, Z):
-    """CLC-persistent AutoWS bwd matches the same torch/TLX reference."""
+def test_self_attention_bwd_autows_clc(L, Z, dq_fp32):
+    """CLC-persistent AutoWS bwd matches the reference in both dQ modes."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     r = subprocess.run(
         [sys.executable, __file__, "--run-clc", str(L), str(Z)],
-        env=_subprocess_env(),
+        env=_clc_subprocess_env(dq_fp32),
         capture_output=True,
         text=True,
         timeout=900,
@@ -363,7 +373,7 @@ if __name__ == "__main__":
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z, jagged=sys.argv[1] == "--run-clc-jagged")
         rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
         print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
-              f"(L={_L} Z={_Z})")
+              f"(L={_L} Z={_Z}, dq_fp32={A._AUTOWS_CFG.dq_fp32})")
         bad = {n: v for n, v in rls.items() if not (v < 1e-2)}
         if bad:
             print(f"FAIL: rel-L2 too high: {bad}")
