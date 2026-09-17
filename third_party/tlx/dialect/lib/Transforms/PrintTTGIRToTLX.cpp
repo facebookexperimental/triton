@@ -281,7 +281,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.precise_sqrt", "tl.math.sqrt_rn", "IEEE-rounded square root"},
 
     // GPU operations
-    {"gpu.barrier", "gpu.barrier", "GPU barrier"},
+    // Reachable only if gpu.barrier is taken off the skip list, and
+    // tlx.workgroup_barrier is AMD-only -- gate it on isAMDTarget if so, the
+    // way the ttg.barrier handler does.
+    {"gpu.barrier", "tlx.workgroup_barrier", "Workgroup-wide barrier"},
     {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
 };
 
@@ -503,6 +506,16 @@ static const llvm::StringSet<> elementTypeCastOps = {
     "arith.extf",   "arith.truncf", "arith.sitofp",
     "arith.uitofp", "arith.fptosi", "arith.fptoui",
 };
+
+// Several TLX primitives lower to ROCDL and so are only usable on CDNA; the
+// target lives on the module as `ttg.target`, e.g. "hip:gfx950".
+static bool isAMDTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+  return target && target.getValue().starts_with("hip");
+}
 
 // Element types getElementTypeName can spell as a TLX dtype. Anything else it
 // renders as raw MLIR, which is not usable in emitted Python.
@@ -2402,6 +2415,37 @@ void printSimplifiedOp(
        << ")";
     printLocComment(op, os);
     return;
+  }
+
+  // tlx.workgroup_barrier is the right spelling for `ttg.barrier local` and
+  // nothing else: a barrier over other address spaces would be silently
+  // under-fenced, so leave those to the generic path, which flags them.
+  //
+  // It is also AMD-only. create_workgroup_barrier emits the ttg.barrier
+  // bracketed by two rocdl.sched.barrier guards, so on a non-AMD target the
+  // round trip would inject ROCDL ops into a kernel that cannot lower them.
+  // On AMD the extra guards are a scheduling constraint, not a semantic one --
+  // they can cost scheduling freedom but cannot change results.
+  if (opName == "ttg.barrier" && isAMDTarget(op)) {
+    Attribute a = op->getAttr("addrSpace");
+    bool localOnly = false;
+    if (auto i = dyn_cast_or_null<IntegerAttr>(a)) {
+      localOnly = i.getInt() == static_cast<int64_t>(ttg::AddrSpace::Local);
+    } else if (a) {
+      std::string text;
+      llvm::raw_string_ostream textOs(text);
+      a.print(textOs);
+      textOs.flush();
+      // `local` is a prefix of nothing else in the bitmask's spellings, but a
+      // combined mask prints several names, so require it to stand alone.
+      StringRef t = StringRef(text).trim();
+      localOnly = t.ends_with("local") && !t.contains(",") && !t.contains("|");
+    }
+    if (localOnly) {
+      os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
   }
 
   // Get the TLX name or use original
