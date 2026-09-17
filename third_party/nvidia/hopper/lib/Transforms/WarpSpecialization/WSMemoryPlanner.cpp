@@ -1392,6 +1392,83 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
                                8);
 }
 
+/// Describe the heuristic fusion group for a TMA store/reduce staging
+/// allocation. Keeping this key construction shared between fallback
+/// detection and Phase 3.5 prevents search from missing a subtile group merely
+/// because each materialized allocation has exactly one store user.
+static std::optional<TMAStagingGroup>
+getTMAStagingGroup(ttg::LocalAllocOp alloc, SmallVector<Channel *> &channels) {
+  Value desc;
+  for (Operation *user : alloc->getUsers()) {
+    if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
+      desc = store.getDesc();
+      break;
+    }
+    if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(user)) {
+      desc = reduce.getDesc();
+      break;
+    }
+  }
+  if (!desc)
+    return std::nullopt;
+
+  Channel *channel = findChannelForOp(alloc, channels);
+  Operation *origLoad = findOriginalLoadForChannel(channel);
+  Operation *producer = channel ? channel->getSrcOp() : nullptr;
+  TMAStagingGroup group;
+  group.desc = desc;
+  group.origLoad = origLoad;
+  group.producerTask = origLoad || !channel ? -1 : channel->relation.first;
+  group.producerBlock = producer ? producer->getBlock() : nullptr;
+  return group;
+}
+
+static bool sameTMAStagingGroup(const TMAStagingGroup &lhs,
+                                const TMAStagingGroup &rhs) {
+  return lhs.desc == rhs.desc && lhs.origLoad == rhs.origLoad &&
+         lhs.producerTask == rhs.producerTask &&
+         lhs.producerBlock == rhs.producerBlock;
+}
+
+/// Return true when Phase 3.5 will fuse multiple separately materialized TMA
+/// staging allocations. Such a group has a K|S rotation invariant and must be
+/// established by the heuristic before fixed-group copy search.
+static bool hasFusableTMAStagingGroup(triton::FuncOp funcOp,
+                                      SmallVector<Channel *> &channels) {
+  SmallVector<ttg::LocalAllocOp> stagingAllocs;
+  SmallVector<TMAStagingGroup> groups;
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    if (!alloc.isSharedMemoryAlloc())
+      return;
+    auto candidate = getTMAStagingGroup(alloc, channels);
+    if (!candidate)
+      return;
+    auto it = llvm::find_if(groups, [&](const TMAStagingGroup &group) {
+      return sameTMAStagingGroup(group, *candidate);
+    });
+    if (it == groups.end()) {
+      groups.push_back(*candidate);
+      it = std::prev(groups.end());
+    }
+    it->indices.push_back(stagingAllocs.size());
+    stagingAllocs.push_back(alloc);
+  });
+
+  for (const TMAStagingGroup &group : groups) {
+    if (group.indices.size() < 2)
+      continue;
+    SmallVector<Operation *> allocs;
+    SmallVector<unsigned> sizes;
+    for (unsigned index : group.indices) {
+      allocs.push_back(stagingAllocs[index].getOperation());
+      sizes.push_back(getSmemAllocSizeBytes(stagingAllocs[index]));
+    }
+    if (allAllocsCompatible(allocs, sizes))
+      return true;
+  }
+  return false;
+}
+
 /// Compute total SMEM usage in bytes across all WSBuffers.
 /// Buffers sharing the same buffer.id (reuse group) contribute
 /// max(sizes) * copies instead of sum(sizes) * copies.
@@ -1440,35 +1517,14 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
     // TMA staging buffers: group per (descriptor, original load) regardless of
     // priority.
     if (buf.tmaStaging > 0) {
-      Value desc;
-      for (auto user : buf.allocOp->getUsers()) {
-        if (auto storeOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(user)) {
-          desc = storeOp.getDesc();
-          break;
-        }
-        if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(user)) {
-          desc = reduceOp.getDesc();
-          break;
-        }
-      }
-      if (desc) {
-        Channel *channel = findChannelForOp(buf.allocOp, channels);
-        Operation *origLoad = findOriginalLoadForChannel(channel);
-        int producerTask = origLoad || !channel ? -1 : channel->relation.first;
-        Operation *producer = channel ? channel->getSrcOp() : nullptr;
-        Block *producerBlock = producer ? producer->getBlock() : nullptr;
+      if (auto candidate = getTMAStagingGroup(
+              cast<ttg::LocalAllocOp>(buf.allocOp), channels)) {
         auto it = llvm::find_if(tmaStagingGroups, [&](const auto &group) {
-          return group.desc == desc && group.origLoad == origLoad &&
-                 group.producerTask == producerTask &&
-                 group.producerBlock == producerBlock;
+          return sameTMAStagingGroup(group, *candidate);
         });
         if (it == tmaStagingGroups.end()) {
-          tmaStagingGroups.emplace_back();
+          tmaStagingGroups.push_back(*candidate);
           it = std::prev(tmaStagingGroups.end());
-          it->desc = desc;
-          it->origLoad = origLoad;
-          it->producerTask = producerTask;
-          it->producerBlock = producerBlock;
         }
         it->indices.push_back(i);
       }
@@ -2534,6 +2590,60 @@ static bool refineFixedSmemPlan(
   baseline->score = cost->score(*baseline);
   plans.push_back(*baseline);
 
+  auto blockFloor = [&](const wsplan::Block &block) {
+    unsigned crossStage = 1;
+    unsigned entries = 0;
+    for (wsplan::BufferId member : block.members) {
+      crossStage = std::max(crossStage, model.stageSpan(member));
+      entries += model.entries(member);
+    }
+    return std::max({crossStage, entries, 1u});
+  };
+  auto blockCeiling = [&](const wsplan::Block &block) {
+    unsigned ceiling = std::numeric_limits<unsigned>::max();
+    for (wsplan::BufferId member : block.members)
+      ceiling = std::min(ceiling, model.maxCopies(member));
+    return ceiling == std::numeric_limits<unsigned>::max() ? 1u : ceiling;
+  };
+  auto appendCandidate = [&](wsplan::Plan candidate) {
+    if (plans.size() == topK || !validator->validate(model, candidate) ||
+        !packer->feasible(candidate, budget) ||
+        llvm::any_of(plans, [&](const wsplan::Plan &other) {
+          return sameCopyDepths(candidate, other);
+        }))
+      return;
+    candidate.score = cost->score(candidate);
+    plans.push_back(std::move(candidate));
+  };
+
+  // Search the heuristic's immediate structural neighborhood first. A
+  // one-copy decrement exposes the nearest lower-buffering plan. Moving that
+  // copy to another mutable block exposes asymmetric alternatives without
+  // depending on latency scores or operand names. This keeps a small top-K
+  // useful even when the hard-floor vector is many edits away from the
+  // heuristic (as in production-shaped fused RMSNorm + GEMM).
+  for (unsigned donor = 0;
+       donor < baseline->blocks.size() && plans.size() < topK; ++donor) {
+    const wsplan::Block &donorBlock = baseline->blocks[donor];
+    if (donorBlock.copies <= blockFloor(donorBlock))
+      continue;
+    wsplan::Plan lower = *baseline;
+    --lower.blocks[donor].copies;
+    appendCandidate(lower);
+    for (unsigned receiver = 0;
+         receiver < baseline->blocks.size() && plans.size() < topK;
+         ++receiver) {
+      if (receiver == donor)
+        continue;
+      const wsplan::Block &receiverBlock = baseline->blocks[receiver];
+      if (receiverBlock.copies >= blockCeiling(receiverBlock))
+        continue;
+      wsplan::Plan transfer = lower;
+      ++transfer.blocks[receiver].copies;
+      appendCandidate(std::move(transfer));
+    }
+  }
+
   // Request slack for assignments that duplicate the imported baseline or are
   // rejected by the hard safety/budget checks. The cap keeps compile time
   // independent of the full Cartesian product.
@@ -2547,15 +2657,7 @@ static bool refineFixedSmemPlan(
       if (it != map.end())
         block.copies = it->second;
     }
-    if (sameCopyDepths(candidate, *baseline) ||
-        !validator->validate(model, candidate) ||
-        !packer->feasible(candidate, budget) ||
-        llvm::any_of(plans, [&](const wsplan::Plan &other) {
-          return sameCopyDepths(candidate, other);
-        }))
-      continue;
-    candidate.score = cost->score(candidate);
-    plans.push_back(std::move(candidate));
+    appendCandidate(std::move(candidate));
     if (plans.size() == topK)
       break;
   }
@@ -2599,12 +2701,12 @@ static unsigned allocateSmemBuffersViaSearch(
   // Safety fallback: the search does not yet model (a) annotation /
   // atomic-broadcast pins, (b) subtiled-region groups, or (c) *multi-store*
   // TMA-staging buffers (S>1 subtiles rotating through the buffer, which carry
-  // a K|S constraint the search does not model). A *single-store* staging
-  // buffer (S=1) is fine: the search keeps it in its own block at its floor
-  // copy count (copy=1 for S=1), never reuse-grouping it (SmemPacker rejects
-  // Staging joins). This lets the search engage on Flash Attention, whose
-  // output-store staging is single-store, instead of deferring the whole
-  // kernel.
+  // a K|S constraint the search does not model). This includes both multiple
+  // stores from one allocation and separately materialized allocations that
+  // Phase 3.5 will fuse by its (descriptor, original producer, task, block)
+  // key. A true *single-store* staging group (S=1) is fine: the search keeps it
+  // in its own block at its floor copy count (copy=1 for S=1), never
+  // reuse-grouping it (SmemPacker rejects Staging joins).
   bool needsFallback = !allocToAnnotation.empty();
   funcOp->walk([&](Operation *op) {
     if (isa<ttng::SubtiledRegionOp>(op))
@@ -2621,6 +2723,8 @@ static unsigned allocateSmemBuffersViaSearch(
         needsFallback = true; // subtiled staging (K|S) unmodeled
     }
   });
+  if (hasFusableTMAStagingGroup(funcOp, channels))
+    needsFallback = true;
   if (needsFallback) {
     LDBG("SMEM plan-search: importing heuristic grouping for unmodeled "
          "grouping features");

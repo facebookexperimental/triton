@@ -636,6 +636,15 @@ their heuristic `buffer.copy`; only ordinary singleton operand buffers are
 eligible for bounded copy-depth enumeration. Rank zero is always the unmodified
 heuristic allocation.
 
+Multi-store detection uses the same `(descriptor, original producer, producer
+task, producer block)` key as Phase 3.5 staging fusion. Consequently, a subtile
+group materialized as several allocations with one TMA store each is treated
+the same as several stores from one allocation. After importing the heuristic
+group, fixed-plan search first explores one-copy decrements and one-copy
+transfers in the immediate neighborhood of rank zero, then continues with the
+hard-floor breadth-first frontier. This keeps useful asymmetric alternatives in
+a small top-K even when the hard-floor vector is many edits from the heuristic.
+
 This two-step path deliberately reuses the existing proofs for staging `K | S`,
 circular grouping, cross-id staging reuse, and annotations instead of
 duplicating them in the generic search model. An `allocation.reuseTarget`

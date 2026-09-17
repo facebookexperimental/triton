@@ -363,6 +363,15 @@ staging), the planner now uses a conservative **fixed-grouping mode**:
 4. enumerate depths only for the remaining singleton operands;
 5. retain the exact heuristic plan as rank zero.
 
+The multi-store gate uses the same `(descriptor, original producer, producer
+task, producer block)` key as heuristic staging fusion, so separately
+materialized one-store subtiles still enter fixed-grouping mode. After rank
+zero, fixed-plan search retains immediate structural neighbors first: decrement
+one mutable block by one copy, then transfer that copy to another mutable block.
+It then appends the ordinary correctness-floor breadth-first frontier. This
+keeps nearby asymmetric allocations available under a small top-K without
+using latency estimates as an admission rule.
+
 The imported model does not reinterpret group member count as static ring
 entries: the heuristic plan may use dynamic subtile indexing where `K < S` is
 legal when `K` divides `S`. Those groups are pinned to their proven emitted

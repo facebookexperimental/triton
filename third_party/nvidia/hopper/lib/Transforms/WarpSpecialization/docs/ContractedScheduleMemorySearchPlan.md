@@ -56,9 +56,9 @@ shows that Contracted search retains the default A0/B0/MMA1 schedule plus the
 three-stage A0/B1/MMA2 and A1/B0/MMA2 alternatives required to reproduce the
 D120 experiment. The pass-local memory test confirms that the existing
 heuristic produces A3/B2 on the same graph. Search-mode coverage on this fixture
-remains pending because its eight separately materialized output-staging allocs
-are not currently recognized as one fixed subtile group before heuristic
-planning.
+now recognizes its eight separately materialized output-staging allocations as
+one fixed subtile group, preserves A3/B2 at rank zero, and retains A2/B2 and
+A2/B3 as the first two alternatives.
 
 **Primary implementation areas:**
 
@@ -749,7 +749,7 @@ as a hard correctness floor.
 - [x] Memory beam returns distinct SMEM depth plans.
 - [x] Fixed-grouping search preserves multi-store staging while searching
       singleton operand depths.
-- [ ] Fixed-grouping search is exercised on a production-shaped subtiled
+- [x] Fixed-grouping search is exercised on a production-shaped subtiled
       kernel.
 - [x] Cross-id `allocation.reuseTarget` footprint is modeled by fixed-group
       search without changing alias depth or topology.
@@ -759,10 +759,10 @@ as a hard correctness floor.
       post-buffer-allocation pass boundaries.
 - [x] Contracted search retains D120's A0/B1/MMA2 and A1/B0/MMA2 iteration-lead
       alternatives on the production-shaped fixture.
-- [ ] Memory search recognizes the production-shaped eight-subtile output
+- [x] Memory search recognizes the production-shaped eight-subtile output
       staging group and retains the heuristic A3/B2 plan as rank zero.
 - [ ] External harness compiles, validates, and measures the bounded product.
-- [ ] D120 candidates exist without lhs/rhs depth annotations.
+- [x] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [ ] FA-backward target schedule exists without stage/order annotations.
 - [ ] FA-backward target memory plan exists without copy/id/offset pins.
