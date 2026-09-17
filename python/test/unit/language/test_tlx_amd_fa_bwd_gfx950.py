@@ -316,6 +316,35 @@ def test_varlen_d128_device_compact_schedules():
     assert plan.dq_tail_k96 is False
 
 
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths", "supply_metadata", "expected_capacities"),
+    (
+        pytest.param([16, 32], [128, 256], False, (3, 3, 0, 2), id="legacy-all-full"),
+        pytest.param([1, 17], [1, 127], False, (3, 0, 2, 2), id="legacy-all-tail"),
+        pytest.param([16, 16], [128, 128], True, (2, 2, 0, 2), id="metadata-uniform-all-full"),
+        pytest.param([16, 16], [64, 96], True, (2, 0, 2, 3), id="metadata-all-tail"),
+        pytest.param([17, 31, 40], [33, 129, 7], True, (9, 1, 3, 4), id="metadata-mixed"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_plan_tightens_provable_schedule_capacities(q_lengths, kv_lengths, supply_metadata,
+                                                                expected_capacities):
+    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, *torch.tensor(kv_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    metadata = (sum(q_lengths), sum(kv_lengths), max(q_lengths), max(kv_lengths)) if supply_metadata else ()
+
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, *metadata)
+
+    capacities = (
+        plan.q_block_sequence.numel(),
+        plan.full_kv_block_sequence.numel(),
+        plan.tail_kv_block_sequence.numel(),
+        plan.wide_kv_start.numel(),
+    )
+    assert capacities == expected_capacities
+    amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
+
+
 def _make_seeded_extend_attention_lengths(batch, max_context, seed):
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -725,16 +754,17 @@ def test_varlen_d128_runtime_totals_reuse_specialization_gfx950(kv_length):
             q.shape[0],
             k.shape[0],
             q_length,
-            128,
+            kv_length,
         )
 
         amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
         torch.cuda.synchronize()
 
     device = torch.cuda.current_device()
-    # The baseline path has separate full and tail specializations. Both are
-    # capacity-launched once and device-guarded, even when a count is zero.
-    for kernel, expected in zip(kernels, (2, 1), strict=True):
+    # Uniform full-tile metadata proves the tail schedule is empty, so only
+    # the full specialization is compiled for KV128.
+    expected_counts = (1, 1) if kv_length == 128 else (2, 1)
+    for kernel, expected in zip(kernels, expected_counts, strict=True):
         assert len(kernel.device_caches[device][0]) == expected, kernel.fn.__name__
 
 

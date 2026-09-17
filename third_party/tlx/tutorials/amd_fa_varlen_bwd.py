@@ -252,7 +252,8 @@ def prepare_varlen_backward(
         raise ValueError("cu_seqlens_q and cu_seqlens_k must describe the same batch")
 
     metadata = (total_q, total_kv, max_seqlen_q, max_seqlen_k)
-    if all(value is None for value in metadata):
+    legacy_path = all(value is None for value in metadata)
+    if legacy_path:
         shared_offsets = cu_seqlens_q is cu_seqlens_k
         cu_seqlens_q = cu_seqlens_q.detach().clone(memory_format=torch.contiguous_format)
         cu_seqlens_k = (cu_seqlens_q if shared_offsets else cu_seqlens_k.detach().clone(
@@ -293,10 +294,20 @@ def prepare_varlen_backward(
         raise ValueError("maximum sequence lengths must be positive")
 
     batch = cu_seqlens_q.numel() - 1
-    q_capacity = triton.cdiv(total_q, _BLOCK_M) + batch
-    full_kv_capacity = total_kv // _BLOCK_N
-    tail_kv_capacity = batch
-    wide_kv_capacity = triton.cdiv(total_kv, _WIDE_BLOCK_N) + batch
+    if legacy_path:
+        q_capacity = sum(triton.cdiv(length, _BLOCK_M) for length in q_lengths)
+        full_kv_capacity = sum(length // _BLOCK_N for length in k_lengths)
+        tail_kv_capacity = sum(length % _BLOCK_N != 0 for length in k_lengths)
+        wide_kv_capacity = wide_task_count
+    else:
+        q_uniform = total_q == batch * max_seqlen_q
+        kv_uniform = total_kv == batch * max_seqlen_k
+        q_capacity = (batch * triton.cdiv(max_seqlen_q, _BLOCK_M) if q_uniform else triton.cdiv(total_q, _BLOCK_M) +
+                      batch)
+        full_kv_capacity = 0 if max_seqlen_k < _BLOCK_N else total_kv // _BLOCK_N
+        tail_kv_capacity = 0 if kv_uniform and max_seqlen_k % _BLOCK_N == 0 else batch
+        wide_kv_capacity = (batch * triton.cdiv(max_seqlen_k, _WIDE_BLOCK_N)
+                            if kv_uniform else triton.cdiv(total_kv, _WIDE_BLOCK_N) + batch)
     device = cu_seqlens_q.device
     q_block_sequence = torch.empty(q_capacity, dtype=torch.int32, device=device)
     q_block_start = torch.empty_like(q_block_sequence)
