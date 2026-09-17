@@ -1,4 +1,5 @@
 import os
+from contextvars import copy_context
 from enum import IntEnum
 from typing import NamedTuple
 
@@ -479,6 +480,41 @@ def _apply_causal_mask(qk, col_limit, BLOCK: tl.constexpr, keep_ge: tl.constexpr
 
 
 @triton.jit
+def _certificate_maximum_nan(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+@core.builtin
+def _add_f32x2_half_sum(a, b, _semantic=None):
+    return core.inline_asm_elementwise(
+        r"""{
+    .reg .b64 aa,bb,cc;
+    mov.b64 aa,{$2,$3};
+    mov.b64 bb,{$4,$5};
+    add.rn.f32x2 cc,aa,bb;
+    mov.b64 {$0,$1},cc;
+}""",
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=core.float32,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+@triton.jit
+def _sum_p_four_pairs(p):
+    pieces = _split_n_2D(p, 8)
+    accum = pieces[0]
+    for part in tl.static_range(1, 8):
+        accum = _add_f32x2_half_sum(accum, pieces[part])
+    pairs = _split_n_2D(accum, 4)
+    left = _add_f32x2_half_sum(pairs[0], pairs[1])
+    right = _add_f32x2_half_sum(pairs[2], pairs[3])
+    total = _add_f32x2_half_sum(left, right)
+    return tl.sum(total, 1)
+
+
+@triton.jit
 def _fwd_softmax_tile_1cta(
     qk_fulls,
     qk_tiles,
@@ -505,11 +541,53 @@ def _fwd_softmax_tile_1cta(
     SCALAR_N: tl.constexpr,
     FAST_FIXED: tl.constexpr,
     SKIP_CAUSAL_DIAG: tl.constexpr,
+    CERTIFIED_CAUSAL: tl.constexpr = False,
+    MERGED_STAGE: tl.constexpr = False,
 ):
+    _ROUNDING_GAUGE: tl.constexpr = 0.055517269
+    _EXP2_MAGIC: tl.constexpr = 12582912.0
+    _EXP2_BF16_SCALE: tl.constexpr = 128.0
+    _EXP2_BF16_BIAS: tl.constexpr = 126.0
+    _EXP2_F16_SCALE: tl.constexpr = 1024.0
+    _EXP2_F16_BIAS: tl.constexpr = 14.0
     FAST_BF16: tl.constexpr = FAST_FIXED and out_dtype == tl.bfloat16
     FAST_F16: tl.constexpr = FAST_FIXED and out_dtype == tl.float16
     NUM_P_SLICES: tl.constexpr = 2 if FAST_F16 else NUM_MMA_SLICES
-    if FAST_FIXED:
+    if CERTIFIED_CAUSAL:
+        m_scaled = m_i * qk_scale
+        if MERGED_STAGE:
+            lo, hi = 0, (start_m + 1) * BLOCK_M
+        else:
+            lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
+        for start_n in tl.range(lo, hi, BLOCK_N):
+            _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
+            tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
+            skip_q0 = SKIP_CAUSAL_DIAG and (STAGE == 2 or MERGED_STAGE) and cid == 0 and start_n + BLOCK_N >= hi
+            if skip_q0:
+                for slice_id in tl.static_range(0, NUM_P_SLICES):
+                    tlx.barrier_arrive(tlx.local_view(p_fulls, cid * NUM_P_SLICES + slice_id))
+            else:
+                qk = tlx.local_load(tlx.local_view(qk_tiles, cid))
+                if STAGE == 2 or (MERGED_STAGE and start_n >= start_m * BLOCK_M):
+                    qk = _apply_causal_mask(qk, (offs_m - start_n + 1)[:, None], BLOCK_N)
+                if start_n == 0:
+                    m_i = tl.max(qk, 1)
+                    m_scaled = m_i * qk_scale
+                qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+                qks = _split_n_2D(qk, NUM_MMA_SLICES)
+                l_ij = tl.zeros_like(l_i)
+                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                    p_i = tl.math.exp2(qks[slice_id])
+                    p_h = p_i.to(out_dtype)
+                    tlx.local_store(tlx.local_view(p_tiles, cid * NUM_P_SLICES + slice_id), p_h)
+                    tlx.barrier_arrive(tlx.local_view(p_fulls, cid * NUM_P_SLICES + slice_id))
+                    l_partial = _sum_p_four_pairs(p_i)
+                    l_ij += l_partial
+                    gauge_cnt = tl.maximum(gauge_cnt, l_partial)
+                l_i += l_ij
+            accum_cnt_qk += 1
+        return m_i, l_i, accum_cnt_qk, gauge_cnt
+    elif FAST_FIXED:
         lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
         for start_n in tl.range(lo, hi, BLOCK_N):
             _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
@@ -575,13 +653,16 @@ def _fwd_softmax_tile_1cta(
             gauge_cnt += 1
         return m_i, l_i, accum_cnt_qk, gauge_cnt
 
-    lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
+    if MERGED_STAGE:
+        lo, hi = 0, (start_m + 1) * BLOCK_M
+    else:
+        lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
     for start_n in tl.range(lo, hi, BLOCK_N):
         qk_buf = cid
         qk_buf_phase = accum_cnt_qk & 1
         alpha_phase = accum_cnt_qk & 1
         tlx.barrier_wait(tlx.local_view(qk_fulls, qk_buf), qk_buf_phase)
-        skip_q0 = SKIP_CAUSAL_DIAG and STAGE == 2 and cid == 0 and start_n + BLOCK_N >= hi
+        skip_q0 = SKIP_CAUSAL_DIAG and (STAGE == 2 or MERGED_STAGE) and cid == 0 and start_n + BLOCK_N >= hi
         if skip_q0:
             alpha = tl.full([BLOCK_M // 2], 1.0, tl.float32)
             tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase ^ 1)
@@ -596,7 +677,7 @@ def _fwd_softmax_tile_1cta(
         else:
             qk = tlx.local_load(tlx.local_view(qk_tiles, qk_buf))
 
-            if STAGE == 2:
+            if STAGE == 2 or (MERGED_STAGE and start_n >= start_m * BLOCK_M):
                 col_limit_right = (offs_m - start_n + 1)[:, None]
                 qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
@@ -855,6 +936,7 @@ def _fwd_softmax_tile(
     USE_2CTA: tl.constexpr,
     FAST_FIXED: tl.constexpr,
     SKIP_CAUSAL_DIAG: tl.constexpr,
+    CERTIFIED_CAUSAL: tl.constexpr = False,
 ):
     if USE_2CTA:
         if FAST_FIXED:
@@ -926,6 +1008,7 @@ def _fwd_softmax_tile(
         SCALAR_N,
         FAST_FIXED,
         SKIP_CAUSAL_DIAG,
+        CERTIFIED_CAUSAL,
     )
 
 
@@ -967,7 +1050,16 @@ def _fwd_fixed_2cta_control_tile(
     RESCALE_OPT: tl.constexpr,
     STAGE: tl.constexpr,
     PIPELINED: tl.constexpr,
+    CERTIFIED_CAUSAL: tl.constexpr = False,
+    alpha_empties=None,
+    alpha_fulls=None,
+    alpha_tiles=None,
+    Failure=None,
+    clc_context=None,
+    clc_phase_producer=None,
 ):
+    _RCP_LN2: tl.constexpr = 1.4426950408889634
+    _BF16_FIXED_GAUGE: tl.constexpr = 4.055517269
     start_m, off_hz, lo, hi, _, _ = _compute_offsets(
         tile_id,
         H,
@@ -988,7 +1080,16 @@ def _fwd_fixed_2cta_control_tile(
     cid = 0
     offs_m = (start_m * EFFECTIVE_BLOCK_M) + (cluster_cta_rank * BLOCK_M_SPLIT +
                                                  tl.arange(0, BLOCK_M_SPLIT))
-    if STAGE & 1:
+    if CERTIFIED_CAUSAL:
+        m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile_1cta(
+            qk_fulls, qk_tiles, p_fulls, p_tiles, alpha_empties, alpha_fulls, alpha_tiles, cid,
+            accum_cnt_qk, gauge_cnt, qk_scale, offs_m, m_i, l_i, start_m,
+            N_CTX, tlx.dtype_of(desc_v), BLOCK_M, BLOCK_N, NUM_MMA_SLICES,
+            STAGE=3, RESCALE_OPT=False, SCALAR_N=1, FAST_FIXED=True,
+            SKIP_CAUSAL_DIAG=STAGE == 3 and (NUM_PID_M_STATIC <= 16 or NUM_PID_M_STATIC == 32) and BLOCK_N * 2 <= BLOCK_M,
+            CERTIFIED_CAUSAL=True, MERGED_STAGE=True,
+        )
+    if not CERTIFIED_CAUSAL and STAGE & 1:
         m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile_2cta(
             qk_fulls,
             qk_tiles,
@@ -1008,7 +1109,7 @@ def _fwd_fixed_2cta_control_tile(
             NUM_MMA_SLICES,
             STAGE=4 - STAGE,
         )
-    if STAGE & 2:
+    if not CERTIFIED_CAUSAL and STAGE & 2:
         m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile_2cta(
             qk_fulls,
             qk_tiles,
@@ -1029,18 +1130,26 @@ def _fwd_fixed_2cta_control_tile(
             STAGE=2,
         )
 
-    tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
+    if CERTIFIED_CAUSAL and (NUM_PID_M_STATIC == 32 or NUM_PID_M_STATIC == 64):
+        tlx.clc_producer(clc_context, clc_phase_producer)
+    if not CERTIFIED_CAUSAL:
+        tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
     _, phase = get_bufidx_phase(tile_count, 1)
     tlx.barrier_wait(acc_empties[cid], phase)
     tlx.barrier_wait(o_empties[cid], phase ^ 1)
     scale = (1 / l_i)[:, None]
+    if CERTIFIED_CAUSAL:
+        bad_rows = ~((gauge_cnt <= 128.0) & (l_i > 0.0) & (l_i <= N_CTX) & (tl.abs(m_i * qk_scale) <= 32.0))
     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
         subslice = tlx.subslice(
             acc_tiles[cid],
             HEAD_DIM * slice_id // NUM_MMA_SLICES,
             HEAD_DIM // NUM_MMA_SLICES,
         )
-        acc = _mul_f32x2(tlx.local_load(subslice), scale)
+        acc = tlx.local_load(subslice)
+        if CERTIFIED_CAUSAL:
+            bad_rows |= ~(tl.reduce(tl.abs(acc), 1, _certificate_maximum_nan) < float("inf"))
+        acc = _mul_f32x2(acc, scale)
         acc = acc.to(tlx.dtype_of(desc_o))
         subslice_o = tlx.local_slice(
             o_tiles[cid],
@@ -1048,9 +1157,17 @@ def _fwd_fixed_2cta_control_tile(
             [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
         )
         tlx.local_store(subslice_o, acc)
+    if CERTIFIED_CAUSAL:
+        tl.store(Failure + 2 * (off_hz * (N_CTX // BLOCK_M) + start_m) + cid,
+                 (tl.sum(bad_rows.to(tl.int32), 0) != 0).to(tl.int32))
     tlx.fence("async_shared")
+    if CERTIFIED_CAUSAL:
+        tlx.barrier_arrive(qk_empties[cid])
     tlx.barrier_arrive(o_fulls[cid])
-    saved_m = 1.0 / l_i if PIPELINED else _BF16_FIXED_GAUGE + tl.math.log2(l_i)
+    if CERTIFIED_CAUSAL:
+        saved_m = m_i * sm_scale * _RCP_LN2 + tl.math.log2(l_i)
+    else:
+        saved_m = 1.0 / l_i if PIPELINED else _BF16_FIXED_GAUGE + tl.math.log2(l_i)
     tl.store(M + off_hz * N_CTX + offs_m, saved_m)
     return accum_cnt_qk, gauge_cnt
 
@@ -1086,7 +1203,17 @@ def _fwd_softmax_stages(
     USE_2CTA: tl.constexpr,
     FAST_FIXED: tl.constexpr,
     SKIP_CAUSAL_DIAG: tl.constexpr,
+    CERTIFIED_CAUSAL: tl.constexpr = False,
+    MERGED_RECOVERY: tl.constexpr = False,
 ):
+    if (CERTIFIED_CAUSAL or MERGED_RECOVERY) and STAGE == 3:
+        return _fwd_softmax_tile_1cta(
+            qk_fulls, qk_tiles, p_fulls, p_tiles, alpha_empties, alpha_fulls, alpha_tiles, cid,
+            accum_cnt_qk, gauge_cnt, qk_scale, offs_m, m_i, l_i, start_m,
+            N_CTX, out_dtype, BLOCK_M, BLOCK_N, NUM_MMA_SLICES,
+            STAGE=3, RESCALE_OPT=RESCALE_OPT, SCALAR_N=SCALAR_N, FAST_FIXED=FAST_FIXED,
+            SKIP_CAUSAL_DIAG=SKIP_CAUSAL_DIAG, CERTIFIED_CAUSAL=CERTIFIED_CAUSAL, MERGED_STAGE=True,
+        )
     for stage_bit in tl.static_range(1, 3):
         if STAGE & stage_bit:
             m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile(
@@ -1119,6 +1246,7 @@ def _fwd_softmax_stages(
                 USE_2CTA=USE_2CTA,
                 FAST_FIXED=FAST_FIXED,
                 SKIP_CAUSAL_DIAG=SKIP_CAUSAL_DIAG,
+                CERTIFIED_CAUSAL=CERTIFIED_CAUSAL,
             )
     return m_i, l_i, accum_cnt_qk, gauge_cnt
 
@@ -1851,8 +1979,14 @@ def _attn_fwd_ws_kernel(
     GRID_X_STATIC: tl.constexpr = 1,
     COMPACT_CLC: tl.constexpr = False,
     GLOBAL_LPT: tl.constexpr = False,
+    N_CTX_STATIC: tl.constexpr = 0,
+    Failure=None,
     LAYOUT_BSHD: tl.constexpr = False,
+    SPARSE_FALLBACK: tl.constexpr = False,
+    Recovery=None,
 ):
+    _RCP_LN2: tl.constexpr = 1.4426950408889634
+    _BF16_FIXED_GAUGE: tl.constexpr = 4.055517269
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -1867,15 +2001,26 @@ def _attn_fwd_ws_kernel(
         and NUM_MMA_SLICES == 2
         and not RESCALE_OPT
     )
-    USE_FAST_FIXED: tl.constexpr = FAST_FIXED and (FAST_F16_CAPABLE or FAST_2CTA_CAPABLE)
+    CERTIFIED_CAUSAL: tl.constexpr = Failure is not None
+    if CERTIFIED_CAUSAL:
+        tl.static_assert(FAST_FIXED and not RESCALE_OPT and not PIPELINED and STAGE == 3 and NUM_CTAS == 1)
+        tl.static_assert(tlx.dtype_of(desc_q) == tl.bfloat16 and tlx.dtype_of(desc_k) == tl.bfloat16
+                         and tlx.dtype_of(desc_v) == tl.bfloat16)
+        tl.static_assert(HEAD_DIM == 128 and BLOCK_M == 256 and BLOCK_N == 128 and NUM_MMA_SLICES == 2)
+        tl.static_assert((N_CTX_STATIC == 2048 and Z * N_CTX_STATIC == 32768 and H == 16 and LAYOUT_BSHD) or (N_CTX_STATIC >= 4096 and N_CTX_STATIC <= 32768 and N_CTX_STATIC % 512 == 0))
+        tl.static_assert(tlx.num_warps() == 4)
+    USE_FAST_FIXED: tl.constexpr = FAST_FIXED and (FAST_F16_CAPABLE or FAST_2CTA_CAPABLE or CERTIFIED_CAUSAL)
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
     SKIP_CAUSAL_DIAG: tl.constexpr = (
         STAGE == 3
-        and NUM_PID_M_STATIC <= 16
+        and (NUM_PID_M_STATIC <= 16 or (CERTIFIED_CAUSAL and NUM_PID_M_STATIC == 32))
         and BLOCK_N * 2 <= BLOCK_M
     )
-    FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA
-    DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16
+    FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA and not CERTIFIED_CAUSAL
+    DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16 or SPARSE_FALLBACK
+    if SPARSE_FALLBACK:
+        tl.static_assert(NUM_CTAS == 1 and STAGE == 3 and GROUP_SIZE_N == 1)
+        tl.static_assert(not COMPACT_CLC and not CERTIFIED_CAUSAL and RESCALE_OPT)
     USE_GRID_LPT: tl.constexpr = (
         STAGE == 3
         and COMPACT_CLC
@@ -1920,6 +2065,9 @@ def _attn_fwd_ws_kernel(
     else:
         start_pid = tl.program_id(0) // NUM_CTAS
         persistent_stride = tl.num_programs(0) // NUM_CTAS
+    if SPARSE_FALLBACK:
+        needs_recovery = tl.load(Recovery + 2 * start_pid) | tl.load(Recovery + 2 * start_pid + 1)
+        start_pid = tl.where(needs_recovery != 0, start_pid, -1)
 
     # allocate SMEM buffers and barriers
     NUM_Q_BUFS: tl.constexpr = NUM_GROUPS_PER_CTA * NUM_BUFFERS_Q
@@ -2039,7 +2187,7 @@ def _attn_fwd_ws_kernel(
     # CLC consumers per CTA: correction(1) + softmax(NUM_GROUPS_PER_CTA) + mma(1) + load(1) + epilog(1).
     if not DIRECT_SCHED:
         clc_context = tlx.clc_create_context(num_consumers=3 + NUM_GROUPS_PER_CTA if FUSE_EPILOG else 4 +
-                                             NUM_GROUPS_PER_CTA)
+                                             NUM_GROUPS_PER_CTA - (1 if CERTIFIED_CAUSAL else 0))
 
     # In 2-CTA mode, cross-CTA barrier_arrive (to the leader's mbarriers) requires
     # the mbarrier.init to be visible cluster-wide before any remote arrive.
@@ -2047,19 +2195,22 @@ def _attn_fwd_ws_kernel(
     if USE_2CTA:
         tlx.fence_mbarrier_init_cluster()
 
-    with tlx.async_tasks():
+    if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+        ws_done = tlx.alloc_barriers(num_barriers=1, arrive_count=3 + (1 if CERTIFIED_CAUSAL else NUM_GROUPS_PER_CTA))
+
+    with tlx.async_tasks(exclusive=CERTIFIED_CAUSAL or SPARSE_FALLBACK):
         # correction group
         with tlx.async_task("default"):
             accum_cnt = 0
             accum_cnt_qk = 0
-            gauge_cnt = 0
+            gauge_cnt = tl.zeros([BLOCK_M_SPLIT], tl.float32) if CERTIFIED_CAUSAL else 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
                 # Publish this persistent tile, then finalize its M and O outputs.
-                if USE_2CTA and USE_FAST_FIXED:
+                if (USE_2CTA or CERTIFIED_CAUSAL) and USE_FAST_FIXED:
                     accum_cnt_qk, gauge_cnt = _fwd_fixed_2cta_control_tile(
                         tile_id,
                         tile_count,
@@ -2097,7 +2248,14 @@ def _attn_fwd_ws_kernel(
                         RESCALE_OPT,
                         STAGE,
                         PIPELINED,
+                        CERTIFIED_CAUSAL, alpha_empties, alpha_fulls, alpha_tiles, Failure,
+                        clc_context if CERTIFIED_CAUSAL and not DIRECT_SCHED else None,
+                        clc_phase_producer,
                     )
+                    if CERTIFIED_CAUSAL and not DIRECT_SCHED:
+                        if NUM_PID_M_STATIC != 32 and NUM_PID_M_STATIC != 64:
+                            tlx.clc_producer(clc_context, clc_phase_producer)
+                        clc_phase_producer ^= 1
                 elif not USE_2CTA:
                     if not DIRECT_SCHED:
                         tlx.clc_producer(clc_context, clc_phase_producer)
@@ -2136,7 +2294,7 @@ def _attn_fwd_ws_kernel(
                         HEAD_DIM,
                         NUM_CTAS,
                         NUM_GROUPS_PER_CTA,
-                        NUM_MMA_SLICES,
+                        4 if SPARSE_FALLBACK else NUM_MMA_SLICES,
                         RESCALE_OPT,
                         SCALAR_N,
                         STAGE,
@@ -2150,7 +2308,7 @@ def _attn_fwd_ws_kernel(
                 tile_count += 1
                 if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
-                    tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+                    tile_id = -1 if SPARSE_FALLBACK else tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
                     if USE_GRID_LPT:
                         cta_x, cta_y, cta_z = tlx.clc_consumer(
@@ -2165,16 +2323,18 @@ def _attn_fwd_ws_kernel(
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+                tlx.barrier_wait(ws_done[0], 0)
+
         # softmax groups
-        with tlx.async_task(num_warps=4, registers=DENSE_REGS if USE_2CTA else 168,
-                            replicate=1 if USE_2CTA and USE_FAST_FIXED else NUM_GROUPS_PER_CTA):
+        with tlx.async_task(num_warps=4, registers=DENSE_REGS if USE_2CTA else 232 if CERTIFIED_CAUSAL else 176 if SPARSE_FALLBACK else 168,
+                            replicate=1 if (USE_2CTA or CERTIFIED_CAUSAL) and USE_FAST_FIXED else NUM_GROUPS_PER_CTA):
             accum_cnt_qk = 0
-            gauge_cnt = 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                gauge_cnt = 0
+                gauge_cnt = tl.zeros([BLOCK_M_SPLIT], tl.float32) if CERTIFIED_CAUSAL else 0
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_id,
@@ -2200,7 +2360,7 @@ def _attn_fwd_ws_kernel(
                 qk_scale *= _RCP_LN2
                 p_dtype = tlx.dtype_of(desc_v)
 
-                if USE_2CTA and USE_FAST_FIXED:
+                if (USE_2CTA or CERTIFIED_CAUSAL) and USE_FAST_FIXED:
                     cid = 1
                     group_id = cid * NUM_CTAS + cluster_cta_rank
                 else:
@@ -2237,21 +2397,29 @@ def _attn_fwd_ws_kernel(
                     USE_2CTA,
                     USE_FAST_FIXED,
                     SKIP_CAUSAL_DIAG,
+                    CERTIFIED_CAUSAL,
+                    MERGED_RECOVERY=SPARSE_FALLBACK,
                 )
 
-                if USE_2CTA:
-                    tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
+                if USE_2CTA or CERTIFIED_CAUSAL:
+                    if USE_2CTA:
+                        tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
                     _, phase = get_bufidx_phase(tile_count, 1)
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
                     scale = (1 / l_i)[:, None]
+                    if CERTIFIED_CAUSAL:
+                        bad_rows = ~((gauge_cnt <= 128.0) & (l_i > 0.0) & (l_i <= N_CTX) & (tl.abs(m_i * qk_scale) <= 32.0))
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         subslice = tlx.subslice(
                             acc_tiles[cid],
                             HEAD_DIM * slice_id // NUM_MMA_SLICES,
                             HEAD_DIM // NUM_MMA_SLICES,
                         )
-                        acc = _mul_f32x2(tlx.local_load(subslice), scale)
+                        acc = tlx.local_load(subslice)
+                        if CERTIFIED_CAUSAL:
+                            bad_rows |= ~(tl.reduce(tl.abs(acc), 1, _certificate_maximum_nan) < float("inf"))
+                        acc = _mul_f32x2(acc, scale)
                         acc = acc.to(tlx.dtype_of(desc_o))
                         subslice_o = tlx.local_slice(
                             o_tiles[cid],
@@ -2259,10 +2427,17 @@ def _attn_fwd_ws_kernel(
                             [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
                         )
                         tlx.local_store(subslice_o, acc)
+                    if CERTIFIED_CAUSAL:
+                        tl.store(Failure + 2 * (off_hz * (N_CTX // BLOCK_M) + start_m) + cid,
+                                 (tl.sum(bad_rows.to(tl.int32), 0) != 0).to(tl.int32))
                     tlx.fence("async_shared")
+                    if CERTIFIED_CAUSAL:
+                        tlx.barrier_arrive(qk_empties[cid])
                     tlx.barrier_arrive(o_fulls[cid])
                     if PIPELINED and USE_FAST_FIXED:
                         saved_m = 1.0 / l_i
+                    elif CERTIFIED_CAUSAL:
+                        saved_m = m_i * sm_scale * _RCP_LN2 + tl.math.log2(l_i)
                     elif USE_FAST_FIXED:
                         saved_m = _BF16_FIXED_GAUGE + tl.math.log2(l_i)
                     else:
@@ -2280,7 +2455,7 @@ def _attn_fwd_ws_kernel(
                 tile_count += 1
                 if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
-                    tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+                    tile_id = -1 if SPARSE_FALLBACK else tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
                     if USE_GRID_LPT:
                         cta_x, cta_y, cta_z = tlx.clc_consumer(
@@ -2294,6 +2469,9 @@ def _attn_fwd_ws_kernel(
                     else:
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
+
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+                tlx.barrier_arrive(ws_done[0])
 
         # mma group
         with tlx.async_task(num_warps=1, registers=24):
@@ -2386,7 +2564,7 @@ def _attn_fwd_ws_kernel(
                 tile_count += 1
                 if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
-                    tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+                    tile_id = -1 if SPARSE_FALLBACK else tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
                     if USE_GRID_LPT:
                         cta_x, cta_y, cta_z = tlx.clc_consumer(
@@ -2400,6 +2578,9 @@ def _attn_fwd_ws_kernel(
                     else:
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
+
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+                tlx.barrier_arrive(ws_done[0])
 
         if USE_2CTA and USE_FAST_FIXED:
             with tlx.async_task(num_warps=1, registers=24):
@@ -2531,7 +2712,7 @@ def _attn_fwd_ws_kernel(
                 tile_count += 1
                 if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
-                    tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+                    tile_id = -1 if SPARSE_FALLBACK else tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
                     if USE_GRID_LPT:
                         cta_x, cta_y, cta_z = tlx.clc_consumer(
@@ -2545,6 +2726,9 @@ def _attn_fwd_ws_kernel(
                     else:
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
+
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+                tlx.barrier_arrive(ws_done[0])
 
         # epilog group
         if USE_2CTA or not FUSE_EPILOG:
@@ -2596,7 +2780,7 @@ def _attn_fwd_ws_kernel(
                     tile_count += 1
                     if DIRECT_SCHED:
                         next_tile_id = tile_id + persistent_stride
-                        tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+                        tile_id = -1 if SPARSE_FALLBACK else tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                     else:
                         if USE_GRID_LPT:
                             cta_x, cta_y, cta_z = tlx.clc_consumer(
@@ -2610,6 +2794,9 @@ def _attn_fwd_ws_kernel(
                         else:
                             tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                         clc_phase_consumer ^= 1
+
+                if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+                    tlx.barrier_arrive(ws_done[0])
 
 
 @triton.jit
@@ -5066,6 +5253,38 @@ def _attn_bwd_ws(
         #     pass
 
 
+def _certified_forward(q, k, v, sm_scale):
+    layout_bshd = _forward_layout_bshd(q, k, v)
+    b, h, n, d = q.shape
+    safe = torch.zeros((b*h*(n//256), 2), device=q.device, dtype=torch.int32)
+    o = torch.empty_like(q)
+    m = torch.empty((b,h,n), device=q.device, dtype=torch.float32)
+    desc_q = _forward_descriptor(q, [128,d], layout_bshd)
+    desc_k = _forward_descriptor(k, [128,d], layout_bshd)
+    desc_v = _forward_descriptor(v, [128,d], layout_bshd)
+    desc_o = _forward_descriptor(o, [128,d], layout_bshd)
+    capacity = max(1,50*1024*1024 // (4*n*d))
+    group = (1 << (h-1).bit_length()) if capacity >= h else (1 << (capacity.bit_length()-1))
+    group = max(4,min(64,group))
+    if group == 4 and h > 4:
+        group = 8
+    grid = _compact_clc_grid(h,group,n//256,b) if group > 4 else (n//256*b*h,)
+    allocator_context = copy_context()
+    allocator_context.run(triton.set_allocator, lambda size,align,stream: torch.empty(size,dtype=torch.int8,device=q.device))
+    common = dict(LAYOUT_BSHD=layout_bshd,N_CTX=n,N_CTX_STATIC=n,HEAD_DIM=d,BLOCK_M=256,BLOCK_N=128,STAGE=3,
+                  NUM_BUFFERS_Q=1,NUM_BUFFERS_KV=3,NUM_BUFFERS_QK=1,NUM_MMA_GROUPS=2,
+                  NUM_MMA_SLICES=2,GROUP_SIZE_N=group,USE_WHERE=False,USE_WARP_BARRIER=True,
+                  NUM_CTAS=1,PIPELINED=False,DENSE_REGS=168,NUM_PID_M_STATIC=n//256,GRID_X_STATIC=h,
+                  COMPACT_CLC=group>4,GLOBAL_LPT=False,POLICY=0,
+                  num_warps=4,num_stages=1,num_ctas=1,multicast=False)
+    allocator_context.run(_attn_fwd_ws_kernel[grid],sm_scale,m,b,h,desc_q,desc_k,desc_v,desc_o,
+                             RESCALE_OPT=False,FAST_FIXED=True,Failure=safe,**common)
+    fallback = dict(common, GROUP_SIZE_N=1, COMPACT_CLC=False, GLOBAL_LPT=False, N_CTX_STATIC=0)
+    allocator_context.run(_attn_fwd_ws_kernel[(b*h*(n//256),)],sm_scale,m,b,h,desc_q,desc_k,desc_v,desc_o,
+                                       RESCALE_OPT=True,FAST_FIXED=False,SPARSE_FALLBACK=True,Recovery=safe,**fallback)
+    return o,m,safe
+
+
 def _select_forward_plan(q, k, v, causal):
     head_dim = q.shape[-1]
     n_ctx = q.shape[2]
@@ -5101,6 +5320,23 @@ class _attention(torch.autograd.Function):
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
         layout_bshd = _forward_layout_bshd(q, k, v)
+        paper_shape = (
+            type(q) is torch.Tensor and type(k) is torch.Tensor and type(v) is torch.Tensor
+            and type(causal) is bool and type(sm_scale) in (float, int) and sm_scale in (128 ** -0.5, 1.0 / 128 ** 0.5)
+            and q.ndim == k.ndim == v.ndim == 4 and q.shape == k.shape == v.shape
+            and q.shape[2] in (1024, 2048, 4096, 8192, 16384, 32768)
+            and (q.shape[0], q.shape[1], q.shape[3]) == (32768 // q.shape[2], 16, 128)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.is_cuda and q.device == k.device == v.device and layout_bshd
+        )
+        if paper_shape and causal and q.shape[2] != 1024:
+            o, M, _ = _certified_forward(q, k, v, sm_scale)
+            ctx.save_for_backward(q, k, v, o, M)
+            ctx.sm_scale = sm_scale
+            ctx.HEAD_DIM = HEAD_DIM_K
+            ctx.causal = causal
+            ctx.saved_inverse_normalizer = False
+            return o
         plan = _select_forward_plan(q, k, v, causal)
 
         o = torch.empty_like(q)
