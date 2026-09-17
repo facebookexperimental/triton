@@ -91,6 +91,15 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="flash_attn_mxfp8",
+        arch="sm100",
+        variant="ws_pipelined_persistent_mxfp8",
+        impl="kernels.flash_attn_mxfp8.sm100:flash_attn_mxfp8",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
         op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
