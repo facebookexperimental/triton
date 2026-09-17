@@ -3507,6 +3507,7 @@ public:
       bool isOperandD = false;
       Operation *producer = nullptr;
       if (Channel *ch = findChannelForAlloc(alloc.getResult(), channels)) {
+        r.channel = ch;
         if (ch->channelKind == DataChannelKind::TMEMAlloc)
           isOperandD = static_cast<ttng::TmemAllocChannel *>(ch)->isOperandD;
         producer = getLogicalProducerOp(ch);
@@ -3558,18 +3559,34 @@ public:
   Operation *allocOpFor(wsplan::BufferId b) const { return records[b].allocOp; }
 
   bool dependsOn(wsplan::BufferId a, wsplan::BufferId b) const override {
-    Operation *from = records[a].producer, *to = records[b].producer;
-    if (!from || !to || from == to)
+    Channel *aChannel = records[a].channel;
+    Channel *bChannel = records[b].channel;
+    if (!aChannel || !bChannel || aChannel == bChannel)
       return false;
-    // See SmemBufferModel::dependsOn: delegate to the shared memory-aware
-    // predicate so the TMEM reuse-legality gate (TmemPacker::legalJoin) accepts
-    // sibling reuse whose dependency flows through a buffer, not only via SSA.
-    return dependsThroughMemory(to, from);
+    // `a depends on b` iff b's last consumer precedes a's producer. Search may
+    // use the selected same-partition loop schedule as that ordering proof.
+    return hasReuseDependencyChain(bChannel, aChannel,
+                                   /*crossPartitionProgOrder=*/false,
+                                   /*useScheduleOrder=*/true);
+  }
+
+  bool canReuse(wsplan::BufferId a, wsplan::BufferId b) const override {
+    Channel *aChannel = records[a].channel;
+    Channel *bChannel = records[b].channel;
+    if (!aChannel || !bChannel || aChannel == bChannel)
+      return false;
+    return hasReuseDependencyChain(aChannel, bChannel,
+                                   /*crossPartitionProgOrder=*/false,
+                                   /*useScheduleOrder=*/true) ||
+           hasReuseDependencyChain(bChannel, aChannel,
+                                   /*crossPartitionProgOrder=*/false,
+                                   /*useScheduleOrder=*/true);
   }
 
 private:
   struct Record {
     Operation *allocOp = nullptr;
+    Channel *channel = nullptr;
     Operation *producer = nullptr;
     wsplan::Footprint footprint;
     Interval<size_t> liveness;
@@ -4050,7 +4067,8 @@ public:
           // data-independent cross-partition siblings are not spuriously
           // ordered (see hasDependencyChain / orderReuseGroupChain).
           auto order =
-              orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false);
+              orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false,
+                                   /*useScheduleOrder=*/true);
           llvm::errs() << "[ws-mem-plan-verify] group {" << names << "} => ";
           if (order.empty()) {
             llvm::errs() << "REJECT (no unique dependency-chain order)\n";
@@ -5855,6 +5873,7 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
     });
     for (size_t i = 0; i < members.size(); ++i) {
       Operation *alloc = model.allocOpFor(members[i]);
+      alloc->setAttr("allocation.searchPlan", UnitAttr::get(ctx));
       alloc->setAttr("buffer.id", IntegerAttr::get(i32, id));
       alloc->setAttr("buffer.copy", IntegerAttr::get(i32, 1));
       if (i > 0)

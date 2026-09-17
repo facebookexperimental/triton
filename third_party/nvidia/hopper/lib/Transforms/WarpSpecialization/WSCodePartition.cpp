@@ -1937,6 +1937,10 @@ DenseMap<Channel *, Value> createBufferForAllocs(
       buffer.getDefiningOp()->setAttr(
           "allocation.shareGroup",
           oldAllocOp->getAttr("allocation.shareGroup"));
+    if (oldAllocOp->getAttr("allocation.searchPlan"))
+      buffer.getDefiningOp()->setAttr(
+          "allocation.searchPlan",
+          oldAllocOp->getAttr("allocation.searchPlan"));
     SmallVector<Operation *> users;
     for (auto *user : oldAllocOp->getResult(0).getUsers())
       users.push_back(user);

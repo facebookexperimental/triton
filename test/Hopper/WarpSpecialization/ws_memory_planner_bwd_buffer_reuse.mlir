@@ -5,6 +5,19 @@
 // RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=0 TRITON_WS_MEM_PLAN_TOPK_DUMP=%t triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 // RUN: FileCheck %s --check-prefix=FIXED-DUMP --input-file=%t
 // RUN: env TRITON_WS_MEM_PLAN_VERIFY_GROUPS=1 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=VERIFY
+// RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
+// RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' %s | \
+// RUN:   env TRITON_WS_MEM_PLAN_TOPK=4 TRITON_WS_MEM_PLAN_PICK=1 \
+// RUN:   triton-opt - --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" \
+// RUN:   --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | \
+// RUN:   FileCheck %s --check-prefix=SEARCHED --implicit-check-not=tt.autows
+// RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
+// RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' %s | \
+// RUN:   env TRITON_WS_SMEM_PLAN_SEARCH=1 TRITON_WS_MEM_PLAN_TOPK=4 \
+// RUN:   TRITON_WS_MEM_PLAN_PICK=1 triton-opt - \
+// RUN:   --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=231000" \
+// RUN:   --verify-each | FileCheck %s --check-prefix=SEARCHED-E2E \
+// RUN:   --implicit-check-not=tt.autows
 
 // BWD FA persistent kernel (BLOCK_M1=128, EPILOGUE_SUBTILE=2) with TMA
 // descriptor_load for M/Di and early_tma_store_lowering for dQ/dK/dV.
@@ -51,6 +64,21 @@
 // VERIFY-DAG: [ws-mem-plan-verify] group {qkT,dpT,dq} => REJECT
 // VERIFY-DAG: [ws-mem-plan-verify] group {qkT,ppT,dsT_0} => REJECT
 // VERIFY-DAG: [ws-mem-plan-verify] group {dpT,dq,dsT_0} => REJECT
+
+// The scheduler target orders dk before dq in their shared GEMM partition.
+// Remove every manual schedule/channel annotation and model that selected
+// cluster relation. The memory search then proves dpT -> dsT -> dq from the
+// data edge plus same-partition schedule order and reconstructs the annotated
+// three-way TMEM reuse topology without buffer IDs or offsets in the input.
+// Rank zero is another equal-footprint candidate; the driver measures all
+// retained ranks, so this oracle selects the rank containing the known target.
+// SEARCHED-LABEL: tt.func public @_attn_bwd_persist
+// SEARCHED: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32{{.*}}buffer.id = [[TARGET:[0-9]+]] : i32{{.*}}buffer.offset = 0 : i32
+// SEARCHED: %dsT_0 = ttng.tmem_alloc {{.*}}buffer.id = [[TARGET]] : i32{{.*}}buffer.offset = 0 : i32
+// SEARCHED: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = [[TARGET]] : i32
+// SEARCHED-E2E-LABEL: tt.func public @_attn_bwd_persist
+// SEARCHED-E2E-COUNT-3: ttng.tmem_alloc {allocation.searchPlan
+// SEARCHED-E2E: ttg.warp_specialize
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

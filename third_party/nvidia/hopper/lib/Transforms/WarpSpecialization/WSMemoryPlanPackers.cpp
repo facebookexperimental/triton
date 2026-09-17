@@ -75,12 +75,11 @@ private:
 };
 
 /// TMEM: a block is a row-owner; members time-multiplex the same rows x cols
-/// space (all at column offset 0). Reuse is legal only when a candidate shares
-/// the members' encoding, has disjoint liveness, AND is bidirectionally
-/// data-dependent with them — the automatic-reuse predicate the existing placer
-/// uses (hasPotentialReuse score 1). The data dependency is load-bearing:
-/// liveness-disjoint-but-independent buffers can be concurrent across warp
-/// partitions despite disjoint op-id intervals. Copies stay 1 (caller pins).
+/// space (all at column offset 0). TMEM is untyped physical storage, so f16
+/// intermediates and f32 accumulators may reuse the same columns. Legality is
+/// delegated to BufferModel::canReuse: the default is disjoint liveness plus a
+/// dependency, while the production model may use a selected serialized
+/// schedule as the stronger proof. Copies stay 1 (caller pins).
 class TmemPacker : public Packer {
 public:
   explicit TmemPacker(const BufferModel &model) : model(model) {}
@@ -90,20 +89,10 @@ public:
     const Block *blk = findBlock(plan, blockId);
     if (!blk || blk->members.empty())
       return false;
-    EncodingKey key = model.encoding(b);
-    Interval<size_t> live = model.liveness(b);
     for (BufferId m : blk->members) {
-      if (model.encoding(m) != key)
-        return false;
-      // Match the proven automatic-reuse predicate (hasPotentialReuse score 1):
-      // disjoint liveness AND a bidirectional data dependency. The dependency
-      // is essential — two liveness-disjoint but *independent* buffers can live
-      // in different warp-specialized partitions and be concurrent at run time
-      // despite disjoint op-id intervals, so sharing columns would
-      // race/deadlock.
-      if (live.intersects(model.liveness(m)))
-        return false;
-      if (!model.dependsOn(b, m) && !model.dependsOn(m, b))
+      // The dependency proof is load-bearing: two lexically disjoint but
+      // independent buffers may run concurrently in different partitions.
+      if (!model.canReuse(b, m))
         return false;
     }
     return true;

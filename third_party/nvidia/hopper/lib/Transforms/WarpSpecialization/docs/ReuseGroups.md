@@ -809,9 +809,12 @@ one partition/block**. It is distinct from every other category:
 (`fused_attention_ws_device_tma.py`): three dots share one TMEM `buffer.id`
 (`dpT.opndD`, `dq.opndD`, `dk.opndA = dsT`). The distinguishing annotation vs
 the default is `dk: "opndA,tmem,1,5"` — `dk` reads `dsT` from the same TMEM
-buffer that `dpT`/`dq` write. The group is formed **by annotation**
-(`FrozenDotAttrs` channel specs pre-assign the shared `buffer.id`), not by the
-overlap/liveness heuristics.
+buffer that `dpT`/`dq` write. An annotation can form the group directly
+(`FrozenDotAttrs` channel specs pre-assign the shared `buffer.id`). The opt-in
+TMEM plan-space search can also retain it without channel pins when the selected
+schedule proves `dk` before `dq` in their shared GEMM partition. The target is
+currently an equal-footprint nonzero rank, so the outer search driver measures
+it rather than assuming rank zero is performance-best.
 
 ### Predicate
 
@@ -825,8 +828,12 @@ iff:
    block, so a block-based test would always see "one block".
 3. The channels admit a **unique total dependency-chain order** —
    `orderReuseGroupChain(group)` returns a non-empty ordering (channel `i`'s
-   consumer reaches channel `i+1`'s producer via SSA use-def or same-block
-   program order). For `{dpT, dsT, dq}` this is `dpT → dsT → dq`.
+   consumer reaches channel `i+1`'s producer via SSA use-def or serialized
+   same-partition order). For search-marked TMEM groups, when both operations
+   carry schedule coordinates, `loop.stage`/`loop.cluster` define that
+   same-partition order; textual order is only the fallback for equal or absent
+   coordinates. Legacy heuristic/manual groups retain textual ordering. For
+   `{dpT, dsT, dq}` the searched order is `dpT → dsT → dq`.
 
 If no unique chain order exists the predicate returns false and the group falls
 back to the per-channel barriers.
@@ -841,10 +848,11 @@ and only the cross-iteration WAR needs an explicit barrier:
 
 - **dpT → dsT** is a data dependency (`dsT` is computed from `dpT` in the
   computation partition), so `dsT`'s write follows `dpT`'s read for free.
-- **dsT → dq** is gemm-partition program order within the same SWP stage (the
-  `dk` MMA reads `dsT` before the `dq` MMA overwrites the slot; consecutive
-  tcgen05 MMAs execute in issue order), so `dq`'s write follows `dsT`'s read for
-  free. (This is why `dk` must be emitted before `dq` — see the accuracy fix.)
+- **dsT → dq** is serialized GEMM-partition schedule order (the `dk` MMA reads
+  `dsT` before the `dq` MMA overwrites the slot). `loop.stage`/`loop.cluster`
+  are consulted before textual IR order because software-pipeline expansion
+  follows the selected schedule. This is why the searched schedule must place
+  `dk` before `dq`.
 - **cross-iteration WAR** (the only explicit edge): the next tile's first write
   (`dpT`) must wait for the previous tile's last read (`dq`). Emitted exactly
   like the 2-buffer **A2** case applied to the chain **endpoints** — early =
@@ -900,7 +908,7 @@ deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
 | `orderReuseGroup2` | `CodePartitionUtility.cpp` | Determine early/late channel ordering |
 | `needExplicitReuseWait` | `CodePartitionUtility.cpp` | Check if explicit cross-channel wait is needed |
 | `isWholeAllocationOverwriteReuseOwner` | `CodePartitionUtility.cpp` | Detect a representative whose producer overwrites the whole allocation (needs back-edges to live packed siblings) |
-| `hasDependencyChain` | `CodePartitionUtility.cpp` | True if A's consumer reaches B's producer (transitive or program order) |
+| `hasDependencyChain` | `CodePartitionUtility.cpp` | True if A's consumer reaches B's producer through data dependence or serialized same-partition schedule/program order |
 | `verifyReuseGroupN` | `CodePartitionUtility.cpp` | **Live** gate for the SMEM epilogue path: SMEM, single-copy, producers same block, N ≥ 2 |
 | N-buffer sync (epilogue) | `WSCodePartition.cpp` (`insertAsyncComm`) | Inline chain + wrap-around `ProducerAcquireOp` insertion |
 | `orderReuseGroupN` | `CodePartitionUtility.cpp` | Producer-order sort helper — **still unused** (inline does its own sort) |

@@ -428,8 +428,16 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
 // `crossPartitionProgOrder` (default true) matches code partitioning's edge
 // policy. Pass false for the planner's group-FORMATION gate so cross-partition
 // textual order cannot spuriously order data-independent siblings.
-SmallVector<Channel *>
-orderReuseGroupChain(ReuseGroup *group, bool crossPartitionProgOrder = true);
+SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group,
+                                            bool crossPartitionProgOrder = true,
+                                            bool useScheduleOrder = false);
+
+// Return whether the consumer of `earlier` is ordered before the producer of
+// `later`. `useScheduleOrder` lets opt-in search plans use loop.stage/cluster
+// within one partition without changing legacy planner semantics.
+bool hasReuseDependencyChain(Channel *earlier, Channel *later,
+                             bool crossPartitionProgOrder = true,
+                             bool useScheduleOrder = false);
 
 // Verify that a reuse group with N channels (N >= 2) is well-formed:
 // - At least 2 channels, each with a single copy (getNumBuffers() == 1).

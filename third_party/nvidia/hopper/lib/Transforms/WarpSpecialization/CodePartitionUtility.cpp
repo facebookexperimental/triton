@@ -967,9 +967,36 @@ bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
 //          it refuses to order independent cross-partition siblings (FA-bwd
 //          {qkT,ppT,dsT}: ppT,dsT are cross-partition and data-independent, so
 //          no edge -> the group is correctly rejected), while a real chain
-//          ({dpT,dsT,dq}: dpT->dsT and dsT->dq are data deps) still orders.
-static bool hasDependencyChain(Channel *A, Channel *B,
-                               bool crossPartitionProgOrder = true) {
+//          ({dpT,dsT,dq}: dpT->dsT is a data dependency and dsT->dq is proven
+//          by same-partition schedule order) still orders.
+static std::optional<bool> scheduledBeforeInSamePartition(Operation *before,
+                                                          Operation *after) {
+  auto beforeLoop = before->getParentOfType<scf::ForOp>();
+  auto afterLoop = after->getParentOfType<scf::ForOp>();
+  if (!beforeLoop || beforeLoop != afterLoop)
+    return std::nullopt;
+  auto beforeStageAttr = before->getAttrOfType<IntegerAttr>("loop.stage");
+  auto afterStageAttr = after->getAttrOfType<IntegerAttr>("loop.stage");
+  if (!beforeStageAttr || !afterStageAttr)
+    return std::nullopt;
+  int beforeStage = beforeStageAttr.getInt();
+  int afterStage = afterStageAttr.getInt();
+  if (beforeStage != afterStage)
+    return beforeStage < afterStage;
+  auto beforeClusterAttr = before->getAttrOfType<IntegerAttr>("loop.cluster");
+  auto afterClusterAttr = after->getAttrOfType<IntegerAttr>("loop.cluster");
+  if (!beforeClusterAttr || !afterClusterAttr)
+    return std::nullopt;
+  int beforeCluster = beforeClusterAttr.getInt();
+  int afterCluster = afterClusterAttr.getInt();
+  if (beforeCluster == afterCluster)
+    return std::nullopt;
+  return beforeCluster < afterCluster;
+}
+
+bool hasReuseDependencyChain(Channel *A, Channel *B,
+                             bool crossPartitionProgOrder,
+                             bool useScheduleOrder) {
   // Reuse safety needs A's LAST consumer (the point after which A's slot is
   // free) to precede B's producer -- getDstOp() returns the earliest/list-order
   // consumer, which under-orders multi-consumer channels (e.g. dsT read by both
@@ -986,17 +1013,22 @@ static bool hasDependencyChain(Channel *A, Channel *B,
 
   // (2) program order within the same block.
   if (aConsumer->getBlock() == bProducer->getBlock()) {
-    if (!crossPartitionProgOrder) {
-      // Sound-gate mode: only accept textual order when a single partition runs
-      // both ops (shared async_task_id) -- otherwise the ops run concurrently
-      // and their relative text position is not a happens-before.
-      auto aTasks = getAsyncTaskIds(aConsumer);
-      auto bTasks = getAsyncTaskIds(bProducer);
-      bool sharePartition = llvm::any_of(
-          aTasks, [&](int t) { return llvm::is_contained(bTasks, t); });
+    auto aTasks = getAsyncTaskIds(aConsumer);
+    auto bTasks = getAsyncTaskIds(bProducer);
+    bool sharePartition = llvm::any_of(
+        aTasks, [&](int t) { return llvm::is_contained(bTasks, t); });
+    // Search-selected reuse may interpret serialized schedule coordinates.
+    // Existing code-partition ordering deliberately retains its textual-order
+    // contract unless the caller opts in: changing that order can alter
+    // circular-buffer rotation for already-formed staging groups.
+    if (useScheduleOrder) {
       if (!sharePartition)
-        return false;
+        return crossPartitionProgOrder && appearsBefore(aConsumer, bProducer);
+      if (auto order = scheduledBeforeInSamePartition(aConsumer, bProducer))
+        return *order;
     }
+    if (!crossPartitionProgOrder && !sharePartition)
+      return false;
     return appearsBefore(aConsumer, bProducer);
   }
 
@@ -1113,7 +1145,10 @@ bool verifyReuseGroup2(ReuseGroup *group) {
            << " disjoint columns (spatial packing, not a sync reuse group)");
       return false;
     }
-    bool chain = hasDependencyChain(chA, chB) || hasDependencyChain(chB, chA);
+    bool searchPlan = chA->getAllocOp()->hasAttr("allocation.searchPlan") &&
+                      chB->getAllocOp()->hasAttr("allocation.searchPlan");
+    bool chain = hasReuseDependencyChain(chA, chB, true, searchPlan) ||
+                 hasReuseDependencyChain(chB, chA, true, searchPlan);
     LDBG("verifyReuseGroup2: TMEM channels "
          << chA->uniqID << "/" << chB->uniqID << " (" << chA->srcName << "/"
          << chB->srcName << ") overlap=1 chain=" << chain);
@@ -1124,8 +1159,8 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   // either direction (e.g. qk/pp). The SMEM epilogue-subtile case (producers
   // in the same block, no chain) is NOT handled here — it is the N-buffer
   // path (verifyReuseGroupN).
-  bool hasAtoB = hasDependencyChain(chA, chB);
-  bool hasBtoA = hasDependencyChain(chB, chA);
+  bool hasAtoB = hasReuseDependencyChain(chA, chB);
+  bool hasBtoA = hasReuseDependencyChain(chB, chA);
   LDBG("verifyReuseGroup2: channel " << chA->uniqID << " -> channel "
                                      << chB->uniqID << ": " << hasAtoB);
   LDBG("verifyReuseGroup2: channel " << chB->uniqID << " -> channel "
@@ -1140,9 +1175,11 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
 
   // The early channel is the one whose consumer feeds into the other's
   // producer. If A.consumer -> B.producer dependency exists, A is early.
-  if (hasDependencyChain(chA, chB))
+  bool searchPlan = chA->getAllocOp()->hasAttr("allocation.searchPlan") &&
+                    chB->getAllocOp()->hasAttr("allocation.searchPlan");
+  if (hasReuseDependencyChain(chA, chB, true, searchPlan))
     return {chA, chB};
-  if (hasDependencyChain(chB, chA))
+  if (hasReuseDependencyChain(chB, chA, true, searchPlan))
     return {chB, chA};
   // Unreachable for a verified group: verifyReuseGroup2 now requires a
   // dependency chain in one direction (both for SMEM and overlapping TMEM), so
@@ -1155,7 +1192,8 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
 }
 
 SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group,
-                                            bool crossPartitionProgOrder) {
+                                            bool crossPartitionProgOrder,
+                                            bool useScheduleOrder) {
   // Topologically order the group's channels into one dependency chain:
   // channel i's consumer reaches channel i+1's producer (via SSA use-def or
   // same-block program order — both captured by hasDependencyChain). This
@@ -1170,12 +1208,20 @@ SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group,
   // order data-independent siblings — see hasDependencyChain.
   unsigned n = group->channels.size();
   SmallVector<Channel *> chans(group->channels.begin(), group->channels.end());
+  // The search planner marks its emitted TMEM allocation decisions so the
+  // later code-partition pass validates and orders them with the same selected
+  // schedule semantics. Heuristic/manual groups retain legacy textual order.
+  useScheduleOrder |= llvm::all_of(chans, [](Channel *ch) {
+    return ch->channelKind == DataChannelKind::TMEMAlloc && ch->getAllocOp() &&
+           ch->getAllocOp()->hasAttr("allocation.searchPlan");
+  });
   SmallVector<SmallVector<bool>> edge(n, SmallVector<bool>(n, false));
   SmallVector<unsigned> indeg(n, 0);
   for (unsigned i = 0; i < n; ++i)
     for (unsigned j = 0; j < n; ++j)
       if (i != j &&
-          hasDependencyChain(chans[i], chans[j], crossPartitionProgOrder)) {
+          hasReuseDependencyChain(chans[i], chans[j], crossPartitionProgOrder,
+                                  useScheduleOrder)) {
         edge[i][j] = true;
         ++indeg[j];
       }

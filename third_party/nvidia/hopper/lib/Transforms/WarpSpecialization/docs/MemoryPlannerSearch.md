@@ -129,6 +129,15 @@ partitioning's downstream `report_fatal_error`. The pass is **inert** unless
 first-fit actually produced an unorderable group — that is why default packings
 never change.
 
+The legacy algo-2 repair retains textual program order. The opt-in plan-space
+search instead uses serialized `loop.stage` and `loop.cluster` coordinates
+within one partition. This lets a Contracted schedule that places FA-bwd `dk`
+before `dq` prove the `dsT → dq` link even when the pre-expansion IR lists the
+MMA operations in another order. Search-selected TMEM allocations carry an
+internal `allocation.searchPlan` marker so code partitioning validates and
+orders the group with the same rule. Schedule order is never treated as a
+happens-before across different partitions.
+
 Finally `applyAllocationState` stamps `buffer.id` / `buffer.offset` /
 `buffer.copy` onto the IR (TMEM `buffer.copy` is pinned to 1 — see §3.2).
 
@@ -182,13 +191,14 @@ Finally `applyAllocationState` stamps `buffer.id` / `buffer.offset` /
 
 | Helper | Where | Role |
 |---|---|---|
-| `orderReuseGroupChain(group, crossPartitionProgOrder=true)` | `:1070` | Kahn topo-sort of a group's channels into a **unique** dependency chain; empty if none exists. The N-way legality oracle. |
-| `hasDependencyChain(A, B, crossPartitionProgOrder=true)` | `:884` | Edge test: data dep (`dependsThroughMemory`), or program order. With `crossPartitionProgOrder=false` (the group-formation gate) it drops cross-partition textual order — which is **not** a happens-before — so independent cross-partition siblings are refused. |
+| `orderReuseGroupChain(group, crossPartitionProgOrder=true, useScheduleOrder=false)` | `CodePartitionUtility.cpp` | Kahn topo-sort of a group's channels into a **unique** dependency chain; empty if none exists. The N-way legality oracle. |
+| `hasReuseDependencyChain(A, B, crossPartitionProgOrder=true, useScheduleOrder=false)` | `CodePartitionUtility.cpp` | Edge test: data dep (`dependsThroughMemory`), or program order. With `crossPartitionProgOrder=false` it drops cross-partition textual order; with `useScheduleOrder=true`, same-partition stage/cluster order may prove the edge. |
 | `verifyReuseGroup2` / `verifyReuseGroupCrossPartition` | `:994` / `:1264` | 2-way and N-way group verdicts used by code partitioning. |
 
-> The planner's group-formation gate calls `orderReuseGroupChain(..., false)`
-> (strict). Code partitioning keeps the default (`true`). Since strict ⊂ lax,
-> anything the planner forms is always orderable/materializable downstream.
+> Search calls the strict, schedule-aware form. Code partitioning recognizes
+> the emitted `allocation.searchPlan` marker and uses the same schedule-aware
+> semantics. Legacy heuristic/manual groups retain their prior textual-order
+> behavior.
 
 ## 5. Control flow (`allocateTMemAllocs2`, `:4230`)
 
@@ -265,10 +275,12 @@ logical blocks so their original ids and copy semantics are preserved.
 Abstract read-only view built once from IR: `size` (`Footprint` — bytes for SMEM,
 rows×cols for TMEM), `liveness` (op-order `Interval`), `stageSpan` (cross-stage
 copy floor), `entries` (slot-collision floor — **SHIPPED: stubbed to 1**),
-`encoding` (reuse-compat key), `kind` (TMALoad/Operand/Accumulator/Staging/
+`encoding` (SMEM reuse-compat key), `kind` (TMALoad/Operand/Accumulator/Staging/
 Other), `reuseScope` (SMEM same-block group gate), `latency` (producer latency
 from `ttng::NVLatencyModel`, on demand), `freq` (trip count — **SHIPPED: stubbed
-to 1.0**), `dependsOn(a,b)` (forward slice via the shared `dependsThroughMemory`).
+to 1.0**), `dependsOn(a,b)`, and `canReuse(a,b)`. The default `canReuse`
+requires disjoint lexical liveness plus a dependency; TMEM search overrides it
+with the selected schedule's stricter channel-order proof.
 Two impls:
 - **`SmemBufferModel`** — one record per `local_alloc`; liveness from first/last
   user in op order; `kind` from users (TMA store → Staging, innermost TMA →
@@ -296,9 +308,11 @@ Callers pass `"liveness"`.
   count is tuned. `feasible` = Σ allocated block bytes ≤ budget, excluding
   imported `countsTowardBudget=false` alias views; `place` = no-op.
 - **`TmemPacker`** — a block is a row-owner whose members time-multiplex the same
-  rows×cols at offset 0. **`legalJoin` = matching encoding AND disjoint liveness
-  AND bidirectional `dependsOn`** (the dependency is load-bearing — independent
-  liveness-disjoint buffers can be concurrent across partitions). `footprint` =
+  rows×cols at offset 0. TMEM storage is untyped, so f16 intermediates and f32
+  accumulators may share columns. **`legalJoin` = pairwise `canReuse`**, using
+  real dependencies or selected same-partition schedule order (the proof is
+  load-bearing — independent buffers can be concurrent across partitions).
+  `footprint` =
   max(member rows)×max(member cols); `feasible` = per-block cols ≤ `tmemCols` and
   Σ rows ≤ `tmemRows`; `place` = no-op (offset 0). Copies pinned to 1 by the
   caller.

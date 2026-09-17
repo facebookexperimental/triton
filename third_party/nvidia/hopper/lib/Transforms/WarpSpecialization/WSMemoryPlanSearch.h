@@ -171,6 +171,15 @@ public:
   /// True if `a` (transitively) depends on `b` via def-use. Used by
   /// `TopologicalOrder` and by TMEM reuse legality.
   virtual bool dependsOn(BufferId a, BufferId b) const = 0;
+
+  /// True when two buffers may time-multiplex one physical block. Most models
+  /// use disjoint lexical liveness plus a dependency edge. Schedule-aware
+  /// models may override this when a selected serialized schedule is the
+  /// stronger non-overlap proof.
+  virtual bool canReuse(BufferId a, BufferId b) const {
+    return !liveness(a).intersects(liveness(b)) &&
+           (dependsOn(a, b) || dependsOn(b, a));
+  }
 };
 
 /// Produces the sequence in which buffers are placed. THE swap seam: changing

@@ -63,6 +63,17 @@ now recognizes its eight separately materialized output-staging allocations as
 one fixed subtile group, preserves A3/B2 at rank zero, and retains A2/B2 and
 A2/B3 as the first two alternatives.
 
+**Production-shaped FA-backward oracle:** The existing BM64 pre-modulo fixture
+already proves that Contracted top-K retains the target five-GEMM schedule with
+no `tt.autows` stage/order metadata. At the post-buffer-allocation boundary,
+the early-TMA FA-backward fixture now strips all remaining `tt.autows` channel
+metadata. When the selected schedule orders `dk` before `dq`, the memory
+planner uses same-partition stage/cluster order to reconstruct the annotated
+three-way `{dpT, dsT, dq}` TMEM reuse group without copy/id/offset pins. It is
+currently an equal-score nonzero TMEM rank, intentionally left to the outer
+measurement driver instead of being forced to rank zero by an unvalidated cost
+model.
+
 **Primary implementation areas:**
 
 - `third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/`
@@ -777,8 +788,8 @@ as a hard correctness floor.
 - [x] External harness compiles, validates, and measures the bounded product.
 - [x] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
-- [ ] FA-backward target schedule exists without stage/order annotations.
-- [ ] FA-backward target memory plan exists without copy/id/offset pins.
+- [x] FA-backward target schedule exists without stage/order annotations.
+- [x] FA-backward target memory plan exists without copy/id/offset pins.
 - [ ] FA-backward memory-space annotations are removed or replaced by a general
       planning rule.
 - [ ] Default-off compilation remains unchanged.
