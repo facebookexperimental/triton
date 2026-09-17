@@ -1,4 +1,4 @@
-"""Enumerate and run the AutoWS schedule x memory-space x memory-plan space.
+"""Enumerate AutoWS schedule x memory-space x SMEM-plan x TMEM-plan.
 
 The child command must compile exactly one searched loop and append its
 compiler records to ``TRITON_WS_SEARCH_MANIFEST``. A zero exit status is the
@@ -24,7 +24,8 @@ from typing import Any, Sequence
 class RunResult:
     schedule_rank: int
     memory_space_rank: int
-    memory_rank: int
+    smem_rank: int
+    tmem_rank: int
     returncode: int
     elapsed_seconds: float
     stdout: str
@@ -56,10 +57,11 @@ def _contiguous_ranks(records: Sequence[dict[str, Any]], kind: str) -> list[int]
     return ranks
 
 
-def _memory_ranks(records: Sequence[dict[str, Any]], schedule_rank: int) -> list[int]:
+def _memory_ranks(records: Sequence[dict[str, Any]], schedule_rank: int, pool_prefix: str) -> list[int]:
     matching = [
         record for record in records
         if record.get("kind") == "memory" and int(record.get("schedule_pick", -1)) == schedule_rank
+        and str(record.get("pool", "")).startswith(pool_prefix)
     ]
     ranks = _contiguous_ranks(matching, "memory")
     return ranks or [0]
@@ -75,8 +77,8 @@ def _selected(records: Sequence[dict[str, Any]], kind: str) -> list[dict[str, An
 
 
 def _run_candidate(command: Sequence[str], base_env: dict[str, str], manifest: Path, schedule_rank: int,
-                   memory_space_rank: int, memory_rank: int, schedule_topk: int, memory_space_topk: int,
-                   memory_topk: int, timeout: float | None) -> RunResult:
+                   memory_space_rank: int, smem_rank: int, tmem_rank: int, schedule_topk: int, memory_space_topk: int,
+                   smem_topk: int, tmem_topk: int, timeout: float | None) -> RunResult:
     manifest.unlink(missing_ok=True)
     env = base_env.copy()
     env.update({
@@ -88,15 +90,19 @@ def _run_candidate(command: Sequence[str], base_env: dict[str, str], manifest: P
         "TRITON_WS_MEMORY_SPACE_TOPK": str(memory_space_topk),
         "TRITON_WS_MEMORY_SPACE_PICK": str(memory_space_rank),
         "TRITON_WS_SMEM_PLAN_SEARCH": "1",
-        "TRITON_WS_MEM_PLAN_TOPK": str(memory_topk),
-        "TRITON_WS_MEM_PLAN_PICK": str(memory_rank),
+        "TRITON_WS_MEM_PLAN_TOPK": str(max(smem_topk, tmem_topk)),
+        "TRITON_WS_MEM_PLAN_PICK": "0",
+        "TRITON_WS_SMEM_PLAN_TOPK": str(smem_topk),
+        "TRITON_WS_SMEM_PLAN_PICK": str(smem_rank),
+        "TRITON_WS_TMEM_PLAN_TOPK": str(tmem_topk),
+        "TRITON_WS_TMEM_PLAN_PICK": str(tmem_rank),
         "TRITON_WS_SEARCH_MANIFEST": str(manifest),
     })
     start = time.perf_counter()
     completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout, check=False)
     elapsed = time.perf_counter() - start
-    return RunResult(schedule_rank, memory_space_rank, memory_rank, completed.returncode, elapsed, completed.stdout,
-                     completed.stderr, _read_manifest(manifest))
+    return RunResult(schedule_rank, memory_space_rank, smem_rank, tmem_rank, completed.returncode, elapsed,
+                     completed.stdout, completed.stderr, _read_manifest(manifest))
 
 
 def _parse_env(values: Sequence[str]) -> dict[str, str]:
@@ -138,7 +144,8 @@ def _selection_error(run: RunResult) -> str | None:
     for pool in pools:
         pool_records = [record for record in memory_records if record["pool"] == pool]
         available = _contiguous_ranks(pool_records, "memory")
-        expected = min(run.memory_rank, available[-1])
+        requested = run.tmem_rank if pool.startswith("tmem") else run.smem_rank
+        expected = min(requested, available[-1])
         selected = {int(record["rank"]) for record in pool_records if record.get("selected") is True}
         if selected != {expected}:
             return f"selected {pool} ranks {sorted(selected)}; expected [{expected}]"
@@ -156,7 +163,8 @@ def _result_record(run: RunResult, pattern: re.Pattern[str] | None) -> dict[str,
     return {
         "schedule_rank": run.schedule_rank,
         "memory_space_rank": run.memory_space_rank,
-        "memory_rank": run.memory_rank,
+        "smem_rank": run.smem_rank,
+        "tmem_rank": run.tmem_rank,
         "status": status,
         "returncode": run.returncode,
         "elapsed_seconds": round(run.elapsed_seconds, 6),
@@ -172,7 +180,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schedule-topk", type=int, default=4)
     parser.add_argument("--memory-space-topk", type=int, default=1)
-    parser.add_argument("--memory-topk", type=int, default=4)
+    parser.add_argument("--memory-topk", type=int, default=4, help="fallback top-K for both memory pools")
+    parser.add_argument("--smem-topk", type=int, help="SMEM top-K (defaults to --memory-topk)")
+    parser.add_argument("--tmem-topk", type=int, help="TMEM top-K (defaults to --memory-topk)")
     parser.add_argument("--results", type=Path, required=True, help="JSONL output path")
     parser.add_argument("--metric-regex", help="Regex whose final match and first capture group is a metric")
     parser.add_argument("--timeout", type=float, default=None, help="Per-candidate timeout in seconds")
@@ -185,7 +195,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         command.pop(0)
     if not command:
         parser.error("a child command is required after --")
-    if args.schedule_topk < 1 or args.memory_space_topk < 1 or args.memory_topk < 1:
+    smem_topk = args.smem_topk if args.smem_topk is not None else args.memory_topk
+    tmem_topk = args.tmem_topk if args.tmem_topk is not None else args.memory_topk
+    if args.schedule_topk < 1 or args.memory_space_topk < 1 or smem_topk < 1 or tmem_topk < 1:
         parser.error("top-K values must be positive")
 
     try:
@@ -198,8 +210,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures = 0
     with tempfile.TemporaryDirectory(prefix="triton-autows-search-") as temp_dir, args.results.open("w") as output:
         manifest = Path(temp_dir) / "manifest.jsonl"
-        first = _run_candidate(command, base_env, manifest, 0, 0, 0, args.schedule_topk, args.memory_space_topk,
-                               args.memory_topk, args.timeout)
+        first = _run_candidate(command, base_env, manifest, 0, 0, 0, 0, args.schedule_topk, args.memory_space_topk,
+                               smem_topk, tmem_topk, args.timeout)
         schedule_ranks = _contiguous_ranks(first.records, "schedule")
         if not schedule_ranks:
             raise RuntimeError("child command emitted no schedule records")
@@ -208,20 +220,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         for schedule_rank in schedule_ranks:
             for memory_space_rank in memory_space_ranks:
                 discovery = first if schedule_rank == 0 and memory_space_rank == 0 else _run_candidate(
-                    command, base_env, manifest, schedule_rank, memory_space_rank, 0, args.schedule_topk,
-                    args.memory_space_topk, args.memory_topk, args.timeout)
-                memory_ranks = _memory_ranks(discovery.records, schedule_rank)
-                for memory_rank in memory_ranks:
-                    run = discovery if memory_rank == 0 else _run_candidate(
-                        command, base_env, manifest, schedule_rank, memory_space_rank, memory_rank, args.schedule_topk,
-                        args.memory_space_topk, args.memory_topk, args.timeout)
-                    record = _result_record(run, pattern)
-                    output.write(json.dumps(record, sort_keys=True) + "\n")
-                    output.flush()
-                    if record["status"] != "passed":
-                        failures += 1
-                        if run.stderr:
-                            print(run.stderr, end="", file=os.sys.stderr)
+                    command, base_env, manifest, schedule_rank, memory_space_rank, 0, 0, args.schedule_topk,
+                    args.memory_space_topk, smem_topk, tmem_topk, args.timeout)
+                smem_ranks = _memory_ranks(discovery.records, schedule_rank, "smem")
+                tmem_ranks = _memory_ranks(discovery.records, schedule_rank, "tmem")
+                for smem_rank in smem_ranks:
+                    for tmem_rank in tmem_ranks:
+                        run = discovery if smem_rank == 0 and tmem_rank == 0 else _run_candidate(
+                            command, base_env, manifest, schedule_rank, memory_space_rank, smem_rank, tmem_rank,
+                            args.schedule_topk, args.memory_space_topk, smem_topk, tmem_topk, args.timeout)
+                        record = _result_record(run, pattern)
+                        output.write(json.dumps(record, sort_keys=True) + "\n")
+                        output.flush()
+                        if record["status"] != "passed":
+                            failures += 1
+                            if run.stderr:
+                                print(run.stderr, end="", file=os.sys.stderr)
 
     return 1 if failures else 0
 

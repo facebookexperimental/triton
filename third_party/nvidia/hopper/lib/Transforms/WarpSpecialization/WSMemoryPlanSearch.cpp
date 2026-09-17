@@ -105,6 +105,53 @@ static void appendUnique(SmallVectorImpl<Plan> &plans, Plan plan) {
     plans.push_back(std::move(plan));
 }
 
+/// Prefer a conservative grouping that introduces the fewest reuse edges.
+/// Among equally conservative plans, keep buffers that are adjacent in the
+/// model's deterministic order together, preferring reuse among the earliest
+/// such buffers. This preserves a structurally distinct, low-aliasing
+/// candidate without using latency as an admission rule or naming any
+/// particular operand.
+static bool isMoreConservative(const Plan &a, const Plan &b) {
+  if (a.blocks.size() != b.blocks.size())
+    return a.blocks.size() > b.blocks.size();
+
+  auto fragmentation = [](const Plan &plan) {
+    uint64_t holes = 0;
+    for (const Block &block : plan.blocks) {
+      if (block.members.empty())
+        continue;
+      auto [minIt, maxIt] =
+          std::minmax_element(block.members.begin(), block.members.end());
+      holes +=
+          static_cast<uint64_t>(*maxIt - *minIt + 1) - block.members.size();
+    }
+    return holes;
+  };
+  uint64_t aHoles = fragmentation(a), bHoles = fragmentation(b);
+  if (aHoles != bHoles)
+    return aHoles < bHoles;
+
+  auto orderedGroupSizes = [](const Plan &plan) {
+    SmallVector<std::pair<BufferId, unsigned>> groups;
+    for (const Block &block : plan.blocks) {
+      if (block.members.empty())
+        continue;
+      groups.push_back(
+          {*std::min_element(block.members.begin(), block.members.end()),
+           static_cast<unsigned>(block.members.size())});
+    }
+    llvm::sort(groups);
+    SmallVector<unsigned> sizes;
+    for (auto [first, size] : groups)
+      sizes.push_back(size);
+    return sizes;
+  };
+  SmallVector<unsigned> aSizes = orderedGroupSizes(a);
+  SmallVector<unsigned> bSizes = orderedGroupSizes(b);
+  return std::lexicographical_compare(bSizes.begin(), bSizes.end(),
+                                      aSizes.begin(), aSizes.end());
+}
+
 /// Return `plan` with `b` appended to block index `blockIdx`.
 Plan withJoin(Plan plan, const Packer &packer, BufferId b, unsigned blockIdx) {
   Block &blk = plan.blocks[blockIdx];
@@ -210,9 +257,25 @@ TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
   llvm::stable_sort(
       leaves, [](const Plan &x, const Plan &y) { return x.score > y.score; });
 
-  unsigned n = std::min<unsigned>(K, leaves.size());
-  for (unsigned i = 0; i < n; ++i)
-    out.push_back(std::move(leaves[i]));
+  // Keep the existing best-scored plan at rank zero. When grouping choices
+  // exist, reserve rank one for the least aggressive feasible reuse topology;
+  // fill the remainder by score. This prevents a small top-K from containing
+  // only maximally packed plans with different reuse edges.
+  appendUnique(out, leaves.front());
+  bool hasGroupingDiversity = llvm::any_of(leaves, [&](const Plan &plan) {
+    return plan.blocks.size() != leaves.front().blocks.size();
+  });
+  if (K > 1 && hasGroupingDiversity) {
+    auto conservative = std::max_element(
+        leaves.begin(), leaves.end(),
+        [](const Plan &a, const Plan &b) { return isMoreConservative(b, a); });
+    appendUnique(out, *conservative);
+  }
+  for (const Plan &plan : leaves) {
+    if (out.size() == K)
+      break;
+    appendUnique(out, plan);
+  }
   return out;
 }
 

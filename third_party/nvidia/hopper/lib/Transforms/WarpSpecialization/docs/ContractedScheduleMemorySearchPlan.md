@@ -49,7 +49,7 @@ records contain the active schedule pick, memory rank and selected state, pool,
 score, and block layout. This is the pass-boundary contract for an external
 Cartesian-product harness; no in-process scheduler object is passed to the
 memory planner. `python/triton/tools/autows_search.py` consumes this contract,
-runs one compile/validation command per bounded candidate triple, verifies
+runs one compile/validation command per bounded candidate quadruple, verifies
 the selected ranks, and records exit status, elapsed time, and an optional
 command-reported metric as JSON lines.
 
@@ -59,19 +59,19 @@ existing heuristic. Higher ranks enumerate subsets of unannotated direct MMA
 LHS operands that the heuristic leaves in SMEM only because a transposed LHS
 sibling consumes the same source. This is the FA-backward dS choice: dQ keeps
 the transposed SMEM view while dK may consume a TMEM copy. Explicit memtype
-annotations retain precedence. The outer driver now sweeps the full
-schedule × memory-space × physical-memory product, and the pass emits a
+annotations retain precedence. The outer driver now sweeps the full schedule ×
+memory-space × SMEM-plan × TMEM-plan product, and the pass emits a
 `memory-space` manifest record so every selected rank is verified.
 
-**Current Milestone D stop point:** The annotation-free BM128 FA-backward
-candidate now compiles through software-pipeline expansion. Pre-lowered
+**Current Milestone D status:** The annotation-free BM128 FA-backward candidate
+compiles through software-pipeline expansion. Pre-lowered
 `ttng.async_tma_store_wait` operations selected into a peeled pipeline stage
 are predicated with the same `scf.if` mechanism as the other unmaskable TMA
-side effects. The selected schedule rank 1, memory-space rank 1, and physical
-memory rank 0 compile and launch, but the first result synchronization hangs.
-The next task is therefore to locate the missing or mis-phased synchronization
-edge in that selected candidate, reject or repair it generally, and only then
-add the annotation-free end-to-end correctness test.
+side effects. Separating the SMEM and TMEM rank coordinates and retaining a
+conservative low-aliasing TMEM frontier candidate exposes the annotated memory
+topology at schedule rank 1, memory-space rank 1, SMEM rank 0, and TMEM rank 1.
+A focused backward-only correctness test passes for this annotation-free
+candidate. Broader correctness and performance validation remain open.
 
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
 with 128x128x128 tiles and eight-way output subtiling has been captured at the
@@ -122,6 +122,7 @@ Contracted-graph structural SWP top-K
   -> selected loop.stage / loop.cluster / nominal II
   -> pre-allocation logical memory-space top-K
   -> search-based SMEM/TMEM planning for that schedule
+  -> selected SMEM copy rank + TMEM reuse rank
   -> selected buffer.copy / buffer.id / buffer.offset / memory space
   -> code partitioning and software-pipeline expansion
 ```
@@ -611,8 +612,9 @@ that schedule. A harness sweeps the bounded Cartesian product:
 for schedulePick in scheduleRanks:
     for memorySpacePick in memorySpaceRanks:
         compile/dump memory candidates for (schedulePick, memorySpacePick)
-        for memoryPick in memoryRanks(schedulePick, memorySpacePick):
-            compile, validate, and measure
+        for smemPick in smemRanks(schedulePick, memorySpacePick):
+            for tmemPick in tmemRanks(schedulePick, memorySpacePick):
+                compile, validate, and measure
 ```
 
 Emit a manifest containing:
@@ -620,7 +622,7 @@ Emit a manifest containing:
 - schedule rank and signature;
 - II;
 - memory-space rank and selected LHS promotions;
-- memory rank and signature;
+- independent SMEM and TMEM ranks and signatures;
 - SMEM bytes and TMEM columns;
 - fallback/fixed-grouping reason;
 - deduplication key.
@@ -629,14 +631,16 @@ Use generic schedule and memory picks; do not expose per-operand controls.
 
 The compiler-side manifest is implemented via `TRITON_WS_SEARCH_MANIFEST`. The
 external `python/triton/tools/autows_search.py` driver discovers ranks from that
-manifest and sweeps the bounded three-dimensional product. Its child command must
-compile exactly one searched loop, return nonzero on validation failure, and
-may print a numeric value selected by `--metric-regex` for performance ranking.
+manifest and sweeps the bounded four-dimensional product. Its child command
+must compile exactly one searched loop, return nonzero on validation failure,
+and may print a numeric value selected by `--metric-regex` for performance
+ranking.
 For example:
 
 ```shell
 python python/triton/tools/autows_search.py \
-  --schedule-topk=4 --memory-space-topk=2 --memory-topk=3 \
+  --schedule-topk=4 --memory-space-topk=2 \
+  --smem-topk=3 --tmem-topk=4 \
   --metric-regex='latency_ms=([0-9.]+)' --results=/tmp/search.jsonl -- \
   python path/to/kernel_correctness_and_benchmark.py
 ```
@@ -770,9 +774,9 @@ the D120 hypothesis before committing to memory-space search.
 
 ### Candidate explosion
 
-Schedule ranks multiplied by memory ranks can grow quickly. Use explicit global
-caps, canonical signatures, and diversity buckets. Do not silently replace
-diversity preservation with latency-score pruning.
+Schedule, memory-space, SMEM, and TMEM ranks multiply quickly. Use explicit
+global caps, canonical signatures, and diversity buckets. Do not silently
+replace diversity preservation with latency-score pruning.
 
 ### Structural schedules that stall heavily
 
@@ -826,8 +830,8 @@ as a hard correctness floor.
       TTGIR.
 - [x] Annotation-free BM128 FA backward compiles through software-pipeline
       expansion with scheduled TMA waits predicated safely.
-- [ ] Annotation-free BM128 FA backward completes runtime synchronization and
-      passes numerical correctness.
+- [x] An annotation-free BM128 FA-backward candidate reproduces the annotated
+      memory topology and passes focused backward-only numerical correctness.
 - [ ] Remove the source memtype annotations after correctness and performance
       select the annotation-free candidate.
 - [ ] Default-off compilation remains unchanged.

@@ -6,8 +6,10 @@ schedule_topk = int(os.environ["TRITON_MODULO_TOPK"])
 schedule_pick = min(int(os.environ["TRITON_MODULO_PICK"]), schedule_topk - 1)
 memory_space_topk = int(os.environ["TRITON_WS_MEMORY_SPACE_TOPK"])
 memory_space_pick = min(int(os.environ["TRITON_WS_MEMORY_SPACE_PICK"]), memory_space_topk - 1)
-memory_topk = int(os.environ["TRITON_WS_MEM_PLAN_TOPK"])
-memory_pick = min(int(os.environ["TRITON_WS_MEM_PLAN_PICK"]), memory_topk - 1)
+smem_topk = int(os.environ["TRITON_WS_SMEM_PLAN_TOPK"])
+smem_pick = min(int(os.environ["TRITON_WS_SMEM_PLAN_PICK"]), smem_topk - 1)
+tmem_topk = int(os.environ["TRITON_WS_TMEM_PLAN_TOPK"])
+tmem_pick = min(int(os.environ["TRITON_WS_TMEM_PLAN_PICK"]), tmem_topk - 1)
 manifest = Path(os.environ["TRITON_WS_SEARCH_MANIFEST"])
 
 with manifest.open("a") as output:
@@ -33,17 +35,18 @@ with manifest.open("a") as output:
             }),
             file=output,
         )
-    for rank in range(memory_topk):
-        print(
-            json.dumps({
-                "kind": "memory",
-                "schedule_pick": schedule_pick,
-                "pool": "smem-fixed",
-                "rank": rank,
-                "selected": rank == memory_pick,
-                "blocks": [{"id": 0, "copy": rank + 1}],
-            }),
-            file=output,
-        )
+    for pool, topk, pick in (("smem-fixed", smem_topk, smem_pick), ("tmem", tmem_topk, tmem_pick)):
+        for rank in range(topk):
+            print(
+                json.dumps({
+                    "kind": "memory",
+                    "schedule_pick": schedule_pick,
+                    "pool": pool,
+                    "rank": rank,
+                    "selected": rank == pick,
+                    "blocks": [{"id": 0, "copy": rank + 1}],
+                }),
+                file=output,
+            )
 
-print(f"latency_ms={100 * schedule_pick + 10 * memory_space_pick + memory_pick + 0.5}")
+print(f"latency_ms={1000 * schedule_pick + 100 * memory_space_pick + 10 * smem_pick + tmem_pick + 0.5}")

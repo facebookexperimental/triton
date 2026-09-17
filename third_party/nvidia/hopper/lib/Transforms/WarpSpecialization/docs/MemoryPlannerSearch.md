@@ -231,8 +231,10 @@ full story.
 | Knob | Effect |
 |---|---|
 | `tt.tmem_alloc_algo` (IR attr on the `scf.for`) | 1 = greedy (default), 2 = backtracking search. |
-| `TRITON_WS_MEM_PLAN_TOPK=K` | Enumerate K ranked TMEM packings (opt-in search). |
-| `tt.mem_plan_pick` (IR attr, from `tl.range(mem_plan_pick=...)`) / `TRITON_WS_MEM_PLAN_PICK` | Apply ranked plan `pick` (0 = cost-best; autotune-native via the constexpr). |
+| `TRITON_WS_MEM_PLAN_TOPK=K` | Legacy common top-K for both pools; used when a pool-specific top-K is absent. |
+| `tt.mem_plan_pick` (IR attr, from `tl.range(mem_plan_pick=...)`) / `TRITON_WS_MEM_PLAN_PICK` | Legacy common rank for both pools; used when a pool-specific pick is absent. |
+| `TRITON_WS_SMEM_PLAN_TOPK/PICK` | Enumerate/select the SMEM copy-plan frontier independently. |
+| `TRITON_WS_TMEM_PLAN_TOPK/PICK` | Enumerate/select the TMEM reuse-plan frontier independently. |
 | `TRITON_WS_MEM_PLAN_TOPK_DUMP=<path>` | Dump the ranked plans (JSON) for an external sweep harness. |
 | `TRITON_WS_SEARCH_MANIFEST=<path>` | Append schedule, logical memory-space, and physical memory candidates to the shared JSON-lines manifest used by the external product-search driver. |
 | `TRITON_WS_SMEM_PLAN_SEARCH` | Enable the SMEM plan-space beam search. |
@@ -372,6 +374,14 @@ then the packer rechecks the copy-expanded footprint. Rejections identify the
 block, buffer, proposed and required depths, and the missing
 release-to-overwrite ordering in `LLVM_DEBUG` output. The validator does not
 read estimated II; II remains solely an optimization-ranking input.
+
+The complete-plan frontier keeps the existing best-scored plan at rank zero.
+When grouping alternatives exist, rank one is reserved for the feasible plan
+with the most physical blocks (least additional reuse), preferring contiguous
+groups in deterministic buffer order. This keeps a conservative topology
+measurable even when equal-score, aggressively packed plans would otherwise
+fill a small top-K. SMEM and TMEM ranks are independently selectable because
+their frontiers have unrelated sizes and meanings.
 
 ### 9.7 Wiring & safety net
 `allocateSmemBuffersViaSearch` / `allocateTmemBuffersViaSearch` build the model,

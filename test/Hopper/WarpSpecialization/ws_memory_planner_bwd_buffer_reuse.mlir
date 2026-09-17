@@ -7,14 +7,16 @@
 // RUN: env TRITON_WS_MEM_PLAN_VERIFY_GROUPS=1 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=VERIFY
 // RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
 // RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' %s | \
-// RUN:   env TRITON_WS_MEM_PLAN_TOPK=4 TRITON_WS_MEM_PLAN_PICK=1 \
+// RUN:   env TRITON_WS_SMEM_PLAN_TOPK=3 TRITON_WS_SMEM_PLAN_PICK=0 \
+// RUN:   TRITON_WS_TMEM_PLAN_TOPK=4 TRITON_WS_TMEM_PLAN_PICK=1 \
 // RUN:   triton-opt - --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" \
 // RUN:   --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | \
 // RUN:   FileCheck %s --check-prefix=SEARCHED --implicit-check-not=tt.autows
 // RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
 // RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' %s | \
-// RUN:   env TRITON_WS_SMEM_PLAN_SEARCH=1 TRITON_WS_MEM_PLAN_TOPK=4 \
-// RUN:   TRITON_WS_MEM_PLAN_PICK=1 triton-opt - \
+// RUN:   env TRITON_WS_SMEM_PLAN_SEARCH=1 TRITON_WS_SMEM_PLAN_TOPK=3 \
+// RUN:   TRITON_WS_SMEM_PLAN_PICK=0 TRITON_WS_TMEM_PLAN_TOPK=4 \
+// RUN:   TRITON_WS_TMEM_PLAN_PICK=1 triton-opt - \
 // RUN:   --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=231000" \
 // RUN:   --verify-each | FileCheck %s --check-prefix=SEARCHED-E2E \
 // RUN:   --implicit-check-not=tt.autows
@@ -70,12 +72,24 @@
 // cluster relation. The memory search then proves dpT -> dsT -> dq from the
 // data edge plus same-partition schedule order and reconstructs the annotated
 // three-way TMEM reuse topology without buffer IDs or offsets in the input.
-// Rank zero is another equal-footprint candidate; the driver measures all
-// retained ranks, so this oracle selects the rank containing the known target.
+// Rank zero remains the score-best packed candidate. The structural frontier
+// reserves TMEM rank one for the least-aggressive legal grouping; combined
+// with SMEM rank zero, it exactly reproduces the annotated allocation topology.
 // SEARCHED-LABEL: tt.func public @_attn_bwd_persist
-// SEARCHED: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.copy = 1 : i32{{.*}}buffer.id = [[TARGET:[0-9]+]] : i32{{.*}}buffer.offset = 0 : i32
-// SEARCHED: %dsT_0 = ttng.tmem_alloc {{.*}}buffer.id = [[TARGET]] : i32{{.*}}buffer.offset = 0 : i32
-// SEARCHED: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = [[TARGET]] : i32
+// SEARCHED: %dq, %dq_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = 16 : i32{{.*}}buffer.offset = 0 : i32
+// SEARCHED: %dsT_0 = ttng.tmem_alloc {{.*}}buffer.id = 16 : i32{{.*}}buffer.offset = 0 : i32
+// SEARCHED: %dsT_1 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32}
+// SEARCHED: %Di = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32}
+// SEARCHED: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = 16 : i32
+// SEARCHED: %ppT = ttng.tmem_alloc {{.*}}buffer.id = 15 : i32{{.*}}buffer.offset = 0 : i32
+// SEARCHED: %do = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32}
+// SEARCHED: %qkT, %qkT_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = 15 : i32
+// SEARCHED: %m = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 3 : i32}
+// SEARCHED: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 4 : i32}
+// SEARCHED: %dk, %dk_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = 13 : i32
+// SEARCHED: %dv, %dv_{{[0-9]+}} = ttng.tmem_alloc {{.*}}buffer.id = 14 : i32
+// SEARCHED: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
+// SEARCHED: %k = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32}
 // SEARCHED-E2E-LABEL: tt.func public @_attn_bwd_persist
 // SEARCHED-E2E-COUNT-3: ttng.tmem_alloc {allocation.searchPlan
 // SEARCHED-E2E: ttg.warp_specialize

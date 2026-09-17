@@ -4,7 +4,8 @@
 // RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448" \
 // RUN:   -mlir-print-debuginfo -mlir-use-nameloc-as-prefix | \
 // RUN:   FileCheck %s --check-prefix=HEURISTIC
-// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=0 \
+// RUN: env TRITON_WS_SMEM_PLAN_TOPK=3 TRITON_WS_SMEM_PLAN_PICK=0 \
+// RUN:   TRITON_WS_TMEM_PLAN_TOPK=1 TRITON_WS_TMEM_PLAN_PICK=0 \
 // RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir \
 // RUN:   -allow-unregistered-dialect \
 // RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \

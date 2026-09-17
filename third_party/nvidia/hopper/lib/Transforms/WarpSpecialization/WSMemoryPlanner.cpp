@@ -2351,12 +2351,15 @@ static double getModuloII(triton::FuncOp funcOp) {
 
 // Top-K / pick knobs for the plan-space search, mirroring the list/modulo
 // schedulers (TRITON_LIST_SCHEDULE_TOPK/PICK, TRITON_MODULO_TOPK/PICK):
-// generate K ranked plans and apply rank `pick` (0 = cost-best). An external
-// harness sets TOPK=K and sweeps PICK over 0..K-1, compiling and timing each,
-// since the cost model only ranks (it may be inaccurate). One PICK applies to
-// both pools, clamped to each pool's plan count.
-static unsigned getMemPlanTopK() {
-  auto v = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_TOPK");
+// generate K ranked plans and apply rank `pick` (0 = cost-best). SMEM and TMEM
+// have independent ranked frontiers; pool-specific knobs let an external
+// harness sweep their Cartesian product. The legacy common knobs remain the
+// fallback for compatibility.
+static unsigned getMemPlanTopK(StringRef pool) {
+  auto v = triton::tools::getStrEnv(
+      pool == "tmem" ? "TRITON_WS_TMEM_PLAN_TOPK" : "TRITON_WS_SMEM_PLAN_TOPK");
+  if (v.empty())
+    v = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_TOPK");
   if (v.empty())
     return 1;
   int n = std::atoi(v.c_str());
@@ -2366,7 +2369,13 @@ static unsigned getMemPlanTopK() {
 // attr on any op (set from the tl.range mem_plan_pick constexpr, mirroring
 // tt.list_schedule_pick) — part of the compilation key so @triton.autotune can
 // sweep it. Falls back to TRITON_WS_MEM_PLAN_PICK, then 0 (cost-best).
-static unsigned getMemPlanPick(triton::FuncOp funcOp) {
+static unsigned getMemPlanPick(triton::FuncOp funcOp, StringRef pool) {
+  auto poolPick = triton::tools::getStrEnv(
+      pool == "tmem" ? "TRITON_WS_TMEM_PLAN_PICK" : "TRITON_WS_SMEM_PLAN_PICK");
+  if (!poolPick.empty()) {
+    int n = std::atoi(poolPick.c_str());
+    return n < 0 ? 0u : static_cast<unsigned>(n);
+  }
   std::optional<unsigned> attrPick;
   funcOp->walk([&](Operation *op) {
     if (attrPick)
@@ -2562,7 +2571,7 @@ static bool refineFixedSmemPlan(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation) {
-  unsigned topK = getMemPlanTopK();
+  unsigned topK = getMemPlanTopK("smem");
   if (topK <= 1)
     return true; // Rank-zero neutrality: leave heuristic attributes untouched.
 
@@ -2663,7 +2672,7 @@ static bool refineFixedSmemPlan(
   }
 
   unsigned selectedRank =
-      std::min<unsigned>(getMemPlanPick(funcOp), plans.size() - 1);
+      std::min<unsigned>(getMemPlanPick(funcOp, "smem"), plans.size() - 1);
   dumpMemPlans(plans, "smem-fixed", /*firstId=*/0, selectedRank);
   const wsplan::Plan &selected = plans[selectedRank];
   auto i32 = IntegerType::get(funcOp.getContext(), 32);
@@ -2748,7 +2757,7 @@ static unsigned allocateSmemBuffersViaSearch(
   wsplan::Budget budget;
   budget.smemBytes = smemBudget;
 
-  unsigned topK = getMemPlanTopK();
+  unsigned topK = getMemPlanTopK("smem");
   auto plans =
       wsplan::beamSearch(model, *ordering, *packer, *cost, *copies, *validator,
                          budget, /*W=*/std::max(16u, topK), /*K=*/topK);
@@ -2782,7 +2791,7 @@ static unsigned allocateSmemBuffersViaSearch(
   }
 
   unsigned selectedRank =
-      std::min<unsigned>(getMemPlanPick(funcOp), plans.size() - 1);
+      std::min<unsigned>(getMemPlanPick(funcOp, "smem"), plans.size() - 1);
   dumpMemPlans(plans, "smem", annotationMaxId, selectedRank);
   const wsplan::Plan &plan = plans[selectedRank];
   auto *ctx = funcOp.getContext();
@@ -4950,9 +4959,9 @@ public:
     // mem_plan_pick is set, enumerate distinct feasible packings and apply the
     // picked rank. Default (topK=1, pick=0) keeps the exact first-fit path so
     // non-search compiles are byte-identical.
-    unsigned topK = getMemPlanTopK();
+    unsigned topK = getMemPlanTopK("tmem");
     triton::FuncOp funcOp = ctrlOp->getParentOfType<triton::FuncOp>();
-    unsigned pick = funcOp ? getMemPlanPick(funcOp) : 0;
+    unsigned pick = funcOp ? getMemPlanPick(funcOp, "tmem") : 0;
     bool enumerated = false;
     if (topK > 1 || pick > 0) {
       // Rank 0 is ALWAYS the deterministic first-fit (the validated-safe
@@ -5838,10 +5847,10 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   budget.tmemRows = 512;
   budget.tmemCols = 512;
 
-  unsigned topK = getMemPlanTopK();
+  unsigned topK = getMemPlanTopK("tmem");
   auto plans =
       wsplan::beamSearch(model, *ordering, *packer, *cost, *copies, *validator,
-                         budget, /*W=*/std::max(16u, topK), /*K=*/topK);
+                         budget, /*W=*/std::max(64u, topK), /*K=*/topK);
   if (plans.empty()) {
     LDBG("TMEM plan-search: no plan found, falling back");
     return false;
@@ -5855,7 +5864,7 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
       blk.copies = 1;
 
   unsigned selectedRank =
-      std::min<unsigned>(getMemPlanPick(funcOp), plans.size() - 1);
+      std::min<unsigned>(getMemPlanPick(funcOp, "tmem"), plans.size() - 1);
   dumpMemPlans(plans, "tmem", bufferId, selectedRank);
   const wsplan::Plan &plan = plans[selectedRank];
   auto *ctx = funcOp.getContext();

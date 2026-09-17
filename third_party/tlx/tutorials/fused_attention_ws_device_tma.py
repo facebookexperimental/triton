@@ -2,6 +2,7 @@ import contextlib
 import copy
 import json
 import os
+import types
 
 import pytest
 import torch
@@ -1872,9 +1873,8 @@ class _attention_opt(torch.autograd.Function):
             if use_clc:
                 # One physical CTA per M tile, matching the static 2-CTA
                 # schedule where neighboring CTAs cover neighboring M tiles.
-                assert total_tiles % num_ctas == 0, (
-                    f"CLC 2-CTA needs one physical CTA per M tile, so total_tiles "
-                    f"({total_tiles}) must be a multiple of NUM_CTAS ({num_ctas})")
+                assert total_tiles % num_ctas == 0, (f"CLC 2-CTA needs one physical CTA per M tile, so total_tiles "
+                                                     f"({total_tiles}) must be a multiple of NUM_CTAS ({num_ctas})")
                 return (total_tiles, 1, 1)
             # Clamp to one cluster: total_tiles // num_ctas floors to 0 when there
             # are fewer tiles than CTAs, which would launch a (0, 1, 1) grid and
@@ -2602,6 +2602,82 @@ def test_bwd_bm128_memtype_only():
             FADD2_REDUCE=False,
             bwd_config_idx=_idx,
         )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm128_annotation_free_search(monkeypatch):
+    # Compile only the backward kernel so the process-wide search ranks select
+    # this loop rather than an unrelated forward loop. The selected structural
+    # schedule, logical memory space, SMEM plan, and TMEM plan reproduce the
+    # annotated BM128 configuration without a BWD_DOT_ATTRS payload.
+    search_env = {
+        "STANDALONE_MODULO": "1",
+        "TRITON_USE_MODULO_SCHEDULE": "contracted",
+        "TRITON_MODULO_TOPK": "5",
+        "TRITON_MODULO_PICK": "1",
+        "TRITON_WS_MEMORY_SPACE_TOPK": "2",
+        "TRITON_WS_MEMORY_SPACE_PICK": "1",
+        "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+        "TRITON_WS_SMEM_PLAN_TOPK": "3",
+        "TRITON_WS_SMEM_PLAN_PICK": "0",
+        "TRITON_WS_TMEM_PLAN_TOPK": "4",
+        "TRITON_WS_TMEM_PLAN_PICK": "1",
+    }
+    for name, value in search_env.items():
+        monkeypatch.setenv(name, value)
+
+    torch.manual_seed(20)
+    z, h, n_ctx, head_dim = 1, 1, 256, 128
+    sm_scale = 0.5
+    q = torch.empty((z, h, n_ctx, head_dim), dtype=torch.float16, device=DEVICE).normal_(0.0, 0.5)
+    k = torch.empty_like(q).normal_(0.0, 0.5)
+    v = torch.empty_like(q).normal_(0.0, 0.5)
+    dout = torch.randn_like(q).contiguous()
+
+    q_ref = q.detach().requires_grad_()
+    k_ref = k.detach().requires_grad_()
+    v_ref = v.detach().requires_grad_()
+    scores = torch.matmul(q_ref, k_ref.transpose(2, 3)) * sm_scale
+    p = torch.softmax(scores.float(), dim=-1).to(torch.float16)
+    o = torch.matmul(p, v_ref).half()
+    o.backward(dout)
+    expected = (q_ref.grad.float(), k_ref.grad.float(), v_ref.grad.float())
+
+    # Forward stores log2(sum(exp(score))) for backward's exp2 formulation.
+    m = torch.logsumexp(scores.detach().float(), dim=-1) * 1.4426950408889634
+    ctx = types.SimpleNamespace(
+        saved_tensors=(q, k, v, o.detach(), m),
+        sm_scale=sm_scale,
+        HEAD_DIM=head_dim,
+        causal=False,
+        persistent=False,
+    )
+    config = triton.Config(
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "SMEM_BUDGET": 220000,
+            "BWD_DOT_ATTRS": FrozenDotAttrs(None),
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    )
+    saved_configs, saved_cache = _attn_bwd.configs, _attn_bwd.cache
+    try:
+        _attn_bwd.configs = [config]
+        _attn_bwd.cache = {}
+        actual = _attention_opt.backward(ctx, dout)[:3]
+    finally:
+        _attn_bwd.configs = saved_configs
+        _attn_bwd.cache = saved_cache
+
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result.float(), reference, atol=1e-2, rtol=0)
 
 
 try:
