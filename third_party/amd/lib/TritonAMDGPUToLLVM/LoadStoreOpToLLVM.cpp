@@ -1416,8 +1416,23 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
       member.sharedEncoding = encoding;
       member.shapePerCTA = llvm::to_vector(
           triton::gpu::getShapePerCTA(encoding, descTy.getShape()));
-      member.desc = mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc,
-                                                         adaptor.getDescs()[i]);
+      Value desc = adaptor.getDescs()[i];
+      // Fold an address/predicate-only update into the copy's descriptor
+      // construction. Materializing the updated packed descriptor first adds
+      // a second address decode/repack and disrupts scheduling of LDS operands
+      // in software-pipelined kernels. Bounds-changing updates must remain
+      // materialized: a copy clamps only by its own per-warp offsets.
+      if (auto update =
+              op.getDescs()[i]
+                  .getDefiningOp<triton::amdgpu::UpdateTensorDescriptorOp>();
+          update && !update.getClampBounds() && update.getSetBounds().empty()) {
+        desc = rewriter.getRemappedValue(update.getDesc());
+        for (Value offset : update.getAddOffsets())
+          member.descriptorOffsets.push_back(rewriter.getRemappedValue(offset));
+        if (Value pred = update.getPred())
+          member.pred = rewriter.getRemappedValue(pred);
+      }
+      member.desc = mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, desc);
       member.copyOffsets.append(descTy.getShape().size(), b.i32_val(0));
 
       auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
@@ -1425,7 +1440,6 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
       member.dstPtrs = getTDMSharedBases(
           loc, rewriter, dstMemObj,
           cast<triton::gpu::MemDescType>(op.getDests()[i].getType()));
-      member.pred = Value();
       memberHints.push_back(static_cast<uint32_t>(op.getWarpUsedHints()[i]));
     }
 
