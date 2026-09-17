@@ -3311,6 +3311,9 @@ _configs_bwd_1cta_runtime = [
     _make_bwd_runtime_config(1, 4, 2, use_warp_barrier)
     for use_warp_barrier in (False, True)
 ]
+_bwd_d64_config = _make_bwd_runtime_config(1, 4, 2, True)
+_bwd_d64_config.kwargs["BLOCK_M1"] = 128
+_configs_bwd_1cta_runtime.append(_bwd_d64_config)
 _configs_bwd_2cta_runtime = [
     _make_bwd_runtime_config(2, epilogue_subtile, dq_stage_count)
     for epilogue_subtile, dq_stage_count in ((2, 1), (4, 2), (8, 2), (8, 4))
@@ -3326,14 +3329,21 @@ def prune_bwd_configs(configs, named_args, **kwargs):
         for config in configs
         if (config.kwargs["EPILOGUE_SUBTILE"] != 2 or kwargs.get("PRENORMALIZED_DO", False))
         and (
+            config.kwargs["NUM_CTAS"] != 1
+            or config.kwargs["BLOCK_M1"] != 128
+            or (
+                kwargs.get("HEAD_DIM") == 64
+                and kwargs.get("STAGE") in (1, 3)
+            )
+        )
+        and (
             (n_ctx + config.kwargs["BLOCK_N1"] - 1)
             // config.kwargs["BLOCK_N1"]
         )
         % config.kwargs.get("NUM_CTAS", 1)
         == 0
     ]
-    if kwargs.get("SCALE_QK_IN_KERNEL", False):
-        assert kwargs["HEAD_DIM"] == 128
+    if kwargs.get("SCALE_QK_IN_KERNEL", False) and kwargs.get("HEAD_DIM") == 128:
         configs = [config for config in configs if config.kwargs.get("NUM_CTAS", 1) == 2]
         if kwargs.get("PERSISTENT_BWD", False):
             configs = [
@@ -4649,14 +4659,14 @@ def _attn_bwd_ws(
         "packed dQ requires the guarded causal BF16 direct two-CTA configuration",
     )
     tl.static_assert(
-        not SCALE_QK_IN_KERNEL or (USE_2CTA and HEAD_DIM == 128),
-        "direct dQ requires NUM_CTAS=2 and HEAD_DIM=128",
+        not SCALE_QK_IN_KERNEL or HEAD_DIM == 64 or (USE_2CTA and HEAD_DIM == 128),
+        "QK scaling requires D64 or two-CTA D128",
     )
     tl.static_assert(
         not PRENORMALIZED_DO or SCALE_QK_IN_KERNEL,
         "prenormalized dO requires direct dQ scaling",
     )
-    DIRECT_DQ_OUTPUT: tl.constexpr = SCALE_QK_IN_KERNEL
+    DIRECT_DQ_OUTPUT: tl.constexpr = SCALE_QK_IN_KERNEL and USE_2CTA and HEAD_DIM == 128
     NATIVE_COORDS: tl.constexpr = USE_2CTA and not PERSISTENT_BWD
     DQ_READ_DONE_BAR: tl.constexpr = 12
     NUM_REDUCE_THREADS: tl.constexpr = 4 * 32
@@ -5258,7 +5268,7 @@ def _attn_bwd_ws(
                                 tlx.barrier_arrive(
                                     dq_empties[tmem_buf_id], 1, remote_cta_rank=0
                                 )
-                            dq_full = dq_full * LN2
+                            dq_full = dq_full * (sm_scale if SCALE_QK_IN_KERNEL else LN2)
                             dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
                             for slice_id in tl.static_range(DQ_PACK_ITERS):
                                 dq_smem = dq_store_buf[slice_id % DQ_STORE_STAGES]
@@ -5960,7 +5970,8 @@ class _attention(torch.autograd.Function):
             dq_accum = torch.empty([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
-        arg_k = k if direct_dq_output else k * (ctx.sm_scale * _RCP_LN2.value)
+        scale_qk_in_kernel = direct_dq_output or ctx.HEAD_DIM == 64
+        arg_k = k if scale_qk_in_kernel else k * (ctx.sm_scale * _RCP_LN2.value)
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
@@ -5992,7 +6003,7 @@ class _attention(torch.autograd.Function):
             DQ_STRIDES=None if dq_accum.is_contiguous() else dq_accum.stride()[:3],
         )
 
-        if prefix_correction:
+        if prefix_correction or (ctx.HEAD_DIM == 64 and ctx.causal and q.dtype == torch.bfloat16):
             prefix_block = 64 if N_CTX == 1024 else 16
             _bwd_prefix_delta[(128 // prefix_block, BATCH * N_HEAD)](
                 q, k, v, do, M, delta, ctx.sm_scale,
@@ -6109,7 +6120,7 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage,
-            SCALE_QK_IN_KERNEL=direct_dq_output,
+            SCALE_QK_IN_KERNEL=scale_qk_in_kernel,
             PERSISTENT_BWD=persistent_bwd,
             PRENORMALIZED_DO=scale_do_by_inv_l,
             PREPROCESS_ZEROES_DQ=preprocess_zeroes_dq,
@@ -6147,7 +6158,7 @@ class _attention(torch.autograd.Function):
                 DQ_STRIDES=None if dq.is_contiguous() else dq.stride()[:3],
             )
 
-        if prefix_correction and N_CTX == 1024:
+        if (prefix_correction and N_CTX == 1024) or (ctx.HEAD_DIM == 64 and ctx.causal and q.dtype == torch.bfloat16):
             _bwd_prefix_dv_residual[(4, BATCH * N_HEAD)](
                 q, k, do, M, dv, ctx.sm_scale, N_CTX=N_CTX, N_HEAD=N_HEAD,
                 Q_STRIDES=q.stride(), K_STRIDES=k.stride(),
