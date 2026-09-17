@@ -589,7 +589,8 @@ private:
 
 void mlir::triton::NVIDIA::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit) {
+    RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    PatternBenefit benefit) {
   // Backend optimized memory ops get higher benefit
   patterns.add<AsyncRemoteShmemReduceOpConversion>(typeConverter, targetInfo,
                                                    benefit.getBenefit() + 1);
@@ -603,6 +604,6 @@ void mlir::triton::NVIDIA::populateMemoryOpToLLVMPatterns(
                                                   benefit.getBenefit() + 1);
   patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo,
                                       benefit.getBenefit() + 1);
-  mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
-                                               patterns, benefit);
+  mlir::triton::populateMemoryOpToLLVMPatterns(
+      typeConverter, targetInfo, patterns, axisInfoAnalysis, benefit);
 }
