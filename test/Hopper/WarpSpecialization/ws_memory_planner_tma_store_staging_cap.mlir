@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=200000" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=0 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=200000 smem-plan-search" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=SEARCH
 
 // Regression coverage for BWD config 1 (BLOCK_M1=64, EPILOGUE_SUBTILE=2)
 // with early_tma_store_lowering. The planner sees the TMA store staging
@@ -20,6 +21,11 @@
 // TMA store staging allocs: emit current attributes (cap-to-1 not currently
 // enforced; see PSM-related design discussion).
 // CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 19 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x64xf16
+
+// Search rank zero imports the same production-shaped FA-bwd staging plan.
+// SEARCH-LABEL: tt.func public @_attn_bwd_persist
+// SEARCH: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
+// SEARCH: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 19 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x64xf16
 
 // Hopper register accumulators do not trace back to a tmem_load. When two data
 // partitions stage stores to the same descriptor, the producer task must keep

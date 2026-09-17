@@ -723,7 +723,12 @@ as a hard correctness floor.
 - [x] Descriptor-load placement participates in candidate identity.
 - [x] CopySolver emits multiple legal copy vectors.
 - [x] Memory beam returns distinct SMEM depth plans.
-- [ ] Fixed-grouping search works with subtiled/staging kernels.
+- [x] Fixed-grouping search preserves multi-store staging while searching
+      singleton operand depths.
+- [ ] Fixed-grouping search is exercised on a production-shaped subtiled
+      kernel.
+- [ ] Cross-id `allocation.reuseTarget` footprint is modeled by fixed-group
+      search.
 - [ ] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [ ] FA-backward target schedule exists without stage/order annotations.
