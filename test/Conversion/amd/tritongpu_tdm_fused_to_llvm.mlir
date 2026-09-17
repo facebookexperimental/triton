@@ -1,5 +1,6 @@
 // RUN: triton-opt %s --split-input-file | FileCheck %s --check-prefix=TTG
 // RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm | FileCheck %s --check-prefix=LLVM
+// RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm --canonicalize --cse | FileCheck %s --check-prefix=FOLD
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
@@ -33,6 +34,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // LLVM-NOT: "llvm.amdgcn.tensor.load.to.lds"
     %0 = amdg.async_tdm_copy_global_to_local %desc0 into %dst0 {warp_used_hint = 3 : i32} : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %1 = amdg.async_tdm_copy_global_to_local %desc1 into %dst1 {warp_used_hint = 12 : i32} : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // TTG-LABEL: tdm_fused_fold_position
+  // LLVM-LABEL: tdm_fused_fold_position
+  // FOLD-LABEL: llvm.func @tdm_fused_fold_position
+  tt.func public @tdm_fused_fold_position(
+      %desc: !tt.tensordesc<32x32xf16, #shared>,
+      %offset: i32,
+      %da: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>,
+      %db: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    // Share the positioned descriptor between two destinations. Its address
+    // must not be updated/repacked before the copy stamps its LDS address.
+    // The dynamic offset retains the signed descriptor-update semantics.
+    // FOLD-NOT: llvm.bitcast
+    // FOLD: llvm.sext %arg1 : i32 to i64
+    // FOLD-NOT: llvm.bitcast
+    // FOLD: llvm.ptrtoint
+    // FOLD: llvm.call_intrinsic "llvm.amdgcn.tensor.load.to.lds"
+    %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %offset] : !tt.tensordesc<32x32xf16, #shared>
+    %0 = amdg.async_tdm_fused_copy_global_to_local %positioned, %positioned into %da, %db {warp_used_hints = array<i32: 1, 2>} : !tt.tensordesc<32x32xf16, #shared>, !tt.tensordesc<32x32xf16, #shared> -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>, !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
     tt.return
   }
 }

@@ -20,10 +20,10 @@ compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
 second. On implementations that provide it, pass `space="full"` explicitly to
 buy back the tuned configs, which are worth up to ~4x on small shapes. The
-gfx950 LocalSplitU implementation currently provides only `"heuristic"`.
+gfx950 implementation currently provides only `"heuristic"`.
 
-Ops with no heuristic yet -- flash_attn, hstu_attn, kimi_delta_attention --
-still default to "full". Their remaining space is "smoke", which selects for
+Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
+kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can follow
 `mm`.
@@ -36,8 +36,10 @@ from __future__ import annotations
 
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
-__all__ = ["mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-           "UnsupportedOp", "InvalidInput"]
+__all__ = [
+    "mm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "UnsupportedOp", "InvalidInput"
+]
 
 
 def mm(a, b, *, arch=None, space="heuristic"):
@@ -49,20 +51,14 @@ def mm(a, b, *, arch=None, space="heuristic"):
     docstring.
     """
     if a.ndim != 2 or b.ndim != 2:
-        raise InvalidInput(
-            "tlx.ops.mm expects two rank-2 tensors; "
-            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
-        )
+        raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     if a.shape[1] != b.shape[0]:
-        raise InvalidInput(
-            "tlx.ops.mm reduction dimensions must match; "
-            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}"
-        )
+        raise InvalidInput("tlx.ops.mm reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     if a.dtype != b.dtype or a.device != b.device:
-        raise InvalidInput(
-            "tlx.ops.mm operands must have the same dtype and device; "
-            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})"
-        )
+        raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
+                           f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
     fn, spec = impl_for("mm", arch)
     # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
     # descriptor transposed, so that is the stride TMA must find aligned.
@@ -80,6 +76,29 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full")
     """
     fn, spec = impl_for("flash_attn", arch)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    return fn(q, k, v, causal, sm_scale, space=space)
+
+
+def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full"):
+    """Differentiable Blackwell MXFP8 attention over BF16 master tensors.
+
+    Q, K, and V are quantized internally to E4M3 data with E8M0 block scales.
+    The initial implementation supports D128 and sequence lengths divisible by
+    256; output and input gradients are BF16.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects rank-4 Q/K/V tensors")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have identical shapes; "
+                           f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if q.dtype != k.dtype or q.dtype != v.dtype or q.device != k.device or q.device != v.device:
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have the same dtype and device")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects contiguous Q/K/V tensors")
+    if space not in ("full", "smoke"):
+        raise InvalidInput(f"tlx.ops.flash_attn_mxfp8 does not provide space={space!r}")
+    fn, spec = impl_for("flash_attn_mxfp8", arch)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     return fn(q, k, v, causal, sm_scale, space=space)
 
 

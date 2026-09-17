@@ -406,9 +406,12 @@ class OpCategorizer {
 public:
   OpCategorizer(LoopLikeOpInterface mainLoop, ArrayRef<Operation *> mmaOps)
       : mainLoop(mainLoop), mmas(mmaOps.begin(), mmaOps.end()) {
-    // Collect all loops (nested + main)
-    for (auto nestedLoop : getLoopBodyBlock(mainLoop)->getOps<scf::ForOp>())
-      loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+    // Keep the same nearest-loop traversal used by getInitialSchedule so
+    // collective control flow does not hide an immediately nested loop.
+    getLoopBodyRegion(mainLoop).walk([&](scf::ForOp nestedLoop) {
+      if (getEnclosingSupportedLoop(nestedLoop) == mainLoop)
+        loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+    });
     loops.push_back(mainLoop);
   }
 
@@ -517,7 +520,12 @@ private:
 
     SmallVector<Operation *> loopMmas;
     for (auto mmaOp : mmas) {
-      if (mmaOp->getParentOp() == innermostLoop.getOperation())
+      // Collective control flow, such as a per-tile bounds guard, does not
+      // introduce a new scheduling scope.  Select MMAs by their nearest
+      // enclosing loop so MMAs nested in an scf.if still participate in the
+      // enclosing loop's data partitioning, while MMAs in a nested loop do
+      // not.
+      if (getEnclosingSupportedLoop(mmaOp) == innermostLoop)
         loopMmas.push_back(mmaOp);
     }
 
@@ -1323,11 +1331,12 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
 
   SmallVector<OpOperand *> uses;
   // For persistent kernels, seed from nested inner loop results.
-  for (auto &op : *getLoopBodyBlock(loop))
-    if (auto innerLoop = dyn_cast<scf::ForOp>(op))
+  getLoopBodyRegion(loop).walk([&](scf::ForOp innerLoop) {
+    if (getEnclosingSupportedLoop(innerLoop) == loop)
       for (OpResult result : innerLoop.getResults())
         for (OpOperand &use : result.getUses())
           uses.push_back(&use);
+  });
   for (OpResult result : loop->getResults())
     for (OpOperand &use : result.getUses())
       uses.push_back(&use);
@@ -1425,16 +1434,21 @@ preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
 static std::optional<ScheduleResult>
 getInitialSchedule(LoopLikeOpInterface mainLoop,
                    const SchedulingOptions &schedOpts) {
-  // Check for an existing schedule.
-  if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
-      succeeded(scheduleOr))
-    // Deserialized schedule: layout/options unknown, use defaults.
-    return ScheduleResult{std::move(*scheduleOr),
-                          PartitionLayout{},
-                          schedOpts,
-                          DenseMap<Operation *, unsigned>(),
-                          DenseMap<unsigned, Partition *>(),
-                          /*createComputePartitions=*/true};
+  // A bare tt.warp_specialize marks a request for PSM to create a schedule;
+  // only stages + tag identify an already serialized schedule. Do not call
+  // fromLoop (and its strict verifier) on the expected unpartitioned input IR.
+  if (mainLoop->hasAttr(kPartitionStagesAttrName) &&
+      mainLoop->hasAttr(kWarpSpecializeTagAttrName)) {
+    if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
+        succeeded(scheduleOr))
+      // Deserialized schedule: layout/options unknown, use defaults.
+      return ScheduleResult{std::move(*scheduleOr),
+                            PartitionLayout{},
+                            schedOpts,
+                            DenseMap<Operation *, unsigned>(),
+                            DenseMap<unsigned, Partition *>(),
+                            /*createComputePartitions=*/true};
+  }
 
   // Modulo path is authoritative for partitioning. If the loop was modulo-
   // scheduled (carries tt.modulo_ii) but fromLoop() above found no honorable
@@ -1450,10 +1464,15 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
     return std::nullopt;
   }
 
-  // Collect all loops (nested + main)
+  // Collect loops immediately nested in the main scheduling scope, including
+  // loops wrapped in collective control flow such as a per-tile bounds guard.
+  // Use nearest-loop ownership so loops nested in another loop are still
+  // handled only by that loop's schedule.
   SmallVector<LoopLikeOpInterface> loops;
-  for (scf::ForOp nestedLoop : getLoopBodyBlock(mainLoop)->getOps<scf::ForOp>())
-    loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+  getLoopBodyRegion(mainLoop).walk([&](scf::ForOp nestedLoop) {
+    if (getEnclosingSupportedLoop(nestedLoop) == mainLoop)
+      loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+  });
   loops.push_back(mainLoop);
 
   // Collect all MMAs

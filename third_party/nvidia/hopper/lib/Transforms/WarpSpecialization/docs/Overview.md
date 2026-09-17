@@ -26,7 +26,7 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doTokenLowering
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
   → SoftwarePipeliner::lowerLoops
-  → peelPartitionLoops   (first masked tile vs. unmasked remainder)
+  → peelPartitionLoops   (masked prefix tiles vs. unmasked remainder)
   → SoftwarePipeliner::expandLoops
 ```
 
@@ -52,8 +52,9 @@ other operands, such as TMEM loads, have been prepared.
 After physical AutoWS lowering, `triton-nvidia-interleave-tmem` chooses TMEM
 load locations for latency and register liveness. The immediately following
 `triton-nvidia-unify-ws-barrier-locations` pass can then co-locate a related
-TMA-ready wait and TMEM-ready wait when only load preparation, casts, and a
-broadcast separate them. See
+TMA-ready wait and TMEM-ready wait and order their operands for register
+materialization. Waiting first means the operand reorder does not move the
+TMEM acquire earlier or extend the asynchronous producer interval. See
 [WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
 For explicitly enabled dependent 2-CTA matmul graphs, the backend runs
@@ -115,7 +116,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
-| `PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a partition-local first iteration when `iv < lb + step`, folding the masked prologue and unmasked remainder predicates |
+| `PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a bounded partition-local masked prefix, folding its predicates and leaving an unmasked remainder |
 | `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `optimizeTMALoads` | Converts `tt.descriptor_load` to buffered `nvws.descriptor_load` before buffer hoisting, then lowers it to async TMA copies after planning |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
@@ -126,7 +127,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
 | `TMemBarrierInsertion.cpp` | `triton-nvidia-gpu-tmem-barrier-insertion` | Inserts CTA barriers for TMEM reuse and elides hazards proven warp-local; see [TMEMBarrierInsertion.md](TMEMBarrierInsertion.md) |
 | `InterleaveTMem.cpp` | `triton-nvidia-interleave-tmem` | Sinks TMEM allocations and loads, then restores their WS barriers |
-| `UnifyWSBarrierLocations.cpp` | `triton-nvidia-unify-ws-barrier-locations` | Co-locates related AutoWS TMA/TMEM waits around broadcast and cast preparation |
+| `UnifyWSBarrierLocations.cpp` | `triton-nvidia-unify-ws-barrier-locations` | Co-locates related AutoWS TMA/TMEM waits, then orders TMEM before streamable SMEM broadcast operands |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
 | `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |
 
@@ -164,7 +165,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Data Partitioning](DataPartition.md) — splitting tensor dimensions across consumer warp groups
 - [Code Partitioning](CodePartition.md) — channel discovery, buffer creation, sync insertion
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
-- [Partition Loop Peeling](PartitionLoopPeeling.md) — first-tile control-flow peeling after physical specialization
+- [Partition Loop Peeling](PartitionLoopPeeling.md) — masked-prefix control-flow peeling after physical specialization
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
 - [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting

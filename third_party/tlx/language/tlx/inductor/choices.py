@@ -81,11 +81,10 @@ class TLXInductorChoices(InductorChoices):
             return True
         return super()._need_to_fix_layout(adjusted_choices, op_name)
 
-    # Ops that use prefix_args (bias passed separately from mat1/mat2).
-    # The blackwell WS template only supports plain mm (2 named kernel args: A, B),
-    # so skip TLX injection for these ops. addmm IS supported: the AMD warp-pipe
-    # template handles the bias epilogue (prefix_args=1), injected via append_tlx.
-    _UNSUPPORTED_OPS = frozenset({"baddbmm"})
+    # The Blackwell template accepts only the two plain-mm inputs. baddbmm has a
+    # bias prefix argument, while scaled_mm has two additional scale arguments.
+    # AMD addmm remains supported by its warp-pipe template.
+    _UNSUPPORTED_OPS = frozenset({"baddbmm", "scaled_mm"})
 
     def get_template_configs(
         self,
@@ -153,7 +152,7 @@ class TLXInductorChoices(InductorChoices):
     ) -> list[Any]:
         from .flex_attention_templates import append_tlx_flex
 
-        append_tlx_flex(
+        return append_tlx_flex(
             choices,
             configs,
             input_nodes,
@@ -163,7 +162,33 @@ class TLXInductorChoices(InductorChoices):
             sparse_q_block_size,
             sparse_kv_block_size,
         )
-        return choices
+
+    def append_flex_attention_backward_choices(
+        self,
+        choices: list[Any],
+        configs: list[Any],
+        input_nodes: list[Any],
+        subgraphs: list[Any],
+        layout: Any,
+        kernel_options: dict[str, Any],
+        sparse_q_block_size: int,
+        sparse_kv_block_size: int,
+        *,
+        mutated_inputs: list[Any],
+    ) -> list[Any]:
+        from .flex_attention_templates import append_tlx_flex_backward
+
+        return append_tlx_flex_backward(
+            choices,
+            configs,
+            input_nodes,
+            subgraphs,
+            layout,
+            kernel_options,
+            sparse_q_block_size,
+            sparse_kv_block_size,
+            mutated_inputs=mutated_inputs,
+        )
 
 
 def maybe_override_best_choice(

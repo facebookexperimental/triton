@@ -175,9 +175,9 @@ def _append_tlx_amd(templates, op_name):
 
 
 def _append_tlx_nvidia(templates, op_name):
-    # The amd_* warp-pipe templates have no heuristic registered on CUDA, so
-    # addmm/bmm get no TLX candidate here; only plain mm does.
-    if op_name in ("addmm", "bmm"):
+    # This helper runs for every NVIDIA target, but only plain mm is eligible
+    # for its Blackwell-specific TLX template. Other operations keep their choices.
+    if op_name != "mm":
         return templates
     templates.append(blackwell_gemm_ws_template)
     return templates

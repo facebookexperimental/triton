@@ -217,12 +217,17 @@ def named_barrier_wait(
     Wait until the total participant count reaches the specified named barrier.
 
     Arguments:
-        bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Total number of threads required to flip the
+        bar (int): Hardware named-barrier identifier. A statically known value must be
+            in the range [0, 15]; ID 0 is reserved for the compiler and IDs 1 and 2 are
+            reserved for special lowering. A dynamic value is accepted but cannot be
+            validated, and its presence stops the compiler from allocating named
+            barriers of its own, since it cannot prove which IDs are free.
+        arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
     """
 
+    _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_wait(bar_handle, arrive_count_handle)
@@ -230,22 +235,39 @@ def named_barrier_wait(
 
 @tl.builtin
 def named_barrier_arrive(
-    bar: tl.constexpr,
-    arrive_count: tl.constexpr,
+    bar: int,
+    arrive_count: int,
     _semantic=None,
 ) -> None:
     """
     Signal arrival at a named mbarrier.
 
     Arguments:
-        bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Total number of threads required to flip the
+        bar (int): Hardware named-barrier identifier. A statically known value must be
+            in the range [0, 15]; ID 0 is reserved for the compiler and IDs 1 and 2 are
+            reserved for special lowering. A dynamic value is accepted but cannot be
+            validated, and its presence stops the compiler from allocating named
+            barriers of its own, since it cannot prove which IDs are free.
+        arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
     """
+    _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_arrive(bar_handle, arrive_count_handle)
+
+
+def _validate_named_barrier_id(bar) -> None:
+    barrier_id = tl._unwrap_if_constexpr(bar)
+    if not isinstance(barrier_id, int):
+        return
+    if barrier_id < 0 or barrier_id > 15:
+        raise ValueError("named barrier ID must be in the range [0, 15]")
+    if barrier_id == 0:
+        raise ValueError("named barrier ID 0 is reserved for the compiler")
+    if barrier_id in (1, 2):
+        raise ValueError("named barrier IDs 1 and 2 are reserved for special lowering")
 
 
 @tl.builtin
@@ -262,3 +284,29 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+@tl.builtin
+def amd_iglp_opt(variant: tl.constexpr, _semantic=None):
+    """Emit LLVM's ``llvm.amdgcn.iglp.opt`` scheduling hint for AMD GPUs.
+
+    The variant meanings are defined by LLVM's AMDGPU instruction scheduler.
+    Variants 0 and 1 interleave LDS and MFMA operations for small GEMMs, with
+    variant 1 targeting a single wave. Variants 2 and 3 interleave transcendental
+    and MFMA operations for attention; variant 2 also interleaves their VALU and
+    LDS predecessors.
+
+    Use at most one hint per LLVM scheduling region. The region must not also
+    contain :func:`amd_sched_barrier` or ``llvm.amdgcn.sched.group.barrier``.
+    Strategies are experimental and may change with LLVM versions. This hint
+    adds no memory or workgroup synchronization.
+
+    See `LLVM AMDGPU intrinsics
+    <https://llvm.org/docs/AMDGPUUsage.html#llvm-ir-intrinsics>`_.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_iglp_opt is only supported on AMD (HIP) backends")
+    variant = tl._unwrap_if_constexpr(variant)
+    assert isinstance(variant, int) and not isinstance(variant, bool), "variant must be a constexpr integer"
+    assert 0 <= variant <= 3, f"variant must be one of 0, 1, 2, or 3, got {variant}"
+    _semantic.builder.create_amd_iglp_opt(variant)

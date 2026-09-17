@@ -1,5 +1,5 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s --check-prefix=GFX950
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-update-async-wait-count=gfx-arch=gfx950 --convert-scf-to-cf --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s --check-prefix=GFX950
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-update-async-wait-count=gfx-arch=gfx942 --convert-scf-to-cf --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -95,6 +95,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     // CHECK: rocdl.wait.asyncmark 64
     // GFX950: rocdl.wait.asyncmark 64
     ttg.async_wait {num = 64 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CDNA3/CDNA4 preserve num=0 for tokens forwarded through a region, even when
+  // waiting on the first of two groups.
+  // Both waits lower to wait.asyncmark 0, so the first also waits for the second
+  // group. Token-derived commit-group counts could improve overlap in the future.
+  // CHECK-LABEL: @region_token_wait_conservative
+  // GFX950-LABEL: @region_token_wait_conservative
+  tt.func @region_token_wait_conservative(%src: tensor<256x!tt.ptr<f32>, #blocked>, %buf0: !ttg.memdesc<256xf32, #shared, #smem, mutable>, %buf1: !ttg.memdesc<256xf32, #shared, #smem, mutable>) {
+    %tokens:2 = scf.execute_region -> (!ttg.async.token, !ttg.async.token) {
+      // CHECK: rocdl.global.load.async.lds
+      // CHECK: rocdl.asyncmark
+      // GFX950: rocdl.global.load.async.lds
+      // GFX950: rocdl.asyncmark
+      %copy0 = ttg.async_copy_global_to_local %src, %buf0 : tensor<256x!tt.ptr<f32>, #blocked> -> <256xf32, #shared, #smem, mutable>
+      %group0 = ttg.async_commit_group tokens %copy0
+      // CHECK: rocdl.global.load.async.lds
+      // CHECK: rocdl.asyncmark
+      // GFX950: rocdl.global.load.async.lds
+      // GFX950: rocdl.asyncmark
+      %copy1 = ttg.async_copy_global_to_local %src, %buf1 : tensor<256x!tt.ptr<f32>, #blocked> -> <256xf32, #shared, #smem, mutable>
+      %group1 = ttg.async_commit_group tokens %copy1
+      scf.yield %group0, %group1 : !ttg.async.token, !ttg.async.token
+    }
+    // CHECK: rocdl.wait.asyncmark 0
+    // GFX950: rocdl.wait.asyncmark 0
+    %wait0 = ttg.async_wait %tokens#0 {num = 0 : i32}
+    // CHECK: rocdl.wait.asyncmark 0
+    // GFX950: rocdl.wait.asyncmark 0
+    %wait1 = ttg.async_wait %tokens#1 {num = 0 : i32}
     tt.return
   }
 }

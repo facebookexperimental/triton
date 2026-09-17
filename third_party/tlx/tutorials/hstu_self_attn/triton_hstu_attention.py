@@ -64,6 +64,7 @@ class HSTUAutoWSConfig:
     dp: int = 1  # data-partition factor (MMA groups)
     manual_dp: bool = False  # manual fwd data partition (split-M, shared K/V)
     dq_reduce: bool = False  # bwd dq via TMA reduce-add (vs in-loop RMW)
+    dq_fp32: bool = False  # accumulate/store dq in fp32, matching TLX
     dq_reuse: bool = False  # FA-style TMEM reuse for the dq-reduce bwd
     dq_iters: int = 1  # dq TMA-reduce column subtiles
     dkdv_subtile: int = 1  # dK/dV output-store column subtiles
@@ -86,6 +87,7 @@ class HSTUAutoWSConfig:
             dp=int(g("HSTU_SELF_DP", "2" if autows else "1")),
             manual_dp=bool(int(g("HSTU_SELF_MANUAL_DP", "0"))),
             dq_reduce=g("HSTU_SELF_DQ_REDUCE") == "1",
+            dq_fp32=g("HSTU_SELF_DQ_FP32") == "1",
             dq_reuse=g("HSTU_SELF_DQ_REUSE", "0") == "1",
             dq_iters=int(g("HSTU_SELF_DQ_ITERS", "1")),
             dkdv_subtile=int(g("HSTU_SELF_BWD_DKDV_SUBTILE", "1")),
@@ -156,8 +158,8 @@ def configure_autows(cfg=None, **kwargs) -> "HSTUAutoWSConfig":
     return _AUTOWS_CFG
 
 
-# The autoWS structural knobs (autows / dp / manual_dp / dq_reduce / dq_iters /
-# dq_reuse) are passed to the kernels as tl.constexpr ARGUMENTS from the fwd/bwd
+# The autoWS structural knobs (autows / dp / manual_dp / dq_reduce / dq_fp32 /
+# dq_iters / dq_reuse) are passed to the kernels as tl.constexpr ARGUMENTS from the fwd/bwd
 # Python wrappers (sourced from _AUTOWS_CFG), so they are part of the JIT/autotune
 # cache key -- switching config recompiles a distinct, correctly-keyed kernel with
 # no module-level constexpr globals and no cache-invalidation dance. dq_reuse is
@@ -992,6 +994,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     BLOCK_D_Q: tl.constexpr,
     BLOCK_D_V: tl.constexpr,
     DQ_REDUCE: tl.constexpr = False,
+    DQ_FP32: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
 ):
@@ -1103,7 +1106,9 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
                 # post-pass spends on a second dV accumulator copy.
                 attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
             ) * alpha)
-        dq = tl.trans(dq_trans).to(k.dtype)
+        dq = tl.trans(dq_trans)
+        if not DQ_FP32:
+            dq = dq.to(k.dtype)
         # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
         # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
         # compiler stages separately (the source-level analog of TLX's subtiled +
@@ -1786,6 +1791,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr = False,
     DQ_REDUCE: tl.constexpr = False,
+    DQ_FP32: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
     DKDV_SUBTILE: tl.constexpr = 1,
@@ -1861,6 +1867,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 BLOCK_D_Q=BLOCK_D_Q,
                 BLOCK_D_V=BLOCK_D_V,
                 DQ_REDUCE=DQ_REDUCE,
+                DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
             )
@@ -1942,6 +1949,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             BLOCK_D_Q=BLOCK_D_Q,
             BLOCK_D_V=BLOCK_D_V,
             DQ_REDUCE=DQ_REDUCE,
+            DQ_FP32=DQ_FP32,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
         )
@@ -2033,6 +2041,7 @@ def _hstu_attn_bwd(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr = False,
     DQ_REDUCE: tl.constexpr = False,
+    DQ_FP32: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
     DKDV_SUBTILE: tl.constexpr = 1,
@@ -2205,6 +2214,7 @@ def _hstu_attn_bwd(  # noqa C901
             ENABLE_TMA=ENABLE_TMA,
             AUTOWS=AUTOWS,
             DQ_REDUCE=DQ_REDUCE,
+            DQ_FP32=DQ_FP32,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
             DKDV_SUBTILE=DKDV_SUBTILE,
@@ -2269,6 +2279,7 @@ def _hstu_attn_bwd(  # noqa C901
                 ENABLE_TMA=ENABLE_TMA,
                 AUTOWS=AUTOWS,
                 DQ_REDUCE=DQ_REDUCE,
+                DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
                 DKDV_SUBTILE=DKDV_SUBTILE,
@@ -2291,7 +2302,6 @@ def _hstu_attn_bwd_clc(  # noqa C901
     DQ,
     DK,
     DV,
-    TILE_IDS,
     LOCK,
     stride_qm,
     stride_qh,
@@ -2334,6 +2344,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr,
     DQ_REDUCE: tl.constexpr,
+    DQ_FP32: tl.constexpr,
     DQ_ITERS: tl.constexpr,
     DQ_REUSE: tl.constexpr,
     DKDV_SUBTILE: tl.constexpr,
@@ -2382,7 +2393,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
             tmem_alloc_algo=2,
             smem_alloc_algo=CLC_SMEM_ALGO,
     ):
-        tile_id = tl.load(TILE_IDS + sched.tile_id[0])
+        tile_id = sched.tile_id[0]
         off_hz = tile_id // num_n_tiles
         start_n = (tile_id % num_n_tiles) * BLOCK_N
         off_z = off_hz // H
@@ -2403,7 +2414,9 @@ def _hstu_attn_bwd_clc(  # noqa C901
         dk_base = DK + seq_start_kv * stride_dkn
         dv_base = DV + seq_start_kv * stride_dvn
 
-        if tl.constexpr(True):
+        # Every partition evaluates the same validity predicate. Invalid
+        # rectangular-grid tiles skip the complete partitioned body.
+        if start_n < seq_len_kv:
             _hstu_attn_bwd_one_col_block(
                 start_n=start_n,
                 desc_row_q=seq_start_q,
@@ -2462,6 +2475,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
                 ENABLE_TMA=True,
                 AUTOWS=False,
                 DQ_REDUCE=DQ_REDUCE,
+                DQ_FP32=DQ_FP32,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
                 DKDV_SUBTILE=DKDV_SUBTILE,
@@ -2579,8 +2593,13 @@ def triton_hstu_attention_bwd(
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
     dv = switch_to_contiguous_if_needed(dv)
+    assert not _AUTOWS_CFG.dq_fp32 or (_AUTOWS_CFG.dq_reduce and enable_tma), (
+        "dq_fp32 requires the dQ TMA reduce path (dq_reduce=True, enable_tma=True)")
+    if _AUTOWS_CFG.dq_fp32:
+        assert dq.dtype == torch.float32, (
+            "dq_fp32=True requires a caller-provided FP32 dQ buffer")
     if dout.shape[0] == 0:
-        return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        return torch.zeros_like(dq), torch.zeros_like(k), torch.zeros_like(v)
     if enable_tma:
         triton.set_allocator(_allocate_tma_workspace)
     Z = seq_offsets.numel() - 1
@@ -2602,37 +2621,15 @@ def triton_hstu_attention_bwd(
     if _AUTOWS_CFG.clc:
         assert enable_tma and _AUTOWS_CFG.autows and _AUTOWS_CFG.dq_reduce
         assert sort_by_length_indices is None
-        # Compact the rectangular max-length grid to valid jagged tiles. Empty
-        # tail tiles cannot enter the partitioned body: their divergent inner
-        # loop trip counts break cross-partition barrier cadence.
-        #
-        # num_n_tiles is the radix of the tile_id encoding below, and the kernel
-        # decodes with tl.cdiv(max_q_len, BLOCK_N). Both sides must use the same
-        # (length, block) pair or tile_id // and % yield different (off_hz,
-        # start_n) pairs, so use max_q_len here too -- it is also the bound that
-        # matches seq_offsets_q, which blocks_per_seq is derived from. BLOCK_N
-        # agrees because the CLC path asserts _AUTOWS_CFG.autows above, and
-        # _get_bw_configs() then pins the single config to BLOCK_N = bwd_bn.
+        # Run the full rectangular grid. A collective in-kernel guard skips
+        # jagged tail tiles while preserving each channel's accumulation count.
         block_n = _AUTOWS_CFG.bwd_bn
         num_n_tiles = triton.cdiv(max_q_len, block_n)
-        seq_lens = seq_offsets_q[1:] - seq_offsets_q[:-1]
-        blocks_per_seq = torch.div(seq_lens + block_n - 1, block_n, rounding_mode="floor")
-        counts = blocks_per_seq.repeat_interleave(H)
-        tile_count = int(counts.sum().item())
-        tile_starts = torch.cumsum(counts, dim=0) - counts
-        compact_ids = torch.arange(tile_count, device=q.device, dtype=torch.int64)
-        off_hz = torch.repeat_interleave(torch.arange(Z * H, device=q.device, dtype=torch.int64), counts)
-        local_n = compact_ids - torch.repeat_interleave(tile_starts, counts)
-        tile_ids = (off_hz * num_n_tiles + local_n).to(torch.int32)
-        # 1D by construction: the CLC tile scheduler hands out a linear tile id
-        # that indexes the compacted TILE_IDS list, which then decodes to
-        # (off_hz, start_n) in the kernel. The compacted list is ragged across
-        # heads/batches, so the (Z * H, n_tiles) rectangle the non-CLC path
-        # launches cannot express it without re-introducing the empty tiles.
+        tile_count = Z * H * num_n_tiles
         grid = lambda meta: (  # noqa E731
             tile_count, )
         bwd_kernel = _hstu_attn_bwd_clc
-        clc_kwargs = {"TILE_IDS": tile_ids, "CLC_SMEM_ALGO": _AUTOWS_CFG.clc_smem_algo}
+        clc_kwargs = {"CLC_SMEM_ALGO": _AUTOWS_CFG.clc_smem_algo}
     else:
         grid = lambda meta: (  # noqa E731
             Z * H,
@@ -2651,7 +2648,7 @@ def triton_hstu_attention_bwd(
     HAS_NUM_TARGETS = num_targets is not None
     HAS_MAX_ATTN_LEN = max_attn_len != 0
     HAS_CONTEXTUAL_SEQ_LEN = contextual_seq_len != 0
-    bwd_kernel[grid](
+    launch_args = dict(
         Q=q,
         K=k,
         V=v,
@@ -2700,11 +2697,25 @@ def triton_hstu_attention_bwd(
         ENABLE_TMA=enable_tma,
         AUTOWS=_AUTOWS_CFG.autows,
         DQ_REDUCE=_AUTOWS_CFG.dq_reduce,
+        DQ_FP32=_AUTOWS_CFG.dq_fp32,
         DQ_ITERS=_AUTOWS_CFG.dq_iters,
         DQ_REUSE=_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse,
         DKDV_SUBTILE=_AUTOWS_CFG.dkdv_subtile,
         **clc_kwargs,
     )
+    if _AUTOWS_CFG.clc:
+        bwd_kernel[grid](**launch_args)
+    elif _AUTOWS_CFG.autows and not _AUTOWS_CFG.dq_reduce:
+        # Direct dQ RMW uses a program-wide lock and is not partition-safe. The
+        # default configuration still exercises AutoWS forward, but compile its
+        # backward with the ordinary pipeline instead of feeding an unannotated
+        # direct-RMW schedule to MetaWS.
+        launch_args["AUTOWS"] = False
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = False
+            bwd_kernel[grid](**launch_args)
+    else:
+        bwd_kernel[grid](**launch_args)
 
     return dq, dk, dv
 
@@ -2811,7 +2822,7 @@ class _AttentionFunction(torch.autograd.Function):
         max_attn_len = ctx.max_attn_len
         contextual_seq_len = ctx.contextual_seq_len
 
-        dq = torch.empty_like(q)
+        dq = torch.empty_like(q, dtype=torch.float32 if _AUTOWS_CFG.dq_fp32 else q.dtype)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         dq, dk, dv = triton_hstu_attention_bwd(

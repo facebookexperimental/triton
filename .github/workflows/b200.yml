@@ -48,7 +48,8 @@ on:
     - cron: '30 */6 * * *'
 
 env:
-  TORCHINDUCTOR_TLX_MODE: ""
+  MAX_JOBS: 16
+  TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
 
@@ -133,6 +134,12 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+      - name: Install torchao
+        timeout-minutes: 10
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
+          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Export TritonBench env
         run: |
           . "${SETUP_SCRIPT}"
@@ -231,6 +238,13 @@ jobs:
             python/test/unit/language/test_tlx_*sm100*.py
             python/test/unit/tlx_ops/test_*sm100*.py
           )
+          # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
+          # separate b200-torchtlx-test job below, not this pinned-PyTorch job.
+          TLX_FILES=()
+          for file in "${FILES[@]}"; do
+            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
+          done
+          FILES=("${TLX_FILES[@]}")
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
           echo "b200 collects:" "${FILES[@]}"
           python -m pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
@@ -260,6 +274,113 @@ jobs:
             --budget /tmp/tlx-core.xml=30 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-codegen.xml=30 \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "b200-tlx-test" \
+            ${FAILED_FLAG}
+
+  b200-torchtlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: nvidia-dgx-b200
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+      TORCHINDUCTOR_TLX_MODE: "allow"
+      TORCHTLX_ARCH: sm100
+    timeout-minutes: 90
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Create isolated TorchTLX environment
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          BASE_PYTHON="$(command -v python3)"
+          BASE_SITE="$("${BASE_PYTHON}" -c 'import site; print(site.getsitepackages()[0])')"
+          TORCHTLX_VENV="${RUNNER_TEMP}/torchtlx-venv"
+
+          # The runner's meta-triton environment carries Meta's refreshed PyTorch.
+          # Expose it read-only to a job-local venv; installs below then land in the
+          # venv and shadow bundled Triton without mutating the shared environment.
+          uv venv --python "${BASE_PYTHON}" "${TORCHTLX_VENV}"
+          TORCHTLX_PYTHON="${TORCHTLX_VENV}/bin/python"
+          TORCHTLX_SITE="$("${TORCHTLX_PYTHON}" -c 'import site; print(site.getsitepackages()[0])')"
+          printf '%s\n' "${BASE_SITE}" > "${TORCHTLX_SITE}/meta-triton.pth"
+
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          from torch._inductor import config
+
+          print(f"torch -> {torch.__version__} ({torch.__file__})")
+          if not hasattr(config.triton, "tlx_mode"):
+              raise RuntimeError(
+                  "the pre-provisioned meta-triton PyTorch has no TorchTLX "
+                  "Inductor support (torch._inductor.config.triton.tlx_mode)"
+              )
+          PY
+      - name: Compile Triton
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          TORCHTLX_PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          uv pip install --python "${TORCHTLX_PYTHON}" \
+            -r python/requirements.txt -r python/test-requirements.txt
+          uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
+            -e . --no-build-isolation
+          uv pip install --python "${TORCHTLX_PYTHON}" pytest expecttest
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          import triton
+
+          print(f"torch  -> {torch.__version__} ({torch.__file__})")
+          print(f"triton -> {triton.__file__}")
+          PY
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 40
+        run: |
+          . "${SETUP_SCRIPT}"
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
+      - name: Run TorchTLX mm perf bench
+        id: run_torchtlx_perf
+        if: always() && github.event_name == 'schedule'
+        timeout-minutes: 40
+        run: |
+          . "${SETUP_SCRIPT}"
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          bash scripts/run_torchtlx_tests.sh --perf \
+            --json /tmp/mm_torchtlx.json --junitxml=/tmp/torchtlx_perf.xml
+      - name: Upload TorchTLX perf artifact
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: b200-torchtlx-mm-perf
+          path: /tmp/mm_torchtlx.json
+          if-no-files-found: ignore
+      - name: Collect nightly failures (TorchTLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
+                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-torchtlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "b200-torchtlx-test" \
             ${FAILED_FLAG}
 
   b200-gluon-test:
@@ -381,6 +502,32 @@ jobs:
       external_dep_reason: ${{ matrix.item.external_dep_reason }}
       platform: b200
 
+  report-b200-torchtlx:
+    needs: b200-torchtlx-test
+    if: always() && github.event_name == 'schedule' && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-torchtlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
   report-b200-gluon:
     needs: b200-gluon-test
     if: always() && github.event_name == 'schedule' && needs.b200-gluon-test.outputs.failures != '' && needs.b200-gluon-test.outputs.failures != '[]'
@@ -434,6 +581,19 @@ jobs:
       workflow_name: ${{ github.workflow }}
       job_name: b200-tlx-test
       failures: ${{ needs.b200-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-b200-torchtlx:
+    needs: b200-torchtlx-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-torchtlx-test.result == 'success' || needs.b200-torchtlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: b200-torchtlx-test
+      failures: ${{ needs.b200-torchtlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   reconcile-b200-gluon:

@@ -31,7 +31,7 @@ Wrap benchmarks with `denoise.sh` (locks clocks/power) for stable results.
 
 ```bash
 CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]
-CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]
+CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version ws_pipelined_pingpong]
 ```
 
 ### Blackwell GPU

@@ -7,6 +7,11 @@
 namespace mlir::triton::AMD {
 using ElemLocationKey = SmallVector<std::pair<StringAttr, int32_t>>;
 
+// Returns true for the narrow runtime-loop CFG form where a block argument is
+// used once in each arm of a two-way cf.cond_br and the arms cannot reach one
+// another without returning through the defining block.
+bool hasMutuallyExclusiveSuccessorUses(Value value);
+
 // Build element coordinates for a given register ID.
 // All other hardware dimensions (lane, warp, block) are set to 0.
 ElemLocationKey getElemCoordinatesFromRegisters(LinearLayout ll, unsigned regId,

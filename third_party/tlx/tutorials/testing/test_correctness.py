@@ -88,14 +88,11 @@ if is_hopper_or_newer():
         matmul as _hopper_gemm_pipelined, )
     from triton.language.extra.tlx.tutorials.hopper_gemm_ws import (
         matmul as _hopper_gemm_ws, )
-    from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong_persistent import (
-        attention as _hopper_fa_ws_pipelined_pingpong_persistent, )
     from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined_pingpong import (
-        attention as _hopper_fa_ws_pipelined_pingpong, )
-    from triton.language.extra.tlx.tutorials.hopper_fa_ws_pipelined import (
-        attention as _hopper_fa_ws_pipelined, )
-    from triton.language.extra.tlx.tutorials.hopper_fa_ws import (
-        attention as _hopper_fa_ws, )
+        _select_forward_policy as _hopper_fa_select_forward_policy,
+        _select_row_schedule as _hopper_fa_select_row_schedule,
+        attention as _hopper_fa_ws_pipelined_pingpong,
+    )
 
 if is_hip():
     from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
@@ -424,32 +421,10 @@ class FlashAttention:
             "GROUP_SIZE_N": 1,
             "RESCALE_OPT": True,
         },
-        "hopper_fa_ws": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS": 2,
-            "NUM_MMA_WARPS": 8,
-            "NUM_MMA_GROUPS": 2,
-        },
-        "hopper_fa_ws_pipelined": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS": 2,
-            "NUM_MMA_WARPS": 8,
-            "NUM_MMA_GROUPS": 2,
-        },
         "hopper_fa_ws_pipelined_pingpong": {
             "BLOCK_M": 128,
             "BLOCK_N": 128,
             "NUM_BUFFERS": 2,
-            "NUM_MMA_WARPS": 8,
-            "NUM_MMA_GROUPS": 2,
-        },
-        "hopper_fa_ws_pipelined_pingpong_persistent": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 2,
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
         },
@@ -1117,28 +1092,109 @@ def test_hopper_gemm_ws():
 # =============================================================================
 
 
-@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws():
-    config = FlashAttention.CONFIGS["hopper_fa_ws"]
-    sm_scale = 0.5
-    causal = False
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
-        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
-        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws(q, k, v, sm_scale, config=config)
-        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
+def test_hopper_fa_ws_pipelined_pingpong_row_schedule_policy():
+    disabled = _hopper_fa_select_row_schedule(False, 4096, 128)
+    assert disabled == {
+        "ROW_REVERSE_HEAD_GROUP": 0,
+        "ROW_REVERSE_MAX": 0,
+        "ROW_AFFINE_MUL": 1,
+        "ROW_AFFINE_ADD": 0,
+        "ROW_AFFINE_MOD": 0,
+        "ROW_SWAP_SRC_0": 0,
+        "ROW_SWAP_SRC_1": 0,
+        "ROW_SWAP_XOR": 0,
+    }
+
+    for n_ctx, reverse_max in ((1024, 7), (2048, 15)):
+        schedule = _hopper_fa_select_row_schedule(True, n_ctx, 128)
+        assert schedule["ROW_REVERSE_HEAD_GROUP"] == 1
+        assert schedule["ROW_REVERSE_MAX"] == reverse_max
+        assert schedule["ROW_AFFINE_MOD"] == 0
+
+    affine = _hopper_fa_select_row_schedule(True, 4096, 128)
+    assert affine == {
+        "ROW_REVERSE_HEAD_GROUP": 0,
+        "ROW_REVERSE_MAX": 0,
+        "ROW_AFFINE_MUL": 5,
+        "ROW_AFFINE_ADD": 29,
+        "ROW_AFFINE_MOD": 32,
+        "ROW_SWAP_SRC_0": 7,
+        "ROW_SWAP_SRC_1": 15,
+        "ROW_SWAP_XOR": 8,
+    }
+
+    pairwise_reverse = _hopper_fa_select_row_schedule(True, 8192, 128)
+    assert pairwise_reverse["ROW_REVERSE_HEAD_GROUP"] == 2
+    assert pairwise_reverse["ROW_REVERSE_MAX"] == 63
+    assert pairwise_reverse["ROW_AFFINE_MOD"] == 0
+
+    explicit_config = _hopper_fa_select_row_schedule(True, 4096, 256)
+    assert explicit_config["ROW_REVERSE_HEAD_GROUP"] == 1
+    assert explicit_config["ROW_REVERSE_MAX"] == 15
 
 
-@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined():
-    config = FlashAttention.CONFIGS["hopper_fa_ws_pipelined"]
-    sm_scale = 0.5
-    causal = False
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
-        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
-        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws_pipelined(q, k, v, sm_scale, config=config)
-        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
+def test_hopper_fa_ws_pipelined_pingpong_launch_policy():
+    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(True, (4, 48, 2048, 128), torch.bfloat16, 128,
+                                                                        132)
+    assert steady_unroll == 1
+    assert target_workers == 132
+
+    _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(True, (4, 48, 4096, 128), torch.bfloat16, 128,
+                                                                        132)
+    assert steady_unroll == 1
+    assert target_workers == 131
+
+    _, _, target_workers = _hopper_fa_select_forward_policy(True, (4, 48, 4096, 128), torch.bfloat16, 128, 120)
+    assert target_workers == 120
+
+    for causal, dtype, shape in (
+        (False, torch.bfloat16, (4, 48, 4096, 128)),
+        (True, torch.float16, (4, 48, 4096, 128)),
+        (True, torch.bfloat16, (4, 8, 4096, 128)),
+    ):
+        _, steady_unroll, target_workers = _hopper_fa_select_forward_policy(causal, shape, dtype, 128, 132)
+        assert steady_unroll == 2
+        assert target_workers == 132
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer GPU")
+def test_hopper_fa_ws_pipelined_pingpong_row_mapping_equivalence():
+
+    def legacy_mapping(num_rows, source_m, off_hz):
+        mapped_m = source_m
+        if num_rows in (8, 16) and (off_hz & 1) != 0:
+            mapped_m = num_rows - 1 - mapped_m
+        if num_rows == 64 and ((off_hz // 2) & 1) != 0:
+            mapped_m = 63 - mapped_m
+        if num_rows == 32:
+            mapped_m = (mapped_m * 5 + 29) % 32
+            if source_m in (7, 15):
+                mapped_m ^= 8
+        return mapped_m
+
+    def parameterized_mapping(schedule, source_m, off_hz):
+        mapped_m = source_m
+        reverse_head_group = schedule["ROW_REVERSE_HEAD_GROUP"]
+        if reverse_head_group != 0 and ((off_hz // reverse_head_group) & 1) != 0:
+            mapped_m = schedule["ROW_REVERSE_MAX"] - mapped_m
+        affine_mod = schedule["ROW_AFFINE_MOD"]
+        if affine_mod != 0:
+            affine_source_m = mapped_m
+            mapped_m = (affine_source_m * schedule["ROW_AFFINE_MUL"] + schedule["ROW_AFFINE_ADD"]) % affine_mod
+            if schedule["ROW_SWAP_XOR"] != 0 and affine_source_m in (
+                    schedule["ROW_SWAP_SRC_0"],
+                    schedule["ROW_SWAP_SRC_1"],
+            ):
+                mapped_m ^= schedule["ROW_SWAP_XOR"]
+        return mapped_m
+
+    for num_rows in (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65):
+        schedule = _hopper_fa_select_row_schedule(True, num_rows * 128, 128)
+        for source_m in range(num_rows):
+            for off_hz in range(128):
+                assert parameterized_mapping(schedule, source_m, off_hz) == legacy_mapping(num_rows, source_m, off_hz)
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
@@ -1188,18 +1244,6 @@ def test_hopper_fa_ws_pipelined_pingpong_bwd(causal):
     assert all(torch.isfinite(grad).all() for grad in result)
     for grad, ref_grad in zip(result, reference):
         torch.testing.assert_close(grad, ref_grad, atol=2e-1, rtol=1e-1)
-
-
-@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper GPU")
-def test_hopper_fa_ws_pipelined_pingpong_persistent():
-    config = FlashAttention.CONFIGS["hopper_fa_ws_pipelined_pingpong_persistent"]
-    sm_scale = 0.5
-    causal = False
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
-        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
-        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
-        tri_out = _hopper_fa_ws_pipelined_pingpong_persistent(q, k, v, sm_scale, config=config)
-        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
 # =============================================================================
@@ -1518,9 +1562,7 @@ def test_amd_bmm(dtype):
     ],
 )
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_register_staged_bmm_resident_operand_policies(
-    dtype, m, n, k, kernel_spec
-):
+def test_register_staged_bmm_resident_operand_policies(dtype, m, n, k, kernel_spec):
     """Exercise both dot orders, input dtypes, and partial output tiles."""
     batch = 2
     torch.manual_seed(0)
@@ -1559,9 +1601,7 @@ def test_register_staged_bmm_rejects_unsupported_wrap_contracts(m, n, k, error):
     ],
 )
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_shared_a_bmm_production_dispatches_at_group_boundaries(
-    batch, m, n, k, dtype
-):
+def test_shared_a_bmm_production_dispatches_at_group_boundaries(batch, m, n, k, dtype):
     """Cover every tuned dispatch at the batch size that enables grouping."""
     torch.manual_seed(0)
     a = torch.randn((1, m, k), device=DEVICE, dtype=dtype).expand(batch, -1, -1)
@@ -1637,6 +1677,81 @@ def test_amd_gemm_offset_width_selection():
 
     assert not _amd_gemm._needs_i64_offsets(within_i32)
     assert _amd_gemm._needs_i64_offsets(beyond_i32)
+
+
+def test_amd_gemm_output_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["USE_I64_C_OFFSETS"]))
+
+            return launch
+
+    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
+    for M, N in [(256, 256), (925210, 4096)]:
+        a = torch.empty((M, 128), device="meta", dtype=torch.float16)
+        b = torch.empty((128, N), device="meta", dtype=torch.float16)
+        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert [use_i64_c_offsets for _, use_i64_c_offsets in launches] == [False, True]
+
+
+def test_amd_gemm_input_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                launches.append((
+                    kwargs["USE_I64_A_OFFSETS"],
+                    kwargs["USE_I64_B_OFFSETS"],
+                    kwargs["HAS_M_TAIL"],
+                    kwargs["HAS_N_TAIL"],
+                ))
+
+            return launch
+
+    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
+    cases = [
+        ((256, 256, 4096), (False, False, False, False)),
+        ((257, 256, 4096), (False, False, True, False)),
+        ((256, 257, 4096), (False, False, False, True)),
+        ((262400, 256, 4096), (True, False, False, False)),
+        ((256, 262400, 4096), (False, True, False, False)),
+    ]
+    for (M, N, K), _ in cases:
+        a = torch.empty((M, K), device="meta", dtype=torch.float16)
+        b = torch.empty((K, N), device="meta", dtype=torch.float16)
+        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert launches == [expected for _, expected in cases]
+
+
+def test_amd_gemm_irregular_shape_policy():
+    assert _amd_gemm.choose_tile(677, 4096, 8192) == (256, 256, 4)
+
+    deep_k = _amd_gemm._intermediate_register_config(677, 2048, 4096)
+    assert (
+        deep_k["BLOCK_M"],
+        deep_k["BLOCK_N"],
+        deep_k["BLOCK_K"],
+        deep_k["matrix_instr_nonkdim"],
+        deep_k["num_warps"],
+        deep_k["num_stages"],
+    ) == (128, 64, 128, 32, 8, 3)
+
+    high_padding = _amd_gemm._intermediate_register_config(279, 2048, 4096)
+    assert (
+        high_padding["BLOCK_M"],
+        high_padding["BLOCK_N"],
+        high_padding["matrix_instr_nonkdim"],
+    ) == (64, 32, 16)
 
 
 @pytest.mark.parametrize(
