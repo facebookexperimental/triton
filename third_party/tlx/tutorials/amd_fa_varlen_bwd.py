@@ -1583,7 +1583,6 @@ def _varlen_bwd_interleaved_bm32_kernel(
         relaxed=True,
     )
     k_prefix32 = tlx.require_layout(k_prefix32, k_nm_layout, pin=True)
-    k_prefix32 = tlx.amd_register_resident(k_prefix32, register_class="agpr", registers_per_group=4)
 
     # Reuse immutable band0 K directly in the dQ operand layout on every phase.
     dq_k_band0_panel0 = _bm32_load_dq_k(k_buffer, 0, 0, k_md_layout)
@@ -3130,20 +3129,16 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s3(
         relaxed=True,
     )
     k_prefix32 = tlx.require_layout(k_prefix32, k_nm_layout, pin=True)
-    k_prefix32 = tlx.amd_register_resident(k_prefix32, register_class="agpr", registers_per_group=4)
 
     # Reuse immutable band0 K directly in the dQ operand layout on every phase.
     dq_k_band0_panel0 = _bm32_load_dq_k(k_buffer, 0, 0, k_md_layout)
     dq_k_band0_panel0 = tlx.require_layout(dq_k_band0_panel0, k_md_layout, pin=True)
-    dq_k_band0_panel0 = tlx.amd_register_resident(dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
     dq_k_band0_panel1 = _bm32_load_dq_k(k_buffer, 0, 1, k_md_layout)
     dq_k_band0_panel1 = tlx.require_layout(dq_k_band0_panel1, k_md_layout, pin=True)
-    dq_k_band0_panel1 = tlx.amd_register_resident(dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
 
     # Extend the immutable dQ cache to band1 with the same prologue layout pins.
     dq_k_band1_panel0 = _bm32_load_dq_k(k_buffer, 1, 0, k_md_layout)
     dq_k_band1_panel0 = tlx.require_layout(dq_k_band1_panel0, k_md_layout, pin=True)
-    dq_k_band1_panel0 = tlx.amd_register_resident(dq_k_band1_panel0, register_class="agpr", registers_per_group=4)
 
     offs_n = tlx.rematerialized_range(0, BLOCK_N, 103, placement=OWNER_ID)
     offs_d = tlx.rematerialized_range(0, D, 104, placement=OWNER_ID)
@@ -3845,7 +3840,6 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_owner_s4(
     dq_k_band0_panel0 = tlx.amd_register_resident(dq_k_band0_panel0, register_class="agpr", registers_per_group=4)
     dq_k_band0_panel1 = _bm32_load_dq_k(k_buffer, 0, 1, k_md_layout)
     dq_k_band0_panel1 = tlx.require_layout(dq_k_band0_panel1, k_md_layout, pin=True)
-    dq_k_band0_panel1 = tlx.amd_register_resident(dq_k_band0_panel1, register_class="agpr", registers_per_group=4)
 
     # Extend the immutable dQ cache to band1 with the same prologue layout pins.
     dq_k_band1_panel0 = _bm32_load_dq_k(k_buffer, 1, 0, k_md_layout)

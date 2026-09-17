@@ -7175,7 +7175,8 @@ def _attn_bwd_dq_d64_causal_impl(
         q3 = tlx.require_layout(q3, q_op0_mn, pin=False)
         # One 64x64 bf16 fragment over four waves is eight 32-bit registers
         # per thread, so one group keeps the complete fragment resident.
-        q3 = tlx.amd_register_resident(q3, register_class="agpr", registers_per_group=8)
+        if STAT_MODE == _D64_GQA_SIGNED_JIT:
+            q3 = tlx.amd_register_resident(q3, register_class="agpr", registers_per_group=8)
     else:
         q3, do3, lse3, delta3, rows3 = q0, do0, lse0, delta0, rows0
 
