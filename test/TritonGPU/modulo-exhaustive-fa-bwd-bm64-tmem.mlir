@@ -36,15 +36,16 @@
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=P3 \
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
-// Contracted pick 1: GEMM stages 0/1 with global modulo cluster order
-// qkT < dk <= dq < dpT <= dv. Loads and stores are deliberately unchecked.
+// Contracted pick 1: structural admission produces GEMM stages 0/1 with global
+// modulo cluster order qkT < dk <= dq < dpT <= dv. The non-GEMM epilogue may
+// occupy stage 2. Loads and stores are deliberately unchecked.
 // CONTRACTED-LABEL: @_attn_bwd
 // CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 4 : i32, loop.stage = 0 : i32{{.*}}"qkT"
-// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 36 : i32, loop.stage = 0 : i32{{.*}}"dpT"
-// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 37 : i32, loop.stage = 0 : i32{{.*}}"dv"
-// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 20 : i32, loop.stage = 1 : i32{{.*}}"dk"
-// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 22 : i32, loop.stage = 1 : i32{{.*}}"dq"
-// CONTRACTED: tt.scheduled_max_stage = 1 : i32
+// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 19 : i32, loop.stage = 0 : i32{{.*}}"dpT"
+// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 20 : i32, loop.stage = 0 : i32{{.*}}"dv"
+// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 13 : i32, loop.stage = 1 : i32{{.*}}"dk"
+// CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 14 : i32, loop.stage = 1 : i32{{.*}}"dq"
+// CONTRACTED: tt.scheduled_max_stage = 2 : i32
 
 // pick 0: each key op by NAME loc + loop.stage/loop.cluster, in program order.
 // P0-LABEL: @_attn_bwd

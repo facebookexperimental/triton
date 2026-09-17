@@ -504,10 +504,10 @@ runModuloScheduling(const DataDependenceGraph &ddg, llvm::StringRef algo,
 
   if (resolvedAlgo == "contracted") {
     LLVM_DEBUG(DBGS() << "Using contracted-graph two-stage search\n");
-    // Contracted mode assigns cycles with a reduced (contracted) latency model
-    // and validates its own dependences (see ContractedGraphScheduler.md). The
-    // full-latency validator would reject its intended stage-0→stage-1 wrap
-    // schedules, so it is deliberately not applied here.
+    // Contracted mode assigns cycles in structural issue quanta and validates
+    // its own dependences (see ContractedGraphScheduler.md). The full-latency
+    // validator would reject measurable schedules based on estimated result
+    // latency, so it is deliberately not applied here.
     return runContractedSearch(ddg, maxII);
   }
 

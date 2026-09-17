@@ -4890,7 +4890,8 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
       if (it != loopSmem.end())
         ancestorSmem += it->second;
     }
-    reduceBuffersForBudget(schedLoop, ancestorSmem);
+    if (!isStandaloneModulo())
+      reduceBuffersForBudget(schedLoop, ancestorSmem);
     loopSmem[schedLoop.id] = computeTotalSmem(schedLoop);
 
     // Update maxStage to match buffer depth for prologue generation.
@@ -4898,21 +4899,24 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
     for (const auto &buf : schedLoop.buffers)
       if (buf.kind == ttg::MemoryKind::SMEM)
         maxBufCount = std::max(maxBufCount, static_cast<int>(buf.count));
-    schedLoop.maxStage = std::max(schedLoop.maxStage, maxBufCount - 1);
+    if (!isStandaloneModulo())
+      schedLoop.maxStage = std::max(schedLoop.maxStage, maxBufCount - 1);
   }
 
   // Per-loop reduction may pass each loop's own check yet exceed the global
   // SMEM budget when sibling/cousin loops share the same SMEM pool.
   // Run a global reduction across all loops jointly (see issue
   // 001_annotation_smem_overflow).
-  reduceBuffersForGlobalBudget(graph);
+  if (!isStandaloneModulo())
+    reduceBuffersForGlobalBudget(graph);
   // Refresh maxStage after global reduction may have changed buffer depths.
   for (auto &schedLoop : graph.loops) {
     int maxBufCount = 1;
     for (const auto &buf : schedLoop.buffers)
       if (buf.kind == ttg::MemoryKind::SMEM)
         maxBufCount = std::max(maxBufCount, static_cast<int>(buf.count));
-    schedLoop.maxStage = std::max(schedLoop.maxStage, maxBufCount - 1);
+    if (!isStandaloneModulo())
+      schedLoop.maxStage = std::max(schedLoop.maxStage, maxBufCount - 1);
   }
 
   // Warp-group partition + cross-group barriers are NOT done here. Pass A
@@ -6424,6 +6428,11 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
       mergeNonOverlappingBuffers(schedLoop);
       finalizeLoweringPlanStatus(schedLoop);
     }
+  // Standalone exploration emits only schedule metadata. Physical storage is
+  // deliberately left to the downstream memory planner, so do not reject a
+  // structurally valid schedule based on this pass's provisional buffers.
+  if (isStandaloneModulo())
+    return success();
   // Final memory audit. Under a joint mode each rejection is also a terminal
   // trigger: a joint-solver schedule presses II down and buffer depths up, so
   // it can overrun a budget the baseline schedule fits in. Reporting it lets

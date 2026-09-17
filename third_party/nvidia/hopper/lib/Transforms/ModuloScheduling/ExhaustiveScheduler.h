@@ -32,9 +32,9 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
                                                 int numSamples = 1000,
                                                 int minIIOverride = 0);
 
-/// Explore exact two-stage GEMM assignments. Non-GEMM computation is
-/// contracted for ranking while the original DDG remains authoritative for
-/// dependence and resource legality.
+/// Explore exact two-stage GEMM assignments. Structural issue order and
+/// resource quanta determine legality; contracted latency estimates only rank
+/// candidates that have already passed those checks.
 FailureOr<ModuloScheduleResult>
 runContractedSearch(const DataDependenceGraph &ddg, int maxII = 0);
 

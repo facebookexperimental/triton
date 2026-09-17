@@ -49,22 +49,23 @@ group edges retain the strongest dependence. Computation with no downstream
 GEMM is contracted as a sink-side group and capped relative to the smallest
 GEMM latency.
 
-The original DDG remains the source of truth for dependency topology. Within a
-contracted computation group, the capped ranking latency is distributed across
-its members for dependence constraints and occupancy. This is intentionally an
-exploration model: it prevents uncertain elementwise latency from ruling out a
-two-stage schedule. Global-memory occupancy is ignored.
+The original DDG remains the source of truth for dependency topology. Admission
+uses structural issue quanta: one quantum per resource-using operation, one per
+emitted member of a data-partition bundle, zero for pipeline-free IR nodes, and
+the already-established inner II for a nested scheduled loop. Modeled result
+latency is not used for dependence constraints, resource reservations, or the
+II lower bound.
 
-## Latency
+## Timing
 
-The scheduler uses two latency views:
+The scheduler uses two timing views:
 
-- **Resource latency** is the existing DDG latency and occupancy for GEMMs,
-  GEMM-facing nodes, and boundaries.
-- **Ranking latency** is the critical path through a computation group, capped
-  relative to the nearest GEMM latency. It prevents elementwise model error
-  from overwhelming the GEMM schedule objective without making an illegal
-  schedule legal.
+- **Structural timing** supplies candidate legality. Pipeline kind and issue
+  count provide a hard resource lower bound; dependence topology provides
+  ordering. No result-latency or RecMII estimate participates.
+- **Estimated timing** is the critical path through a computation group,
+  capped relative to the nearest GEMM latency. It is only a tie-breaker among
+  candidates already admitted by structural timing.
 
 The initial cap is 25% of the nearest GEMM latency and can be changed for
 experiments with `TRITON_CONTRACTED_COMPUTE_RATIO`.
@@ -81,16 +82,17 @@ are pinned to stages 0 or 1 and both stages must be used. Non-GEMM epilogue
 nodes may occupy stage 2 when a loop-carried token requires it. Reject assignments
 that violate distance-0 GEMM reachability. For each assignment:
 
-1. Schedule the original DDG in topological order.
-2. Place pinned GEMMs in their requested stages.
-3. Keep the leading stage-0 GEMM early and pack later stage-0 GEMMs at the end
+1. Compute a structural resource lower bound, excluding latency-derived RecMII.
+2. Schedule the original DDG in topological order.
+3. Place pinned GEMMs in their requested stages.
+4. Keep the leading stage-0 GEMM early and pack later stage-0 GEMMs at the end
    of the modulo interval. This leaves wrapped low clusters for stage-1 GEMMs.
-4. Place computation with contracted latency and the reservation table.
-5. Place memory greedily; do not use it in ranking.
+5. Place every operation with its structural issue duration and the reservation
+   table.
 6. Validate every original-DDG dependence before ranking. Intra-iteration
-   edges use contracted computation latency. Loop-carried edges use the
-   standard SWP structural ordering constraint, shifting the consumer by
-   `distance * II` without imposing the full latency model.
+   edges require producer issue before consumer issue. Loop-carried edges use
+   the standard SWP structural ordering constraint, shifting the consumer by
+   `distance * II` without imposing the result-latency model.
 
 Candidate identity is the ordered `(GEMM node, stage, modulo cluster)` tuple,
 not the full per-node stage vector. This removes duplicates caused only by
@@ -115,13 +117,16 @@ signature for each retained top-K schedule.
 `test/TritonGPU/modulo-exhaustive-fa-bwd-bm64-tmem.mlir` is the primary lit
 test. It checks GEMM stages and clusters only; descriptor loads/stores are not
 part of the scheduling objective. The test must contain a top-K candidate with
-the target FA backward schedule above and `tt.scheduled_max_stage = 1`.
+the target FA backward GEMM schedule above. Pipeline-free and epilogue work may
+extend the loop's `tt.scheduled_max_stage` beyond the two GEMM stages.
 
 ## Implementation Status
 
 - [x] Design and compatibility boundary documented.
 - [x] Node classification and downstream GEMM ownership.
-- [x] Contracted computation groups and ranking latency.
+- [x] Contracted computation groups and ranking-only latency.
+- [x] Structural resource lower bound without result latency or RecMII.
+- [x] Structural dependence and reservation-table admission.
 - [x] Exact two-stage GEMM assignment enumeration.
 - [x] Original-DDG placement and validation.
 - [x] GEMM-signature top-K deduplication and diagnostics.

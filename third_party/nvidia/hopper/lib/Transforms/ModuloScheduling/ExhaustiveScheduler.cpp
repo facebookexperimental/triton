@@ -1027,24 +1027,43 @@ gemmSignature(const ContractedGraphInfo &info,
   return signature;
 }
 
-static int contractedNodeLatency(const DataDependenceGraph &ddg,
-                                 const ContractedGraphInfo &info,
-                                 unsigned nodeIdx, int fallback) {
-  if (ddg.getNode(nodeIdx).pipeline == HWPipeline::TMA)
-    return 1;
-  if (ddg.getNode(nodeIdx).pipeline == HWPipeline::TC)
-    return std::max(ddg.getNode(nodeIdx).selfLatency, 1);
-  int groupIdx = info.nodeToGroup[nodeIdx];
-  if (groupIdx < 0)
-    return fallback;
-  const auto &group = info.groups[groupIdx];
-  return std::max(1,
-                  group.rankingLatency / std::max<int>(group.nodes.size(), 1));
+/// Hard issue duration used by contracted scheduling. This is deliberately an
+/// abstract structural quantum rather than a modeled cycle count: operations
+/// on a hardware pipeline issue once, data-partition bundles issue once per
+/// partition, pipeline-free IR nodes issue for zero quanta, and an
+/// already-scheduled inner loop retains its II as a structural fact.
+static int structuralIssueDuration(const DDGNode &node) {
+  if (node.isSuperNode)
+    return std::max(node.innerII, 1);
+  if (node.pipeline == HWPipeline::NONE)
+    return 0;
+  return std::max<int>(node.partitionCount, 1);
+}
+
+/// Resource-only lower bound for the structural contracted search. Result
+/// latency and recurrence latency are intentionally absent; scoreboarding and
+/// synchronization may stall a candidate, but do not remove it from the
+/// measurable search frontier.
+static int computeStructuralMinII(const DataDependenceGraph &ddg) {
+  llvm::DenseMap<HWPipeline, int> issueLoad;
+  int nestedLoopII = 0;
+  for (const DDGNode &node : ddg.getNodes()) {
+    if (node.isSuperNode) {
+      if (node.innerII <= 0)
+        return 0;
+      nestedLoopII = std::max(nestedLoopII, node.innerII);
+    }
+    if (node.pipeline != HWPipeline::NONE)
+      issueLoad[node.pipeline] += structuralIssueDuration(node);
+  }
+  int resourceII = 0;
+  for (const auto &entry : issueLoad)
+    resourceII = std::max(resourceII, entry.second);
+  return std::max({resourceII, nestedLoopII, 1});
 }
 
 static int
 computeContractedEarliest(unsigned nodeIdx, const DataDependenceGraph &ddg,
-                          const ContractedGraphInfo &info,
                           const llvm::DenseMap<unsigned, int> &scheduled,
                           int II) {
   int earliest = 0;
@@ -1052,15 +1071,14 @@ computeContractedEarliest(unsigned nodeIdx, const DataDependenceGraph &ddg,
     auto source = scheduled.find(edge->srcIdx);
     if (source == scheduled.end())
       continue;
-    int latency = contractedNodeLatency(ddg, info, edge->srcIdx, edge->latency);
-    earliest = std::max(earliest, source->second + latency -
+    int issueDuration = structuralIssueDuration(ddg.getNode(edge->srcIdx));
+    earliest = std::max(earliest, source->second + issueDuration -
                                       static_cast<int>(edge->distance) * II);
   }
   return earliest;
 }
 
 static bool validateSchedule(const DataDependenceGraph &ddg,
-                             const ContractedGraphInfo &info,
                              const llvm::DenseMap<unsigned, int> &scheduled,
                              int II) {
   for (const auto &edge : ddg.getEdges()) {
@@ -1068,13 +1086,12 @@ static bool validateSchedule(const DataDependenceGraph &ddg,
     auto dst = scheduled.find(edge.dstIdx);
     if (src == scheduled.end() || dst == scheduled.end())
       return false;
-    int latency = edge.distance == 0
-                      ? contractedNodeLatency(ddg, info, edge.srcIdx,
-                                              edge.latency)
-                      : 0;
+    int issueDuration = edge.distance == 0
+                            ? structuralIssueDuration(ddg.getNode(edge.srcIdx))
+                            : 0;
     int64_t consumerCycle = static_cast<int64_t>(dst->second) +
                             static_cast<int64_t>(edge.distance) * II;
-    int64_t producerCycle = static_cast<int64_t>(src->second) + latency;
+    int64_t producerCycle = static_cast<int64_t>(src->second) + issueDuration;
     if (consumerCycle < producerCycle)
       return false;
   }
@@ -1085,7 +1102,7 @@ static bool validateSchedule(const DataDependenceGraph &ddg,
 
 FailureOr<ModuloScheduleResult>
 runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
-  int minII = ddg.computeMinII();
+  int minII = computeStructuralMinII(ddg);
   if (minII <= 0)
     return failure();
   if (maxII <= 0)
@@ -1116,7 +1133,9 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
     llvm::dbgs() << "[modulo-scheduling-contracted]: original nodes="
                  << ddg.getNumNodes() << " GEMMs=" << contracted.gemms.size()
-                 << " compute groups=" << contracted.groups.size() << "\n";
+                 << " compute groups=" << contracted.groups.size()
+                 << " structural MinII=" << minII
+                 << " modeled MinII=" << ddg.computeMinII() << "\n";
   });
 
   for (int II = minII; II <= maxII; ++II) {
@@ -1127,12 +1146,8 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
       bool valid = true;
       for (unsigned nodeIdx : topo) {
         const auto &node = ddg.getNode(nodeIdx);
-        int earliest =
-            computeContractedEarliest(nodeIdx, ddg, contracted, scheduled, II);
-        int duration = node.pipeline == HWPipeline::TMA
-                           ? 1
-                           : contractedNodeLatency(ddg, contracted, nodeIdx,
-                                                   getNodeDuration(node));
+        int earliest = computeContractedEarliest(nodeIdx, ddg, scheduled, II);
+        int duration = structuralIssueDuration(node);
         int targetStage = earliest / II;
         int ordinal = contracted.gemmOrdinal[nodeIdx];
         if (ordinal >= 0)
@@ -1167,7 +1182,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
                ++gemm) {
             if (((assignment >> gemm) & 1) == 0)
               trailingOccupancy +=
-                  getNodeDuration(ddg.getNode(contracted.gemms[gemm]));
+                  structuralIssueDuration(ddg.getNode(contracted.gemms[gemm]));
           }
           stageStart = std::max(stageStart, II - trailingOccupancy);
         }
@@ -1192,7 +1207,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
       }
       if (!valid)
         continue;
-      if (!validateSchedule(ddg, contracted, scheduled, II)) {
+      if (!validateSchedule(ddg, scheduled, II)) {
         validationFailures++;
         continue;
       }
