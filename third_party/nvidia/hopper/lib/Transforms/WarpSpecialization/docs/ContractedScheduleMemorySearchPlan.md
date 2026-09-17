@@ -49,6 +49,18 @@ score, and block layout. This is the pass-boundary contract for an external
 Cartesian-product harness; no in-process scheduler object is passed to the
 memory planner.
 
+**Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
+with 128x128x128 tiles and eight-way output subtiling has been captured at the
+pre-modulo and post-buffer-allocation boundaries. The pass-local scheduler test
+shows that Contracted search currently retains both descriptor-load orders but
+places both loads in stage 0 and the MMA in stage 1. It does not yet retain the
+three-stage A0/B1/MMA2 and A1/B0/MMA2 alternatives required to reproduce the
+D120 experiment. The pass-local memory test confirms that the existing
+heuristic produces A3/B2 on the same graph. Search-mode coverage on this fixture
+remains pending because its eight separately materialized output-staging allocs
+are not currently recognized as one fixed subtile group before heuristic
+planning.
+
 **Primary implementation areas:**
 
 - `third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/`
@@ -744,6 +756,12 @@ as a hard correctness floor.
       search without changing alias depth or topology.
 - [x] Compiler emits schedule and memory JSON-lines records for external
       Cartesian-product search.
+- [x] Production-shaped D120 TTGIR is captured at the pre-modulo and
+      post-buffer-allocation pass boundaries.
+- [ ] Contracted search retains D120's A0/B1/MMA2 and A1/B0/MMA2 iteration-lead
+      alternatives on the production-shaped fixture.
+- [ ] Memory search recognizes the production-shaped eight-subtile output
+      staging group and retains the heuristic A3/B2 plan as rank zero.
 - [ ] External harness compiles, validates, and measures the bounded product.
 - [ ] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
