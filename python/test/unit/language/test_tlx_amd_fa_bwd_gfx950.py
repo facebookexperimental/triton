@@ -888,7 +888,6 @@ def test_varlen_d128_legacy_plan_accepts_strided_offsets():
 
     cu_q.zero_()
     cu_kv.zero_()
-
     assert plan.cu_seqlens_q.tolist() == [0, 17, 48]
     assert plan.cu_seqlens_k.tolist() == [0, 33, 162]
     amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
