@@ -637,11 +637,12 @@ eligible for bounded copy-depth enumeration. Rank zero is always the unmodified
 heuristic allocation.
 
 This two-step path deliberately reuses the existing proofs for staging `K | S`,
-circular grouping, and annotations instead of duplicating them in the generic
-search model. A plan with `allocation.reuseTarget` is not refined yet because
-that attribute aliases storage across distinct buffer ids; until the generic
-packer models that relationship, its byte accounting would double-count the
-physical backing.
+circular grouping, cross-id staging reuse, and annotations instead of
+duplicating them in the generic search model. An `allocation.reuseTarget`
+source stays a distinct, depth-pinned logical block but does not contribute a
+second physical footprint; its target is pinned as well. Search therefore
+cannot alter the reuse synchronization topology, while unrelated singleton
+operands can still vary within the remaining real budget.
 
 ---
 

@@ -58,8 +58,11 @@ public:
 
   bool feasible(const PartialPlan &plan, const Budget &budget) const override {
     uint64_t total = 0;
-    for (const Block &blk : plan.blocks)
+    for (const Block &blk : plan.blocks) {
+      if (!blk.countsTowardBudget)
+        continue;
       total += footprint(blk).bytes;
+    }
     return total <= budget.smemBytes;
   }
 
@@ -119,6 +122,8 @@ public:
   bool feasible(const PartialPlan &plan, const Budget &budget) const override {
     unsigned totalRows = 0;
     for (const Block &blk : plan.blocks) {
+      if (!blk.countsTowardBudget)
+        continue;
       Footprint f = footprint(blk);
       if (f.cols > budget.tmemCols)
         return false;

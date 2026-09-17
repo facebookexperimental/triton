@@ -2347,7 +2347,9 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
       const wsplan::Block &blk = p.blocks[bi];
       os << (bi ? ", " : "") << "{\"id\": " << (firstId + blk.id)
          << ", \"copy\": " << blk.copies
-         << ", \"members\": " << blk.members.size() << "}";
+         << ", \"members\": " << blk.members.size()
+         << ", \"allocated\": " << (blk.countsTowardBudget ? "true" : "false")
+         << "}";
     }
     os << "]}\n";
   }
@@ -2359,8 +2361,8 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
 /// CopySolver does not model yet. Mutable singleton operands remain searchable.
 ///
 /// `allocation.reuseTarget` represents physical aliasing between *different*
-/// buffer ids. The generic Packer cannot account for that footprint yet, so
-/// fail closed and preserve the complete heuristic plan in that case.
+/// buffer ids. Both the aliasing source and its target are pinned: the source
+/// remains a distinct logical block but is excluded from the physical budget.
 static bool isUsedBySubtiledRegion(Operation *alloc) {
   if (alloc->getParentOfType<ttng::SubtiledRegionOp>())
     return true;
@@ -2388,6 +2390,7 @@ static bool collectFixedSmemDepths(
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     DenseSet<Operation *> &fixedDepthAllocs) {
   DenseMap<int64_t, SmallVector<Operation *>> idGroups;
+  DenseSet<int64_t> aliasPinnedIds;
   bool supported = true;
   funcOp->walk([&](ttg::LocalAllocOp alloc) {
     if (!alloc.isSharedMemoryAlloc())
@@ -2401,9 +2404,14 @@ static bool collectFixedSmemDepths(
     }
     idGroups[id.getInt()].push_back(op);
 
-    if (op->hasAttr("allocation.reuseTarget")) {
-      supported = false;
-      return;
+    if (auto target =
+            op->getAttrOfType<IntegerAttr>("allocation.reuseTarget")) {
+      if (target.getInt() < 0) {
+        supported = false;
+        return;
+      }
+      aliasPinnedIds.insert(id.getInt());
+      aliasPinnedIds.insert(target.getInt());
     }
     if (allocToAnnotation.count(op) ||
         op->hasAttr(kAtomicBroadcastCopiesAttrName) ||
@@ -2415,6 +2423,13 @@ static bool collectFixedSmemDepths(
   });
   if (!supported)
     return false;
+
+  for (int64_t id : aliasPinnedIds) {
+    auto it = idGroups.find(id);
+    if (it == idGroups.end())
+      return false;
+    fixedDepthAllocs.insert(it->second.begin(), it->second.end());
+  }
 
   for (auto &[id, members] : idGroups) {
     (void)id;
@@ -2452,10 +2467,14 @@ importSmemGrouping(const SmemBufferModel &model) {
       wsplan::Block block;
       block.id = static_cast<wsplan::BlockId>(physicalId);
       block.copies = static_cast<unsigned>(copyAttr.getInt());
+      block.countsTowardBudget = !alloc->hasAttr("allocation.reuseTarget");
       plan.blocks.push_back(std::move(block));
     }
     unsigned blockIndex = it->second;
     wsplan::Block &block = plan.blocks[blockIndex];
+    bool countsTowardBudget = !alloc->hasAttr("allocation.reuseTarget");
+    if (block.countsTowardBudget != countsTowardBudget)
+      return std::nullopt; // mixed allocated/alias members under one id
     block.members.push_back(buffer);
     block.placement[buffer] = {};
     plan.blockOf[buffer] = blockIndex;
@@ -2485,8 +2504,8 @@ static bool refineFixedSmemPlan(
 
   DenseSet<Operation *> fixedDepthAllocs;
   if (!collectFixedSmemDepths(funcOp, allocToAnnotation, fixedDepthAllocs)) {
-    LDBG("SMEM fixed-group search: unsupported cross-id reuse or malformed "
-         "heuristic plan; preserving heuristic output");
+    LDBG("SMEM fixed-group search: malformed heuristic grouping; preserving "
+         "heuristic output");
     return false;
   }
 
@@ -2555,7 +2574,8 @@ static bool refineFixedSmemPlan(
 // Kernels with annotation/atomic-broadcast pins, subtiled regions, or
 // multi-store TMA staging first run the heuristic planner, then use its output
 // as a fixed grouping while searching mutable singleton depths. Cross-id
-// allocation.reuseTarget aliases still remain on the pure heuristic path.
+// allocation.reuseTarget sources and targets remain depth-pinned, and alias
+// sources are excluded from the imported plan's physical budget.
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,

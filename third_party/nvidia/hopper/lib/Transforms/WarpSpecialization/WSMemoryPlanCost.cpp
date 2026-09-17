@@ -48,6 +48,8 @@ public:
     // open item (docs §8); refined alongside a real occupancy model.
     double penalty = 0.0;
     for (const Block &blk : plan.blocks) {
+      if (!blk.countsTowardBudget)
+        continue;
       double blockUnits = 0.0;
       for (BufferId b : blk.members) {
         Footprint f = model.size(b);

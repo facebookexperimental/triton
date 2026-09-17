@@ -2,9 +2,9 @@
 
 **Status:** implementation in progress. Milestone A's structural schedule
 frontier and Milestone B's bounded SMEM depth frontier are implemented.
-Conservative fixed-group search now covers staging/subtile cases without
-cross-id aliases. Modeling `allocation.reuseTarget` and composing schedule and
-memory candidates across compilation runs remain open.
+Conservative fixed-group search now covers staging, subtile, and cross-id reuse
+plans. Composing schedule and memory candidates across compilation runs remains
+open.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
@@ -37,8 +37,9 @@ and A2/B3 under a budget that admits exactly one additional copy.
 an immediate all-or-nothing fallback. The heuristic first establishes its
 proven grouping and staging depths; fixed-group search preserves that plan as
 rank zero, pins constrained groups, and enumerates only mutable singleton
-operand depths. Cross-id `allocation.reuseTarget` aliases still fail closed to
-the heuristic until their physical footprint is represented by the packer.
+operand depths. Cross-id `allocation.reuseTarget` sources remain distinct
+logical blocks but are excluded from the budget because their backing is owned
+by a pinned target block.
 
 **Primary implementation areas:**
 
@@ -528,13 +529,13 @@ rules outside the generic packer. Preserve them through fixed-grouping mode:
 3. Enumerate legal copy vectors within it.
 4. Preserve staging, `K | S`, encoding, and reuse synchronization invariants.
 
-The first conservative implementation now performs steps 1–3 and preserves
-same-id grouping, staging, subtile, atomic-broadcast, and annotation invariants
-by pinning their heuristic depths. It searches only unconstrained singleton
-operands and keeps the imported heuristic allocation at rank zero. Cross-id
-`allocation.reuseTarget` plans remain a deliberate fallback because the generic
-packer would otherwise double-count their aliased physical backing. Modeling
-those alias edges is the remaining part of this phase.
+The conservative implementation performs steps 1–4 and preserves same-id
+grouping, staging, subtile, atomic-broadcast, annotation, and cross-id reuse
+invariants by pinning their heuristic depths. It searches only unconstrained
+singleton operands and keeps the imported heuristic allocation at rank zero.
+Cross-id reuse sources are marked non-owning for budget accounting, while both
+ends of the alias remain fixed so search cannot invalidate the synchronization
+proof.
 
 #### D120426461 example
 
@@ -727,8 +728,8 @@ as a hard correctness floor.
       singleton operand depths.
 - [ ] Fixed-grouping search is exercised on a production-shaped subtiled
       kernel.
-- [ ] Cross-id `allocation.reuseTarget` footprint is modeled by fixed-group
-      search.
+- [x] Cross-id `allocation.reuseTarget` footprint is modeled by fixed-group
+      search without changing alias depth or topology.
 - [ ] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [ ] FA-backward target schedule exists without stage/order annotations.

@@ -1,7 +1,9 @@
 // These checks pin raw planner budgets; auxiliary reservation is covered by
 // ws_memory_planner_load_order.mlir.
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
-// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=2 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: rm -f %t
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=0 TRITON_WS_MEM_PLAN_TOPK_DUMP=%t triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: FileCheck %s --check-prefix=FIXED-DUMP --input-file=%t
 // RUN: env TRITON_WS_MEM_PLAN_VERIFY_GROUPS=1 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=VERIFY
 
 // BWD FA persistent kernel (BLOCK_M1=128, EPILOGUE_SUBTILE=2) with TMA
@@ -35,6 +37,13 @@
 
 // dK staging: reuses dO, NOT V (allocation.shareGroup = 22)
 // CHECK: ttg.local_alloc {allocation.reuseTarget = 4 : i32, allocation.shareGroup = 22 : i32, buffer.copy = 2 : i32, buffer.id = 22 : i32, buffer.tmaStaging = 1 : i32}
+
+// The fixed-group dump accounts reuse-source ids as logical blocks backed by
+// another allocation. Their copies remain pinned, but they consume zero extra
+// budget and therefore do not block searching unrelated singleton operands.
+// FIXED-DUMP: {"pool": "smem-fixed", "rank": 0
+// FIXED-DUMP-SAME: {"id": 20, "copy": 2, "members": 2, "allocated": false}
+// FIXED-DUMP-SAME: {"id": 22, "copy": 2, "members": 2, "allocated": false}
 
 // The verify harness enumerates every candidate pair/triple of a loop's TMEM
 // allocs and runs the reuse-group ordering predicate without changing the plan.

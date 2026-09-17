@@ -78,7 +78,9 @@ static bool samePlan(const Plan &a, const Plan &b) {
   for (unsigned i = 0; i < a.blocks.size(); ++i) {
     const Block &aBlock = a.blocks[i];
     const Block &bBlock = b.blocks[i];
-    if (aBlock.copies != bBlock.copies || aBlock.members != bBlock.members)
+    if (aBlock.copies != bBlock.copies ||
+        aBlock.countsTowardBudget != bBlock.countsTowardBudget ||
+        aBlock.members != bBlock.members)
       return false;
     for (BufferId member : aBlock.members) {
       auto aPlacement = aBlock.placement.find(member);

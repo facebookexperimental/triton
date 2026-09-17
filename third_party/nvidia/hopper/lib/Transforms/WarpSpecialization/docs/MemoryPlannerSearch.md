@@ -255,6 +255,11 @@ variable, built from six swappable seams. Each is a pure predicate/policy, so th
 ordering can change *which* plans are found without changing *what is legal* (the
 design invariant).
 
+A plan `Block` also records `countsTowardBudget`. It is normally true. Imported
+SMEM blocks carrying `allocation.reuseTarget` set it false because their bytes
+are physically backed by another, depth-pinned block; they remain separate
+logical blocks so their original ids and copy semantics are preserved.
+
 ### 9.1 `BufferModel` — normalized per-buffer facts
 Abstract read-only view built once from IR: `size` (`Footprint` — bytes for SMEM,
 rows×cols for TMEM), `liveness` (op-order `Interval`), `stageSpan` (cross-stage
@@ -287,7 +292,8 @@ Callers pass `"liveness"`.
   `max(member bytes)·copies`. **`legalJoin` returns `false` unconditionally**: the
   search does no SMEM reuse grouping (encoding + basic block is not a safe reuse
   condition — see §3.2), so every SMEM buffer gets its own block and only its copy
-  count is tuned. `feasible` = Σ block bytes ≤ budget; `place` = no-op.
+  count is tuned. `feasible` = Σ allocated block bytes ≤ budget, excluding
+  imported `countsTowardBudget=false` alias views; `place` = no-op.
 - **`TmemPacker`** — a block is a row-owner whose members time-multiplex the same
   rows×cols at offset 0. **`legalJoin` = matching encoding AND disjoint liveness
   AND bidirectional `dependsOn`** (the dependency is load-bearing — independent
@@ -359,9 +365,11 @@ staging), the planner now uses a conservative **fixed-grouping mode**:
 The imported model does not reinterpret group member count as static ring
 entries: the heuristic plan may use dynamic subtile indexing where `K < S` is
 legal when `K` divides `S`. Those groups are pinned to their proven emitted
-depth. Plans carrying `allocation.reuseTarget` still stay entirely heuristic,
-because they alias physical storage across different `buffer.id` values and the
-generic packer's budget accounting cannot represent that yet.
+depth. An `allocation.reuseTarget` source remains a separate logical block with
+its own id/copy semantics, but has `countsTowardBudget=false`; its target and
+source depths are both pinned. This models the heuristic's cross-id physical
+alias without changing its synchronization topology or double-counting its
+SMEM footprint.
 
 TMEM still falls back for scaled MMA (scale-column reservation) and subtiled
 regions. Correctness floors (cross-stage depth, per-id entry count) are re-applied

@@ -96,6 +96,10 @@ struct Block {
   BlockId id = 0;
   SmallVector<BufferId, 4> members;
   unsigned copies = 1;
+  /// False when this logical block is a view of another block's physical
+  /// backing (for example, SMEM `allocation.reuseTarget`). Such a block keeps
+  /// its own id/copy semantics but contributes no additional pool footprint.
+  bool countsTowardBudget = true;
   DenseMap<BufferId, Placement> placement;
 };
 
