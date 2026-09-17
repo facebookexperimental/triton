@@ -1082,7 +1082,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   }
 
   // CHECK: def diagnostic_memory_ops(
-  // CHECK: var_{{[0-9]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
+  // CHECK: var_{{[0-9_]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
   // CHECK: tlx.async_remote_shmem_copy(
   // CHECK: tlx.async_descriptor_store({{.*}}, store_reduce="and")
   tt.func public @diagnostic_memory_ops(
@@ -1106,12 +1106,12 @@ module {
   // CHECK: tlx.async_descriptor_store_wait(1)
   // CHECK: arg2 = arg0
   // CHECK: while True:
-  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 < arg1
-  // CHECK-NEXT:   if not var_{{[0-9]+}}:
-  // CHECK-NEXT:     var_{{[0-9]+}} = arg2
+  // CHECK-NEXT:   var_{{[0-9_]+}} = arg2 < arg1
+  // CHECK-NEXT:   if not var_{{[0-9_]+}}:
+  // CHECK-NEXT:     var_{{[0-9_]+}} = arg2
   // CHECK-NEXT:     break
-  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 + arg1
-  // CHECK-NEXT:   arg2 = var_{{[0-9]+}}
+  // CHECK-NEXT:   var_{{[0-9_]+}} = arg2 + arg1
+  // CHECK-NEXT:   arg2 = var_{{[0-9_]+}}
   tt.func public @clc_while(%start: i32, %limit: i32) -> i32 {
     %token = ub.poison : !ttg.async.token
     ttng.async_tma_store_token_wait %token {planned_pending_count = 1 : i32} : !ttg.async.token
@@ -1147,8 +1147,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: [[ACC:[a-z0-9_]+]] = cst
   // CHECK: for {{[a-z0-9_]+}} in range(
   // CHECK: [[ACC]] = {{[a-z0-9_]+}}
-  // The carry between the two loops, and not a fresh -inf tensor.
-  // CHECK: [[ACC]] = [[ACC]]
+  // The carry between the two loops, and not a fresh -inf tensor. The two
+  // loops' iter_args are distinct values, so the second is a distinct name.
+  // CHECK: {{[a-z0-9_]+}} = [[ACC]]
   // CHECK-NOT: tl.full({{.*}}-inf
   // CHECK: for {{[a-z0-9_]+}} in range(
   tt.func public @ws_chained_loops(%n: i32) attributes {noinline = false} {
@@ -1423,3 +1424,44 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// MLIR value names can carry characters a Python identifier cannot -- notably
+// the dots in names derived from block-pointer fields -- so they are sanitized.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def dotted_value_name(
+  // CHECK: V_block_ptr_offsets_1 = arg0 * arg0
+  // CHECK-NOT: V_block_ptr.offsets.1
+  tt.func public @dotted_value_name(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked> loc(#loc_dot)
+    tt.return
+  }
+}
+#loc_dot = loc("V_block_ptr.offsets.1")
+
+// -----
+
+// Sanitization is many-to-one, so two MLIR names can want the same Python
+// identifier. Shadowing one with the other is valid Python but a different
+// program, so the second claimant is suffixed.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // A third claimant keeps counting up rather than reusing the first suffix.
+  // CHECK-LABEL: def colliding_value_names(
+  // CHECK: v_a_b = arg0 * arg0
+  // CHECK: v_a_b_1 = v_a_b + arg0
+  // CHECK: v_a_b_2 = v_a_b_1 - arg0
+  tt.func public @colliding_value_names(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked> loc(#loc_dotted)
+    %a = arith.addf %m, %x : tensor<256xf32, #blocked> loc(#loc_under)
+    %s = arith.subf %a, %x : tensor<256xf32, #blocked> loc(#loc_dashed)
+    tt.return
+  }
+}
+#loc_dotted = loc("v.a.b")
+#loc_under = loc("v_a_b")
+#loc_dashed = loc("v-a-b")
