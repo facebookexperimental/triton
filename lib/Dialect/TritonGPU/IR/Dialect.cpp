@@ -4486,6 +4486,23 @@ bool triton::gpu::hasSingleWarpSpecialize(ModuleOp module) {
   return attr && attr.getValue();
 }
 
+Value triton::gpu::resolveWarpSpecializeCapture(Value value) {
+  // `visited` guards against a malformed capture chain closing a cycle; a
+  // well-formed one terminates because each hop leaves a nested region.
+  llvm::SmallDenseSet<Value> visited;
+  while (visited.insert(value).second) {
+    auto arg = dyn_cast<BlockArgument>(value);
+    if (!arg)
+      break;
+    auto partitions =
+        dyn_cast<WarpSpecializePartitionsOp>(arg.getOwner()->getParentOp());
+    if (!partitions)
+      break;
+    value = partitions.getExplicitCaptures()[arg.getArgNumber()];
+  }
+  return value;
+}
+
 int triton::gpu::lookupThreadsPerWarp(OpBuilder &rewriter) {
   assert(rewriter.getInsertionBlock() && "expected an insertion point");
   Operation *op =

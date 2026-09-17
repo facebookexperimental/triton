@@ -1,0 +1,9 @@
+{
+  "priority": 10,
+  "backends": ["cuda", "nvidia"],
+  "architectures": [],
+  "documents": [
+    "async-tma-output-publication.md",
+    "warp-barrier-efficiency.md"
+  ]
+}

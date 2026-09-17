@@ -33,9 +33,11 @@ correctness/performance driver.
 ## Packed variable-length FlashAttention backward
 
 [`amd_fa_varlen_bwd.py`](amd_fa_varlen_bwd.py) provides a gfx950 specialization
-for packed BF16 THD, non-causal MHA/GQA backward with head dimension 128 and
-`Hq % Hkv == 0`.  Prepare a plan once for immutable cumulative sequence
-offsets, then reuse it for every backward invocation with the same packing:
+for packed BF16 THD backward with head dimension 128.  Non-causal mode supports
+MHA/GQA with `Hq % Hkv == 0`; causal mode supports MHA self-attention with
+identical Q/KV cumulative offsets and `Hq == Hkv`.  Prepare a plan once for
+immutable cumulative sequence offsets, then reuse it for every backward
+invocation with the same packing:
 
 ```python
 from triton.language.extra.tlx.tutorials.amd_fa_varlen_bwd import (
@@ -45,6 +47,9 @@ from triton.language.extra.tlx.tutorials.amd_fa_varlen_bwd import (
 
 plan = prepare_varlen_backward(cu_seqlens_q, cu_seqlens_k)
 dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale)
+
+# Causal packed self-attention. Q and KV offsets and head counts must match.
+dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, causal=True)
 ```
 
 Plan preparation validates and copies `cu_seqlens_q` and `cu_seqlens_k` to the
@@ -54,8 +59,13 @@ frozen plan prevents field rebinding, but its PyTorch tensors are still mutable;
 treat every plan-owned offset and schedule tensor as immutable after
 preparation.  Keep plan construction outside the timed or repeated execution
 path.  Every sequence must have at least one query and one key/value token.
-`lse` is contiguous FP32 with shape `(query_heads, total_q)`.
+`lse` is contiguous FP32 with shape `(query_heads, total_q)`.  In causal mode,
+V may use the TritonBench-style `v_storage[:, 0]` view: the head and D axes must
+remain dense while the token stride may include gaps.  Returned `dv` is always
+contiguous.
 
-The Q and KV offsets are independent.  To model an extend-attention workload,
-pack only the extend tokens in Q and pack the full context in K/V, using
-`q_len = extend_len` and `kv_len = prefix_len + extend_len` for each request.
+In non-causal mode the Q and KV offsets are independent.  To model an
+extend-attention workload, pack only the extend tokens in Q and pack the full
+context in K/V, using `q_len = extend_len` and
+`kv_len = prefix_len + extend_len` for each request.  Causal cross-attention
+and causal GQA are rejected by the current specialization.

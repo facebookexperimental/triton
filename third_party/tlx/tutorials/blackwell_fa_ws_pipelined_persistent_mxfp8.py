@@ -1429,7 +1429,7 @@ mxfp8_bwd_configs = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "EPILOGUE_SUBTILE": 2,
-            "DQ_REDUCE_NCOL": 64,
+            "DQ_REDUCE_NCOL": 32,
         },
         num_warps=8,
         num_stages=1,
@@ -2158,7 +2158,7 @@ def _attn_bwd_mxf8_ws(
     NUM_DKV_STORE_BUFFERS: tl.constexpr = 1
     dkv_store_buf = tlx.local_alloc((BLOCK_N1, slice_size_alloc), tl.bfloat16, NUM_DKV_STORE_BUFFERS)
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
-    DQ_REDUCE_STAGES: tl.constexpr = 2
+    DQ_REDUCE_STAGES: tl.constexpr = DQ_REDUCE_ITERS
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
     sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
     sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
@@ -2351,7 +2351,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
-        with tlx.async_task(num_warps=4, registers=96):
+        with tlx.async_task(num_warps=4, registers=80):
             tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
@@ -2378,7 +2378,7 @@ def _attn_bwd_mxf8_ws(
                         dq = tlx.local_load(dq_slice)
                         if slice_id == (DQ_REDUCE_ITERS - 1):
                             tlx.barrier_arrive(dq_empties[0])
-                        dq = dq * sm_scale
+                        dq = _mul_f32x2(dq, sm_scale)
                         tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
                         tlx.local_store(
                             dq_store_buf[dq_smem_idx],
@@ -2393,6 +2393,7 @@ def _attn_bwd_mxf8_ws(
                                 curr_m,
                                 slice_id * DQ_REDUCE_NCOL,
                             ],
+                            eviction_policy="evict_last",
                             store_reduce="add",
                         )
 
