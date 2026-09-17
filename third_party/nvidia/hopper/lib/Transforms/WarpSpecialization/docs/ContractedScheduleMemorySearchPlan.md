@@ -47,7 +47,10 @@ contain rank, selected state, II, load-order variant, and signature; memory
 records contain the active schedule pick, memory rank and selected state, pool,
 score, and block layout. This is the pass-boundary contract for an external
 Cartesian-product harness; no in-process scheduler object is passed to the
-memory planner.
+memory planner. `python/triton/tools/autows_search.py` consumes this contract,
+runs one compile/validation command per bounded schedule-memory pair, verifies
+the selected ranks, and records exit status, elapsed time, and an optional
+command-reported metric as JSON lines.
 
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
 with 128x128x128 tiles and eight-way output subtiling has been captured at the
@@ -589,9 +592,19 @@ Emit a manifest containing:
 
 Use generic schedule and memory picks; do not expose per-operand controls.
 
-The compiler-side manifest is now implemented via
-`TRITON_WS_SEARCH_MANIFEST`. The external compile/measure harness that consumes
-the JSON-lines records and sweeps the Cartesian product remains to be added.
+The compiler-side manifest is implemented via `TRITON_WS_SEARCH_MANIFEST`. The
+external `python/triton/tools/autows_search.py` driver discovers ranks from that
+manifest and sweeps the bounded Cartesian product. Its child command must
+compile exactly one searched loop, return nonzero on validation failure, and
+may print a numeric value selected by `--metric-regex` for performance ranking.
+For example:
+
+```shell
+python python/triton/tools/autows_search.py \
+  --schedule-topk=4 --memory-topk=3 \
+  --metric-regex='latency_ms=([0-9.]+)' --results=/tmp/search.jsonl -- \
+  python path/to/kernel_correctness_and_benchmark.py
+```
 
 #### D120426461 example
 
@@ -761,7 +774,7 @@ as a hard correctness floor.
       alternatives on the production-shaped fixture.
 - [x] Memory search recognizes the production-shaped eight-subtile output
       staging group and retains the heuristic A3/B2 plan as rank zero.
-- [ ] External harness compiles, validates, and measures the bounded product.
+- [x] External harness compiles, validates, and measures the bounded product.
 - [x] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [ ] FA-backward target schedule exists without stage/order annotations.
