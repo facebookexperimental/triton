@@ -12,6 +12,12 @@
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=CONTRACTED \
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
+// RUN:   TRITON_MODULO_TOPK=5 TRITON_MODULO_PICK=3 \
+// RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
+// RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=CONTRACTED-II \
+// RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
+
 // RUN: env STANDALONE_MODULO=1 STANDALONE_MODULO_MAX_STAGE_DIFF=2 \
 // RUN:   TRITON_USE_MODULO_SCHEDULE=exhaustive TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=0 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
@@ -46,6 +52,17 @@
 // CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 13 : i32, loop.stage = 1 : i32{{.*}}"dk"
 // CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 14 : i32, loop.stage = 1 : i32{{.*}}"dq"
 // CONTRACTED: tt.scheduled_max_stage = 2 : i32
+
+// Pick 3 is reserved for a larger-II frontier representative rather than a
+// fourth candidate from the structural lower bound. It has more slack, so the
+// epilogue fits without stage 2.
+// CONTRACTED-II-LABEL: @_attn_bwd
+// CONTRACTED-II: ttng.tc_gen5_mma {{.*}}loop.cluster = 4 : i32, loop.stage = 0 : i32{{.*}}"qkT"
+// CONTRACTED-II: ttng.tc_gen5_mma {{.*}}loop.cluster = 23 : i32, loop.stage = 0 : i32{{.*}}"dpT"
+// CONTRACTED-II: ttng.tc_gen5_mma {{.*}}loop.cluster = 5 : i32, loop.stage = 1 : i32{{.*}}"dv"
+// CONTRACTED-II: ttng.tc_gen5_mma {{.*}}loop.cluster = 14 : i32, loop.stage = 1 : i32{{.*}}"dk"
+// CONTRACTED-II: ttng.tc_gen5_mma {{.*}}loop.cluster = 15 : i32, loop.stage = 1 : i32{{.*}}"dq"
+// CONTRACTED-II: tt.scheduled_max_stage = 1 : i32
 
 // pick 0: each key op by NAME loc + loop.stage/loop.cluster, in program order.
 // P0-LABEL: @_attn_bwd

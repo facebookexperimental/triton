@@ -1,12 +1,18 @@
 # Contracted Schedule and Memory-Plan Search Plan
 
-**Status:** implementation in progress. Phase 1 structural admission is
-implemented; II-frontier and load-placement diversity remain open.
+**Status:** implementation in progress. Structural admission and the bounded
+II frontier are implemented; load-placement diversity remains open.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
 checks, and reserves modeled latency only for ranking. The FA-backward lit
 oracle pins the resulting target GEMM stage and modulo-order candidate.
+
+**Implemented second slice:** II is part of candidate identity. A bounded
+frontier reserves roughly half of top-K for evenly spaced feasible II values,
+including the minimum and maximum when possible, and uses the other slots for
+the globally best structural alternatives. This keeps rank 0 default-neutral
+while ensuring larger-II schedules remain measurable.
 
 **Primary implementation areas:**
 
@@ -78,8 +84,8 @@ Before this implementation started, `runContractedSearch`:
 
 The first implementation slice now uses structural issue quanta for the II
 lower bound, dependence admission, and resource reservations. Contracted
-latency remains only as a ranking tie-breaker. II-frontier retention and
-load-placement branching are still required before Milestone A is complete.
+latency remains only as a ranking tie-breaker. Load-placement branching is
+still required before Milestone A is complete.
 
 ### 2.2 Contracted candidate identity hides memory-relevant schedules
 
@@ -276,9 +282,11 @@ for II in [lowerII, upperII]:
 The bound is a compiler/search configuration, not a kernel-facing operand
 annotation. Cap total explored states independently from the II range.
 
-Retain representatives from every feasible II before filling remaining top-K
-slots. Do not let the lowest II evict every larger-II candidate solely because
-it is numerically smaller.
+When the feasible II count exceeds top-K, retaining every II is impossible.
+Reserve a bounded quota for evenly spaced II representatives, always including
+the minimum and maximum when the quota permits, then fill remaining top-K slots
+by deterministic structural ranking. Do not let the lowest II evict every
+larger-II candidate solely because it is numerically smaller.
 
 #### D120426461 example
 
@@ -660,7 +668,7 @@ as a hard correctness floor.
 ## 8. Completion checklist
 
 - [x] Structural Contracted SWP does not use result latency for admission.
-- [ ] Multiple II values survive top-K selection.
+- [x] Multiple II values survive top-K selection.
 - [ ] Descriptor-load placement participates in candidate identity.
 - [ ] CopySolver emits multiple legal copy vectors.
 - [ ] Memory beam returns distinct SMEM depth plans.

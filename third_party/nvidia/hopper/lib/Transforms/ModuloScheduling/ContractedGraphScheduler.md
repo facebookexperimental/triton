@@ -70,10 +70,11 @@ The scheduler uses two timing views:
 The initial cap is 25% of the nearest GEMM latency and can be changed for
 experiments with `TRITON_CONTRACTED_COMPUTE_RATIO`.
 
-TC dependence latency uses TC self-latency/occupancy in this exploration mode.
-Using full modeled result latency would forbid a stage-0 GEMM near the end of
-the modulo interval from feeding an earlier modulo cluster in stage 1, which is
-the schedule family this mode is intended to expose.
+Structural dependence delay uses the producer's issue quantum. In particular,
+it does not use TC result latency or occupancy. Using full modeled result
+latency would forbid a stage-0 GEMM near the end of the modulo interval from
+feeding an earlier modulo cluster in stage 1, which is the schedule family this
+mode is intended to expose.
 
 ## Search
 
@@ -94,9 +95,10 @@ that violate distance-0 GEMM reachability. For each assignment:
    the standard SWP structural ordering constraint, shifting the consumer by
    `distance * II` without imposing the result-latency model.
 
-Candidate identity is the ordered `(GEMM node, stage, modulo cluster)` tuple,
+Candidate identity is `(II, ordered (GEMM node, stage, modulo cluster) tuple)`,
 not the full per-node stage vector. This removes duplicates caused only by
-loads or elementwise placement.
+loads or elementwise placement while preserving schedules whose different II
+can change resource slack and downstream memory planning.
 
 Unlike the production schedulers, contracted mode emits clusters as one global
 dense rank of `cycle % II`, rather than restarting the rank in every stage.
@@ -104,7 +106,12 @@ Cross-stage cluster inequalities therefore describe the explored modulo order.
 
 Candidates are ranked lexicographically by II, exact two-stage shape,
 contracted critical-path cost, TC utilization, computation-cluster count, and
-a stable GEMM signature. Buffer depth and SMEM/TMEM headroom are excluded.
+a stable GEMM signature. The final bounded frontier reserves roughly half its
+slots for evenly spaced feasible II values, including both endpoints when
+possible, then fills the rest from that ranking. The frontier is finally
+presented in ranking order, so rank 0 remains the lowest-II default while
+larger-II candidates cannot all be displaced by alternatives at the lower
+bound. Buffer depth and SMEM/TMEM headroom are excluded.
 
 ## Diagnostics
 
@@ -118,7 +125,9 @@ signature for each retained top-K schedule.
 test. It checks GEMM stages and clusters only; descriptor loads/stores are not
 part of the scheduling objective. The test must contain a top-K candidate with
 the target FA backward GEMM schedule above. Pipeline-free and epilogue work may
-extend the loop's `tt.scheduled_max_stage` beyond the two GEMM stages.
+extend the loop's `tt.scheduled_max_stage` beyond the two GEMM stages. A second
+pick checks that the same top-K contains a larger-II candidate with enough
+structural slack to keep the epilogue within stage 1.
 
 ## Implementation Status
 
@@ -127,6 +136,7 @@ extend the loop's `tt.scheduled_max_stage` beyond the two GEMM stages.
 - [x] Contracted computation groups and ranking-only latency.
 - [x] Structural resource lower bound without result latency or RecMII.
 - [x] Structural dependence and reservation-table admission.
+- [x] II-aware candidate identity and bounded II-diverse frontier.
 - [x] Exact two-stage GEMM assignment enumeration.
 - [x] Original-DDG placement and validation.
 - [x] GEMM-signature top-K deduplication and diagnostics.

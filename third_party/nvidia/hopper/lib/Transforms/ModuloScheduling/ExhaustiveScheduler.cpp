@@ -21,6 +21,7 @@
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <climits>
 #include <numeric>
@@ -1213,7 +1214,15 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
       }
 
       auto signature = gemmSignature(contracted, scheduled, II);
-      if (!seen.insert(signature).second)
+      // A modulo schedule's II is part of its identity. The same GEMM
+      // stage/cluster signature at a different II has different resource
+      // slack and can induce a different memory plan, so it must remain
+      // measurable.
+      llvm::SmallVector<int> identity;
+      identity.reserve(signature.size() + 1);
+      identity.push_back(II);
+      identity.append(signature.begin(), signature.end());
+      if (!seen.insert(std::move(identity)).second)
         continue;
 
       int stageOne = llvm::popcount(assignment);
@@ -1252,7 +1261,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
     });
   if (candidates.empty())
     return failure();
-  llvm::stable_sort(candidates, [](const Candidate &lhs, const Candidate &rhs) {
+  auto candidateLess = [](const Candidate &lhs, const Candidate &rhs) {
     if (lhs.II != rhs.II)
       return lhs.II < rhs.II;
     if (lhs.imbalance != rhs.imbalance)
@@ -1262,16 +1271,52 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
     return std::lexicographical_compare(
         lhs.signature.begin(), lhs.signature.end(), rhs.signature.begin(),
         rhs.signature.end());
+  };
+  llvm::stable_sort(candidates, candidateLess);
+
+  // Reserve roughly half of top-K for II diversity, sampling the feasible II
+  // range evenly and always retaining both endpoints when at least two slots
+  // are available. Fill the remaining slots by the ordinary deterministic
+  // ranking. This preserves low-II GEMM alternatives while preventing them
+  // from evicting every schedule with more structural slack.
+  int nTop = std::min<int>(K, candidates.size());
+  llvm::SmallVector<int> feasibleIIs;
+  for (const Candidate &candidate : candidates)
+    if (feasibleIIs.empty() || feasibleIIs.back() != candidate.II)
+      feasibleIIs.push_back(candidate.II);
+
+  unsigned iiQuota =
+      std::min<unsigned>(feasibleIIs.size(), std::max(1, (nTop + 1) / 2));
+  llvm::SmallVector<unsigned> frontier;
+  llvm::DenseSet<unsigned> selected;
+  for (unsigned slot = 0; slot < iiQuota; ++slot) {
+    unsigned iiIndex =
+        iiQuota == 1 ? 0 : slot * (feasibleIIs.size() - 1) / (iiQuota - 1);
+    int targetII = feasibleIIs[iiIndex];
+    auto candidate = std::find_if(
+        candidates.begin(), candidates.end(),
+        [&](const Candidate &value) { return value.II == targetII; });
+    assert(candidate != candidates.end() && "missing feasible II candidate");
+    unsigned candidateIndex = candidate - candidates.begin();
+    frontier.push_back(candidateIndex);
+    selected.insert(candidateIndex);
+  }
+  for (unsigned candidateIndex = 0;
+       frontier.size() < static_cast<unsigned>(nTop); ++candidateIndex) {
+    if (selected.insert(candidateIndex).second)
+      frontier.push_back(candidateIndex);
+  }
+  llvm::stable_sort(frontier, [&](unsigned lhs, unsigned rhs) {
+    return candidateLess(candidates[lhs], candidates[rhs]);
   });
 
-  int nTop = std::min<int>(K, candidates.size());
   int pick = std::min(getModuloPick(), nTop - 1);
   DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
     llvm::dbgs() << "[modulo-scheduling-contracted]: top-" << nTop
                  << " applying pick " << pick << " from " << candidates.size()
-                 << " schedules\n";
+                 << " schedules; II representatives=" << iiQuota << "\n";
     for (int rank = 0; rank < nTop; ++rank) {
-      const auto &candidate = candidates[rank];
+      const auto &candidate = candidates[frontier[rank]];
       llvm::dbgs() << "  rank " << rank << " II=" << candidate.II
                    << " imbalance=" << candidate.imbalance
                    << " computeCost=" << candidate.contractedCost
@@ -1284,8 +1329,9 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   });
 
   ModuloScheduleResult result;
-  result.II = candidates[pick].II;
-  result.nodeToCycle = std::move(candidates[pick].scheduled);
+  Candidate &selectedCandidate = candidates[frontier[pick]];
+  result.II = selectedCandidate.II;
+  result.nodeToCycle = std::move(selectedCandidate.scheduled);
   return result;
 }
 
