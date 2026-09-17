@@ -232,8 +232,8 @@ jobs:
             python/test/unit/language/test_tlx_*sm100*.py
             python/test/unit/tlx_ops/test_*sm100*.py
           )
-          # TorchTLX depends on floating PyTorch Inductor APIs and runs in
-          # torchtlx-b200.yml, not this regular TLX job.
+          # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
+          # separate b200-torchtlx-test job below, not this pinned-PyTorch job.
           TLX_FILES=()
           for file in "${FILES[@]}"; do
             [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
@@ -473,6 +473,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
