@@ -86,11 +86,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CONTRACTED-B-LABEL: tt.func @gemm_inner_loop
 // CONTRACTED-B: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
 // CONTRACTED-B: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CONTRACTED-B: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CONTRACTED-B: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 2 : i32}
 // CONTRACTED-B: tt.scheduled_max_stage = 2 : i32
 
-// MANIFEST: {"kind": "schedule", "rank": 0, "selected": false, "ii": {{[0-9]+}}, "load_order_variant": 0, "signature": [
-// MANIFEST-NEXT: {"kind": "schedule", "rank": 1, "selected": true, "ii": {{[0-9]+}}, "load_order_variant": {{[1-9][0-9]*}}, "signature": [
+// MANIFEST: {"kind": "schedule", "rank": 0, "selected": false, "ii": {{[0-9]+}}, "load_order_variant": 0, "load_stage_variant": 0, "signature": [
+// MANIFEST-NEXT: {"kind": "schedule", "rank": 1, "selected": true, "ii": {{[0-9]+}}, "load_order_variant": 0, "load_stage_variant": 1, "signature": [
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<128x64xf16>,
   %b_desc: !tt.tensordesc<64x128xf16>

@@ -101,6 +101,13 @@ load-priority variants. Each variant pulls one GEMM-reaching TMA load and its
 distance-zero predecessor slice forward whenever those nodes are ready. This
 only changes tie-breaks among independent nodes; it never bypasses a DDG edge.
 
+For a single-GEMM loop with multiple GEMM-reaching TMA loads, the scheduler
+also branches over one structural iteration-lead movement per load. The
+selected load is placed in stage 1, its peers remain in stage 0, and the GEMM
+moves to stage 2. The baseline schedule remains unchanged. Loads are selected
+by stable DDG ordinal, so this produces asymmetric prefetch alternatives
+without lhs/rhs-specific roles or a latency-model decision.
+
 Candidate identity is `(II, ordered GEMM stage/cluster tuple, ordered
 GEMM-reaching TMA-load stage/cluster tuple)`, not the full per-node stage
 vector. Loads are discovered by a distance-zero forward path to a GEMM, not by
@@ -111,16 +118,17 @@ Unlike the production schedulers, contracted mode emits clusters as one global
 dense rank of `cycle % II`, rather than restarting the rank in every stage.
 Cross-stage cluster inequalities therefore describe the explored modulo order.
 
-Candidates are ranked lexicographically by II, exact two-stage shape,
+Candidates are ranked lexicographically by II, exact stage shape,
 contracted critical-path cost, TC utilization, computation-cluster count, and
 a stable GEMM signature. The final bounded frontier reserves roughly half its
 slots for evenly spaced feasible II values, including both endpoints when
-possible, reserves one slot for the best non-default load-order variant, then
-fills the rest from that ranking. Baseline topological orders sort before load
-variants at the same II, keeping rank 0 default-neutral. The frontier is
-finally presented in ranking order, so larger-II and load-order candidates
-cannot both be displaced by alternatives at the lower bound. Buffer depth and
-SMEM/TMEM headroom are excluded.
+possible, reserves one slot per legal single-load stage movement, then reserves
+one slot for the best non-default same-stage load-order variant if capacity
+remains. Baseline topological orders sort before load variants at the same II,
+keeping rank 0 default-neutral. The frontier is finally presented in ranking
+order, so larger-II and iteration-lead candidates cannot both be displaced by
+alternatives at the lower bound. Buffer depth and SMEM/TMEM headroom are
+excluded.
 
 ## Diagnostics
 
@@ -129,11 +137,11 @@ contracted nodes, stage assignments considered/rejected, and the GEMM plus
 GEMM-reaching-load signature for each retained top-K schedule.
 
 `TRITON_WS_SEARCH_MANIFEST=<path>` appends one JSON-line record per retained
-candidate with its rank, selected bit, structural II, load-order variant, and
-canonical schedule signature. The memory planner appends its candidates to the
-same file later in compilation, allowing an external harness to enumerate the
-schedule×memory product without passing scheduler data structures between
-passes.
+candidate with its rank, selected bit, structural II, load-order variant,
+load-stage variant, and canonical schedule signature. The memory planner
+appends its candidates to the same file later in compilation, allowing an
+external harness to enumerate the schedule×memory product without passing
+scheduler data structures between passes.
 
 ## Testing
 
@@ -159,6 +167,7 @@ without operand-specific annotations.
 - [x] II-aware candidate identity and bounded II-diverse frontier.
 - [x] GEMM-reaching TMA-load discovery and candidate identity.
 - [x] Predecessor-slice load-order branching and frontier retention.
+- [x] Single-GEMM asymmetric iteration-lead branching and frontier retention.
 - [x] One-MMA scheduling with two operand-order alternatives.
 - [x] Exact two-stage GEMM assignment enumeration.
 - [x] Original-DDG placement and validation.

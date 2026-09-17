@@ -52,8 +52,7 @@ memory planner.
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
 with 128x128x128 tiles and eight-way output subtiling has been captured at the
 pre-modulo and post-buffer-allocation boundaries. The pass-local scheduler test
-shows that Contracted search currently retains both descriptor-load orders but
-places both loads in stage 0 and the MMA in stage 1. It does not yet retain the
+shows that Contracted search retains the default A0/B0/MMA1 schedule plus the
 three-stage A0/B1/MMA2 and A1/B0/MMA2 alternatives required to reproduce the
 D120 experiment. The pass-local memory test confirms that the existing
 heuristic produces A3/B2 on the same graph. Search-mode coverage on this fixture
@@ -758,7 +757,7 @@ as a hard correctness floor.
       Cartesian-product search.
 - [x] Production-shaped D120 TTGIR is captured at the pre-modulo and
       post-buffer-allocation pass boundaries.
-- [ ] Contracted search retains D120's A0/B1/MMA2 and A1/B0/MMA2 iteration-lead
+- [x] Contracted search retains D120's A0/B1/MMA2 and A1/B0/MMA2 iteration-lead
       alternatives on the production-shaped fixture.
 - [ ] Memory search recognizes the production-shaped eight-subtile output
       staging group and retains the heuristic A3/B2 plan as rank zero.

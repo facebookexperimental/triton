@@ -9,6 +9,12 @@
 // RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-pre-modulo.mlir \
 // RUN:   -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | \
+// RUN:   FileCheck %s --check-prefix=A-EARLY
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
+// RUN:   TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=2 \
+// RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-pre-modulo.mlir \
+// RUN:   -allow-unregistered-dialect -nvgpu-modulo-schedule \
+// RUN:   -mlir-print-debuginfo -mlir-print-local-scope | \
 // RUN:   FileCheck %s --check-prefix=B-EARLY
 // RUN: rm -f %t
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
@@ -32,16 +38,22 @@
 // BASELINE: "tt.reduce"
 // BASELINE: ttng.tc_gen5_mma {{.*}}loop.cluster = 0 : i32, loop.stage = 1 : i32
 
-// Rank one prioritizes B's address/load slice without bypassing the A -> RMS
-// reduction dependency. Both loads still occupy stage zero on this real graph.
+// Rank one keeps A two stages ahead of the MMA and B one stage ahead.
+// A-EARLY-LABEL: tt.func public @d120_rmsnorm_gemm
+// A-EARLY: %[[A:.*]] = tt.descriptor_load {{.*}}loop.cluster = 1 : i32, loop.stage = 0 : i32{{.*}}loc("a"
+// A-EARLY: %[[B:.*]] = tt.descriptor_load {{.*}}loop.cluster = 0 : i32, loop.stage = 1 : i32{{.*}}loc("b"
+// A-EARLY: "tt.reduce"
+// A-EARLY: ttng.tc_gen5_mma {{.*}}loop.cluster = 0 : i32, loop.stage = 2 : i32
+
+// Rank two reverses the iteration lead without using operand-specific rules.
 // B-EARLY-LABEL: tt.func public @d120_rmsnorm_gemm
-// B-EARLY: %[[A:.*]] = tt.descriptor_load {{.*}}loop.cluster = 2 : i32, loop.stage = 0 : i32{{.*}}loc("a"
+// B-EARLY: %[[A:.*]] = tt.descriptor_load {{.*}}loop.cluster = 0 : i32, loop.stage = 1 : i32{{.*}}loc("a"
 // B-EARLY: %[[B:.*]] = tt.descriptor_load {{.*}}loop.cluster = 1 : i32, loop.stage = 0 : i32{{.*}}loc("b"
 // B-EARLY: "tt.reduce"
-// B-EARLY: ttng.tc_gen5_mma {{.*}}loop.cluster = 0 : i32, loop.stage = 1 : i32
+// B-EARLY: ttng.tc_gen5_mma {{.*}}loop.cluster = 0 : i32, loop.stage = 2 : i32
 
-// The frontier contains both load orders and larger-II representatives.
-// MANIFEST: {"kind": "schedule", "rank": 0, "selected": true, "ii": 5, "load_order_variant": 0, "signature": [1, 0, 0, 1, 0, 2]}
-// MANIFEST-NEXT: {"kind": "schedule", "rank": 1, "selected": false, "ii": 5, "load_order_variant": 1, "signature": [1, 0, 0, 2, 0, 1]}
-// MANIFEST-NEXT: {"kind": "schedule", "rank": 2, "selected": false, "ii": 6, "load_order_variant": 0, "signature": [1, 0, 0, 1, 0, 2]}
-// MANIFEST-NEXT: {"kind": "schedule", "rank": 3, "selected": false, "ii": 15, "load_order_variant": 0, "signature": [1, 0, 0, 1, 0, 2]}
+// The frontier contains both iteration-lead choices and a larger-II baseline.
+// MANIFEST: {"kind": "schedule", "rank": 0, "selected": true, "ii": 5, "load_order_variant": 0, "load_stage_variant": 0, "signature": [1, 0, 0, 1, 0, 2]}
+// MANIFEST-NEXT: {"kind": "schedule", "rank": 1, "selected": false, "ii": 5, "load_order_variant": 0, "load_stage_variant": 2, "signature": [2, 0, 0, 1, 1, 0]}
+// MANIFEST-NEXT: {"kind": "schedule", "rank": 2, "selected": false, "ii": 5, "load_order_variant": 0, "load_stage_variant": 1, "signature": [2, 0, 1, 0, 0, 1]}
+// MANIFEST-NEXT: {"kind": "schedule", "rank": 3, "selected": false, "ii": 15, "load_order_variant": 0, "load_stage_variant": 0, "signature": [1, 0, 0, 1, 0, 2]}

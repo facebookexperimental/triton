@@ -904,6 +904,7 @@ struct ContractedGraphInfo {
   llvm::SmallVector<unsigned> gemms;
   llvm::SmallVector<unsigned> loads;
   llvm::SmallVector<int> gemmOrdinal;
+  llvm::SmallVector<int> loadOrdinal;
   llvm::SmallVector<int> nodeToGroup;
   llvm::SmallVector<ComputeGroup> groups;
 };
@@ -931,6 +932,7 @@ analyzeContractedGraph(const DataDependenceGraph &ddg,
   ContractedGraphInfo info;
   const unsigned numNodes = ddg.getNumNodes();
   info.gemmOrdinal.assign(numNodes, -1);
+  info.loadOrdinal.assign(numNodes, -1);
   info.nodeToGroup.assign(numNodes, -1);
   for (const auto &node : ddg.getNodes()) {
     if (node.pipeline != HWPipeline::TC)
@@ -951,9 +953,12 @@ analyzeContractedGraph(const DataDependenceGraph &ddg,
         reachable[nodeIdx] |= reachable[edge->dstIdx];
     }
   }
-  for (const auto &node : ddg.getNodes())
-    if (node.pipeline == HWPipeline::TMA && reachable[node.idx].any())
+  for (const auto &node : ddg.getNodes()) {
+    if (node.pipeline == HWPipeline::TMA && reachable[node.idx].any()) {
+      info.loadOrdinal[node.idx] = info.loads.size();
       info.loads.push_back(node.idx);
+    }
+  }
 
   llvm::SmallVector<unsigned> parent(numNodes);
   std::iota(parent.begin(), parent.end(), 0);
@@ -1203,6 +1208,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
     int imbalance;
     int64_t contractedCost;
     unsigned loadOrderVariant;
+    unsigned loadStageVariant;
     llvm::SmallVector<int> signature;
     llvm::DenseMap<unsigned, int> scheduled;
   };
@@ -1232,11 +1238,30 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
     topoVariants.push_back(std::move(prioritized));
   }
 
+  // A single-GEMM loop admits one additional, structurally useful schedule
+  // family: place exactly one GEMM-reaching load in the stage immediately
+  // before the GEMM while keeping its peers one stage farther ahead. This is
+  // the generic iteration-lead choice needed by asymmetric prefetching. It is
+  // deliberately keyed by stable DDG load ordinal rather than operand role.
+  // Multi-GEMM stage assignments already express their prefetch distance and
+  // are left unchanged.
+  unsigned numLoadStageVariants = 1;
+  if (contracted.gemms.size() == 1 && contracted.loads.size() > 1)
+    numLoadStageVariants +=
+        std::min<unsigned>(contracted.loads.size(), kMaxLoadOrderVariants);
+  llvm::SmallVector<std::pair<unsigned, unsigned>> placementVariants;
+  for (unsigned loadOrderVariant = 0;
+       loadOrderVariant < topoVariants.size(); ++loadOrderVariant)
+    for (unsigned loadStageVariant = 0;
+         loadStageVariant < numLoadStageVariants; ++loadStageVariant)
+      placementVariants.emplace_back(loadOrderVariant, loadStageVariant);
+
   DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
     llvm::dbgs() << "[modulo-scheduling-contracted]: original nodes="
                  << ddg.getNumNodes() << " GEMMs=" << contracted.gemms.size()
                  << " compute groups=" << contracted.groups.size()
                  << " load-order variants=" << topoVariants.size()
+                 << " load-stage variants=" << numLoadStageVariants
                  << " structural MinII=" << minII
                  << " modeled MinII=" << ddg.computeMinII() << "\n";
   });
@@ -1247,8 +1272,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
       // to stage 1 so stage 0 remains available for its operand prefetches.
       if (contracted.gemms.size() > 1 && assignment + 1 == assignmentLimit)
         continue;
-      for (unsigned loadOrderVariant = 0;
-           loadOrderVariant < topoVariants.size(); ++loadOrderVariant) {
+      for (auto [loadOrderVariant, loadStageVariant] : placementVariants) {
         ModuloReservationTable table(II);
         llvm::DenseMap<unsigned, int> scheduled;
         bool valid = true;
@@ -1258,9 +1282,18 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
           int duration = structuralIssueDuration(node);
           int targetStage = earliest / II;
           int ordinal = contracted.gemmOrdinal[nodeIdx];
+          int loadOrdinal = contracted.loadOrdinal[nodeIdx];
           if (ordinal >= 0)
             targetStage = (assignment >> ordinal) & 1;
-          int maxStage = ordinal >= 0 ? 1 : 2;
+          if (loadStageVariant != 0) {
+            if (ordinal >= 0)
+              ++targetStage;
+            if (loadOrdinal >= 0)
+              targetStage =
+                  loadOrdinal + 1 == static_cast<int>(loadStageVariant) ? 1 : 0;
+          }
+          bool pinnedLoad = loadStageVariant != 0 && loadOrdinal >= 0;
+          int maxStage = ordinal >= 0 ? (loadStageVariant != 0 ? 2 : 1) : 2;
           if (targetStage > maxStage ||
               (ordinal >= 0 && earliest > (targetStage + 1) * II - 1)) {
             DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
@@ -1282,8 +1315,8 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
               stageStart = std::max(stageStart, II + leading->second % II + 1);
           }
           // Keep the leading stage-0 GEMM early. Pack later stage-0 GEMMs at
-          // the end of the modulo interval, leaving low modulo cycles available
-          // to stage-1 consumers after the iteration boundary.
+          // the end of the modulo interval, leaving low modulo cycles
+          // available to stage-1 consumers after the iteration boundary.
           if (ordinal > 0 && targetStage == 0) {
             int trailingOccupancy = 0;
             for (unsigned gemm = ordinal; gemm < contracted.gemms.size();
@@ -1296,7 +1329,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
           }
           int slot = table.findFreeSlot(stageStart, node.pipeline, duration);
           if (slot < 0 || slot / II > maxStage ||
-              (ordinal >= 0 && slot / II != targetStage)) {
+              ((ordinal >= 0 || pinnedLoad) && slot / II != targetStage)) {
             DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
               if (placementFailures[nodeIdx] == 0)
                 llvm::dbgs()
@@ -1353,7 +1386,8 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
                             (maxStage - minStage);
         }
         candidates.push_back({II, imbalance, contractedCost, loadOrderVariant,
-                              std::move(signature), std::move(scheduled)});
+                              loadStageVariant, std::move(signature),
+                              std::move(scheduled)});
       }
     }
   }
@@ -1373,8 +1407,8 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   auto candidateLess = [](const Candidate &lhs, const Candidate &rhs) {
     if (lhs.II != rhs.II)
       return lhs.II < rhs.II;
-    bool lhsBaseline = lhs.loadOrderVariant == 0;
-    bool rhsBaseline = rhs.loadOrderVariant == 0;
+    bool lhsBaseline = lhs.loadOrderVariant == 0 && lhs.loadStageVariant == 0;
+    bool rhsBaseline = rhs.loadOrderVariant == 0 && rhs.loadStageVariant == 0;
     if (lhsBaseline != rhsBaseline)
       return lhsBaseline;
     if (lhs.imbalance != rhs.imbalance)
@@ -1415,9 +1449,28 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
     frontier.push_back(candidateIndex);
     selected.insert(candidateIndex);
   }
+  // Preserve one representative for every legal single-load stage movement
+  // before spending a slot on same-stage load-order diversity. These variants
+  // change logical iteration lead and therefore can induce distinct memory
+  // plans; mere ordering variants do not.
+  for (unsigned loadStageVariant = 1;
+       loadStageVariant < numLoadStageVariants &&
+       frontier.size() < static_cast<unsigned>(nTop);
+       ++loadStageVariant) {
+    auto candidate = std::find_if(
+        candidates.begin(), candidates.end(), [&](const Candidate &value) {
+          return value.loadStageVariant == loadStageVariant;
+        });
+    if (candidate == candidates.end())
+      continue;
+    unsigned candidateIndex = candidate - candidates.begin();
+    if (selected.insert(candidateIndex).second)
+      frontier.push_back(candidateIndex);
+  }
   auto loadVariant = std::find_if(candidates.begin(), candidates.end(),
                                   [](const Candidate &candidate) {
-                                    return candidate.loadOrderVariant != 0;
+                                    return candidate.loadStageVariant == 0 &&
+                                           candidate.loadOrderVariant != 0;
                                   });
   if (frontier.size() < static_cast<unsigned>(nTop) &&
       loadVariant != candidates.end()) {
@@ -1447,6 +1500,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
            << ", \"selected\": " << (rank == pick ? "true" : "false")
            << ", \"ii\": " << candidate.II
            << ", \"load_order_variant\": " << candidate.loadOrderVariant
+           << ", \"load_stage_variant\": " << candidate.loadStageVariant
            << ", \"signature\": [";
         for (unsigned i = 0; i < candidate.signature.size(); ++i)
           os << (i ? ", " : "") << candidate.signature[i];
@@ -1464,6 +1518,7 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
                    << " imbalance=" << candidate.imbalance
                    << " computeCost=" << candidate.contractedCost
                    << " loadOrderVariant=" << candidate.loadOrderVariant
+                   << " loadStageVariant=" << candidate.loadStageVariant
                    << " gemms(stage,cluster)=[";
       for (unsigned i = 0; i < contracted.gemms.size(); ++i)
         llvm::dbgs() << (i ? "," : "") << "(" << candidate.signature[2 * i]
