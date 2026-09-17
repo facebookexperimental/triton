@@ -1,6 +1,7 @@
 // These checks pin raw planner budgets; auxiliary reservation is covered by
 // ws_memory_planner_load_order.mlir.
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=2 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 // RUN: env TRITON_WS_MEM_PLAN_VERIFY_GROUPS=1 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=VERIFY
 
 // BWD FA persistent kernel (BLOCK_M1=128, EPILOGUE_SUBTILE=2) with TMA

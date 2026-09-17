@@ -2111,7 +2111,9 @@ namespace {
 class SmemBufferModel : public wsplan::BufferModel {
 public:
   SmemBufferModel(triton::FuncOp funcOp, SmallVector<Channel *> &channels,
-                  unsigned configuredDepth) {
+                  unsigned configuredDepth,
+                  const DenseSet<Operation *> *fixedDepthAllocs = nullptr,
+                  bool importExistingGrouping = false) {
     DenseMap<Operation *, unsigned> opOrder;
     unsigned next = 0;
     funcOp->walk<WalkOrder::PreOrder>(
@@ -2137,10 +2139,23 @@ public:
       }
       r.liveness = Interval<size_t>(lo, hi + 1);
 
-      r.stageSpan =
+      unsigned safetyFloor =
           getStaticSmemCopySafetyFloor(alloc, channels, configuredDepth);
-      r.entries = 1; // TODO(step9): data-partition expansion count.
-      r.maxCopies = configuredDepth;
+      bool fixedDepth =
+          fixedDepthAllocs && fixedDepthAllocs->contains(r.allocOp);
+      unsigned existingCopies = 1;
+      if (auto copy = alloc->getAttrOfType<IntegerAttr>("buffer.copy"))
+        existingCopies =
+            static_cast<unsigned>(std::max<int64_t>(1, copy.getInt()));
+
+      // A fixed grouping is imported from the proven heuristic planner. Its
+      // grouped/staging members already encode static slot assignment and K|S
+      // constraints, so pin them to the emitted depth rather than attempting
+      // to reinterpret `entries()` as a new circular-ring proof. Mutable
+      // singleton operands retain the ordinary schedule-derived floor.
+      r.stageSpan = fixedDepth ? existingCopies : safetyFloor;
+      r.entries = importExistingGrouping ? 0 : 1;
+      r.maxCopies = fixedDepth ? existingCopies : configuredDepth;
       r.freq = 1.0; // TODO(step9): enclosing-loop trip count.
 
       auto memTy = alloc.getType();
@@ -2338,6 +2353,197 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
   }
 }
 
+/// Identify the parts of a heuristic SMEM plan whose depth must remain fixed
+/// when the plan is imported into copy search. Grouped buffers, staging rings,
+/// subtiled-region buffers, and explicit pins carry invariants that the generic
+/// CopySolver does not model yet. Mutable singleton operands remain searchable.
+///
+/// `allocation.reuseTarget` represents physical aliasing between *different*
+/// buffer ids. The generic Packer cannot account for that footprint yet, so
+/// fail closed and preserve the complete heuristic plan in that case.
+static bool isUsedBySubtiledRegion(Operation *alloc) {
+  if (alloc->getParentOfType<ttng::SubtiledRegionOp>())
+    return true;
+  SmallVector<Value> worklist(alloc->getResults());
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      if (user->getParentOfType<ttng::SubtiledRegionOp>())
+        return true;
+      if (!user->hasTrait<OpTrait::MemDescViewTrait>())
+        continue;
+      for (Value result : user->getResults())
+        if (isa<ttg::MemDescType>(result.getType()))
+          worklist.push_back(result);
+    }
+  }
+  return false;
+}
+
+static bool collectFixedSmemDepths(
+    triton::FuncOp funcOp,
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
+    DenseSet<Operation *> &fixedDepthAllocs) {
+  DenseMap<int64_t, SmallVector<Operation *>> idGroups;
+  bool supported = true;
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    if (!alloc.isSharedMemoryAlloc())
+      return;
+    Operation *op = alloc.getOperation();
+    auto id = op->getAttrOfType<IntegerAttr>("buffer.id");
+    auto copies = op->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!id || !copies) {
+      supported = false;
+      return;
+    }
+    idGroups[id.getInt()].push_back(op);
+
+    if (op->hasAttr("allocation.reuseTarget")) {
+      supported = false;
+      return;
+    }
+    if (allocToAnnotation.count(op) ||
+        op->hasAttr(kAtomicBroadcastCopiesAttrName) ||
+        op->hasAttr("buffer.tmaStaging"))
+      fixedDepthAllocs.insert(op);
+
+    if (isUsedBySubtiledRegion(op))
+      fixedDepthAllocs.insert(op);
+  });
+  if (!supported)
+    return false;
+
+  for (auto &[id, members] : idGroups) {
+    (void)id;
+    if (members.size() <= 1)
+      continue;
+    auto firstCopies =
+        members.front()->getAttrOfType<IntegerAttr>("buffer.copy").getInt();
+    if (llvm::any_of(members, [&](Operation *member) {
+          return member->getAttrOfType<IntegerAttr>("buffer.copy").getInt() !=
+                 firstCopies;
+        }))
+      return false;
+    fixedDepthAllocs.insert(members.begin(), members.end());
+  }
+  return true;
+}
+
+/// Import the heuristic's buffer.id grouping as a fixed plan. Block ids are
+/// the already-emitted physical ids, so dumps describe the actual allocation.
+static std::optional<wsplan::Plan>
+importSmemGrouping(const SmemBufferModel &model) {
+  wsplan::Plan plan;
+  DenseMap<int64_t, unsigned> idToBlock;
+  for (wsplan::BufferId buffer : model.buffers()) {
+    Operation *alloc = model.allocOpFor(buffer);
+    auto idAttr = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+    auto copyAttr = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!idAttr || !copyAttr || idAttr.getInt() < 0 || copyAttr.getInt() < 1)
+      return std::nullopt;
+
+    int64_t physicalId = idAttr.getInt();
+    auto [it, inserted] = idToBlock.try_emplace(
+        physicalId, static_cast<unsigned>(plan.blocks.size()));
+    if (inserted) {
+      wsplan::Block block;
+      block.id = static_cast<wsplan::BlockId>(physicalId);
+      block.copies = static_cast<unsigned>(copyAttr.getInt());
+      plan.blocks.push_back(std::move(block));
+    }
+    unsigned blockIndex = it->second;
+    wsplan::Block &block = plan.blocks[blockIndex];
+    block.members.push_back(buffer);
+    block.placement[buffer] = {};
+    plan.blockOf[buffer] = blockIndex;
+  }
+  return plan;
+}
+
+static bool sameCopyDepths(const wsplan::Plan &a, const wsplan::Plan &b) {
+  if (a.blocks.size() != b.blocks.size())
+    return false;
+  for (unsigned i = 0; i < a.blocks.size(); ++i)
+    if (a.blocks[i].id != b.blocks[i].id ||
+        a.blocks[i].copies != b.blocks[i].copies)
+      return false;
+  return true;
+}
+
+/// Keep the heuristic plan at rank zero, then add bounded copy alternatives
+/// without changing its grouping/reuse/staging structure.
+static bool refineFixedSmemPlan(
+    triton::FuncOp funcOp, SmallVector<Channel *> &channels,
+    unsigned numBuffers, unsigned smemBudget,
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation) {
+  unsigned topK = getMemPlanTopK();
+  if (topK <= 1)
+    return true; // Rank-zero neutrality: leave heuristic attributes untouched.
+
+  DenseSet<Operation *> fixedDepthAllocs;
+  if (!collectFixedSmemDepths(funcOp, allocToAnnotation, fixedDepthAllocs)) {
+    LDBG("SMEM fixed-group search: unsupported cross-id reuse or malformed "
+         "heuristic plan; preserving heuristic output");
+    return false;
+  }
+
+  SmemBufferModel model(funcOp, channels, numBuffers, &fixedDepthAllocs,
+                        /*importExistingGrouping=*/true);
+  auto baseline = importSmemGrouping(model);
+  if (!baseline)
+    return false;
+
+  auto packer = wsplan::createSmemPacker(model);
+  auto cost = wsplan::createLatencyCostModel(model, getModuloII(funcOp));
+  auto copies = wsplan::createGreedyCopySolver();
+  auto validator = wsplan::createStaticCopySafetyValidator();
+  wsplan::Budget budget;
+  budget.smemBytes = smemBudget;
+
+  wsplan::TopKPlans plans;
+  baseline->score = cost->score(*baseline);
+  plans.push_back(*baseline);
+
+  // Request slack for assignments that duplicate the imported baseline or are
+  // rejected by the hard safety/budget checks. The cap keeps compile time
+  // independent of the full Cartesian product.
+  unsigned enumerationLimit = std::min(256u, std::max(8u, topK * 4u));
+  wsplan::CopyMaps maps = copies->enumerate(model, *packer, *baseline, budget,
+                                            *cost, enumerationLimit);
+  for (const wsplan::CopyMap &map : maps) {
+    wsplan::Plan candidate = *baseline;
+    for (wsplan::Block &block : candidate.blocks) {
+      auto it = map.find(block.id);
+      if (it != map.end())
+        block.copies = it->second;
+    }
+    if (sameCopyDepths(candidate, *baseline) ||
+        !validator->validate(model, candidate) ||
+        !packer->feasible(candidate, budget) ||
+        llvm::any_of(plans, [&](const wsplan::Plan &other) {
+          return sameCopyDepths(candidate, other);
+        }))
+      continue;
+    candidate.score = cost->score(candidate);
+    plans.push_back(std::move(candidate));
+    if (plans.size() == topK)
+      break;
+  }
+
+  dumpMemPlans(plans, "smem-fixed", /*firstId=*/0);
+  const wsplan::Plan &selected =
+      plans[std::min<size_t>(getMemPlanPick(funcOp), plans.size() - 1)];
+  auto i32 = IntegerType::get(funcOp.getContext(), 32);
+  for (const wsplan::Block &block : selected.blocks)
+    for (wsplan::BufferId member : block.members)
+      model.allocOpFor(member)->setAttr("buffer.copy",
+                                        IntegerAttr::get(i32, block.copies));
+  return true;
+}
+
 // Step 9 (docs §6): SMEM allocation via the plan-space search. Runs the beam
 // search (SmemBufferModel + SmemPacker + latency cost + bounded copy
 // enumeration), then stamps buffer.id/buffer.copy from the selected plan.
@@ -2346,9 +2552,10 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
 // count) are re-applied as a safety net so the search output can never drop
 // below the proven floors (docs §2.2 / Algo-0 hazard). Returns nextBufferId.
 //
-// Falls back to the heuristic allocateSmemBuffers when the kernel uses features
-// the search does not yet model (annotation/atomic-broadcast pins, subtiled
-// regions, TMA-staging buffers) or when the search yields no plan.
+// Kernels with annotation/atomic-broadcast pins, subtiled regions, or
+// multi-store TMA staging first run the heuristic planner, then use its output
+// as a fixed grouping while searching mutable singleton depths. Cross-id
+// allocation.reuseTarget aliases still remain on the pure heuristic path.
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
@@ -2386,11 +2593,14 @@ static unsigned allocateSmemBuffersViaSearch(
     }
   });
   if (needsFallback) {
-    LDBG("SMEM plan-search: unmodeled feature present, falling back to "
-         "heuristic");
-    return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
-                               smemCircularReuse, allocToAnnotation,
-                               annotationMaxId);
+    LDBG("SMEM plan-search: importing heuristic grouping for unmodeled "
+         "grouping features");
+    unsigned nextId = allocateSmemBuffers(funcOp, channels, numBuffers,
+                                          smemBudget, smemCircularReuse,
+                                          allocToAnnotation, annotationMaxId);
+    (void)refineFixedSmemPlan(funcOp, channels, numBuffers, smemBudget,
+                              allocToAnnotation);
+    return nextId;
   }
 
   SmemBufferModel model(funcOp, channels, numBuffers);

@@ -344,12 +344,29 @@ read estimated II; II remains solely an optimization-ranking input.
 ### 9.7 Wiring & safety net
 `allocateSmemBuffersViaSearch` / `allocateTmemBuffersViaSearch` build the model,
 run `beamSearch`, then stamp `buffer.id` / `buffer.copy` (/ `buffer.offset`) from
-the picked plan (rank via `mem_plan_pick`). Both **fall back** to the heuristic
-path for unmodeled features — SMEM: annotation / atomic-broadcast pins, subtiled
-regions, multi-store TMA staging; TMEM: scaled MMA (scale-column reservation) and
-subtiled regions. Correctness floors (cross-stage depth, per-id entry count) are
-re-applied after the search as a backstop, so a plan can never drop below the
-proven floor.
+the picked plan (rank via `mem_plan_pick`).
+
+For SMEM features whose grouping rules are not represented by `SmemPacker`
+(explicit pins, atomic-broadcast depth, subtiled regions, and multi-store TMA
+staging), the planner now uses a conservative **fixed-grouping mode**:
+
+1. run the heuristic planner to establish `buffer.id`, staging depth, and reuse;
+2. import each same-`buffer.id` group as one plan block;
+3. pin grouped, staged, subtiled, and explicitly annotated blocks;
+4. enumerate depths only for the remaining singleton operands;
+5. retain the exact heuristic plan as rank zero.
+
+The imported model does not reinterpret group member count as static ring
+entries: the heuristic plan may use dynamic subtile indexing where `K < S` is
+legal when `K` divides `S`. Those groups are pinned to their proven emitted
+depth. Plans carrying `allocation.reuseTarget` still stay entirely heuristic,
+because they alias physical storage across different `buffer.id` values and the
+generic packer's budget accounting cannot represent that yet.
+
+TMEM still falls back for scaled MMA (scale-column reservation) and subtiled
+regions. Correctness floors (cross-stage depth, per-id entry count) are re-applied
+after ordinary search as a backstop, so a plan can never drop below the proven
+floor.
 
 SMEM search and heuristic allocation share
 `getStaticSmemCopySafetyFloor`. Besides ordinary consumer stage span, it

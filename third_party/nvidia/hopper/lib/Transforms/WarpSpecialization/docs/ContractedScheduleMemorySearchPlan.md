@@ -2,8 +2,9 @@
 
 **Status:** implementation in progress. Milestone A's structural schedule
 frontier and Milestone B's bounded SMEM depth frontier are implemented.
-Composing schedule and memory candidates across compilation runs and supporting
-the current fallback-only staging/subtile cases remain open.
+Conservative fixed-group search now covers staging/subtile cases without
+cross-id aliases. Modeling `allocation.reuseTarget` and composing schedule and
+memory candidates across compilation runs remain open.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
@@ -31,6 +32,13 @@ leaves also enumerate the hard-floor vector and progressively deeper legal
 neighbors. The plan beam validates, scores, and deduplicates those concrete
 plans before global top-K selection. A two-operand oracle covers A2/B2, A3/B2,
 and A2/B3 under a budget that admits exactly one additional copy.
+
+**Implemented fifth slice:** unsupported SMEM grouping features no longer force
+an immediate all-or-nothing fallback. The heuristic first establishes its
+proven grouping and staging depths; fixed-group search preserves that plan as
+rank zero, pins constrained groups, and enumerates only mutable singleton
+operand depths. Cross-id `allocation.reuseTarget` aliases still fail closed to
+the heuristic until their physical footprint is represented by the packer.
 
 **Primary implementation areas:**
 
@@ -511,14 +519,22 @@ the known `{dpT, dsT, dQ}` case, without hand-written IDs or offsets.
 
 ### Phase 8: Preserve search through unsupported grouping features
 
-The current plan-space path falls back on subtiled regions, multi-store staging,
-and some annotations. Replace all-or-nothing fallback with fixed-grouping mode:
+Subtiled regions, multi-store staging, and some annotations require grouping
+rules outside the generic packer. Preserve them through fixed-grouping mode:
 
 1. Run the existing heuristic planner to establish a legal grouping/reuse
    structure.
 2. Import that structure as a fixed `wsplan::Plan`.
 3. Enumerate legal copy vectors within it.
 4. Preserve staging, `K | S`, encoding, and reuse synchronization invariants.
+
+The first conservative implementation now performs steps 1–3 and preserves
+same-id grouping, staging, subtile, atomic-broadcast, and annotation invariants
+by pinning their heuristic depths. It searches only unconstrained singleton
+operands and keeps the imported heuristic allocation at rank zero. Cross-id
+`allocation.reuseTarget` plans remain a deliberate fallback because the generic
+packer would otherwise double-count their aliased physical backing. Modeling
+those alias edges is the remaining part of this phase.
 
 #### D120426461 example
 

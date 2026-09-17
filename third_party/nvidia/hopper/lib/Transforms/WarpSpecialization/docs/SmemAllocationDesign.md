@@ -626,6 +626,23 @@ This interface is unchanged.
 | Budget | Enforced for discretionary copies; cross-stage floor is exempt (HW SMEM limit is the backstop) |
 | Iteration order | Sorted by operation ID |
 
+### Search integration for heuristic-only grouping features
+
+When `smem-plan-search` is enabled, kernels with explicit pins, atomic
+broadcasts, subtiled regions, or multi-store TMA staging first run the algorithm
+above unchanged. The resulting `buffer.id` groups are then imported as a fixed
+plan. Grouped buffers and buffers carrying staging/subtile/pin invariants keep
+their heuristic `buffer.copy`; only ordinary singleton operand buffers are
+eligible for bounded copy-depth enumeration. Rank zero is always the unmodified
+heuristic allocation.
+
+This two-step path deliberately reuses the existing proofs for staging `K | S`,
+circular grouping, and annotations instead of duplicating them in the generic
+search model. A plan with `allocation.reuseTarget` is not refined yet because
+that attribute aliases storage across distinct buffer ids; until the generic
+packer models that relationship, its byte accounting would double-count the
+physical backing.
+
 ---
 
 ## Pipeline Context
