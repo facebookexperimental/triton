@@ -1,0 +1,7 @@
+[preparation] {"clusters": 13, "collapse_ratio": 0.8939, "collapsed_entries": 59, "distinct_survivors": [1], "first_stage_sum": 7, "objective_f": 320, "pool_size": 75, "positive_entries": 66, "second_stage_sum": 7, "survivor_spread": 1.0, "u": 150}
+[preparation] wrote prepared/fwd_prep1.pool.json
+[attempt] {'ii': 1, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 2, 'L': 4, 'stage': 'joint', 'result': 'unsat', 'seconds': 0.1}
+[attempt] {'ii': 3, 'L': 4, 'stage': 'joint', 'result': 'sat', 'seconds': 0.1}
+[prepared] sat after 0.3s -> prepared/fwd_prep1.json
+[prepared] wrote prepared/fwd_prep1.strategy.json
