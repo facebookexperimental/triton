@@ -116,6 +116,9 @@ using PartialPlan = Plan;
 /// Copy-count decision per block, produced by `CopySolver`.
 using CopyMap = DenseMap<BlockId, unsigned>;
 
+/// Bounded set of copy-count decisions for one fixed grouping.
+using CopyMaps = SmallVector<CopyMap>;
+
 /// The K best complete plans, best-first.
 using TopKPlans = SmallVector<Plan>;
 
@@ -143,6 +146,9 @@ public:
   virtual Interval<size_t> liveness(BufferId) const = 0;
   virtual unsigned stageSpan(BufferId) const = 0; // cross-stage floor
   virtual unsigned entries(BufferId) const = 0;   // slot-collision floor
+  /// Largest discretionary copy depth representable for this buffer. A hard
+  /// correctness floor may exceed this value and is still preserved.
+  virtual unsigned maxCopies(BufferId) const = 0;
   virtual EncodingKey encoding(BufferId) const = 0;
   virtual BufferKind kind(BufferId) const = 0;
 
@@ -200,19 +206,27 @@ public:
                        ArrayRef<BufferId> remaining) const = 0;
 };
 
-/// Given a fixed grouping, allocates copies per block under the budget. The
-/// latency benefit of the c-th copy is concave, so greedy-by-benefit-density is
-/// exact (docs §2.3). Correctness floors (cross-stage, slot-collision) are hard
-/// constraints seeded from the `BufferModel` and are set even if they exceed
-/// the budget (the HW limit is the backstop — docs §2.2). Needs the `Packer`
-/// for pool-specific footprint/feasibility, and the `CostModel` as the single
-/// source of the objective (marginal benefit = score delta).
+/// Given a fixed grouping, enumerates bounded copy-count alternatives under
+/// the budget. Candidate zero is the legacy greedy solution, preserving the
+/// TOPK=1 behavior. Remaining candidates start at the hard correctness floors
+/// (cross-stage, slot-collision) and expand by structural edit distance up to
+/// BufferModel::maxCopies. The CostModel ranks plans after enumeration; it is
+/// never used as a legality condition.
 class CopySolver {
 public:
   virtual ~CopySolver() = default;
-  virtual CopyMap solve(const BufferModel &, const Packer &,
-                        const Plan &grouping, const Budget &,
-                        const CostModel &) const = 0;
+  virtual CopyMaps enumerate(const BufferModel &, const Packer &,
+                             const Plan &grouping, const Budget &,
+                             const CostModel &, unsigned limit) const = 0;
+
+  /// Compatibility helper used to rank partial grouping states. This returns
+  /// exactly the first (legacy greedy) assignment from `enumerate`.
+  CopyMap solve(const BufferModel &model, const Packer &packer,
+                const Plan &grouping, const Budget &budget,
+                const CostModel &cost) const {
+    CopyMaps maps = enumerate(model, packer, grouping, budget, cost, 1);
+    return maps.empty() ? CopyMap{} : std::move(maps.front());
+  }
 };
 
 /// Validates physical-slot reuse using correctness facts from BufferModel.
@@ -268,8 +282,9 @@ std::unique_ptr<CostModel> createLatencyCostModel(const BufferModel &model,
 // Driver
 //===----------------------------------------------------------------------===//
 
-/// Beam search over grouping+placement, with the copy dimension solved in
-/// closed form per grouping (docs §3.3). Returns the K best complete plans.
+/// Beam search over grouping+placement. Partial groupings use the solver's
+/// legacy greedy assignment for ranking; complete leaves branch over bounded
+/// copy-count alternatives before the global top-K selection (docs §3.3).
 ///   W = beam width (partials retained per level)
 ///   K = number of top plans to return
 TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,

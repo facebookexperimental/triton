@@ -1,9 +1,9 @@
 # Contracted Schedule and Memory-Plan Search Plan
 
-**Status:** implementation in progress. Structural admission, the bounded II
-frontier, and the first load-placement branching mechanism are implemented.
-The one-GEMM scheduling oracle now exposes both operand orders; connecting
-those schedules to multi-result SMEM copy search remains open.
+**Status:** implementation in progress. Milestone A's structural schedule
+frontier and Milestone B's bounded SMEM depth frontier are implemented.
+Composing schedule and memory candidates across compilation runs and supporting
+the current fallback-only staging/subtile cases remain open.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
@@ -24,6 +24,13 @@ top-K slot for a non-default load order. The FA-backward oracle now checks such
 a load-order candidate directly. A one-MMA two-descriptor fixture additionally
 checks both A-early/B-late and A-late/B-early orders, matching the scheduling
 shape needed by D120426461.
+
+**Implemented fourth slice:** `CopySolver` now returns bounded copy vectors.
+The existing greedy result remains candidate zero, while complete memory-beam
+leaves also enumerate the hard-floor vector and progressively deeper legal
+neighbors. The plan beam validates, scores, and deduplicates those concrete
+plans before global top-K selection. A two-operand oracle covers A2/B2, A3/B2,
+and A2/B3 under a budget that admits exactly one additional copy.
 
 **Primary implementation areas:**
 
@@ -95,8 +102,9 @@ Before this implementation started, `runContractedSearch`:
 
 The first implementation slice now uses structural issue quanta for the II
 lower bound, dependence admission, and resource reservations. Contracted
-latency remains only as a ranking tie-breaker. Load-placement branching is
-still required before Milestone A is complete.
+latency remains only as a ranking tie-breaker. The search also preserves II
+diversity and branches over GEMM-reaching load order, completing Milestone A's
+structural frontier.
 
 ### 2.2 Contracted candidate identity originally hid memory-relevant schedules
 
@@ -105,12 +113,13 @@ contains structurally discovered GEMM-reaching TMA-load stage/cluster pairs,
 so load-order variants remain distinct. The reduced one-GEMM oracle proves that
 A-early and B-early both reach top-K; the full fused RMSNorm fixture remains.
 
-### 2.3 The memory beam produces little SMEM diversity
+### 2.3 The memory beam now preserves SMEM depth diversity
 
-The plan-space beam calls `CopySolver::solve()` once per grouping. The solver
-returns one copy vector. For SMEM, `SmemPacker::legalJoin()` is currently
-always false, so there is one singleton-block grouping and usually one final
-plan even when top-K is requested.
+Partial grouping states use `CopySolver::solve()` (the legacy greedy candidate)
+for inexpensive ranking. At complete leaves, `CopySolver::enumerate()` returns
+a bounded set of copy vectors. For SMEM, `SmemPacker::legalJoin()` remains false,
+so blocks are singletons, but top-K can now contain distinct depth assignments
+such as A2/B2, A3/B2, and A2/B3.
 
 ### 2.4 Schedule-derived buffer analysis does not reach WSMemoryPlanner
 
@@ -416,7 +425,7 @@ does not pin physical IDs or reuse groups.
 
 ### Phase 6: Make CopySolver return multiple copy assignments
 
-Replace the single-result interface:
+The single-result interface has been replaced:
 
 ```cpp
 CopyMap solve(...);
@@ -425,19 +434,25 @@ CopyMap solve(...);
 with a bounded enumeration interface, conceptually:
 
 ```cpp
-SmallVector<CopyMap> enumerate(..., unsigned limit);
+CopyMaps enumerate(..., unsigned limit);
 ```
 
 For each block, enumerate from its hard correctness floor through the configured
 maximum. Hard floors include cross-stage/release safety and rotating-entry
 requirements. Predicted latency hiding is not a legality condition.
 
-Candidate retention order:
+Implemented candidate generation order:
 
-1. current/default copy vector;
-2. every legal one-buffer `+1` neighbor;
-3. larger edit-distance combinations;
-4. deterministic tie-breaks.
+1. the legacy greedy vector (so `TOPK=1` remains neutral);
+2. the hard-floor vector;
+3. legal one-buffer `+1` neighbors from that floor within the bound;
+4. larger edit-distance combinations;
+5. deterministic tie-breaks.
+
+The per-buffer ceiling is part of `BufferModel`: configured `num-buffers` for
+SMEM and one for TMEM. A correctness floor may exceed this ceiling and remains
+authoritative. Feasibility is monotone in depth, so an over-budget vector prunes
+all descendants. The enumerator is bounded by the caller's requested `K`.
 
 Reject candidates only for hard safety violations, impossible representation,
 or memory-capacity overflow.
@@ -458,11 +473,11 @@ A3/B3, if it fits and the candidate cap permits
 Enumerate q/k/v operand depths and legal staging depths without relying on the
 stubbed `freq` or latency-benefit score.
 
-**Likely files:** `WSMemoryPlanSearch.h`, `WSMemoryPlanCopies.cpp`.
+**Implemented in:** `WSMemoryPlanSearch.h`, `WSMemoryPlanCopies.cpp`.
 
 ### Phase 7: Compose grouping and copy search in beamSearch
 
-For every grouping candidate, branch over the CopySolver results:
+Complete grouping candidates now branch over the CopySolver results:
 
 ```text
 grouping candidate
@@ -477,6 +492,11 @@ SMEM initially has singleton groups because `SmemPacker::legalJoin()` is false,
 but it now gains real depth diversity. TMEM continues to search grouping and
 placement with copies fixed to one until TMEM multi-copy becomes legal.
 
+Partial grouping states deliberately continue to use only the legacy greedy
+copy assignment for beam ranking. Expanding the copy Cartesian product only at
+complete leaves keeps the grouping beam width bounded while still exposing the
+depth alternatives to `TRITON_WS_MEM_PLAN_PICK`.
+
 #### D120426461 example
 
 The memory beam returns distinct A3/B2 and A2/B3 plans rather than one greedy
@@ -487,8 +507,7 @@ copy solution.
 TMEM search retains alternative legal placements and reuse groups, including
 the known `{dpT, dsT, dQ}` case, without hand-written IDs or offsets.
 
-**Likely files:** `WSMemoryPlanSearch.cpp`, `WSMemoryPlanPackers.cpp`,
-`WSMemoryPlanner.cpp`.
+**Implemented in:** `WSMemoryPlanSearch.cpp`, `WSMemoryPlanner.cpp`.
 
 ### Phase 8: Preserve search through unsupported grouping features
 
@@ -686,8 +705,8 @@ as a hard correctness floor.
 - [x] Structural Contracted SWP does not use result latency for admission.
 - [x] Multiple II values survive top-K selection.
 - [x] Descriptor-load placement participates in candidate identity.
-- [ ] CopySolver emits multiple legal copy vectors.
-- [ ] Memory beam returns distinct SMEM depth plans.
+- [x] CopySolver emits multiple legal copy vectors.
+- [x] Memory beam returns distinct SMEM depth plans.
 - [ ] Fixed-grouping search works with subtiled/staging kernels.
 - [ ] D120 candidates exist without lhs/rhs depth annotations.
 - [ ] D120 measured winner is A3/B2 on the target shapes.

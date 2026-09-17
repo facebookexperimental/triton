@@ -7,11 +7,12 @@
 // are dropped; the surviving partials are ranked and truncated to the beam
 // width W.
 //
-// The copy dimension is solved in closed form per grouping (CopySolver), not
-// branched: it is used both to rank partials (a good grouping frees budget for
-// more copies -> higher score) and to finalize the leaf plans. Because all
-// partials at a given level have placed the SAME prefix of buffers, ranking by
-// score alone is apples-to-apples — no optimistic remainder term is needed.
+// Partial groupings use CopySolver's legacy greedy result for ranking (a good
+// grouping frees budget for more copies -> higher score). Complete leaves
+// branch over the solver's bounded copy-count frontier before global top-K
+// selection. Because all partials at a given level have placed the SAME prefix
+// of buffers, ranking by score alone is apples-to-apples — no optimistic
+// remainder term is needed.
 
 #include "WSMemoryPlanSearch.h"
 
@@ -28,15 +29,13 @@ namespace wsplan {
 
 namespace {
 
-/// Apply the CopySolver to `plan` (a grouping) and return its scored copy. Used
-/// both for beam ranking and leaf finalization so the two stay consistent.
-std::optional<Plan> scoreWithCopies(const BufferModel &model,
-                                    const Packer &packer, const Budget &budget,
-                                    const CostModel &cost,
-                                    const CopySolver &copies,
-                                    const CopySafetyValidator &validator,
-                                    Plan plan) {
-  CopyMap cm = copies.solve(model, packer, plan, budget, cost);
+/// Apply one copy assignment to `plan`, validate it, and score it.
+std::optional<Plan> applyCopiesAndScore(const BufferModel &model,
+                                        const Packer &packer,
+                                        const Budget &budget,
+                                        const CostModel &cost,
+                                        const CopySafetyValidator &validator,
+                                        Plan plan, const CopyMap &cm) {
   for (Block &blk : plan.blocks) {
     auto it = cm.find(blk.id);
     if (it != cm.end())
@@ -60,6 +59,48 @@ std::optional<Plan> scoreWithCopies(const BufferModel &model,
   }
   plan.score = cost.score(plan);
   return plan;
+}
+
+/// Rank a partial grouping with the solver's first (legacy greedy) result.
+std::optional<Plan>
+scoreWithGreedyCopies(const BufferModel &model, const Packer &packer,
+                      const Budget &budget, const CostModel &cost,
+                      const CopySolver &copies,
+                      const CopySafetyValidator &validator, Plan plan) {
+  CopyMap cm = copies.solve(model, packer, plan, budget, cost);
+  return applyCopiesAndScore(model, packer, budget, cost, validator,
+                             std::move(plan), cm);
+}
+
+static bool samePlan(const Plan &a, const Plan &b) {
+  if (a.blocks.size() != b.blocks.size())
+    return false;
+  for (unsigned i = 0; i < a.blocks.size(); ++i) {
+    const Block &aBlock = a.blocks[i];
+    const Block &bBlock = b.blocks[i];
+    if (aBlock.copies != bBlock.copies || aBlock.members != bBlock.members)
+      return false;
+    for (BufferId member : aBlock.members) {
+      auto aPlacement = aBlock.placement.find(member);
+      auto bPlacement = bBlock.placement.find(member);
+      bool aMissing = aPlacement == aBlock.placement.end();
+      bool bMissing = bPlacement == bBlock.placement.end();
+      if (aMissing != bMissing)
+        return false;
+      if (aMissing)
+        continue;
+      if (aPlacement->second.rowOffset != bPlacement->second.rowOffset ||
+          aPlacement->second.colOffset != bPlacement->second.colOffset)
+        return false;
+    }
+  }
+  return true;
+}
+
+static void appendUnique(SmallVectorImpl<Plan> &plans, Plan plan) {
+  if (llvm::none_of(plans,
+                    [&](const Plan &other) { return samePlan(plan, other); }))
+    plans.push_back(std::move(plan));
 }
 
 /// Return `plan` with `b` appended to block index `blockIdx`.
@@ -131,8 +172,8 @@ TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
     SmallVector<std::pair<double, unsigned>> ranked;
     ranked.reserve(next.size());
     for (unsigned i = 0; i < next.size(); ++i) {
-      auto scored = scoreWithCopies(model, packer, budget, cost, copies,
-                                    validator, next[i]);
+      auto scored = scoreWithGreedyCopies(model, packer, budget, cost, copies,
+                                          validator, next[i]);
       if (scored)
         ranked.push_back({scored->score, i});
     }
@@ -152,13 +193,18 @@ TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
     beam = std::move(pruned);
   }
 
-  // Finalize: solve copies + score every beam leaf, then take the top K.
+  // Finalize: branch over bounded copy assignments for every grouping leaf,
+  // validate + score each concrete plan, deduplicate, then take global top-K.
   SmallVector<Plan> leaves;
-  leaves.reserve(beam.size());
-  for (Plan &p : beam)
-    if (auto scored =
-            scoreWithCopies(model, packer, budget, cost, copies, validator, p))
-      leaves.push_back(std::move(*scored));
+  leaves.reserve(beam.size() * K);
+  for (Plan &p : beam) {
+    CopyMaps copyMaps = copies.enumerate(model, packer, p, budget, cost, K);
+    for (const CopyMap &cm : copyMaps) {
+      if (auto scored = applyCopiesAndScore(model, packer, budget, cost,
+                                            validator, p, cm))
+        appendUnique(leaves, std::move(*scored));
+    }
+  }
   llvm::stable_sort(
       leaves, [](const Plan &x, const Plan &y) { return x.score > y.score; });
 

@@ -304,22 +304,33 @@ optimistic upper bound (assume full latency hidden, drop the ≥0 penalty) for a
 future branch-and-bound. `II` = `tt.modulo_ii` (`getModuloII`, default 1); `λ`
 defaults to 0 (pure latency hiding — the occupancy term is a deferred open item).
 
-### 9.5 `CopySolver` — copies per block (concave knapsack)
-`GreedyCopySolver`, given a fixed grouping: (1) set each block's **correctness
-floor** = `max(max stageSpan, Σ entries, 1)`, exempt from budget; (2) greedily
-add discretionary copies by **benefit density** (`Δscore / Δfootprint`) until no
-block has positive benefit that still fits budget. Per-copy latency benefit is
-concave, so greedy is the exact optimum for this separable knapsack. The
-`CostModel` is the sole source of the objective (marginal benefit = score delta).
+### 9.5 `CopySolver` — bounded copies per block
+`GreedyCopySolver`, given a fixed grouping, returns a bounded vector of copy
+assignments. Candidate zero preserves the prior behavior: (1) set each block's
+**correctness floor** = `max(max stageSpan, Σ entries, 1)`, exempt from budget;
+(2) greedily add discretionary copies by **benefit density**
+(`Δscore / Δfootprint`) up to `BufferModel::maxCopies`, stopping when no
+positive-benefit copy fits.
+
+When more than one result is requested, the solver also breadth-first enumerates
+from the correctness-floor vector up to each block's maximum. This gives a
+deterministic structural order: the floor, every feasible one-block `+1`
+neighbor, then larger edit-distance combinations. The packer budget prunes a
+state and all of its descendants. Duplicate assignments (including a greedy
+result that is also reached structurally) are removed. The latency model helps
+construct candidate zero and ranks complete plans; it is not a legality filter.
+
+SMEM sets `maxCopies` to the configured `num-buffers`. TMEM sets it to one,
+because non-accumulator TMEM multi-copy is not representable yet.
 
 ### 9.6 `beamSearch` — the driver
 Places buffers one at a time in the ordering. Each partial branches into (a) join
 `b` into every existing block the `Packer` deems legal + feasible and (b) open a
-new block for `b`. Surviving partials are ranked by their **copy-solved score**
-(`scoreWithCopies` runs the `CopySolver` + `CostModel`) — *not* `bound()`, since
-all partials at a level share the same placed prefix — and truncated to beam
-width `W`. Leaves are finalized (copies + score) and the top `K` returned. The
-copy dimension is solved in closed form per grouping, never branched. Callers use
+new block for `b`. Surviving partials are ranked by their **greedy-copy score** —
+*not* `bound()`, since all partials at a level share the same placed prefix — and
+truncated to beam width `W`. Complete leaves then branch over up to `K`
+CopySolver assignments. Each concrete plan is safety-validated, budget-checked,
+scored, canonically deduplicated, and included in the global top-K. Callers use
 `W = max(16, topK)`, `K = topK`.
 
 Every copy-solved partial and leaf passes through

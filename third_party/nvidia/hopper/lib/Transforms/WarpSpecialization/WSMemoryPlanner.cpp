@@ -2140,7 +2140,8 @@ public:
       r.stageSpan =
           getStaticSmemCopySafetyFloor(alloc, channels, configuredDepth);
       r.entries = 1; // TODO(step9): data-partition expansion count.
-      r.freq = 1.0;  // TODO(step9): enclosing-loop trip count.
+      r.maxCopies = configuredDepth;
+      r.freq = 1.0; // TODO(step9): enclosing-loop trip count.
 
       auto memTy = alloc.getType();
       r.encoding = {memTy.getElementType(), memTy.getEncoding()};
@@ -2210,6 +2211,9 @@ public:
   unsigned entries(wsplan::BufferId b) const override {
     return records[b].entries;
   }
+  unsigned maxCopies(wsplan::BufferId b) const override {
+    return records[b].maxCopies;
+  }
   wsplan::EncodingKey encoding(wsplan::BufferId b) const override {
     return records[b].encoding;
   }
@@ -2249,6 +2253,7 @@ private:
     Interval<size_t> liveness;
     unsigned stageSpan = 1;
     unsigned entries = 1;
+    unsigned maxCopies = 1;
     wsplan::EncodingKey encoding;
     wsplan::BufferKind kind = wsplan::BufferKind::Other;
     unsigned scope = 0;
@@ -2334,8 +2339,9 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
 }
 
 // Step 9 (docs §6): SMEM allocation via the plan-space search. Runs the beam
-// search (SmemBufferModel + SmemPacker + latency cost + greedy copies), then
-// stamps buffer.id/buffer.copy from the top plan. Discretionary copies are
+// search (SmemBufferModel + SmemPacker + latency cost + bounded copy
+// enumeration), then stamps buffer.id/buffer.copy from the selected plan.
+// Discretionary copies are
 // capped at numBuffers; correctness floors (cross-stage depth, per-id entry
 // count) are re-applied as a safety net so the search output can never drop
 // below the proven floors (docs §2.2 / Algo-0 hazard). Returns nextBufferId.
@@ -3148,6 +3154,7 @@ public:
 
       r.stageSpan = 1; // TODO(step7/9): TMEM cross-stage floor.
       r.entries = 1;   // TODO(step7/9): data-partition expansion count.
+      r.maxCopies = 1; // Non-accumulator TMEM multi-copy is not yet legal.
       r.freq = 1.0;    // TODO(step7/9): enclosing-loop trip count.
 
       auto memTy = alloc.getType();
@@ -3186,6 +3193,9 @@ public:
   unsigned entries(wsplan::BufferId b) const override {
     return records[b].entries;
   }
+  unsigned maxCopies(wsplan::BufferId b) const override {
+    return records[b].maxCopies;
+  }
   wsplan::EncodingKey encoding(wsplan::BufferId b) const override {
     return records[b].encoding;
   }
@@ -3221,6 +3231,7 @@ private:
     Interval<size_t> liveness;
     unsigned stageSpan = 1;
     unsigned entries = 1;
+    unsigned maxCopies = 1;
     wsplan::EncodingKey encoding;
     wsplan::BufferKind kind = wsplan::BufferKind::Other;
     double latency = 0.0;
