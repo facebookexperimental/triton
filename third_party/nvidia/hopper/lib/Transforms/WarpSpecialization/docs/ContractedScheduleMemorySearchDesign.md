@@ -504,11 +504,15 @@ Implemented:
 - A synchronization-independent protocol graph and deterministic weighted-cycle
   solver, including direct lit coverage for zero-credit, positive-credit,
   acyclic, and unsupported graphs.
+- Shared `ChannelProtocolPlan` construction for grouped producer endpoints,
+  per-task consumer wait/release anchors, buffer depth, and cadence. Existing
+  synchronization insertion consumes this plan; reuse-specific acquire
+  relocation updates the same record.
 
 Next:
 
-1. Build the post-memory protocol graph from reconstructed channels and reject
-   D120 B-early before launch.
+1. Lower the shared endpoint plans into the normalized post-memory protocol
+   graph and reject D120 B-early before launch.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.

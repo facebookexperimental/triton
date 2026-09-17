@@ -138,7 +138,7 @@ recognizes the `scf.while` outer loop (same doc).
 |------|-------------|
 | `Utility.h` | `AsyncTaskId` typedef, `OpBuilderWithAsyncTaskIds`, `LoopScheduleInfo`, task ID helpers |
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
-| `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
+| `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel`, `ChannelProtocolPlan` |
 | `WSChannelCycleAnalysis.h` | Synchronization-independent protocol events/edges and `safe`/`unsafe`/`unsupported` validation result |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
 | `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `buildWSBarrierOrderedRegionRanges`, `injectChannelGraph` — channel graph and ordered-region construction for barrier constraints |

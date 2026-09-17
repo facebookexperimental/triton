@@ -99,6 +99,14 @@ zero-credit rejection, its positive-credit neighbor, an acyclic negative edge,
 and malformed-graph `unsupported` handling. The post-memory IR graph builder
 and candidate rejection are the next unit.
 
+**Implemented tenth slice:** `buildChannelProtocolPlan` now derives grouped
+producer bounds, TMA producer placement, per-consumer-task wait/release
+anchors, copy depth, and cadence without mutating IR. `insertAsyncComm`
+consumes these shared decisions, including the effective acquire relocation
+selected by its existing operand-D and reuse rules. This establishes the
+single endpoint contract needed by the planned-protocol graph builder while
+preserving the emitted synchronization protocol.
+
 **Current Milestone D status:** The annotation-free BM128 FA-backward candidate
 compiles through software-pipeline expansion. Pre-lowered
 `ttng.async_tma_store_wait` operations selected into a peeled pipeline stage
@@ -1109,11 +1117,12 @@ The implementation sequence is:
    `before(i) -> after(i + distance)` under the serialized
    `loop.stage`/`loop.cluster` schedule; missing metadata returns unknown rather
    than lexical-order fallback across tasks.
-3. Factor the non-mutating endpoint decisions needed by both insertion and
-   validation into `ChannelProtocolPlan`: effective producer-acquire anchor,
-   producer-ready anchor, per-task consumer-wait anchor, consumer-release
-   anchor, buffer depth, and cadence. Preserve existing `insertAsyncComm`
-   behavior by making it consume these helpers before enabling rejection.
+3. **Implemented:** factor the non-mutating endpoint decisions needed by both
+   insertion and validation into `ChannelProtocolPlan`: effective
+   producer-acquire anchor, producer-ready anchor, per-task consumer-wait
+   anchor, consumer-release anchor, buffer depth, and cadence. Existing
+   operand-D and reuse rules update the plan's acquire anchor before
+   `insertAsyncComm` consumes it.
 4. In `doCodePartition`, call
    `validatePlannedChannelCycles(...)` after `ReuseConfig` construction,
    consumer-group merging, and reuse-group shape checks, but before

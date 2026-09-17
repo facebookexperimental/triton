@@ -2465,45 +2465,6 @@ void insertAsyncComm(
     return parent;
   };
 
-  // Find the operation that is along producer's parent chain, and its parent
-  // is the same op as producer's parent. Here p is producer, and c is consumer.
-  auto getSameLevelOp = [&](Operation *p, Operation *c) -> Operation * {
-    Operation *op = c;
-    // Go along consumer's parent chain until it is in the same scope as
-    // producer, return the current scope of consumer.
-    while (!isa<triton::FuncOp>(op)) {
-      if (getEffectiveParentOp(op) == getEffectiveParentOp(p)) {
-        // When the match is due to SubtiledRegionOp transparency,
-        // return the SubtiledRegionOp itself (the structural ancestor
-        // in the shared parent block), not the op inside it.
-        while (auto subtiled = op->getParentOfType<ttng::SubtiledRegionOp>()) {
-          if (subtiled->getParentOp() == getEffectiveParentOp(p))
-            op = subtiled;
-          else
-            break;
-        }
-        return op;
-      }
-      op = op->getParentOp();
-    }
-    op = p;
-    // Go along producer's parent chain until it is in the same scope as
-    // consumer, return the current scope of producer.
-    while (!isa<triton::FuncOp>(op)) {
-      if (getEffectiveParentOp(c) == getEffectiveParentOp(op)) {
-        while (auto subtiled = c->getParentOfType<ttng::SubtiledRegionOp>()) {
-          if (subtiled->getParentOp() == getEffectiveParentOp(op))
-            c = subtiled.getOperation();
-          else
-            break;
-        }
-        return c;
-      }
-      op = op->getParentOp();
-    }
-    llvm_unreachable("Failed to find consumer's same level Op with producer");
-  };
-
   // 0: same scope, -1: A in nested scope, 1: B in nested scope
   auto isAinNestedRegion = [&](Operation *A, Operation *B) -> int {
     if (A->getBlock() == B->getBlock())
@@ -2525,49 +2486,7 @@ void insertAsyncComm(
     llvm_unreachable("error in isAinNestedRegion");
   };
 
-  mlir::DominanceInfo dom(funcOp);
   mlir::PostDominanceInfo pdom(funcOp);
-  auto consumerReleaseHeuristic = [&](Operation *p, Operation *c,
-                                      int consumerAsyncTaskId) -> Operation * {
-    if (c->getBlock() != p->getBlock())
-      return getSameLevelOp(p, c);
-
-    // Find a common place for all users of the consumer, which would be the
-    // common post dominator.
-    auto actualConsumers = getActualConsumers(c);
-    std::unordered_set<Operation *> mutuallyNonDominatingUsers;
-    for (auto user : actualConsumers) {
-      auto it = mutuallyNonDominatingUsers.begin();
-      while (it != mutuallyNonDominatingUsers.end()) {
-        if (pdom.properlyPostDominates(user, *it)) {
-          it = mutuallyNonDominatingUsers.erase(it);
-        } else if (pdom.properlyPostDominates(*it, user)) {
-          break;
-        } else {
-          ++it;
-        }
-      }
-      if (it == mutuallyNonDominatingUsers.end())
-        mutuallyNonDominatingUsers.insert(user);
-    }
-
-    if (mutuallyNonDominatingUsers.size() == 1) {
-      // Find the common parent of this user and c
-      auto user = *mutuallyNonDominatingUsers.begin();
-      while (user && user->getParentOp() != c->getParentOp())
-        user = user->getParentOp();
-      assert(user && "Failed to find common parent of this user and c");
-      return user;
-    }
-
-    for (auto &op : reverse(c->getBlock()->getOperations())) {
-      auto asyncTasks = getAsyncTaskIds(&op);
-      if (asyncTasks.size() == 1 && asyncTasks[0] == consumerAsyncTaskId)
-        return &op;
-    }
-
-    return nullptr;
-  };
 
   // Maps each MMAv5 op to the A/B channel where it is the consumer,
   // so D-channel processing can look up the correct barrier and reuse group.
@@ -2630,109 +2549,9 @@ void insertAsyncComm(
 
   // Go through each channel group.
   for (auto kv : orderedChannelsGroupedByConsumers) {
-    // Find head and tail ops.
-    DenseSet<Operation *> producerOps;
-    DenseSet<Operation *> consumerOps;
-    DenseSet<Operation *> actualConsumerOps;
-    for (auto &c : kv.second) {
-      producerOps.insert(c->getSrcOp());
-      if (c->channelKind == DataChannelKind::SMEMAlloc) {
-        auto *cAlloc = static_cast<AllocChannel *>(c);
-        SmallVector<Operation *> dsts;
-        cAlloc->getDstOps(dsts);
-        for (auto *dst : dsts) {
-          consumerOps.insert(dst);
-          auto consumers = getActualConsumers(dst);
-          for (auto *t : consumers) {
-            consumerOps.insert(t);
-            actualConsumerOps.insert(t);
-          }
-
-          // If the consumer is subsequently used to perform a TMA store, we
-          // would like to skip actually loading the value and just directly
-          // copy it from SMEM to global memory. To make this possible, the TMA
-          // store should be treated as a consumer of the channel, so that the
-          // consumer release barrier is placed after the TMA store is
-          // completed. Note that this is best effort, if we miss the TMA store,
-          // the result will incur a performance hit, but still be correct.
-          if (llvm::isa<ttg::LocalLoadOp>(dst)) {
-            for (auto user : dst->getUsers()) {
-              // Advance past any layout conversions, because we will be storing
-              // directly from memory anyway.
-              while (llvm::isa<ttg::ConvertLayoutOp>(user) && user->hasOneUse())
-                user = *user->getUsers().begin();
-              // Handle descriptor store/reduce or early lowered TMA
-              // store/reduce
-              if (llvm::isa<tt::DescriptorStoreOp,
-                            ttng::AsyncTMACopyLocalToGlobalOp,
-                            ttng::AsyncTMAReduceOp>(user)) {
-                consumerOps.insert(user);
-                actualConsumerOps.insert(user);
-              }
-            }
-          }
-        }
-      } else {
-        consumerOps.insert(c->getDstOp());
-        consumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
-        actualConsumerOps.insert(getUniqueActualConsumer(c->getDstOp()));
-      }
-    }
-
-    // If any actual consumer is a TMA store-like op, follow its token
-    // result to find TMAStoreTokenWaitOp and add it to actualConsumerOps.
-    // This enables barrier fusion for the early-lowered TMA store/reduce
-    // pattern (local_alloc → async_tma_copy/reduce → token_wait).
-    DenseSet<Operation *> additionalConsumerOps;
-    for (auto *op : actualConsumerOps) {
-      if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-              op)) {
-        for (auto user : op->getUsers()) {
-          if (llvm::isa<ttng::TMAStoreTokenWaitOp>(user)) {
-            additionalConsumerOps.insert(user);
-          }
-        }
-      }
-    }
-    for (auto *op : additionalConsumerOps) {
-      consumerOps.insert(op);
-      actualConsumerOps.insert(op);
-    }
-
-    // Assuming all ops are under the same block.
-    auto getFirstOpInBlock =
-        [&](const DenseSet<Operation *> &ops) -> Operation * {
-      Operation *first = *(ops.begin());
-      auto block = first->getBlock();
-      Operation *headOp = nullptr;
-      for (auto &op : block->getOperations()) {
-        if (ops.count(&op)) {
-          headOp = &op;
-          break;
-        }
-      }
-      return headOp;
-    };
-    auto appearsBefore = [&](Operation *A, Operation *B) -> bool {
-      assert(A->getBlock() == B->getBlock());
-      auto block = A->getBlock();
-      int AIdx = -1, BIdx = -1, cnt = 0;
-      for (auto &op : block->getOperations()) {
-        if (&op == A) {
-          AIdx = cnt;
-        }
-        if (&op == B) {
-          BIdx = cnt;
-        }
-        ++cnt;
-      }
-      assert(AIdx >= 0 && BIdx >= 0);
-      return AIdx < BIdx;
-    };
-
-    // Find head producer
-    Operation *frontSrcOp = kv.second.front()->getSrcOp();
-    if (!frontSrcOp) {
+    ChannelProtocolPlan protocolPlan =
+        buildChannelProtocolPlan(kv.second, pdom);
+    if (!protocolPlan.headProducer) {
       auto *fc = kv.second.front();
       funcOp.emitError()
           << "warp specialization: could not resolve the producer of "
@@ -2743,26 +2562,7 @@ void insertAsyncComm(
              "channel; this subtiled-region channel topology is not supported.";
       llvm_unreachable("insertAsyncComm: null producer for channel");
     }
-    auto producerBlock = frontSrcOp->getBlock();
-    Operation *headProducer = nullptr;
-    for (auto &op : producerBlock->getOperations()) {
-      if (producerOps.count(&op)) {
-        headProducer = &op;
-        break;
-      }
-    }
-    // Find tail producer
-    Operation *tailProducer = nullptr;
-    for (auto &op : reverse(producerBlock->getOperations())) {
-      if (producerOps.count(&op)) {
-        tailProducer = &op;
-        break;
-      }
-    }
-
-    // Find head consumer and tail consumer
-    Operation *frontDstOp = kv.second.front()->getDstOp();
-    if (!frontDstOp) {
+    if (!protocolPlan.headConsumer) {
       auto *fc = kv.second.front();
       funcOp.emitError()
           << "warp specialization: could not resolve the consumer of "
@@ -2773,21 +2573,11 @@ void insertAsyncComm(
              "channel; this subtiled-region channel topology is not supported.";
       llvm_unreachable("insertAsyncComm: null consumer for channel");
     }
-    auto consumerBlock = frontDstOp->getBlock();
-    Operation *headConsumer = nullptr;
-    for (auto &op : consumerBlock->getOperations()) {
-      if (consumerOps.count(&op)) {
-        headConsumer = &op;
-        break;
-      }
-    }
-    Operation *tailConsumer = nullptr;
-    for (auto &op : reverse(consumerBlock->getOperations())) {
-      if (consumerOps.count(&op)) {
-        tailConsumer = &op;
-        break;
-      }
-    }
+    Operation *headProducer = protocolPlan.headProducer;
+    Operation *tailProducer = protocolPlan.tailProducer;
+    Operation *headConsumer = protocolPlan.headConsumer;
+    Operation *tailConsumer = protocolPlan.tailConsumer;
+    DenseSet<Operation *> &actualConsumerOps = protocolPlan.actualConsumerOps;
 
     // We have one set of tokens for each channel group.
     // Check if token exists (may not exist for channels we skipped in
@@ -2819,21 +2609,12 @@ void insertAsyncComm(
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
     SmallVector<ttnvws::DescriptorLoadOp> tmaLoads;
-    // Go through all channels in this channel group.
-    for (auto &c : kv.second) {
-      if (auto *tmaLoadOp = findTMAProducer(c)) {
-        auto tmaLoad = cast<ttnvws::DescriptorLoadOp>(tmaLoadOp);
-        tmaLoads.push_back(tmaLoad);
-      }
-    }
+    for (Operation *producer : protocolPlan.tmaProducers)
+      tmaLoads.push_back(cast<ttnvws::DescriptorLoadOp>(producer));
 
     Value bufferIdx;
     Value phase = Value();
-    DenseSet<Operation *> tOps;
-    for (auto tOp : tmaLoads)
-      tOps.insert(tOp.getOperation());
-    tOps.insert(headProducer);
-    Operation *tmaHeadProducer = getFirstOpInBlock(tOps);
+    Operation *tmaHeadProducer = protocolPlan.tmaHeadProducer;
 
     auto withSameTask = [&](Operation *A, Operation *B) -> bool {
       auto aTasks = getAsyncTaskIds(A);
@@ -2966,12 +2747,14 @@ void insertAsyncComm(
                 isOperandDTmemStore) &&
                "Only MMAv5, SubtiledRegionOp-nested, or operand-D tmem_store "
                "producers supported");
-        nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
+        nestedInsertionTarget =
+            getProtocolSameLevelOp(headConsumer, headProducer);
         producerInNestedRegion = true;
       } else if (regionCmp > 0) {
         // B/consumer in nested region. Lift up headConsumer till it is
         // in the same scope as headProducer.
-        nestedInsertionTarget = getSameLevelOp(tmaHeadProducer, headConsumer);
+        nestedInsertionTarget =
+            getProtocolSameLevelOp(tmaHeadProducer, headConsumer);
         consumerInNestedRegion = true;
       }
     } else {
@@ -3385,6 +3168,8 @@ void insertAsyncComm(
         } // end else if (allSingleCopy)
       } // end else if (group->channels.size() > 2)
     }
+    if (producerAcquireForChannelLoop)
+      protocolPlan.producerAcquireAnchor = producerAcquireForChannelLoop;
     builder.clearLoopScheduleInfo();
     if (nestedInsertionTarget) {
       // If the producer is nested we need to pull the buffer + index
@@ -3402,7 +3187,7 @@ void insertAsyncComm(
         if (getEnclosingSubtiledRegionTile(headProducer) &&
             !getEnclosingSubtiledRegionTile(headConsumer)) {
           Operation *flatConsumerAnchor =
-              getSameLevelOp(headProducer, headConsumer);
+              getProtocolSameLevelOp(headProducer, headConsumer);
           if (flatConsumerAnchor &&
               flatConsumerAnchor->getBlock() ==
                   nestedInsertionTarget->getBlock() &&
@@ -3431,7 +3216,7 @@ void insertAsyncComm(
       // parity toggles across persistent iterations; getBufferIdxAndPhase ->
       // getAccumCount resolves the counter from the while's after-region args.
       if (producerAcquireForChannelLoop) {
-        builder.setInsertionPoint(producerAcquireForChannelLoop);
+        builder.setInsertionPoint(protocolPlan.producerAcquireAnchor);
       } else {
         builder.setInsertionPoint(tmaHeadProducer);
       }
@@ -3809,7 +3594,7 @@ void insertAsyncComm(
                  << masterChannel->uniqID << " ");
             producerAcquireForChannelLoop->dump();
           });
-          producerAcquirePoint = producerAcquireForChannelLoop;
+          producerAcquirePoint = protocolPlan.producerAcquireAnchor;
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
         // An outer-produced operand can be consumed by multiple sequential
@@ -4062,8 +3847,9 @@ void insertAsyncComm(
           // tmem_load (srcOp).
           auto *guardTmemLoad = foundGuardCh->getSrcOp();
           auto guardConsumerTaskId = foundGuardCh->relation.first;
-          auto guardConsumerReleasePoint = consumerReleaseHeuristic(
-              foundGuardCh->getDstOp(), guardTmemLoad, guardConsumerTaskId);
+          auto guardConsumerReleasePoint = getProtocolConsumerReleaseAnchor(
+              pdom, foundGuardCh->getDstOp(), guardTmemLoad,
+              guardConsumerTaskId);
           builder.setAsynTaskIdsFromArray(foundGuardCh->relation.first);
           builder.setInsertionPointAfter(guardConsumerReleasePoint);
           builder.setLoopScheduleInfoFromOp(guardConsumerReleasePoint);
@@ -4178,8 +3964,7 @@ void insertAsyncComm(
       // Use token for producer acquire and consumer release.
       if (!commChannel.consumerBarriers.count(token.first)) {
         // Insert ProducerAcquireOp before the producer.
-        auto producerAcquirePoint =
-            getSameLevelOp(headConsumer, tmaHeadProducer);
+        auto producerAcquirePoint = protocolPlan.producerAcquireAnchor;
         auto producerSubtiled =
             getEnclosingSubtiledRegionTile(producerAcquirePoint);
         if (!producerSubtiled)
@@ -4233,8 +4018,9 @@ void insertAsyncComm(
         } else {
           builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
           if (producerAcquireForChannelLoop) {
-            builder.setInsertionPoint(producerAcquireForChannelLoop);
-            builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
+            builder.setInsertionPoint(protocolPlan.producerAcquireAnchor);
+            builder.setLoopScheduleInfoFromOp(
+                protocolPlan.producerAcquireAnchor);
           } else {
             builder.setInsertionPoint(producerAcquirePoint);
             builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
@@ -4384,8 +4170,7 @@ void insertAsyncComm(
         // and ConsumerWait. Otherwise, there is no explicit ProducerCommit,
         // and ConsumerWait will be on the producerBarrier via WaitBarrierOp
         // which is handled else where.
-        Operation *producerCommitPoint =
-            getSameLevelOp(headConsumer, tailProducer);
+        Operation *producerCommitPoint = protocolPlan.producerReadyAnchor;
         auto commitSubtiled =
             getEnclosingSubtiledRegionTile(producerCommitPoint);
         if (!commitSubtiled)
@@ -4631,20 +4416,16 @@ void insertAsyncComm(
         LDBG("ConsumerWaitOp: tokenTaskId="
              << tokenTaskId << " headConsumer task="
              << (headConsumerTaskIds.empty() ? -1 : headConsumerTaskIds[0]));
-        Operation *tokenHeadConsumer = headConsumer;
-        for (auto &op : headConsumer->getBlock()->getOperations()) {
-          if (consumerOps.count(&op)) {
-            auto taskIds = getAsyncTaskIds(&op);
-            if (std::find(taskIds.begin(), taskIds.end(), tokenTaskId) !=
-                taskIds.end()) {
-              tokenHeadConsumer = &op;
-              LDBG("  found tokenHeadConsumer for task " << tokenTaskId);
-              break;
-            }
-          }
-        }
-        auto consumerWaitPoint =
-            getSameLevelOp(headProducer, tokenHeadConsumer);
+        const ChannelConsumerProtocolPlan *consumerPlan =
+            protocolPlan.findConsumer(tokenTaskId);
+        Operation *tokenHeadConsumer =
+            consumerPlan ? consumerPlan->head : headConsumer;
+        if (consumerPlan)
+          LDBG("  found tokenHeadConsumer for task " << tokenTaskId);
+        Operation *consumerWaitPoint =
+            consumerPlan
+                ? consumerPlan->waitAnchor
+                : getProtocolSameLevelOp(headProducer, tokenHeadConsumer);
         // If the consumer IS a SubtiledRegionOp, use it directly
         // for annotation with the first tile body op as target.
         auto subtiled = getEnclosingSubtiledRegionTile(consumerWaitPoint);
@@ -4742,20 +4523,15 @@ void insertAsyncComm(
         // wait stays flat, so the flat consumer's barrier is never released and
         // the producer's next-iteration acquire deadlocks. Task-id filtering
         // skips the task-0 region and lands on the flat task-2 consumer.
-        Operation *tokenTailConsumer = tailConsumer;
-        for (auto &op :
-             llvm::reverse(tailConsumer->getBlock()->getOperations())) {
-          if (consumerOps.count(&op)) {
-            auto taskIds = getAsyncTaskIds(&op);
-            if (std::find(taskIds.begin(), taskIds.end(), token.first) !=
-                taskIds.end()) {
-              tokenTailConsumer = &op;
-              break;
-            }
-          }
-        }
-        auto consumerReleasePoint = consumerReleaseHeuristic(
-            tailProducer, tokenTailConsumer, token.first);
+        const ChannelConsumerProtocolPlan *consumerPlan =
+            protocolPlan.findConsumer(token.first);
+        Operation *tokenTailConsumer =
+            consumerPlan ? consumerPlan->tail : tailConsumer;
+        Operation *consumerReleasePoint =
+            consumerPlan ? consumerPlan->releaseAnchor
+                         : getProtocolConsumerReleaseAnchor(pdom, tailProducer,
+                                                            tokenTailConsumer,
+                                                            token.first);
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (!subtiled)
           subtiled = getEnclosingSubtiledRegionTile(tokenTailConsumer);
@@ -4860,7 +4636,7 @@ void insertAsyncComm(
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
       // Instead of headConsumer, need to lift out to the same scope.
-      auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
+      auto consumerWaitPoint = protocolPlan.tmaConsumerWaitAnchor;
       // Collect additional consumer task IDs beyond the primary headConsumer.
       SmallVector<int> additionalConsumerTaskIds;
       auto primaryTaskIds = getAsyncTaskIds(headConsumer);

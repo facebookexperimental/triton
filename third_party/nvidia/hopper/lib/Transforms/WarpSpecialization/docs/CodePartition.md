@@ -205,6 +205,15 @@ detailed decision tree, code paths, and a worked FA BWD example.
    call site ensures the replacement is only attempted when data partitioning
    has produced multiple distinct per-MMA channels.
 
+Before mutating IR for a consumer group, `buildChannelProtocolPlan` collects
+its shared endpoint facts in one non-owning record: producer head/tail, TMA
+producer head, ordinary producer acquire/ready anchors, per-task consumer
+wait/release anchors, copy depth, and cadence class. The release anchor retains
+the existing post-dominance heuristic. Reuse and operand-D rules may relocate
+the acquire anchor, but write the result back to the same plan before
+insertion. The post-memory cycle validator consumes this contract rather than
+independently rediscovering different endpoints.
+
 ### Channel Loop Detection
 
 - **`isForwardOfChannelLoop`** / **`isBackwardOfChannelLoop`**: Detect
