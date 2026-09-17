@@ -10,6 +10,11 @@ import triton.language as tl
 from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
+from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
+    amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
@@ -194,6 +199,16 @@ def test_slice_layout_rejects_negative_dimension():
     mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1])
     with pytest.raises(ValueError, match="dim must be non-negative"):
         tlx.slice_layout(mma, dim=-1)
+
+
+def make_ir_for_target(fn, signature, constexprs, target):
+    backend = triton.compiler.compiler.make_backend(target)
+    options = backend.parse_options({})
+    context = ir.context()
+    backend.load_dialects(context)
+    codegen_fns = backend.get_codegen_implementation(options)
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+    return src.make_ir(target, options, codegen_fns, {}, context)
 
 
 def test_swizzled_layout_cute_mapping():
@@ -890,6 +905,92 @@ def _shared_concrete_helper_kernel(x_ptr, y_ptr):
 
 
 @triton.jit
+def _concrete_dot_loop_helper(lhs, rhs, acc):
+    for _ in tl.range(0, 2, num_stages=1):
+        acc = tl.dot(lhs, rhs, acc=acc, out_dtype=tl.float32)
+    return acc
+
+
+@triton.jit
+def _concrete_dot_loop_helper_kernel(
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    out_ptr,
+    CAST_BEFORE_RELEASE: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    consumer_layout: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    m = tl.arange(0, 64)
+    n = tl.arange(0, 64)
+    k = tl.arange(0, 32)
+    lhs = tl.load(a_ptr + m[:, None] * 32 + k[None, :])
+    rhs = tl.load(b_ptr + k[:, None] * 64 + n[None, :])
+    lhs = tlx.require_layout(lhs, dot0, pin=False)
+    rhs = tlx.require_layout(rhs, dot1, pin=False)
+    acc = tlx.zeros([64, 64], dtype=tl.float32, layout=mma)
+    result = _concrete_dot_loop_helper(lhs, rhs, acc)
+    offsets = m[:, None] * 64 + n[None, :]
+    bias = tlx.require_layout(tl.load(bias_ptr + offsets), mma, pin=False)
+    result += bias
+    if CAST_BEFORE_RELEASE:
+        result = result.to(tl.bfloat16)
+    result = tlx.release_layout(result)
+    result = tlx.require_layout(result, consumer_layout, pin=False)
+    output = tlx.require_layout(out_ptr + offsets, consumer_layout, pin=False)
+    tl.store(output, result)
+
+
+def test_concrete_dot_loop_helper_result_layout_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _concrete_dot_loop_helper_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "bias_ptr": "*fp32",
+            "out_ptr": "*fp32",
+        },
+        constexprs={"CAST_BEFORE_RELEASE": False},
+    )
+    assert "amdgcn" in compiled.asm
+    assert "scf.for" in compiled.asm["ttir"]
+    assert "#ttg.amd_mfma" in compiled.asm["ttgir"]
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+def test_release_layout_accepts_cast_helper_result_gfx950():
+    module = make_ir_for_target(
+        _concrete_dot_loop_helper_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "bias_ptr": "*fp32",
+            "out_ptr": "*bf16",
+        },
+        constexprs={"CAST_BEFORE_RELEASE": True},
+        target=GFX950,
+    )
+    ttir = str(module)
+    assert "tt.call" in ttir
+    assert "arith.addf" in ttir
+    assert "arith.truncf" in ttir
+    assert "tlx.release_layout" in ttir
+    assert ttir.index("arith.truncf") < ttir.index("tlx.release_layout")
+
+
+@triton.jit
 def _mixed_helper_results(values, condition, LAYOUT: tl.constexpr):
     # The frontend emits an encoding-free return for the else path and the
     # trailing unreachable block.  Fixup must bridge only result 0; result 1
@@ -1212,9 +1313,10 @@ def _release_dot_layout_reduce_kernel(x_ptr, y_ptr):
 
 
 @triton.jit
-def _invalid_release_layout_kernel(x_ptr, y_ptr):
+def _unencoded_release_layout_kernel(x_ptr, y_ptr):
     offsets = tl.arange(0, 64)
     values = tl.load(x_ptr + offsets)
+    values = values.to(tl.float16).to(tl.float32)
     values = tlx.release_layout(values)
     tl.store(y_ptr + offsets, values)
 
@@ -1700,6 +1802,19 @@ def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
     values = tl.load(x_ptr + offsets)
     tlx.amd_sched_barrier()
     tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _amd_iglp_opt_kernel(x_ptr, y_ptr, VARIANT: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_iglp_opt(VARIANT)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _amd_iglp_opt_dynamic_kernel(variant):
+    tlx.amd_iglp_opt(variant)
 
 
 def test_amd_ttgir_schedule_env_is_cache_keyed_and_overridable(monkeypatch):
@@ -2881,13 +2996,14 @@ def test_release_dot_layout_reduce_compiles_gfx950():
     assert "amdgcn" in compiled.asm
 
 
-def test_release_layout_rejects_unencoded_source():
-    with pytest.raises(CompilationError, match="release_layout requires an explicit source layout"):
-        compile_for_gfx950(
-            _invalid_release_layout_kernel,
-            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
-            constexprs={},
-        )
+def test_release_layout_accepts_unencoded_source_gfx950():
+    compiled = compile_for_gfx950(
+        _unencoded_release_layout_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={},
+    )
+    assert "tlx.release_layout" not in compiled.asm["ttir"]
+    assert "amdgcn" in compiled.asm
 
 
 def test_amd_scheduled_mfma_compiles_gfx950():
@@ -3530,6 +3646,12 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
             "NUM_BUFFERS": 2,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "baseline",
+            "TDM_FUSION": "none",
+            "L2_PREFETCH_DISTANCE": -1,
+            "TDM_SPLIT": False,
         },
     )
     ttgir = compiled.asm["ttgir"]
@@ -3755,6 +3877,45 @@ def test_amd_sched_barrier_compiles_gfx950():
         constexprs={"BLOCK": 64},
     )
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
+
+
+def test_amd_iglp_opt_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_iglp_opt_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "VARIANT": "constexpr"},
+        constexprs={"VARIANT": 3},
+    )
+    calls = re.findall(r"call void @llvm\.amdgcn\.iglp\.opt\(i32 3\)", compiled.asm["llir"])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("variant", [False, 3.0, "3", -1, 4, 1 << 32])
+def test_amd_iglp_opt_rejects_invalid_variant(variant):
+    # Exercise frontend validation even when a string and integer constant
+    # have the same textual ASTSource cache key.
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        with pytest.raises(CompilationError, match="variant must be"):
+            compile_for_gfx950(
+                _amd_iglp_opt_kernel,
+                signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "VARIANT": "constexpr"},
+                constexprs={"VARIANT": variant},
+            )
+
+
+def test_amd_iglp_opt_rejects_runtime_variant():
+    with pytest.raises(CompilationError, match="variant must be a constexpr integer"):
+        compile_for_gfx950(_amd_iglp_opt_dynamic_kernel, signature={"variant": "i32"}, constexprs={})
+
+
+def test_amd_iglp_opt_rejects_cuda_backend():
+    with pytest.raises(CompilationError, match="only supported on AMD"):
+        compile_for_target(
+            _amd_iglp_opt_kernel,
+            signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "VARIANT": "constexpr"},
+            constexprs={"VARIANT": 3},
+            target=GPUTarget("cuda", 90, 32),
+        )
 
 
 def test_d64_causal_stat_conventions_are_equivalent():
@@ -4775,3 +4936,277 @@ def test_tdm_copy_view_incompatible_gfx1250(view, mode, capfd):
             constexprs={"VIEW": view, "MODE": mode, "PADDED": True},
         )
     assert "is inconsistent with the shared memory allocation layout" in capfd.readouterr().err
+
+
+def test_gfx1250_matmul_tdm_pipelined_compiles():
+    """Compile-only check: runs everywhere, validates the kernel still
+    lowers cleanly to TDM intrinsics + a propagated padded encoding."""
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+    from triton.backends.compiler import GPUTarget
+
+    src = ASTSource(
+        fn=_gfx1250_gemm.matmul_tdm_pipelined_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*fp16",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+        },
+        constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir, ("expected TDM store of C in TTGIR, got:\n" + ttgir)
+    assert "amdg.tdm_prefetch" in ttgir, ("expected TDM prefetch in TTGIR, got:\n" + ttgir)
+    assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)
+    # Auto-propagation gives:
+    #   A: [128, 32] fp16 opIdx=0 -> WMMA-tuned `[128:+8]`
+    #   B: [32, 128] fp16 opIdx=1 transposed -> WMMA-tuned `[128:+16]`
+    #   C: [128, 128] fp16 -> default `[128:+8]` (innermost = 128)
+    # So three distinct encoding strings should be present.
+    assert "ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}" in ttgir, (
+        "expected WMMA-tuned encoding for A, got:\n" + ttgir)
+    assert "ttg.padded_shared<[128:+16] {order = [1, 0], shape = [32, 128]}" in ttgir, (
+        "expected WMMA-tuned encoding for B, got:\n" + ttgir)
+    assert "ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 128]}" in ttgir, (
+        "expected default encoding for C, got:\n" + ttgir)
+
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn, (
+        "expected tensor_store_from_lds intrinsic in AMDGCN, got:\n" + amdgcn)
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_gfx1250_matmul_tdm_pipelined_single_warp_per_simd_schedule_compiles(TRANSPOSE_B):
+    """Compile-only check for the TLX port of the Gluon single-warp-per-SIMD schedule."""
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+    from triton.backends.compiler import GPUTarget
+
+    src = ASTSource(
+        fn=_gfx1250_gemm.matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*bf16",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+        },
+        constexprs={
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "TRANSPOSE_B": TRANSPOSE_B,
+            "L2_PREFETCH_DISTANCE": 2,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
+    assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    tensor_load_count = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    tensor_store_count = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
+    assert tensor_load_count == 3, ("expected grouped full-tile TDM loads with LDS subtile slicing, got:\n" + amdgcn)
+    assert tensor_store_count == 1, ("expected one TDM store of C, got:\n" + amdgcn)
+
+
+@pytest.mark.parametrize("TDM_FUSION", ["none", "2way", "4way", "partial"])
+def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+    src = ASTSource(
+        fn=_gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
+        signature={
+            "a_ptr": "*fp8e5",
+            "b_ptr": "*fp8e5",
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": "e5m2",
+            "DTYPE_B": "e5m2",
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 2,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "baseline",
+            "TDM_FUSION": TDM_FUSION,
+            "L2_PREFETCH_DISTANCE": 2,
+            "TDM_SPLIT": False,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    if TDM_FUSION == "none":
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    else:
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_copy_global_to_local" not in ttgir
+    if TDM_FUSION == "2way":
+        assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    elif TDM_FUSION == "4way":
+        assert "warp_used_hints = array<i32: 1, 2, 4, 8>" in ttgir
+    elif TDM_FUSION == "partial":
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn
+
+
+def test_gfx1250_mxgemm_tdm_split_compiles():
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+    src = ASTSource(
+        fn=_gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
+        signature={
+            "a_ptr": "*fp8e4nv",
+            "b_ptr": "*u8",
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": "e4m3",
+            "DTYPE_B": "e2m1",
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 256,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 3,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": "partial",
+            "L2_PREFETCH_DISTANCE": -1,
+            "TDM_SPLIT": True,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn
+
+
+def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
+    """Compile-only check: lowers cleanly to TDM intrinsics + WMMA."""
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+    from triton.backends.compiler import GPUTarget
+
+    src = ASTSource(
+        fn=_gfx1250_attention.attn_fwd_tdm_pipelined_kernel,
+        signature={
+            "q_ptr": "*bf16",
+            "k_ptr": "*bf16",
+            "v_ptr": "*bf16",
+            "o_ptr": "*fp32",
+            "stride_qz": "i64",
+            "stride_qh": "i64",
+            "stride_qm": "i64",
+            "stride_qk": "i64",
+            "stride_kz": "i64",
+            "stride_kh": "i64",
+            "stride_kn": "i64",
+            "stride_kk": "i64",
+            "stride_vz": "i64",
+            "stride_vh": "i64",
+            "stride_vn": "i64",
+            "stride_vk": "i64",
+            "stride_oz": "i64",
+            "stride_oh": "i64",
+            "stride_om": "i64",
+            "stride_on": "i64",
+            "SM_SCALE": "constexpr",
+            "SEQLEN_Q": "constexpr",
+            "SEQLEN_K": "constexpr",
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "HEAD_SZ": "constexpr",
+        },
+        constexprs={
+            "SM_SCALE": 1.0 / (128**0.5),
+            "SEQLEN_Q": 1024,
+            "SEQLEN_K": 1024,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "HEAD_SZ": 128,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir  # TDM store of O
+    assert "tt.dot" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+
+
+test_gfx1250_grouped_gemm_xcd_remap_is_permutation = _gfx1250_grouped.test_grouped_gemm_xcd_remap_is_permutation
+
+test_gfx1250_grouped_gemm_cost_model_selects_large_saturated_tile = _gfx1250_grouped.test_grouped_gemm_cost_model_selects_large_saturated_tile
+
+test_gfx1250_grouped_gemm_cost_model_selects_small_m_tile = _gfx1250_grouped.test_grouped_gemm_cost_model_selects_small_m_tile
+
+test_gfx1250_grouped_gemm_tdm_compiles = _gfx1250_grouped.test_grouped_gemm_tdm_compiles_gfx1250
+
+test_gfx1250_grouped_gemm_tdm_asymmetric_alias_compiles = _gfx1250_grouped.test_grouped_gemm_tdm_asymmetric_alias_compiles_gfx1250
+
+test_gfx1250_grouped_gemm_tdm_asymmetric_dedicated_c_compiles = _gfx1250_grouped.test_grouped_gemm_tdm_asymmetric_dedicated_c_compiles_gfx1250
+
+test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch_compiles = _gfx1250_grouped.test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250

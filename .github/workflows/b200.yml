@@ -49,7 +49,7 @@ on:
 
 env:
   MAX_JOBS: 16
-  TORCHINDUCTOR_TLX_MODE: ""
+  TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
 
@@ -134,6 +134,12 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+      - name: Install torchao
+        timeout-minutes: 10
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
+          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Export TritonBench env
         run: |
           . "${SETUP_SCRIPT}"

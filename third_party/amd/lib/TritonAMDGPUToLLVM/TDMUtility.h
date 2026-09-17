@@ -74,6 +74,8 @@ SmallVector<Value> createTDMDescriptor(RewriterBase &rewriter, Location loc,
 // `warpUsedHint`: see TritonAMDGPUOps.td for the axis-aligned hint rule.
 // `isPureForm`: inherit `pred` from the descriptor (group0[0]) instead of the
 // `pred` arg, and leave the barrier-enable bit untouched.
+// `descriptorOffsets`: optional signed offsets folded from an unclamped
+// descriptor update. These advance the address but do not shrink the bounds.
 void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        const LLVMTypeConverter *typeConverter, Type elementType,
                        SmallVector<int64_t> blockShape, int numWarps,
@@ -84,7 +86,8 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        const triton::LinearLayout &sharedLayout, Value ctaId,
                        bool isStore, ArrayRef<unsigned> warpsPerCTA,
                        std::optional<uint32_t> warpUsedHint = std::nullopt,
-                       bool isPureForm = false);
+                       bool isPureForm = false,
+                       ArrayRef<Value> descriptorOffsets = {});
 
 // Emit a TDM load/store for regular contiguous transfers (1D-5D).
 // PartitionedSharedEncoding aligns warps to LDS partitions; without a hint
@@ -114,6 +117,8 @@ struct TDMFusedLoadMemberInfo {
   Value multicastMask;
   SmallVector<Value> desc;
   SmallVector<Value> copyOffsets;
+  // Folded address-only update, in tensor elements and Triton dimension order.
+  SmallVector<Value> descriptorOffsets;
   SmallVector<Value> dstPtrs;
   Value pred;
 };
