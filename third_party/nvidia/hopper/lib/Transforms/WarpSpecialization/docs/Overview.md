@@ -176,6 +176,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [SMEM Allocation Design](SmemAllocationDesign.md) — SMEM budget-aware allocation
 - [Memory Planner Search](MemoryPlannerSearch.md) — high-level guide to the TMEM/SMEM plan-space allocator (heuristics → search → post-pass, module seams, knobs)
 - [Contracted Schedule and Memory-Plan Search Plan](ContractedScheduleMemorySearchPlan.md) — roadmap for model-independent Contracted SWP top-K followed by SMEM/TMEM plan search, targeting annotation-free FA backward and D120426461
+- [Contracted Schedule and Memory-Plan Search Design](ContractedScheduleMemorySearchDesign.md) — high-level architecture, algorithms, data structures, legality contracts, and worked D120/FA-backward examples
 - [Barrier Fusion](BarrierFusion.md) — TMA fusion, tcgen05_commit combining
 - [Barrier Constraints](BarrierConstraints.md) — generic barrier constraints and WSBarrier reordering metadata
 - [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs

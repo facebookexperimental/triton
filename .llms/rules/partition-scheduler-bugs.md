@@ -291,6 +291,32 @@
   slots. The actual annotation-free B200 kernel passes against the torch
   reference at `atol=rtol=0.03`.
 
+### 37. D120 B-early schedule creates a zero-credit cross-partition channel cycle (2026-09-17, open)
+
+- **Symptom**: The production-shaped D120 RMSNorm+GEMM kernel hangs when the
+  Contracted schedule selects B at stage 0, A at stage 1, and MMA at stage 2.
+  The hang reproduces with both A2/B2 and A2/B3; A-early with A2/B3 passes, so
+  B's third copy is not the cause.
+- **Root cause**: A also feeds the RMSNorm reduction. Buffer allocation creates
+  a single-copy cross-partition relay for that side path. In the shared load
+  task, the next iteration's A-relay acquire precedes issuing B. The GEMM task
+  waits for that next B before it consumes and releases the previous A relay:
+  `release A(i) -> acquire A(i+1) -> issue B(i+1) -> wait B(i+1) -> release
+  A(i)`. The cycle has no startup credit and deadlocks independently of B's
+  descriptor-buffer depth.
+- **Planned fix**: Use one normalized channel-protocol graph with two builders.
+  The authoritative candidate gate runs inside `doCodePartition` after its
+  post-memory channel/reuse topology is reconstructed but before accumulation
+  counters or synchronization mutate the IR; it assumes each channel receives
+  its correct ready/empty protocol. A conformance audit rebuilds the same graph
+  from the actual endpoints after `insertAsyncComm` and barrier fusion. Both use
+  selected `buffer.copy`, task order, and `loop.stage`/`loop.cluster`. The full
+  implementation plan is Phase 10 of
+  `ContractedScheduleMemorySearchPlan.md`.
+- **Required regression**: The captured B-early D120 TTGIR must fail at compile
+  time with a cycle witness for both A2/B2 and A2/B3. A-early/A2-B3 and the
+  annotation-free FA-backward target must remain accepted.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

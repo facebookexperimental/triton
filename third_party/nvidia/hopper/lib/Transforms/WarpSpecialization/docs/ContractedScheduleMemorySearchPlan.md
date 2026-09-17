@@ -1,11 +1,29 @@
 # Contracted Schedule and Memory-Plan Search Plan
 
-**Status:** implementation in progress. Milestone A's structural schedule
-frontier and Milestone B's bounded SMEM depth frontier are implemented.
-Conservative fixed-group search now covers staging, subtile, and cross-id reuse
-plans. The external driver composes schedule, logical memory-space, and physical
-memory-plan candidates across compilation runs. Runtime evaluation and source
-annotation removal remain open.
+For the stable architecture, algorithms, data structures, and worked examples,
+start with
+[ContractedScheduleMemorySearchDesign.md](ContractedScheduleMemorySearchDesign.md).
+This file tracks implementation history, remaining work, and validation status.
+
+**Status:** Milestones A-C are complete. Milestone D has reached a focused
+annotation-free FA-backward correctness result, but broad correctness and
+performance validation are still required before removing the annotated
+fallback. Milestone E has not started. For D120426461, the production-shaped
+A3/B2 candidate passes correctness; the B-early/A2-B3 candidate still hangs and
+must be fixed or rejected before evaluating the full frontier.
+
+The remaining work is:
+
+1. Add the post-memory, schedule-aware channel-cycle validator and use it to
+   reject the unsafe D120 B-early candidates before GPU execution.
+2. Measure D120 candidates on the target shapes and confirm whether A3/B2 wins.
+3. Validate annotation-free FA backward over its supported correctness matrix,
+   then compare it with the annotated baseline under sanitizers and performance
+   measurement.
+4. Remove the remaining source memtype annotations only if the annotation-free
+   candidate passes those gates.
+5. Verify search-off neutrality, measure compile-time/candidate-count growth,
+   and choose production search caps and fallback policy.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
@@ -169,6 +187,158 @@ candidate is fastest.
 - Do not initially search CTA topology, warp-group count, or epilogue subtile
   factor.
 
+### 1.3 Current implemented search axes
+
+This section is the current-state reference for the implemented search. Later
+phases retain the design rationale and historical implementation order, but do
+not supersede the algorithms summarized here. The axes are deliberately
+separate: one compiler invocation selects a schedule and logical memory-space
+candidate, then constructs independent physical SMEM and TMEM frontiers for
+that selected IR.
+
+#### Contracted schedule
+
+**Implementation:** `ExhaustiveScheduler.cpp::runContractedSearch`.
+
+**Candidate generation:** The scheduler computes a structural lower bound for
+II from issue-resource demand, then searches a bounded II range. For each II it
+enumerates tensor-core stage/cluster assignments and structurally discovered
+descriptor/TMA loads that have a distance-zero path to a GEMM. Bounded variants
+change both load stage and the topological order of a load plus its address
+dependency slice. Candidate identity contains II and the stable
+stage/cluster signatures of both GEMMs and GEMM-reaching loads.
+
+**Admission and ranking:** Dependence topology, loop-carried distance, issue
+duration, resource conflicts, and stage bounds are hard constraints. Estimated
+result latency is only a ranking tie-breaker. The frontier pins the existing
+default at rank zero, preserves distinct GEMM/load signatures, reserves a
+non-default load-order candidate, and reserves representatives from the
+feasible II range before filling remaining slots by deterministic rank.
+
+**Output:** The selected candidate writes `loop.stage`, `loop.cluster`, and
+`tt.modulo_ii`. Standalone Contracted search does not write authoritative
+pipeline depth, physical copy counts, buffer IDs, or reuse groups.
+
+**Status and limits:** Implemented and covered by reduced plus
+production-shaped D120 and FA-backward fixtures. The frontier intentionally
+retains the D120 B-early schedule because schedule generation alone cannot know
+whether the later memory plan gives every relay enough capacity. Its selected
+schedule-memory combination currently deadlocks. The authoritative fix is the
+post-memory channel-cycle validator in Phase 10; an earlier scheduler rule may
+eventually prune candidates only when it can prove the same result.
+
+#### Logical memory space
+
+**Implementation:** `PromoteLHSToTMem`, before physical buffer allocation.
+
+**Candidate generation:** Rank zero preserves the established promotion
+heuristic. Higher ranks enumerate bounded subsets of unannotated direct MMA LHS
+operands that remain in SMEM only because the same source also feeds a
+transposed LHS. This captures the FA-backward choice in which dQ keeps its
+transposed SMEM view while dK may consume a TMEM copy, without naming either
+operand in the search interface.
+
+**Admission and ranking:** Only structurally recognized, representable
+promotions are enumerated. Explicit `opndA,smem` or `opndA,tmem` annotations are
+authoritative and remove that choice from the searchable set. Candidates use a
+stable logical signature; this axis does not rank with a latency model.
+
+**Output:** The selected rank changes the logical SMEM/TMEM backing seen by
+`doBufferAllocation`. It does not assign `buffer.id`, `buffer.offset`, or
+`buffer.copy`.
+
+**Status and limits:** The direct/transposed-LHS ambiguity needed by the
+annotation-free FA-backward oracle is implemented. Other ambiguous
+memory-space patterns are not yet candidate generators and continue to use the
+heuristic or explicit annotation.
+
+#### SMEM copy depth
+
+**Implementation:** `WSMemoryPlanSearch.{h,cpp}`,
+`WSMemoryPlanCopies.cpp`, and `allocateSmemBuffersViaSearch` in
+`WSMemoryPlanner.cpp`.
+
+**Candidate generation:** The plan-space beam represents each ordinary SMEM
+allocation as a singleton block; `SmemPacker::legalJoin()` intentionally does
+not invent SMEM alias groups. At complete beam leaves, `CopySolver` returns a
+bounded set of copy vectors: the legacy greedy vector first, then the hard-floor
+vector, feasible one-copy increments, and larger edit-distance combinations.
+For subtiled regions, multi-store staging, explicit pins, atomic broadcast, or
+cross-ID reuse, fixed-group mode first imports the heuristic grouping and pins
+its proven invariants while enumerating only mutable singleton depths.
+
+**Admission and ranking:** `StaticCopySafetyValidator` enforces schedule-derived
+stage/release floors and rotating-entry requirements. `SmemPacker` rechecks the
+copy-expanded byte budget; an over-budget vector prunes its deeper descendants.
+Estimated latency may rank candidates but cannot make an unsafe depth legal or
+remove the correctness floor. The exact heuristic plan remains rank zero.
+
+**Output:** The selected SMEM rank writes physical `buffer.copy` and preserves
+or imports the required `buffer.id`/reuse structure. Cross-ID alias sources are
+represented as non-owning blocks for budget accounting without changing their
+synchronization topology.
+
+**Status and limits:** Implemented. D120 retains A3/B2 at rank zero and exposes
+A2/B2 and A2/B3 alternatives while preserving the eight-subtile output-staging
+group. General SMEM reuse-group discovery is not searched; unsupported grouping
+features remain fixed to the heuristic topology.
+
+#### TMEM grouping and placement
+
+**Implementation:** `WSMemoryPlanSearch.{h,cpp}` and
+`allocateTmemBuffersViaSearch` in `WSMemoryPlanner.cpp`, with the existing
+`MemoryPlannerTmem` allocator as the fallback for unmodeled features.
+
+**Candidate generation:** The beam considers joining a TMEM buffer to every
+legal existing block or opening a new block. A joined block time-multiplexes
+members at offset zero; legality requires disjoint liveness plus a real
+dependency or a same-partition order proved by the selected
+`loop.stage`/`loop.cluster` schedule. Complete plans are canonically
+deduplicated. TMEM copy depth is fixed at one; the searched variables are reuse
+grouping and placement.
+
+**Admission and ranking:** Plans must satisfy the TMEM footprint limit and the
+same strict reuse-chain ordering that code partitioning will use. The heuristic
+plan remains rank zero. When grouping alternatives exist, the next rank is
+reserved for a feasible plan with the most physical blocks, providing a
+low-aliasing candidate before other score-ranked packings.
+
+**Output:** The selected TMEM rank writes `buffer.id`, `buffer.offset`, and
+`buffer.copy = 1`; search-selected groups carry the marker that makes code
+partitioning validate them with schedule-aware ordering.
+
+**Status and limits:** Implemented for representable ordinary allocations and
+used to recover the FA-backward `{dpT, dsT, dQ}` topology at a nonzero rank.
+Scaled-MMA scale-column reservation and subtiled TMEM regions still fall back
+to the existing allocator. TMEM multi-copy search is not implemented.
+
+#### Cross-axis composition and selection
+
+**Implementation:** compiler JSON-lines records through
+`TRITON_WS_SEARCH_MANIFEST` and the external
+`python/triton/tools/autows_search.py` driver.
+
+The searches are layered, not one joint in-process beam:
+
+```text
+schedule rank
+  -> logical memory-space rank
+    -> SMEM plan rank x TMEM plan rank
+      -> compile, validate, and optionally measure
+```
+
+Each child compilation selects exactly one rank on each upstream axis and
+re-derives downstream facts from the resulting IR. The manifest records each
+frontier and verifies that the requested ranks were applied. The driver sweeps
+the bounded Cartesian product, rejects compile or correctness failures, and can
+select by a command-reported runtime metric. There is currently no global
+compiler cost model and no scheduler data structure passed directly to the
+memory planner.
+
+**Status and limits:** The four-axis product and independent SMEM/TMEM rank
+coordinates are implemented. Production search caps, broad correctness gates,
+runtime measurements, and the fallback/default policy remain Milestone E work.
+
 ## 2. Why the current paths are insufficient
 
 ### 2.1 Contracted SWP originally depended on modeled timing
@@ -190,8 +360,9 @@ structural frontier.
 
 The original signature contained only `(GEMM stage, GEMM cluster)`. It now also
 contains structurally discovered GEMM-reaching TMA-load stage/cluster pairs,
-so load-order variants remain distinct. The reduced one-GEMM oracle proves that
-A-early and B-early both reach top-K; the full fused RMSNorm fixture remains.
+so load-order variants remain distinct. Both the reduced one-GEMM oracle and
+the production-shaped fused RMSNorm fixture prove that A-early and B-early
+reach top-K.
 
 ### 2.3 The memory beam now preserves SMEM depth diversity
 
@@ -307,9 +478,10 @@ Retain three configurations as the minimal search oracle:
 Check descriptor-load and MMA stage/cluster assignments, final SMEM rings, and
 barrier counts.
 
-The scheduler half now has a reduced one-MMA/two-descriptor oracle in
-`test/TritonGPU/modulo-schedule.mlir`; the A/B copy-depth alternatives remain a
-Milestone B deliverable.
+The reduced one-MMA/two-descriptor oracle and the production-shaped fixture now
+check the schedule alternatives. The memory-planner fixture retains A2/B2,
+A3/B2, and A2/B3, while the actual kernel has runtime correctness coverage for
+A3/B2 and A2/B2. A2/B3 currently hangs and is the remaining safety gap.
 
 #### FA-backward example
 
@@ -327,8 +499,10 @@ cluster(qkT) < cluster(dk) <= cluster(dq)
 Record the current annotation-selected SMEM/TMEM plan, including any
 `{dpT, dsT, dQ}` reuse relationship.
 
-**Deliverable:** tests that initially prove the annotated oracle and later pass
-with the annotations removed.
+**Status:** The pass-local fixtures prove the target schedule and memory
+topology without stage/order/copy/id/offset pins. A focused annotation-free
+BM128 backward correctness test passes. Broad correctness and performance
+comparison with the annotated baseline remain.
 
 ### Phase 1: Introduce a structural timing view for Contracted SWP
 
@@ -676,7 +850,325 @@ Each retained qkT/dk/dq/dpT/dv schedule is evaluated with its logical
 memory-space and physical SMEM/TMEM plans. Runtime measurement selects the
 triple rather than a compiler cost model.
 
-### Phase 10: Remove manual annotations incrementally
+### Phase 10: Reject schedule-aware channel cycles after memory planning
+
+The scheduler must not conservatively reject every load with a non-GEMM side
+use: a later memory plan may make the schedule safe through additional relay
+copies or a different reuse topology. Instead, use one normalized protocol
+graph with two frontends. The authoritative candidate gate runs after
+`doMemoryPlanner` has assigned physical depths and `doCodePartition` has
+reconstructed its `Channel` and `ReuseConfig` topology, but before accumulation
+counters, tokens, barriers, or buffer rewrites mutate the IR. A second,
+post-insertion frontend builds the same graph from emitted synchronization and
+audits that materialization matches the accepted plan.
+
+The precise early insertion point is inside `doCodePartition`, after channel
+collection, reuse-group construction, consumer-group merging, and existing
+reuse-group validation, but before `appendAccumCntsForOps`. Running directly
+between the top-level `doMemoryPlanner` and `doCodePartition` calls would be too
+early: generated subtiled regions and code partition's effective channel
+grouping would not yet be represented.
+
+#### 10.1 Define one normalized protocol graph
+
+Represent only events relevant to blocking progress:
+
+- producer acquire / empty wait;
+- producer-ready commit or TMA/MMAv5 completion;
+- consumer-ready wait;
+- consumer release / empty arrival.
+
+Each normalized event records a stable channel ID, role, task, enclosing
+scheduled loop, stage, cluster, stable block order, physical buffer ID, copy
+count, transaction stride, and logical transaction offset. The common graph
+and cycle solver must not refer to concrete token or barrier op classes.
+
+The intended internal representation is:
+
+```cpp
+using EventId = unsigned;
+
+enum class ProtocolEventKind { Acquire, Ready, Wait, Release };
+enum class ProtocolEdgeKind { TaskOrder, DataReady, SlotReuse, ControlFlow };
+
+struct SchedulePoint {
+  Operation *scope; // The scheduled loop or straight-line parent.
+  int stage;
+  int cluster;
+  unsigned ordinal; // Stable order inside the cluster/task.
+};
+
+struct BufferKey {
+  DataChannelKind space;
+  unsigned bufferId;
+  int64_t offset;
+  int64_t extent;
+};
+
+struct ProtocolEvent {
+  EventId id;
+  SmallVector<unsigned> channelIds; // More than one after fusion.
+  ProtocolEventKind kind;
+  AsyncTaskId task;
+  Operation *anchor; // Diagnostic only; never used by the solver.
+  SchedulePoint schedule;
+  BufferKey buffer;
+  unsigned copies;
+  unsigned transactionStride;
+  unsigned transactionOffset;
+};
+
+struct ProtocolEdge {
+  EventId from;
+  EventId to;
+  int64_t iterationDistance;
+  ProtocolEdgeKind kind;
+  unsigned channelId; // Diagnostic provenance.
+};
+
+struct ProtocolGraph {
+  SmallVector<ProtocolEvent> events;
+  SmallVector<ProtocolEdge> edges;
+};
+
+enum class ProtocolStatus { Safe, Unsafe, Unsupported };
+
+struct ProtocolValidation {
+  ProtocolStatus status;
+  SmallVector<ProtocolEdge> cycleWitness;
+  std::string reason;
+};
+```
+
+`Operation *` fields exist only in a builder-side diagnostic table. The solver
+itself consumes dense event IDs and integer edge weights, which makes it
+unit-testable without constructing MLIR. Subtiled or multi-rate channels are
+expanded to one event template per static transaction position before solving;
+different loop nests are separate cadence domains until a supported affine
+mapping between them is available.
+
+#### 10.2 Provide pre- and post-insertion graph builders
+
+The **planned-protocol builder** is the candidate-safety authority. It consumes
+the post-memory `Channel` objects, selected allocation attributes, merged
+consumer groups, and `ReuseConfig`. It models the synchronization contract of a
+correct channel directly:
+
+```text
+producer acquire(i) waits for consumer release(i - copies)
+consumer wait(i) waits for producer ready(i)
+```
+
+Factor the endpoint-placement decisions currently embedded in
+`insertAsyncComm` into pure helpers: head/tail producer, head/last actual
+consumer, inline-MMAv5 versus token protocol, reuse-group channel order, and
+transaction cadence. Both the validator and insertion must call those helpers.
+Reuse-group staggering, subtile stride, direct-grid ordinal, persistent-loop
+cadence, and synthetic staging-reuse WAR edges must use the same routines as
+`getBufferIdxAndPhase`; do not duplicate slot/phase arithmetic.
+
+The **materialized-protocol builder** is a conformance audit. It runs after
+`insertAsyncComm`, channel-graph injection, and barrier fusion, but before
+buffer replacement or `specializeRegion`. It pairs NVWS token endpoints by SSA
+value and direct TMA/MMAv5 endpoints by barrier SSA value, then lowers them to
+the same normalized event representation. When fusion combines channels,
+internal channel-ID metadata must be unioned rather than discarded. This audit
+answers a different question from the early gate: not “would correct channel
+sync make this plan live?” but “did code partitioning emit the protocol that
+was validated?”
+
+Do not pass a scheduler-owned graph across passes. Both builders re-derive
+schedule order from `loop.stage`/`loop.cluster` and the selected memory plan
+from IR. The in-memory normalized graph lives only within `doCodePartition`.
+
+#### 10.3 Add precedence edges with iteration distance
+
+Build a directed graph whose edge label is the logical-iteration distance from
+the source event to the destination event:
+
+1. **Task order:** consecutive blocking/signaling events in one task, ordered
+   by the selected stage/cluster schedule and then stable program order.
+2. **Data-ready:** producer completion for transaction `i` precedes the
+   matching consumer wait for transaction `i`.
+3. **Slot reuse:** consumer release for transaction `i` precedes producer
+   acquire for transaction `i + copies`.
+4. **Control flow:** loop backedges, guarded transactions, sibling loops, and
+   persistent `scf.while` counters contribute their actual transaction stride.
+
+The copy-count edge represents initial buffer credit. A normal circular
+pipeline therefore has positive iteration distance around its recurrence. A
+directed cycle whose total iteration advance is non-positive has no initial
+credit that can sustain it and is a deadlock. Do not use operation latency.
+
+For each cadence domain, solve this exactly as an integer weighted-cycle
+problem:
+
+1. Drop acyclic vertices using strongly connected components. A deadlock cycle
+   can exist only inside an SCC.
+2. For an SCC with `N` events, transform every edge distance `d` to
+   `w = d * (N + 1) - 1`.
+3. Add a zero-cost synthetic source to every event and run Bellman-Ford. A
+   relaxation on iteration `N` proves a negative transformed cycle.
+4. Follow predecessor edges `N` times to enter that cycle, reconstruct it, and
+   report the original iteration distances and event metadata.
+
+The transform handles the strictness of event order without floating point.
+For any simple cycle of length `L <= N`:
+
+```text
+sum(w) = (N + 1) * sum(iterationDistance) - L
+```
+
+Therefore `sum(w) < 0` exactly when the original cycle advances by at most zero
+iterations; a cycle advancing by at least one iteration has
+`sum(w) >= N + 1 - L > 0`. Complexity is `O(VE)` per SCC, and these graphs are
+small relative to the compiler DDG.
+
+For scheduled events in one task, derive task-order distance from the
+deserialized `CoarseSchedule`, not lexical order alone. In one steady-state
+modulo period, moving from event `u` to the next event `v` contributes the
+stage difference plus a one-iteration carry when the ordered cluster sequence
+wraps. Real SSA/control dependencies retain their explicit dependence
+distance. If stage, cadence, or control-flow mapping is ambiguous, return
+`Unsupported` instead of guessing an edge weight.
+
+#### 10.4 Reject the selected combination, not the schedule globally
+
+Return one of `safe`, `unsafe`, or `unsupported`:
+
+- `safe`: continue code partitioning;
+- `unsafe`: emit a deterministic diagnostic and fail this selected compiler
+  invocation;
+- `unsupported`: do not claim validation coverage. During rollout, preserve
+  the existing rank-zero path, but do not send an unvalidated nonzero search
+  candidate to runtime measurement.
+
+Change `doCodePartition` to return `LogicalResult` so the production and
+test-only passes propagate an early-gate rejection normally. The external
+product driver records the failed schedule/memory ranks and continues with the
+next tuple. A mismatch or new cycle in the post-insertion audit is an internal
+code-partitioning error, not a candidate-quality result. Add a manifest
+validation record containing the selected ranks, validation boundary, status,
+reason, and cycle witness. Do not silently substitute another rank inside the
+compiler.
+
+The diagnostic cycle witness should list, in order:
+
+```text
+task, event role, source location, buffer.id, copies,
+loop.stage, loop.cluster, iteration delta
+```
+
+This makes rejection explainable and lets a future planner determine whether
+increasing one relay depth or changing task order would break the cycle.
+
+#### 10.5 Land coverage in increasing scope
+
+1. Unit-test the common weighted graph solver directly with a zero-credit cycle
+   and a neighboring positive-credit recurrence.
+2. Add a synthetic code-partition fixture whose planned-protocol builder finds
+   the same two-task cycle, plus a safe copy-depth or schedule variant.
+3. Capture the actual D120 B-early post-memory TTGIR and check that both A2/B2
+   and A2/B3 are rejected by the early gate with the same relay/B wait-for
+   cycle. Check that A-early with A2/B3 passes; this proves the memory plan
+   itself is not being banned.
+4. On safe fixtures, compare canonical planned and materialized graphs after
+   insertion. Add a negative test that deliberately omits or misplaces one
+   endpoint so the conformance audit fails.
+5. Run the existing FA-backward memory-topology and code-partition fixtures as
+   positive tests, especially the `{dpT, dsT, dQ}` TMEM reuse group and
+   persistent staging-reuse channels.
+6. Run the external D120 product search and verify that rejected tuples finish
+   at compile time rather than launching a hanging kernel, while A3/B2,
+   A2/B2, and safe A2/B3 tuples still run correctness.
+7. Extend the materialized graph to overlapping physical TMEM ranges as a
+   follow-up. That subsumes the late barrier-aware checker proposed in
+   `BwdTmemReuseSlotHazard.md`, but is not required to reject the D120 channel
+   deadlock.
+
+#### 10.6 First implementation slice: planned-protocol validator only
+
+Land the post-memory validator before adding the materialized-protocol audit.
+The implementation sequence is:
+
+1. Add `WSChannelCycleAnalysis.{h,cpp}` and register the source in the Hopper
+   transforms CMake target. Keep the normalized graph and weighted-cycle solver
+   independent of MLIR synchronization op classes.
+2. Move the schedule-order predicate currently local to `insertAsyncComm` into
+   a shared utility. Its contract is
+   `before(i) -> after(i + distance)` under the serialized
+   `loop.stage`/`loop.cluster` schedule; missing metadata returns unknown rather
+   than lexical-order fallback across tasks.
+3. Factor the non-mutating endpoint decisions needed by both insertion and
+   validation into `ChannelProtocolPlan`: effective producer-acquire anchor,
+   producer-ready anchor, per-task consumer-wait anchor, consumer-release
+   anchor, buffer depth, and cadence. Preserve existing `insertAsyncComm`
+   behavior by making it consume these helpers before enabling rejection.
+4. In `doCodePartition`, call
+   `validatePlannedChannelCycles(...)` after `ReuseConfig` construction,
+   consumer-group merging, and reuse-group shape checks, but before
+   `appendAccumCntsForOps`. Change `doCodePartition` to return `LogicalResult`
+   and propagate failure through the production and test-only passes.
+5. Initially support ordinary channels whose relevant endpoints share one
+   scheduled `scf.for` cadence and have affine one-transaction-per-iteration
+   behavior. Analyze supported SCCs even when unrelated channels are outside
+   that scope. A proven cycle is `Unsafe`; an unsupported component is reported
+   as unvalidated and does not cause a false rejection during bring-up.
+6. Add debug output and a manifest validation record. The error must include
+   the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
+   stage/cluster coordinates, and edge distances.
+7. Capture the actual B-early D120 IR at the post-buffer-allocation boundary so
+   the lit pipeline still runs memory planning before validation. Extend the
+   existing D120 memory-planner test rather than creating a disconnected toy
+   test file: B-early with A2/B2 and A2/B3 must fail with the same cycle;
+   A-early/A2-B3 must pass.
+8. Run the existing annotation-free FA-backward memory and code-partition lit
+   tests as positive coverage. Only after these stay clean should the external
+   search driver treat a proven `Unsafe` result as a rejected tuple and avoid
+   launching it.
+
+The first slice does not inspect emitted tokens/barriers, validate TMEM alias
+reads, or claim that every unsupported control-flow shape is safe. Those are
+follow-up extensions to the second graph builder. It does eliminate the D120
+runtime hang by rejecting the proven cycle before code-partition mutation.
+
+Each implementation commit must rebuild Triton in the `metamain` environment
+with `/home/mren/OpenSource2/llvm-build`, run the focused D120 and FA-backward
+lit tests from the configured build directory, run the full relevant
+WarpSpecialization lit suite, and pass pre-commit. GPU correctness is run only
+after the lit gate; no performance benchmark is part of this slice.
+
+#### D120426461 example
+
+For the B-early schedule, the validator should report the zero-advance cycle:
+
+```text
+A relay release(i)
+  -> A relay acquire(i+1)
+  -> issue B(i+1)
+  -> wait for B(i+1)
+  -> A relay release(i)
+```
+
+The single-copy A relay supplies enough initial credit for the first
+transaction, but the selected schedule consumes that credit without creating
+positive iteration advance around the steady-state cycle. Changing only B from
+two to three copies cannot break this cycle. A-early/A2-B3 remains accepted.
+
+#### FA-backward example
+
+The selected annotation-free schedule and `{dpT, dsT, dQ}` TMEM plan must
+validate as a positive control. Its cross-partition reuse dependencies advance
+through real data-ready and release edges rather than forming a non-positive
+cycle. Persistent `scf.while`, same-task staging, MMAv5 inline completion, and
+multi-member reuse remain explicit coverage requirements before enabling the
+validator for all nonzero search candidates.
+
+**Planned implementation areas:** `WSCodePartition.cpp`,
+`CodePartitionUtility.{h,cpp}`, a focused channel-cycle analysis utility,
+`WarpSpecializationPipeline.h`, and `autows_search.py` manifest handling.
+
+### Phase 11: Remove manual annotations incrementally
 
 1. Remove `stage` and `order` fields after Contracted SWP retains equivalent
    schedules.
@@ -711,6 +1203,8 @@ schedule or channel-allocation string.
 - Descriptor-load placement candidate identity and deduplication.
 - CopySolver multi-result enumeration and deterministic ordering.
 - Static copy-safety and budget rejection.
+- Post-memory schedule-aware channel-cycle rejection, including a diagnostic
+  cycle witness.
 - Fixed-grouping search for subtiled and staging cases.
 - Default-off and rank-0 neutrality.
 - End-to-end candidate presence for D120426461 and FA backward.
@@ -740,6 +1234,8 @@ gate.
 
 ### Milestone A: structural schedule frontier
 
+**Status: complete.**
+
 - Split hard issue facts from estimated latency.
 - Search a bounded II range.
 - Retain GEMM- and load-placement diversity.
@@ -748,16 +1244,24 @@ gate.
 
 ### Milestone B: real SMEM copy search
 
+**Status: complete.**
+
 - Make CopySolver multi-result.
 - Integrate copy candidates into beamSearch.
 - Demonstrate A2/B2, A3/B2, and A2/B3 without operand annotations.
 
 ### Milestone C: fallback-compatible search
 
+**Status: complete.**
+
 - Add fixed-grouping mode.
 - Exercise D120's subtiled epilogue and FA-backward staging cases.
 
 ### Milestone D: annotation-free FA backward
+
+**Status: in progress.** The target schedule, memory-space choice, and physical
+memory topology are searchable, and focused BM128 correctness passes. The
+broader correctness/performance gates and source annotation removal remain.
 
 - Remove schedule and physical-allocation pins.
 - Add memory-space selection or a general memory-space heuristic. The first
@@ -766,12 +1270,14 @@ gate.
 
 ### Milestone E: evaluation and default decision
 
+**Status: not started.**
+
 - Measure the bounded schedule × memory-space × memory-plan product.
 - Choose search limits and fallback policy based on compile-time and runtime
   data.
 - Keep the feature opt-in until representative workloads show stable wins.
 
-Estimated engineering effort, assuming a working native build and B200 access:
+Original engineering estimate, retained for historical context:
 
 | Milestone | Estimate |
 |---|---:|
@@ -781,9 +1287,10 @@ Estimated engineering effort, assuming a working native build and B200 access:
 | D | 5–8 days |
 | E | 2–4 days |
 
-The stages overlap, but the complete annotation-removal goal is approximately
-three to five engineering weeks. Milestones A–C should be sufficient to test
-the D120 hypothesis before committing to memory-space search.
+Milestones A-C and the first memory-space search axis are now implemented. The
+remaining duration depends primarily on debugging the unsafe D120 candidate and
+collecting representative correctness, sanitizer, compile-time, and performance
+results rather than on implementing another core search layer.
 
 ## 7. Risks and decision points
 
@@ -842,6 +1349,8 @@ a hard correctness floor on the structural path.
 - [x] D120 candidates exist without lhs/rhs depth annotations.
 - [x] D120 schedule rank 1 with the A3/B2 memory plan passes the actual
       1024x12800x1024 bf16 correctness run on B200.
+- [ ] Post-memory channel-cycle validation rejects D120 B-early before launch
+      while retaining A-early with the A2/B3 memory plan.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [x] FA-backward target schedule exists without stage/order annotations.
 - [x] FA-backward target memory plan exists without copy/id/offset pins.
