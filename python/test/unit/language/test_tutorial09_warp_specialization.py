@@ -6,6 +6,8 @@ with both Flatten=True and Flatten=False configurations. Tests cover both
 Blackwell and Hopper GPUs.
 """
 
+import json
+import os
 from typing import NamedTuple
 
 import pytest
@@ -92,6 +94,45 @@ def matmul_kernel_tma_ws(
     offs_cm = pid_m * BLOCK_SIZE_M
     offs_cn = pid_n * BLOCK_SIZE_N
     c_desc.store([offs_cm, offs_cn], c)
+
+
+@triton.jit
+def rmsnorm_gemm_kernel_tma_ws(
+    a_desc,
+    b_desc,
+    c_desc,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+):
+    """Production-shaped fused pre-GEMM RMSNorm + GEMM from D120426461."""
+    pid = tl.program_id(axis=0)
+    num_pid_n: tl.constexpr = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    offs_m = pid_m * BLOCK_SIZE_M
+    offs_n = pid_n * BLOCK_SIZE_N
+
+    sum_sq = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in tl.range(tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=True, separate_epilogue_store=True):
+        offs_k = k * BLOCK_SIZE_K
+        a = a_desc.load([offs_m, offs_k])
+        b = b_desc.load([offs_n, offs_k])
+        a_f32 = a.to(tl.float32)
+        sum_sq += tl.sum(a_f32 * a_f32, axis=1)
+        accumulator = tl.dot(a, b.T, accumulator)
+
+    inv_rms = tl.rsqrt(sum_sq / K + 1e-5)
+    accumulator *= inv_rms[:, None]
+    slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+    slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+        c_desc.store([offs_m, offs_n + slice_id * slice_size], slices[slice_id].to(tl.bfloat16))
 
 
 # ============================================================================
@@ -687,6 +728,84 @@ def _reduce_k_kernel(
 # ============================================================================
 # Test 1: matmul_kernel_tma warp specialization (K-loop based)
 # ============================================================================
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_d120_rmsnorm_gemm_search(monkeypatch, tmp_path):
+    """Run the D120426461 fused RMSNorm + GEMM shape without depth annotations."""
+    search_env = {
+        "STANDALONE_MODULO": "1",
+        "TRITON_USE_MODULO_SCHEDULE": "contracted",
+        "TRITON_MODULO_TOPK": "4",
+        "TRITON_MODULO_PICK": "1",
+        "TRITON_WS_MEMORY_SPACE_TOPK": "1",
+        "TRITON_WS_MEMORY_SPACE_PICK": "0",
+        "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+        "TRITON_WS_SMEM_PLAN_TOPK": "3",
+        "TRITON_WS_SMEM_PLAN_PICK": "0",
+        "TRITON_WS_TMEM_PLAN_TOPK": "1",
+        "TRITON_WS_TMEM_PLAN_PICK": "0",
+        "TRITON_WS_SEARCH_MANIFEST": str(tmp_path / "search.jsonl"),
+        "TRITON_ALWAYS_COMPILE": "1",
+    }
+    for name, value in search_env.items():
+        if name not in os.environ:
+            monkeypatch.setenv(name, value)
+
+    M, N, K = 1024, 12800, 1024
+    block_m = block_n = block_k = 128
+    epilogue_subtile = 8
+    torch.manual_seed(42)
+    a = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
+    c = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_n, block_k])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n // epilogue_subtile])
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), )
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        compiled = rmsnorm_gemm_kernel_tma_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M=M,
+            N=N,
+            K=K,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            EPILOGUE_SUBTILE=epilogue_subtile,
+            num_stages=3,
+            num_warps=4,
+            early_tma_store_lowering=True,
+        )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.warp_specialize" in ttgir
+
+    records = [json.loads(line) for line in (tmp_path / "search.jsonl").read_text().splitlines()]
+    selected = {(record["kind"], record.get("pool")): record["rank"] for record in records if record.get("selected")}
+    assert selected[("schedule", None)] == int(os.environ["TRITON_MODULO_PICK"])
+    assert selected[("memory-space", None)] == int(os.environ["TRITON_WS_MEMORY_SPACE_PICK"])
+    assert selected[("memory", "smem-fixed")] == int(os.environ["TRITON_WS_SMEM_PLAN_PICK"])
+    assert selected[("memory", "tmem")] == int(os.environ["TRITON_WS_TMEM_PLAN_PICK"])
+    selected_smem = next(record for record in records if record.get("selected") and record.get("pool") == "smem-fixed")
+    expected_depths = {0: (3, 2), 1: (2, 2), 2: (2, 3)}[int(os.environ["TRITON_WS_SMEM_PLAN_PICK"])]
+    assert tuple(block["copy"] for block in selected_smem["blocks"][:2]) == expected_depths
+    for depth in set(expected_depths):
+        assert f"!ttg.memdesc<{depth}x128x128xbf16" in ttgir
+
+    a_f32 = a.float()
+    reference = torch.matmul(a_f32, b.float().T)
+    reference *= torch.rsqrt(torch.mean(a_f32 * a_f32, dim=1) + 1e-5)[:, None]
+    torch.testing.assert_close(c, reference.to(torch.bfloat16), atol=0.03, rtol=0.03)
+
+
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])
 @pytest.mark.parametrize("BLOCK_SIZE_M", [128])
 @pytest.mark.parametrize("BLOCK_SIZE_N", [128])

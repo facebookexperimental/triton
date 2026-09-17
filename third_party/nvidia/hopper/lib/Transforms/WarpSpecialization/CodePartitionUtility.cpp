@@ -1486,7 +1486,20 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   while (parentRegion &&
          !isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parentRegion))
     parentRegion = parentRegion->getParentOp();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentRegion, chList);
+  auto *group = config->getGroup(reuseGroupIdx);
+  if (parentRegion) {
+    getReuseChannels(group, parentRegion, chList);
+  } else {
+    // A direct-grid epilogue has no enclosing control-flow operation to carry
+    // an accumCnt. Order its reuse-group transactions directly in the
+    // function block so a fused staging ring still advances across the
+    // straight-line stores. Without this, every member falls back to slot 0
+    // and phase 0, deadlocking the second handoff.
+    for (Operation &candidate : *op->getBlock())
+      for (auto *groupChannel : group->channels)
+        if (&candidate == groupChannel->getDstOp())
+          chList.push_back(&candidate);
+  }
   assert(chList.size() >= 1);
 
   // When multiple channels in the reuse group share the same getDstOp() but
@@ -1495,7 +1508,6 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // per channel. We must find the correct entry by counting how many
   // *distinct consumer groups* with the same getDstOp() appear before ch's
   // consumer group in the reuse group's channel list.
-  auto *group = config->getGroup(reuseGroupIdx);
   int targetOccurrence = 0;
   SmallVector<Channel *> seenGroups;
   for (auto *grpCh : group->channels) {

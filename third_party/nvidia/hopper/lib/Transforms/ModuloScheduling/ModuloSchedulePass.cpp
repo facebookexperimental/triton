@@ -422,38 +422,48 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   loop->setAttr(tt::kScheduledMaxStageAttrName,
                 IntegerAttr::get(IntegerType::get(ctx, 32), maxStage));
 
-  // Override tt.num_stages with modulo's authoritative value.
-  // The downstream `pipelineForLoop` reads this attribute to decide how
-  // many copies of each pipelined SMEM buffer to allocate. Modulo's
-  // Step 4.6 already analyzed the budget and decided per-buffer counts
-  // in `tt.num_buffers`; align `tt.num_stages` to the deepest of those
-  // so the pipeliner's pipelining depth matches modulo's intent.
-  // See issue 001_annotation_smem_overflow.
-  unsigned moduloNumStages = 1;
-  for (const auto &buf : schedLoop.buffers) {
-    if (buf.kind == ttg::MemoryKind::SMEM || buf.kind == ttg::MemoryKind::TMEM)
-      moduloNumStages = std::max(moduloNumStages, buf.count);
-  }
-  loop->setAttr(mlir::triton::kNumStagesAttrName,
-                IntegerAttr::get(IntegerType::get(ctx, 32),
-                                 static_cast<int>(moduloNumStages)));
+  // The joint modulo path owns physical allocation, but standalone Contracted
+  // search only owns logical stage/cluster order.  Keep the frontend pipeline
+  // depth in the latter case and let WSMemoryPlanner choose all copy/grouping
+  // attributes.  In particular, modeled lifetime / II can be arbitrarily
+  // large when structural search intentionally does not trust latency.
+  if (!standalone) {
+    // Override tt.num_stages with modulo's authoritative value.  The
+    // downstream `pipelineForLoop` reads this attribute to decide how many
+    // copies of each pipelined SMEM buffer to allocate. Modulo's Step 4.6
+    // already analyzed the budget and decided per-buffer counts in
+    // `tt.num_buffers`; align `tt.num_stages` to the deepest of those so the
+    // pipeliner's pipelining depth matches modulo's intent.
+    // See issue 001_annotation_smem_overflow.
+    unsigned moduloNumStages = 1;
+    for (const auto &buf : schedLoop.buffers) {
+      if (buf.kind == ttg::MemoryKind::SMEM ||
+          buf.kind == ttg::MemoryKind::TMEM)
+        moduloNumStages = std::max(moduloNumStages, buf.count);
+    }
+    loop->setAttr(mlir::triton::kNumStagesAttrName,
+                  IntegerAttr::get(IntegerType::get(ctx, 32),
+                                   static_cast<int>(moduloNumStages)));
 
-  // ── 3. Per-buffer: tt.num_buffers, buffer.id ──
-  for (const auto &buf : schedLoop.buffers) {
-    if (!buf.defOp || buf.kind == ttg::MemoryKind::BARRIER)
-      continue;
-    buf.defOp->setAttr("tt.num_buffers",
-                       IntegerAttr::get(IntegerType::get(ctx, 32), buf.count));
-    buf.defOp->setAttr("buffer.id",
-                       IntegerAttr::get(IntegerType::get(ctx, 32), buf.id));
-    // Step 4.5 buffer-merge decision: buffers sharing a merge_group_id were
-    // colored to the same physical SMEM/TMEM slot (interval-graph coloring).
-    // Carry it so the downstream allocator can reuse modulo's coloring instead
-    // of running its own merge.
-    if (buf.mergeGroupId != UINT_MAX)
-      buf.defOp->setAttr("buffer.merge_group_id",
-                         IntegerAttr::get(IntegerType::get(ctx, 32),
-                                          static_cast<int>(buf.mergeGroupId)));
+    // ── 3. Per-buffer: tt.num_buffers, buffer.id ──
+    for (const auto &buf : schedLoop.buffers) {
+      if (!buf.defOp || buf.kind == ttg::MemoryKind::BARRIER)
+        continue;
+      buf.defOp->setAttr(
+          "tt.num_buffers",
+          IntegerAttr::get(IntegerType::get(ctx, 32), buf.count));
+      buf.defOp->setAttr("buffer.id",
+                         IntegerAttr::get(IntegerType::get(ctx, 32), buf.id));
+      // Step 4.5 buffer-merge decision: buffers sharing a merge_group_id were
+      // colored to the same physical SMEM/TMEM slot (interval-graph coloring).
+      // Carry it so the downstream allocator can reuse modulo's coloring
+      // instead of running its own merge.
+      if (buf.mergeGroupId != UINT_MAX)
+        buf.defOp->setAttr(
+            "buffer.merge_group_id",
+            IntegerAttr::get(IntegerType::get(ctx, 32),
+                             static_cast<int>(buf.mergeGroupId)));
+    }
   }
 
   // ── 4. Clean up internal attrs ──

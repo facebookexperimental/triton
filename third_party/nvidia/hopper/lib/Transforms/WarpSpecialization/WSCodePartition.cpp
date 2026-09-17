@@ -888,12 +888,19 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
     // Restore insertion point to user
     builder.setInsertionPoint(user);
   } else {
-    // Fallback: if we can't find a parent loop, use constant 0
-    // (this should only happen for operations truly outside any loop)
-    bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        user->getLoc(), 0, 32);
-    _phase = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
-        user->getLoc(), 0);
+    // A direct-grid epilogue has no loop-carried counter, but a fused reuse
+    // group still advances once per straight-line channel. Derive its static
+    // member ordinal through getStaggeredAccumCnt so data and barriers rotate
+    // through the same slots. Truly independent buffers remain on slot 0.
+    if (reuseGrp >= 0) {
+      getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                           bufferIdx, _phase, config, reuseGrp, channel);
+    } else {
+      bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          user->getLoc(), 0, 32);
+      _phase = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+          user->getLoc(), 0);
+    }
   }
 
   return {bufferIdx, _phase};
@@ -3468,11 +3475,21 @@ void insertAsyncComm(
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
     } else {
-      // Producer is truly outside any loop, create phase and bufferIdx here.
-      bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          headProducer->getLoc(), 0, 32);
-      phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          headProducer->getLoc(), 0, 1);
+      // A direct-grid epilogue can contain several straight-line channels
+      // sharing one staging ring. Use each channel's static reuse-group
+      // ordinal so the barrier slot/phase matches the data view selected in
+      // createBufferForAllocs. A non-reused buffer stays on slot/phase zero.
+      if (reuseGrp >= 0) {
+        getBufferIdxAndPhase(builder, headProducer,
+                             kv.second.front()->getNumBuffers(),
+                             regionsWithChannels, bufferIdx, phase, config,
+                             reuseGrp, masterChannel);
+      } else {
+        bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            headProducer->getLoc(), 0, 32);
+        phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            headProducer->getLoc(), 0, 1);
+      }
     }
 
     // For SMEM channels whose producer/consumer ops live inside a

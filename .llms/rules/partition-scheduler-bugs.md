@@ -267,6 +267,30 @@
 - **Fix**: When one outer-produced operand channel has MMAv5 consumers in multiple sibling loops, emit a single `tcgen5.commit` after the final sibling loop instead of an inline MMA completion. The post-loop commit drains every MMA issued by any nonempty sibling and still executes when the final loop is empty, restoring the one-load/one-release outer cadence.
 - **Validation**: HSTU CLC backward passes `L=128, Z=80` (160 tiles, empty unmasked loop, reused CTAs), `L=256, Z=120` uniform, and the 480-tile jagged production case. Relative-L2 for dQ/dK/dV is about `2.34e-3 / 2.34e-3 / 2.35e-3`. The existing high-grid jagged E2E is the deadlock regression.
 
+### 36. Direct-grid fused output staging reuses slot 0 for every subtile (2026-09-17, fixed)
+- **Symptom**: The production-shaped D120 RMSNorm+GEMM kernel
+  (`M=1024, N=12800, K=1024`, BF16, 128x128x128 tiles, eight output
+  subtiles) hangs at CUDA synchronization. Its selected memory plan correctly
+  contains one three-copy output-staging group, but final TTGIR indexes slot 0
+  for all eight producer/consumer handoffs with a constant barrier phase.
+- **Root cause**: `getBufferIdxAndPhaseForOutsideLoopOps` and the corresponding
+  truly-outside-loop branch in `insertAsyncComm` unconditionally returned
+  slot/phase zero. That is correct for an independent prologue/epilogue buffer,
+  but not for a multi-member reuse group in a direct-grid straight-line
+  epilogue. Unlike persistent `scf.for`/`scf.while` epilogues, this shape has no
+  loop-carried `accumCnt`, so the existing reuse-group staggering path was
+  bypassed completely.
+- **Fix**: For a direct-grid reuse group, derive the logical count from the
+  channel's stable consumer program-order position. Both physical data-buffer
+  indexing and barrier insertion use that same count, producing slots
+  `0,1,2,0,1,2,0,1` and phases `0,0,0,1,1,1,0,0` for the D120 three-copy
+  eight-subtile group. Non-reused outside-loop buffers retain slot/phase zero.
+- **Tests**: `ws_memory_planner_rmsnorm_gemm.mlir` runs the captured D120
+  post-buffer-allocation fixture through memory planning and code partitioning,
+  and checks matching producer/consumer staging views rotate through the three
+  slots. The actual annotation-free B200 kernel passes against the torch
+  reference at `atol=rtol=0.03`.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

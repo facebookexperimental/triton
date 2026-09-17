@@ -387,6 +387,14 @@ When channels share a reuse group (same `buffer.id`), they share a single
 
 See [Reuse Groups](ReuseGroups.md) for more details.
 
+For a direct-grid epilogue, the reuse group is a straight-line sequence outside
+any loop, so there is no loop-carried `accumCnt`. The channel's stable position
+in consumer program order is the complete logical count. Both
+`createBufferForAllocs` and `insertAsyncComm` use that position to derive the
+same data-buffer slot and barrier phase. Falling back to zero for every member
+would repeatedly address slot 0 at phase 0 and deadlock the second subtile of a
+multi-copy output-staging group.
+
 ## TMA Staging Buffers: same-partition vs cross-partition
 
 `getStaggeredAccumCnt` (`CodePartitionUtility.cpp`) has a special path for

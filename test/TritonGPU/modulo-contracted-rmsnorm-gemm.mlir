@@ -3,19 +3,28 @@
 // RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-pre-modulo.mlir \
 // RUN:   -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | \
-// RUN:   FileCheck %s --check-prefix=BASELINE
+// RUN:   FileCheck %s --check-prefix=BASELINE \
+// RUN:   --implicit-check-not=tt.num_stages \
+// RUN:   --implicit-check-not=tt.num_buffers \
+// RUN:   --implicit-check-not=buffer.merge_group_id
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
 // RUN:   TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=1 \
 // RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-pre-modulo.mlir \
 // RUN:   -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | \
-// RUN:   FileCheck %s --check-prefix=A-EARLY
+// RUN:   FileCheck %s --check-prefix=A-EARLY \
+// RUN:   --implicit-check-not=tt.num_stages \
+// RUN:   --implicit-check-not=tt.num_buffers \
+// RUN:   --implicit-check-not=buffer.merge_group_id
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
 // RUN:   TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=2 \
 // RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-pre-modulo.mlir \
 // RUN:   -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | \
-// RUN:   FileCheck %s --check-prefix=B-EARLY
+// RUN:   FileCheck %s --check-prefix=B-EARLY \
+// RUN:   --implicit-check-not=tt.num_stages \
+// RUN:   --implicit-check-not=tt.num_buffers \
+// RUN:   --implicit-check-not=buffer.merge_group_id
 // RUN: rm -f %t
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
 // RUN:   TRITON_MODULO_TOPK=4 TRITON_MODULO_PICK=0 \

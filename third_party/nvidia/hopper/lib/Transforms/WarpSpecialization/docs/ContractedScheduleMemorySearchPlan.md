@@ -63,6 +63,14 @@ annotations retain precedence. The outer driver now sweeps the full schedule ×
 memory-space × SMEM-plan × TMEM-plan product, and the pass emits a
 `memory-space` manifest record so every selected rank is verified.
 
+**Implemented eighth slice:** Standalone Contracted search no longer emits
+latency-derived `tt.num_buffers`, `buffer.id`, `buffer.merge_group_id`, or
+`tt.num_stages`. It preserves only logical stage/cluster scheduling metadata;
+the frontend pipeline depth and WSMemoryPlanner remain authoritative for
+physical buffering. This prevents structural schedules from turning a large
+modeled lifetime/II ratio (182 stages in the D120 oracle) into an unsafe
+software-pipeline depth.
+
 **Current Milestone D status:** The annotation-free BM128 FA-backward candidate
 compiles through software-pipeline expansion. Pre-lowered
 `ttng.async_tma_store_wait` operations selected into a peeled pipeline stage
@@ -82,7 +90,14 @@ D120 experiment. The pass-local memory test confirms that the existing
 heuristic produces A3/B2 on the same graph. Search-mode coverage on this fixture
 now recognizes its eight separately materialized output-staging allocations as
 one fixed subtile group, preserves A3/B2 at rank zero, and retains A2/B2 and
-A2/B3 as the first two alternatives.
+A2/B3 as the first two alternatives. The actual 1024x12800x1024 bf16 kernel now
+passes numerical correctness on B200 for schedule rank 1 plus the A3/B2 SMEM
+plan. Direct-grid output staging rotates the eight straight-line stores through
+the selected three-copy ring; its data slots and barrier phases are checked at
+the code-partition boundary. The adjacent A-early/A2-B2 candidate also passes
+correctness. The currently paired B-early/A2-B3 cross-product candidate still
+hangs and remains an explicit candidate-safety gap; it must be fixed or rejected
+before claiming the entire D120 frontier is executable.
 
 **Production-shaped FA-backward oracle:** The existing BM64 pre-modulo fixture
 already proves that Contracted top-K retains the target five-GEMM schedule with
@@ -792,12 +807,13 @@ allocation, but this first candidate generator is intentionally narrow. New
 memory-space ambiguities should extend the same generic rank/manifest axis and
 retain explicit annotations as an override until runtime validation is done.
 
-### Ambiguous ownership of `tt.num_buffers`
+### Ownership of `tt.num_buffers`
 
-The scheduler currently emits it, while WSMemoryPlanner owns final copy counts.
-Resolve this explicitly: either rename it as a non-binding schedule-demand hint
-or stop emitting it on the structural path. Never interpret a modeled demand
-as a hard correctness floor.
+The joint modulo path continues to emit authoritative `tt.num_buffers`, buffer
+IDs/grouping, and `tt.num_stages`. Standalone structural Contracted search no
+longer emits them: WSMemoryPlanner owns physical copy counts and grouping, and
+the frontend pipeline depth remains intact. A modeled demand must never become
+a hard correctness floor on the structural path.
 
 ## 8. Completion checklist
 
@@ -814,6 +830,8 @@ as a hard correctness floor.
       search without changing alias depth or topology.
 - [x] Compiler emits schedule and memory JSON-lines records for external
       Cartesian-product search.
+- [x] Standalone Contracted search leaves pipeline depth and physical buffer
+      decisions to the frontend and WSMemoryPlanner.
 - [x] Production-shaped D120 TTGIR is captured at the pre-modulo and
       post-buffer-allocation pass boundaries.
 - [x] Contracted search retains D120's A0/B1/MMA2 and A1/B0/MMA2 iteration-lead
@@ -822,6 +840,8 @@ as a hard correctness floor.
       staging group and retains the heuristic A3/B2 plan as rank zero.
 - [x] External harness compiles, validates, and measures the bounded product.
 - [x] D120 candidates exist without lhs/rhs depth annotations.
+- [x] D120 schedule rank 1 with the A3/B2 memory plan passes the actual
+      1024x12800x1024 bf16 correctness run on B200.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [x] FA-backward target schedule exists without stage/order annotations.
 - [x] FA-backward target memory plan exists without copy/id/offset pins.
