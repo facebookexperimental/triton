@@ -1,0 +1,7 @@
+{
+  "operation": "gemm",
+  "vendor": "amd",
+  "architecture": "gfx950",
+  "aliases": ["cdna4", "mi350"],
+  "cuda_major": null
+}

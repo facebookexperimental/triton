@@ -193,6 +193,7 @@ def run_accuracy(shapes):
 _PERF_ENV = {
     "triton": {},
     "tlx": {},
+    "tlx_raw": {},
     "autows": {
         "HSTU_SELF_AUTOWS": "1",
         "HSTU_SELF_DQ_REDUCE": "1",
@@ -209,9 +210,10 @@ _PERF_ENV = {
     "autows_clc": {
         "HSTU_SELF_AUTOWS": "1",
         "HSTU_SELF_DQ_REDUCE": "1",
+        "HSTU_SELF_DQ_FP32": "1",
         "HSTU_SELF_DQ_REUSE": "1",
         "HSTU_SELF_AUTOWS_CLC": "1",
-        "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "2",
+        "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "1",
         "HSTU_SELF_BWD_DKDV_SUBTILE": "2",
         "HSTU_SELF_DP": "1",
         "HSTU_SELF_AUTOWS_BWD_BM": "64",
@@ -230,13 +232,10 @@ def _clc_bwd(q, k, v, do, so, asc, L, num_targets):
     wrapper directly so forward compilation/autotuning is excluded from both
     setup and timing while retaining backward-side allocations and preprocessing.
 
-    dq is zeroed rather than left uninitialized: the CLC path writes it with
-    store_reduce="add", so garbage (possibly inf/NaN) would be accumulated into.
-    The buffers are still reused across calls, so dq keeps summing across
-    repetitions -- this closure is for timing only and its gradients are not
-    meaningful. Zeroing per call would put a memset inside the timed region and
-    bias the CLC number against the other variants."""
-    dq = torch.zeros_like(q)
+    The launch pre-hook zeroes dQ before every reduce-add launch, matching TLX.
+    Allocate it as FP32 when the aligned mode is selected so both raw variants
+    time the same output contract."""
+    dq = torch.empty_like(q, dtype=torch.float32 if A._AUTOWS_CFG.dq_fp32 else q.dtype)
     dk, dv = torch.empty_like(k), torch.empty_like(v)
 
     def bwd():
@@ -264,6 +263,43 @@ def _clc_bwd(q, k, v, do, so, asc, L, num_targets):
     return bwd
 
 
+def _tlx_raw_bwd(q, k, v, do, so, asc, L, num_targets):
+    """Backward-only closure for the TLX baseline: call the hand-written TLX
+    backward wrapper directly so both TLX and CLC variants are compared at the
+    same boundary -- prepared inputs and gradient buffers, without forward or
+    autograd dispatch.
+
+    SiLU TLX does not consume M/Delta, but its common wrapper requires pointer
+    arguments. Keep stable dummy buffers outside the timed call."""
+    dq = torch.empty_like(q, dtype=torch.float32)
+    dk, dv = torch.empty_like(k), torch.empty_like(v)
+    M = torch.empty((1, ), device=q.device, dtype=torch.float32)
+    Delta = torch.empty((1, ), device=q.device, dtype=torch.float32)
+
+    def bwd():
+        T.tlx_hstu_attention_bwd(
+            dout=do,
+            q=q,
+            k=k,
+            v=v,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            seq_offsets=so,
+            attn_scale=asc,
+            max_seq_len=L,
+            alpha=1.0 / D,
+            M=M,
+            Delta=Delta,
+            stride_mm=1,
+            num_softmax_heads=0,
+            num_targets=num_targets,
+            causal=True,
+        )
+
+    return bwd
+
+
 def _time_variant(variant, L, Z, nrep, run, kw, tensors, mode):
     """Compile, warm and time fwd+bwd for ONE variant inside the caller's knobs
     scope. `mode` selects the work done after the warm-up backward: "bench"
@@ -273,8 +309,10 @@ def _time_variant(variant, L, Z, nrep, run, kw, tensors, mode):
     q, k, v, do, so, asc = tensors
     warmup = int(os.environ.get("BENCH_WARMUP", "25"))
     rep = int(os.environ.get("BENCH_REP", "100"))
-    if variant == "autows_clc":
-        bwd = _clc_bwd(q, k, v, do, so, asc, L, kw.get("num_targets"))
+    if variant in ("autows_clc", "tlx_raw"):
+        # Compare backward wrappers at the same boundary: prepared inputs and
+        # gradient buffers, without forward or autograd dispatch.
+        bwd = (_tlx_raw_bwd if variant == "tlx_raw" else _clc_bwd)(q, k, v, do, so, asc, L, kw.get("num_targets"))
         fwd_s = [float("nan")] * nrep
     else:
         fwd = lambda: run(q, k, v, so, L, asc, **kw)  # noqa: E731
@@ -304,7 +342,8 @@ def _time_variant(variant, L, Z, nrep, run, kw, tensors, mode):
     logger.info("%s backward-ready", variant)
     bwd_s = [triton.testing.do_bench(bwd, warmup=warmup, rep=rep) for _ in range(nrep)]
     fm, bm = statistics.mean(fwd_s), statistics.mean(bwd_s)
-    fsd = (float("nan") if variant == "autows_clc" else (statistics.stdev(fwd_s) if len(fwd_s) > 1 else 0.0))
+    fsd = (float("nan") if variant in ("autows_clc", "tlx_raw") else
+           (statistics.stdev(fwd_s) if len(fwd_s) > 1 else 0.0))
     bsd = statistics.stdev(bwd_s) if len(bwd_s) > 1 else 0.0
     print(f"PERF {variant} L={L} Z={Z} fwd={fm:.4f} fwd_sd={fsd:.4f} bwd={bm:.4f} bwd_sd={bsd:.4f}")
 
@@ -417,7 +456,8 @@ def main():
     ap.add_argument("--perf", action="store_true", help="run the fwd/bwd latency benchmark")
     ap.add_argument("--acc", action="store_true", help="run the accuracy check (default)")
     ap.add_argument("--nrep", type=int, default=1, help="do_bench repetitions per point; >1 reports mean + std")
-    ap.add_argument("--variants", default="autows,tlx,triton", help="comma subset of autows,tlx,triton (perf)")
+    ap.add_argument("--variants", default="autows,tlx,triton",
+                    help="comma subset of autows,autows_clc,tlx,tlx_raw,triton (perf)")
     ap.add_argument("--seqlens", default=None, help="comma L list, e.g. 256,512,1024,4096")
     ap.add_argument("--batch", type=int, default=None, help="batch Z (default 2)")
     ap.add_argument("--heads", type=int, default=None, help="num heads H (perf; default 2)")

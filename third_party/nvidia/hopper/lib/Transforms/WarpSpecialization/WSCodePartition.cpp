@@ -4074,11 +4074,14 @@ void insertAsyncComm(
           bool releaseOnLastIterOnly = false;
           if (addCompletionBarrier) {
             if (auto mmaLoop = mmaOp->getParentOfType<scf::ForOp>()) {
-              if (auto prodLoop = headProducer->getParentOfType<scf::ForOp>()) {
+              Operation *prodLoop = headProducer->getParentOp();
+              while (prodLoop && !isa<scf::ForOp, scf::WhileOp>(prodLoop))
+                prodLoop = prodLoop->getParentOp();
+              if (prodLoop) {
                 for (Operation *anc = mmaLoop->getParentOp();
                      anc && !isa<triton::FuncOp>(anc);
                      anc = anc->getParentOp()) {
-                  if (anc == prodLoop.getOperation()) {
+                  if (anc == prodLoop) {
                     releaseOnLastIterOnly = true;
                     break;
                   }
@@ -4238,8 +4241,9 @@ void insertAsyncComm(
                 earlyTokenIt->second.consumerBarriers.find(earlyToken.first);
             if (cbIt != earlyTokenIt->second.consumerBarriers.end()) {
               if (elidedCompletionArrival.contains(earlyChannelForReuseSync))
-                llvm::report_fatal_error(llvm::Twine(
-                    "intra-iteration reuse sync would wait on channel ") +
+                llvm::report_fatal_error(
+                    llvm::Twine(
+                        "intra-iteration reuse sync would wait on channel ") +
                     llvm::Twine(earlyChannelForReuseSync->uniqID) +
                     "'s consumer barrier, but its completion arrival was "
                     "elided by the whole-TMEM-overwrite proof");
@@ -4307,8 +4311,9 @@ void insertAsyncComm(
                 wrapTokenIt->second.consumerBarriers.find(wrapToken.first);
             if (wcbIt != wrapTokenIt->second.consumerBarriers.end()) {
               if (elidedCompletionArrival.contains(wrapCh))
-                llvm::report_fatal_error(llvm::Twine(
-                    "wrap-around reuse sync would wait on channel ") +
+                llvm::report_fatal_error(
+                    llvm::Twine(
+                        "wrap-around reuse sync would wait on channel ") +
                     llvm::Twine(wrapCh->uniqID) +
                     "'s consumer barrier, but its completion arrival was "
                     "elided by the whole-TMEM-overwrite proof");

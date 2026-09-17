@@ -1,0 +1,8 @@
+{
+  "priority": 20,
+  "backends": ["cuda", "nvidia"],
+  "architectures": ["blackwell", "sm100", "sm_100", "b200", "b200a", "gb200", "gb300"],
+  "documents": [
+    "persistent-clc-scheduling.md"
+  ]
+}
