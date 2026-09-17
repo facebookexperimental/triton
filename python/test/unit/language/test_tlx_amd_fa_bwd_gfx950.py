@@ -95,6 +95,26 @@ def _assert_scratch_free(name, compiled):
     }, (name, resources)
 
 
+def _capture_kernel_with_constexprs(monkeypatch, module, name, **constexprs):
+    kernel = getattr(module, name)
+    launches = []
+
+    class CapturedKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                kwargs.update(constexprs)
+                compiled = kernel[grid](*args, **kwargs)
+                launches.append((kwargs, compiled))
+                return compiled
+
+            return launch
+
+    monkeypatch.setattr(module, name, CapturedKernel())
+    return launches
+
+
 def _make_varlen_d128_reference_case(
     q_lengths,
     kv_lengths,
@@ -240,6 +260,42 @@ def test_d64_causal_gqa8_codegen_is_scratch_free_gfx950(monkeypatch):
         for compiled in compiled_objects:
             _assert_scratch_free(kernel.fn.__name__, compiled)
             assert not re.search(r"\b\w*atomic\w*\b", compiled.asm["amdgcn"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("register_class", ("default", None, "vgpr", "agpr"), ids=("default", "none", "vgpr", "agpr"))
+@pytest.mark.parametrize(
+    ("shape", "family", "default_class"),
+    (
+        pytest.param((1, 8, 8, 16384, 16384, 64), "mha", None, id="mha"),
+        pytest.param((1, 16, 2, 8192, 8192, 64), "gqa8", "agpr", id="gqa8"),
+    ),
+)
+def test_d64_q3_register_class_tuning_gfx950(monkeypatch, register_class, shape, family, default_class):
+    monkeypatch.delenv("TRITON_DISABLE_POST_MISCHED", raising=False)
+    options = {} if register_class == "default" else {"Q3_REGISTER_CLASS": register_class}
+    expected_class = default_class if register_class == "default" else register_class
+    launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_bwd, f"_attn_bwd_dq_d64_causal_{family}_kernel",
+                                               **options)
+    case = _make_d64_aten_case(shape, causal=True, seed=3623)
+
+    actual = fa_backward(*case.kernel_args)
+    torch.cuda.synchronize()
+
+    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads, strict=True):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
+
+    assert len(launches) == 1
+    kwargs, compiled = launches[0]
+    assert kwargs["OWNER_FRAGMENTS"] == 4
+    q3_hints = re.findall(
+        r'amdg\.register_resident [^\n]*class "(\w+)" groups (\d+) : tensor<64x64xbf16,',
+        compiled.asm["ttir"],
+    )
+    assert q3_hints == ([] if expected_class is None else [(expected_class, "8")])
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -700,6 +756,42 @@ def test_varlen_d128_bm32_boundaries_gfx950(q_lengths, q_heads, kv_heads):
         relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
             reference.float())
         assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+
+@pytest.mark.parametrize("register_class", ("default", None, "vgpr", "agpr"), ids=("default", "none", "vgpr", "agpr"))
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_prefix_register_class_tuning_gfx950(monkeypatch, register_class):
+    options = {} if register_class == "default" else {"K_PREFIX_REGISTER_CLASS": register_class}
+    expected_class = None if register_class == "default" else register_class
+    launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_bm32_kernel",
+                                               **options)
+    case = _make_varlen_d128_reference_case(
+        [1, 17, 31, 32, 33, 5460],
+        [1, 255, 256, 257, 511, 17],
+        q_heads=3,
+        kv_heads=1,
+        seed=490,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale)
+    torch.cuda.synchronize()
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    assert len(launches) == 1
+    kwargs, compiled = launches[0]
+    assert kwargs["KV_SPLITS"] == 3
+    prefix_hints = re.findall(
+        r'amdg\.register_resident [^\n]*class "(\w+)" groups (\d+) : tensor<256x32xbf16,',
+        compiled.asm["ttir"],
+    )
+    assert prefix_hints == ([] if expected_class is None else [(expected_class, "4")])
 
 
 @pytest.mark.parametrize("metadata", ("legacy", "missing_sequence", "missing_start", "default_k96"))
