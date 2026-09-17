@@ -38,6 +38,28 @@ PERSISTENT_CTA_FRACTION = 0.92
 BWD_DIRECT_DQ_CONFIG = (False, 8, 2)
 
 
+def _forward_layout_bshd(q, k, v):
+    if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("attention requires matching four-dimensional Q, K, and V tensors")
+    values = (q, k, v)
+    if all(value.is_contiguous() for value in values):
+        return False
+    if all(
+        tuple(value.stride()) == (value.shape[2] * value.shape[1] * value.shape[3],
+                                  value.shape[3], value.shape[1] * value.shape[3], 1)
+        for value in values
+    ):
+        return True
+    raise ValueError("attention requires contiguous BHSD or matching BSHD-backed BHSD views")
+
+
+def _forward_descriptor(value, block_shape, layout_bshd):
+    b, h, n, d = value.shape
+    shape = [b * n, h * d] if layout_bshd else [b * h * n, d]
+    strides = [h * d, 1] if layout_bshd else [d, 1]
+    return TensorDescriptor(value, shape=shape, strides=strides, block_shape=block_shape)
+
+
 def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
@@ -401,6 +423,17 @@ def _compute_offsets(
     lo, hi = _get_fused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
     kv_offset_y = offset_y + lo
     return start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y
+
+
+@triton.jit
+def _forward_descriptor_offsets(qo_y, kv_y, off_hz, H: tl.constexpr, N_CTX, HEAD_DIM: tl.constexpr,
+                                LAYOUT_BSHD: tl.constexpr):
+    if LAYOUT_BSHD:
+        batch = off_hz // H
+        head = off_hz % H
+        row_shift = (batch - off_hz) * N_CTX
+        return qo_y + row_shift, kv_y + row_shift, head * HEAD_DIM
+    return qo_y, kv_y, 0
 
 
 @triton.jit
@@ -1134,6 +1167,7 @@ def _fwd_control_tile(
     SKIP_RESCALE,
     FUSE_EPILOG,
     GLOBAL_LPT: tl.constexpr,
+    LAYOUT_BSHD: tl.constexpr = False,
 ):
     start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
         tile_id // NUM_CTAS,
@@ -1148,6 +1182,8 @@ def _fwd_control_tile(
         GRID_X_STATIC,
         GLOBAL_LPT,
     )
+    qo_offset_y, kv_offset_y, offset_x = _forward_descriptor_offsets(
+        qo_offset_y, kv_offset_y, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
     control_lo = hi if SKIP_RESCALE else lo
     # Rescale the live output accumulator when the online-softmax gauge changes.
     for _ in tl.range(control_lo, hi, BLOCK_N):
@@ -1241,7 +1277,7 @@ def _fwd_control_tile(
         if FUSE_EPILOG:
             qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
             tlx.async_descriptor_store(
-                desc_o, o_tiles[cid], [qo_offset_y_split, 0], eviction_policy="evict_first")
+                desc_o, o_tiles[cid], [qo_offset_y_split, offset_x], eviction_policy="evict_first")
             tlx.async_descriptor_store_wait(0)
             tlx.barrier_arrive(o_empties[cid])
         else:
@@ -1265,6 +1301,7 @@ def _fwd_load_first_k_tile(
     NUM_BUFFERS_KV: tl.constexpr,
     cluster_cta_rank,
     NUM_CTAS: tl.constexpr,
+    offset_x=0,
 ):
     buf, phase = get_bufidx_phase(accum_cnt_k, NUM_BUFFERS_KV)
     tlx.barrier_wait(k_empties[buf], phase ^ 1)
@@ -1273,7 +1310,7 @@ def _fwd_load_first_k_tile(
     tlx.async_descriptor_load(
         desc_k,
         k_tiles[buf],
-        [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), 0],
+        [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), offset_x],
         k_fulls[buf],
         two_ctas=True,
     )
@@ -1312,6 +1349,7 @@ def _fwd_load_tile(
     NUM_GROUPS_PER_CTA: tl.constexpr = 2,
     NUM_CTAS: tl.constexpr = 1,
     SKIP_FIRST_K: tl.constexpr = False,
+    offset_x=0,
 ):
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
     # load q0
@@ -1325,7 +1363,7 @@ def _fwd_load_tile(
             tlx.async_descriptor_load(
                 desc_q,
                 q_tiles[q_id],
-                [qo_offset_y + (group_id * NUM_CTAS + cluster_cta_rank) * BLOCK_M_SPLIT, 0],
+                [qo_offset_y + (group_id * NUM_CTAS + cluster_cta_rank) * BLOCK_M_SPLIT, offset_x],
                 q_fulls[q_id],
                 two_ctas=True,
             )
@@ -1337,7 +1375,7 @@ def _fwd_load_tile(
             tlx.async_descriptor_load(
                 desc_v,
                 v_tiles[buf],
-                [kv_offset_y, cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+                [kv_offset_y, offset_x + cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
                 v_fulls[buf],
                 two_ctas=True,
             )
@@ -1355,14 +1393,14 @@ def _fwd_load_tile(
             tlx.async_descriptor_load(
                 desc_k,
                 kv_tiles[buf],
-                [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), 0],
+                [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), offset_x],
                 kv_fulls[buf],
                 two_ctas=True,
             )
             tlx.async_descriptor_load(
                 desc_v,
                 v_tiles[buf],
-                [kv_offset_y, cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+                [kv_offset_y, offset_x + cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
                 v_fulls[buf],
                 two_ctas=True,
             )
@@ -1373,7 +1411,7 @@ def _fwd_load_tile(
     tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
     tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
     qo_offset_y_split = qo_offset_y
-    tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
+    tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, offset_x], q_fulls[q_bufIdx])
 
     # loop over loading k, v
     k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
@@ -1384,14 +1422,14 @@ def _fwd_load_tile(
     k_full = tlx.local_view(kv_fulls, k_bufIdx)
     k_tile = tlx.local_view(kv_tiles, k_bufIdx)
     tlx.barrier_expect_bytes(k_full, K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-    tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
+    tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, offset_x], k_full)
 
     # load q1
     q_bufIdx += NUM_BUFFERS_Q
     tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
     tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
     qo_offset_y_split = qo_offset_y + BLOCK_M_SPLIT
-    tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, 0], q_fulls[q_bufIdx])
+    tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo_offset_y_split, offset_x], q_fulls[q_bufIdx])
 
     v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
     v_empty = tlx.local_view(kv_empties, v_bufIdx)
@@ -1400,7 +1438,7 @@ def _fwd_load_tile(
     v_full = tlx.local_view(kv_fulls, v_bufIdx)
     v_tile = tlx.local_view(kv_tiles, v_bufIdx)
     tlx.barrier_expect_bytes(v_full, V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-    tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
+    tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, offset_x], v_full)
 
     kv_offset_y += BLOCK_N
     accum_cnt_kv += 2
@@ -1413,7 +1451,7 @@ def _fwd_load_tile(
         k_full = tlx.local_view(kv_fulls, k_bufIdx)
         k_tile = tlx.local_view(kv_tiles, k_bufIdx)
         tlx.barrier_expect_bytes(k_full, K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-        tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, 0], k_full)
+        tlx.async_descriptor_load(desc_k, k_tile, [kv_offset_y, offset_x], k_full)
 
         v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
         v_empty = tlx.local_view(kv_empties, v_bufIdx)
@@ -1422,7 +1460,7 @@ def _fwd_load_tile(
         v_full = tlx.local_view(kv_fulls, v_bufIdx)
         v_tile = tlx.local_view(kv_tiles, v_bufIdx)
         tlx.barrier_expect_bytes(v_full, V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-        tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, 0], v_full)
+        tlx.async_descriptor_load(desc_v, v_tile, [kv_offset_y, offset_x], v_full)
 
         kv_offset_y += BLOCK_N
         accum_cnt_kv += 2
@@ -1736,7 +1774,7 @@ def _fwd_mma_tile(
 
 @triton.autotune(
     configs=configs,
-    key=["N_CTX", "HEAD_DIM", "H", "STAGE"],
+    key=["N_CTX", "HEAD_DIM", "H", "STAGE", "LAYOUT_BSHD"],
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
@@ -1772,11 +1810,12 @@ def _attn_fwd_ws(
     GRID_X_STATIC: tl.constexpr = 1,
     COMPACT_CLC: tl.constexpr = False,
     GLOBAL_LPT: tl.constexpr = False,
+    LAYOUT_BSHD: tl.constexpr = False,
 ):
     _attn_fwd_ws_kernel(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N, STAGE,
                         NUM_BUFFERS_Q, NUM_BUFFERS_KV, NUM_BUFFERS_QK, NUM_MMA_GROUPS, NUM_MMA_SLICES, GROUP_SIZE_N,
                         RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS, PIPELINED, POLICY, DENSE_REGS, FAST_FIXED,
-                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC, GLOBAL_LPT)
+                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC, GLOBAL_LPT, LAYOUT_BSHD=LAYOUT_BSHD)
 
 
 @triton.jit
@@ -1812,6 +1851,7 @@ def _attn_fwd_ws_kernel(
     GRID_X_STATIC: tl.constexpr = 1,
     COMPACT_CLC: tl.constexpr = False,
     GLOBAL_LPT: tl.constexpr = False,
+    LAYOUT_BSHD: tl.constexpr = False,
 ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -2105,6 +2145,7 @@ def _attn_fwd_ws_kernel(
                         USE_FAST_FIXED,
                         FUSE_EPILOG,
                         GLOBAL_LPT,
+                        LAYOUT_BSHD=LAYOUT_BSHD,
                     )
                 tile_count += 1
                 if DIRECT_SCHED:
@@ -2365,7 +2406,7 @@ def _attn_fwd_ws_kernel(
                 accum_cnt_k = 0
                 tile_id = start_pid
                 while tile_id != -1:
-                    _, _, lo, hi, _, kv_offset_y = _compute_offsets(
+                    _, off_hz, lo, hi, _, kv_offset_y = _compute_offsets(
                         tile_id,
                         H,
                         num_pid_n,
@@ -2378,6 +2419,8 @@ def _attn_fwd_ws_kernel(
                         OFFSET_GRID_X,
                         GLOBAL_LPT,
                     )
+                    _, kv_offset_y, offset_x = _forward_descriptor_offsets(
+                        0, kv_offset_y, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
                     accum_cnt_k = _fwd_load_first_k_tile(
                         accum_cnt_k,
                         lo,
@@ -2393,6 +2436,7 @@ def _attn_fwd_ws_kernel(
                         NUM_BUFFERS_KV,
                         cluster_cta_rank,
                         NUM_CTAS,
+                        offset_x=offset_x,
                     )
                     tlx.named_barrier_wait(15, 64)
                     next_tile_id = tile_id + persistent_stride
@@ -2405,7 +2449,7 @@ def _attn_fwd_ws_kernel(
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
+                _, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_id,
                     H,
                     num_pid_n,
@@ -2418,6 +2462,8 @@ def _attn_fwd_ws_kernel(
                     OFFSET_GRID_X,
                     GLOBAL_LPT,
                 )
+                qo_offset_y, kv_offset_y, offset_x = _forward_descriptor_offsets(
+                    qo_offset_y, kv_offset_y, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
                 if USE_2CTA:
                     accum_cnt_kv = _fwd_load_tile(
                         tile_count,
@@ -2450,6 +2496,7 @@ def _attn_fwd_ws_kernel(
                         NUM_GROUPS_PER_CTA,
                         NUM_CTAS,
                         SKIP_FIRST_K=USE_FAST_FIXED,
+                        offset_x=offset_x,
                     )
                     if USE_FAST_FIXED:
                         tlx.named_barrier_arrive(15, 64)
@@ -2478,6 +2525,7 @@ def _attn_fwd_ws_kernel(
                         HEAD_DIM,
                         NUM_BUFFERS_Q,
                         NUM_BUFFERS_KV,
+                        offset_x=offset_x,
                     )
 
                 tile_count += 1
@@ -2507,7 +2555,7 @@ def _attn_fwd_ws_kernel(
                 clc_phase_consumer = 0
                 while tile_id != -1:
                     # initialize offsets
-                    _, _, _, _, qo_offset_y, _ = _compute_offsets(
+                    _, off_hz, _, _, qo_offset_y, _ = _compute_offsets(
                         tile_id,
                         H,
                         num_pid_n,
@@ -2520,6 +2568,8 @@ def _attn_fwd_ws_kernel(
                         OFFSET_GRID_X,
                         GLOBAL_LPT,
                     )
+                    qo_offset_y, _, offset_x = _forward_descriptor_offsets(
+                        qo_offset_y, 0, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
                     _, phase = get_bufidx_phase(tile_count, 1)
                     if USE_FAST_FIXED and NUM_GROUPS_PER_CTA == 2:
                         for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
@@ -2527,7 +2577,7 @@ def _attn_fwd_ws_kernel(
                             tlx.barrier_wait(o_fulls[cid], phase)
                             qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
                             tlx.async_descriptor_store(
-                                desc_o, o_tiles[cid], [qo_offset_y_split, 0], eviction_policy="evict_first")
+                                desc_o, o_tiles[cid], [qo_offset_y_split, offset_x], eviction_policy="evict_first")
                         tlx.async_descriptor_store_wait(1)
                         tlx.barrier_arrive(o_empties[0])
                         tlx.async_descriptor_store_wait(0)
@@ -2538,7 +2588,7 @@ def _attn_fwd_ws_kernel(
                             tlx.barrier_wait(o_fulls[cid], phase)
                             qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
                             tlx.async_descriptor_store(
-                                desc_o, o_tiles[cid], [qo_offset_y_split, 0], eviction_policy="evict_first")
+                                desc_o, o_tiles[cid], [qo_offset_y_split, offset_x], eviction_policy="evict_first")
                         for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                             tlx.async_descriptor_store_wait(NUM_GROUPS_PER_CTA - 1 - cid)
                             tlx.barrier_arrive(o_empties[cid])
@@ -2563,31 +2613,50 @@ def _attn_fwd_ws_kernel(
 
 
 @triton.jit
+def _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM: tl.constexpr,
+                    N_HEAD: tl.constexpr, STRIDES: tl.constexpr):
+    if STRIDES is None:
+        return off_hz * HEAD_DIM * N_CTX + off_m * HEAD_DIM
+    else:
+        return ((off_hz // N_HEAD) * STRIDES[0] + (off_hz % N_HEAD) * STRIDES[1]
+                + off_m * STRIDES[2])
+
+
+@triton.jit
 def _attn_bwd_preprocess(O, DO,  #
                          M, DO_SCALED, Delta, DQ_ACCUM,  #
                          N_CTX,  #
                          SCALE_DO_BY_INV_L: tl.constexpr,
                          ZERO_DQ: tl.constexpr,
                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                         N_HEAD: tl.constexpr = 1,
+                         O_STRIDES: tl.constexpr = None,
+                         DO_STRIDES: tl.constexpr = None,
+                         SCALED_DO_STRIDES: tl.constexpr = None,
+                         DQ_STRIDES: tl.constexpr = None,
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
     # load
-    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do_ptrs = DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]
+    o_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM, N_HEAD, O_STRIDES)
+    do_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM, N_HEAD, DO_STRIDES)
+    o = tl.load(O + o_rows[:, None] + off_n[None, :])
+    do_ptrs = DO + do_rows[:, None] + off_n[None, :]
     do = tl.load(do_ptrs).to(tl.float32)
     if SCALE_DO_BY_INV_L:
         inv_l = tl.load(M + off_hz * N_CTX + off_m)
         do = (do * inv_l[:, None]).to(DO.dtype.element_ty)
-        tl.store(DO_SCALED + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :], do)
+        scaled_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM, N_HEAD, SCALED_DO_STRIDES)
+        tl.store(DO_SCALED + scaled_rows[:, None] + off_n[None, :], do)
         do = do.to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
     if ZERO_DQ:
+        dq_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM, N_HEAD, DQ_STRIDES)
         tl.store(
-            DQ_ACCUM + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :],
+            DQ_ACCUM + dq_rows[:, None] + off_n[None, :],
             0.0,
         )
 
@@ -2597,6 +2666,8 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
                              N_CTX,  #
                              BLK: tl.constexpr, HALF_HD: tl.constexpr,  #
                              BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                             N_HEAD: tl.constexpr = 1,
+                             DQ_STRIDES: tl.constexpr = None,
                              ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
@@ -2610,7 +2681,8 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
     packed_row = 2 * tile_base + local + BLK * half
     src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + col
     val = tl.load(src)
-    dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
+    output_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM, N_HEAD, DQ_STRIDES)
+    dst = DQ_OUT + output_rows[:, None] + h
     tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
 
 
@@ -5028,6 +5100,7 @@ class _attention(torch.autograd.Function):
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
+        layout_bshd = _forward_layout_bshd(q, k, v)
         plan = _select_forward_plan(q, k, v, causal)
 
         o = torch.empty_like(q)
@@ -5039,30 +5112,10 @@ class _attention(torch.autograd.Function):
 
         use_2cta = plan.num_ctas == 2
         dummy_block = [128, HEAD_DIM_K] if plan.pipelined else [1, 1]
-        desc_q = TensorDescriptor(
-            q,
-            shape=[y_dim, HEAD_DIM_K],
-            strides=[HEAD_DIM_K, 1],
-            block_shape=dummy_block,
-        )
-        desc_v = TensorDescriptor(
-            v,
-            shape=[y_dim, HEAD_DIM_K],
-            strides=[HEAD_DIM_K, 1],
-            block_shape=[128, 64] if use_2cta else dummy_block,
-        )
-        desc_k = TensorDescriptor(
-            k,
-            shape=[y_dim, HEAD_DIM_K],
-            strides=[HEAD_DIM_K, 1],
-            block_shape=[64, 128] if use_2cta else dummy_block,
-        )
-        desc_o = TensorDescriptor(
-            o,
-            shape=[y_dim, HEAD_DIM_K],
-            strides=[HEAD_DIM_K, 1],
-            block_shape=dummy_block,
-        )
+        desc_q = _forward_descriptor(q, dummy_block, layout_bshd)
+        desc_v = _forward_descriptor(v, [128, 64] if use_2cta else dummy_block, layout_bshd)
+        desc_k = _forward_descriptor(k, [64, 128] if use_2cta else dummy_block, layout_bshd)
+        desc_o = _forward_descriptor(o, dummy_block, layout_bshd)
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -5098,6 +5151,7 @@ class _attention(torch.autograd.Function):
                 desc_k,
                 desc_v,
                 desc_o,  #
+                LAYOUT_BSHD=layout_bshd,
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
                 BLOCK_M=256,
@@ -5150,6 +5204,7 @@ class _attention(torch.autograd.Function):
                 desc_k,
                 desc_v,
                 desc_o,
+                LAYOUT_BSHD=layout_bshd,
                 N_CTX=q.shape[2],
                 HEAD_DIM=HEAD_DIM_K,
                 STAGE=plan.stage,
@@ -5180,8 +5235,8 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, M = ctx.saved_tensors
-        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-        assert o.is_contiguous() and do.is_contiguous()
+        assert all(tensor.is_contiguous() or tensor.transpose(1, 2).is_contiguous()
+                   for tensor in (q, k, v, o, do))
         assert ctx.HEAD_DIM in (64, 128), "backward requires head dimension 64 or 128"
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         direct_dq_output = (
@@ -5196,11 +5251,11 @@ class _attention(torch.autograd.Function):
         )
         if direct_dq_output:
             if bf16_dq_output:
-                dq = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+                dq = torch.empty_like(q, dtype=torch.bfloat16)
             else:
-                dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+                dq = torch.empty_like(q, dtype=torch.float32)
         else:
-            dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+            dq = torch.empty_like(q, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         _HALF_HD = ctx.HEAD_DIM // 2
@@ -5232,43 +5287,47 @@ class _attention(torch.autograd.Function):
             SCALE_DO_BY_INV_L=scale_do_by_inv_l,
             ZERO_DQ=preprocess_zeroes_dq,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
+            N_HEAD=N_HEAD,
+            O_STRIDES=None if o.is_contiguous() else o.stride()[:3],
+            DO_STRIDES=None if do.is_contiguous() else do.stride()[:3],
+            SCALED_DO_STRIDES=None if do_scaled.is_contiguous() else do_scaled.stride()[:3],
+            DQ_STRIDES=None if dq_accum.is_contiguous() else dq_accum.stride()[:3],
         )
 
         dummy_block = [1, 1, 1, 1]
         HEAD_DIM = ctx.HEAD_DIM
         desc_shape = [BATCH, N_HEAD, N_CTX, HEAD_DIM]
-        desc_strides = [N_HEAD * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, HEAD_DIM, 1]
         desc_k = TensorDescriptor(
             arg_k,
             shape=desc_shape,
-            strides=desc_strides,
+            strides=arg_k.stride(),
             block_shape=dummy_block,
         )
         desc_v = TensorDescriptor(
             v,
             shape=desc_shape,
-            strides=desc_strides,
+            strides=v.stride(),
             block_shape=dummy_block,
         )
         desc_q = TensorDescriptor(
             q,
             shape=desc_shape,
-            strides=desc_strides,
+            strides=q.stride(),
             block_shape=dummy_block,
         )
         desc_do = TensorDescriptor(
             do_scaled,
             shape=desc_shape,
-            strides=desc_strides,
+            strides=do_scaled.stride(),
             block_shape=dummy_block,
         )
         if direct_dq_output:
             packed_shape = [BATCH, N_HEAD, 2, N_CTX, _HALF_HD]
             packed_strides = [
-                N_HEAD * N_CTX * HEAD_DIM,
-                N_CTX * HEAD_DIM,
+                dq_accum.stride(0),
+                dq_accum.stride(1),
                 _HALF_HD,
-                HEAD_DIM,
+                dq_accum.stride(2),
                 1,
             ]
         else:
@@ -5283,13 +5342,13 @@ class _attention(torch.autograd.Function):
         desc_dk = TensorDescriptor(
             dk,
             shape=desc_shape,
-            strides=desc_strides,
+            strides=dk.stride(),
             block_shape=dummy_block,
         )
         desc_dv = TensorDescriptor(
             dv,
             shape=desc_shape,
-            strides=desc_strides,
+            strides=dv.stride(),
             block_shape=dummy_block,
         )
         desc_m = TensorDescriptor(
@@ -5305,9 +5364,9 @@ class _attention(torch.autograd.Function):
             block_shape=[1],
         )
 
-        desc_kt = TensorDescriptor(arg_k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-        desc_qt = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-        desc_dot = TensorDescriptor(do_scaled, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+        desc_kt = TensorDescriptor(arg_k, shape=desc_shape, strides=arg_k.stride(), block_shape=dummy_block)
+        desc_qt = TensorDescriptor(q, shape=desc_shape, strides=q.stride(), block_shape=dummy_block)
+        desc_dot = TensorDescriptor(do_scaled, shape=desc_shape, strides=do_scaled.stride(), block_shape=dummy_block)
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -5354,6 +5413,8 @@ class _attention(torch.autograd.Function):
                 N_CTX,  #
                 BLK=_blk, HALF_HD=_HALF_HD,  #
                 BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
+                N_HEAD=N_HEAD,
+                DQ_STRIDES=None if dq.is_contiguous() else dq.stride()[:3],
             )
 
         return dq, dk, dv, None, None
@@ -5363,18 +5424,17 @@ def attention(q, k, v, sm_scale, causal, config=None):
     if config is None:
         return _attention.apply(q, k, v, sm_scale, causal)
 
+    layout_bshd = _forward_layout_bshd(q, k, v)
     # Non-autotuned path with explicit config
     HEAD_DIM_K = q.shape[-1]
     stage = 3 if causal else 1
     o = torch.empty_like(q)
     M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-    y_dim = q.shape[0] * q.shape[1] * q.shape[2]
-
     dummy_block = [1, 1]
-    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-    desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+    desc_q = _forward_descriptor(q, dummy_block, layout_bshd)
+    desc_v = _forward_descriptor(v, dummy_block, layout_bshd)
+    desc_k = _forward_descriptor(k, dummy_block, layout_bshd)
+    desc_o = _forward_descriptor(o, dummy_block, layout_bshd)
 
     # Apply pre_hook to set block shapes
     nargs = {**config, "HEAD_DIM": HEAD_DIM_K, "desc_q": desc_q, "desc_k": desc_k, "desc_v": desc_v, "desc_o": desc_o}
@@ -5410,6 +5470,7 @@ def attention(q, k, v, sm_scale, causal, config=None):
         desc_k,
         desc_v,
         desc_o,
+        LAYOUT_BSHD=layout_bshd,
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
