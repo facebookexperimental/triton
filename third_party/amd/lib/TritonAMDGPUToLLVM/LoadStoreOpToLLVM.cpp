@@ -606,7 +606,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     }
 
     // vectorized iteration through all the pointer/mask/other elements
-    const int valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
+    const int valueElemNBits =
+        std::max(8u, valueElemTy.getIntOrFloatBitWidth());
     const size_t valueElemNBytes = valueElemNBits / 8;
     const int numVecs = numElems / vec;
 
@@ -1846,7 +1847,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     SmallVector<Value> maskElems =
         getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
 
-    const size_t valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
+    const size_t valueElemNBits =
+        std::max<int>(8, valueElemTy.getIntOrFloatBitWidth());
     const size_t valueElemNBytes = valueElemNBits / 8;
 
     auto cacheMod = *cacheModifier;
