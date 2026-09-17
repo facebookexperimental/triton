@@ -95,6 +95,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 8 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+  // CHECK-LABEL: @tensor_memory_base_before_alloc_marker
+  // CHECK: tcgen05.alloc.cta_group::1
+  // CHECK: [[EARLY_BASE:%.*]] = llvm.inttoptr
+  // CHECK: llvm.ptrtoint [[EARLY_BASE]] : !llvm.ptr<6> to i64
+  llvm.func @tensor_memory_base_before_alloc_marker() attributes {nvvm.kernel = 1 : ui1, nvvm.maxntid = array<i32: 128>} {
+    %base = nvg.tensor_memory_base
+    %address = llvm.ptrtoint %base : !llvm.ptr<6> to i64
+    ttng.tcgen5_global_alloc {allocation.offset = 0 : i32, tensor_memory_size = 128 : i32}
+    "use"(%address) : (i64) -> ()
+    llvm.return
+  }
+}
+
+// -----
+
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65544 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
   // CHECK-LABEL: @tensor_memory_base_lowering_tlx_2cta
   //      CHECK:    llvm.inline_asm has_side_effects

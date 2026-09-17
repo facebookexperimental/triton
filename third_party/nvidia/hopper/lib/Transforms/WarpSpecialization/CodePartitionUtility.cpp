@@ -6,6 +6,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/Support/JSON.h"
@@ -186,7 +187,8 @@ Operation *AllocChannel::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user))
+    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp,
+            ttnvws::DescriptorGatherOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
@@ -210,7 +212,8 @@ static void getAllConsumers(AllocChannel *ch,
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user) &&
+    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp,
+             ttnvws::DescriptorGatherOp>(user) &&
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
@@ -1838,7 +1841,7 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Load operations
-  if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  if (isa<ttnvws::DescriptorLoadOpInterface, tt::LoadOp, ttng::TMEMLoadOp,
           ttg::LocalLoadOp>(op))
     return true;
 
@@ -1944,10 +1947,13 @@ static std::string getKeyOpDescription(Operation *op) {
   }
 
   // For loads, show source and result
-  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOpInterface>(op)) {
     // NVWS "result" is the destination memdesc operand, not an SSA result.
+    Value buffer = isa<ttnvws::DescriptorLoadOp>(op)
+                       ? cast<ttnvws::DescriptorLoadOp>(op).getResult()
+                       : cast<ttnvws::DescriptorGatherOp>(op).getResult();
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
-       << formatInput(loadOp.getResult());
+       << formatInput(buffer);
     return result;
   }
   if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
@@ -2168,7 +2174,8 @@ static std::string getKeyOpLabel(Operation *op) {
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
     label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
-  } else if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  } else if (isa<ttnvws::DescriptorLoadOpInterface, tt::LoadOp,
+                 ttng::TMEMLoadOp,
                  ttg::LocalLoadOp>(op)) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
@@ -3563,7 +3570,11 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
         // Alloc associated with operand D can have multiple producers.
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user)) {
+      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp,
+                     ttnvws::DescriptorGatherOp>(user)) {
+        // NVWSInsertAllocas writes descriptor results directly into the
+        // communication buffer. Treat that operation as the producer, just as
+        // the pre-shim MemoryPlannerNVWSAdapter did.
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
@@ -3629,7 +3640,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
     SmallVector<Operation *> taskOwners = {consumer};
     // A memdesc view can carry boundary task IDs that do not all consume the
     // buffer. Descriptor channels synchronize with the terminal consumers.
-    if (isa<ttnvws::DescriptorLoadOp>(producerOp))
+    if (isa<ttnvws::DescriptorLoadOp, ttnvws::DescriptorGatherOp>(producerOp))
       taskOwners = getActualConsumers(consumer);
     for (Operation *taskOwner : taskOwners) {
       for (int id : getAsyncTaskIds(taskOwner)) {
@@ -3689,10 +3700,16 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
       auto *post = static_cast<AllocChannel *>(channels.back().get());
-      // Cache the resolved producer op so getSrcOp() survives a sibling
-      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
-      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
-      if (producerOp != allocOp)
+      // Fix the regression introduced by 401386fae8: cache only
+      // subtiled-region producers, whose template store survives sibling
+      // channel lowering. Ordinary TMA producers are replaced and erased by
+      // optimizeTMALoads, so caching them would leave a dangling pointer;
+      // getSrcOp() must rediscover their replacement from alloc users.
+      bool isSubtiledProducer =
+          producerOp &&
+          (isa<ttng::SubtiledRegionOp>(producerOp) ||
+           producerOp->getParentOfType<ttng::SubtiledRegionOp>());
+      if (producerOp != allocOp && isSubtiledProducer)
         post->cachedSrcOp = producerOp;
     }
   }

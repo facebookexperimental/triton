@@ -30,9 +30,6 @@ SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs);
 Operation *createAlloc(OpBuilder &builder, Location loc,
                        gpu::MemDescType memDescType, Value src);
 
-ArefCreateOp createArefCreateOp(OpBuilder &builder, ArrayRef<Type> arefTypes,
-                                ValueRange allocOps, Location loc);
-
 template <typename Range>
 inline std::optional<int> findValuePosInRange(const Range &range,
                                               mlir::Value v) {
@@ -53,10 +50,9 @@ struct PartitionId : std::pair<int, int> {
 std::optional<PartitionId> getPartitionId(Operation *op);
 #endif
 
-gpu::MemDescType getArefViewBufferType(gpu::MemDescType arefBufType);
-gpu::MemDescType getArefMultiBufferedType(gpu::MemDescType arefBufType,
-                                          int depth);
-int getArefDepth(gpu::MemDescType bufTy);
+gpu::MemDescType getSemaphoreViewBufferType(gpu::MemDescType bufType);
+gpu::MemDescType getSemaphoreMultiBufferedType(gpu::MemDescType bufType,
+                                               int depth);
 
 scf::ForOp getOuterWSLoop(scf::ForOp innerFor);
 } // namespace mlir::triton::nvws

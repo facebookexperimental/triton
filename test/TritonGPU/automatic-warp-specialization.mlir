@@ -1,8 +1,6 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 | FileCheck %s --check-prefix=CHECK --check-prefix=BASE --check-prefix=CLEAN
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 -tritongpu-pipeline | FileCheck %s --check-prefix=CHECK --check-prefix=PIPELINE --check-prefix=CLEAN
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 -tritongpu-pipeline -tritongpu-optimize-partition-warps | FileCheck %s --check-prefix=OPT --check-prefix=CLEAN
-// XFAIL: *
-
 // CLEAN: module
 // CLEAN-NOT: ttg.partition
 // CLEAN-NOT: ttg.warp_specialize.tag
@@ -44,7 +42,7 @@ tt.func @matmul_change_desc_in_prologue(
   // PIPELINE-NOT: tc_gen5_mma
   // CHECK-LABEL: partition1
   // OPT-LABEL: partition1
-  // OPT-SAME: num_warps(2)
+  // OPT-SAME: num_warps(1)
   // BASE-NOT: tt.make_tensor_descriptor
   // BASE-COUNT-2: ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 384 : i32}
   // BASE-COUNT-2: ttng.tensormap_create
