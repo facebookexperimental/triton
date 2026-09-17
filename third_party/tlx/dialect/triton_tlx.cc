@@ -301,19 +301,12 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               auto parentFunc =
-                   v.getParentRegion()->getParentOfType<tt::FuncOp>();
-               bool hasDeferredHelperLayout =
-                   v.getDefiningOp<tt::CallOp>() ||
-                   (parentFunc && parentFunc.getSymVisibility() == "private");
-               if (!type.getEncoding() && !hasDeferredHelperLayout)
-                 throw std::runtime_error(
-                     "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
              } else {
-               throw std::runtime_error("Unsupported type");
+               throw std::runtime_error(
+                   "release_layout expects a ranked tensor");
              }
            })
       .def("create_assert_same_layout",
