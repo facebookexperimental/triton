@@ -15,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _harness import Case, Prepared, close_enough, driver  # noqa: E402
 
 OP = "mm"
-REF_NAME = "torch.matmul"
+REF_NAME = "torch.matmul (hipBLASLt)" if torch.version.hip is not None else "torch.matmul"
 #: mm has a shape heuristic, so its default is a single analytically chosen
 #: config and a first call stays under a second.
 DEFAULT_SPACE = "heuristic"
@@ -40,13 +40,24 @@ def cases(synthetic: bool = False) -> list[Case]:
     # dtype is a Case field, so it is dropped from `shape` -- carrying it in
     # both duplicates it in the key and in the report.
     return [
-        Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
-             label=label(*entry)) for entry in shapes(synthetic)
+        Case(
+            op=OP,
+            arch=driver.arch(),
+            dtype=str(DTYPES[entry[5]]).removeprefix("torch."),
+            shape=tuple(entry[:5]),
+            label=label(*entry),
+        )
+        for entry in shapes(synthetic)
     ]
 
 
 def prepare(case: Case, space: str) -> Prepared:
     from triton.tlx.ops import mm as tlx_mm
+
+    if torch.version.hip is not None:
+        # Pin the production AMD matmul backend instead of inheriting a process-
+        # global preference that could silently switch the reference to rocBLAS.
+        torch.backends.cuda.preferred_blas_library("hipblaslt")
 
     M, N, K, a_strides, b_strides = case.shape
     dtype = getattr(torch, case.dtype)
