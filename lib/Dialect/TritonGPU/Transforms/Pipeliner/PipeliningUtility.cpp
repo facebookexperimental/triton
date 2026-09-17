@@ -229,7 +229,8 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op) ||
       isa<tt::DescriptorStoreLikeOpInterface>(op) ||
       isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
-          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
+          ttng::AsyncTMAScatterOp, ttng::TMAStoreWaitOp,
+          ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
     auto ifOp =

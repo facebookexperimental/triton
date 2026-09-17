@@ -33,6 +33,29 @@ tt.func public @softmax_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90"} {
 
+// A pre-lowered TMA wait can already be part of an explicit schedule, as in
+// FA backward with early TMA-store lowering. Dynamic trip counts require the
+// moved wait to be guarded in peeled pipeline iterations.
+// CHECK-LABEL: @scheduled_tma_store_wait
+// CHECK: scf.if %{{.*}} {
+// CHECK-NEXT: ttng.async_tma_store_wait {pendings = 0 : i32, read_only}
+tt.func public @scheduled_tma_store_wait(%lb: i32, %ub: i32) {
+  %c1_i32 = arith.constant 1 : i32
+  scf.for %iv = %lb to %ub step %c1_i32 : i32 {
+    ttng.async_tma_store_wait {loop.cluster = 0 : i32, loop.stage = 0 : i32,
+                               pendings = 0 : i32, read_only}
+    %next = arith.addi %iv, %c1_i32 {loop.cluster = 1 : i32,
+                                     loop.stage = 1 : i32} : i32
+  } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
+  tt.return
+}
+
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90"} {
+
 // CHECK-LABEL: @scalar_load
 tt.func public @scalar_load(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32, %arg3: f32) -> f32 {
   %c1_i32 = arith.constant 1 : i32

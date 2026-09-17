@@ -63,6 +63,16 @@ annotations retain precedence. The outer driver now sweeps the full
 schedule × memory-space × physical-memory product, and the pass emits a
 `memory-space` manifest record so every selected rank is verified.
 
+**Current Milestone D stop point:** The annotation-free BM128 FA-backward
+candidate now compiles through software-pipeline expansion. Pre-lowered
+`ttng.async_tma_store_wait` operations selected into a peeled pipeline stage
+are predicated with the same `scf.if` mechanism as the other unmaskable TMA
+side effects. The selected schedule rank 1, memory-space rank 1, and physical
+memory rank 0 compile and launch, but the first result synchronization hangs.
+The next task is therefore to locate the missing or mis-phased synchronization
+edge in that selected candidate, reject or repair it generally, and only then
+add the annotation-free end-to-end correctness test.
+
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
 with 128x128x128 tiles and eight-way output subtiling has been captured at the
 pre-modulo and post-buffer-allocation boundaries. The pass-local scheduler test
@@ -814,6 +824,10 @@ as a hard correctness floor.
 - [x] FA-backward's remaining dS memory-space choice is represented by a
       general pre-allocation search rank and covered with captured production
       TTGIR.
+- [x] Annotation-free BM128 FA backward compiles through software-pipeline
+      expansion with scheduled TMA waits predicated safely.
+- [ ] Annotation-free BM128 FA backward completes runtime synchronization and
+      passes numerical correctness.
 - [ ] Remove the source memtype annotations after correctness and performance
       select the annotation-free candidate.
 - [ ] Default-off compilation remains unchanged.
