@@ -1,5 +1,35 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx1250" | FileCheck %s
 
+// A peeled/unrolled GEMM must retain the 2x2 warp layout across the remainder
+// loop. Its accumulator result is independent of the returned A/B operands.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+// CHECK-LABEL: @wmma_independent_loop_results
+// CHECK: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHECK: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHECK: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @wmma_independent_loop_results(
+      %a: tensor<256x32xf16, #dotOp0>, %b: tensor<32x256xf16, #dotOp1>,
+      %lb: index, %ub: index, %step: index) -> tensor<256x256xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<256x256xf32, #blocked>
+    %first = tt.dot %a, %b, %zero : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    %r:3 = scf.for %iv = %lb to %ub step %step iter_args(%acc = %first, %a_iter = %a, %b_iter = %b)
+        -> (tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>) {
+      %next = tt.dot %a_iter, %b_iter, %acc : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+      %next_a = arith.addf %a_iter, %a : tensor<256x32xf16, #dotOp0>
+      %next_b = arith.addf %b_iter, %b : tensor<32x256xf16, #dotOp1>
+      scf.yield %next, %next_a, %next_b : tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>
+    }
+    %last = tt.dot %r#1, %r#2, %r#0 : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    tt.return %last : tensor<256x256xf32, #blocked>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>

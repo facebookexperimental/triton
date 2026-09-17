@@ -1,7 +1,99 @@
-// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx942 matrix-instruction-size=16" | FileCheck %s --check-prefixes MFMA16,CHECK
-// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx942 matrix-instruction-size=32" | FileCheck %s --check-prefixes MFMA32,CHECK
-// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx950 matrix-instruction-size=32" | FileCheck %s --check-prefixes CHECK-GFX950
-// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx950 matrix-instruction-size=16" | FileCheck %s --check-prefixes CHECK-GFX950
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx942 matrix-instruction-size=16" | FileCheck %s --check-prefixes MFMA16,CHECK,CHAIN
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx942 matrix-instruction-size=32" | FileCheck %s --check-prefixes MFMA32,CHECK,CHAIN
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx950 matrix-instruction-size=32" | FileCheck %s --check-prefixes CHECK-GFX950,CHAIN
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx950 matrix-instruction-size=16" | FileCheck %s --check-prefixes CHECK-GFX950,CHAIN
+
+// Accumulating into one loop result does not create a chain through the
+// independent A/B operands returned by that same loop.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHAIN: #mma = #ttg.amd_mfma<{{.*}}warpsPerCTA = [2, 2]
+// CHAIN-LABEL: @independent_loop_results
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @independent_loop_results(
+      %a: tensor<256x32xf16, #dotOp0>, %b: tensor<32x256xf16, #dotOp1>,
+      %lb: index, %ub: index, %step: index) -> tensor<256x256xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<256x256xf32, #blocked>
+    %first = tt.dot %a, %b, %zero : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    %r:3 = scf.for %iv = %lb to %ub step %step iter_args(%acc = %first, %a_iter = %a, %b_iter = %b)
+        -> (tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>) {
+      %next = tt.dot %a_iter, %b_iter, %acc : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+      %next_a = arith.addf %a_iter, %a : tensor<256x32xf16, #dotOp0>
+      %next_b = arith.addf %b_iter, %b : tensor<32x256xf16, #dotOp1>
+      scf.yield %next, %next_a, %next_b : tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>
+    }
+    %last = tt.dot %r#1, %r#2, %r#0 : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    tt.return %last : tensor<256x256xf32, #blocked>
+  }
+}
+
+// -----
+
+// Real operand dependencies must survive both the loop and conditional yields.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHAIN: #mma = #ttg.amd_mfma<{{.*}}warpsPerCTA = [4, 1]
+// CHAIN-LABEL: @chain_through_loop_and_if
+// CHAIN: tt.dot {{.*}} -> tensor<128x128xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<128x128xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @chain_through_loop_and_if(
+      %a: tensor<128x128xf16, #dotOp0>, %b: tensor<128x128xf16, #dotOp1>,
+      %lb: index, %ub: index, %step: index, %pred: i1) -> tensor<128x128xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
+    %first = tt.dot %a, %b, %zero : tensor<128x128xf16, #dotOp0> * tensor<128x128xf16, #dotOp1> -> tensor<128x128xf32, #blocked>
+    %half = arith.truncf %first : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
+    %p = ttg.convert_layout %half : tensor<128x128xf16, #blocked> -> tensor<128x128xf16, #dotOp0>
+    %r:2 = scf.for %iv = %lb to %ub step %step iter_args(%p_iter = %p, %other = %a)
+        -> (tensor<128x128xf16, #dotOp0>, tensor<128x128xf16, #dotOp0>) {
+      %next_p = arith.addf %p_iter, %p : tensor<128x128xf16, #dotOp0>
+      %next_other = arith.addf %other, %a : tensor<128x128xf16, #dotOp0>
+      scf.yield %next_p, %next_other : tensor<128x128xf16, #dotOp0>, tensor<128x128xf16, #dotOp0>
+    }
+    %selected = scf.if %pred -> tensor<128x128xf16, #dotOp0> {
+      scf.yield %r#0 : tensor<128x128xf16, #dotOp0>
+    } else {
+      %sum = arith.addf %r#0, %r#1 : tensor<128x128xf16, #dotOp0>
+      scf.yield %sum : tensor<128x128xf16, #dotOp0>
+    }
+    %last = tt.dot %selected, %b, %zero : tensor<128x128xf16, #dotOp0> * tensor<128x128xf16, #dotOp1> -> tensor<128x128xf32, #blocked>
+    tt.return %last : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// An if's accumulator result must not contaminate its independent A result.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHAIN: #mma = #ttg.amd_mfma<{{.*}}warpsPerCTA = [2, 2]
+// CHAIN-LABEL: @independent_if_results
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @independent_if_results(
+      %a: tensor<256x32xf16, #dotOp0>, %b: tensor<32x256xf16, #dotOp1>,
+      %pred: i1) -> tensor<256x256xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<256x256xf32, #blocked>
+    %first = tt.dot %a, %b, %zero : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    %r:2 = scf.if %pred -> (tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>) {
+      scf.yield %first, %a : tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>
+    } else {
+      %next_a = arith.addf %a, %a : tensor<256x32xf16, #dotOp0>
+      scf.yield %first, %next_a : tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>
+    }
+    %last = tt.dot %r#1, %b, %r#0 : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    tt.return %last : tensor<256x256xf32, #blocked>
+  }
+}
+
+// -----
 
 // Check the warpsPerCTA parameter of #mma layout of the two dot's.
 // The 1st dot always has warpsPerCTA = [4, 1].
