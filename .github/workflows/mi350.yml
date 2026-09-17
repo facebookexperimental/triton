@@ -320,42 +320,53 @@ jobs:
         uses: actions/checkout@v3
         with:
           submodules: recursive
-      - name: Install nightly PyTorch
+      - name: Create isolated TorchTLX environment
         run: |
+          set -eux
           . "${SETUP_SCRIPT}"
-          PYTHON_BIN="$(command -v python3)"
+          BASE_PYTHON="$(command -v python3)"
+          TORCHTLX_VENV="${RUNNER_TEMP}/torchtlx-venv"
+          uv venv --python "${BASE_PYTHON}" "${TORCHTLX_VENV}"
+          TORCHTLX_PYTHON="${TORCHTLX_VENV}/bin/python"
+
           # Force the freshest floating ROCm nightly. A stable release sorts
-          # above a nightly with the same version, so uninstall it first.
-          uv pip uninstall --python "${PYTHON_BIN}" \
-            torch pytorch-triton pytorch-triton-rocm triton-rocm triton || true
-          uv pip install --python "${PYTHON_BIN}" --pre --upgrade torch \
+          # above a nightly with the same version in a pre-existing environment;
+          # this clean job-local venv has no installed release to outrank it.
+          uv pip install --python "${TORCHTLX_PYTHON}" --pre torch \
             --index-url https://download.pytorch.org/whl/nightly/rocm7.2
-          "${PYTHON_BIN}" - <<'PY'
+          "${TORCHTLX_PYTHON}" - <<'PY'
           import torch
           from torch._inductor import config
 
           print(f"torch -> {torch.__version__} ({torch.__file__})")
           if not hasattr(config.triton, "tlx_mode"):
               raise RuntimeError(
-                  "the installed PyTorch nightly has no TorchTLX Inductor support "
+                  "the ROCm PyTorch nightly has no TorchTLX Inductor support "
                   "(torch._inductor.config.triton.tlx_mode)"
               )
           PY
       - name: Compile Triton
         run: |
+          set -eux
           . "${SETUP_SCRIPT}"
-          PYTHON_BIN="$(command -v python3)"
-          # Install this checkout on top of nightly torch's bundled Triton.
-          uv pip uninstall --python "${PYTHON_BIN}" \
-            pytorch-triton pytorch-triton-rocm triton-rocm triton || true
-          uv pip install --python "${PYTHON_BIN}" \
+          TORCHTLX_PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          uv pip install --python "${TORCHTLX_PYTHON}" \
             -r python/requirements.txt -r python/test-requirements.txt
-          uv pip install --python "${PYTHON_BIN}" -e . --no-build-isolation
+          uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
+            -e . --no-build-isolation
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          import triton
+
+          print(f"torch  -> {torch.__version__} ({torch.__file__})")
+          print(f"triton -> {triton.__file__}")
+          PY
       - name: Run TorchTLX template + fusion tests
         id: run_torchtlx_tests
         timeout-minutes: 60
         run: |
           . "${SETUP_SCRIPT}"
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
       - name: Run TorchTLX L2 perf
         id: run_torchtlx_perf
@@ -363,6 +374,7 @@ jobs:
         timeout-minutes: 50
         run: |
           . "${SETUP_SCRIPT}"
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           bash scripts/run_torchtlx_tests.sh --perf \
             --junitxml=/tmp/torchtlx_perf.xml
       - name: Upload TorchTLX perf artifacts
