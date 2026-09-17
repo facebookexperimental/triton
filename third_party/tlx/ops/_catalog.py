@@ -81,6 +81,35 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
+        # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
+        op="mm_torchtlx",
+        arch="sm100",
+        variant="inductor_blackwell_gemm_ws",
+        impl="kernels.mm.sm100_torch:mm",
+        dtypes=_FP16,
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        # TorchTLX providers are benchmark/catalog entries rather than public
+        # wrappers: their API is torch.addmm, with TLX selected by Inductor.
+        op="addmm_torchtlx",
+        arch="gfx950",
+        variant="inductor_gfx950_addmm",
+        impl="kernels.addmm.gfx950_torch:addmm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="bmm_torchtlx",
+        arch="gfx950",
+        variant="inductor_gfx950_bmm",
+        impl="kernels.bmm.gfx950_torch:bmm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm90",
         variant="ws_pipelined_pingpong",
@@ -96,6 +125,15 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="kernels.flash_attn.sm100:flash_attn",
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="flash_attn_mxfp8",
+        arch="sm100",
+        variant="ws_pipelined_persistent_mxfp8",
+        impl="kernels.flash_attn_mxfp8.sm100:flash_attn_mxfp8",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(

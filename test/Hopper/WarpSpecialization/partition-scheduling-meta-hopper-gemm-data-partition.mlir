@@ -1,4 +1,6 @@
-// RUN: triton-opt %s --nvgpu-partition-scheduling-meta --verify-each=false | FileCheck %s
+// RUN: env MLIR_ENABLE_DIAGNOSTICS=warnings triton-opt %s --nvgpu-partition-scheduling-meta --verify-each=false 2>&1 | FileCheck %s
+
+// CHECK-NOT: does not have expected attribute ttg.partition
 
 // Tests that on Hopper (cuda:90) with DATA_PARTITION_FACTOR=2 and
 // WarpGroupDotOp, the partition scheduler correctly creates per-dpId
