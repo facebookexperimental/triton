@@ -275,6 +275,33 @@ bool appearsBefore(Operation *A, Operation *B) {
   llvm_unreachable("appearsBefore");
 }
 
+bool orderedByPipelineSchedule(Operation *before, Operation *after,
+                               int64_t logicalIterDistance) {
+  auto beforeStage = before->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  auto afterStage = after->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  auto beforeCluster =
+      before->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  auto afterCluster =
+      after->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+  if (!beforeStage || !afterStage || !beforeCluster || !afterCluster)
+    return false;
+
+  // An op at stage S executes logical iteration
+  //   kernelIter + maxStage - S.
+  // Convert the logical-iteration distance to the distance between expanded
+  // kernel iterations. A positive distance is ordered by the loop itself. In
+  // the same expanded iteration, clusters and then source order are the
+  // execution order.
+  int64_t kernelIterDistance =
+      logicalIterDistance + afterStage.getInt() - beforeStage.getInt();
+  if (kernelIterDistance != 0)
+    return kernelIterDistance > 0;
+  if (beforeCluster.getInt() != afterCluster.getInt())
+    return beforeCluster.getInt() < afterCluster.getInt();
+  return before->getBlock() == after->getBlock() &&
+         appearsBefore(before, after);
+}
+
 // A few assumptions, a channel can have multiple consumers, but the consumers
 // must be in the same region and the taskIds must be the same. We can have
 // a representative consumer in the channel.

@@ -389,6 +389,17 @@ void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
 
+// Return whether `before(logicalIter)` is guaranteed to execute before
+// `after(logicalIter + logicalIterDistance)` after software-pipeline
+// expansion. Operations must carry loop.stage/loop.cluster metadata. Missing
+// metadata does not provide an ordering proof and returns false.
+//
+// This is shared by synchronization insertion and the post-memory channel
+// protocol validator; keeping one implementation prevents their views of
+// scheduled task order from diverging.
+bool orderedByPipelineSchedule(Operation *before, Operation *after,
+                               int64_t logicalIterDistance);
+
 // Shared reuse-legality primitive: is `dstOp` in the forward slice of `srcOp`,
 // following SSA results AND memory (store -> buffer -> load)?  Single source of
 // truth for "one op's value flows into another"; used by both the memory

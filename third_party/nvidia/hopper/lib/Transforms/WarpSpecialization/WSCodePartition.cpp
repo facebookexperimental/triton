@@ -2841,37 +2841,6 @@ void insertAsyncComm(
       return aTasks == bTasks;
     };
 
-    // Return whether `before(logicalIter)` is guaranteed to execute before
-    // `after(logicalIter + logicalIterDistance)` after software-pipeline
-    // expansion.  An op at stage S executes logical iteration
-    // `kernelIter + maxStage - S`, so the two ops' kernel-iteration distance
-    // is `logicalIterDistance + afterStage - beforeStage`.  Operations in the
-    // same expanded kernel iteration are ordered by cluster, then by their
-    // original order within the cluster.  Missing schedule annotations provide
-    // no ordering proof, so fail closed.
-    auto orderedByPipelineSchedule = [&](Operation *before, Operation *after,
-                                         int64_t logicalIterDistance) -> bool {
-      auto beforeStage =
-          before->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
-      auto afterStage =
-          after->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
-      auto beforeCluster =
-          before->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
-      auto afterCluster =
-          after->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
-      if (!beforeStage || !afterStage || !beforeCluster || !afterCluster)
-        return false;
-
-      int64_t kernelIterDistance =
-          logicalIterDistance + afterStage.getInt() - beforeStage.getInt();
-      if (kernelIterDistance != 0)
-        return kernelIterDistance > 0;
-      if (beforeCluster.getInt() != afterCluster.getInt())
-        return beforeCluster.getInt() < afterCluster.getInt();
-      return before->getBlock() == after->getBlock() &&
-             appearsBefore(before, after);
-    };
-
     // Consecutive same-task MMAs may write one operand-D allocation without a
     // channel between them.  In that case the forward channel ends at the
     // first writer while the loop-carried backward channel starts at the last
