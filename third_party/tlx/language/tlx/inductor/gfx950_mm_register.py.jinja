@@ -1,0 +1,110 @@
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        return
+
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    pid = tl.program_id(0).to(tl.int32)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_mn = grid_m * grid_n
+
+    XCD_CHUNK: tl.constexpr = 4
+    if NUM_XCDS != 1:
+        aligned = (
+            grid_mn // (NUM_XCDS * XCD_CHUNK)
+        ) * (NUM_XCDS * XCD_CHUNK)
+        if pid < aligned:
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = (
+                (local_pid // XCD_CHUNK) * NUM_XCDS * XCD_CHUNK
+                + xcd * XCD_CHUNK
+                + local_pid % XCD_CHUNK
+            )
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    input_rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+    input_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+    offs_m = (
+        input_rows
+        if M % BLOCK_M == 0
+        else tl.where(input_rows < M, input_rows, 0)
+    )
+    offs_n = (
+        input_cols
+        if N % BLOCK_N == 0
+        else tl.where(input_cols < N, input_cols, 0)
+    )
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+    reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    full_k_tiles: tl.constexpr = K // BLOCK_K
+    for k_idx in range(0, full_k_tiles):
+        k = k_idx * BLOCK_K
+        a_ptrs = (
+            A
+            + reg_m[:, None] * stride_am
+            + (k + offs_k[None, :]) * stride_ak
+        )
+        b_ptrs = (
+            B
+            + (k + offs_k[:, None]) * stride_bk
+            + reg_n[None, :] * stride_bn
+        )
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        acc += tl.dot(
+            a,
+            b,
+            allow_tf32=ALLOW_TF32,
+            out_dtype=ACC_TYPE,
+        )
+
+    if K % BLOCK_K != 0:
+        k = full_k_tiles * BLOCK_K
+        k_mask = offs_k < K - k
+        a_ptrs = (
+            A
+            + reg_m[:, None] * stride_am
+            + (k + offs_k[None, :]) * stride_ak
+        )
+        b_ptrs = (
+            B
+            + (k + offs_k[:, None]) * stride_bk
+            + reg_n[None, :] * stride_bn
+        )
+        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        acc += tl.dot(
+            a,
+            b,
+            allow_tf32=ALLOW_TF32,
+            out_dtype=ACC_TYPE,
+        )
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+    idx_m = rows[:, None]
+    idx_n = cols[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
