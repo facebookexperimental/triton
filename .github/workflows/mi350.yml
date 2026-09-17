@@ -305,8 +305,6 @@ jobs:
     if: github.repository_owner == 'facebookexperimental'
     runs-on: linux-fb-triton-mi350-1
     env:
-      CONDA_ENV: pytorch
-      SETUP_SCRIPT: /workspace/setup_instance.sh
       TORCHINDUCTOR_TLX_MODE: "allow"
       TORCHTLX_ARCH: gfx950
     timeout-minutes: 120
@@ -323,7 +321,6 @@ jobs:
       - name: Create isolated TorchTLX environment
         run: |
           set -eux
-          . "${SETUP_SCRIPT}"
           BASE_PYTHON="$(command -v python3)"
           TORCHTLX_VENV="${RUNNER_TEMP}/torchtlx-venv"
           uv venv --python "${BASE_PYTHON}" "${TORCHTLX_VENV}"
@@ -348,7 +345,6 @@ jobs:
       - name: Compile Triton
         run: |
           set -eux
-          . "${SETUP_SCRIPT}"
           TORCHTLX_PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           uv pip install --python "${TORCHTLX_PYTHON}" \
             -r python/requirements.txt -r python/test-requirements.txt
@@ -365,7 +361,6 @@ jobs:
         id: run_torchtlx_tests
         timeout-minutes: 60
         run: |
-          . "${SETUP_SCRIPT}"
           export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
       - name: Run TorchTLX L2 perf
@@ -373,7 +368,6 @@ jobs:
         if: always() && github.event_name == 'schedule'
         timeout-minutes: 50
         run: |
-          . "${SETUP_SCRIPT}"
           export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           bash scripts/run_torchtlx_tests.sh --perf \
             --junitxml=/tmp/torchtlx_perf.xml
@@ -388,7 +382,6 @@ jobs:
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
-          . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
           if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
                 "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
