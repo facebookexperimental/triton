@@ -177,7 +177,7 @@ class CrossWGBarrier:
     depth: int
     paired_buffer_id: int | None
     expect_bytes: int
-    distance: int = 0
+    distance: int | None = None  # iteration delay; absent in legacy JSON
     arrive_after_node: int | None = None
     wait_before_node: int | None = None
 
@@ -516,6 +516,21 @@ def _validate_lowering_contract(loop: ScheduleLoop) -> None:
 def _to_schedule_loop(d: dict[str, Any]) -> ScheduleLoop:
     iv = d.get("induction_var", {})
     g = d.get("graph", {})
+    raw_edges = g.get("edges", [])
+
+    def barrier_distance(barrier: dict[str, Any]) -> int | None:
+        if "distance" in barrier:
+            return barrier["distance"]
+        return next(
+            (
+                edge.get("distance", 0)
+                for edge in raw_edges
+                if edge["src"] == barrier["producer_node"]
+                and edge["dst"] == barrier["consumer_node"]
+            ),
+            None,
+        )
+
     loop = ScheduleLoop(
         id=d["id"],
         II=d["II"],
@@ -538,7 +553,7 @@ def _to_schedule_loop(d: dict[str, Any]) -> ScheduleLoop:
                 distance=e["distance"],
                 latency=e["latency"],
             )
-            for e in g.get("edges", [])
+            for e in raw_edges
         ],
         cross_wg_barriers=[
             CrossWGBarrier(
@@ -550,7 +565,7 @@ def _to_schedule_loop(d: dict[str, Any]) -> ScheduleLoop:
                 depth=b["depth"],
                 paired_buffer_id=b.get("paired_buffer_id"),
                 expect_bytes=b["expect_bytes"],
-                distance=b.get("distance", 0),
+                distance=barrier_distance(b),
                 arrive_after_node=b.get("arrive_after_node"),
                 wait_before_node=b.get("wait_before_node"),
             )

@@ -1,0 +1,1477 @@
+{
+ "curation_source": {
+  "baseline_graph_sha256": "b556c6a72f8bae5129ad8ccc7ac1067250369789d4a9aa69afb1ebb49b7c2e1d",
+  "curator_sources_sha256": "2bef320b1288ea32a96348ecd50399b7ce2b56b561e74bfd328f90a8dcc7eac4",
+  "ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5"
+ },
+ "loops": [
+  {
+   "edges": [
+    {
+     "action": "removed",
+     "dst": 1,
+     "reason": "src dropped (emitter-infra)",
+     "src": 0
+    },
+    {
+     "action": "removed",
+     "dst": 2,
+     "reason": "src dropped (emitter-infra)",
+     "src": 1
+    },
+    {
+     "action": "removed",
+     "dst": 3,
+     "reason": "src dropped (emitter-infra)",
+     "src": 1
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_producer_unit_TMA",
+     "dst": 5,
+     "src": 2
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_producer_unit_TMA",
+     "dst": 4,
+     "src": 3
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 28,
+     "src": 4
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 52,
+     "src": 4
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 6,
+     "src": 5
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 7,
+     "src": 6
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 31,
+     "src": 6
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_producer_unit_TC",
+     "dst": 8,
+     "resolution": "token_to_plain_dependence",
+     "src": 7
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 7,
+     "src": 8
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 9,
+     "src": 8
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 14,
+     "src": 8
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 10,
+     "src": 9
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 11,
+     "src": 10
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 11,
+     "src": 11
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 12,
+     "src": 11
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 12,
+     "src": 11
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 15,
+     "src": 11
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 13,
+     "src": 12
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 22,
+     "src": 13
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 29,
+     "src": 13
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 17,
+     "src": 14
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 16,
+     "src": 15
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 17,
+     "src": 16
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 18,
+     "src": 17
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 19,
+     "src": 18
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 20,
+     "src": 18
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 30,
+     "src": 19
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 21,
+     "src": 20
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 28,
+     "src": 21
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 23,
+     "src": 22
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 24,
+     "src": 23
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 26,
+     "src": 24
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 26,
+     "src": 25
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 27,
+     "src": 25
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 27,
+     "src": 26
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_token_completion",
+     "dst": 28,
+     "resolution": "token_to_plain_dependence",
+     "src": 27
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_producer_unit_TC",
+     "dst": 25,
+     "resolution": "token_to_plain_dependence",
+     "src": 28
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 30,
+     "src": 29
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 29,
+     "src": 30
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_producer_unit_TC",
+     "dst": 32,
+     "resolution": "token_to_plain_dependence",
+     "src": 31
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 31,
+     "src": 32
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 33,
+     "src": 32
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 38,
+     "src": 32
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 34,
+     "src": 33
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 35,
+     "src": 34
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 35,
+     "src": 35
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 36,
+     "src": 35
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 36,
+     "src": 35
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 39,
+     "src": 35
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 37,
+     "src": 36
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 46,
+     "src": 37
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 53,
+     "src": 37
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 41,
+     "src": 38
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 40,
+     "src": 39
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 41,
+     "src": 40
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 42,
+     "src": 41
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 43,
+     "src": 42
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 44,
+     "src": 42
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 54,
+     "src": 43
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 45,
+     "src": 44
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 52,
+     "src": 45
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 47,
+     "src": 46
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 48,
+     "src": 47
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 50,
+     "src": 48
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 50,
+     "src": 49
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 51,
+     "src": 49
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 51,
+     "src": 50
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_token_completion",
+     "dst": 52,
+     "resolution": "token_to_plain_dependence",
+     "src": 51
+    },
+    {
+     "action": "kept",
+     "blocking": true,
+     "blocking_rule": "async_producer_unit_TC",
+     "dst": 49,
+     "resolution": "token_to_plain_dependence",
+     "src": 52
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 54,
+     "src": 53
+    },
+    {
+     "action": "kept",
+     "blocking": false,
+     "dst": 53,
+     "src": 54
+    }
+   ],
+   "footprints": [
+    {
+     "amount": 16384,
+     "amount_basis": {
+      "bytes": 16384,
+      "rule": "max_union"
+     },
+     "kind": "smem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      3,
+      4
+     ],
+     "object": "smem:4",
+     "owner": 3,
+     "rules": [
+      "descriptor_load",
+      "local_alloc"
+     ]
+    },
+    {
+     "amount": 16384,
+     "amount_basis": {
+      "bytes": 16384,
+      "rule": "max_union"
+     },
+     "kind": "smem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      2,
+      5,
+      6
+     ],
+     "object": "smem:5",
+     "owner": 2,
+     "rules": [
+      "descriptor_load",
+      "local_alloc"
+     ]
+    },
+    {
+     "amount": 64,
+     "amount_basis": {
+      "bytes": 32768,
+      "rule": "max_union",
+      "tmem_column_bytes": 512
+     },
+     "kind": "tmem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      27,
+      28
+     ],
+     "object": "tmem:op_269849424",
+     "owner": 27,
+     "rules": [
+      "mma_operand2_accumulator",
+      "tmem_store_operand0"
+     ]
+    },
+    {
+     "amount": 32,
+     "amount_basis": {
+      "bytes": 16384,
+      "rule": "max_union",
+      "tmem_column_bytes": 512
+     },
+     "kind": "tmem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      7
+     ],
+     "object": "tmem:op_269852336",
+     "owner": 7,
+     "rules": [
+      "mma_operand2_accumulator"
+     ]
+    },
+    {
+     "amount": 32,
+     "amount_basis": {
+      "bytes": 16384,
+      "rule": "max_union",
+      "tmem_column_bytes": 512
+     },
+     "kind": "tmem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      31
+     ],
+     "object": "tmem:op_269860064",
+     "owner": 31,
+     "rules": [
+      "mma_operand2_accumulator"
+     ]
+    },
+    {
+     "amount": 64,
+     "amount_basis": {
+      "bytes": 32768,
+      "rule": "max_union",
+      "tmem_column_bytes": 512
+     },
+     "kind": "tmem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      51,
+      52
+     ],
+     "object": "tmem:op_269872496",
+     "owner": 51,
+     "rules": [
+      "mma_operand2_accumulator",
+      "tmem_store_operand0"
+     ]
+    },
+    {
+     "amount": 16,
+     "amount_basis": {
+      "bytes": 8192,
+      "rule": "max_union",
+      "tmem_column_bytes": 512
+     },
+     "kind": "tmem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      21
+     ],
+     "object": "tmem:op_269887616",
+     "owner": 21,
+     "rules": [
+      "tmem_alloc"
+     ]
+    },
+    {
+     "amount": 16,
+     "amount_basis": {
+      "bytes": 8192,
+      "rule": "max_union",
+      "tmem_column_bytes": 512
+     },
+     "kind": "tmem",
+     "liveness_cover": "desugared_use_edges",
+     "members": [
+      45
+     ],
+     "object": "tmem:op_269902656",
+     "owner": 45,
+     "rules": [
+      "tmem_alloc"
+     ]
+    }
+   ],
+   "loop_id": 0,
+   "nodes": [
+    {
+     "action": "dropped",
+     "id": 0,
+     "op_kind": "arith.muli",
+     "reason": "emitter-infra (baseline warp_group<0)"
+    },
+    {
+     "action": "dropped",
+     "id": 1,
+     "op_kind": "arith.addi",
+     "reason": "emitter-infra (baseline warp_group<0)"
+    },
+    {
+     "action": "kept",
+     "id": 2,
+     "pipeline": {
+      "from": "TMA",
+      "to": "TMA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": true,
+     "variable_latency": true
+    },
+    {
+     "action": "kept",
+     "id": 3,
+     "pipeline": {
+      "from": "TMA",
+      "to": "TMA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": true,
+     "variable_latency": true
+    },
+    {
+     "action": "kept",
+     "id": 4,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 5,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 6,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 7,
+     "pipeline": {
+      "from": "TC",
+      "to": "TC"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 8,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "TMEM"
+     },
+     "pipeline_rule": "tmem_port_unit",
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 9,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 10,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 11,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 12,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 13,
+     "pipeline": {
+      "from": "SFU",
+      "to": "SFU"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 14,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 15,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 16,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 17,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 18,
+     "pipeline": {
+      "from": "SFU",
+      "to": "SFU"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 19,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 20,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 21,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 22,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 23,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 24,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 25,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "TMEM"
+     },
+     "pipeline_rule": "tmem_port_unit",
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 26,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 27,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "TMEM"
+     },
+     "pipeline_rule": "tmem_port_unit",
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 28,
+     "pipeline": {
+      "from": "TC",
+      "to": "TC"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 29,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 30,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 31,
+     "pipeline": {
+      "from": "TC",
+      "to": "TC"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 32,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "TMEM"
+     },
+     "pipeline_rule": "tmem_port_unit",
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 33,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 34,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 35,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 36,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 37,
+     "pipeline": {
+      "from": "SFU",
+      "to": "SFU"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 38,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 39,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 40,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 41,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 42,
+     "pipeline": {
+      "from": "SFU",
+      "to": "SFU"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 43,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 44,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 45,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 46,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 47,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 48,
+     "pipeline": {
+      "from": "NONE",
+      "to": "NONE"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 49,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "TMEM"
+     },
+     "pipeline_rule": "tmem_port_unit",
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 50,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 51,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "TMEM"
+     },
+     "pipeline_rule": "tmem_port_unit",
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 52,
+     "pipeline": {
+      "from": "TC",
+      "to": "TC"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "memory_backed_zero",
+      "value": 0
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 53,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    },
+    {
+     "action": "kept",
+     "id": 54,
+     "pipeline": {
+      "from": "CUDA",
+      "to": "CUDA"
+     },
+     "rrt": "synthesized_from_occupancy",
+     "spill_cost": {
+      "rule": "default_regs_producer",
+      "value": 30
+     },
+     "streaming": false,
+     "variable_latency": false
+    }
+   ],
+   "observations": {
+    "dropped_field_names": [
+     "node.self_latency",
+     "node.is_super_node",
+     "edge.kind",
+     "edge.src_result_idx"
+    ],
+    "dropped_loop_fields": {
+     "induction_var": {
+      "name": "iv",
+      "type": "i32"
+     },
+     "is_outer": false,
+     "lower_bound": {
+      "const": 0,
+      "type": "i32"
+     },
+     "min_ii": 1204,
+     "rec_mii": 1033,
+     "res_mii": 1204,
+     "step": {
+      "const": 1,
+      "type": "i32"
+     },
+     "trip_count_estimated": true,
+     "upper_bound": {
+      "op": "op_269842864"
+     }
+    },
+    "dropped_node_kinds": {
+     "arith.addi": 1,
+     "arith.muli": 1
+    },
+    "edges_synthesized": 0,
+    "token_edges_resolved": 6
+   }
+  }
+ ],
+ "schema_version": "curation-manifest-0.2"
+}
