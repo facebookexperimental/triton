@@ -3,8 +3,9 @@
 **Status:** implementation in progress. Milestone A's structural schedule
 frontier and Milestone B's bounded SMEM depth frontier are implemented.
 Conservative fixed-group search now covers staging, subtile, and cross-id reuse
-plans. Composing schedule and memory candidates across compilation runs remains
-open.
+plans. The external driver composes schedule, logical memory-space, and physical
+memory-plan candidates across compilation runs. Runtime evaluation and source
+annotation removal remain open.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
@@ -48,9 +49,19 @@ records contain the active schedule pick, memory rank and selected state, pool,
 score, and block layout. This is the pass-boundary contract for an external
 Cartesian-product harness; no in-process scheduler object is passed to the
 memory planner. `python/triton/tools/autows_search.py` consumes this contract,
-runs one compile/validation command per bounded schedule-memory pair, verifies
+runs one compile/validation command per bounded candidate triple, verifies
 the selected ranks, and records exit status, elapsed time, and an optional
 command-reported metric as JSON lines.
+
+**Implemented seventh slice:** `PromoteLHSToTMem` exposes a bounded logical
+memory-space rank before physical buffer planning. Rank zero preserves the
+existing heuristic. Higher ranks enumerate subsets of unannotated direct MMA
+LHS operands that the heuristic leaves in SMEM only because a transposed LHS
+sibling consumes the same source. This is the FA-backward dS choice: dQ keeps
+the transposed SMEM view while dK may consume a TMEM copy. Explicit memtype
+annotations retain precedence. The outer driver now sweeps the full
+schedule × memory-space × physical-memory product, and the pass emits a
+`memory-space` manifest record so every selected rank is verified.
 
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
 with 128x128x128 tiles and eight-way output subtiling has been captured at the
@@ -99,6 +110,7 @@ The intended pipeline is:
 ```text
 Contracted-graph structural SWP top-K
   -> selected loop.stage / loop.cluster / nominal II
+  -> pre-allocation logical memory-space top-K
   -> search-based SMEM/TMEM planning for that schedule
   -> selected buffer.copy / buffer.id / buffer.offset / memory space
   -> code partitioning and software-pipeline expansion
@@ -127,7 +139,7 @@ candidate is fastest.
   production search path.
 - Do not use predicted latency as a correctness condition.
 - Do not require one in-process solver to choose the globally fastest
-  schedule-memory pair.
+  schedule/memory-space/memory-plan combination.
 - Do not initially search CTA topology, warp-group count, or epilogue subtile
   factor.
 
@@ -587,15 +599,17 @@ that schedule. A harness sweeps the bounded Cartesian product:
 
 ```text
 for schedulePick in scheduleRanks:
-    compile/dump memory candidates for schedulePick
-    for memoryPick in memoryRanks(schedulePick):
-        compile, validate, and measure
+    for memorySpacePick in memorySpaceRanks:
+        compile/dump memory candidates for (schedulePick, memorySpacePick)
+        for memoryPick in memoryRanks(schedulePick, memorySpacePick):
+            compile, validate, and measure
 ```
 
 Emit a manifest containing:
 
 - schedule rank and signature;
 - II;
+- memory-space rank and selected LHS promotions;
 - memory rank and signature;
 - SMEM bytes and TMEM columns;
 - fallback/fixed-grouping reason;
@@ -605,14 +619,14 @@ Use generic schedule and memory picks; do not expose per-operand controls.
 
 The compiler-side manifest is implemented via `TRITON_WS_SEARCH_MANIFEST`. The
 external `python/triton/tools/autows_search.py` driver discovers ranks from that
-manifest and sweeps the bounded Cartesian product. Its child command must
+manifest and sweeps the bounded three-dimensional product. Its child command must
 compile exactly one searched loop, return nonzero on validation failure, and
 may print a numeric value selected by `--metric-regex` for performance ranking.
 For example:
 
 ```shell
 python python/triton/tools/autows_search.py \
-  --schedule-topk=4 --memory-topk=3 \
+  --schedule-topk=4 --memory-space-topk=2 --memory-topk=3 \
   --metric-regex='latency_ms=([0-9.]+)' --results=/tmp/search.jsonl -- \
   python path/to/kernel_correctness_and_benchmark.py
 ```
@@ -629,8 +643,9 @@ The measured set includes at least:
 
 #### FA-backward example
 
-Each retained qkT/dk/dq/dpT/dv schedule is evaluated with its legal SMEM/TMEM
-plans. Runtime measurement selects the pair rather than a compiler cost model.
+Each retained qkT/dk/dq/dpT/dv schedule is evaluated with its logical
+memory-space and physical SMEM/TMEM plans. Runtime measurement selects the
+triple rather than a compiler cost model.
 
 ### Phase 10: Remove manual annotations incrementally
 
@@ -641,8 +656,12 @@ plans. Runtime measurement selects the pair rather than a compiler cost model.
 3. Remove memtype-only annotations after memory-space choice becomes a logical
    planning axis before physical buffer creation.
 
-The third step likely requires splitting `doBufferAllocation` into logical
-channel discovery and physical memory-space materialization.
+The first memory-space dimension is implemented in `PromoteLHSToTMem`, which
+already runs before physical buffer creation. It enumerates the general
+structural ambiguity "direct LHS shares a source with a transposed LHS" rather
+than naming dK/dQ or exposing an operand-specific frontend knob. This avoids a
+larger `doBufferAllocation` split for the current FA case; other ambiguous
+memory-space decisions can be added to the same ranked manifest contract.
 
 #### D120426461 example
 
@@ -712,12 +731,13 @@ gate.
 ### Milestone D: annotation-free FA backward
 
 - Remove schedule and physical-allocation pins.
-- Add memory-space selection or a general memory-space heuristic.
+- Add memory-space selection or a general memory-space heuristic. The first
+  bounded rank is implemented for direct/transposed LHS siblings.
 - Validate correctness and performance before removing the annotated fallback.
 
 ### Milestone E: evaluation and default decision
 
-- Measure the bounded schedule-memory Cartesian product.
+- Measure the bounded schedule × memory-space × memory-plan product.
 - Choose search limits and fallback policy based on compile-time and runtime
   data.
 - Keep the feature opt-in until representative workloads show stable wins.
@@ -751,11 +771,12 @@ scoreboarding or barriers serialize. Runtime measurement rejects them. The
 search must nevertheless enforce semantic dependence order and physical
 resource legality.
 
-### Incomplete memory-space search
+### Incomplete memory-space coverage
 
-FA backward cannot become entirely annotation-free until SMEM/TMEM placement
-is decided before physical allocation. Treat memtype removal as its own
-milestone rather than hiding a heuristic choice inside `doBufferAllocation`.
+The FA-backward dS SMEM/TMEM choice is now searchable before physical
+allocation, but this first candidate generator is intentionally narrow. New
+memory-space ambiguities should extend the same generic rank/manifest axis and
+retain explicit annotations as an override until runtime validation is done.
 
 ### Ambiguous ownership of `tt.num_buffers`
 
@@ -790,7 +811,10 @@ as a hard correctness floor.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [x] FA-backward target schedule exists without stage/order annotations.
 - [x] FA-backward target memory plan exists without copy/id/offset pins.
-- [ ] FA-backward memory-space annotations are removed or replaced by a general
-      planning rule.
+- [x] FA-backward's remaining dS memory-space choice is represented by a
+      general pre-allocation search rank and covered with captured production
+      TTGIR.
+- [ ] Remove the source memtype annotations after correctness and performance
+      select the annotation-free candidate.
 - [ ] Default-off compilation remains unchanged.
 - [ ] Correctness, sanitizer, compile-time, and performance gates pass.

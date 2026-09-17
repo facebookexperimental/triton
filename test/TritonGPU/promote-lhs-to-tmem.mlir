@@ -1,4 +1,11 @@
 // RUN: triton-opt %s -tritongpu-promote-lhs-to-tmem | FileCheck --dump-input-context=50 %s
+// RUN: env TRITON_WS_MEMORY_SPACE_TOPK=2 TRITON_WS_MEMORY_SPACE_PICK=1 triton-opt %s -tritongpu-promote-lhs-to-tmem | FileCheck --check-prefix=SPACE1 %s
+// RUN: rm -f %t.manifest
+// RUN: env TRITON_WS_MEMORY_SPACE_TOPK=2 TRITON_WS_MEMORY_SPACE_PICK=1 TRITON_WS_SEARCH_MANIFEST=%t.manifest triton-opt %s -tritongpu-promote-lhs-to-tmem > /dev/null
+// RUN: FileCheck --check-prefix=MANIFEST %s --input-file=%t.manifest
+
+// MANIFEST: {"kind": "memory-space", "rank": 0, "selected": false,
+// MANIFEST-NEXT: {"kind": "memory-space", "rank": 1, "selected": true,
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -198,6 +205,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: %[[A2T:.+]] = ttg.memdesc_trans %[[A2]]
   // CHECK: ttng.tc_gen5_mma %[[A1]], %{{.+}}, %{{.+}}, {{.+}}
   // CHECK: ttng.tc_gen5_mma %[[A2T]], %{{.+}}, %{{.+}}, {{.+}}
+  // SPACE1-LABEL: @dont_promote_when_trans_used_as_lhs
+  // SPACE1: %[[SEARCH_A:.+]] = tt.load
+  // SPACE1: %[[SEARCH_SMEM:.+]] = ttg.local_alloc %[[SEARCH_A]]
+  // SPACE1: %[[SEARCH_TMEM:.+]] = ttng.tmem_alloc %[[SEARCH_A]] {allocation.memorySpaceSearch}
+  // SPACE1: %[[SEARCH_TRANS:.+]] = ttg.memdesc_trans %[[SEARCH_SMEM]]
+  // SPACE1: ttng.tc_gen5_mma %[[SEARCH_TMEM]],
+  // SPACE1: ttng.tc_gen5_mma %[[SEARCH_TRANS]],
   tt.func public @dont_promote_when_sibling_alloc_trans_as_lhs(%A_ptr: tensor<128x128x!tt.ptr<f32>, #blocked1>, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
     %true = arith.constant true
     %false = arith.constant false
@@ -235,6 +249,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: %[[A:.+]] = tt.load
   // CHECK: %[[A_SH:.+]] = ttg.local_alloc %[[A]]
   // CHECK: ttng.tc_gen5_mma %[[A_SH]],
+  // SPACE1-LABEL: @promote_lhs_opnda_smem
+  // SPACE1: %[[PINNED_A:.+]] = tt.load
+  // SPACE1: %[[PINNED_SMEM:.+]] = ttg.local_alloc %[[PINNED_A]]
+  // SPACE1-NOT: allocation.memorySpaceSearch
+  // SPACE1: ttng.tc_gen5_mma %[[PINNED_SMEM]],
   tt.func public @promote_lhs_opnda_smem(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
@@ -260,6 +279,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: %[[A:.+]] = tt.load
   // CHECK: %[[A_TMEM:.+]] = ttng.tmem_alloc %[[A]]
   // CHECK: ttng.tc_gen5_mma %[[A_TMEM]],
+  // SPACE1-LABEL: @promote_lhs_opnda_tmem
+  // SPACE1: %[[PINNED_TMEM:.+]] = ttng.tmem_alloc
+  // SPACE1-NOT: allocation.memorySpaceSearch
+  // SPACE1: ttng.tc_gen5_mma %[[PINNED_TMEM]],
   tt.func public @promote_lhs_opnda_tmem(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %arg3: i32) -> tensor<128x128xf16, #blocked1> {
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>

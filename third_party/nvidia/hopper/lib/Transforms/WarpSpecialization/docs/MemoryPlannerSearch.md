@@ -29,6 +29,16 @@ Output: each `ttng.tmem_alloc` gets `buffer.id` (which slot), `buffer.offset`
 (column within the slot), and `buffer.copy` (multi-buffer depth). Allocs sharing
 a `buffer.id` form a **reuse group**.
 
+Before this physical planning step, `PromoteLHSToTMem` owns a separate logical
+memory-space search axis. With `TRITON_WS_MEMORY_SPACE_TOPK=K`, rank zero keeps
+the established promotion heuristic and higher ranks enumerate legal subsets
+of otherwise-ambiguous direct MMA LHS operands. The first candidate class is a
+direct LHS whose source also feeds a transposed LHS: FA backward can keep the
+transposed dQ view in SMEM while exploring a TMEM copy for dK. Explicit
+`opndA,smem` / `opndA,tmem` annotations override this search. This phase does
+not choose `buffer.id`, `buffer.offset`, or `buffer.copy`; those remain the
+physical planner's responsibility.
+
 ## 2. Mental model
 
 - **Buffer** (`BufferT`): one TMEM alloc, with a liveness interval
@@ -224,8 +234,9 @@ full story.
 | `TRITON_WS_MEM_PLAN_TOPK=K` | Enumerate K ranked TMEM packings (opt-in search). |
 | `tt.mem_plan_pick` (IR attr, from `tl.range(mem_plan_pick=...)`) / `TRITON_WS_MEM_PLAN_PICK` | Apply ranked plan `pick` (0 = cost-best; autotune-native via the constexpr). |
 | `TRITON_WS_MEM_PLAN_TOPK_DUMP=<path>` | Dump the ranked plans (JSON) for an external sweep harness. |
-| `TRITON_WS_SEARCH_MANIFEST=<path>` | When the dedicated memory dump is unset, append memory candidates, selected state, and active schedule pick to the shared schedule×memory JSON-lines manifest. |
+| `TRITON_WS_SEARCH_MANIFEST=<path>` | Append schedule, logical memory-space, and physical memory candidates to the shared JSON-lines manifest used by the external product-search driver. |
 | `TRITON_WS_SMEM_PLAN_SEARCH` | Enable the SMEM plan-space beam search. |
+| `TRITON_WS_MEMORY_SPACE_TOPK=K` / `TRITON_WS_MEMORY_SPACE_PICK=R` | Enumerate and select the pre-allocation logical memory-space rank. Rank 0 preserves the existing heuristic. |
 
 ## 7. Debugging
 

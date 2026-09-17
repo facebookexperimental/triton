@@ -4,6 +4,8 @@ from pathlib import Path
 
 schedule_topk = int(os.environ["TRITON_MODULO_TOPK"])
 schedule_pick = min(int(os.environ["TRITON_MODULO_PICK"]), schedule_topk - 1)
+memory_space_topk = int(os.environ["TRITON_WS_MEMORY_SPACE_TOPK"])
+memory_space_pick = min(int(os.environ["TRITON_WS_MEMORY_SPACE_PICK"]), memory_space_topk - 1)
 memory_topk = int(os.environ["TRITON_WS_MEM_PLAN_TOPK"])
 memory_pick = min(int(os.environ["TRITON_WS_MEM_PLAN_PICK"]), memory_topk - 1)
 manifest = Path(os.environ["TRITON_WS_SEARCH_MANIFEST"])
@@ -20,6 +22,17 @@ with manifest.open("a") as output:
             }),
             file=output,
         )
+    for rank in range(memory_space_topk):
+        print(
+            json.dumps({
+                "kind": "memory-space",
+                "rank": rank,
+                "selected": rank == memory_space_pick,
+                "candidate_count": 1,
+                "lhs_tmem": [] if rank == 0 else [0],
+            }),
+            file=output,
+        )
     for rank in range(memory_topk):
         print(
             json.dumps({
@@ -33,4 +46,4 @@ with manifest.open("a") as output:
             file=output,
         )
 
-print(f"latency_ms={10 * schedule_pick + memory_pick + 0.5}")
+print(f"latency_ms={100 * schedule_pick + 10 * memory_space_pick + memory_pick + 0.5}")

@@ -1,4 +1,4 @@
-"""Enumerate and run the AutoWS schedule x memory-plan search space.
+"""Enumerate and run the AutoWS schedule x memory-space x memory-plan space.
 
 The child command must compile exactly one searched loop and append its
 compiler records to ``TRITON_WS_SEARCH_MANIFEST``. A zero exit status is the
@@ -23,6 +23,7 @@ from typing import Any, Sequence
 @dataclass
 class RunResult:
     schedule_rank: int
+    memory_space_rank: int
     memory_rank: int
     returncode: int
     elapsed_seconds: float
@@ -42,7 +43,7 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"invalid manifest JSON at {path}:{line_number}: {exc}") from exc
-        if not isinstance(record, dict) or record.get("kind") not in {"schedule", "memory"}:
+        if not isinstance(record, dict) or record.get("kind") not in {"schedule", "memory-space", "memory"}:
             raise RuntimeError(f"invalid search record at {path}:{line_number}")
         records.append(record)
     return records
@@ -64,12 +65,18 @@ def _memory_ranks(records: Sequence[dict[str, Any]], schedule_rank: int) -> list
     return ranks or [0]
 
 
+def _memory_space_ranks(records: Sequence[dict[str, Any]]) -> list[int]:
+    ranks = _contiguous_ranks(records, "memory-space")
+    return ranks or [0]
+
+
 def _selected(records: Sequence[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
     return [record for record in records if record.get("kind") == kind and record.get("selected") is True]
 
 
 def _run_candidate(command: Sequence[str], base_env: dict[str, str], manifest: Path, schedule_rank: int,
-                   memory_rank: int, schedule_topk: int, memory_topk: int, timeout: float | None) -> RunResult:
+                   memory_space_rank: int, memory_rank: int, schedule_topk: int, memory_space_topk: int,
+                   memory_topk: int, timeout: float | None) -> RunResult:
     manifest.unlink(missing_ok=True)
     env = base_env.copy()
     env.update({
@@ -78,6 +85,8 @@ def _run_candidate(command: Sequence[str], base_env: dict[str, str], manifest: P
         "TRITON_USE_MODULO_SCHEDULE": "contracted",
         "TRITON_MODULO_TOPK": str(schedule_topk),
         "TRITON_MODULO_PICK": str(schedule_rank),
+        "TRITON_WS_MEMORY_SPACE_TOPK": str(memory_space_topk),
+        "TRITON_WS_MEMORY_SPACE_PICK": str(memory_space_rank),
         "TRITON_WS_SMEM_PLAN_SEARCH": "1",
         "TRITON_WS_MEM_PLAN_TOPK": str(memory_topk),
         "TRITON_WS_MEM_PLAN_PICK": str(memory_rank),
@@ -86,8 +95,8 @@ def _run_candidate(command: Sequence[str], base_env: dict[str, str], manifest: P
     start = time.perf_counter()
     completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout, check=False)
     elapsed = time.perf_counter() - start
-    return RunResult(schedule_rank, memory_rank, completed.returncode, elapsed, completed.stdout, completed.stderr,
-                     _read_manifest(manifest))
+    return RunResult(schedule_rank, memory_space_rank, memory_rank, completed.returncode, elapsed, completed.stdout,
+                     completed.stderr, _read_manifest(manifest))
 
 
 def _parse_env(values: Sequence[str]) -> dict[str, str]:
@@ -116,6 +125,14 @@ def _selection_error(run: RunResult) -> str | None:
     if selected_schedules != {run.schedule_rank}:
         return f"selected schedule ranks {sorted(selected_schedules)}; expected [{run.schedule_rank}]"
 
+    memory_space_records = [record for record in run.records if record.get("kind") == "memory-space"]
+    if memory_space_records:
+        available = _contiguous_ranks(memory_space_records, "memory-space")
+        expected = min(run.memory_space_rank, available[-1])
+        selected = {int(record["rank"]) for record in memory_space_records if record.get("selected") is True}
+        if selected != {expected}:
+            return f"selected memory-space ranks {sorted(selected)}; expected [{expected}]"
+
     memory_records = [record for record in run.records if record.get("kind") == "memory"]
     pools = {str(record["pool"]) for record in memory_records}
     for pool in pools:
@@ -138,6 +155,7 @@ def _result_record(run: RunResult, pattern: re.Pattern[str] | None) -> dict[str,
         status = "metric-missing"
     return {
         "schedule_rank": run.schedule_rank,
+        "memory_space_rank": run.memory_space_rank,
         "memory_rank": run.memory_rank,
         "status": status,
         "returncode": run.returncode,
@@ -145,6 +163,7 @@ def _result_record(run: RunResult, pattern: re.Pattern[str] | None) -> dict[str,
         "metric": metric,
         "error": selection_error,
         "schedule": _selected(run.records, "schedule"),
+        "memory_space": _selected(run.records, "memory-space"),
         "memory": _selected(run.records, "memory"),
     }
 
@@ -152,6 +171,7 @@ def _result_record(run: RunResult, pattern: re.Pattern[str] | None) -> dict[str,
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schedule-topk", type=int, default=4)
+    parser.add_argument("--memory-space-topk", type=int, default=1)
     parser.add_argument("--memory-topk", type=int, default=4)
     parser.add_argument("--results", type=Path, required=True, help="JSONL output path")
     parser.add_argument("--metric-regex", help="Regex whose final match and first capture group is a metric")
@@ -165,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         command.pop(0)
     if not command:
         parser.error("a child command is required after --")
-    if args.schedule_topk < 1 or args.memory_topk < 1:
+    if args.schedule_topk < 1 or args.memory_space_topk < 1 or args.memory_topk < 1:
         parser.error("top-K values must be positive")
 
     try:
@@ -178,26 +198,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures = 0
     with tempfile.TemporaryDirectory(prefix="triton-autows-search-") as temp_dir, args.results.open("w") as output:
         manifest = Path(temp_dir) / "manifest.jsonl"
-        first = _run_candidate(command, base_env, manifest, 0, 0, args.schedule_topk, args.memory_topk, args.timeout)
+        first = _run_candidate(command, base_env, manifest, 0, 0, 0, args.schedule_topk, args.memory_space_topk,
+                               args.memory_topk, args.timeout)
         schedule_ranks = _contiguous_ranks(first.records, "schedule")
         if not schedule_ranks:
             raise RuntimeError("child command emitted no schedule records")
+        memory_space_ranks = _memory_space_ranks(first.records)
 
         for schedule_rank in schedule_ranks:
-            discovery = first if schedule_rank == 0 else _run_candidate(
-                command, base_env, manifest, schedule_rank, 0, args.schedule_topk, args.memory_topk, args.timeout)
-            memory_ranks = _memory_ranks(discovery.records, schedule_rank)
-            for memory_rank in memory_ranks:
-                run = discovery if memory_rank == 0 else _run_candidate(
-                    command, base_env, manifest, schedule_rank, memory_rank, args.schedule_topk, args.memory_topk,
-                    args.timeout)
-                record = _result_record(run, pattern)
-                output.write(json.dumps(record, sort_keys=True) + "\n")
-                output.flush()
-                if record["status"] != "passed":
-                    failures += 1
-                    if run.stderr:
-                        print(run.stderr, end="", file=os.sys.stderr)
+            for memory_space_rank in memory_space_ranks:
+                discovery = first if schedule_rank == 0 and memory_space_rank == 0 else _run_candidate(
+                    command, base_env, manifest, schedule_rank, memory_space_rank, 0, args.schedule_topk,
+                    args.memory_space_topk, args.memory_topk, args.timeout)
+                memory_ranks = _memory_ranks(discovery.records, schedule_rank)
+                for memory_rank in memory_ranks:
+                    run = discovery if memory_rank == 0 else _run_candidate(
+                        command, base_env, manifest, schedule_rank, memory_space_rank, memory_rank, args.schedule_topk,
+                        args.memory_space_topk, args.memory_topk, args.timeout)
+                    record = _result_record(run, pattern)
+                    output.write(json.dumps(record, sort_keys=True) + "\n")
+                    output.flush()
+                    if record["status"] != "passed":
+                        failures += 1
+                        if run.stderr:
+                            print(run.stderr, end="", file=os.sys.stderr)
 
     return 1 if failures else 0
 
