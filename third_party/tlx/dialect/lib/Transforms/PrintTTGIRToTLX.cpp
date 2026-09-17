@@ -281,7 +281,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.precise_sqrt", "tl.math.sqrt_rn", "IEEE-rounded square root"},
 
     // GPU operations
-    {"gpu.barrier", "gpu.barrier", "GPU barrier"},
+    // Reachable only if gpu.barrier is taken off the skip list, and
+    // tlx.workgroup_barrier is AMD-only -- gate it on isAMDTarget if so, the
+    // way the ttg.barrier handler does.
+    {"gpu.barrier", "tlx.workgroup_barrier", "Workgroup-wide barrier"},
     {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
 };
 
@@ -418,7 +421,11 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  std::replace(name.begin(), name.end(), '#', '_');
+  // MLIR names may carry characters Python identifiers cannot, notably the
+  // dots in block-pointer-derived names like `V_block_ptr.offsets.1`.
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
   if (!name.empty() && std::isdigit(name.front()))
     name = "var_" + name;
   return name;
@@ -435,26 +442,59 @@ static DenseMap<Value, std::string> *getValueNameCachePtr() {
 static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
   DenseMap<Value, std::string> cache;
   AsmState asmState(rootOp, OpPrintingFlags().printNameLocAsPrefix(true));
-  rootOp->walk([&](Operation *op) {
-    for (Value result : op->getResults()) {
-      std::string buf;
-      llvm::raw_string_ostream os(buf);
-      result.printAsOperand(os, asmState);
-      os.flush();
-      cache[result] = formatSSAName(buf);
-    }
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        for (BlockArgument arg : block.getArguments()) {
-          std::string buf;
-          llvm::raw_string_ostream os(buf);
-          arg.printAsOperand(os, asmState);
-          os.flush();
-          cache[arg] = formatSSAName(buf);
+
+  // Sanitization is many-to-one -- `a.b` and `a_b` both become `a_b` -- and two
+  // values sharing a name in one emitted function would shadow each other,
+  // which is valid Python but a different program. Deduplicate within a
+  // function, not across the module: separate functions get separate Python
+  // scopes, and each legitimately has its own `arg0`.
+  auto nameScope = [&](Operation *scope) {
+    llvm::StringMap<unsigned> used;
+    auto claim = [&](StringRef raw) {
+      std::string name = formatSSAName(raw);
+      auto [it, inserted] = used.try_emplace(name, 0);
+      if (inserted)
+        return name;
+      // Copy the counter out rather than holding `it` across the loop: the
+      // insertions below can grow the map, and StringMap iterators point into
+      // a bucket table that growth reallocates.
+      unsigned suffix = it->second;
+      std::string candidate;
+      do {
+        candidate = name + "_" + std::to_string(++suffix);
+      } while (!used.try_emplace(candidate, 0).second);
+      used[name] = suffix;
+      return candidate;
+    };
+    scope->walk([&](Operation *op) {
+      for (Value result : op->getResults()) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        result.printAsOperand(os, asmState);
+        os.flush();
+        cache[result] = claim(buf);
+      }
+      for (Region &region : op->getRegions()) {
+        for (Block &block : region) {
+          for (BlockArgument arg : block.getArguments()) {
+            std::string buf;
+            llvm::raw_string_ostream os(buf);
+            arg.printAsOperand(os, asmState);
+            os.flush();
+            cache[arg] = claim(buf);
+          }
         }
       }
-    }
+    });
+  };
+
+  bool sawFunc = false;
+  rootOp->walk([&](tt::FuncOp f) {
+    sawFunc = true;
+    nameScope(f);
   });
+  if (!sawFunc)
+    nameScope(rootOp);
   return cache;
 }
 
@@ -466,6 +506,16 @@ static const llvm::StringSet<> elementTypeCastOps = {
     "arith.extf",   "arith.truncf", "arith.sitofp",
     "arith.uitofp", "arith.fptosi", "arith.fptoui",
 };
+
+// Several TLX primitives lower to ROCDL and so are only usable on CDNA; the
+// target lives on the module as `ttg.target`, e.g. "hip:gfx950".
+static bool isAMDTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+  return target && target.getValue().starts_with("hip");
+}
 
 // Element types getElementTypeName can spell as a TLX dtype. Anything else it
 // renders as raw MLIR, which is not usable in emitted Python.
@@ -717,19 +767,7 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
       } else {
         printConstantValue(splatAttr, os);
       }
-      os << ", ";
-      Type et = tensorType.getElementType();
-      if (et.isF32())
-        os << "tl.float32";
-      else if (et.isBF16())
-        os << "tl.bfloat16";
-      else if (et.isF16())
-        os << "tl.float16";
-      else if (et.isInteger(32))
-        os << "tl.int32";
-      else
-        os << "tl.float32";
-      os << ")";
+      os << ", " << getElementTypeName(tensorType.getElementType()) << ")";
     } else {
       os << "dense<...>";
     }
@@ -2379,6 +2417,37 @@ void printSimplifiedOp(
     return;
   }
 
+  // tlx.workgroup_barrier is the right spelling for `ttg.barrier local` and
+  // nothing else: a barrier over other address spaces would be silently
+  // under-fenced, so leave those to the generic path, which flags them.
+  //
+  // It is also AMD-only. create_workgroup_barrier emits the ttg.barrier
+  // bracketed by two rocdl.sched.barrier guards, so on a non-AMD target the
+  // round trip would inject ROCDL ops into a kernel that cannot lower them.
+  // On AMD the extra guards are a scheduling constraint, not a semantic one --
+  // they can cost scheduling freedom but cannot change results.
+  if (opName == "ttg.barrier" && isAMDTarget(op)) {
+    Attribute a = op->getAttr("addrSpace");
+    bool localOnly = false;
+    if (auto i = dyn_cast_or_null<IntegerAttr>(a)) {
+      localOnly = i.getInt() == static_cast<int64_t>(ttg::AddrSpace::Local);
+    } else if (a) {
+      std::string text;
+      llvm::raw_string_ostream textOs(text);
+      a.print(textOs);
+      textOs.flush();
+      // `local` is a prefix of nothing else in the bitmask's spellings, but a
+      // combined mask prints several names, so require it to stand alone.
+      StringRef t = StringRef(text).trim();
+      localOnly = t.ends_with("local") && !t.contains(",") && !t.contains("|");
+    }
+    if (localOnly) {
+      os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
@@ -2412,6 +2481,12 @@ void printSimplifiedOp(
     os << getValueName(operand, argSubstitutionMap);
   }
   os << ")";
+
+  // An unmapped op is emitted as its raw MLIR name, which is not valid Python.
+  // Flag it inline so the gap is visible in the dump rather than surfacing as
+  // an unexplained NameError when the regenerated kernel is launched.
+  if (it == opNameMap.end())
+    os << "  # UNSUPPORTED: no TLX mapping for " << opName;
 
   printLocComment(op, os);
 }
