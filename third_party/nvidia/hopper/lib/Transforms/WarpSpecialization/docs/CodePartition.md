@@ -208,11 +208,27 @@ detailed decision tree, code paths, and a worked FA BWD example.
 Before mutating IR for a consumer group, `buildChannelProtocolPlan` collects
 its shared endpoint facts in one non-owning record: producer head/tail, TMA
 producer head, ordinary producer acquire/ready anchors, per-task consumer
-wait/release anchors, copy depth, and cadence class. The release anchor retains
-the existing post-dominance heuristic. Reuse and operand-D rules may relocate
-the acquire anchor, but write the result back to the same plan before
-insertion. The post-memory cycle validator consumes this contract rather than
-independently rediscovering different endpoints.
+wait/release anchors, the actual consumer used to schedule each wait, copy
+depth, and cadence class. The release anchor retains the existing
+post-dominance heuristic. Reuse and operand-D rules may relocate the acquire
+anchor, but write the result back to the same plan before insertion.
+
+Immediately after reuse-group validation and before accumulation counters
+rewrite the loops, `doCodePartition` lowers supported plans to a normalized
+protocol graph. Each ordinary loop-cadence SMEM channel contributes
+`Acquire -> Ready -> Wait -> Release` edges at logical distance zero and a
+`Release(i) -> Acquire(i + copies)` slot-reuse edge. Per-task serialized event
+classes contribute schedule-order edges whose distance is
+`next.stage - current.stage`, plus one on the wrap edge. Events at the same
+anchor and on the same side of it form an unordered equivalence class.
+
+This first integration is audit-only: production builds compute and debug-log
+the result without rejecting the selected candidate; the test pass can emit
+`nvws.test.channel_cycle_*` attributes. Physical reuse groups, TMEM, subtiled,
+straight-line, and `scf.while` protocols are reported as unsupported. An unsafe
+cycle in a supported component takes priority over unsupported coverage. The
+captured D120 B-early schedule is detected as a zero-distance cycle through
+the real post-memory channel-planning path.
 
 ### Channel Loop Detection
 

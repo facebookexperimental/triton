@@ -38,12 +38,44 @@
 // RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
 // RUN:   --nvgpu-warp-specialization="num-stages=3 smem-budget=232448" | \
 // RUN:   FileCheck %s --check-prefix=CODEPART
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=1 \
+// RUN:   triton-opt \
+// RUN:   %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir \
+// RUN:   -allow-unregistered-dialect \
+// RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" | \
+// RUN:   FileCheck %s --check-prefix=CYCLE-AUDIT
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=2 \
+// RUN:   triton-opt \
+// RUN:   %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir \
+// RUN:   -allow-unregistered-dialect \
+// RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" | \
+// RUN:   FileCheck %s --check-prefix=CYCLE-AUDIT
 
 // Production-shaped D120426461 memory-planner oracle. A feeds both the RMS
 // reduction and the MMA, while B feeds only the MMA. The existing heuristic
 // therefore assigns A3/B2. Eight output subtiles share one three-copy staging
 // ring. Fixed-group search preserves that ring and exposes A2/B2 and A2/B3 as
 // the first two alternatives without operand-specific annotations.
+// The captured loop schedule is the unsafe B-early rank: A/relay is at stage
+// 1, B is at stage 0, and the MMA is at stage 2.
+
+// The real post-memory channel builder finds the zero-credit A-relay/B cycle
+// for both the A2/B2 and A2/B3 memory ranks.
+// Specialized output-staging and TMEM channels remain explicitly unsupported
+// in this first audit-only slice, but an unsafe supported SCC takes priority.
+// CYCLE-AUDIT-LABEL: tt.func public @d120_rmsnorm_gemm
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_channels = array<i64: 1, 1, 4, 4, 4, 1>
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_distance = 0 : i64
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_edge_count = 28 : i64
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_edge_distances = array<i64: 0, 0, 1, 0, -1, 0>
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_edges = array<i64: 5, 21, 11, 14, 15, 16>
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_event_count = 12 : i64
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_reason = "channel protocol contains a non-positive-distance cycle"
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_status = "unsafe"
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_supported_channels = 3 : i64
+// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
 
 // HEURISTIC-LABEL: tt.func public @d120_rmsnorm_gemm
 // HEURISTIC: %a = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32}

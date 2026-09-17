@@ -204,6 +204,7 @@ struct ChannelConsumerProtocolPlan {
   Operation *head = nullptr;
   Operation *tail = nullptr;
   Operation *waitAnchor = nullptr;
+  Operation *waitScheduleAnchor = nullptr;
   Operation *releaseAnchor = nullptr;
 };
 
@@ -213,6 +214,7 @@ struct ChannelConsumerProtocolPlan {
 /// exactly the same endpoint and cadence decisions.
 struct ChannelProtocolPlan {
   Channel *masterChannel = nullptr;
+  SmallVector<Channel *> channels;
   Operation *headProducer = nullptr;
   Operation *tailProducer = nullptr;
   Operation *headConsumer = nullptr;

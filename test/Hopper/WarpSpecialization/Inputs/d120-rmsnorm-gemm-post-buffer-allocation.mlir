@@ -1,6 +1,7 @@
 // Captured after doBufferAllocation from a production-shaped reconstruction of
 // D120426461. This is the pass-local input for memory-plan search; it preserves
-// the A -> RMS reduction + MMA fanout and eight independent output subtiles.
+// the A -> RMS reduction + MMA fanout, the B-early contracted schedule, and
+// eight independent output subtiles.
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
@@ -69,21 +70,21 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %a_5 = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc49)
     %acc_6 = ttng.tmem_store %acc_2, %acc_3[%acc_4], %true {async_task_id = array<i32: 0>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc51)
     %sum_sq_7:3 = scf.for %k = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%sum_sq_44 = %sum_sq, %acc_45 = %acc_0, %acc_46 = %acc_6) -> (tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, i1, !ttg.async.token)  : i32 {
-      %offs_k = arith.muli %k, %c128_i32 {async_task_id = array<i32: 3>} : i32 loc(#loc62)
-      nvws.descriptor_load %a_desc[%offs_m, %offs_k] 32768 %a {async_task_id = array<i32: 3>, multicast = false} : !tt.tensordesc<128x128xbf16, #shared>, i32, i32, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc49)
-      %a_47 = ttg.local_load %a {async_task_id = array<i32: 0, 3>} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> tensor<128x128xbf16, #blocked> loc(#loc49)
-      ttg.local_store %a_47, %a_5 {async_task_id = array<i32: 3>} : tensor<128x128xbf16, #blocked> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc49)
-      nvws.descriptor_load %b_desc[%offs_n, %offs_k] 32768 %acc {async_task_id = array<i32: 3>, multicast = false} : !tt.tensordesc<128x128xbf16, #shared>, i32, i32, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc63)
-      %a_f32 = arith.extf %a_47 {async_task_id = array<i32: 0>} : tensor<128x128xbf16, #blocked> to tensor<128x128xf32, #blocked> loc(#loc64)
-      %sum_sq_48 = arith.mulf %a_f32, %a_f32 {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> loc(#loc65)
+      %offs_k = arith.muli %k, %c128_i32 {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : i32 loc(#loc62)
+      nvws.descriptor_load %a_desc[%offs_m, %offs_k] 32768 %a {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32, multicast = false} : !tt.tensordesc<128x128xbf16, #shared>, i32, i32, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc49)
+      %a_47 = ttg.local_load %a {async_task_id = array<i32: 0, 3>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> tensor<128x128xbf16, #blocked> loc(#loc49)
+      ttg.local_store %a_47, %a_5 {async_task_id = array<i32: 3>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xbf16, #blocked> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc49)
+      nvws.descriptor_load %b_desc[%offs_n, %offs_k] 32768 %acc {async_task_id = array<i32: 3>, loop.cluster = 1 : i32, loop.stage = 0 : i32, multicast = false} : !tt.tensordesc<128x128xbf16, #shared>, i32, i32, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> loc(#loc63)
+      %a_f32 = arith.extf %a_47 {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x128xbf16, #blocked> to tensor<128x128xf32, #blocked> loc(#loc64)
+      %sum_sq_48 = arith.mulf %a_f32, %a_f32 {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> loc(#loc65)
       %sum_sq_49 = "tt.reduce"(%sum_sq_48) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
       ^bb0(%sum_sq_53: f32 loc(callsite(#loc5 at #loc66)), %sum_sq_54: f32 loc(callsite(#loc5 at #loc66))):
         %sum_sq_55 = arith.addf %sum_sq_53, %sum_sq_54 {async_task_id = array<i32: 0>} : f32 loc(#loc88)
         tt.reduce.return %sum_sq_55 {async_task_id = array<i32: 0>} : f32 loc(#loc83)
-      }) {async_task_id = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> loc(#loc83)
-      %sum_sq_50 = arith.addf %sum_sq_44, %sum_sq_49 {async_task_id = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> loc(#loc67)
-      %acc_51 = ttg.memdesc_trans %acc {async_task_id = array<i32: 1>, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable> loc(#loc50)
-      %acc_52 = ttng.tc_gen5_mma %a_5, %acc_51, %acc_3[%acc_46], %acc_45, %true {async_task_id = array<i32: 1>} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc51)
+      }) {async_task_id = array<i32: 0>, loop.cluster = 3 : i32, loop.stage = 1 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> loc(#loc83)
+      %sum_sq_50 = arith.addf %sum_sq_44, %sum_sq_49 {async_task_id = array<i32: 0>, loop.cluster = 4 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> loc(#loc67)
+      %acc_51 = ttg.memdesc_trans %acc {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 0 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable> loc(#loc50)
+      %acc_52 = ttng.tc_gen5_mma %a_5, %acc_51, %acc_3[%acc_46], %acc_45, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc51)
       scf.yield {async_task_id = array<i32: 0, 1>} %sum_sq_50, %true, %acc_52 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, i1, !ttg.async.token loc(#loc7)
     } {async_task_id = array<i32: 0, 1, 2, 3>, tt.separate_epilogue_store = true, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load"], ttg.warp_specialize.tag = 0 : i32} loc(#loc82)
     %acc_8, %acc_9 = ttng.tmem_load %acc_3[%sum_sq_7#2] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear> loc(#loc51)

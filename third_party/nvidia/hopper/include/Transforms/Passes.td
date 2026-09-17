@@ -165,7 +165,10 @@ def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::Module
            "number of warp groups for warp specialization">,
     Option<"requestedRegisters", "requested-registers",
            "int32_t", /*default*/"232",
-           "number of register requested for computation group">
+           "number of register requested for computation group">,
+    Option<"channelCycleAudit", "channel-cycle-audit",
+           "bool", /*default*/"false",
+           "emit post-memory channel-cycle analysis attributes">
   ];
 }
 

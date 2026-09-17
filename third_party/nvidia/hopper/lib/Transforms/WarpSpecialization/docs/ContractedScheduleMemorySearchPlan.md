@@ -97,7 +97,8 @@ the exact integer transform `d * (N + 1) - 1`, and reconstructs a stable edge
 witness for every non-positive-distance recurrence. Direct lit coverage pins a
 zero-credit rejection, its positive-credit neighbor, an acyclic negative edge,
 and malformed-graph `unsupported` handling. The post-memory IR graph builder
-and candidate rejection are the next unit.
+and candidate rejection were left for subsequent units; the ordinary-loop
+post-memory builder is now connected by the eleventh slice below.
 
 **Implemented tenth slice:** `buildChannelProtocolPlan` now derives grouped
 producer bounds, TMA producer placement, per-consumer-task wait/release
@@ -106,6 +107,18 @@ consumes these shared decisions, including the effective acquire relocation
 selected by its existing operand-D and reuse rules. This establishes the
 single endpoint contract needed by the planned-protocol graph builder while
 preserving the emitted synchronization protocol.
+
+**Implemented eleventh slice:** `doCodePartition` now lowers ordinary
+loop-cadence SMEM endpoint plans into the normalized protocol graph immediately
+after reuse-group validation and before accumulation-counter rewriting. Each
+channel contributes zero-distance Acquire/Ready/Wait/Release edges plus a
+copy-depth slot-reuse edge; task serialization contributes stage-delta edges
+in cluster/source order. The common weighted-cycle solver runs in production
+as an audit without changing candidate selection, while the test pass exposes
+status, coverage counts, graph size, and the witness. The production-shaped
+D120 B-early fixture reaches this path and reports its zero-credit cycle.
+Reuse-group, TMEM, subtiled, straight-line, and while protocols remain
+explicitly unsupported in this slice.
 
 **Current Milestone D status:** The annotation-free BM128 FA-backward candidate
 compiles through software-pipeline expansion. Pre-lowered
@@ -1146,10 +1159,11 @@ The implementation sequence is:
    search driver treat a proven `Unsafe` result as a rejected tuple and avoid
    launching it.
 
-The first slice does not inspect emitted tokens/barriers, validate TMEM alias
+The audit slice does not inspect emitted tokens/barriers, validate TMEM alias
 reads, or claim that every unsupported control-flow shape is safe. Those are
-follow-up extensions to the second graph builder. It does eliminate the D120
-runtime hang by rejecting the proven cycle before code-partition mutation.
+follow-up extensions to the second graph builder. The following rejection
+slice will eliminate the D120 runtime hang by rejecting the proven cycle
+before code-partition mutation.
 
 Each implementation commit must rebuild Triton in the `metamain` environment
 with `/home/mren/OpenSource2/llvm-build`, run the focused D120 and FA-backward
@@ -1368,6 +1382,8 @@ a hard correctness floor on the structural path.
 - [x] D120 candidates exist without lhs/rhs depth annotations.
 - [x] D120 schedule rank 1 with the A3/B2 memory plan passes the actual
       1024x12800x1024 bf16 correctness run on B200.
+- [x] The audit-only post-memory builder detects D120 B-early through real
+      planned channels and returns a zero-distance witness.
 - [ ] Post-memory channel-cycle validation rejects D120 B-early before launch
       while retaining A-early with the A2/B3 memory plan.
 - [ ] D120 measured winner is A3/B2 on the target shapes.

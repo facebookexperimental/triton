@@ -4005,6 +4005,7 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
   assert(!channels.empty() && "expected a non-empty channel consumer group");
   ChannelProtocolPlan plan;
   plan.masterChannel = channels.front();
+  plan.channels.append(channels.begin(), channels.end());
   plan.copies = plan.masterChannel->getNumBuffers();
 
   DenseSet<Operation *> producerOps;
@@ -4119,8 +4120,12 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
         break;
       }
     }
+    Operation *waitAnchor = getProtocolSameLevelOp(plan.headProducer, head);
+    auto actualConsumers = getActualConsumers(waitAnchor);
+    Operation *waitScheduleAnchor =
+        actualConsumers.size() == 1 ? actualConsumers.front() : waitAnchor;
     plan.consumers.push_back(
-        {task, head, tail, getProtocolSameLevelOp(plan.headProducer, head),
+        {task, head, tail, waitAnchor, waitScheduleAnchor,
          getProtocolConsumerReleaseAnchor(postDominance, plan.tailProducer,
                                           tail, task)});
   }
