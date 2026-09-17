@@ -1193,11 +1193,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
         nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, options.allowDependentTwoCTA)
-        if "consan" in options.instrumentation_mode:
-            # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
-            passes.ttgpuir.add_concurrency_sanitizer(pm)
-            passes.gluon.add_canonicalizer(pm)
-            passes.common.add_cse(pm)
+        # ConSan runs inside ConvertTritonGPUToLLVM through the flag passed to
+        # add_to_llvmir below. It is not idempotent, so do not also run it here.
         if "gsan" in options.instrumentation_mode:
             passes.ttgpuir.add_global_sanitizer(pm)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
