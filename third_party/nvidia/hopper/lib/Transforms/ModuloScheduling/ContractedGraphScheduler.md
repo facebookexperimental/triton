@@ -78,10 +78,11 @@ mode is intended to expose.
 
 ## Search
 
-For `G` GEMM anchors, enumerate the nontrivial `G`-bit stage assignments. GEMMs
-are pinned to stages 0 or 1 and both stages must be used. Non-GEMM epilogue
-nodes may occupy stage 2 when a loop-carried token requires it. Reject assignments
-that violate distance-0 GEMM reachability. For each assignment:
+For `G` GEMM anchors, enumerate the nontrivial `G`-bit stage assignments. With
+multiple GEMMs, both stages must be used. With one GEMM, place it in stage 1 so
+stage 0 remains available for operand prefetches. Non-GEMM epilogue nodes may
+occupy stage 2 when a loop-carried token requires it. Reject assignments that
+violate distance-0 GEMM reachability. For each assignment:
 
 1. Compute a structural resource lower bound, excluding latency-derived RecMII.
 2. Schedule the original DDG in topological order.
@@ -95,10 +96,16 @@ that violate distance-0 GEMM reachability. For each assignment:
    the standard SWP structural ordering constraint, shifting the consumer by
    `distance * II` without imposing the result-latency model.
 
-Candidate identity is `(II, ordered (GEMM node, stage, modulo cluster) tuple)`,
-not the full per-node stage vector. This removes duplicates caused only by
-loads or elementwise placement while preserving schedules whose different II
-can change resource slack and downstream memory planning.
+The scheduler evaluates the baseline stable topological order plus up to eight
+load-priority variants. Each variant pulls one GEMM-reaching TMA load and its
+distance-zero predecessor slice forward whenever those nodes are ready. This
+only changes tie-breaks among independent nodes; it never bypasses a DDG edge.
+
+Candidate identity is `(II, ordered GEMM stage/cluster tuple, ordered
+GEMM-reaching TMA-load stage/cluster tuple)`, not the full per-node stage
+vector. Loads are discovered by a distance-zero forward path to a GEMM, not by
+operand names. This keeps memory-relevant load placements distinct while still
+removing duplicates caused only by elementwise placement.
 
 Unlike the production schedulers, contracted mode emits clusters as one global
 dense rank of `cycle % II`, rather than restarting the rank in every stage.
@@ -108,16 +115,18 @@ Candidates are ranked lexicographically by II, exact two-stage shape,
 contracted critical-path cost, TC utilization, computation-cluster count, and
 a stable GEMM signature. The final bounded frontier reserves roughly half its
 slots for evenly spaced feasible II values, including both endpoints when
-possible, then fills the rest from that ranking. The frontier is finally
-presented in ranking order, so rank 0 remains the lowest-II default while
-larger-II candidates cannot all be displaced by alternatives at the lower
-bound. Buffer depth and SMEM/TMEM headroom are excluded.
+possible, reserves one slot for the best non-default load-order variant, then
+fills the rest from that ranking. Baseline topological orders sort before load
+variants at the same II, keeping rank 0 default-neutral. The frontier is
+finally presented in ranking order, so larger-II and load-order candidates
+cannot both be displaced by alternatives at the lower bound. Buffer depth and
+SMEM/TMEM headroom are excluded.
 
 ## Diagnostics
 
 `-debug-only=modulo-scheduling-contracted` reports graph sizes, classified and
-contracted nodes, stage assignments considered/rejected, and the GEMM-only
-signature for each retained top-K schedule.
+contracted nodes, stage assignments considered/rejected, and the GEMM plus
+GEMM-reaching-load signature for each retained top-K schedule.
 
 ## Testing
 
@@ -129,6 +138,10 @@ extend the loop's `tt.scheduled_max_stage` beyond the two GEMM stages. A second
 pick checks that the same top-K contains a larger-II candidate with enough
 structural slack to keep the epilogue within stage 1.
 
+`test/TritonGPU/modulo-schedule.mlir` is the one-MMA oracle. Its two independent
+descriptor operands appear in both A-early/B-late and A-late/B-early orders
+without operand-specific annotations.
+
 ## Implementation Status
 
 - [x] Design and compatibility boundary documented.
@@ -137,6 +150,9 @@ structural slack to keep the epilogue within stage 1.
 - [x] Structural resource lower bound without result latency or RecMII.
 - [x] Structural dependence and reservation-table admission.
 - [x] II-aware candidate identity and bounded II-diverse frontier.
+- [x] GEMM-reaching TMA-load discovery and candidate identity.
+- [x] Predecessor-slice load-order branching and frontier retention.
+- [x] One-MMA scheduling with two operand-order alternatives.
 - [x] Exact two-stage GEMM assignment enumeration.
 - [x] Original-DDG placement and validation.
 - [x] GEMM-signature top-K deduplication and diagnostics.

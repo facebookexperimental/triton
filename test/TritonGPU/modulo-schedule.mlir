@@ -5,6 +5,8 @@
 // gated on the feature rather than failing every default build.
 // RUN: %if z3-joint-solver %{ env TRITON_USE_MODULO_SCHEDULE=joint_solver triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=JOINT %}
 // RUN: env TRITON_MODULO_BASELINE_REPORT=1 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule 2>&1 | FileCheck %s --check-prefix=BASELINE
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted TRITON_MODULO_TOPK=2 TRITON_MODULO_PICK=0 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=CONTRACTED-A
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted TRITON_MODULO_TOPK=2 TRITON_MODULO_PICK=1 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=CONTRACTED-B
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -66,6 +68,23 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // BASELINE: soundness (II_full >= relaxed_LB): {{PASS|SKIP}}
 // BASELINE: no-regression (II_full <= II_rau): {{PASS|SKIP}}
 // BASELINE: strict improvement (II_full < II_rau): {{NO|SKIP}}
+//
+// The one-MMA Contracted path is the D120-shaped scheduling oracle: two
+// independent descriptor operands can trade the early prefetch position
+// without lhs/rhs-specific options. Rank 0 preserves source order (A early),
+// while rank 1 prioritizes B's address/load slice.
+//
+// CONTRACTED-A-LABEL: tt.func @gemm_inner_loop
+// CONTRACTED-A: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CONTRACTED-A: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
+// CONTRACTED-A: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CONTRACTED-A: tt.scheduled_max_stage = 2 : i32
+//
+// CONTRACTED-B-LABEL: tt.func @gemm_inner_loop
+// CONTRACTED-B: tt.descriptor_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32}
+// CONTRACTED-B: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CONTRACTED-B: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 1 : i32}
+// CONTRACTED-B: tt.scheduled_max_stage = 2 : i32
 tt.func @gemm_inner_loop(
   %a_desc: !tt.tensordesc<128x64xf16>,
   %b_desc: !tt.tensordesc<64x128xf16>

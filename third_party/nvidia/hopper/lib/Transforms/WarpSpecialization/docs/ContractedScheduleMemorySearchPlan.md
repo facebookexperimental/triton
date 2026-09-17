@@ -1,7 +1,9 @@
 # Contracted Schedule and Memory-Plan Search Plan
 
-**Status:** implementation in progress. Structural admission and the bounded
-II frontier are implemented; load-placement diversity remains open.
+**Status:** implementation in progress. Structural admission, the bounded II
+frontier, and the first load-placement branching mechanism are implemented.
+The one-GEMM scheduling oracle now exposes both operand orders; connecting
+those schedules to multi-result SMEM copy search remains open.
 
 **Implemented first slice:** Contracted search now derives its lower II from
 structural issue counts, uses those same quanta for dependence and reservation
@@ -13,6 +15,15 @@ frontier reserves roughly half of top-K for evenly spaced feasible II values,
 including the minimum and maximum when possible, and uses the other slots for
 the globally best structural alternatives. This keeps rank 0 default-neutral
 while ensuring larger-II schedules remain measurable.
+
+**Implemented third slice:** Descriptor/TMA loads with a distance-zero path to
+a GEMM are discovered structurally and appended to the schedule signature.
+The search generates bounded topological variants that pull each load and its
+address-dependency slice forward without violating DDG edges, and reserves one
+top-K slot for a non-default load order. The FA-backward oracle now checks such
+a load-order candidate directly. A one-MMA two-descriptor fixture additionally
+checks both A-early/B-late and A-late/B-early orders, matching the scheduling
+shape needed by D120426461.
 
 **Primary implementation areas:**
 
@@ -87,11 +98,12 @@ lower bound, dependence admission, and resource reservations. Contracted
 latency remains only as a ranking tie-breaker. Load-placement branching is
 still required before Milestone A is complete.
 
-### 2.2 Contracted candidate identity hides memory-relevant schedules
+### 2.2 Contracted candidate identity originally hid memory-relevant schedules
 
-The current signature contains only `(GEMM stage, GEMM cluster)`. Schedules
-that differ only in descriptor-load placement collapse. D120426461's A3/B2
-and A2/B3 cases can therefore appear identical to the top-K machinery.
+The original signature contained only `(GEMM stage, GEMM cluster)`. It now also
+contains structurally discovered GEMM-reaching TMA-load stage/cluster pairs,
+so load-order variants remain distinct. The reduced one-GEMM oracle proves that
+A-early and B-early both reach top-K; the full fused RMSNorm fixture remains.
 
 ### 2.3 The memory beam produces little SMEM diversity
 
@@ -205,6 +217,10 @@ Retain three configurations as the minimal search oracle:
 
 Check descriptor-load and MMA stage/cluster assignments, final SMEM rings, and
 barrier counts.
+
+The scheduler half now has a reduced one-MMA/two-descriptor oracle in
+`test/TritonGPU/modulo-schedule.mlir`; the A/B copy-depth alternatives remain a
+Milestone B deliverable.
 
 #### FA-backward example
 
@@ -669,7 +685,7 @@ as a hard correctness floor.
 
 - [x] Structural Contracted SWP does not use result latency for admission.
 - [x] Multiple II values survive top-K selection.
-- [ ] Descriptor-load placement participates in candidate identity.
+- [x] Descriptor-load placement participates in candidate identity.
 - [ ] CopySolver emits multiple legal copy vectors.
 - [ ] Memory beam returns distinct SMEM depth plans.
 - [ ] Fixed-grouping search works with subtiled/staging kernels.

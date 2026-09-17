@@ -257,7 +257,8 @@ static int computeEarliest(unsigned nodeIdx, const DataDependenceGraph &ddg,
 
 /// Build topological order of DDG nodes (Kahn's algorithm on distance-0 edges).
 static llvm::SmallVector<unsigned>
-topologicalOrder(const DataDependenceGraph &ddg) {
+topologicalOrder(const DataDependenceGraph &ddg,
+                 const llvm::DenseSet<unsigned> *prioritized = nullptr) {
   unsigned N = ddg.getNumNodes();
   llvm::SmallVector<int> inDeg(N, 0);
   for (const auto &edge : ddg.getEdges()) {
@@ -273,7 +274,13 @@ topologicalOrder(const DataDependenceGraph &ddg) {
 
   llvm::SmallVector<unsigned> order;
   while (!ready.empty()) {
-    llvm::sort(ready);
+    llvm::sort(ready, [&](unsigned lhs, unsigned rhs) {
+      bool lhsPriority = prioritized && prioritized->contains(lhs);
+      bool rhsPriority = prioritized && prioritized->contains(rhs);
+      if (lhsPriority != rhsPriority)
+        return lhsPriority;
+      return lhs < rhs;
+    });
     unsigned cur = ready.front();
     ready.erase(ready.begin());
     order.push_back(cur);
@@ -285,6 +292,25 @@ topologicalOrder(const DataDependenceGraph &ddg) {
     }
   }
   return order;
+}
+
+/// Build a legal topological order that pulls one node and its distance-zero
+/// predecessor slice forward whenever those nodes are ready. This changes only
+/// the tie-break between independent operations; all DDG edges remain intact.
+static llvm::SmallVector<unsigned>
+topologicalOrderPrioritizing(const DataDependenceGraph &ddg,
+                             unsigned priorityRoot) {
+  llvm::DenseSet<unsigned> prioritized;
+  llvm::SmallVector<unsigned> worklist{priorityRoot};
+  while (!worklist.empty()) {
+    unsigned nodeIdx = worklist.pop_back_val();
+    if (!prioritized.insert(nodeIdx).second)
+      continue;
+    for (const DDGEdge *edge : ddg.getInEdges(nodeIdx))
+      if (edge->distance == 0)
+        worklist.push_back(edge->srcIdx);
+  }
+  return topologicalOrder(ddg, &prioritized);
 }
 
 // ── Branch-and-bound search ─────────────────────────────────────────────────
@@ -876,6 +902,7 @@ struct ComputeGroup {
 
 struct ContractedGraphInfo {
   llvm::SmallVector<unsigned> gemms;
+  llvm::SmallVector<unsigned> loads;
   llvm::SmallVector<int> gemmOrdinal;
   llvm::SmallVector<int> nodeToGroup;
   llvm::SmallVector<ComputeGroup> groups;
@@ -924,6 +951,9 @@ analyzeContractedGraph(const DataDependenceGraph &ddg,
         reachable[nodeIdx] |= reachable[edge->dstIdx];
     }
   }
+  for (const auto &node : ddg.getNodes())
+    if (node.pipeline == HWPipeline::TMA && reachable[node.idx].any())
+      info.loads.push_back(node.idx);
 
   llvm::SmallVector<unsigned> parent(numNodes);
   std::iota(parent.begin(), parent.end(), 0);
@@ -1006,20 +1036,22 @@ analyzeContractedGraph(const DataDependenceGraph &ddg,
 }
 
 static llvm::SmallVector<int>
-gemmSignature(const ContractedGraphInfo &info,
-              const llvm::DenseMap<unsigned, int> &scheduled, int II) {
+scheduleSignature(const ContractedGraphInfo &info,
+                  const llvm::DenseMap<unsigned, int> &scheduled, int II) {
+  llvm::SmallVector<unsigned> anchors = info.gemms;
+  anchors.append(info.loads.begin(), info.loads.end());
   llvm::SmallVector<int> signature;
-  signature.reserve(2 * info.gemms.size());
+  signature.reserve(2 * anchors.size());
   llvm::SmallVector<int> moduloCycles;
-  moduloCycles.reserve(info.gemms.size());
-  for (unsigned nodeIdx : info.gemms)
+  moduloCycles.reserve(anchors.size());
+  for (unsigned nodeIdx : anchors)
     moduloCycles.push_back(scheduled.lookup(nodeIdx) % II);
   llvm::SmallVector<int> sortedCycles = moduloCycles;
   llvm::sort(sortedCycles);
   sortedCycles.erase(std::unique(sortedCycles.begin(), sortedCycles.end()),
                      sortedCycles.end());
-  for (unsigned i = 0; i < info.gemms.size(); ++i) {
-    int cycle = scheduled.lookup(info.gemms[i]);
+  for (unsigned i = 0; i < anchors.size(); ++i) {
+    int cycle = scheduled.lookup(anchors[i]);
     int cluster =
         llvm::lower_bound(sortedCycles, moduloCycles[i]) - sortedCycles.begin();
     signature.push_back(cycle / II);
@@ -1093,10 +1125,59 @@ static bool validateSchedule(const DataDependenceGraph &ddg,
     int64_t consumerCycle = static_cast<int64_t>(dst->second) +
                             static_cast<int64_t>(edge.distance) * II;
     int64_t producerCycle = static_cast<int64_t>(src->second) + issueDuration;
-    if (consumerCycle < producerCycle)
+    if (consumerCycle < producerCycle) {
+      DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
+        llvm::dbgs() << "[modulo-scheduling-contracted]: reject edge N"
+                     << edge.srcIdx << "@" << src->second << " -> N"
+                     << edge.dstIdx << "@" << dst->second
+                     << " distance=" << edge.distance
+                     << " producer-end=" << producerCycle
+                     << " consumer-cycle=" << consumerCycle << "\n";
+      });
       return false;
+    }
   }
   return true;
+}
+
+/// Zero-duration IR nodes do not reserve a hardware pipeline, so their initial
+/// topological placement is arbitrary. Move them forward after the complete
+/// schedule is known when a backedge requires a later modulo position. This
+/// commonly occurs for an accumulator allocation between a loop-carried load
+/// and the next iteration's MMA. Non-zero-duration nodes remain fixed, and the
+/// ordinary validator below rejects the candidate if the move crosses a real
+/// consumer.
+static bool normalizeZeroDurationNodes(
+    const DataDependenceGraph &ddg,
+    llvm::DenseMap<unsigned, int> &scheduled, int II) {
+  for (unsigned iteration = 0; iteration < ddg.getNumNodes(); ++iteration) {
+    bool changed = false;
+    for (const DDGNode &node : ddg.getNodes()) {
+      if (structuralIssueDuration(node) != 0)
+        continue;
+      int cycle = scheduled.lookup(node.idx);
+      for (const auto *edge : ddg.getInEdges(node.idx)) {
+        auto source = scheduled.find(edge->srcIdx);
+        if (source == scheduled.end())
+          return false;
+        int issueDuration = edge->distance == 0
+                                ? structuralIssueDuration(
+                                      ddg.getNode(edge->srcIdx))
+                                : 0;
+        cycle = std::max(cycle, source->second + issueDuration -
+                                    static_cast<int>(edge->distance) * II);
+      }
+      if (cycle > 3 * II - 1)
+        return false;
+      if (cycle > scheduled.lookup(node.idx)) {
+        scheduled[node.idx] = cycle;
+        changed = true;
+      }
+    }
+    if (!changed)
+      return true;
+  }
+  return false;
 }
 
 } // namespace
@@ -1114,13 +1195,14 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   if (topo.size() != ddg.getNumNodes())
     return failure();
   auto contracted = analyzeContractedGraph(ddg, topo);
-  if (contracted.gemms.size() < 2 || contracted.gemms.size() >= 63)
+  if (contracted.gemms.empty() || contracted.gemms.size() >= 63)
     return failure();
 
   struct Candidate {
     int II;
     int imbalance;
     int64_t contractedCost;
+    unsigned loadOrderVariant;
     llvm::SmallVector<int> signature;
     llvm::DenseMap<unsigned, int> scheduled;
   };
@@ -1131,121 +1213,148 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   llvm::SmallVector<unsigned> placementFailures(ddg.getNumNodes(), 0);
   unsigned validationFailures = 0;
 
+  // Baseline stable order plus one predecessor-slice-prioritized order per
+  // GEMM-reaching TMA load. Bound the internal branching independently from
+  // top-K; candidate identity below removes variants that do not actually
+  // change an anchor placement.
+  constexpr unsigned kMaxLoadOrderVariants = 8;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> topoVariants{topo};
+  for (unsigned loadIdx = 0;
+       loadIdx <
+       std::min<unsigned>(contracted.loads.size(), kMaxLoadOrderVariants);
+       ++loadIdx) {
+    auto prioritized =
+        topologicalOrderPrioritizing(ddg, contracted.loads[loadIdx]);
+    if (prioritized.size() != ddg.getNumNodes() ||
+        std::find(topoVariants.begin(), topoVariants.end(), prioritized) !=
+            topoVariants.end())
+      continue;
+    topoVariants.push_back(std::move(prioritized));
+  }
+
   DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
     llvm::dbgs() << "[modulo-scheduling-contracted]: original nodes="
                  << ddg.getNumNodes() << " GEMMs=" << contracted.gemms.size()
                  << " compute groups=" << contracted.groups.size()
+                 << " load-order variants=" << topoVariants.size()
                  << " structural MinII=" << minII
                  << " modeled MinII=" << ddg.computeMinII() << "\n";
   });
 
   for (int II = minII; II <= maxII; ++II) {
-    for (uint64_t assignment = 1; assignment + 1 < assignmentLimit;
-         ++assignment) {
-      ModuloReservationTable table(II);
-      llvm::DenseMap<unsigned, int> scheduled;
-      bool valid = true;
-      for (unsigned nodeIdx : topo) {
-        const auto &node = ddg.getNode(nodeIdx);
-        int earliest = computeContractedEarliest(nodeIdx, ddg, scheduled, II);
-        int duration = structuralIssueDuration(node);
-        int targetStage = earliest / II;
-        int ordinal = contracted.gemmOrdinal[nodeIdx];
-        if (ordinal >= 0)
-          targetStage = (assignment >> ordinal) & 1;
-        int maxStage = ordinal >= 0 ? 1 : 2;
-        if (targetStage > maxStage ||
-            (ordinal >= 0 && earliest > (targetStage + 1) * II - 1)) {
-          DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
-            if (placementFailures[nodeIdx] == 0)
-              llvm::dbgs() << "[modulo-scheduling-contracted]: first reject N"
-                           << nodeIdx << " II=" << II
-                           << " assignment=" << assignment
-                           << " targetStage=" << targetStage
-                           << " earliest=" << earliest << " (stage bound)\n";
-          });
-          placementFailures[nodeIdx]++;
-          valid = false;
-          break;
-        }
-        int stageStart = std::max(earliest, targetStage * II);
-        if (ordinal > 0 && targetStage == 1) {
-          auto leading = scheduled.find(contracted.gemms.front());
-          if (leading != scheduled.end())
-            stageStart = std::max(stageStart, II + leading->second % II + 1);
-        }
-        // Keep the leading stage-0 GEMM early. Pack later stage-0 GEMMs at the
-        // end of the modulo interval, leaving low modulo cycles available to
-        // stage-1 consumers after the iteration boundary.
-        if (ordinal > 0 && targetStage == 0) {
-          int trailingOccupancy = 0;
-          for (unsigned gemm = ordinal; gemm < contracted.gemms.size();
-               ++gemm) {
-            if (((assignment >> gemm) & 1) == 0)
-              trailingOccupancy +=
-                  structuralIssueDuration(ddg.getNode(contracted.gemms[gemm]));
+    for (uint64_t assignment = 1; assignment < assignmentLimit; ++assignment) {
+      // Multi-GEMM schedules must use both stages. A single GEMM is assigned
+      // to stage 1 so stage 0 remains available for its operand prefetches.
+      if (contracted.gemms.size() > 1 && assignment + 1 == assignmentLimit)
+        continue;
+      for (unsigned loadOrderVariant = 0;
+           loadOrderVariant < topoVariants.size(); ++loadOrderVariant) {
+        ModuloReservationTable table(II);
+        llvm::DenseMap<unsigned, int> scheduled;
+        bool valid = true;
+        for (unsigned nodeIdx : topoVariants[loadOrderVariant]) {
+          const auto &node = ddg.getNode(nodeIdx);
+          int earliest = computeContractedEarliest(nodeIdx, ddg, scheduled, II);
+          int duration = structuralIssueDuration(node);
+          int targetStage = earliest / II;
+          int ordinal = contracted.gemmOrdinal[nodeIdx];
+          if (ordinal >= 0)
+            targetStage = (assignment >> ordinal) & 1;
+          int maxStage = ordinal >= 0 ? 1 : 2;
+          if (targetStage > maxStage ||
+              (ordinal >= 0 && earliest > (targetStage + 1) * II - 1)) {
+            DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
+              if (placementFailures[nodeIdx] == 0)
+                llvm::dbgs()
+                    << "[modulo-scheduling-contracted]: first reject N"
+                    << nodeIdx << " II=" << II << " assignment=" << assignment
+                    << " targetStage=" << targetStage
+                    << " earliest=" << earliest << " (stage bound)\n";
+            });
+            placementFailures[nodeIdx]++;
+            valid = false;
+            break;
           }
-          stageStart = std::max(stageStart, II - trailingOccupancy);
+          int stageStart = std::max(earliest, targetStage * II);
+          if (ordinal > 0 && targetStage == 1) {
+            auto leading = scheduled.find(contracted.gemms.front());
+            if (leading != scheduled.end())
+              stageStart = std::max(stageStart, II + leading->second % II + 1);
+          }
+          // Keep the leading stage-0 GEMM early. Pack later stage-0 GEMMs at
+          // the end of the modulo interval, leaving low modulo cycles available
+          // to stage-1 consumers after the iteration boundary.
+          if (ordinal > 0 && targetStage == 0) {
+            int trailingOccupancy = 0;
+            for (unsigned gemm = ordinal; gemm < contracted.gemms.size();
+                 ++gemm) {
+              if (((assignment >> gemm) & 1) == 0)
+                trailingOccupancy += structuralIssueDuration(
+                    ddg.getNode(contracted.gemms[gemm]));
+            }
+            stageStart = std::max(stageStart, II - trailingOccupancy);
+          }
+          int slot = table.findFreeSlot(stageStart, node.pipeline, duration);
+          if (slot < 0 || slot / II > maxStage ||
+              (ordinal >= 0 && slot / II != targetStage)) {
+            DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
+              if (placementFailures[nodeIdx] == 0)
+                llvm::dbgs()
+                    << "[modulo-scheduling-contracted]: first reject N"
+                    << nodeIdx << " II=" << II << " assignment=" << assignment
+                    << " targetStage=" << targetStage
+                    << " earliest=" << earliest << " slot=" << slot
+                    << " (resource)\n";
+            });
+            placementFailures[nodeIdx]++;
+            valid = false;
+            break;
+          }
+          table.reserve(slot, node.pipeline, nodeIdx, duration);
+          scheduled[nodeIdx] = slot;
         }
-        int slot = table.findFreeSlot(stageStart, node.pipeline, duration);
-        if (slot < 0 || slot / II > maxStage ||
-            (ordinal >= 0 && slot / II != targetStage)) {
-          DEBUG_WITH_TYPE("modulo-scheduling-contracted", {
-            if (placementFailures[nodeIdx] == 0)
-              llvm::dbgs() << "[modulo-scheduling-contracted]: first reject N"
-                           << nodeIdx << " II=" << II
-                           << " assignment=" << assignment
-                           << " targetStage=" << targetStage
-                           << " earliest=" << earliest << " slot=" << slot
-                           << " (resource)\n";
-          });
-          placementFailures[nodeIdx]++;
-          valid = false;
-          break;
-        }
-        table.reserve(slot, node.pipeline, nodeIdx, duration);
-        scheduled[nodeIdx] = slot;
-      }
-      if (!valid)
-        continue;
-      if (!validateSchedule(ddg, scheduled, II)) {
-        validationFailures++;
-        continue;
-      }
-
-      auto signature = gemmSignature(contracted, scheduled, II);
-      // A modulo schedule's II is part of its identity. The same GEMM
-      // stage/cluster signature at a different II has different resource
-      // slack and can induce a different memory plan, so it must remain
-      // measurable.
-      llvm::SmallVector<int> identity;
-      identity.reserve(signature.size() + 1);
-      identity.push_back(II);
-      identity.append(signature.begin(), signature.end());
-      if (!seen.insert(std::move(identity)).second)
-        continue;
-
-      int stageOne = llvm::popcount(assignment);
-      int imbalance =
-          std::abs(static_cast<int>(contracted.gemms.size()) - 2 * stageOne);
-      int64_t contractedCost = 0;
-      for (const auto &group : contracted.groups) {
-        if (group.reachableGemms.none())
+        if (!valid)
           continue;
-        int minStage = 1;
-        int maxStage = 0;
-        for (int gemm = group.reachableGemms.find_first(); gemm >= 0;
-             gemm = group.reachableGemms.find_next(gemm)) {
-          int stage = (assignment >> gemm) & 1;
-          minStage = std::min(minStage, stage);
-          maxStage = std::max(maxStage, stage);
+        if (!normalizeZeroDurationNodes(ddg, scheduled, II))
+          continue;
+        if (!validateSchedule(ddg, scheduled, II)) {
+          validationFailures++;
+          continue;
         }
-        contractedCost +=
-            static_cast<int64_t>(group.rankingLatency) * (maxStage - minStage);
+
+        auto signature = scheduleSignature(contracted, scheduled, II);
+        // A modulo schedule's II is part of its identity. The same GEMM
+        // stage/cluster signature at a different II has different resource
+        // slack and can induce a different memory plan, so it must remain
+        // measurable.
+        llvm::SmallVector<int> identity;
+        identity.reserve(signature.size() + 1);
+        identity.push_back(II);
+        identity.append(signature.begin(), signature.end());
+        if (!seen.insert(std::move(identity)).second)
+          continue;
+
+        int stageOne = llvm::popcount(assignment);
+        int imbalance =
+            std::abs(static_cast<int>(contracted.gemms.size()) - 2 * stageOne);
+        int64_t contractedCost = 0;
+        for (const auto &group : contracted.groups) {
+          if (group.reachableGemms.none())
+            continue;
+          int minStage = 1;
+          int maxStage = 0;
+          for (int gemm = group.reachableGemms.find_first(); gemm >= 0;
+               gemm = group.reachableGemms.find_next(gemm)) {
+            int stage = (assignment >> gemm) & 1;
+            minStage = std::min(minStage, stage);
+            maxStage = std::max(maxStage, stage);
+          }
+          contractedCost += static_cast<int64_t>(group.rankingLatency) *
+                            (maxStage - minStage);
+        }
+        candidates.push_back({II, imbalance, contractedCost, loadOrderVariant,
+                              std::move(signature), std::move(scheduled)});
       }
-      candidates.push_back({II, imbalance, contractedCost,
-                            std::move(signature),
-                            std::move(scheduled)});
     }
   }
 
@@ -1264,6 +1373,10 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
   auto candidateLess = [](const Candidate &lhs, const Candidate &rhs) {
     if (lhs.II != rhs.II)
       return lhs.II < rhs.II;
+    bool lhsBaseline = lhs.loadOrderVariant == 0;
+    bool rhsBaseline = rhs.loadOrderVariant == 0;
+    if (lhsBaseline != rhsBaseline)
+      return lhsBaseline;
     if (lhs.imbalance != rhs.imbalance)
       return lhs.imbalance < rhs.imbalance;
     if (lhs.contractedCost != rhs.contractedCost)
@@ -1276,9 +1389,10 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
 
   // Reserve roughly half of top-K for II diversity, sampling the feasible II
   // range evenly and always retaining both endpoints when at least two slots
-  // are available. Fill the remaining slots by the ordinary deterministic
-  // ranking. This preserves low-II GEMM alternatives while preventing them
-  // from evicting every schedule with more structural slack.
+  // are available. Reserve another slot for the best non-default load-order
+  // variant, then fill the rest by the ordinary deterministic ranking. This
+  // preserves low-II GEMM alternatives while preventing them from evicting
+  // every schedule with more structural slack or a distinct load placement.
   int nTop = std::min<int>(K, candidates.size());
   llvm::SmallVector<int> feasibleIIs;
   for (const Candidate &candidate : candidates)
@@ -1301,6 +1415,16 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
     frontier.push_back(candidateIndex);
     selected.insert(candidateIndex);
   }
+  auto loadVariant = std::find_if(candidates.begin(), candidates.end(),
+                                  [](const Candidate &candidate) {
+                                    return candidate.loadOrderVariant != 0;
+                                  });
+  if (frontier.size() < static_cast<unsigned>(nTop) &&
+      loadVariant != candidates.end()) {
+    unsigned candidateIndex = loadVariant - candidates.begin();
+    if (selected.insert(candidateIndex).second)
+      frontier.push_back(candidateIndex);
+  }
   for (unsigned candidateIndex = 0;
        frontier.size() < static_cast<unsigned>(nTop); ++candidateIndex) {
     if (selected.insert(candidateIndex).second)
@@ -1320,10 +1444,18 @@ runContractedSearch(const DataDependenceGraph &ddg, int maxII) {
       llvm::dbgs() << "  rank " << rank << " II=" << candidate.II
                    << " imbalance=" << candidate.imbalance
                    << " computeCost=" << candidate.contractedCost
+                   << " loadOrderVariant=" << candidate.loadOrderVariant
                    << " gemms(stage,cluster)=[";
       for (unsigned i = 0; i < contracted.gemms.size(); ++i)
         llvm::dbgs() << (i ? "," : "") << "(" << candidate.signature[2 * i]
                      << "," << candidate.signature[2 * i + 1] << ")";
+      llvm::dbgs() << "] loads(stage,cluster)=[";
+      for (unsigned i = 0; i < contracted.loads.size(); ++i) {
+        unsigned signatureIndex = 2 * (contracted.gemms.size() + i);
+        llvm::dbgs() << (i ? "," : "") << "("
+                     << candidate.signature[signatureIndex] << ","
+                     << candidate.signature[signatureIndex + 1] << ")";
+      }
       llvm::dbgs() << "]\n";
     }
   });

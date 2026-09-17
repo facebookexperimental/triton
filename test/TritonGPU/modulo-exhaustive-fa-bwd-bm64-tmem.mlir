@@ -13,6 +13,12 @@
 // RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
 
 // RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
+// RUN:   TRITON_MODULO_TOPK=5 TRITON_MODULO_PICK=2 \
+// RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
+// RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=CONTRACTED-LOAD \
+// RUN:       --implicit-check-not=tt.autows --implicit-check-not=tt.modulo_ii --implicit-check-not=ttg.partition
+
+// RUN: env STANDALONE_MODULO=1 TRITON_USE_MODULO_SCHEDULE=contracted \
 // RUN:   TRITON_MODULO_TOPK=5 TRITON_MODULO_PICK=3 \
 // RUN:   triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule \
 // RUN:   -mlir-print-debuginfo -mlir-print-local-scope | FileCheck %s --check-prefix=CONTRACTED-II \
@@ -52,6 +58,19 @@
 // CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 13 : i32, loop.stage = 1 : i32{{.*}}"dk"
 // CONTRACTED: ttng.tc_gen5_mma {{.*}}loop.cluster = 14 : i32, loop.stage = 1 : i32{{.*}}"dq"
 // CONTRACTED: tt.scheduled_max_stage = 2 : i32
+
+// Pick 2 prioritizes the `do` descriptor-load predecessor slice. The source
+// operation remains after qkT, but its modulo cluster moves before q and qkT.
+// This proves load order is a searched structural choice, not an operand-name
+// special case.
+// CONTRACTED-LOAD-LABEL: @_attn_bwd
+// CONTRACTED-LOAD: tt.descriptor_load {{.*}}loop.cluster = 4 : i32, loop.stage = 0 : i32{{.*}}"q"
+// CONTRACTED-LOAD: ttng.tc_gen5_mma {{.*}}loop.cluster = 5 : i32, loop.stage = 0 : i32{{.*}}"qkT"
+// CONTRACTED-LOAD: tt.descriptor_load {{.*}}loop.cluster = 3 : i32, loop.stage = 0 : i32{{.*}}"do"
+// CONTRACTED-LOAD: ttng.tc_gen5_mma {{.*}}loop.cluster = 20 : i32, loop.stage = 0 : i32{{.*}}"dpT"
+// CONTRACTED-LOAD: ttng.tc_gen5_mma {{.*}}loop.cluster = 6 : i32, loop.stage = 1 : i32{{.*}}"dv"
+// CONTRACTED-LOAD: ttng.tc_gen5_mma {{.*}}loop.cluster = 14 : i32, loop.stage = 1 : i32{{.*}}"dk"
+// CONTRACTED-LOAD: ttng.tc_gen5_mma {{.*}}loop.cluster = 15 : i32, loop.stage = 1 : i32{{.*}}"dq"
 
 // Pick 3 is reserved for a larger-II frontier representative rather than a
 // fourth candidate from the structural lower bound. It has more slack, so the
