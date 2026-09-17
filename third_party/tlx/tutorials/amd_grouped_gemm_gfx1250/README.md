@@ -9,6 +9,8 @@ its correctness and compile tests, and a regular-shape benchmark sweep.
   kernel, tests, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with process isolation and CSV
   output.
+- `grouped_gemm_experiments.py`: opt-in cluster multicast and WMMA operand
+  reuse transformations for hardware experiments.
 
 ## Data Layout
 
@@ -212,3 +214,53 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
   --case 16,4096,4096,4096
 ```
+
+## Optional Hardware Experiments
+
+Cluster multicast and WMMA operand-cache reuse are available for hardware
+comparison. Both are disabled by default; their performance benefit needs
+hardware validation.
+
+`--cluster-size 2` shares B within each workgroup pair. `--cluster-size 4`
+shares A and B across a logical two-by-two output region. Use
+`--no-cluster-multicast` with either size for a synchronization-only control.
+`--cluster-sync all` uses conservative cluster rendezvous at all handoffs;
+`--cluster-sync refill` limits them to handoffs preceding input refills,
+retaining local synchronization for data readiness and output staging.
+`--num-programs` continues to count physical workgroups.
+
+Cluster experiments require the square hybrid defaults: `256x256x128`, depth
+two, `group_m=4`, cross-tile prefetch enabled, dedicated C staging and L2
+prefetch disabled, and chunked remapping with eight logical XCDs and chunk
+size two. Groups must have equal, nonzero M divisible by 1024; N must be
+divisible by 512. The program count must be divisible by 16 and divide each
+group's output tile count. Set `--num-programs` explicitly when the device CU
+count does not satisfy those conditions. Automatic configuration selection
+is unsupported for this experiment.
+
+`--operand-reuse` sets WMMA reuse hints only when consecutive instructions
+use the same physical source registers and the preceding result does not
+overwrite them. It can be used independently or together with multicast.
+Use `--benchmark-mode graph` for timing comparisons to reduce host launch
+overhead from the experimental compilation hook.
+
+```bash
+# Four-workgroup multicast with reduced synchronization.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --cluster-size 4 --cluster-sync refill --benchmark-mode graph --check
+
+# The matching synchronization-only control.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --cluster-size 4 --cluster-sync refill --no-cluster-multicast --benchmark-mode graph --check
+
+# Operand reuse on the ordinary workgroup schedule.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --operand-reuse --benchmark-mode graph --check
+```
+
+The standalone script and Python wrapper expose the same options with
+underscores, such as `--cluster_size` and `operand_reuse=True`.
+These experiments use a scoped, cache-keyed compilation hook for this kernel.
+The cluster prototype edits LLVM IR and rejects unrecognized code generation;
+operand reuse is applied after register allocation. Tensor layouts, tensor
+APIs, and the ordinary compiler schedule remain unchanged.

@@ -122,6 +122,10 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         str(args.num_xcds),
         "--xcd_chunk",
         str(args.xcd_chunk),
+        "--cluster_size",
+        str(args.cluster_size),
+        "--cluster_sync",
+        args.cluster_sync,
         "--seed",
         str(args.seed),
     ]
@@ -133,6 +137,10 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         command.append("--cross_tile_prefetch")
     if args.auto_config:
         command.append("--auto_config")
+    if not args.cluster_multicast:
+        command.append("--no-cluster_multicast")
+    if args.operand_reuse:
+        command.append("--operand_reuse")
     if args.check:
         command.append("--check")
     return command
@@ -224,6 +232,14 @@ def main() -> int:
                         help="persistent program remapping (default: chunked)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
+    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=1,
+                        help="experimental workgroup cluster size (default: 1, disabled)")
+    parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share inputs within a cluster; disable for a synchronization-only control")
+    parser.add_argument("--cluster-sync", choices=("all", "refill"), default="all",
+                        help="cluster rendezvous at all handoffs or only before input refills")
+    parser.add_argument("--operand-reuse", action=argparse.BooleanOptionalAction, default=False,
+                        help="experimental WMMA operand-cache reuse hints")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--benchmark-num-iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
