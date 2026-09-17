@@ -119,6 +119,38 @@ candidates for further copy increases. The `isCrossStage` property does
 | **P1** | `isInnermost && !isTMA` | Non-TMA innermost buffers. Lower priority. |
 | **P2** (lowest) | `!isInnermost` | Outside-loop or non-innermost buffers. Stay at current copies. |
 
+### Phases 3.5–3.8: Reuse, staging, and MMA/output competition
+
+Before the ordinary priority walk, the planner performs four bounded steps:
+
+1. **Phase 3.5** merges compatible epilogue subtiles and TMA staging buffers
+   that can share a physical `buffer.id`.
+2. **Phase 3.6** may place discretionary staging buffers in compatible reuse
+   hosts when correctness floors alone exceed the soft SMEM budget. It never
+   aliases an operand that remains live across the inner loop.
+3. **Phase 3.7** reserves loop-carried TMA-reduction staging. The helper takes
+   an explicit target depth; this is intentionally independent of the target
+   used for ordinary output staging, even though the current policy initializes
+   both from the same configured/capped depth.
+4. **Phase 3.8** may balance one complete MMA operand bundle against ordinary
+   TMA output rings. A bundle is eligible only when every candidate operand is
+   consumed by the same closest non-persistent reduction loop and the same
+   consumer task. Multiple or ambiguous loop/task groups fall back to the
+   ordinary output-first policy.
+
+The closest non-persistent loop is authoritative for operand reuse. A static
+loop contributes its trip count. A dynamic loop conservatively uses the
+configured pipeline depth; the planner does not inspect an enclosing static
+loop because that loop may represent persistent tile scheduling rather than K
+reuse.
+
+Ordinary output rings obey their correctness floor, the staging-depth cap, the
+SMEM budget, reuse-host capacity, and their rotation legality constraint. A
+1CTA ring depth must be one or divide its subtile count; 2CTA ordinary output
+staging currently permits one copy only. If no legal depth at or above a hard
+correctness floor fits, allocation terminates with failure. It must not proceed
+to Phase 4 with a partially invalid plan.
+
 ### Phase 4: Iterative Copy Increase
 
 Process each priority level from P0 to P1 (P2 is never increased).
