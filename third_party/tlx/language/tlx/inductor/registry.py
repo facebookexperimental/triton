@@ -2810,8 +2810,8 @@ TritonTemplateKernel.call_kernel = _tlx_call_kernel  # type: ignore[method-assig
 
 
 # ---------------------------------------------------------------------------
-# Override TritonScheduling.create_kernel_choices to offer the gfx950
-# cross-phase LDS retention kernel as an extra MultiKernel candidate.
+# Override TritonScheduling.create_kernel_choices to offer the cross-phase
+# local-retention kernel as an extra MultiKernel candidate.
 #
 # Same monkeypatch mechanism as the TritonTemplateKernel overrides above, so
 # the retention prototype needs no hook inside torch._inductor.  The
@@ -2819,7 +2819,7 @@ TritonTemplateKernel.call_kernel = _tlx_call_kernel  # type: ignore[method-assig
 # clears the retention legality envelope.
 # ---------------------------------------------------------------------------
 from torch._inductor.codegen.triton import TritonScheduling
-from .local_buffer_retention_gfx950 import (
+from .scheduling.local_buffer_retention import (
     create_kernel_choices as _tlx_create_kernel_choices_impl,
 )
 

@@ -26,7 +26,7 @@ from torch.testing._internal.inductor_utils import GPU_TYPE
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._triton import has_datacenter_blackwell_tma_device
 from triton.language.extra.tlx.inductor import tlx_config
-from triton.language.extra.tlx.inductor.local_buffer_retention_gfx950 import (
+from triton.language.extra.tlx.inductor.scheduling.local_buffer_retention import (
     LocalBufferRetention, )
 from triton.language.extra.tlx.hw.target import current_target
 
@@ -50,6 +50,11 @@ def has_tlx() -> bool:
 def is_gfx950() -> bool:
     """True on AMD MI350X (gfx950), where the TLX warp-pipe addmm template runs."""
     return current_target().is_gfx950
+
+
+def is_hopper() -> bool:
+    """True on an H100, where local-buffer retention uses SMEM."""
+    return current_target().is_hopper
 
 
 def is_blackwell() -> bool:
@@ -113,7 +118,25 @@ class TestLocalBufferRetention(TestCase):
         with mock.patch.object(torch.version, "hip", "6.0"), mock.patch.object(
                 torch.cuda,
                 "get_device_properties",
-                return_value=mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
+                return_value=mock.Mock(
+                gcnArchName="gfx950:sramecc+:xnack-",
+                multi_processor_count=256,
+                shared_memory_per_block_optin=163840,
+            ),
+        ):
+            yield
+
+    @contextlib.contextmanager
+    def _on_hopper(self):
+        with mock.patch.object(torch.version, "hip", None), mock.patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=mock.Mock(
+                major=9,
+                minor=0,
+                multi_processor_count=132,
+                shared_memory_per_block_optin=232448,
+            ),
         ):
             yield
 
@@ -152,8 +175,8 @@ class TestLocalBufferRetention(TestCase):
         # candidate under the same contract as the built-in siblings: one
         # shared must_keep_buffers so every choice takes identical arguments,
         # persistent kernels last, and nothing at all when multi_kernel is off.
-        from triton.language.extra.tlx.inductor import (
-            local_buffer_retention_gfx950 as lbr, )
+        from triton.language.extra.tlx.inductor.scheduling import (
+            local_buffer_retention as lbr, )
 
         class FakeKernel:
 
@@ -189,24 +212,45 @@ class TestLocalBufferRetention(TestCase):
             self.assertEqual(extra.call_count, 0)
             self.assertEqual(len(kernels), 1)
 
-    def test_enablement_requires_allow_and_gfx950(self):
-        with V.set_graph_handler(self._graph_mock()), mock.patch.object(torch.version, "hip", "6.0"):
-            with mock.patch.object(
-                    torch.cuda,
-                    "get_device_properties",
-                    return_value=mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
-            ):
-                with config.patch({"triton.tlx_mode": "allow"}):
-                    self.assertTrue(LocalBufferRetention._is_enabled())
-                with config.patch({"triton.tlx_mode": "force"}):
-                    self.assertFalse(LocalBufferRetention._is_enabled())
+    def test_enablement_requires_allow_and_supported_architecture(self):
+        with V.set_graph_handler(self._graph_mock()), self._on_gfx950():
+            with config.patch({"triton.tlx_mode": "allow"}):
+                self.assertTrue(LocalBufferRetention._is_enabled())
+            with config.patch({"triton.tlx_mode": "force"}):
+                self.assertFalse(LocalBufferRetention._is_enabled())
 
-            with mock.patch.object(
-                    torch.cuda,
-                    "get_device_properties",
-                    return_value=mock.Mock(gcnArchName="gfx942:sramecc+:xnack-"),
-            ):
-                with config.patch({"triton.tlx_mode": "allow"}):
+        with V.set_graph_handler(self._graph_mock()), self._on_hopper():
+            with config.patch({"triton.tlx_mode": "allow"}):
+                self.assertTrue(LocalBufferRetention._is_enabled())
+
+        unsupported_targets = (
+            (
+                "6.0",
+                mock.Mock(
+                    gcnArchName="gfx942:sramecc+:xnack-",
+                    multi_processor_count=304,
+                    shared_memory_per_block_optin=65536,
+                ),
+            ),
+            (
+                None,
+                mock.Mock(
+                    major=10,
+                    minor=0,
+                    multi_processor_count=148,
+                    shared_memory_per_block_optin=232448,
+                ),
+            ),
+        )
+        for hip_version, properties in unsupported_targets:
+            with self.subTest(hip_version=hip_version, properties=properties):
+                with V.set_graph_handler(self._graph_mock()), mock.patch.object(
+                    torch.version, "hip", hip_version
+                ), mock.patch.object(
+                    torch.cuda, "get_device_properties", return_value=properties
+                ), config.patch(
+                    {"triton.tlx_mode": "allow"}
+                ):
                     self.assertFalse(LocalBufferRetention._is_enabled())
 
     def test_enablement_follows_the_compilation_target(self):
@@ -250,12 +294,54 @@ class TestLocalBufferRetention(TestCase):
         self.assertEqual(plan.reduction_numel, 4096)
         self.assertEqual(plan.reduction_block, 2048)
         self.assertEqual(plan.num_warps, 4)
-        self.assertEqual(plan.waves_per_eu, 4)
+        self.assertEqual(plan.backend_options, (("waves_per_eu", 4),))
+        self.assertEqual(
+            plan.triton_config,
+            {
+                "XBLOCK": 1,
+                "R0_BLOCK": 2048,
+                "num_warps": 4,
+                "num_stages": 1,
+                "waves_per_eu": 4,
+            },
+        )
         self.assertEqual(plan.total_bytes, 8192)
         self.assertEqual(len(plan.buffers), 1)
         self.assertEqual(plan.buffers[0].name, "workspace")
         self.assertEqual(plan.buffers[0].store_phase, 2)
         self.assertEqual(plan.buffers[0].load_phases, (4, ))
+
+    def test_hopper_plan_omits_amd_backend_options(self):
+        i, r = sympy.symbols("i r", integer=True)
+        access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
+        producer = self._scheduler_node(
+            "producer", is_reduction=True, writes=(access,)
+        )
+        consumer = self._scheduler_node(
+            "consumer", is_reduction=True, reads=(access,), writes=(access,)
+        )
+        graph = self._graph_mock()
+        graph.get_dtype.return_value = torch.float16
+        graph.get_numel.return_value = 128 * 4096
+
+        with V.set_graph_handler(graph), self._on_hopper(), config.patch(
+            {"triton.tlx_mode": "allow"}
+        ):
+            plan = LocalBufferRetention.plan_for(
+                [producer, DisableReduction, EnableReduction, consumer]
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.backend_options, ())
+        self.assertEqual(
+            plan.triton_config,
+            {
+                "XBLOCK": 1,
+                "R0_BLOCK": 4096,
+                "num_warps": 8,
+                "num_stages": 1,
+            },
+        )
 
     def test_rejects_unproven_buffer_multiple(self):
         i, r = sympy.symbols("i r", integer=True)
@@ -365,8 +451,15 @@ class TestLocalBufferRetention(TestCase):
 
         self.assertIsNone(plan)
 
-    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(
+        not (is_gfx950() or is_hopper()),
+        "Need AMD MI350X (gfx950) or NVIDIA H100 (sm90)",
+    )
     def test_inductor_codegen(self):
+        # Earlier tests initialize V.choices with TLX disabled, so install the
+        # registry explicitly before exercising the production codegen path.
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
         n = 6144
 
         def double_layernorm_silu(x, residual, weight1, bias1, weight2, bias2):
@@ -400,6 +493,45 @@ class TestLocalBufferRetention(TestCase):
 
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_scaled_mm_delegates_to_standard_choices(self):
+        from torch._inductor.choices import InductorChoices
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        expected = [object()]
+        for mode in ("allow", "force"):
+            with self.subTest(mode=mode), config.patch(
+                {"triton.tlx_mode": mode}
+            ), mock.patch.object(
+                InductorChoices,
+                "get_template_configs",
+                return_value=expected,
+            ) as base_get_configs:
+                actual = TLXInductorChoices().get_template_configs(
+                    mock.sentinel.kernel_inputs,
+                    [mock.sentinel.template],
+                    "scaled_mm",
+                )
+
+            self.assertIs(actual, expected)
+            base_get_configs.assert_called_once()
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_nvidia_only_appends_blackwell_template_to_mm(self):
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        existing_template = object()
+        scaled_mm_templates = [existing_template]
+        with mock.patch.object(_tlx_mm, "is_rocm", return_value=False):
+            scaled_mm_result = _tlx_mm.append_tlx(
+                scaled_mm_templates, op_name="scaled_mm"
+            )
+            mm_result = _tlx_mm.append_tlx([], op_name="mm")
+
+        self.assertIs(scaled_mm_result, scaled_mm_templates)
+        self.assertEqual(scaled_mm_templates, [existing_template])
+        self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_bmm_shared_a_rejects_non_gfx950(self):

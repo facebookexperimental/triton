@@ -18,6 +18,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+// CHECK: module attributes
+// CHECK-SAME: ttng.warp_specialize_barrier_ids = array<i32: 2, 4>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 12 : i32} {
+  tt.func @allocate_warp_specialize_barrier_ids() {
+    %c3 = arith.constant 3 : i32
+    %c128 = arith.constant 128 : i32
+    %user = ttng.user_named_barrier_id %c3 : i32
+    ttng.wait_barrier_named %user, %c128 : !ttng.named_barrier_id, i32
+    ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4, 8>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      ttg.warp_return
+    }
+    partition1() num_warps(4) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
@@ -128,7 +152,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
     // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
     // CHECK-NEXT: "llvm.nvvm.barrier.cta.arrive.aligned.count"([[BAR_ID]], [[NUM_THRADS]])
-    ttng.arrive_barrier_named %c9_i32, %c256_i32 : i32, i32
+    %bar = ttng.user_named_barrier_id %c9_i32 : i32
+    ttng.arrive_barrier_named %bar, %c256_i32 : !ttng.named_barrier_id, i32
     tt.return
   }
 
@@ -155,7 +180,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK-NEXT: [[BAR_ID:%.*]] = llvm.mlir.constant(9 : i32) : i32
     // CHECK-NEXT: [[NUM_THRADS:%.*]] = llvm.mlir.constant(256 : i32) : i32
     // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.aligned.count"([[BAR_ID]], [[NUM_THRADS]])
-    ttng.wait_barrier_named %c9_i32, %c256_i32 : i32, i32
+    %bar = ttng.compiler_named_barrier_id %c9_i32 : i32
+    ttng.wait_barrier_named %bar, %c256_i32 : !ttng.named_barrier_id, i32
     tt.return
   }
 

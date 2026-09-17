@@ -48,7 +48,8 @@ on:
     - cron: '30 */6 * * *'
 
 env:
-  TORCHINDUCTOR_TLX_MODE: ""
+  MAX_JOBS: 16
+  TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
 
