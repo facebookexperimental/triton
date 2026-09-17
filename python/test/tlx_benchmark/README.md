@@ -45,6 +45,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
+| `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |

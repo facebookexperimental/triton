@@ -60,6 +60,13 @@ def _union(*lists: list[list]) -> list[list]:
 
 
 GFX942_FOCUS: list[list] = [
+    # BF16 production shapes with row-major A and column-major B. These select
+    # the frozen direct-load fast paths in gfx942.py.
+    [819200, 1024, 192, (192, 1), (1, 192), "bf16"],
+    [4096, 1894, 242432, (242432, 1), (1, 242432), "bf16"],
+    [1024, 6144, 20480, (20480, 1), (1, 20480), "bf16"],
+    [2048, 25408, 10240, (10240, 1), (1, 10240), "bf16"],
+    [61440, 2048, 5120, (5120, 1), (1, 5120), "bf16"],
     [819200, 192, 1024, (1024, 1), (192, 1), "fp16"],
     [4096, 242432, 1894, (1894, 1), (242432, 1), "fp16"],
     [1024, 20480, 6144, (6144, 1), (20480, 1), "fp16"],
@@ -77,9 +84,7 @@ GFX950_FOCUS: list[list] = [
     [7, 2048, 4096, (4096, 1), (1, 4096), "fp16"],
 ]
 
-ALL: list[list] = _union(
-    SYNTHETIC, SM100_FOCUS, GFX942_FOCUS, GFX950_FOCUS
-)
+ALL: list[list] = _union(SYNTHETIC, SM100_FOCUS, GFX942_FOCUS, GFX950_FOCUS)
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):
