@@ -351,6 +351,7 @@ def _compute_offsets(
     NUM_PID_M_STATIC: tl.constexpr,
     GRID_X_STATIC: tl.constexpr,
     GLOBAL_LPT: tl.constexpr,
+    DENSE_PAIRED: tl.constexpr = False,
 ):
     if STAGE == 3 and GROUP_SIZE_N > 4:
         if GRID_X_STATIC > 0:
@@ -414,7 +415,7 @@ def _compute_offsets(
     else:
         group_id = tile_idx // num_pid_in_group
         first_pid_n = group_id * GROUP_SIZE_N
-        group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+        group_size_n = 1 if DENSE_PAIRED and STAGE == 1 and GROUP_SIZE_N == 1 else min(num_pid_n - first_pid_n, GROUP_SIZE_N)
         start_m = (tile_idx % num_pid_in_group) // group_size_n
         off_hz = first_pid_n + (tile_idx % group_size_n)
         off_z = off_hz // H
@@ -735,6 +736,79 @@ def _fwd_softmax_tile_1cta(
     return m_i, l_i, accum_cnt_qk, gauge_cnt
 
 
+@core.builtin
+def _bf16_dual_start(a0, a1, a2, a3, b0, b1, b2, b3, _semantic=None):
+    return core.inline_asm_elementwise(
+        r"""{
+    .reg .b32 s, t;
+    prmt.b32 s, $1, $5, 0x5410;
+    prmt.b32 t, $1, $5, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $2, $6, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $2, $6, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $3, $7, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $3, $7, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $4, $8, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $4, $8, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    mov.b32 $0, s;
+}""",
+        "=r,r,r,r,r,r,r,r,r",
+        [a0, a1, a2, a3, b0, b1, b2, b3],
+        dtype=core.bfloat16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+@core.builtin
+def _bf16_dual_step(acc, a0, a1, a2, a3, b0, b1, b2, b3, _semantic=None):
+    return core.inline_asm_elementwise(
+        r"""{
+    .reg .b32 s, t;
+    mov.b32 s, $1;
+    prmt.b32 t, $2, $6, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $2, $6, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $3, $7, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $3, $7, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $4, $8, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $4, $8, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $5, $9, 0x5410;
+    add.rn.bf16x2 s, s, t;
+    prmt.b32 t, $5, $9, 0x7632;
+    add.rn.bf16x2 s, s, t;
+    mov.b32 $0, s;
+}""",
+        "=r,r,r,r,r,r,r,r,r,r",
+        [acc, a0, a1, a2, a3, b0, b1, b2, b3],
+        dtype=core.bfloat16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+@triton.jit
+def _sum_bf16_row32_dual(p, q):
+    tl.static_assert(p.shape[1] == 32 and q.shape[1] == 32)
+    a = _split_n_2D(p, 16)
+    b = _split_n_2D(q, 16)
+    acc = _bf16_dual_start(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3])
+    for i in tl.static_range(1, 4):
+        acc = _bf16_dual_step(acc, a[4*i], a[4*i+1], a[4*i+2], a[4*i+3], b[4*i], b[4*i+1], b[4*i+2], b[4*i+3])
+    return acc
+
+
 @triton.jit
 def _fwd_softmax_tile_2cta(
     qk_fulls,
@@ -754,7 +828,12 @@ def _fwd_softmax_tile_2cta(
     BLOCK_N: tl.constexpr,
     NUM_MMA_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
+    DENSE_PAIRED: tl.constexpr = False,
 ):
+    _BF16_FIXED_GAUGE: tl.constexpr = 4.055517269
+    _EXP2_MAGIC: tl.constexpr = 12582912.0
+    _EXP2_BF16_SCALE: tl.constexpr = 128.0
+    _EXP2_BF16_BIAS: tl.constexpr = 126.0
     tl.static_assert(NUM_MMA_SLICES == 2)
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
     for start_n in tl.range(lo, hi, BLOCK_N):
@@ -762,6 +841,7 @@ def _fwd_softmax_tile_2cta(
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
         l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
         p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
+        p_sum_pending = p_pending
         for fragment_id in tl.static_range(0, 4):
             qk_fragment = tlx.local_load(tlx.subslice(
                 tlx.local_view(qk_tiles, cid),
@@ -797,7 +877,16 @@ def _fwd_softmax_tile_2cta(
                     1,
                     remote_cta_rank=0,
                 )
-            l_ij += tl.reduce(p_h, axis=1, combine_fn=_reduce_bf16).to(tl.float32)
+            if DENSE_PAIRED and STAGE == 3:
+                if fragment_id % 2 == 0:
+                    p_sum_pending = p_h
+                else:
+                    sum_pair = _sum_bf16_row32_dual(p_sum_pending, p_h)
+                    sum_lo, sum_hi = sum_pair.split()
+                    l_ij += sum_lo.to(tl.float32)
+                    l_ij += sum_hi.to(tl.float32)
+            else:
+                l_ij += tl.reduce(p_h, axis=1, combine_fn=_reduce_bf16).to(tl.float32)
             if gauge_cnt == 0:
                 m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
         if gauge_cnt == 0:
@@ -937,6 +1026,7 @@ def _fwd_softmax_tile(
     FAST_FIXED: tl.constexpr,
     SKIP_CAUSAL_DIAG: tl.constexpr,
     CERTIFIED_CAUSAL: tl.constexpr = False,
+    DENSE_PAIRED: tl.constexpr = False,
 ):
     if USE_2CTA:
         if FAST_FIXED:
@@ -958,6 +1048,7 @@ def _fwd_softmax_tile(
                 BLOCK_N,
                 NUM_MMA_SLICES,
                 STAGE,
+                DENSE_PAIRED=DENSE_PAIRED,
             )
         return _fwd_softmax_tile_2cta_online(
             qk_fulls,
@@ -1057,6 +1148,7 @@ def _fwd_fixed_2cta_control_tile(
     Failure=None,
     clc_context=None,
     clc_phase_producer=None,
+    DENSE_PAIRED: tl.constexpr = False,
 ):
     _RCP_LN2: tl.constexpr = 1.4426950408889634
     _BF16_FIXED_GAUGE: tl.constexpr = 4.055517269
@@ -1072,6 +1164,7 @@ def _fwd_fixed_2cta_control_tile(
         NUM_PID_M_STATIC,
         GRID_X_STATIC,
         GLOBAL_LPT,
+        DENSE_PAIRED=DENSE_PAIRED,
     )
     m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32)
@@ -1108,6 +1201,7 @@ def _fwd_fixed_2cta_control_tile(
             BLOCK_N,
             NUM_MMA_SLICES,
             STAGE=4 - STAGE,
+            DENSE_PAIRED=DENSE_PAIRED,
         )
     if not CERTIFIED_CAUSAL and STAGE & 2:
         m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile_2cta(
@@ -1128,6 +1222,7 @@ def _fwd_fixed_2cta_control_tile(
             BLOCK_N,
             NUM_MMA_SLICES,
             STAGE=2,
+            DENSE_PAIRED=DENSE_PAIRED,
         )
 
     if CERTIFIED_CAUSAL and (NUM_PID_M_STATIC == 32 or NUM_PID_M_STATIC == 64):
@@ -1205,6 +1300,7 @@ def _fwd_softmax_stages(
     SKIP_CAUSAL_DIAG: tl.constexpr,
     CERTIFIED_CAUSAL: tl.constexpr = False,
     MERGED_RECOVERY: tl.constexpr = False,
+    DENSE_PAIRED: tl.constexpr = False,
 ):
     if (CERTIFIED_CAUSAL or MERGED_RECOVERY) and STAGE == 3:
         return _fwd_softmax_tile_1cta(
@@ -1247,6 +1343,7 @@ def _fwd_softmax_stages(
                 FAST_FIXED=FAST_FIXED,
                 SKIP_CAUSAL_DIAG=SKIP_CAUSAL_DIAG,
                 CERTIFIED_CAUSAL=CERTIFIED_CAUSAL,
+                DENSE_PAIRED=DENSE_PAIRED,
             )
     return m_i, l_i, accum_cnt_qk, gauge_cnt
 
@@ -2020,6 +2117,7 @@ def _attn_fwd_ws_kernel(
         and NUM_MMA_SLICES == 2 and NUM_BUFFERS_KV == 3 and DENSE_REGS == 176
         and H == 16 and LAYOUT_BSHD and Z * N_CTX_STATIC == 32768
     )
+    DENSE_PAIRED: tl.constexpr = DENSE_EXCLUSIVE and N_CTX_STATIC != 32768
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
     SKIP_CAUSAL_DIAG: tl.constexpr = (
         STAGE == 3
@@ -2262,6 +2360,7 @@ def _attn_fwd_ws_kernel(
                         CERTIFIED_CAUSAL, alpha_empties, alpha_fulls, alpha_tiles, Failure,
                         clc_context if CERTIFIED_CAUSAL and not DIRECT_SCHED else None,
                         clc_phase_producer,
+                        DENSE_PAIRED=DENSE_PAIRED,
                     )
                     if CERTIFIED_CAUSAL and not DIRECT_SCHED:
                         if NUM_PID_M_STATIC != 32 and NUM_PID_M_STATIC != 64:
@@ -2359,6 +2458,7 @@ def _attn_fwd_ws_kernel(
                     NUM_PID_M_STATIC,
                     OFFSET_GRID_X,
                     GLOBAL_LPT,
+                    DENSE_PAIRED=DENSE_PAIRED,
                 )
                 # initialize pointer to m and l
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
@@ -2410,6 +2510,7 @@ def _attn_fwd_ws_kernel(
                     SKIP_CAUSAL_DIAG,
                     CERTIFIED_CAUSAL,
                     MERGED_RECOVERY=SPARSE_FALLBACK,
+                    DENSE_PAIRED=DENSE_PAIRED,
                 )
 
                 if USE_2CTA or CERTIFIED_CAUSAL:
@@ -2505,6 +2606,7 @@ def _attn_fwd_ws_kernel(
                     NUM_PID_M_STATIC,
                     OFFSET_GRID_X,
                     GLOBAL_LPT,
+                    DENSE_PAIRED=DENSE_PAIRED,
                 )
                 if USE_2CTA:
                     if is_leader:
@@ -2610,6 +2712,7 @@ def _attn_fwd_ws_kernel(
                         NUM_PID_M_STATIC,
                         OFFSET_GRID_X,
                         GLOBAL_LPT,
+                        DENSE_PAIRED=DENSE_PAIRED,
                     )
                     _, kv_offset_y, offset_x = _forward_descriptor_offsets(
                         0, kv_offset_y, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
@@ -2655,6 +2758,7 @@ def _attn_fwd_ws_kernel(
                     NUM_PID_M_STATIC,
                     OFFSET_GRID_X,
                     GLOBAL_LPT,
+                    DENSE_PAIRED=DENSE_PAIRED,
                 )
                 qo_offset_y, kv_offset_y, offset_x = _forward_descriptor_offsets(
                     qo_offset_y, kv_offset_y, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
@@ -2764,6 +2868,7 @@ def _attn_fwd_ws_kernel(
                         NUM_PID_M_STATIC,
                         OFFSET_GRID_X,
                         GLOBAL_LPT,
+                        DENSE_PAIRED=DENSE_PAIRED,
                     )
                     qo_offset_y, _, offset_x = _forward_descriptor_offsets(
                         qo_offset_y, 0, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
