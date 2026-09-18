@@ -6,7 +6,8 @@ causal self-attention MHA; long non-causal split-GQA uses masked BN256/BM32
 phases and forms dQ as two native BM16 accumulator chains.  Split workgroups
 preserve FP32 dK/dV partials through their final reduction.  Independent KV
 owners combine dQ contributions with FP32 atomics in a guarded native layout,
-followed by a conversion to packed THD order.
+followed by a conversion to packed THD order. Long windowed-causal MHA instead
+uses a Q-owner kernel that accumulates each dQ tile locally and stores it once.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
 :func:`fa_varlen_backward` on the same CUDA stream. When token metadata is
@@ -32,6 +33,8 @@ _BLOCK_M = 16
 _BLOCK_N = 128
 _WIDE_BLOCK_M = 32
 _WIDE_BLOCK_N = 256
+_SPLIT_DQ_MIN_AVERAGE_Q = 8192
+_SPLIT_DQ_MAX_WINDOW_SIZE = 512
 _HEAD_DIM = 128
 _I32_BUFFER_BF16_ELEMENTS = 1 << 30
 _I32_BUFFER_FP32_ELEMENTS = _I32_BUFFER_BF16_ELEMENTS // 2
@@ -1868,7 +1871,9 @@ def _varlen_bwd_interleaved_kernel(
     FULL_KV_TILE: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
     V_STRIDE_T: tl.constexpr,
+    STORE_DQ: tl.constexpr = True,
     QDO_ALIGNED: tl.constexpr = False,
     CACHE_MHA_STATS: tl.constexpr = False,
     INTERLEAVE_MHA_TASKS: tl.constexpr = False,
@@ -1890,8 +1895,10 @@ def _varlen_bwd_interleaved_kernel(
     # Preserve the established causal LDS layout and copy schedule.
     NONCAUSAL_MHA: tl.constexpr = HQ == HKV and not IS_CAUSAL
     tl.static_assert(not CACHE_MHA_STATS or NONCAUSAL_MHA)
+    tl.static_assert(STORE_DQ or IS_CAUSAL)
     tl.static_assert(not FINALIZE_DQ
-                     or (NONCAUSAL_MHA and KV_SPLITS == 1 and not FULL_KV_TILE and CACHE_MHA_STATS and QDO_ALIGNED))
+                     or (STORE_DQ and NONCAUSAL_MHA and KV_SPLITS == 1 and not FULL_KV_TILE and CACHE_MHA_STATS
+                         and QDO_ALIGNED))
     tl.static_assert(not DQ_TAIL_K96 or FINALIZE_DQ)
     if NONCAUSAL_MHA:
         task = tl.program_id(1)
@@ -1921,7 +1928,12 @@ def _varlen_bwd_interleaved_kernel(
     kv_len = (kv_end - kv_start).to(tl.int32)
     q_blocks = (q_len + BLOCK_M - 1) // BLOCK_M
     first_q_block = n0 // BLOCK_M if IS_CAUSAL else 0
-    active_q_blocks = q_blocks - first_q_block
+    stop_q_block = q_blocks
+    if IS_CAUSAL and WINDOW_SIZE > 0:
+        kv_tile_end = tl.minimum(n0 + BLOCK_N, kv_len)
+        stop_q_row = tl.minimum(q_len, kv_tile_end + WINDOW_SIZE - 1)
+        stop_q_block = (stop_q_row + BLOCK_M - 1) // BLOCK_M
+    active_q_blocks = stop_q_block - first_q_block
     total_steps = heads_per_split * active_q_blocks
 
     QDO_BANKPERM: tl.constexpr = NONCAUSAL_MHA and CACHE_MHA_STATS and QDO_ALIGNED and FULL_KV_TILE
@@ -2145,12 +2157,16 @@ def _varlen_bwd_interleaved_kernel(
             valid = tlx.require_layout(valid, mma_nm, pin=False)
             if IS_CAUSAL:
                 query_fragment = q_step - first_q_block
+                causal_n = n0 + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
+                causal_m = q_step * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
                 if query_fragment < BLOCK_N // BLOCK_M:
-                    causal_n = n0 + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
-                    causal_m = q_step * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
                     causal_valid = causal_n[:, None] <= causal_m[None, :]
                     causal_valid = tlx.require_layout(causal_valid, mma_nm, pin=False)
                     valid = valid & causal_valid
+                if WINDOW_SIZE > 0:
+                    window_valid = causal_n[:, None] + WINDOW_SIZE > causal_m[None, :]
+                    window_valid = tlx.require_layout(window_valid, mma_nm, pin=False)
+                    valid = valid & window_valid
                 neg_inf = tlx.require_layout(
                     tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
                     mma_nm,
@@ -2170,8 +2186,9 @@ def _varlen_bwd_interleaved_kernel(
             )
             ds_t = p_t * (dp_t - delta_full)
             ds_bf16 = ds_t.to(tl.bfloat16)
-            current_ds = tlx.local_view(ds_buffers, current_slot)
-            tlx.local_store(current_ds, tl.trans(ds_bf16))
+            if STORE_DQ or NONCAUSAL_MHA:
+                current_ds = tlx.local_view(ds_buffers, current_slot)
+                tlx.local_store(current_ds, tl.trans(ds_bf16))
             if NONCAUSAL_MHA:
                 # Exchange P and dS together. The dS buffer also feeds the next
                 # iteration's dQ, so its existing storage serves both layouts.
@@ -2201,7 +2218,7 @@ def _varlen_bwd_interleaved_kernel(
                 dv = tl.dot(p_nd, do_tile, acc=dv, out_dtype=dv.dtype)
                 dk = tl.dot(ds_nd, q_tile, acc=dk, out_dtype=dk.dtype)
 
-            if not CACHE_MHA_STATS or phase > 0:
+            if STORE_DQ and (not CACHE_MHA_STATS or phase > 0):
                 if CACHE_MHA_STATS or step > 0:
                     previous_step = step - 1
                     if heads_per_split == 1:
@@ -2269,51 +2286,52 @@ def _varlen_bwd_interleaved_kernel(
 
     tlx.async_load_wait_group(0)
     tl.debug_barrier()
-    last_step = total_steps - 1
-    if heads_per_split == 1:
-        last_q_step = first_q_block + last_step
-        last_q_head = kv_head * group_size + split
-    else:
-        last_group_index = last_step // active_q_blocks
-        last_q_step = first_q_block + last_step % active_q_blocks
-        last_q_head = kv_head * group_size + split * heads_per_split + last_group_index
-    last_dq_acc_base = (last_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
-    if DQ_TAIL_K96:
-        dq_part = _compute_dq_tail_k96(tlx.local_view(ds_buffers, last_step % 2), tlx.local_view(k_buffer, 0), mma_md)
-    else:
-        last_ds = tlx.local_load(tlx.local_view(ds_buffers, last_step % 2), layout=ds_md_layout)
-        k_for_dq = tlx.local_load(tlx.local_view(k_buffer, 0), layout=k_md_layout)
-        dq_acc = tlx.zeros((BLOCK_M, D), tl.float32, layout=mma_md)
-        dq_part = tl.dot(last_ds, k_for_dq, acc=dq_acc, out_dtype=dq_acc.dtype)
-    if FINALIZE_DQ:
-        _store_dq_tail_final(
-            dq_part,
-            DQ_ACC,
-            DQ_OUTPUT,
-            last_dq_acc_base,
-            q_start,
-            last_q_head,
-            q_len,
-            last_q_step,
-            SM_SCALE,
-            HQ,
-            D,
-            BLOCK_M,
-            mma_md,
-            DEFER_SCRATCH=not DQ_TAIL_K96,
-        )
-    else:
-        _store_dq_native(
-            dq_part,
-            DQ_ACC,
-            last_dq_acc_base,
-            q_len,
-            last_q_step,
-            SM_SCALE,
-            D,
-            BLOCK_M,
-            mma_md,
-        )
+    if STORE_DQ:
+        last_step = total_steps - 1
+        if heads_per_split == 1:
+            last_q_step = first_q_block + last_step
+            last_q_head = kv_head * group_size + split
+        else:
+            last_group_index = last_step // active_q_blocks
+            last_q_step = first_q_block + last_step % active_q_blocks
+            last_q_head = kv_head * group_size + split * heads_per_split + last_group_index
+        last_dq_acc_base = (last_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
+        if DQ_TAIL_K96:
+            dq_part = _compute_dq_tail_k96(tlx.local_view(ds_buffers, last_step % 2), tlx.local_view(k_buffer, 0), mma_md)
+        else:
+            last_ds = tlx.local_load(tlx.local_view(ds_buffers, last_step % 2), layout=ds_md_layout)
+            k_for_dq = tlx.local_load(tlx.local_view(k_buffer, 0), layout=k_md_layout)
+            dq_acc = tlx.zeros((BLOCK_M, D), tl.float32, layout=mma_md)
+            dq_part = tl.dot(last_ds, k_for_dq, acc=dq_acc, out_dtype=dq_acc.dtype)
+        if FINALIZE_DQ:
+            _store_dq_tail_final(
+                dq_part,
+                DQ_ACC,
+                DQ_OUTPUT,
+                last_dq_acc_base,
+                q_start,
+                last_q_head,
+                q_len,
+                last_q_step,
+                SM_SCALE,
+                HQ,
+                D,
+                BLOCK_M,
+                mma_md,
+                DEFER_SCRATCH=not DQ_TAIL_K96,
+            )
+        else:
+            _store_dq_native(
+                dq_part,
+                DQ_ACC,
+                last_dq_acc_base,
+                q_len,
+                last_q_step,
+                SM_SCALE,
+                D,
+                BLOCK_M,
+                mma_md,
+            )
 
     if DQ_TAIL_K96:
         _store_dkdv_tail_n96(
@@ -2374,6 +2392,185 @@ def _varlen_bwd_interleaved_kernel(
             output_mask = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), store_layout, pin=False)
             tlx.buffer_store(dk, DK, output_offsets, mask=output_mask)
             tlx.buffer_store(dv, DV, output_offsets, mask=output_mask)
+
+
+@triton.jit
+def _issue_dq_owner_kv_async(
+    k_dst,
+    v_dst,
+    K,
+    V,
+    kv_start,
+    kv_len,
+    head,
+    n_start,
+    V_STRIDE_T,
+    HEADS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    offs_n = n_start.to(tl.int64) + tl.arange(0, BLOCK_N).to(tl.int64)
+    global_n = kv_start + offs_n
+    head_i64 = head.to(tl.int64)
+    valid = offs_n[:, None] < kv_len
+    k_offsets = (global_n[:, None] * HEADS + head_i64) * D + tl.arange(0, D)[None, :]
+    v_offsets = global_n[:, None] * V_STRIDE_T.to(tl.int64) + head_i64 * D + tl.arange(0, D)[None, :]
+    k_token = tlx.async_load(K + k_offsets, k_dst, mask=valid, other=0.0)
+    v_token = tlx.async_load(V + v_offsets, v_dst, mask=valid, other=0.0)
+    tlx.async_load_commit_group([k_token, v_token])
+
+
+# Triton TR001: the Q-owner path uses fixed D128 BM64/BN64 tiles.
+@triton.jit
+def _varlen_bwd_dq_owner_kernel(  # noqa: TR001
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    CuQ,
+    CuKV,
+    TaskCounts,
+    DQ,
+    V_STRIDE_T,
+    SM_SCALE: tl.constexpr,
+    TOTAL_Q,
+    PLAN_ERROR_INDEX: tl.constexpr,
+    HEADS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+):
+    tl.static_assert(D == 128)
+    tl.static_assert(BLOCK_M == 64)
+    tl.static_assert(BLOCK_N == 64)
+    tl.static_assert(WINDOW_SIZE > 0)
+
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    pid_m = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch = batch_head // HEADS
+    head = batch_head % HEADS
+    head_i64 = head.to(tl.int64)
+    m0 = pid_m * BLOCK_M
+    q_start_i32 = tl.load(CuQ + batch)
+    q_end_i32 = tl.load(CuQ + batch + 1)
+    kv_start_i32 = tl.load(CuKV + batch)
+    kv_end_i32 = tl.load(CuKV + batch + 1)
+    q_start = q_start_i32.to(tl.int64)
+    kv_start = kv_start_i32.to(tl.int64)
+    q_len = q_end_i32 - q_start_i32
+    kv_len = kv_end_i32 - kv_start_i32
+
+    offs_m = m0.to(tl.int64) + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_d = tl.arange(0, D).to(tl.int64)
+    global_m = q_start + offs_m
+    qdo_offsets = (global_m[:, None] * HEADS + head_i64) * D + offs_d[None, :]
+    qdo_mask = offs_m[:, None] < q_len
+    q_tile = tl.load(Q + qdo_offsets, mask=qdo_mask, other=0.0)
+    do_tile = tl.load(DO + qdo_offsets, mask=qdo_mask, other=0.0)
+    lse = tl.load(LSE + head_i64 * TOTAL_Q.to(tl.int64) + global_m, mask=offs_m < q_len, other=0.0)
+    delta = tl.load(Delta + global_m * HEADS + head_i64, mask=offs_m < q_len, other=0.0)
+
+    kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
+         [4, 0], [8, 0]],
+        [BLOCK_N, D],
+    )
+    mma_mn: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 2],
+    )
+    mma_md: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 2],
+    )
+    q_mn_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_mn, k_width=8)
+    kt_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_mn, k_width=8)
+    ds_md_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_md, k_width=8)
+    k_md_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_md, k_width=8)
+    k_buffers = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 2, layout=kv_layout)
+    v_buffers = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 2, layout=kv_layout)
+    q_tile = tlx.require_layout(q_tile, q_mn_layout, pin=False)
+    do_tile = tlx.require_layout(do_tile, q_mn_layout, pin=False)
+    dq = tlx.zeros((BLOCK_M, D), tl.float32, layout=mma_md)
+    first_n = tl.maximum(0, m0 - WINDOW_SIZE + 1)
+    first_n = first_n // BLOCK_N * BLOCK_N
+    stop_n = tl.minimum(kv_len, m0 + BLOCK_M)
+    log2e: tl.constexpr = 1.4426950408889634
+
+    _issue_dq_owner_kv_async(
+        tlx.local_view(k_buffers, 0),
+        tlx.local_view(v_buffers, 0),
+        K,
+        V,
+        kv_start,
+        kv_len,
+        head,
+        first_n,
+        V_STRIDE_T,
+        HEADS,
+        D,
+        BLOCK_N,
+    )
+
+    for n0 in tl.range(first_n, stop_n, BLOCK_N, num_stages=1):
+        relative_n = (n0 - first_n) // BLOCK_N
+        current_slot = relative_n % 2
+        next_slot = 1 - current_slot
+        tl.debug_barrier()
+        offs_n = n0.to(tl.int64) + tl.arange(0, BLOCK_N).to(tl.int64)
+        next_n = n0 + BLOCK_N
+        if next_n < stop_n:
+            _issue_dq_owner_kv_async(
+                tlx.local_view(k_buffers, next_slot),
+                tlx.local_view(v_buffers, next_slot),
+                K,
+                V,
+                kv_start,
+                kv_len,
+                head,
+                next_n,
+                V_STRIDE_T,
+                HEADS,
+                D,
+                BLOCK_N,
+            )
+            kv_wait = tlx.async_load_wait_group(1)
+        else:
+            kv_wait = tlx.async_load_wait_group(0)
+        k_view = tlx.local_view(k_buffers, current_slot)
+        v_view = tlx.local_view(v_buffers, current_slot)
+        k_tile = tlx.local_load(k_view, token=kv_wait, layout=k_md_layout)
+        k_t = tlx.local_load(tlx.local_trans(k_view), token=kv_wait, layout=kt_layout)
+        v_t = tlx.local_load(tlx.local_trans(v_view), token=kv_wait, layout=kt_layout)
+
+        score_acc = tlx.zeros((BLOCK_M, BLOCK_N), tl.float32, layout=mma_mn)
+        scores = tl.dot(q_tile, k_t, acc=score_acc, out_dtype=score_acc.dtype, allow_tf32=False)
+        scores = scores * (SM_SCALE * log2e) - lse[:, None] * log2e
+        valid = ((offs_m[:, None] < q_len) & (offs_n[None, :] < kv_len)
+                 & (offs_n[None, :] <= offs_m[:, None])
+                 & (offs_n[None, :] + WINDOW_SIZE > offs_m[:, None]))
+        valid = tlx.require_layout(valid, mma_mn, pin=False)
+        scores = tlx.require_layout(scores, mma_mn, pin=False)
+        scores = tl.where(valid, scores, float("-inf"))
+        p = tl.math.exp2(scores)
+        dp_acc = tlx.zeros((BLOCK_M, BLOCK_N), tl.float32, layout=mma_mn)
+        dp = tl.dot(do_tile, v_t, acc=dp_acc, out_dtype=dp_acc.dtype, allow_tf32=False)
+        ds = p * (dp - delta[:, None])
+        ds_md = tlx.require_layout(ds.to(tl.bfloat16), ds_md_layout, pin=False)
+        dq = tl.dot(ds_md, k_tile, acc=dq, out_dtype=dq.dtype, allow_tf32=False)
+
+    dq *= SM_SCALE
+    tl.store(DQ + qdo_offsets, dq.to(tl.bfloat16), mask=qdo_mask)
 
 
 @triton.jit
@@ -2511,11 +2708,17 @@ def _varlen_mha_dq_convert_coalesced_kernel(
     ttgl.store(DQ + output_offsets, values, mask=valid)
 
 
-def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal):
+def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal, window_size):
     if not isinstance(plan, VarlenBackwardPlan):
         raise TypeError("plan must be a VarlenBackwardPlan")
     if not math.isfinite(float(sm_scale)):
         raise ValueError("sm_scale must be finite")
+    if not isinstance(window_size, int):
+        raise TypeError("window_size must be int")
+    if window_size < 0:
+        raise ValueError("window_size must be non-negative")
+    if window_size > 0 and not causal:
+        raise ValueError("window_size requires causal=True")
     if q.ndim != 3 or k.ndim != 3:
         raise ValueError("q and k must be rank-3 packed THD tensors")
     total_q, heads, head_dim = q.shape
@@ -4180,20 +4383,23 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4(
             state = KV_SPLITS * tl.atomic_add(OWNER_NEXT, 1, sem="relaxed", scope="gpu")
 
 
-def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
+def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, window_size=0):
     """Run packed BF16 D128 backward using a prepared immutable-offset plan.
 
     Non-causal mode supports MHA/GQA with independent Q and KV offsets.  Causal
     mode is limited to self-attention MHA, so Q/KV offsets and head counts must
-    match.  Its V input may have a larger token stride when the head and D axes
-    remain dense, as in TritonBench's ``v_storage[:, 0]`` view.
+    match. ``window_size=0`` uses full causal attention; a positive value uses
+    a sliding causal window. Its V input may have a larger token stride when the
+    head and D axes remain dense, as in TritonBench's ``v_storage[:, 0]`` view.
     """
-    _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal)
+    _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal, window_size)
     plan_error_index = _CAUSAL_PLAN_ERROR if causal else _PLAN_ERROR
     total_q, heads, head_dim = q.shape
     total_kv, kv_heads, _ = k.shape
     group_size = heads // kv_heads
     kv_splits = _select_varlen_kv_splits(plan.max_q, group_size)
+    split_dq = (causal and 0 < window_size <= _SPLIT_DQ_MAX_WINDOW_SIZE
+                and total_q >= plan.batch * _SPLIT_DQ_MIN_AVERAGE_Q)
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(k)
@@ -4231,8 +4437,11 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     pack_stats = pad_dq_to_bm32 and 2 * heads * total_q_padded <= _I32_BUFFER_FP32_ELEMENTS
     delta_shape = (heads, 2 * total_q_padded) if pack_stats else (total_q, heads)
     delta = torch.empty(delta_shape, dtype=torch.float32, device=q.device)
-    allocate_dq_acc = torch.empty if use_dq_aux else torch.zeros
-    dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=torch.float32, device=q.device)
+    if split_dq:
+        dq_acc = torch.empty(0, dtype=torch.float32, device=q.device)
+    else:
+        allocate_dq_acc = torch.empty if use_dq_aux else torch.zeros
+        dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=torch.float32, device=q.device)
 
     owner_tasks = plan.wide_task_count if rolling_fp32_case and plan.wide_task_count is not None else 0
     owner_groups = kv_heads * owner_tasks
@@ -4253,7 +4462,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
         HEADS=heads,
         D=head_dim,
         BLOCK_M=64,
-        ZERO_DQ=use_dq_aux,
+        ZERO_DQ=use_dq_aux and not split_dq,
         DQ_PAD_ROWS=dq_pad_rows,
         LSE=lse if pack_stats else None,
         TOTAL_Q=total_q if pack_stats else None,
@@ -4368,7 +4577,9 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
                 FULL_KV_TILE=full_kv_tile,
                 KV_SPLITS=kv_splits,
                 IS_CAUSAL=causal,
+                WINDOW_SIZE=window_size,
                 V_STRIDE_T=v.stride(0),
+                STORE_DQ=not split_dq,
                 QDO_ALIGNED=qdo_aligned,
                 CACHE_MHA_STATS=cache_mha_stats,
                 INTERLEAVE_MHA_TASKS=(not causal and group_size == 1 and full_kv_tile and uniform_kv),
@@ -4397,7 +4608,32 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
             BLOCK_N=_BLOCK_M,
             num_warps=4,
         )
-    if use_dq_aux:
+    if split_dq:
+        _varlen_bwd_dq_owner_kernel[(triton.cdiv(plan.max_q, 64), plan.batch * heads)](
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            plan.cu_seqlens_q,
+            plan.cu_seqlens_k,
+            plan.task_counts,
+            dq,
+            v.stride(0),
+            SM_SCALE=sm_scale,
+            TOTAL_Q=total_q,
+            PLAN_ERROR_INDEX=plan_error_index,
+            HEADS=heads,
+            D=head_dim,
+            BLOCK_M=64,
+            BLOCK_N=64,
+            WINDOW_SIZE=window_size,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+        )
+    elif use_dq_aux:
         dq_sequence = plan.dq_full_kv_sequence if finalize_tail_dq else plan.q_block_sequence
         dq_start = plan.dq_full_kv_start if finalize_tail_dq else plan.q_block_start
         if dq_sequence is not None and dq_start is not None and dq_sequence.numel():
