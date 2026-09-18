@@ -10,6 +10,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "llvm/ADT/DenseSet.h"
 namespace tt = mlir::triton;
 using mlir::triton::ModuleAxisInfoAnalysis;
 using mlir::triton::amdgpu::ISAFamily;
@@ -910,119 +911,83 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
   return true;
 }
 
-// For a region iter arg of an scf.for, return the yield operand that feeds it
-// on the back-edge. Returns {} if the parent isn't scf.for or the arg is the
-// induction variable.
-static Value resolveLoopBackedge(BlockArgument bbArg) {
-  auto forOp = dyn_cast<scf::ForOp>(bbArg.getOwner()->getParentOp());
-  if (!forOp)
-    return {};
-  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  int iterArgIdx = bbArg.getArgNumber() - forOp.getNumInductionVars();
-  if (iterArgIdx < 0 || iterArgIdx >= (int)yieldOp.getNumOperands())
-    return {};
-  return yieldOp.getOperand(iterArgIdx);
-}
-
 bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
-  auto isInSameRegion = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion();
-  };
-  ForwardSliceOptions fwdOpt;
-  fwdOpt.filter = isInSameRegion;
-  SetVector<mlir::Operation *> fwdSlices;
-  getForwardSlice(dotOp, &fwdSlices, fwdOpt);
-  for (Operation *op : fwdSlices) {
-    if (auto dOp = dyn_cast<tt::DotOpInterface>(op)) {
-      assert(dOp != dotOp);
-      Operation *dotOperand = (opIdx == 0) ? dOp.getA().getDefiningOp()
-                                           : dOp.getB().getDefiningOp();
-      if (dotOperand && fwdSlices.contains(dotOperand)) {
-        return true;
+  // Follow values, not whole operations: a loop carrying an accumulator and
+  // independent A/B tiles does not make those tiles depend on the accumulator.
+  SmallVector<Value> worklist{dotOp.getD()};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto nextDot = dyn_cast<tt::DotOpInterface>(user)) {
+        if (nextDot != dotOp &&
+            value == (opIdx == 0 ? nextDot.getA() : nextDot.getB()))
+          return true;
       }
-    }
-  }
-
-  // Cross-iteration: for each op in the forward slice (including dotOp itself)
-  // that is consumed by a scf.yield, resolve to the corresponding iter arg and
-  // check that iter arg's forward slice for a dot.
-  fwdSlices.insert(dotOp);
-  for (Operation *op : fwdSlices) {
-    for (Value result : op->getResults()) {
-      for (OpOperand &use : result.getUses()) {
-        auto yieldOp = dyn_cast<scf::YieldOp>(use.getOwner());
-        if (!yieldOp)
-          continue;
-        auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
-        if (!forOp)
-          continue;
-        BlockArgument nextIterArg =
-            forOp.getRegionIterArg(use.getOperandNumber());
-        SetVector<Operation *> argFwdSlices;
-        getForwardSlice(nextIterArg, &argFwdSlices, fwdOpt);
-        for (Operation *argOp : argFwdSlices) {
-          auto dOp = dyn_cast<tt::DotOpInterface>(argOp);
-          if (!dOp || dOp == dotOp)
-            continue;
-          Value dotOperand = (opIdx == 0) ? dOp.getA() : dOp.getB();
-          if (dotOperand == nextIterArg ||
-              (dotOperand.getDefiningOp() &&
-               argFwdSlices.contains(dotOperand.getDefiningOp())))
-            return true;
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        if (auto iterArg = forOp.getTiedLoopRegionIterArg(&use)) {
+          worklist.push_back(iterArg);
+          // The initial value is also the result when the loop is skipped.
+          worklist.push_back(forOp.getTiedLoopResult(&use));
         }
+        continue;
       }
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+        Operation *parent = yieldOp->getParentOp();
+        unsigned index = use.getOperandNumber();
+        if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+          worklist.push_back(forOp.getRegionIterArg(index));
+          worklist.push_back(forOp.getResult(index));
+        } else if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+          worklist.push_back(ifOp.getResult(index));
+        }
+        continue;
+      }
+      // Do not turn control dependencies on other region operations into
+      // dependencies on every result (in particular, an scf.if condition).
+      if (user->getNumRegions() == 0)
+        llvm::append_range(worklist, user->getResults());
     }
   }
   return false;
 }
 
 bool isChainDotTail(tt::DotOpInterface dotOp) {
-  auto isInSameRegion = [&dotOp](Operation *op) {
-    return op->getParentRegion() == dotOp->getParentRegion();
-  };
-  BackwardSliceOptions bwdOpt;
-  bwdOpt.omitBlockArguments = true;
-  bwdOpt.filter = isInSameRegion;
-  SetVector<Operation *> bwdSlices;
-  Operation *opA = dotOp.getA().getDefiningOp();
-  if (opA) {
-    (void)getBackwardSlice(opA, &bwdSlices, bwdOpt);
-    if (llvm::find_if(bwdSlices, [](Operation *op) {
-          return isa<tt::DotOpInterface>(op);
-        }) != bwdSlices.end())
-      return true;
-  }
-
-  // Cross-iteration: if operand A (or its backward slice) touches a block
-  // arg, resolve via the yield back-edge and check the backward slice of
-  // the yielded value for a dot (mirrors the intra-iteration check above).
-  SmallVector<BlockArgument, 4> bbArgs;
-  if (auto bbArg = dyn_cast<BlockArgument>(dotOp.getA())) {
-    bbArgs.push_back(bbArg);
-  } else if (opA) {
-    bwdSlices.insert(opA);
-    for (Operation *sliceOp : bwdSlices)
-      for (Value operand : sliceOp->getOperands())
-        if (auto bbArg = dyn_cast<BlockArgument>(operand))
-          bbArgs.push_back(bbArg);
-  }
-
-  for (BlockArgument bbArg : bbArgs) {
-    Value yieldVal = resolveLoopBackedge(bbArg);
-    if (!yieldVal)
+  SmallVector<Value> worklist{dotOp.getA()};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
       continue;
-    Operation *yieldDef = yieldVal.getDefiningOp();
-    if (!yieldDef)
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      if (auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())) {
+        if (OpOperand *init = forOp.getTiedLoopInit(arg)) {
+          worklist.push_back(init->get());
+          worklist.push_back(forOp.getTiedLoopYieldedValue(arg)->get());
+        }
+      }
       continue;
-    SetVector<Operation *> yieldBwdSlices;
-    (void)getBackwardSlice(yieldDef, &yieldBwdSlices, bwdOpt);
-    yieldBwdSlices.insert(yieldDef);
-    if (llvm::find_if(yieldBwdSlices, [&dotOp](Operation *op) {
-          return isa<tt::DotOpInterface>(op) && op != dotOp;
-        }) != yieldBwdSlices.end())
+    }
+    auto result = cast<OpResult>(value);
+    Operation *def = result.getOwner();
+    if (isa<tt::DotOpInterface>(def) && def != dotOp)
       return true;
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      worklist.push_back(forOp.getTiedLoopRegionIterArg(result));
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+      unsigned index = result.getResultNumber();
+      worklist.push_back(ifOp.thenYield().getOperand(index));
+      worklist.push_back(ifOp.elseYield().getOperand(index));
+      continue;
+    }
+    if (def->getNumRegions() == 0)
+      llvm::append_range(worklist, def->getOperands());
   }
-
   return false;
 }
 

@@ -4,6 +4,12 @@ Each shape is ``(G, M_per_group, N, K)``. Every group has the same M.
 Each case runs in a separate process so its large GPU allocations are released
 before the next case starts. Subprocesses use the current Python interpreter
 and inherit its environment.
+
+The standard sweep uses the within-group hybrid with cross-tile prefetch enabled
+and chunked XCD remapping, four-workgroup multicast, and refill-only cluster
+synchronization. Operand reuse is disabled.
+With --cluster-size 1, --no-cross-tile-prefetch selects alias-C and --auto-config
+selects the kernel's general cost model instead.
 """
 
 from __future__ import annotations
@@ -26,6 +32,9 @@ DEFAULT_CASES = (
     (8, 32768, 4096, 4096),
     (8, 65536, 8192, 4096),
     (8, 65536, 4096, 4096),
+    (1, 4096, 4096, 4096),
+    (1, 8192, 8192, 8192),
+    (1, 16384, 16384, 16384),
     (16, 4096, 4096, 4096),
 )
 
@@ -117,6 +126,10 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         str(args.num_xcds),
         "--xcd_chunk",
         str(args.xcd_chunk),
+        "--cluster_size",
+        str(args.cluster_size),
+        "--cluster_sync",
+        args.cluster_sync,
         "--seed",
         str(args.seed),
     ]
@@ -128,6 +141,10 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         command.append("--cross_tile_prefetch")
     if args.auto_config:
         command.append("--auto_config")
+    if not args.cluster_multicast:
+        command.append("--no-cluster_multicast")
+    if args.operand_reuse:
+        command.append("--operand_reuse")
     if args.check:
         command.append("--check")
     return command
@@ -212,11 +229,21 @@ def main() -> int:
     parser.add_argument("--l2-prefetch-distance", type=int, default=0)
     parser.add_argument("--num-programs", type=int, default=None)
     parser.add_argument("--dedicated-c-buffer", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=True,
+                        help="enable cross-tile prefetch (default: on); alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto-config", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none")
+    parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="chunked",
+                        help="persistent program remapping (default: chunked)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
+    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=4,
+                        help="workgroup cluster size (default: 4); use 1 to disable clustering")
+    parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share inputs within a cluster; disable for a synchronization-only control")
+    parser.add_argument("--cluster-sync", choices=("all", "refill"), default="refill",
+                        help="cluster rendezvous at all handoffs or only before input refills (default: refill)")
+    parser.add_argument("--operand-reuse", action=argparse.BooleanOptionalAction, default=False,
+                        help="experimental WMMA operand-cache reuse hints")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--benchmark-num-iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
