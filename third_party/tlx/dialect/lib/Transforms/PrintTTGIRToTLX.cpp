@@ -754,19 +754,7 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
       } else {
         printConstantValue(splatAttr, os);
       }
-      os << ", ";
-      Type et = tensorType.getElementType();
-      if (et.isF32())
-        os << "tl.float32";
-      else if (et.isBF16())
-        os << "tl.bfloat16";
-      else if (et.isF16())
-        os << "tl.float16";
-      else if (et.isInteger(32))
-        os << "tl.int32";
-      else
-        os << "tl.float32";
-      os << ")";
+      os << ", " << getElementTypeName(tensorType.getElementType()) << ")";
     } else {
       os << "dense<...>";
     }

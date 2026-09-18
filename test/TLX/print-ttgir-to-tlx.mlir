@@ -1465,3 +1465,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #loc_dotted = loc("v.a.b")
 #loc_under = loc("v_a_b")
 #loc_dashed = loc("v-a-b")
+
+// -----
+
+// Splat constants outside the hand-rolled dtype ladder were all typed
+// float32, silently changing the dtype of anything built from them.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def splat_constant_dtypes(
+  // CHECK-DAG: tl.full([256], 0, tl.float64)
+  // CHECK-DAG: tl.full([256], 0, tl.int64)
+  tt.func public @splat_constant_dtypes() attributes {noinline = false} {
+    %cf = arith.constant dense<0.000000e+00> : tensor<256xf64, #blocked>
+    %ci = arith.constant dense<0> : tensor<256xi64, #blocked>
+    %a = arith.addf %cf, %cf : tensor<256xf64, #blocked>
+    %b = arith.addi %ci, %ci : tensor<256xi64, #blocked>
+    tt.return
+  }
+}
