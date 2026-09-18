@@ -82,8 +82,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Checkout Tritonbench
         uses: actions/checkout@v3
         with:
@@ -140,8 +138,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Checkout TritonBench (Optional)
         id: tritonbench_pr
         if: github.event_name == 'pull_request'
@@ -221,8 +217,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Checkout Tritonbench
         uses: actions/checkout@v3
         with:
@@ -320,8 +314,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -356,6 +348,8 @@ jobs:
           TORCHTLX_PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           uv pip install --python "${TORCHTLX_PYTHON}" \
             -r python/requirements.txt -r python/test-requirements.txt
+          uv pip uninstall --python "${TORCHTLX_PYTHON}" \
+            pytorch-triton pytorch-triton-rocm triton-rocm triton || true
           uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
             -e . --no-build-isolation
           "${TORCHTLX_PYTHON}" - <<'PY'
@@ -425,8 +419,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Checkout Tritonbench
         uses: actions/checkout@v3
         with:

@@ -76,8 +76,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Restore ccache
         uses: actions/cache@v4
         with:
@@ -126,8 +124,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -211,8 +207,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -301,8 +295,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -413,8 +405,6 @@ jobs:
           exit 1
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
