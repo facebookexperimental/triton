@@ -36,11 +36,16 @@ DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
 REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
+# L2 intentionally benchmarks every registered shape; keep this placeholder for
+# future benchmark-only exclusions.
+FAILED_SHAPES = set()
+
 
 def shapes(synthetic: bool = False, suites=None) -> list:
     if sm100_torch is None:
         return []
-    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes("sm100", suites))
+    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes("sm100", suites)
+    return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
 
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:
