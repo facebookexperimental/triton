@@ -75,6 +75,33 @@ ChannelProtocolPlan::findConsumer(AsyncTaskId task) const {
   return it == consumers.end() ? nullptr : &*it;
 }
 
+bool taskUsesOnlyGen5Consumers(ArrayRef<Channel *> channels,
+                               AsyncTaskId consumerTaskId) {
+  bool foundConsumer = false;
+  for (Channel *channel : channels) {
+    if (!llvm::is_contained(channel->relation.second, consumerTaskId))
+      continue;
+
+    SmallVector<Operation *> dstOps;
+    if (channel->channelKind == DataChannelKind::SMEMAlloc)
+      static_cast<AllocChannel *>(channel)->getDstOps(dstOps);
+    else
+      dstOps.push_back(channel->getDstOp());
+
+    for (Operation *dst : dstOps) {
+      for (Operation *consumer : getActualConsumers(dst)) {
+        if (!llvm::is_contained(getAsyncTaskIds(consumer), consumerTaskId))
+          continue;
+        foundConsumer = true;
+        if (!isa<ttng::MMAv5OpInterface>(consumer))
+          return false;
+      }
+    }
+  }
+  assert(foundConsumer && "expected a consumer for the channel task");
+  return true;
+}
+
 static Operation *findFirstProtocolOp(const DenseSet<Operation *> &ops,
                                       Block *block) {
   for (Operation &op : block->getOperations())
@@ -240,6 +267,7 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
       getProtocolSameLevelOp(plan.headConsumer, plan.tmaHeadProducer);
   plan.producerReadyAnchor =
       getProtocolSameLevelOp(plan.headConsumer, plan.tailProducer);
+  plan.producerReadyIsAsync = !plan.tmaProducers.empty();
   plan.tmaConsumerWaitAnchor =
       getProtocolSameLevelOp(plan.tmaHeadProducer, plan.headConsumer);
   std::tie(plan.cadence, plan.cadenceScope) =
@@ -277,10 +305,10 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
     auto actualConsumers = getActualConsumers(waitAnchor);
     Operation *waitScheduleAnchor =
         actualConsumers.size() == 1 ? actualConsumers.front() : waitAnchor;
-    plan.consumers.push_back(
-        {task, head, tail, waitAnchor, waitScheduleAnchor,
-         getProtocolConsumerReleaseAnchor(postDominance, plan.tailProducer,
-                                          tail, task)});
+    plan.consumers.push_back({task, head, tail, waitAnchor, waitScheduleAnchor,
+                              getProtocolConsumerReleaseAnchor(
+                                  postDominance, plan.tailProducer, tail, task),
+                              taskUsesOnlyGen5Consumers(channels, task)});
   }
   return plan;
 }

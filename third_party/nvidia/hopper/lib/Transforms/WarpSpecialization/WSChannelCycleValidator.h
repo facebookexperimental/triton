@@ -27,9 +27,9 @@ struct PostMemoryProtocolAnalysis {
 /// Build and validate the ordinary loop-cadence channel protocols represented
 /// by post-memory endpoint plans. Reuse groups and other specialized protocol
 /// shapes are conservatively reported as unsupported by this first builder.
-PostMemoryProtocolAnalysis
-analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
-                                  ReuseConfig *reuseConfig);
+PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
+    ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
+    const DenseSet<int64_t> &specializedBufferIds);
 
 /// Re-derive endpoint plans from post-memory channels and run the common
 /// solver. Unsafe cycles fail validation; safe and not-yet-supported protocol

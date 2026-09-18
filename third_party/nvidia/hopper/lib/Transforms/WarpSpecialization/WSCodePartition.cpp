@@ -986,37 +986,6 @@ static bool checkConsumersInLoops(Channel *channel) {
   return false;
 }
 
-/// Return true when every consumer in `consumerTaskId` can use an MMAv5 inline
-/// completion barrier. Channels that reuse a physical slot must agree on the
-/// mode, so one scalar consumer makes the whole task token-based even when
-/// single-copy channels retain separate tokens.
-static bool taskUsesOnlyGen5Consumers(ArrayRef<Channel *> channels,
-                                      AsyncTaskId consumerTaskId) {
-  bool foundConsumer = false;
-  for (Channel *channel : channels) {
-    if (!llvm::is_contained(channel->relation.second, consumerTaskId))
-      continue;
-
-    SmallVector<Operation *> dstOps;
-    if (channel->channelKind == DataChannelKind::SMEMAlloc)
-      static_cast<AllocChannel *>(channel)->getDstOps(dstOps);
-    else
-      dstOps.push_back(channel->getDstOp());
-
-    for (Operation *dst : dstOps) {
-      for (Operation *consumer : getActualConsumers(dst)) {
-        if (!llvm::is_contained(getAsyncTaskIds(consumer), consumerTaskId))
-          continue;
-        foundConsumer = true;
-        if (!isa<ttng::MMAv5OpInterface>(consumer))
-          return false;
-      }
-    }
-  }
-  assert(foundConsumer && "expected a consumer for the channel task");
-  return true;
-}
-
 void createToken(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,

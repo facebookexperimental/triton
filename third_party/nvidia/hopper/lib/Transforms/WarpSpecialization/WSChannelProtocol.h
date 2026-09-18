@@ -34,6 +34,7 @@ struct ChannelConsumerProtocolPlan {
   Operation *waitAnchor = nullptr;
   Operation *waitScheduleAnchor = nullptr;
   Operation *releaseAnchor = nullptr;
+  bool releaseIsAsync = false;
 };
 
 /// Non-owning, non-mutating description of the synchronization endpoints for
@@ -50,6 +51,7 @@ struct ChannelProtocolPlan {
   Operation *tmaHeadProducer = nullptr;
   Operation *producerAcquireAnchor = nullptr;
   Operation *producerReadyAnchor = nullptr;
+  bool producerReadyIsAsync = false;
   Operation *tmaConsumerWaitAnchor = nullptr;
   Operation *cadenceScope = nullptr;
   ChannelProtocolCadence cadence = ChannelProtocolCadence::Unsupported;
@@ -61,6 +63,12 @@ struct ChannelProtocolPlan {
 
   const ChannelConsumerProtocolPlan *findConsumer(AsyncTaskId task) const;
 };
+
+/// Return true when every consumer in `consumerTaskId` uses an MMAv5 inline
+/// completion barrier. This classification is shared by token creation and
+/// protocol validation.
+bool taskUsesOnlyGen5Consumers(ArrayRef<Channel *> channels,
+                               AsyncTaskId consumerTaskId);
 
 /// Same-level lookup used by channel protocol placement. SubtiledRegionOp is a
 /// sequencing marker rather than a control-flow boundary, so this variant

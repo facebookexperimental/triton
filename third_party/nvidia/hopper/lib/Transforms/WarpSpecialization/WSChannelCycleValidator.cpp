@@ -38,6 +38,7 @@ struct ScheduledProtocolEvent {
   int64_t stage;
   int64_t cluster;
   unsigned channelId;
+  bool ordersFollowingEvents;
 };
 
 struct ProtocolTaskTimeline {
@@ -109,14 +110,27 @@ static bool addTaskOrderEdges(ProtocolGraph &graph,
   auto connect = [&](ArrayRef<ScheduledProtocolEvent> from,
                      ArrayRef<ScheduledProtocolEvent> to, bool wraps) {
     int64_t distance = to.front().stage - from.front().stage + (wraps ? 1 : 0);
-    for (const ScheduledProtocolEvent &src : from)
+    for (const ScheduledProtocolEvent &src : from) {
+      if (!src.ordersFollowingEvents)
+        continue;
       for (const ScheduledProtocolEvent &dst : to)
         graph.addEdge(src.id, dst.id, distance, ProtocolEdgeKind::TaskOrder,
                       src.channelId);
+    }
   };
-  for (size_t i = 1; i < classes.size(); ++i)
-    connect(classes[i - 1], classes[i], /*wraps=*/false);
-  connect(classes.back(), classes.front(), /*wraps=*/true);
+  auto hasOrderingSource = [](ArrayRef<ScheduledProtocolEvent> eventClass) {
+    return llvm::any_of(eventClass, [](const ScheduledProtocolEvent &event) {
+      return event.ordersFollowingEvents;
+    });
+  };
+  for (size_t target = 0; target < classes.size(); ++target) {
+    size_t source = (target + classes.size() - 1) % classes.size();
+    while (source != target && !hasOrderingSource(classes[source]))
+      source = (source + classes.size() - 1) % classes.size();
+    if (!hasOrderingSource(classes[source]))
+      continue;
+    connect(classes[source], classes[target], source >= target);
+  }
   return true;
 }
 
@@ -166,11 +180,12 @@ static void attachAuditAttributes(triton::FuncOp funcOp,
 
 } // namespace
 
-PostMemoryProtocolAnalysis
-analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
-                                  ReuseConfig *reuseConfig) {
+PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
+    ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
+    const DenseSet<int64_t> &specializedBufferIds) {
   PostMemoryProtocolAnalysis analysis;
   SmallVector<ProtocolTaskTimeline> timelines;
+  DenseSet<ProtocolEventId> nestedCadenceEvents;
   std::string unsupportedReason;
 
   for (const ChannelProtocolPlan &plan : plans) {
@@ -189,11 +204,6 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
       unsupported("only scf.for loop-cadence channels are supported");
       continue;
     }
-    if (plan.cadenceScope->getParentOfType<scf::ForOp>() ||
-        plan.cadenceScope->getParentOfType<scf::WhileOp>()) {
-      unsupported("nested loop-cadence channels are not yet supported");
-      continue;
-    }
     if (triton::gpu::isPhysicalCluster(plan.cadenceScope)) {
       unsupported("multi-CTA channel protocols are not yet supported");
       continue;
@@ -208,6 +218,16 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
                  member->getNumBuffers() != plan.copies;
         })) {
       unsupported("grouped producers do not share one SMEM protocol");
+      continue;
+    }
+    if (llvm::any_of(plan.channels, [&](Channel *member) {
+          Operation *alloc = member->getAllocOp();
+          if (!alloc)
+            return false;
+          auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+          return bufferId && specializedBufferIds.contains(bufferId.getInt());
+        })) {
+      unsupported("staging-reuse channel protocols are not yet supported");
       continue;
     }
     if (reuseConfig && llvm::any_of(plan.channels, [&](Channel *member) {
@@ -225,6 +245,9 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
 
     unsigned channelId = channel->uniqID;
     std::string label = "channel " + std::to_string(channelId);
+    LDBG(label << " buffer " << channel->getAllocOp()->getAttr("buffer.id")
+               << " copies " << plan.copies << " producer task "
+               << channel->relation.first);
     size_t eventStart = analysis.graph.events.size();
     ProtocolEventId acquire =
         analysis.graph.addEvent(ProtocolEventKind::Acquire, label + " acquire");
@@ -233,7 +256,8 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
 
     SmallVector<ScheduledProtocolEvent> pendingEvents;
     auto stageEvent = [&](ProtocolEventId id, AsyncTaskId task,
-                          Operation *anchor, ProtocolEventSide side) {
+                          Operation *anchor, ProtocolEventSide side,
+                          bool ordersFollowingEvents = true) {
       int64_t stage;
       int64_t cluster;
       if (!anchor ||
@@ -241,15 +265,21 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
               plan.cadenceScope ||
           !getScheduleCoordinate(anchor, stage, cluster))
         return false;
+      LDBG("channel " << channelId << " event " << id << " task " << task
+                      << " stage " << stage << " cluster " << cluster
+                      << (side == ProtocolEventSide::BeforeAnchor ? " before "
+                                                                  : " after ")
+                      << anchor->getName());
       pendingEvents.push_back({id, task, plan.cadenceScope, anchor, side, stage,
-                               cluster, channelId});
+                               cluster, channelId, ordersFollowingEvents});
       return true;
     };
     if (!stageEvent(acquire, channel->relation.first,
                     plan.producerAcquireAnchor,
                     ProtocolEventSide::BeforeAnchor) ||
         !stageEvent(ready, channel->relation.first, plan.producerReadyAnchor,
-                    ProtocolEventSide::AfterAnchor)) {
+                    ProtocolEventSide::AfterAnchor,
+                    !plan.producerReadyIsAsync)) {
       analysis.graph.events.resize(eventStart);
       unsupported("producer endpoint lacks a loop schedule coordinate");
       continue;
@@ -271,7 +301,8 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
       if (!stageEvent(wait, consumer.task, consumer.waitScheduleAnchor,
                       ProtocolEventSide::BeforeAnchor) ||
           !stageEvent(release, consumer.task, consumer.releaseAnchor,
-                      ProtocolEventSide::AfterAnchor)) {
+                      ProtocolEventSide::AfterAnchor,
+                      !consumer.releaseIsAsync)) {
         complete = false;
         break;
       }
@@ -283,16 +314,38 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
       continue;
     }
 
+    if (plan.cadenceScope->getParentOfType<scf::ForOp>() ||
+        plan.cadenceScope->getParentOfType<scf::WhileOp>()) {
+      for (ProtocolEventId event = eventStart;
+           event < analysis.graph.events.size(); ++event)
+        nestedCadenceEvents.insert(event);
+    }
+
+    auto getEventStage = [&](ProtocolEventId id) {
+      auto event = llvm::find_if(pendingEvents,
+                                 [id](const ScheduledProtocolEvent &candidate) {
+                                   return candidate.id == id;
+                                 });
+      assert(event != pendingEvents.end() &&
+             "missing scheduled protocol event");
+      return event->stage;
+    };
+    auto getTaskSpanDistance = [&](ProtocolEventId from, ProtocolEventId to) {
+      return getEventStage(to) - getEventStage(from);
+    };
+
     for (const ScheduledProtocolEvent &event : pendingEvents)
       getTaskTimeline(timelines, event.task, event.scope)
           .events.push_back(event);
-    analysis.graph.addEdge(acquire, ready, 0, ProtocolEdgeKind::DataReady,
-                           channelId);
+    analysis.graph.addEdge(acquire, ready, getTaskSpanDistance(acquire, ready),
+                           ProtocolEdgeKind::TaskOrder, channelId);
     for (const ConsumerEvents &consumer : consumerEvents) {
       analysis.graph.addEdge(ready, consumer.wait, 0,
                              ProtocolEdgeKind::DataReady, channelId);
-      analysis.graph.addEdge(consumer.wait, consumer.release, 0,
-                             ProtocolEdgeKind::ControlFlow, channelId);
+      analysis.graph.addEdge(
+          consumer.wait, consumer.release,
+          getTaskSpanDistance(consumer.wait, consumer.release),
+          ProtocolEdgeKind::TaskOrder, channelId);
       analysis.graph.addEdge(consumer.release, acquire, plan.copies,
                              ProtocolEdgeKind::SlotReuse, channelId);
     }
@@ -307,6 +360,21 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
       unsupportedReason = "task protocol events span multiple blocks";
   }
   analysis.validation = validateProtocolCycles(analysis.graph);
+  bool hasNegativeNestedEdge =
+      analysis.validation.status == ProtocolStatus::Unsafe &&
+      llvm::any_of(analysis.validation.cycleEdgeIds, [&](unsigned edgeId) {
+        const ProtocolEdge &edge = analysis.graph.edges[edgeId];
+        return edge.iterationDistance < 0 &&
+               (nestedCadenceEvents.contains(edge.from) ||
+                nestedCadenceEvents.contains(edge.to));
+      });
+  if (hasNegativeNestedEdge) {
+    analysis.validation.status = ProtocolStatus::Unsupported;
+    analysis.validation.cycleEdgeIds.clear();
+    analysis.validation.reason =
+        "mixed-distance cycles in nested loops require outer-boundary "
+        "validation";
+  }
   if (analysis.validation.status == ProtocolStatus::Unsafe &&
       analysis.validation.cycleIterationDistance < 0) {
     analysis.validation.status = ProtocolStatus::Unsupported;
@@ -335,14 +403,35 @@ LogicalResult validatePostMemoryChannelProtocols(
     plans.push_back(buildChannelProtocolPlan(groupIt->second, postDominance));
   }
 
-  PostMemoryProtocolAnalysis analysis =
-      analyzePostMemoryChannelProtocols(plans, reuseConfig);
+  DenseSet<int64_t> specializedBufferIds;
+  funcOp.walk([&](triton::gpu::LocalAllocOp alloc) {
+    auto reuseTarget =
+        alloc->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+    if (!reuseTarget)
+      return;
+    specializedBufferIds.insert(reuseTarget.getInt());
+    if (auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
+      specializedBufferIds.insert(bufferId.getInt());
+  });
+
+  PostMemoryProtocolAnalysis analysis = analyzePostMemoryChannelProtocols(
+      plans, reuseConfig, specializedBufferIds);
   LDBG("post-memory channel-cycle audit: "
        << stringifyProtocolStatus(analysis.validation.status)
        << ", events=" << analysis.graph.events.size()
        << ", edges=" << analysis.graph.edges.size()
        << ", supported=" << analysis.supportedChannelCount
        << ", unsupported=" << analysis.unsupportedChannelCount);
+  LLVM_DEBUG({
+    for (unsigned edgeId : analysis.validation.cycleEdgeIds) {
+      const ProtocolEdge &edge = analysis.graph.edges[edgeId];
+      DBGS() << "cycle edge " << edgeId << " "
+             << analysis.graph.events[edge.from].label << " -> "
+             << analysis.graph.events[edge.to].label << " kind "
+             << static_cast<unsigned>(edge.kind) << " distance "
+             << edge.iterationDistance << "\n";
+    }
+  });
   if (emitAuditAttributes)
     attachAuditAttributes(funcOp, analysis);
   if (analysis.validation.status != ProtocolStatus::Unsafe)

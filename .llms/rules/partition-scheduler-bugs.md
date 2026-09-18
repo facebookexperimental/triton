@@ -291,7 +291,7 @@
   slots. The actual annotation-free B200 kernel passes against the torch
   reference at `atol=rtol=0.03`.
 
-### 37. D120 B-early schedule creates a zero-credit cross-partition channel cycle (2026-09-17, open)
+### 37. D120 B-early schedule creates a zero-credit cross-partition channel cycle (2026-09-17, fixed)
 
 - **Symptom**: The production-shaped D120 RMSNorm+GEMM kernel hangs when the
   Contracted schedule selects B at stage 0, A at stage 1, and MMA at stage 2.
@@ -304,18 +304,18 @@
   `release A(i) -> acquire A(i+1) -> issue B(i+1) -> wait B(i+1) -> release
   A(i)`. The cycle has no startup credit and deadlocks independently of B's
   descriptor-buffer depth.
-- **Planned fix**: Use one normalized channel-protocol graph with two builders.
-  The authoritative candidate gate runs inside `doCodePartition` after its
-  post-memory channel/reuse topology is reconstructed but before accumulation
-  counters or synchronization mutate the IR; it assumes each channel receives
-  its correct ready/empty protocol. A conformance audit rebuilds the same graph
-  from the actual endpoints after `insertAsyncComm` and barrier fusion. Both use
-  selected `buffer.copy`, task order, and `loop.stage`/`loop.cluster`. The full
-  implementation plan is Phase 10 of
+- **Fix**: `doCodePartition` builds a normalized protocol graph after memory
+  planning and reuse-group reconstruction, but before accumulation counters or
+  synchronization mutate the IR. The graph models channel copy depth,
+  task-local schedule order, TMA-ready completion, and MMAv5-release completion;
+  its weighted-cycle solver rejects a proven non-positive-distance cycle.
+  Mixed-distance cycles in nested loops remain unsupported until the enclosing
+  prologue/drain boundary is modeled, avoiding false rejection of FA backward.
+  The post-insertion conformance builder remains a follow-up in Phase 10 of
   `ContractedScheduleMemorySearchPlan.md`.
-- **Required regression**: The captured B-early D120 TTGIR must fail at compile
-  time with a cycle witness for both A2/B2 and A2/B3. A-early/A2-B3 and the
-  annotation-free FA-backward target must remain accepted.
+- **Tests**: The captured B-early D120 TTGIR fails at compile time with the same
+  cycle witness for A2/B2 and A2/B3. A-early/A2-B3 and the annotation-free
+  FA-backward fixtures remain accepted.
 
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)

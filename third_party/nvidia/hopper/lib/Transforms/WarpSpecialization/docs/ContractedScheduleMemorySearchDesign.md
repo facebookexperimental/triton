@@ -511,11 +511,14 @@ Implemented:
   synchronization insertion consumes this plan; reuse-specific acquire
   relocation updates the same record.
 - A post-memory graph builder and candidate gate for ordinary, single-CTA SMEM
-  channels in a top-level scheduled `scf.for`.
+  channels in a common scheduled `scf.for`, including nested inner loops.
   It lowers planned endpoints to Acquire/Ready/Wait/Release events, adds copy
-  depth and stage-delta edges, and runs the common weighted-cycle solver. The
-  production-shaped D120 B-early fixture reports the expected zero-credit
-  cycle through this real channel path. Only `Unsafe` is rejected;
+  depth and stage-delta edges, distinguishes asynchronous TMA/MMAv5 completion
+  from task-serializing endpoints, and runs the common weighted-cycle solver.
+  Mixed-distance cycles inside a nested loop remain `Unsupported` until the
+  graph represents the enclosing prologue/drain boundary. The production-shaped
+  D120 B-early fixture reports the expected zero-credit cycle through this real
+  channel path. Only `Unsafe` is rejected;
   `Unsupported` continues. Endpoint planning lives in
   `WSChannelProtocol.{h,cpp}`, graph lowering and audit diagnostics in
   `WSChannelCycleValidator.{h,cpp}`, and the generic solver remains isolated in
@@ -540,8 +543,8 @@ Current limitations:
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
 - The ordinary-loop post-memory builder rejects proven zero-distance cycles.
-  Negative-distance, nested-loop, multi-CTA, specialized-protocol, and
-  post-insertion coverage remain open.
+  Negative-total cycles, mixed-distance nested cycles, multi-CTA,
+  specialized-protocol, and post-insertion coverage remain open.
 
 ## 12. Controls and diagnostics
 
