@@ -648,6 +648,16 @@ pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1
   `needExplicitReuseWait` returns `false`.
 - Action: No change. Partition-internal ordering guarantees correctness.
 
+The post-memory validator models single-copy SMEM A2 pairs using the same
+`verifyReuseGroup2` and `orderReuseGroup2` helpers. Each logical channel keeps
+its ordinary `release(c, i) -> acquire(c, i+1)` edge because A2 uses distinct
+per-channel tokens. The shared physical slot adds
+`release(early, i) -> acquire(late, i)` and
+`release(late, i) -> acquire(early, i+1)`. These normalized edges represent
+either the explicit reuse waits above or the same-task order that proves those
+waits redundant. Initial support requires one unambiguous plan per channel,
+one common `scf.for` or finite straight-line scope, and no subtiled member.
+
 ### FA-forward P publication: schedule-proven empty-edge elision
 
 FA forward can pack the softmax probability `P` into the QK accumulator's
@@ -694,6 +704,13 @@ back-waits on channel `i-1`'s consumer, and the first channel wraps around to wa
 on the last channel's consumer from the previous iteration. This is the original
 N>2 path and covers epilogue subtiling, where N subtiles share one SMEM buffer and
 are stored/loaded sequentially.
+
+The post-memory validator applies the same `verifyReuseGroupN` and producer
+ordering, then requires consumer order to agree before admitting the group. It
+keeps each member's ordinary one-copy edge and adds the adjacent physical-slot
+edges plus the last-to-first distance-one wrap. For a finite straight-line
+group, the first transaction starts with the empty slot and the wrap is
+omitted. A dedicated A3 lit function checks a three-member cyclic SMEM chain.
 
 ### Whole-allocation overwrite owner ("hub" case)
 

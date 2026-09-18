@@ -271,9 +271,13 @@ physical predecessor `release(j - K) -> acquire(j)`. Loop groups include the
 corresponding cross-iteration distance; direct-grid groups are finite and omit
 both initial-slot predecessors and the last-to-first task-order wrap. The D120
 eight-subtile/three-copy output ring is the production fixture for the finite
-case. Single-copy reuse groups, TMEM, subtiled, general straight-line,
-multi-CTA, and ordinary `scf.while` protocols are currently reported as
-unsupported.
+case. Single-copy A2 dependency pairs and A3 same-block SMEM chains are also
+supported. They retain each channel's ordinary one-copy edge and add the
+physical ownership chain: adjacent releases gate the next producer in the same
+iteration, and the final release gates the first producer in the next
+iteration. A finite straight-line chain omits that wrap. TMEM, subtiled,
+general straight-line, multi-CTA, and ordinary `scf.while` protocols are
+currently reported as unsupported.
 Staging-to-operand reuse is identified from both sides of each
 `allocation.reuseTarget` relation and validated with its cross-tile WAR token.
 Multi-CTA needs cluster synchronization, and

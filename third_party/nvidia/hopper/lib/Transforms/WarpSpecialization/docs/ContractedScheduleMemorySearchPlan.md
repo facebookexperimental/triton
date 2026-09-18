@@ -151,6 +151,17 @@ subtiles as one three-copy ring: supported coverage rises from 3 to 11 channels
 and only its two TMEM protocols remain unsupported. Its A-early candidate is
 accepted and both B-early memory ranks retain the same zero-credit rejection.
 
+**Implemented fourteenth slice:** Single-copy SMEM reuse groups now use the
+same normalized physical-ownership chain. A2 pairs are admitted and ordered by
+`verifyReuseGroup2`/`orderReuseGroup2`; A3 groups are admitted by
+`verifyReuseGroupN`, ordered by producer program order, and require matching
+consumer order. Unlike A1, each member retains its ordinary one-copy token
+edge. The validator additionally connects each member's release to the next
+member's acquire in the same iteration and the final release to the first
+acquire in the next iteration. Finite straight-line chains omit that wrap.
+Focused real-TTGIR functions cover safe two- and three-member cyclic SMEM
+groups. A4-A6 TMEM and subtiled protocols remain unsupported.
+
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
 `WSChannelCycleValidator` owns IR-to-graph lowering and audit diagnostics, and
@@ -1221,6 +1232,8 @@ The implementation sequence is:
    unambiguous plan per member. Replace member-local copy-depth edges with the
    actual cross-channel physical-slot predecessor. Model loop groups cyclically
    and direct-grid groups as finite sequences without a fabricated wraparound.
+   The same representation supports A2/A3 single-copy SMEM chains while
+   retaining their ordinary per-channel token edges.
 7. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
@@ -1468,6 +1481,7 @@ a hard correctness floor on the structural path.
       while retaining A-early with the A2/B3 memory plan.
 - [x] Post-memory validation models D120's eight-member/three-copy A1 output
       staging ring and reports only the two TMEM protocols unsupported.
+- [x] Post-memory validation models A2 and A3 single-copy SMEM reuse chains.
 - [x] The full bounded D120 product runs without hangs: nine tuples pass
       correctness and the three B-early tuples are rejected before launch.
 - [ ] D120 measured winner is A3/B2 on the target shapes.

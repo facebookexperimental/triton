@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" | FileCheck %s
 
 // Reuse groups share a single communication channel.  The channel must be
 // built from the union of the logical buffers in the group, not just from the
@@ -45,6 +45,35 @@
 // CHECK:        nvws.producer_acquire
 // CHECK:        ttng.async_tma_copy_global_to_local
 
+// The second function is a real A2 SMEM dependency chain: A's local_load
+// directly feeds B's producer. The post-memory validator models the ordinary
+// one-copy channel edges plus A.release(i) -> B.acquire(i) and
+// B.release(i) -> A.acquire(i+1).
+// CHECK-LABEL: tt.func public @smem_reuse_a2
+// CHECK-SAME: nvws.test.channel_cycle_edge_count = 18 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 8 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_a1_groups = 0 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_a2_groups = 1 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_a3_groups = 0 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_reuse_groups = 1 : i64
+// CHECK-SAME: nvws.test.channel_cycle_status = "safe"
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 2 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 0 : i64
+
+// The third function is an A3 SMEM chain with three independent producer/
+// consumer pairs in matching program order. The validator adds both adjacent
+// same-iteration reuse edges and the last-to-first next-iteration edge.
+// CHECK-LABEL: tt.func public @smem_reuse_a3
+// CHECK-SAME: nvws.test.channel_cycle_edge_count = 27 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 12 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_a1_groups = 0 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_a2_groups = 0 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_a3_groups = 1 : i64
+// CHECK-SAME: nvws.test.channel_cycle_smem_reuse_groups = 1 : i64
+// CHECK-SAME: nvws.test.channel_cycle_status = "safe"
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 3 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 0 : i64
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
@@ -71,6 +100,54 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.store %ptrs1, %sum {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
       scf.yield {async_task_id = array<i32: 0, 1, 2>}
     } {async_task_id = array<i32: 0, 1, 2>, tt.warp_specialize}
+    tt.return
+  }
+
+  tt.func public @smem_reuse_a2(%a_desc: !tt.tensordesc<128x64xf16, #shared>, %out: !tt.ptr<f16>) attributes {noinline = false} {
+    %a = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %b = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
+    %c1 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 1 : i32
+    %c4 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 4 : i32
+    %ptrs = tt.splat %out {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    scf.for %iv = %c0 to %c4 step %c1 : i32 {
+      %tile = tt.descriptor_load %a_desc[%c0, %c0] {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %tile, %a {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %a_value = ttg.local_load %a {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %b_value = arith.addf %a_value, %a_value {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x64xf16, #blocked>
+      ttg.local_store %b_value, %b {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %result = ttg.local_load %b {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs, %result {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 2 : i32} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      scf.yield {async_task_id = array<i32: 0, 1, 2>}
+    } {async_task_id = array<i32: 0, 1, 2>, tt.scheduled_max_stage = 2 : i32, tt.warp_specialize}
+    tt.return
+  }
+
+  tt.func public @smem_reuse_a3(%desc0: !tt.tensordesc<128x64xf16, #shared>, %desc1: !tt.tensordesc<128x64xf16, #shared>, %desc2: !tt.tensordesc<128x64xf16, #shared>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>, %out2: !tt.ptr<f16>) attributes {noinline = false} {
+    %a = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %b = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
+    %c1 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : i32
+    %c4 = arith.constant {async_task_id = array<i32: 0, 1>} 4 : i32
+    %ptrs0 = tt.splat %out0 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %ptrs1 = tt.splat %out1 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %ptrs2 = tt.splat %out2 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    scf.for %iv = %c0 to %c4 step %c1 : i32 {
+      %tile0 = tt.descriptor_load %desc0[%c0, %c0] {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %tile0, %a {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %value0 = ttg.local_load %a {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs0, %value0 {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      %tile1 = tt.descriptor_load %desc1[%c0, %c0] {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %tile1, %b {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %value1 = ttg.local_load %b {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs1, %value1 {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 1 : i32} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      %tile2 = tt.descriptor_load %desc2[%c0, %c0] {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %tile2, %c {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %value2 = ttg.local_load %c {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs2, %value2 {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      scf.yield {async_task_id = array<i32: 0, 1>}
+    } {async_task_id = array<i32: 0, 1>, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize}
     tt.return
   }
 }

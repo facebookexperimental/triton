@@ -53,10 +53,17 @@ struct ProtocolTaskTimeline {
   SmallVector<ScheduledProtocolEvent> events;
 };
 
-struct SmemCircularReuseGroupPlan {
+enum class SmemReuseGroupKind {
+  Circular,
+  DependencyPair,
+  LinearChain,
+};
+
+struct SmemReuseGroupPlan {
   SmallVector<Channel *> transactions;
   unsigned copies;
   bool finite;
+  SmemReuseGroupKind kind;
 };
 
 struct ChannelEventSet {
@@ -406,11 +413,11 @@ static ProtocolValidation validateProtocolScopes(
   return {};
 }
 
-static SmallVector<SmemCircularReuseGroupPlan>
-collectSupportedSmemCircularReuseGroups(
-    ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
-    DenseMap<Channel *, unsigned> &groupByChannel) {
-  SmallVector<SmemCircularReuseGroupPlan> groups;
+static SmallVector<SmemReuseGroupPlan>
+collectSupportedSmemReuseGroups(ArrayRef<ChannelProtocolPlan> plans,
+                                ReuseConfig *reuseConfig,
+                                DenseMap<Channel *, unsigned> &groupByChannel) {
+  SmallVector<SmemReuseGroupPlan> groups;
   if (!reuseConfig)
     return groups;
 
@@ -430,19 +437,56 @@ collectSupportedSmemCircularReuseGroups(
       continue;
     Channel *representative = group->channels.front();
     unsigned copies = representative->getNumBuffers();
-    if (copies <= 1 || !verifyReuseGroup1(group) ||
-        llvm::any_of(group->channels, [](Channel *channel) {
+    if (llvm::any_of(group->channels, [](Channel *channel) {
           return channel->channelKind != DataChannelKind::SMEMAlloc ||
                  channelIsSubtiled(channel);
         }))
       continue;
 
+    SmemReuseGroupKind kind;
+    SmallVector<Channel *> transactions;
+    if (copies > 1) {
+      if (!verifyReuseGroup1(group))
+        continue;
+      kind = SmemReuseGroupKind::Circular;
+      transactions.append(group->channels.begin(), group->channels.end());
+      // A1 assigns each member an accumCnt offset in consumer program order.
+      // Use that exact logical transaction order for physical-slot ownership.
+      llvm::stable_sort(transactions, [](Channel *lhs, Channel *rhs) {
+        return lhs->getDstOp()->isBeforeInBlock(rhs->getDstOp());
+      });
+    } else {
+      if (llvm::any_of(group->channels, [](Channel *channel) {
+            return channel->getNumBuffers() != 1;
+          }))
+        continue;
+      if (group->channels.size() == 2 && verifyReuseGroup2(group)) {
+        kind = SmemReuseGroupKind::DependencyPair;
+        auto [early, late] = orderReuseGroup2(group);
+        transactions.assign({early, late});
+      } else if (verifyReuseGroupN(group)) {
+        kind = SmemReuseGroupKind::LinearChain;
+        transactions = orderReuseGroupN(group);
+        bool consumerOrderMatches = llvm::all_of(
+            llvm::seq<size_t>(1, transactions.size()), [&](size_t index) {
+              Operation *previous = transactions[index - 1]->getDstOp();
+              Operation *current = transactions[index]->getDstOp();
+              return previous && current &&
+                     previous->getBlock() == current->getBlock() &&
+                     previous->isBeforeInBlock(current);
+            });
+        if (!consumerOrderMatches)
+          continue;
+      } else {
+        continue;
+      }
+    }
+
     Operation *scope = nullptr;
     Block *transactionBlock = nullptr;
     std::optional<bool> finite;
-    SmallVector<Channel *> transactions;
     bool supported = true;
-    for (Channel *channel : group->channels) {
+    for (Channel *channel : transactions) {
       auto planIt = planByChannel.find(channel);
       if (channel->getNumBuffers() != copies ||
           ambiguousChannels.contains(channel) ||
@@ -455,9 +499,10 @@ collectSupportedSmemCircularReuseGroups(
       bool planIsFinite = plan.cadence == ChannelProtocolCadence::StraightLine;
       bool planIsLoop = plan.cadence == ChannelProtocolCadence::Loop &&
                         isa_and_nonnull<scf::ForOp>(plan.cadenceScope);
+      Operation *source = channel->getSrcOp();
       Operation *destination = channel->getDstOp();
-      if ((!planIsFinite && !planIsLoop) || !plan.cadenceScope ||
-          !destination) {
+      if ((!planIsFinite && !planIsLoop) || !plan.cadenceScope || !source ||
+          !destination || source->getBlock() != destination->getBlock()) {
         supported = false;
         break;
       }
@@ -470,23 +515,17 @@ collectSupportedSmemCircularReuseGroups(
         supported = false;
         break;
       }
-      transactions.push_back(channel);
     }
     if (!supported)
       continue;
 
-    // A1 assigns each member an accumCnt offset in consumer program order.
-    // Use that exact logical transaction order for physical-slot ownership.
-    llvm::stable_sort(transactions, [](Channel *lhs, Channel *rhs) {
-      return lhs->getDstOp()->isBeforeInBlock(rhs->getDstOp());
-    });
     if (llvm::adjacent_find(transactions, [](Channel *lhs, Channel *rhs) {
           return lhs->getDstOp() == rhs->getDstOp();
         }) != transactions.end())
       continue;
 
     unsigned supportedIndex = groups.size();
-    groups.push_back({std::move(transactions), copies, *finite});
+    groups.push_back({std::move(transactions), copies, *finite, kind});
     for (Channel *channel : groups.back().transactions)
       groupByChannel[channel] = supportedIndex;
   }
@@ -518,6 +557,15 @@ static void attachAuditAttributes(triton::FuncOp funcOp,
   funcOp->setAttr("nvws.test.channel_cycle_smem_reuse_groups",
                   IntegerAttr::get(IntegerType::get(context, 64),
                                    analysis.supportedSmemReuseGroupCount));
+  funcOp->setAttr("nvws.test.channel_cycle_smem_a1_groups",
+                  IntegerAttr::get(IntegerType::get(context, 64),
+                                   analysis.supportedSmemA1GroupCount));
+  funcOp->setAttr("nvws.test.channel_cycle_smem_a2_groups",
+                  IntegerAttr::get(IntegerType::get(context, 64),
+                                   analysis.supportedSmemA2GroupCount));
+  funcOp->setAttr("nvws.test.channel_cycle_smem_a3_groups",
+                  IntegerAttr::get(IntegerType::get(context, 64),
+                                   analysis.supportedSmemA3GroupCount));
   if (!analysis.validation.reason.empty())
     funcOp->setAttr("nvws.test.channel_cycle_reason",
                     StringAttr::get(context, analysis.validation.reason));
@@ -555,10 +603,9 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
   DenseMap<ProtocolEventId, ScheduledProtocolEvent> eventSchedules;
   DenseMap<Channel *, ChannelEventSet> channelEvents;
   DenseMap<Channel *, unsigned> smemReuseGroupByChannel;
-  SmallVector<SmemCircularReuseGroupPlan> smemReuseGroups =
-      collectSupportedSmemCircularReuseGroups(plans, reuseConfig,
-                                              smemReuseGroupByChannel);
-  analysis.supportedSmemReuseGroupCount = smemReuseGroups.size();
+  SmallVector<SmemReuseGroupPlan> smemReuseGroups =
+      collectSupportedSmemReuseGroups(plans, reuseConfig,
+                                      smemReuseGroupByChannel);
   std::string unsupportedReason;
   bool hasUnsupportedProtocol =
       stagingReusePlan.hasReuseTargets() && !stagingReusePlan.isSupported();
@@ -596,7 +643,7 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
         isa_and_nonnull<scf::ForOp>(plan.cadenceScope) &&
         isa_and_nonnull<scf::ForOp>(plan.innerCadenceScope);
     auto smemReuseGroupIt = smemReuseGroupByChannel.find(channel);
-    const SmemCircularReuseGroupPlan *smemReuseGroup =
+    const SmemReuseGroupPlan *smemReuseGroup =
         smemReuseGroupIt == smemReuseGroupByChannel.end()
             ? nullptr
             : &smemReuseGroups[smemReuseGroupIt->second];
@@ -781,19 +828,34 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
                                 : ProtocolEdgeKind::TaskOrder,
           channelId);
       events.releases.push_back(consumer.release);
-      if (!smemReuseGroup)
+      // A2/A3 retain their ordinary per-channel one-copy tokens. Their extra
+      // physical-alias dependencies are added below. A1 shares the circular
+      // barrier itself, so its member-local edge is replaced completely.
+      if (!smemReuseGroup ||
+          smemReuseGroup->kind != SmemReuseGroupKind::Circular)
         analysis.graph.addEdge(consumer.release, acquire, plan.copies,
                                ProtocolEdgeKind::SlotReuse, channelId);
     }
     ++analysis.supportedChannelCount;
   }
 
-  for (const SmemCircularReuseGroupPlan &group : smemReuseGroups) {
+  for (const SmemReuseGroupPlan &group : smemReuseGroups) {
     if (llvm::any_of(group.transactions, [&](Channel *channel) {
           return !channelEvents.contains(channel);
-        })) {
-      --analysis.supportedSmemReuseGroupCount;
+        }))
       continue;
+
+    ++analysis.supportedSmemReuseGroupCount;
+    switch (group.kind) {
+    case SmemReuseGroupKind::Circular:
+      ++analysis.supportedSmemA1GroupCount;
+      break;
+    case SmemReuseGroupKind::DependencyPair:
+      ++analysis.supportedSmemA2GroupCount;
+      break;
+    case SmemReuseGroupKind::LinearChain:
+      ++analysis.supportedSmemA3GroupCount;
+      break;
     }
     size_t transactionCount = group.transactions.size();
     for (size_t target = 0; target < transactionCount; ++target) {

@@ -346,6 +346,24 @@
   A1 group, and only the two TMEM channels unsupported. A-early remains
   accepted; B-early A2/B2 and A2/B3 retain the same zero-credit rejection.
 
+### 39. Post-memory validation omitted single-copy SMEM reuse chains (2026-09-17, fixed)
+
+- **Symptom**: A2 two-channel and A3 N-channel SMEM reuse groups were reported
+  `Unsupported`, so schedule-memory candidates using those established code-
+  partition protocols could not receive a complete progress proof.
+- **Root cause**: The normalized graph knew only member-local copy-depth edges
+  and A1's shared circular barrier. A2/A3 use distinct single-copy channel
+  tokens plus extra physical-slot WAR ordering, which is a different topology.
+- **Fix**: Reuse the insertion predicates and ordering helpers. A2 uses
+  `verifyReuseGroup2`/`orderReuseGroup2`; A3 uses `verifyReuseGroupN`, producer
+  order, and the same consumer-order consistency check. Keep each member's
+  `release(c,i) -> acquire(c,i+1)` edge, then add adjacent same-iteration
+  physical edges and the last-to-first distance-one wrap. Finite chains omit
+  the wrap.
+- **Lit test**: `ws_code_partition_reuse_group_union_consumers.mlir` includes
+  real scheduled TTGIR for safe two- and three-member single-copy SMEM groups
+  and checks full validator coverage.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

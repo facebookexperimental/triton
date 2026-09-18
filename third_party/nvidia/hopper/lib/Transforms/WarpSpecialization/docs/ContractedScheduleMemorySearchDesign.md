@@ -86,7 +86,7 @@ WSMemoryPlanner remain authoritative for physical buffering.
 | Logical memory space | Which ambiguous values use SMEM or TMEM | Representability and explicit annotation overrides | Heuristic rank zero; deterministic subset order | Implemented for direct/transposed LHS siblings |
 | SMEM plan | Copy count per logical block | Safety floors and byte budget | Heuristic plan rank zero; structural copy neighbors | Implemented, including fixed-group mode |
 | TMEM plan | Reuse groups and column placement | Dependency order and 512-column capacity | Heuristic rank zero; low-aliasing representative; remaining score order | Implemented for ordinary allocations |
-| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Post-memory builder covers ordinary SMEM, staging WAR, and A1 SMEM reuse |
+| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Post-memory builder covers ordinary SMEM, staging WAR, and A1/A2/A3 SMEM reuse |
 
 Ranks are local enumeration positions, not stable semantic identities. Tests,
 manifests, and result databases should retain canonical signatures as well as
@@ -551,12 +551,14 @@ Implemented:
   actual shared-slot predecessor relation. Both cyclic `scf.for` groups and
   finite direct-grid groups are represented; the D120 eight-subtile,
   three-copy staging ring contributes 32 events and five physical slot-reuse
-  edges.
+  edges. Single-copy A2 dependency pairs and A3 same-block chains retain their
+  ordinary per-channel token edges and add the ordered physical-slot chain and
+  its cross-iteration wrap. Focused lit functions cover two- and three-member
+  cyclic SMEM groups.
 
 Next:
 
-1. Complete post-memory coverage for single-copy reuse groups, TMEM, and
-   subtiled protocol shapes.
+1. Complete post-memory coverage for TMEM and subtiled protocol shapes.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.
@@ -573,9 +575,9 @@ Current limitations:
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
 - The post-memory builder rejects proven zero-distance cycles and covers A1
-  multi-buffered SMEM reuse. Dynamic negative-total cycles, single-copy/TMEM
-  reuse, multi-CTA, other specialized protocols, and post-insertion coverage
-  remain open.
+  multi-buffered plus A2/A3 single-copy SMEM reuse. Dynamic negative-total
+  cycles, TMEM reuse, multi-CTA, other specialized protocols, and
+  post-insertion coverage remain open.
 
 ## 12. Controls and diagnostics
 

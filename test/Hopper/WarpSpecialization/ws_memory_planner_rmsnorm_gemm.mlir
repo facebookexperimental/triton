@@ -84,6 +84,9 @@
 // CYCLE-POSITIVE-LABEL: tt.func public @d120_rmsnorm_gemm
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_edge_count = 87 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_event_count = 44 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_a1_groups = 1 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_a2_groups = 0 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_a3_groups = 0 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_reuse_groups = 1 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_status = "unsupported"
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_supported_channels = 11 : i64

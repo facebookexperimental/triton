@@ -24,12 +24,15 @@ struct PostMemoryProtocolAnalysis {
   unsigned unsupportedChannelCount = 0;
   unsigned supportedStagingReuseProtocolCount = 0;
   unsigned supportedSmemReuseGroupCount = 0;
+  unsigned supportedSmemA1GroupCount = 0;
+  unsigned supportedSmemA2GroupCount = 0;
+  unsigned supportedSmemA3GroupCount = 0;
 };
 
-/// Build and validate ordinary loop-cadence channel protocols, A1
-/// multi-buffered SMEM reuse groups, and the coalesced staging-to-operand reuse
-/// WAR protocol. Other physical reuse and specialized protocol shapes remain
-/// conservatively unsupported.
+/// Build and validate ordinary loop-cadence channel protocols, A1/A2/A3 SMEM
+/// reuse groups, and the coalesced staging-to-operand reuse WAR protocol. Other
+/// physical reuse and specialized protocol shapes remain conservatively
+/// unsupported.
 PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
     const StagingReuseProtocolPlan &stagingReusePlan);
