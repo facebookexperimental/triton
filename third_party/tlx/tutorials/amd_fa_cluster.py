@@ -150,7 +150,7 @@ def _concat_cols(x0, x1):
 
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
-    """Reduce four MFMA-layout column slices through one dependency chain."""
+    """Release the MFMA row sum to prevent repeated-RLC N8 relayouts."""
     tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
     tl.static_assert(x.shape[1] % 4 == 0)
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -172,7 +172,8 @@ def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
     else:
         partial = partial + x_2
         partial = partial + x_3
-    return tl.sum(partial, 1)
+    reduced = tl.sum(partial, 1)
+    return tlx.release_layout(reduced)
 
 
 @triton.jit

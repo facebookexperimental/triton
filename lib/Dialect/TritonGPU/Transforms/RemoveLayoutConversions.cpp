@@ -104,12 +104,38 @@ static void propagateCoordinateRematerialization(FuncOp funcOp) {
 //    assume the IR is structured we just need to process the regions in the
 //    correct order. For each op, rewrite it using the layout decided by the
 //    analysis phase.
+static Attribute getEffectiveLayoutEncoding(Attribute encoding) {
+  return triton::unwrapTlxWrappers(encoding);
+}
+
+static bool hasSameEffectiveLayout(Attribute lhs, Attribute rhs) {
+  return getEffectiveLayoutEncoding(lhs) == getEffectiveLayoutEncoding(rhs);
+}
+
 class LayoutPropagation {
 public:
   // Structure to keep track of the layout associated to a value.
   struct LayoutInfo {
-    LayoutInfo(Attribute encoding) { encodings.insert(encoding); }
+    LayoutInfo(Attribute encoding) { insertEncoding(encoding); }
     LayoutInfo() {}
+
+    bool insertEncoding(Attribute encoding) {
+      for (Attribute existing : encodings) {
+        if (!hasSameEffectiveLayout(existing, encoding))
+          continue;
+        // Preserve pin provenance when two candidates describe the same
+        // physical layout.
+        if (!containsPinnedEncoding(existing) &&
+            containsPinnedEncoding(encoding)) {
+          encodings.remove(existing);
+          encodings.insert(encoding);
+          return true;
+        }
+        return false;
+      }
+      return encodings.insert(encoding);
+    }
+
     llvm::SmallSetVector<Attribute, 8> encodings;
   };
   LayoutPropagation(FuncOp F, unsigned smemBudget = 0)
@@ -125,6 +151,8 @@ public:
   // in `changed`.
   void setEncoding(ValueRange values, LayoutInfo &info,
                    SmallVector<Value> &changed, Operation *op);
+  // Resolve layout constraints that must hold across warp_predicate regions.
+  LogicalResult resolveWarpPredicateIslands();
   // Resolve cases where a value has multiple layouts associated to it.
   void resolveConflicts();
   // Rewrite the IR for the full module.
@@ -156,6 +184,9 @@ public:
 private:
   // map from value to layout information.
   llvm::MapVector<Value, LayoutInfo> layouts;
+  // Encodings selected atomically for values inside warp_predicate islands.
+  DenseMap<Value, Attribute> forcedWarpPredicateEncodings;
+  DenseMap<Operation *, Attribute> forcedWarpPredicatePredicates;
   // original encodings of tensor values rewritten in place.
   DenseMap<Value, Attribute> originalEncodings;
   FuncOp funcOp;
@@ -288,8 +319,9 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       if (isa<mlir::triton::ReduceOp>(op)) {
         auto tensorType =
             dyn_cast<RankedTensorType>(op->getOperand(0).getType());
-        if (tensorType &&
-            isa<NvidiaMmaEncodingAttr>(tensorType.getEncoding())) {
+        if (tensorType && isa<NvidiaMmaEncodingAttr>(
+                              getEffectiveLayoutEncoding(
+                                  tensorType.getEncoding()))) {
           auto mmaInstrShape =
               cast<NvidiaMmaEncodingAttr>(encoding).getInstrShape();
           if (tensorType.getShape()[tensorType.getRank() - 2] <
@@ -302,7 +334,8 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       }
 
       if (auto convertOp = dyn_cast<ConvertLayoutOp>(op)) {
-        Attribute dstEncoding = convertOp.getType().getEncoding();
+        Attribute dstEncoding = getEffectiveLayoutEncoding(
+            convertOp.getType().getEncoding());
         if (auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(dstEncoding))
           return (mmaLayout.getVersionMajor() > 1) ? true
                                                    : mmaLayout == encoding;
@@ -398,6 +431,11 @@ bool isLayoutAnchor(Operation *op) {
       if (containsPinnedEncoding(rankedTy.getEncoding()))
         return true;
 
+  // A release ends propagation from the pinned side and starts a new layout
+  // region from the compiler-selected result encoding.
+  if (isa<ReleaseLayoutOp>(op))
+    return true;
+
   if (isa<DescriptorOpInterface>(op))
     return true;
   if (isa<LoadOp, StoreOp>(op))
@@ -426,15 +464,22 @@ bool isLayoutAnchor(Operation *op) {
 void LayoutPropagation::initAnchorLayout() {
   auto addAnchor = [&](Value v) {
     if (auto tensorType = dyn_cast<RankedTensorType>(v.getType())) {
+      // User-pinned values are unconditional anchors. Do not let the ordinary
+      // MMA profitability heuristic suppress an explicit semantic constraint.
+      if (containsPinnedEncoding(tensorType.getEncoding())) {
+        layouts.insert({v, LayoutInfo(tensorType.getEncoding())});
+        return;
+      }
       // Facebook begin
       // Workaround, don't popagate MMA layout unless there is a convert
       // back to mma further down to avoid generating reduction with MMA
       // layout that may have lower performance.
       // This can be improved with more aggressive backward propagation.
-      if (isa<MmaEncodingTrait>(tensorType.getEncoding()) &&
-          v.getDefiningOp() &&
+      Attribute physicalEncoding =
+          getEffectiveLayoutEncoding(tensorType.getEncoding());
+      if (isa<MmaEncodingTrait>(physicalEncoding) && v.getDefiningOp() &&
           !hasConvertToMMATransisitiveUse(v.getDefiningOp(),
-                                          tensorType.getEncoding())) {
+                                          physicalEncoding)) {
         return;
       }
       // Facebook end
@@ -450,28 +495,9 @@ void LayoutPropagation::initAnchorLayout() {
   }
 
   funcOp.walk([&](Operation *op) {
-    // Once a requirement has been materialized, its source and result already
-    // have the same type. Keep the operation as a propagation fence without
-    // treating it as another layout-selection anchor on subsequent runs.
-    if (auto requireOp = dyn_cast<RequireLayoutOp>(op);
-        requireOp && requireOp.getSrc().getType() == requireOp.getType())
-      return;
     if (isLayoutAnchor(op)) {
-      for (auto result : op->getResults()) {
-        if (isa<RequireLayoutOp>(op)) {
-          // TlxPropagateLayout lowers only source-level pin=True constraints
-          // to ttg.require_layout. pin=False constraints fold or become
-          // ordinary ttg.convert_layout ops before reaching this pass.
-          // The wrapper is a semantic constraint on the require_layout
-          // boundary, not a second physical representation to propagate.
-          // The require op retains its wrapped result type; downstream layout
-          // inference should see only its concrete physical encoding.
-          auto type = cast<RankedTensorType>(result.getType());
-          layouts.insert({result, LayoutInfo(triton::unwrapTlxWrappers(
-                                      type.getEncoding()))});
-        } else
-          addAnchor(result);
-      }
+      for (auto result : op->getResults())
+        addAnchor(result);
     }
   });
 }
@@ -483,18 +509,22 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
     if (!isa<RankedTensorType>(value.getType()))
       continue;
     bool hasChanged = false;
-    for (auto encoding : info.encodings) {
+    for (Attribute encoding : info.encodings) {
+      // Wrappers describe the anchor's semantic constraint. Downstream layout
+      // inference operates on the physical layout so the pin does not turn
+      // every reached value into a new hard anchor.
+      Attribute physicalEncoding = getEffectiveLayoutEncoding(encoding);
       Attribute dstEncoding;
       if (auto convertOp = dyn_cast<ConvertLayoutOp>(op);
           convertOp && !isPinnedConvertLayout(convertOp)) {
         // Try to remove the convert by making the dst encoding match the source
         // encoding.
-        dstEncoding = encoding;
+        dstEncoding = physicalEncoding;
       } else {
-        dstEncoding = inferDstEncoding(op, encoding);
+        dstEncoding = inferDstEncoding(op, physicalEncoding);
       }
       if (dstEncoding)
-        hasChanged |= layouts[value].encodings.insert(dstEncoding);
+        hasChanged |= layouts[value].insertEncoding(dstEncoding);
     }
     if (hasChanged)
       changed.push_back(value);
@@ -509,7 +539,8 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
       return;
     bool hasChanged = false;
     for (Attribute encoding : info.encodings)
-      hasChanged |= layouts[target].encodings.insert(encoding);
+      hasChanged |= layouts[target].insertEncoding(
+          getEffectiveLayoutEncoding(encoding));
     if (hasChanged)
       changed.push_back(target);
   };
@@ -594,7 +625,7 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
     if (auto reshapeOp = dyn_cast<ReshapeOp>(user);
         reshapeOp && reshapeOp.getEfficientLayout())
       continue;
-    if (isa<RequireLayoutOp>(user))
+    if (isa<RequireLayoutOp, ReleaseLayoutOp>(user))
       continue;
     if (auto convertOp = dyn_cast<ConvertLayoutOp>(user)) {
       if (!isPinnedConvertLayout(convertOp))
@@ -639,18 +670,20 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
   Operation *op = value.getDefiningOp();
   if (!op)
     return 0;
-  auto encTrait = dyn_cast<LayoutEncodingTrait>(encoding);
+  Attribute physicalEncoding = getEffectiveLayoutEncoding(encoding);
+  auto encTrait = dyn_cast<LayoutEncodingTrait>(physicalEncoding);
   unsigned cost = 0;
   for (Value operand : op->getOperands()) {
     auto srcTy = dyn_cast<RankedTensorType>(operand.getType());
     if (!srcTy)
       continue;
-    Attribute srcEnc = srcTy.getEncoding();
-    if (!srcEnc || srcEnc == encoding)
+    Attribute srcEnc = getEffectiveLayoutEncoding(srcTy.getEncoding());
+    if (!srcEnc || srcEnc == physicalEncoding)
       continue;
     if (encTrait && srcTy.getRank() != encTrait.getRank())
       continue;
-    auto dstTy = srcTy.cloneWithEncoding(encoding);
+    srcTy = srcTy.cloneWithEncoding(srcEnc);
+    auto dstTy = srcTy.cloneWithEncoding(physicalEncoding);
     // Skip encodings without modular layout support.
     if (!npotCvtSafe(srcTy, dstTy))
       continue;
@@ -667,6 +700,7 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
 // encodings. Higher score is preferred — layouts with more contiguous elements
 // per thread allow better vectorized memory access (ld.shared, st.shared).
 static int64_t getLayoutScore(Attribute encoding) {
+  encoding = getEffectiveLayoutEncoding(encoding);
   SmallVector<unsigned> sizePerThread;
   if (auto blocked = dyn_cast<BlockedEncodingAttr>(encoding)) {
     sizePerThread = SmallVector<unsigned>(blocked.getSizePerThread());
@@ -693,6 +727,7 @@ static int64_t getLayoutScore(Attribute encoding) {
 static int64_t
 getAtomicContiguousWidth(Value value, Attribute encoding,
                          ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  encoding = getEffectiveLayoutEncoding(encoding);
   Operation *op = value.getDefiningOp();
   if (!op || !isa<AtomicRMWOp, AtomicCASOp>(op))
     return 0;
@@ -711,6 +746,8 @@ getAtomicContiguousWidth(Value value, Attribute encoding,
   if (!ptrTy || !ptrAxisInfo)
     return 0;
 
+  ptrTy = ptrTy.cloneWithEncoding(
+      getEffectiveLayoutEncoding(ptrTy.getEncoding()));
   auto candidateTy = ptrTy.cloneWithEncoding(encoding);
   auto order = getOrder(candidateTy);
   auto contigPerThread = getContigPerThread(candidateTy);
@@ -805,7 +842,9 @@ estimateRelayout(Value value, Attribute encoding,
   auto canSupply = [&](Value v) {
     auto it = candidates.find(v);
     if (it != candidates.end()) {
-      if (it->second.contains(encoding))
+      if (llvm::any_of(it->second, [&](Attribute candidate) {
+            return hasSameEffectiveLayout(candidate, encoding);
+          }))
         return true;
       // A single-candidate neighbour holds one encoding only because
       // propagation reached it once, not because it needs that one. If it is
@@ -816,7 +855,7 @@ estimateRelayout(Value value, Attribute encoding,
       return it->second.size() == 1 && isLayoutTransparent(v.getDefiningOp());
     }
     auto ty = dyn_cast<RankedTensorType>(v.getType());
-    return ty && ty.getEncoding() == encoding;
+    return ty && hasSameEffectiveLayout(ty.getEncoding(), encoding);
   };
 
   int64_t peak = 0, total = 0;
@@ -841,6 +880,262 @@ estimateRelayout(Value value, Attribute encoding,
   return {peak, total};
 }
 
+static bool isMmaFamilyEncoding(Attribute encoding) {
+  encoding = getEffectiveLayoutEncoding(encoding);
+  if (isa<MmaEncodingTrait>(encoding))
+    return true;
+  if (auto slice = dyn_cast<SliceEncodingAttr>(encoding))
+    return isMmaFamilyEncoding(slice.getParent());
+  if (auto dot = dyn_cast<DotOperandEncodingAttr>(encoding))
+    return isMmaFamilyEncoding(dot.getParent());
+  return false;
+}
+
+static FailureOr<Attribute>
+projectToPredicateEncoding(RankedTensorType valueType,
+                           RankedTensorType predicateType) {
+  if (valueType.getRank() < predicateType.getRank() ||
+      !llvm::equal(predicateType.getShape(),
+                   valueType.getShape().take_front(predicateType.getRank())))
+    return failure();
+
+  Attribute encoding = getEffectiveLayoutEncoding(valueType.getEncoding());
+  if (!isa<DistributedEncodingTrait>(encoding))
+    return failure();
+  for (int rank = valueType.getRank(); rank > predicateType.getRank(); --rank)
+    encoding = SliceEncodingAttr::get(
+        valueType.getContext(), rank - 1,
+        cast<DistributedEncodingTrait>(encoding));
+  return encoding;
+}
+
+// A non-wave-uniform warp_predicate restricts AMD EXEC while its body runs.
+// Any layout conversion that communicates across lanes may lower through LDS
+// and a CTA barrier, so choosing layouts independently for values in the body
+// can create an illegal conversion after otherwise valid local decisions.
+//
+// Resolve each predicate as one layout island before ordinary conflict
+// ranking: choose body-native encodings for the carried groups, project their
+// lane ownership to the tensor predicate, force the transparent body slices to
+// those encodings, and record the boundary types used during rewriting.  The
+// rewrite then converts captures before EXEC is restricted and restores
+// externally required result layouts after reconvergence.
+LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
+  WalkResult walkResult = funcOp.walk([&](WarpPredicateOp predicateOp) {
+    auto yieldOp = dyn_cast<PredicateYieldOp>(
+        predicateOp.getRegion().front().getTerminator());
+    if (!yieldOp)
+      return WalkResult::advance();
+
+    auto predicateType =
+        dyn_cast<RankedTensorType>(predicateOp.getPredicate().getType());
+    SmallVector<Value> bodyRoots;
+    SmallVector<Attribute> bodyEncodings;
+    SmallVector<std::optional<Attribute>> projectedEncodings;
+
+    // Prefer structural MMA-family ownership already present in the body or
+    // result candidates.  Falling back to the body's current encoding avoids
+    // inventing a new ownership solely for the predicate boundary.
+    auto chooseBodyEncoding = [&](Value bodyRoot, Value result) {
+      auto chooseFromCandidates = [&](Value value) -> Attribute {
+        auto it = layouts.find(value);
+        if (it == layouts.end())
+          return {};
+        for (Attribute candidate : it->second.encodings)
+          if (isMmaFamilyEncoding(candidate))
+            return getEffectiveLayoutEncoding(candidate);
+        return {};
+      };
+      if (Attribute encoding = chooseFromCandidates(bodyRoot))
+        return encoding;
+      if (Attribute encoding = chooseFromCandidates(result))
+        return encoding;
+      return getEffectiveLayoutEncoding(
+          cast<RankedTensorType>(bodyRoot.getType()).getEncoding());
+    };
+
+    for (auto [result, yielded] :
+         llvm::zip(predicateOp.getResults(), yieldOp.getValues())) {
+      auto resultType = dyn_cast<RankedTensorType>(result.getType());
+      auto yieldedType = dyn_cast<RankedTensorType>(yielded.getType());
+      if (!resultType || !yieldedType) {
+        bodyRoots.push_back(yielded);
+        bodyEncodings.push_back({});
+        projectedEncodings.push_back(std::nullopt);
+        continue;
+      }
+
+      // A one-use conversion directly yielded by the region is a restoration
+      // boundary, not body computation.  Select the island from its source so
+      // the conversion can be recreated after waves reconverge.
+      Value bodyRoot = yielded;
+      if (auto boundary = yielded.getDefiningOp<ConvertLayoutOp>();
+          boundary && boundary->hasOneUse())
+        bodyRoot = boundary.getSrc();
+      auto bodyRootType = cast<RankedTensorType>(bodyRoot.getType());
+      Attribute bodyEncoding = chooseBodyEncoding(bodyRoot, result);
+      bodyRoots.push_back(bodyRoot);
+      bodyEncodings.push_back(bodyEncoding);
+
+      std::optional<Attribute> projected;
+      if (predicateType) {
+        auto nativeType = bodyRootType.cloneWithEncoding(bodyEncoding);
+        if (FailureOr<Attribute> encoding =
+                projectToPredicateEncoding(nativeType, predicateType);
+            succeeded(encoding))
+          projected = *encoding;
+      }
+      projectedEncodings.push_back(projected);
+    }
+
+    // EXEC is controlled per lane, so every carried group must project to the
+    // same lane/warp ownership on the predicate shape.  Prefer an MMA-derived
+    // projection when available; register enumeration is checked separately
+    // below and is allowed to differ.
+    std::optional<Attribute> predicateEncoding;
+    if (predicateType) {
+      for (std::optional<Attribute> candidate : projectedEncodings) {
+        if (!candidate)
+          continue;
+        if (!predicateEncoding ||
+            (isMmaFamilyEncoding(*candidate) &&
+             !isMmaFamilyEncoding(*predicateEncoding)))
+          predicateEncoding = *candidate;
+      }
+      if (!predicateEncoding)
+        return WalkResult::advance();
+    }
+
+    bool conflict = false;
+    std::function<LogicalResult(Value, Attribute)> forceSlice =
+        [&](Value value, Attribute encoding) -> LogicalResult {
+      auto valueType = dyn_cast<RankedTensorType>(value.getType());
+      if (!valueType)
+        return success();
+      encoding = getEffectiveLayoutEncoding(encoding);
+
+      // Captures are island inputs.  Do not retag their producers: rewriting
+      // will materialize the requested encoding before entering restricted
+      // EXEC, where cross-lane communication remains safe.
+      Region *valueRegion = value.getParentRegion();
+      bool captured = valueRegion != &predicateOp.getRegion() &&
+                      !predicateOp.getRegion().isAncestor(valueRegion);
+      if (captured)
+        return success();
+
+      if (auto it = forcedWarpPredicateEncodings.find(value);
+          it != forcedWarpPredicateEncodings.end())
+        return hasSameEffectiveLayout(it->second, encoding) ? success()
+                                                            : failure();
+      if (containsPinnedEncoding(valueType.getEncoding()) &&
+          !hasSameEffectiveLayout(valueType.getEncoding(), encoding))
+        return failure();
+      if (hasSameEffectiveLayout(valueType.getEncoding(), encoding)) {
+        forcedWarpPredicateEncodings[value] = encoding;
+        return success();
+      }
+
+      // Only recurse through operations whose layout can be changed without
+      // changing ownership-sensitive semantics.  Structural and shape-changing
+      // operations stop the slice unless they already have the selected layout.
+      Operation *producer = value.getDefiningOp();
+      bool transparent =
+          producer && (producer->hasTrait<OpTrait::Elementwise>() ||
+                       isa<ConvertLayoutOp>(producer));
+      if (producer && !transparent &&
+          !hasSameEffectiveLayout(valueType.getEncoding(), encoding))
+        return failure();
+
+      forcedWarpPredicateEncodings[value] = encoding;
+      if (!transparent)
+        return success();
+
+      Attribute operandEncoding = inferSrcEncoding(producer, encoding);
+      if (!operandEncoding)
+        return failure();
+      for (Value operand : producer->getOperands())
+        if (isa<RankedTensorType>(operand.getType()) &&
+            failed(forceSlice(operand, operandEncoding)))
+          return failure();
+      return success();
+    };
+
+    for (auto [index, result, yielded, bodyRoot] :
+         llvm::enumerate(predicateOp.getResults(), yieldOp.getValues(),
+                         bodyRoots)) {
+      auto resultType = dyn_cast<RankedTensorType>(result.getType());
+      if (!resultType || !bodyEncodings[index])
+        continue;
+
+      Attribute bodyEncoding = bodyEncodings[index];
+      if (predicateType && resultType.getRank() == predicateType.getRank())
+        bodyEncoding = *predicateEncoding;
+      if (predicateType) {
+        // Different register order is harmless because EXEC masks lanes, not
+        // individual registers.  Any lane, warp, or block ownership mismatch
+        // would make one shared tensor predicate invalid for this carried group.
+        auto nativeType = resultType.cloneWithEncoding(bodyEncoding);
+        FailureOr<Attribute> projected =
+            projectToPredicateEncoding(nativeType, predicateType);
+        if (failed(projected)) {
+          conflict = true;
+          break;
+        }
+        auto selectedType = RankedTensorType::get(
+            predicateType.getShape(), predicateType.getElementType(),
+            *predicateEncoding);
+        auto candidateType = RankedTensorType::get(
+            predicateType.getShape(), predicateType.getElementType(),
+            *projected);
+        if (!isLayoutEquivalentIgnoringRegisterOrder(
+                toLinearLayout(selectedType), toLinearLayout(candidateType))) {
+          conflict = true;
+          break;
+        }
+      }
+
+      // Boundary values participate in the island as one atomic choice.  Keep
+      // compatible pin provenance so repeated RLC rediscovers the same hard
+      // anchor, and reject a pin that requires different physical ownership.
+      auto forceBoundary = [&](Value value) {
+        auto type = cast<RankedTensorType>(value.getType());
+        if (auto forced = forcedWarpPredicateEncodings.find(value);
+            forced != forcedWarpPredicateEncodings.end())
+          return hasSameEffectiveLayout(forced->second, bodyEncoding)
+                     ? success()
+                     : failure();
+        if (containsPinnedEncoding(type.getEncoding())) {
+          if (!hasSameEffectiveLayout(type.getEncoding(), bodyEncoding))
+            return failure();
+          forcedWarpPredicateEncodings[value] = type.getEncoding();
+        } else {
+          forcedWarpPredicateEncodings[value] = bodyEncoding;
+        }
+        return success();
+      };
+      if (failed(forceBoundary(result)) || failed(forceBoundary(yielded)) ||
+          failed(forceSlice(bodyRoot, bodyEncoding))) {
+        conflict = true;
+        break;
+      }
+    }
+
+    if (conflict) {
+      predicateOp.emitError(
+          "cannot form a cross-lane-free warp_predicate layout island");
+      return WalkResult::interrupt();
+    }
+    // resolveConflicts consumes the forced value encodings before ordinary
+    // per-value ranking.  rewriteWarpPredicateOp consumes this predicate entry
+    // to insert its conversion outside the restricted-EXEC region.
+    if (predicateEncoding)
+      forcedWarpPredicatePredicates[predicateOp.getOperation()] =
+          *predicateEncoding;
+    return WalkResult::advance();
+  });
+  return failure(walkResult.wasInterrupted());
+}
+
 void LayoutPropagation::resolveConflicts() {
   std::unique_ptr<ModuleAxisInfoAnalysis> axisInfoAnalysis;
   std::optional<size_t> smemFootprint;
@@ -851,9 +1146,15 @@ void LayoutPropagation::resolveConflicts() {
   for (auto &it : layouts) {
     Operation *op = it.first.getDefiningOp();
     LayoutInfo &info = it.second;
+    auto originalType = cast<RankedTensorType>(it.first.getType());
+    if (auto forced = forcedWarpPredicateEncodings.find(it.first);
+        forced != forcedWarpPredicateEncodings.end()) {
+      info.encodings.clear();
+      info.encodings.insert(forced->second);
+      continue;
+    }
     if (info.encodings.size() <= 1)
       continue;
-    auto originalType = cast<RankedTensorType>(it.first.getType());
     if ((op && op->hasAttr("tlx.preserve_layout")) ||
         containsPinnedEncoding(originalType.getEncoding())) {
       // A user pin is an invariant, not merely another profitable anchor.
@@ -883,6 +1184,7 @@ void LayoutPropagation::resolveConflicts() {
     // see @atomic_vector_width_beats_relayout_cost.
     bool costRankable = !(op && isa<AtomicRMWOp, AtomicCASOp>(op)) &&
                         llvm::none_of(info.encodings, [](Attribute e) {
+                          e = getEffectiveLayoutEncoding(e);
                           return isa<MmaEncodingTrait, DotOperandEncodingAttr,
                                      SliceEncodingAttr>(e);
                         });
@@ -911,8 +1213,9 @@ void LayoutPropagation::resolveConflicts() {
     // score-only ranking the two were equivalent.
     if (!anyVectorized) {
       for (Attribute e : info.encodings) {
-        if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
-            (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
+        Attribute physicalEncoding = getEffectiveLayoutEncoding(e);
+        if ((isLoadOrStore && isa<BlockedEncodingAttr>(physicalEncoding)) ||
+            (!isLoadOrStore && isa<MmaEncodingTrait>(physicalEncoding))) {
           encoding = e;
           break;
         }
@@ -996,6 +1299,9 @@ void LayoutPropagation::rewriteRegion(Region &region) {
           continue;
         needRewrite = true;
       }
+      if (isa<WarpPredicateOp>(op) &&
+          forcedWarpPredicatePredicates.count(&op))
+        needRewrite = true;
       if (needRewrite) {
         rewriteOp(&op);
         for (Region &R : op.getRegions())
@@ -1143,6 +1449,12 @@ void LayoutPropagation::rewriteIfOp(scf::IfOp ifOp) {
 }
 
 void LayoutPropagation::rewriteWarpPredicateOp(WarpPredicateOp predicateOp) {
+  if (auto forced =
+          forcedWarpPredicatePredicates.find(predicateOp.getOperation());
+      forced != forcedWarpPredicatePredicates.end())
+    predicateOp->setOperand(
+        0, getValueAs(predicateOp.getPredicate(), forced->second));
+
   for (auto [index, init, result] :
        llvm::enumerate(predicateOp.getInits(), predicateOp.getResults())) {
     auto it = layouts.find(result);
@@ -1241,7 +1553,7 @@ void LayoutPropagation::rewriteOp(Operation *op) {
     rewriteRequireLayoutOp(requireOp);
   else {
     Attribute encoding = *layouts[op->getResult(0)].encodings.begin();
-    if (canUseResultEncoding(op, encoding)) {
+    if (canUseResultEncoding(op, getEffectiveLayoutEncoding(encoding))) {
       setEncodingInPlace(op->getResult(0), encoding);
     } else if (op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
                op->hasTrait<OpTrait::Elementwise>() ||
@@ -1262,7 +1574,7 @@ void LayoutPropagation::rewriteRequireLayoutOp(RequireLayoutOp requireOp) {
 }
 
 bool canBeRemat(Operation *op) {
-  if (op->hasAttr("tlx.preserve_layout"))
+  if (op->hasAttr("tlx.preserve_layout") || isa<ReleaseLayoutOp>(op))
     return false;
   // A pinned result is a semantic boundary.  Cloning its producer in a
   // different encoding would bypass the user-requested layout even if the
@@ -2336,14 +2648,19 @@ public:
     ModuleOp m = getOperation();
 
     // 1. Propagate layout forward starting from "anchor" ops.
-    m.walk([this](FuncOp funcOp) {
+    WalkResult propagation = m.walk([this](FuncOp funcOp) {
       propagateCoordinateRematerialization(funcOp);
       LayoutPropagation layoutPropagation(funcOp, smemBudget);
       layoutPropagation.initAnchorLayout();
       layoutPropagation.propagateLayout();
+      if (failed(layoutPropagation.resolveWarpPredicateIslands()))
+        return WalkResult::interrupt();
       layoutPropagation.resolveConflicts();
       layoutPropagation.rewrite();
+      return WalkResult::advance();
     });
+    if (propagation.wasInterrupted())
+      return signalPassFailure();
 
     LLVM_DEBUG({
       DBGS() << "Module after propagating layouts forward:\n";
@@ -2468,6 +2785,9 @@ public:
 
       for (OpOperand &use : v.getUses()) {
         Operation *user = use.getOwner();
+        // A release is a durable layout fence, never a transparent user.
+        if (isa<ReleaseLayoutOp>(user))
+          return false;
         // local_store accepts any register layout — it's a sink.
         if (isa<LocalStoreOp>(user))
           continue;

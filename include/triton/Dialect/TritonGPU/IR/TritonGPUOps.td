@@ -63,6 +63,26 @@ def TTG_RequireLayoutOp
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+def TTG_ReleaseLayoutOp
+    : TTG_Op<"release_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType, Pure]> {
+  let summary = "end a user-requested layout region";
+
+  let description = [{
+    `ttg.release_layout` is a semantic layout boundary produced from a
+    source-level layout release. Layout propagation must not carry the source
+    layout through this operation; the result starts an independently selected
+    layout region. The operation is not a memory fence and is retired only after
+    layout optimization has completed.
+  }];
+
+  let arguments = (ins TT_Tensor:$src);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
 def TTG_AsyncWaitOp : TTG_Op<"async_wait", [MemWaitOpTrait]> {
   let summary = "Ensure all specified async_copy_* operations are complete.";
   let description = [{

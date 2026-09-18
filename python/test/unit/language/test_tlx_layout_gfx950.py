@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.tutorials.amd_fa_cluster import _sum_rows_chain4 as _cluster_sum_rows_chain4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -21,6 +22,7 @@ def _assert_no_layout_residue(ttgir):
     assert "#tlx.user_layout" not in ttgir, "user-layout wrapper encoding leaked into final IR"
     assert "#tlx.no_verify_layout" not in ttgir, "no-verify wrapper encoding leaked into final IR"
     assert "ttg.require_layout" not in ttgir, "require_layout boundary leaked into final IR"
+    assert "ttg.release_layout" not in ttgir, "release_layout boundary leaked into final IR"
 
 
 _A16W16_SHARED_INTERVALS = [(512, 16)]
@@ -364,13 +366,16 @@ def test_tlx_dot_preserves_explicit_accumulator_layout_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
+@pytest.mark.parametrize("rotate_final", [False, True], ids=["stage-three", "stage-four-rotated"])
+def test_mfma_split_concat_preserves_logical_columns_on_cdna4(rotate_final):
     """Order-preserving reshape/split/join reconstructs an MFMA score tile.
 
     Flash attention carries N8 probability fragments across source stages and
     later reassembles them for its row sum and P-by-V dot.  Marking these
     reshapes reorderable changes their logical register interpretation: the
     shapes still verify, but every reconstructed row can contain wrong values.
+    Both orders are production schedules: stage three uses the ordinary chain,
+    while the N8192+ causal stage-four schedule rotates the final two additions.
     """
 
     @triton.jit
@@ -383,21 +388,14 @@ def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
         return tl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] + x1.shape[1]])
 
     @triton.jit
-    def sum_rows_chain4(x):
-        x_01, x_23 = split_cols(x)
-        x_0, x_1 = split_cols(x_01)
-        x_2, x_3 = split_cols(x_23)
-        return tl.sum(x_0 + x_1 + x_2 + x_3, 1)
-
-    @triton.jit
-    def kernel(X, Recon, Chain, Direct, MMA: tl.constexpr):
+    def kernel(X, Recon, Chain, Direct, MMA: tl.constexpr, ROTATE_FINAL: tl.constexpr):
         rows = tl.arange(0, 256)
         cols = tl.arange(0, 64)
         offsets = rows[:, None] * 64 + cols[None, :]
         x = tlx.require_layout(tl.load(X + offsets), MMA)
         x_lo, x_hi = split_cols(x)
         reconstructed = concat_cols(x_lo, x_hi)
-        chain = sum_rows_chain4(x)
+        chain = _cluster_sum_rows_chain4(x, ROTATE_FINAL)
         direct = tl.sum(x, 1)
         tl.store(Recon + offsets, reconstructed)
         tl.store(Chain + rows, chain)
@@ -409,7 +407,21 @@ def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
     reconstructed = torch.empty_like(x)
     chain = torch.empty((256, ), device=DEVICE, dtype=torch.float32)
     direct = torch.empty_like(chain)
-    compiled = kernel[(1, )](x, reconstructed, chain, direct, mma, num_warps=8, enable_tree_reduction=True)
+    compiled = kernel[(1, )](
+        x,
+        reconstructed,
+        chain,
+        direct,
+        mma,
+        rotate_final,
+        num_warps=8,
+        enable_tree_reduction=True,
+    )
+
+    ttir = compiled.asm["ttir"]
+    release_line = next(line for line in ttir.splitlines() if "tlx.release_layout" in line)
+    release_operand = release_line.split("tlx.release_layout", 1)[1].split()[0]
+    assert any(f'{release_operand} = "tt.reduce"' in line for line in ttir.splitlines())
 
     reference = x.sum(1)
     torch.testing.assert_close(reconstructed, x, atol=0, rtol=0)

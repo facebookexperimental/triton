@@ -1873,7 +1873,8 @@ LogicalResult WarpPredicateOp::verify() {
       return emitOpError("region reduction axis must be warp-local");
     if (crossLaneOp)
       return emitOpError("cross-lane operation ")
-             << crossLaneOp->getName() << " requires a wave-uniform predicate";
+             << crossLaneOp->getName()
+             << " requires a wave-uniform predicate";
     return emitOpError("region may not contain nested operation ")
            << unsupportedRegion->getName();
   }
@@ -1909,7 +1910,8 @@ LogicalResult WarpPredicateOp::verify() {
     });
     if (crossLaneOp)
       return emitOpError("cross-lane operation ")
-             << crossLaneOp->getName() << " requires a wave-uniform predicate";
+             << crossLaneOp->getName()
+             << " requires a wave-uniform predicate";
   }
 
   WalkResult barrier = getRegion().walk([&](Operation *nested) {
