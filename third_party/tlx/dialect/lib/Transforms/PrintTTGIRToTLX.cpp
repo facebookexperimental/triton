@@ -228,9 +228,9 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"arith.constant", "const", "Constant value"},
     {"arith.select", "tl.where", "Select operation"},
     {"arith.maxf", "tl.maximum", "Float max"},
-    {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
+    {"arith.maxnumf", "tl.maximum", "Float max (NaN-quieting)"},
     {"arith.minf", "tl.minimum", "Float min"},
-    {"arith.minnumf", "tl.minimum", "Float min (NaN-propagating)"},
+    {"arith.minnumf", "tl.minimum", "Float min (NaN-quieting)"},
     // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
     // they are not used here. Use tl.minimum/maximum similar to float above.
     {"arith.maxsi", "tl.maximum", "Signed integer max"},
@@ -2446,6 +2446,45 @@ void printSimplifiedOp(
       printLocComment(op, os);
       return;
     }
+  }
+
+  // tl.maximum/minimum/clamp default to propagate_nan=NONE, which is the
+  // NaN-quieting behaviour of maxnumf/minnumf. maximumf/minimumf propagate
+  // NaN instead, and tt.clampf carries the choice in an attribute, so all
+  // three have to say so explicitly or the round trip changes NaN semantics.
+  auto propagateNanAll = [&](Operation *o) {
+    Attribute a = o->getAttr("propagateNan");
+    if (auto i = dyn_cast_or_null<IntegerAttr>(a))
+      return i.getInt() != 0;
+    std::string text;
+    llvm::raw_string_ostream textOs(text);
+    if (a)
+      a.print(textOs);
+    textOs.flush();
+    return StringRef(text).contains("all");
+  };
+
+  if ((opName == "arith.maximumf" || opName == "arith.minimumf") &&
+      op->getNumOperands() == 2 && op->getNumResults() == 1) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+       << (opName == "arith.maximumf" ? "tl.maximum(" : "tl.minimum(")
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap)
+       << ", propagate_nan=tl.PropagateNan.ALL)";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (opName == "tt.clampf" && op->getNumOperands() == 3 &&
+      op->getNumResults() == 1) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = tl.clamp(";
+    for (unsigned i = 0; i < 3; ++i)
+      os << (i ? ", " : "") << getValueName(op->getOperand(i), argSubstitutionMap);
+    if (propagateNanAll(op))
+      os << ", propagate_nan=tl.PropagateNan.ALL";
+    os << ")";
+    printLocComment(op, os);
+    return;
   }
 
   // Get the TLX name or use original
