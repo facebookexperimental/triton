@@ -1,4 +1,5 @@
-#include "triton/Analysis/Utility.h"
+#include "triton/Analysis/CallGraph.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Parser/Parser.h"
 

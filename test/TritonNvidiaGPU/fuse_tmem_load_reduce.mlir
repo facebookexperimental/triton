@@ -316,6 +316,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A negative requested-register value means the compiler will assign the
+// partition's registers later and must not disable load-reduce fusion.
+
+#blocked_ws = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem_ws = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#shared_ws = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func public @tmem_load_reduce_fuse_with_unspecified_partition_registers(
+  // CHECK: partition0
+  // CHECK: %{{.+}}, %[[RED:.+]] = ttng.tmem_load %{{.+}} {{.*}}redOp = #ttng.redOp<max>
+  // CHECK-NEXT: %{{.+}} = ttg.memdesc_index
+  // CHECK-NEXT: ttng.arrive_barrier
+  // CHECK-NEXT: "use"(%[[RED]])
+  tt.func public @tmem_load_reduce_fuse_with_unspecified_partition_registers(%arg0: !ttg.memdesc<128x128xf32, #tmem_ws, #ttng.tensor_memory>, %bars: !ttg.memdesc<2x1xi64, #shared_ws, #ttg.shared_memory, mutable>, %index: i32) {
+    ttg.warp_specialize(%arg0, %bars, %index) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_arg0: !ttg.memdesc<128x128xf32, #tmem_ws, #ttng.tensor_memory>, %part_bars: !ttg.memdesc<2x1xi64, #shared_ws, #ttg.shared_memory, mutable>, %part_index: i32) num_warps(4) {
+      %0 = ttng.tmem_load %part_arg0 : !ttg.memdesc<128x128xf32, #tmem_ws, #ttng.tensor_memory> -> tensor<128x128xf32, #blocked_ws>
+      %bar = ttg.memdesc_index %part_bars[%part_index] : !ttg.memdesc<2x1xi64, #shared_ws, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_ws, #ttg.shared_memory, mutable>
+      ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared_ws, #ttg.shared_memory, mutable>
+      %1 = "tt.reduce"(%0) <{axis = 1 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %2 = arith.maxnumf %lhs, %rhs : f32
+        tt.reduce.return %2 : f32
+      }) : (tensor<128x128xf32, #blocked_ws>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_ws}>>
+      "use"(%1) : (tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_ws}>>) -> ()
+      ttg.warp_return
+    } : (!ttg.memdesc<128x128xf32, #tmem_ws, #ttng.tensor_memory>, !ttg.memdesc<2x1xi64, #shared_ws, #ttg.shared_memory, mutable>, i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 // Negative: an otherwise pure operation that consumes the tmem_load result
 // is not independent and must still block fusion.
 

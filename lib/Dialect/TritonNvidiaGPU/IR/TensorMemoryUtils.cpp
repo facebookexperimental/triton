@@ -84,6 +84,12 @@ int getContextualMaxNReg(Operation *op) {
       unsigned idx = op->getParentRegion()->getRegionNumber();
       if (auto actRegisters = partitions.getParentOp().getActualRegisters())
         return (*actRegisters)[1 + idx];
+      if (auto requestedRegisters =
+              partitions.getParentOp().getRequestedRegisters()) {
+        int requested = (*requestedRegisters)[idx];
+        if (requested > 0)
+          return requested;
+      }
       return {};
     }
 

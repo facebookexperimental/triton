@@ -955,7 +955,10 @@ public:
     populateCFPatterns(typeConverter, patterns);
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
-    if (failed(applyPartialConversion(op, target, std::move(patterns))))
+    ConversionConfig config;
+    config.allowPatternRollback = false;
+    if (failed(
+            applyPartialConversion(op, target, std::move(patterns), config)))
     return signalPassFailure();
   }
 

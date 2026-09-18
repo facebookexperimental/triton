@@ -35,6 +35,7 @@ include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUOpInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUMemoryEffects.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
@@ -43,7 +44,6 @@ include "mlir/Interfaces/ViewLikeInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td" // ReturnLike
 
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
-def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 def TensorMemory : Resource<"::mlir::triton::nvidia_gpu::TensorMemory">;
 
 class TTNG_Op<string mnemonic, list<Trait> traits = []>
@@ -239,9 +239,15 @@ def TTNG_ClusterBarrierOp : TTNG_Op<"cluster_barrier", []> {
 //
 // Cluster Launch Control (CLC) Ops - Blackwell SM100+
 //
-def TTNG_CLCTryCancelOp
-    : TTNG_Op<"clc_try_cancel", [DeclareOpInterfaceMethods<
-                                    MBarrierOpInterface, ["getBarrier"]>]> {
+def TTNG_CLCTryCancelSyncOp : TTNG_Op<"clc_try_cancel_sync"> {
+  let summary = "Request cancellation of a pending cluster";
+  let results = (outs TT_Tensor:$response);
+  let assemblyFormat = "attr-dict `:` type($response)";
+  let hasVerifier = 1;
+}
+
+def TTNG_CLCTryCancelOp : TTNG_Op<"clc_try_cancel", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "Issue CLC try_cancel to cancel a pending cluster";
 
   let description = [{
@@ -256,8 +262,8 @@ def TTNG_CLCTryCancelOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-          Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier);
+      (ins Arg<TTG_MemDescType, "", AsyncSharedWrite>:$result,
+          Arg<TTG_MemDescType, "", BarrierSharedWrite>:$mbarrier);
 
   let assemblyFormat = [{
     $result `,` $mbarrier attr-dict `:` qualified(type($result)) `,` qualified(type($mbarrier))
@@ -274,7 +280,9 @@ def TTNG_CLCLoadResultOp : TTNG_Op<"clc_load_result", []> {
     operate on registers without re-reading shared memory.
   }];
 
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src);
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", GenericSharedRead>:$src
+  );
 
   let results = (outs I128:$clcResult);
 
@@ -464,7 +472,7 @@ def TTNG_WarpGroupDotWaitOp
                                       AllTypesMatch<["inputs", "outputs"]>]> {
   let summary = "warp group dot wait";
   let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs,
-      I32Attr:$pendings);
+      I32Attr:$pendings, UnitAttr:$warpGroupLocal);
   let results = (outs Variadic<TTG_TensorOrMemDesc>:$outputs);
   let description = [{
     Waits until there are $pendings or fewer outstanding async dot operations.
@@ -473,6 +481,11 @@ def TTNG_WarpGroupDotWaitOp
     waiting on. For example, if there are N pending async dot ops and we wait
     until one remains pending, then $inputs must include the results of the
     first N - 1 dot ops.
+
+    The `warpGroupLocal` attribute specifies that we only wait for the local
+    warp group, and if num_warps > 4 then shared memory inputs may still be in
+    use by other warp groups. This is useful when only the result register
+    values need to be ready and the shared memory inputs will not be overwritten.
   }];
 
   let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
@@ -493,7 +506,7 @@ def TTNG_InitBarrierOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+      (ins Arg<TTG_MemDescType, "", GenericSharedWrite>:$alloc,
           I32Attr:$count);
   let assemblyFormat =
       "$alloc `,` $count attr-dict `:` qualified(type($alloc))";
@@ -513,8 +526,7 @@ def TTNG_InvalBarrierOp
   }];
 
   let hasVerifier = 1;
-  let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc);
+  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedWrite>:$alloc);
   let assemblyFormat = "$alloc attr-dict `:` qualified(type($alloc))";
 }
 
@@ -533,7 +545,7 @@ def TTNG_BarrierExpectOp
 
   let hasVerifier = 1;
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+      (ins Arg<TTG_MemDescType, "", BarrierSharedWrite>:$alloc,
           I32Attr:$size, I1:$pred);
 
   let assemblyFormat = [{
@@ -563,8 +575,7 @@ def TTNG_WaitBarrierOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+      (ins Arg<TTG_MemDescType, "", BarrierSharedReadWrite>:$alloc,
           I32:$phase, Optional<I1>:$pred, Variadic<TTG_MemDescType>:$deps,
           OptionalAttr<DictionaryAttr>:$constraints);
 
@@ -624,8 +635,7 @@ def TTNG_ArriveBarrierOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+      (ins Arg<TTG_MemDescType, "", BarrierSharedReadWrite>:$alloc,
           I32Attr:$count, DefaultValuedOptionalAttr<I32Attr, "0">:$ctaMask,
           Optional<I1>:$pred, UnitAttr:$perThread,
           OptionalAttr<DictionaryAttr>:$constraints);
@@ -673,7 +683,7 @@ def TTNG_AsyncCopyMbarrierArriveOp
   let summary =
       "arrive on mbarrier once all previously issued copies are completed";
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
+      (ins Arg<TTG_MemDescType, "", BarrierSharedWrite>:$barrier,
           UnitAttr:$noIncrement);
   let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
 }
@@ -805,8 +815,8 @@ def TTNG_AsyncSharedStoreOp
   }];
 
   let arguments = (ins TT_Tensor:$src,
-      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier);
+      Arg<TTG_MemDescType, "", GenericSharedWrite>:$dst,
+      Arg<TTG_MemDescType, "", BarrierSharedWrite>:$mbarrier);
 
   let assemblyFormat = [{
     $src `,` $dst `,` $mbarrier attr-dict `:` type($src) `->`
@@ -856,8 +866,8 @@ def TTNG_AsyncTMACopyGlobalToLocalOp
   let arguments = (ins Optional<I32>:$multicastTargets,
       Arg<TT_AnyTensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
       Variadic<I32>:$coord, Variadic<I16>:$offsets,
-      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
-      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result, I1:$pred,
+      Arg<TTG_MemDescType, "", BarrierSharedWrite>:$barrier,
+      Arg<TTG_MemDescType, "", AsyncSharedWrite>:$result, I1:$pred,
       UnitAttr:$multicast,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "triton::CacheModifier::NONE">:$cache,
@@ -969,7 +979,7 @@ def TTNG_AsyncTMACopyLocalToGlobalOp
       (ins Arg<TT_TensorDescType,
                "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
           Variadic<I32>:$coord,
-          Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+          Arg<TTG_MemDescType, "", AsyncSharedRead>:$src,
           DefaultValuedAttr<TT_EvictionPolicyAttr,
                             "triton::EvictionPolicy::NORMAL">:$evict);
 
@@ -1015,7 +1025,7 @@ def TTNG_AsyncTMAReduceOp
       Arg<TT_TensorDescType,
           "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
       Variadic<I32>:$coord,
-      Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+      Arg<TTG_MemDescType, "", AsyncSharedRead>:$src,
       DefaultValuedAttr<TT_EvictionPolicyAttr,
                         "triton::EvictionPolicy::NORMAL">:$evict);
 
@@ -1064,8 +1074,8 @@ def TTNG_AsyncTMAGatherOp
   let arguments =
       (ins Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
           RankedTensorOf<[I32]>:$x_offsets, I32:$y_offset,
-          Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
-          Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result, I1:$pred,
+          Arg<TTG_MemDescType, "", BarrierSharedWrite>:$barrier,
+          Arg<TTG_MemDescType, "", AsyncSharedWrite>:$result, I1:$pred,
           UnitAttr:$multicast);
 
   let assemblyFormat = [{
@@ -1093,7 +1103,7 @@ def TTNG_AsyncTMAScatterOp
       (ins Arg<TT_TensorDescType,
                "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
           RankedTensorOf<[I32]>:$x_offsets, I32:$y_offset,
-          Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src);
+          Arg<TTG_MemDescType, "", AsyncSharedRead>:$src);
 
   let assemblyFormat = [{
     $desc `[` $x_offsets `,` $y_offset `]` $src
@@ -1297,7 +1307,7 @@ def TTNG_TCGen5CommitOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
+      (ins Arg<TTG_MemDescType, "", BarrierSharedWrite>:$barrier,
           Optional<I1>:$pred, Variadic<TTG_MemDescType>:$descs);
 
   let assemblyFormat = [{
@@ -1554,7 +1564,7 @@ def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {
     In the absence of such operations on memdesc, we resort to implicitly encoding the reshape/transpose semantics in tmem_copy.
 
   }];
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+  let arguments = (ins Arg<TTG_MemDescType, "", AsyncSharedRead>:$src,
       Arg<TTG_MemDescType, "", [MemWrite<TensorMemory>]>:$dst);
 
   let assemblyFormat =
