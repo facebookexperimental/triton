@@ -6,9 +6,10 @@ before the next case starts. Subprocesses use the current Python interpreter
 and inherit its environment.
 
 The standard sweep uses the within-group hybrid with cross-tile prefetch enabled
-and chunked XCD remapping.
---no-cross-tile-prefetch selects alias-C; --auto-config selects the kernel's
-general cost model instead.
+and chunked XCD remapping, four-workgroup multicast, and refill-only cluster
+synchronization. Operand reuse is disabled.
+With --cluster-size 1, --no-cross-tile-prefetch selects alias-C and --auto-config
+selects the kernel's general cost model instead.
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ DEFAULT_CASES = (
     (8, 32768, 4096, 4096),
     (8, 65536, 8192, 4096),
     (8, 65536, 4096, 4096),
+    (1, 32768, 8192, 4096),
+    (1, 32768, 4096, 4096),
+    (1, 65536, 8192, 4096),
+    (1, 65536, 4096, 4096),
     (16, 4096, 4096, 4096),
 )
 
@@ -232,12 +237,12 @@ def main() -> int:
                         help="persistent program remapping (default: chunked)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
-    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=1,
-                        help="experimental workgroup cluster size (default: 1, disabled)")
+    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=4,
+                        help="workgroup cluster size (default: 4); use 1 to disable clustering")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
-    parser.add_argument("--cluster-sync", choices=("all", "refill"), default="all",
-                        help="cluster rendezvous at all handoffs or only before input refills")
+    parser.add_argument("--cluster-sync", choices=("all", "refill"), default="refill",
+                        help="cluster rendezvous at all handoffs or only before input refills (default: refill)")
     parser.add_argument("--operand-reuse", action=argparse.BooleanOptionalAction, default=False,
                         help="experimental WMMA operand-cache reuse hints")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")

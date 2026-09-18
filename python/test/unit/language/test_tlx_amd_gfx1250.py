@@ -558,7 +558,8 @@ test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm
 
 
 @pytest.mark.parametrize("cluster_size,cluster_sync", [(1, "all"), (2, "all"), (4, "all"), (4, "refill")])
-def test_grouped_gemm_experiments_codegen(cluster_size, cluster_sync):
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_grouped_gemm_experiments_codegen(cluster_size, cluster_sync, group_size):
     import re
     from triton import knobs
     from triton.backends.compiler import GPUTarget
@@ -570,7 +571,7 @@ def test_grouped_gemm_experiments_codegen(cluster_size, cluster_sync):
         signature=_gfx1250_grouped._grouped_gemm_tdm_compile_signature(),
         constexprs=dict(NUM_PROGRAMS=32, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
                         L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2,
-                        NUM_XCDS=8, XCD_CHUNK=2, K=1024, group_size=2),
+                        NUM_XCDS=8, XCD_CHUNK=2, K=1024, group_size=group_size),
         attrs=_gfx1250_grouped._grouped_gemm_tdm_compile_attrs(),
     )
     target = GPUTarget("hip", "gfx1250", 32)
@@ -669,6 +670,7 @@ def test_grouped_gemm_cluster_config_validation(m_list, n, num_programs, valid):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("group_size", [1, 2])
 @pytest.mark.parametrize("cluster_size,cluster_multicast,cluster_sync,operand_reuse", [
     (1, True, "all", False),
     (1, True, "all", True),
@@ -678,10 +680,10 @@ def test_grouped_gemm_cluster_config_validation(m_list, n, num_programs, valid):
     (4, False, "refill", False),
     (4, True, "refill", True),
 ])
-def test_grouped_gemm_experiments_correctness(cluster_size, cluster_multicast, cluster_sync, operand_reuse):
-    # Multiple persistent tiles followed by a group transition; distinct
-    # random operands catch sharing the wrong tile or group.
-    m_list, n, k = [2048, 2048], 1024, 512
+def test_grouped_gemm_experiments_correctness(cluster_size, cluster_multicast, cluster_sync, operand_reuse, group_size):
+    # Exercise priming and multiple persistent tiles, with a group transition
+    # when present. Distinct operands catch sharing the wrong tile or group.
+    m_list, n, k = [2048] * group_size, 1024, 512
     device = triton.runtime.driver.active.get_active_torch_device()
     a, b, offsets, groups = _gfx1250_grouped._make_packed_ragged_m(m_list, n, k, device)
     original_c_cache = _gfx1250_grouped.grouped_gemm_tdm_kernel.c_cache

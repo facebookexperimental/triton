@@ -189,15 +189,19 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py
 ```
 
 Each tuple is `(G, M_per_group, N, K)`. The default cases cover the requested
-`G=8/32`, `M_per_group=32768/65536`, `N=4096/8192`, `K=4096`
-combinations plus the `16x4096x4096x4096` reference.
+`G=1/8/32`, `M_per_group=32768/65536`, `N=4096/8192`, `K=4096`
+combinations plus the `16x4096x4096x4096` reference. The `G=1` cases run
+ordinary GEMM through the same kernel and configuration.
 
 The sweep defaults to `256x256x128`, depth 2, and the within-group hybrid with
-cross-tile prefetch and TDM output stores enabled for every shape. XCD remapping
-defaults to `chunked`; use `--xcd-remap none` to disable it. Use
-`--no-cross-tile-prefetch` to compare the alias-C schedule. `--auto-config`
-instead lets the kernel's general cost model select the configuration,
-including whether to use cross-tile prefetch.
+cross-tile prefetch and TDM output stores enabled for every shape. It uses
+`--cluster-size 4 --cluster-sync refill` with multicast enabled and operand
+reuse disabled. XCD remapping defaults to `chunked`.
+
+Use `--cluster-size 1` to disable clustering. Combine it with
+`--no-cross-tile-prefetch` to compare the alias-C schedule, `--xcd-remap none`
+to disable remapping, or `--auto-config` to let the kernel's general cost
+model select the configuration, including whether to use cross-tile prefetch.
 
 Each case runs in a separate process so large GPU allocations are released
 before the next case. Useful options:
@@ -213,13 +217,18 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
 # Run a subset.
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
   --case 16,4096,4096,4096
+
+# Run a single-group (ordinary GEMM) case.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --case 1,32768,8192,4096
 ```
 
-## Optional Hardware Experiments
+## Cluster and Operand Reuse Options
 
 Cluster multicast and WMMA operand-cache reuse are available for hardware
-comparison. Both are disabled by default; their performance benefit needs
-hardware validation.
+comparison. The benchmark sweep defaults to four-workgroup multicast with
+refill-only synchronization. Operand reuse remains opt-in and disabled by
+default.
 
 `--cluster-size 2` shares B within each workgroup pair. `--cluster-size 4`
 shares A and B across a logical two-by-two output region. Use
@@ -255,11 +264,13 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
 
 # Operand reuse on the ordinary workgroup schedule.
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
-  --operand-reuse --benchmark-mode graph --check
+  --cluster-size 1 --operand-reuse --benchmark-mode graph --check
 ```
 
 The standalone script and Python wrapper expose the same options with
 underscores, such as `--cluster_size` and `operand_reuse=True`.
+Their defaults remain `cluster_size=1`, `cluster_sync="all"`, and
+`operand_reuse=False` to support the general ragged-group path.
 These experiments use a scoped, cache-keyed compilation hook for this kernel.
 The cluster prototype edits LLVM IR and rejects unrecognized code generation;
 operand reuse is applied after register allocation. Tensor layouts, tensor
