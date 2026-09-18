@@ -313,8 +313,10 @@
   and dynamic loops recognize the prologue credit created by a same-stage async
   producer/consumer transaction. That accepts FA backward's seeded `m/Di/dS`
   recurrence without granting credit to D120's producer-acquire cycle. Dynamic
-  negative-total recurrences remain unsupported. The post-insertion
-  conformance builder remains a follow-up in Phase 10 of
+  negative-total recurrences remain unsupported. Outer-produced channels with
+  consumers in one directly nested loop are modeled as one outer transaction,
+  from inner entry through inner drain. The post-insertion conformance builder
+  remains a follow-up in Phase 10 of
   `ContractedScheduleMemorySearchPlan.md`.
 - **Tests**: The captured B-early D120 TTGIR fails at compile time with the same
   cycle witness for A2/B2 and A2/B3. A-early/A2-B3 and the annotation-free

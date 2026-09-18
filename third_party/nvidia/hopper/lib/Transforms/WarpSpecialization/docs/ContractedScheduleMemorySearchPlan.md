@@ -123,7 +123,9 @@ explicitly unsupported in this slice. Ordinary channels in a common nested
 `scf.for` cadence are supported. Constant-trip nested loops are expanded over
 their exact finite transaction domain, and same-stage asynchronous
 producer/consumer paths contribute their pipeline-prologue credit. Dynamic
-negative-total witnesses remain unsupported.
+negative-total witnesses remain unsupported. An outer-produced ordinary SMEM
+channel consumed by one directly nested `scf.for` is summarized at inner-loop
+entry/drain and validated at outer cadence.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -1183,8 +1185,11 @@ The implementation sequence is:
    one invocation. For a dynamic nested loop, recognize prologue credit only
    when a negative task-order edge ends at a consumer wait whose asynchronous
    producer-ready event is in the same stage; producer-acquire edges never gain
-   credit. Dynamic negative-total recurrences remain unsupported. Unsupported
-   components do not cause a false rejection during bring-up.
+   credit. Outer-produced channels whose consumers all live in one directly
+   nested loop contribute one outer-cadence transaction, with wait at loop
+   entry and release at loop drain. Dynamic negative-total recurrences remain
+   unsupported. Unsupported components do not cause a false rejection during
+   bring-up.
 6. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.

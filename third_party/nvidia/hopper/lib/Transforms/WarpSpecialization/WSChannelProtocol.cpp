@@ -158,16 +158,25 @@ Operation *getProtocolConsumerReleaseAnchor(PostDominanceInfo &postDominance,
   return nullptr;
 }
 
-static std::pair<ChannelProtocolCadence, Operation *>
-classifyProtocolCadence(Operation *producer, Operation *consumer) {
+struct ProtocolCadence {
+  ChannelProtocolCadence kind = ChannelProtocolCadence::Unsupported;
+  Operation *scope = nullptr;
+  Operation *innerScope = nullptr;
+};
+
+static ProtocolCadence classifyProtocolCadence(Operation *producer,
+                                               Operation *consumer) {
   if (producer->getParentOfType<ttng::SubtiledRegionOp>() ||
       consumer->getParentOfType<ttng::SubtiledRegionOp>())
-    return {ChannelProtocolCadence::Subtiled, nullptr};
+    return {ChannelProtocolCadence::Subtiled};
 
   auto producerFor = producer->getParentOfType<scf::ForOp>();
   auto consumerFor = consumer->getParentOfType<scf::ForOp>();
   if (producerFor && producerFor == consumerFor)
     return {ChannelProtocolCadence::Loop, producerFor.getOperation()};
+  if (producerFor && consumerFor && producerFor->isProperAncestor(consumerFor))
+    return {ChannelProtocolCadence::OuterToInnerLoop,
+            producerFor.getOperation(), consumerFor.getOperation()};
 
   auto producerWhile = producer->getParentOfType<scf::WhileOp>();
   auto consumerWhile = consumer->getParentOfType<scf::WhileOp>();
@@ -177,7 +186,7 @@ classifyProtocolCadence(Operation *producer, Operation *consumer) {
   if (!producerFor && !consumerFor && !producerWhile && !consumerWhile &&
       producer->getBlock() == consumer->getBlock())
     return {ChannelProtocolCadence::StraightLine, producer->getParentOp()};
-  return {ChannelProtocolCadence::Unsupported, nullptr};
+  return {};
 }
 
 ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
@@ -270,8 +279,11 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
   plan.producerReadyIsAsync = !plan.tmaProducers.empty();
   plan.tmaConsumerWaitAnchor =
       getProtocolSameLevelOp(plan.tmaHeadProducer, plan.headConsumer);
-  std::tie(plan.cadence, plan.cadenceScope) =
+  ProtocolCadence cadence =
       classifyProtocolCadence(plan.headProducer, plan.headConsumer);
+  plan.cadence = cadence.kind;
+  plan.cadenceScope = cadence.scope;
+  plan.innerCadenceScope = cadence.innerScope;
 
   SmallVector<AsyncTaskId> consumerTasks;
   for (Channel *channel : channels)

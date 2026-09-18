@@ -230,14 +230,25 @@ task instructions. `ChannelProtocolPlan` carries this endpoint classification,
 shared with `createToken`, and the task timeline bypasses an asynchronous
 completion when choosing the predecessor of the following event.
 
-Production rejects only `Unsafe`: in this first slice that means a proven
-zero-distance cycle in a single-CTA scheduled loop. A nested `scf.for` is
-supported when all endpoints have that same inner-loop cadence; its per-task
-timeline remains independent from the enclosing persistent cadence. A nested
-cycle containing a negative-distance schedule edge is conservatively
-`Unsupported`, even when positive edges make its total zero: deciding that
-case requires the enclosing loop's prologue/drain boundary. The diagnostic
-includes its total iteration distance, channel IDs, and edge distances.
+Production rejects only `Unsafe`: this includes a proven zero-distance cycle
+in a single-CTA scheduled loop. A nested `scf.for` is supported when all
+endpoints have that same inner-loop cadence. Constant-trip loops are expanded
+over `(event, inner iteration)` so only dependencies inside one finite
+invocation remain. Dynamic nested loops recognize the startup credit from a
+same-stage asynchronous producer/consumer transaction; a negative edge into a
+producer acquire receives no such credit.
+
+An ordinary SMEM channel produced directly in an outer `scf.for` and consumed
+only in one directly nested `scf.for` is summarized in the outer cadence. Its
+consumer wait is placed at inner-loop entry and its release at inner-loop
+drain, producing one outer transaction regardless of the inner trip count.
+The outer and inner protocol scopes are then solved independently: a safe
+inner scope is a terminating region for the outer summary, while an unsafe
+inner scope still rejects the candidate. Sibling consumer loops and consumers
+hidden behind an intervening control-flow block remain unsupported.
+
+The diagnostic includes its total iteration distance, channel IDs, and edge
+distances.
 `Safe` and `Unsupported` continue, so incomplete coverage cannot reject a
 candidate. The test pass can additionally emit `nvws.test.channel_cycle_*`
 attributes. Physical reuse groups, staging-to-operand reuse, TMEM, subtiled,
@@ -245,10 +256,10 @@ straight-line, multi-CTA, and `scf.while` protocols are currently reported as
 unsupported. Staging-to-operand reuse is identified from both sides of each
 `allocation.reuseTarget` relation because its cross-tile WAR token changes the
 physical protocol. Multi-CTA needs cluster synchronization, and
-negative-total witnesses and mixed-distance nested witnesses need boundary
-semantics before they can be rejected soundly. The captured top-level D120
-B-early schedules are rejected with a zero-distance cycle through the real
-post-memory channel-planning path, while A-early continues.
+dynamic negative-total witnesses need additional boundary semantics before
+they can be rejected soundly. The captured top-level D120 B-early schedules are
+rejected with a zero-distance cycle through the real post-memory
+channel-planning path, while A-early continues.
 
 ### Channel Loop Detection
 

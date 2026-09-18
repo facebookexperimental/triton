@@ -17,11 +17,14 @@ namespace mlir {
 class PostDominanceInfo;
 
 /// Transaction cadence understood by the planned channel-protocol builder.
-/// The first validator slice accepts only Loop cadence; the remaining values
-/// are explicit so an unsupported shape is never mistaken for a simple loop.
+/// OuterToInnerLoop summarizes a producer in an outer scf.for and all of its
+/// consumers in one directly nested scf.for; cadenceScope is the outer loop and
+/// innerCadenceScope is the nested loop. Other values remain explicit so an
+/// unsupported shape is never mistaken for a simple loop.
 enum class ChannelProtocolCadence {
   StraightLine,
   Loop,
+  OuterToInnerLoop,
   WhileLoop,
   Subtiled,
   Unsupported,
@@ -54,6 +57,7 @@ struct ChannelProtocolPlan {
   bool producerReadyIsAsync = false;
   Operation *tmaConsumerWaitAnchor = nullptr;
   Operation *cadenceScope = nullptr;
+  Operation *innerCadenceScope = nullptr;
   ChannelProtocolCadence cadence = ChannelProtocolCadence::Unsupported;
   unsigned copies = 0;
   DenseSet<Operation *> consumerOps;

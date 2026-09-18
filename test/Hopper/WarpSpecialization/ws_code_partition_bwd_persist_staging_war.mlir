@@ -28,11 +28,12 @@
 // to a no-op -> cross-tile SMEM race (non-deterministic wrong dv/dk gradients on
 // the persistent path). E2E regression: test_bwd_tmem_dsT_reuse_3group_persistent.
 
-// Four ordinary SMEM channels in the nested scheduled loop are validated. The
-// remaining specialized protocols keep the overall result unsupported.
+// Four ordinary SMEM channels in the nested scheduled loop are validated, and
+// the outer-produced K channel is summarized from inner-loop entry to drain.
+// The remaining specialized protocols keep the overall result unsupported.
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 // CHECK-SAME: nvws.test.channel_cycle_status = "unsupported"
-// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 4 : i64
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 5 : i64
 // Load task (2) acquires the dedicated single-buffered reuse token at the top of
 // the persistent outer loop (loop-carried phase), targeting the staging task.
 // CHECK: nvws.producer_acquire %[[WAR_TOK:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 3 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32, i1

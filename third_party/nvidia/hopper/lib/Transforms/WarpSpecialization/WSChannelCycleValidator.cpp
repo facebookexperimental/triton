@@ -453,13 +453,32 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
       unsupported("channel plan has incomplete identity or copy depth");
       continue;
     }
-    if (plan.cadence != ChannelProtocolCadence::Loop ||
-        !isa_and_nonnull<scf::ForOp>(plan.cadenceScope)) {
+    bool isInnerLoopCadence = plan.cadence == ChannelProtocolCadence::Loop &&
+                              isa_and_nonnull<scf::ForOp>(plan.cadenceScope);
+    bool isOuterToInnerCadence =
+        plan.cadence == ChannelProtocolCadence::OuterToInnerLoop &&
+        isa_and_nonnull<scf::ForOp>(plan.cadenceScope) &&
+        isa_and_nonnull<scf::ForOp>(plan.innerCadenceScope);
+    if (!isInnerLoopCadence && !isOuterToInnerCadence) {
       unsupported("only scf.for loop-cadence channels are supported");
       continue;
     }
-    if (triton::gpu::isPhysicalCluster(plan.cadenceScope)) {
+    if (triton::gpu::isPhysicalCluster(plan.cadenceScope) ||
+        (plan.innerCadenceScope &&
+         triton::gpu::isPhysicalCluster(plan.innerCadenceScope))) {
       unsupported("multi-CTA channel protocols are not yet supported");
+      continue;
+    }
+    if (isOuterToInnerCadence &&
+        (!plan.producerAcquireAnchor ||
+         plan.innerCadenceScope->getBlock() !=
+             plan.producerAcquireAnchor->getBlock() ||
+         llvm::any_of(plan.actualConsumerOps, [&](Operation *consumer) {
+           return consumer->getParentOfType<scf::ForOp>().getOperation() !=
+                  plan.innerCadenceScope;
+         }))) {
+      unsupported(
+          "outer-to-inner channels require one direct nested consumer loop");
       continue;
     }
     if (channel->channelKind != DataChannelKind::SMEMAlloc) {
@@ -514,11 +533,23 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
                           bool ordersFollowingEvents = true) {
       int64_t stage;
       int64_t cluster;
-      if (!anchor ||
-          anchor->getParentOfType<scf::ForOp>().getOperation() !=
-              plan.cadenceScope ||
-          !getScheduleCoordinate(anchor, stage, cluster))
+      if (!anchor)
         return false;
+      if (isOuterToInnerCadence) {
+        if (anchor->getBlock() != plan.innerCadenceScope->getBlock())
+          return false;
+        // Cross-scope events form an outer-iteration protocol. Producer
+        // events retain their outer-block source position; consumer wait and
+        // release events are placed immediately before and after the nested
+        // loop, which summarizes its prologue and drain as one transaction.
+        stage = 0;
+        cluster = 0;
+      } else {
+        if (anchor->getParentOfType<scf::ForOp>().getOperation() !=
+                plan.cadenceScope ||
+            !getScheduleCoordinate(anchor, stage, cluster))
+          return false;
+      }
       LDBG("channel " << channelId << " event " << id << " task " << task
                       << " stage " << stage << " cluster " << cluster
                       << (side == ProtocolEventSide::BeforeAnchor ? " before "
@@ -552,9 +583,14 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
       ProtocolEventId release = analysis.graph.addEvent(
           ProtocolEventKind::Release,
           label + " release task " + std::to_string(consumer.task));
-      if (!stageEvent(wait, consumer.task, consumer.waitScheduleAnchor,
+      Operation *waitAnchor = isOuterToInnerCadence
+                                  ? plan.innerCadenceScope
+                                  : consumer.waitScheduleAnchor;
+      Operation *releaseAnchor = isOuterToInnerCadence ? plan.innerCadenceScope
+                                                       : consumer.releaseAnchor;
+      if (!stageEvent(wait, consumer.task, waitAnchor,
                       ProtocolEventSide::BeforeAnchor) ||
-          !stageEvent(release, consumer.task, consumer.releaseAnchor,
+          !stageEvent(release, consumer.task, releaseAnchor,
                       ProtocolEventSide::AfterAnchor,
                       !consumer.releaseIsAsync)) {
         complete = false;
@@ -598,7 +634,9 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
       analysis.graph.addEdge(
           consumer.wait, consumer.release,
           getTaskSpanDistance(consumer.wait, consumer.release),
-          ProtocolEdgeKind::TaskOrder, channelId);
+          isOuterToInnerCadence ? ProtocolEdgeKind::ControlFlow
+                                : ProtocolEdgeKind::TaskOrder,
+          channelId);
       analysis.graph.addEdge(consumer.release, acquire, plan.copies,
                              ProtocolEdgeKind::SlotReuse, channelId);
     }

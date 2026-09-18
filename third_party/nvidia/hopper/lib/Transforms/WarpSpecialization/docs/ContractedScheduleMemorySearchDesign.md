@@ -525,8 +525,11 @@ Implemented:
   task-order edge ending at that wait. A negative edge ending at producer
   acquire receives no credit. This accepts FA backward's seeded `m/Di/dS`
   recurrence while preserving rejection of D120's unseeded B-early A-relay
-  cycle. Dynamic negative-total recurrences remain `Unsupported`. Only
-  `Unsafe` is rejected;
+  cycle. An outer-produced channel consumed by one directly nested loop is
+  represented as one outer transaction: wait at inner entry, release at inner
+  drain. The production FA-backward fixture now includes its ordinary K
+  outer-to-inner channel in the supported graph. Dynamic negative-total
+  recurrences remain `Unsupported`. Only `Unsafe` is rejected;
   `Unsupported` continues. Endpoint planning lives in
   `WSChannelProtocol.{h,cpp}`, graph lowering and audit diagnostics in
   `WSChannelCycleValidator.{h,cpp}`, and the generic solver remains isolated in
