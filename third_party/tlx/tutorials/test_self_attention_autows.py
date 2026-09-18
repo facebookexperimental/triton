@@ -75,7 +75,10 @@ _CLC_CFG = dict(
     clc=True,
     bwd_bm=64,
     bwd_bn=128,
-    bwd_stages=2,
+    # One stage is faster for the persistent CLC schedule: it avoids the
+    # duplicated steady-state body and reduces SMEM/register spill pressure.
+    bwd_stages=1,
+    warps=8,
     dkdv_subtile=2,
     clc_smem_algo=1,
 )
@@ -93,6 +96,7 @@ if "--run-clc" in sys.argv or "--run-clc-jagged" in sys.argv:
     clc_cfg["dq_fp32"] = os.environ.get("HSTU_SELF_TEST_DQ_FP32", "1") == "1"
     _C.set_config(**clc_cfg)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
+    os.environ["TRITON_WS_TMA_REDUCE_STAGING_COPIES"] = "2"
 elif "--run-dqreduce" in sys.argv:
     _C.set_config(**_DQREDUCE_CFG)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
