@@ -94,6 +94,10 @@ def _switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
 
 # kpack is deprecated on gfx950; only gfx942 benefited from kpack=2.
 KPACK: int = 1
+# Each gfx950 XCD exposes 32 active CUs and a private L2 slice.  A full
+# MI350X has eight XCDs; logical devices in partitioned modes expose fewer.
+GFX950_CUS_PER_XCD: int = 32
+GFX950_MAX_XCDS: int = 8
 
 
 def _get_fw_configs() -> List[triton.Config]:
@@ -123,11 +127,6 @@ HAS_FAST_TANH_INSTRUCTION = (
     and torch.cuda.get_device_capability()[0] >= 9  # >= H100
 )
 
-# AMD CDNA3/4: polynomial tanh avoids Trans unit (exp at 1/4 VALU rate).
-# Uses degree-9 minimax odd polynomial on [-4.5, 4.5], clamped outside.
-# Max error < 5e-4, invisible at bf16 precision (eps ~0.0078).
-HAS_AMD_POLY_SIGMOID = torch.version.hip is not None
-
 if HAS_FAST_TANH_INSTRUCTION:
 
     @triton.jit
@@ -154,43 +153,12 @@ if HAS_FAST_TANH_INSTRUCTION:
         else:
             return (1 + tanh_approx_fp32(x)) * 0.5
 
-elif HAS_AMD_POLY_SIGMOID:
-
-    @triton.jit
-    def _tanh_poly(x):
-        """Degree-9 minimax polynomial approximation of tanh(x).
-
-        Uses Horner form: tanh(x) ~= x * (a0 + u*(a1 + u*(a2 + u*(a3 + u*a4))))
-        where u = x*x. All ops are FMA on VALU (full throughput on CDNA3/4),
-        avoiding the Trans unit used by exp/tanh hardware instructions.
-
-        Clamped to [-1, 1] for |x| > 4.5 where |tanh(x)| > 0.9999.
-        """
-        # Minimax coefficients for tanh on [-4.5, 4.5]
-        u = x * x
-        # Horner evaluation: p(u) = a0 + u*(a1 + u*(a2 + u*(a3 + u*a4)))
-        p = -0.000198527 + u * 0.00972515  # a4*u + a3
-        p = p * u + (-0.0533740)  # ... + a2
-        p = p * u + 0.133392  # ... + a1
-        p = p * u + 1.0  # ... + a0
-        result = x * p
-        # Clamp for |x| > 4.5 where polynomial diverges
-        result = tl.where(result > 1.0, 1.0, result)
-        result = tl.where(result < -1.0, -1.0, result)
-        return result
-
-    @triton.jit
-    def fast_silu(x, MULT_BY_X: tl.constexpr):
-        # sigmoid(x) = 0.5 * (1 + tanh(x/2))
-        # SiLU(x) = x * sigmoid(x)
-        x_half = x * 0.5
-        if MULT_BY_X:
-            return x_half * (_tanh_poly(x_half) + 1.0)
-        else:
-            return (_tanh_poly(x_half) + 1.0) * 0.5
-
 else:
-    # Fallback for non-AMD, non-H100 hardware
+    # CDNA does not have the fast tanh instruction used above. Keep the
+    # standard exp-based sigmoid here: the former degree-nine polynomial was
+    # not a valid tanh approximation over its advertised interval and
+    # introduced O(1e-1) forward and backward relative error for ordinary HSTU
+    # score ranges.
     @triton.jit
     def fast_silu(x, MULT_BY_X: tl.constexpr):
         if MULT_BY_X:
@@ -2736,19 +2704,7 @@ def _tlx_gfx950_hstu_fa_front(
     alpha_full = tlx.require_layout(tl.broadcast_to(alpha, (BLOCK_N, 16)), MMA_NM, pin=False)
     r = scores * alpha_full
     one = tlx.require_layout(tl.full((BLOCK_N, 16), 1.0, tl.float32), MMA_NM, pin=False)
-    half = tlx.require_layout(tl.full((BLOCK_N, 16), 0.5, tl.float32), MMA_NM, pin=False)
-    x_half = r * half
-    u = x_half * x_half
-    p = tlx.require_layout(tl.full((BLOCK_N, 16), -0.000198527, tl.float32), MMA_NM, pin=False)
-    p = p + u * tlx.require_layout(tl.full((BLOCK_N, 16), 0.00972515, tl.float32), MMA_NM, pin=False)
-    p = p * u + tlx.require_layout(tl.full((BLOCK_N, 16), -0.0533740, tl.float32), MMA_NM, pin=False)
-    p = p * u + tlx.require_layout(tl.full((BLOCK_N, 16), 0.133392, tl.float32), MMA_NM, pin=False)
-    p = p * u + one
-    tanh_half = x_half * p
-    # Triton TR012: tl.clamp rejects the explicit MFMA-layout bound encoding.
-    tanh_half = tl.maximum(tanh_half, -one)  # noqa: TR012
-    tanh_half = tl.minimum(tanh_half, one)
-    sig = (tanh_half + one) * half
+    sig = fast_dividef(one, one + fast_expf(-r))
     scale = tlx.require_layout(
         tl.full((BLOCK_N, 16), 1.0 / MAX_SEQ_LEN, tl.float32),
         MMA_NM,
@@ -2761,9 +2717,16 @@ def _tlx_gfx950_hstu_fa_front(
     else:
         offs_n = start_n + tlx.rematerialized_range(0, BLOCK_N, 32, placement=start_m)
         offs_m = start_m + tlx.rematerialized_range(0, 16, 33, placement=start_m)
+        # HSTU uses target-aware causality.  History queries see their causal
+        # prefix, while target queries see every history key plus only their
+        # own target key.  Keeping the raw diagonal separate is important:
+        # clamping all target positions to history_end otherwise makes the
+        # target-to-target block look dense.
         valid = ((offs_n[:, None] < seq_len)
                  & (offs_m[None, :] < seq_len)
-                 & ((offs_m[None, :] >= history_end) | (offs_n[:, None] <= offs_m[None, :])))
+                 & ((offs_n[:, None] == offs_m[None, :])
+                    | ((offs_n[:, None] < history_end)
+                       & (offs_n[:, None] < offs_m[None, :]))))
         valid = tlx.require_layout(valid, MMA_NM, pin=False)
         a = tl.where(valid, r * scaled_sig, zero)
 
@@ -2959,6 +2922,8 @@ def _tlx_gfx950_hstu_fa_phase(
     dk = tlx.require_layout(dk, MMA_ND, pin=False)
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
+    # Interleave the SiLU transcendental work with the phase's MFMA chain.
+    tlx.amd_iglp_opt(3)
     if PREFETCH_NEXT:
         # Phase 3 publishes both current dR and the next Q/dOut slot.
         tlx.async_load_wait_group(1)
@@ -3151,6 +3116,25 @@ def _tlx_gfx950_hstu_fa_outer_block(
 
 
 @triton.jit
+def _tlx_gfx950_hstu_remap_xcd(pid, grid_size, NUM_XCDS: tl.constexpr):
+    """Keep contiguous ``(batch, K/V tile, head)`` work in one XCD.
+
+    gfx950 dispatches consecutive physical program IDs across XCDs.  Map each
+    physical-XCD residue to a balanced contiguous logical range so neighboring
+    K/V owners reuse Q/dO and relaxed dQ atomics through one L2.
+    """
+    # Avoid overflowing tl.num_programs()'s signed i32 type in ceildiv.
+    pids_per_xcd = (grid_size - 1) // NUM_XCDS + 1
+    tall_xcds = grid_size % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    if xcd < tall_xcds:
+        return xcd * pids_per_xcd + local_pid
+    return tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+
+@triton.jit
 # Triton TR001: callers select the separately benchmarked BLOCK_N variant.
 def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
     Q,
@@ -3179,6 +3163,7 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
     H: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     DIRECT_QDO_G2L: tl.constexpr,
     MASK_PEEL: tl.constexpr,
     RESIDENT_K_SCORE: tl.constexpr,
@@ -3188,9 +3173,12 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
     BLOCK_M: tl.constexpr = 16
     OUTER_M: tl.constexpr = 64
     D: tl.constexpr = 128
-    off_h = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    off_z = tl.program_id(2)
+    num_n_blocks: tl.constexpr = tl.cdiv(MAX_SEQ_LEN, BLOCK_N)
+    tpid = _tlx_gfx950_hstu_remap_xcd(tl.program_id(0), tl.num_programs(0), NUM_XCDS)
+    off_h = tpid % H
+    off_zn = tpid // H
+    pid_n = off_zn % num_n_blocks
+    off_z = off_zn // num_n_blocks
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     seq_end = tl.load(seq_offsets + off_z + 1)
     seq_len = (seq_end - seq_start).to(tl.int32)
@@ -3521,14 +3509,17 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
         maskless_row = tl.minimum(history_end, start_n + BLOCK_N - 1)
         maskless_begin_block = tl.maximum(first_outer_block, tl.cdiv(maskless_row, OUTER_M))
         maskless_end_block = tl.maximum(maskless_begin_block, seq_len // OUTER_M)
-        full_k_tile = start_n + BLOCK_N <= seq_len
+        # A query region is maskless only when this entire K/V tile belongs
+        # to history.  Tiles containing targets retain the mask because each
+        # target may attend itself, but not any other target.
+        full_history_k_tile = start_n + BLOCK_N <= history_end
         maskless_begin = tl.where(
-            full_k_tile,
+            full_history_k_tile,
             tl.minimum(maskless_begin_block - first_outer_block, active_outer_blocks),
             active_outer_blocks,
         )
         maskless_end = tl.where(
-            full_k_tile,
+            full_history_k_tile,
             tl.minimum(maskless_end_block - first_outer_block, active_outer_blocks),
             active_outer_blocks,
         )
@@ -4987,7 +4978,7 @@ def _tlx_gfx950_ragged_hstu_attn_bwd_one_col_block(  # noqa C901
 
 
 def _bwd_pre_hook(nargs):
-    nargs["DQ"].zero_()
+    # DQ_ACC either aliases DQ or is converted into DQ with a full overwrite.
     nargs["DQ_ACC"].zero_()
     if nargs["DTW"] is not None:
         nargs["DTW"].zero_()
@@ -5452,9 +5443,11 @@ def tlx_gfx950_ragged_attention_bwd(
                                  and dk.stride(0) >= 0 and dk.stride(1) >= 0 and dv.stride(0) >= 0
                                  and dv.stride(1) >= 0)
     if fa_schedule:
-        dq.zero_()
+        # The post-kernel conversion fully overwrites DQ when this is separate.
         dq_acc.zero_()
-        _tlx_gfx950_hstu_fa_schedule_bwd_kernel[(H, triton.cdiv(N, fa_schedule_block_n), Z)](
+        cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_xcds = max(1, min(GFX950_MAX_XCDS, cu_count // GFX950_CUS_PER_XCD))
+        _tlx_gfx950_hstu_fa_schedule_bwd_kernel[(H * triton.cdiv(N, fa_schedule_block_n) * Z, )](
             Q=q,
             K=k,
             V=v,
@@ -5481,6 +5474,7 @@ def tlx_gfx950_ragged_attention_bwd(
             H=H,
             MAX_SEQ_LEN=N,
             BLOCK_N=fa_schedule_block_n,
+            NUM_XCDS=num_xcds,
             DIRECT_QDO_G2L=fa_schedule_direct_qdo_g2l,
             MASK_PEEL=fa_schedule_mask_peel,
             RESIDENT_K_SCORE=fa_schedule_resident_k_score,
@@ -5491,6 +5485,10 @@ def tlx_gfx950_ragged_attention_bwd(
             matrix_instr_nonkdim=16,
             waves_per_eu=0,
             reverse_local_assignment=not fa_schedule_direct_qdo_g2l,
+            # IGLP markers cannot be combined with sched-group barriers.  This
+            # kernel carries its own scheduling hints and uses LLVM's stock
+            # scheduler even when TRITON_AMD_TTGIR_SCHEDULE is set globally.
+            enable_sched_group_barrier_scheduler=False,
         )
     else:
         _tlx_gfx950_ragged_hstu_attn_bwd[grid](
