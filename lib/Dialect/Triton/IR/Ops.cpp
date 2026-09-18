@@ -698,11 +698,13 @@ bool ReduceOp::hasDefinedOrdering() {
 
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
-                   ValueRange operands, int axis, bool reverse) {
+                   ValueRange operands, int axis, bool reverse,
+                   StringAttr reductionOrdering) {
   SmallVector<Type> inferredReturnTypes;
   for (auto arg : operands)
     inferredReturnTypes.push_back(arg.getType());
-  ScanOp::build(builder, state, inferredReturnTypes, operands, axis, reverse);
+  ScanOp::build(builder, state, inferredReturnTypes, operands, axis, reverse,
+                reductionOrdering);
 }
 
 LogicalResult
@@ -715,7 +717,14 @@ ScanOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   return success();
 }
 
-LogicalResult ScanOp::verify() { return verifyReduceScan(*this); }
+LogicalResult ScanOp::verify() {
+  if (auto ordering = getReductionOrderingAttr()) {
+    if (ordering.getValue() != "unordered" &&
+        ordering.getValue() != "inner_tree")
+      return emitOpError("unsupported scan reduction ordering: ") << ordering;
+  }
+  return verifyReduceScan(*this);
+}
 
 LogicalResult ScanOp::verifyRegions() {
   return verifyRegionsImpl<ScanReturnOp>(*this);
