@@ -23,6 +23,8 @@ On each promo, also sync this directory to the latest triton-cpu:
    triton-cpu and must be reconciled with fbtriton's side on every sync.
 3. Keep the LLVM revision in agreement. Both fbtriton and triton-cpu build
    on upstream Triton and its pinned LLVM.
+4. Keep the SLEEF revision in `CMakeLists.txt` in sync. CMake fetches the
+   pinned revision; offline builds must provide `TRITON_SLEEF_SOURCE_DIR`.
 
 ## In-tree integration (outside this directory)
 
@@ -36,7 +38,6 @@ On each promo, also sync this directory to the latest triton-cpu:
 - `include/triton/Tools/Sys/GetEnv.h` — cache-invalidating `TRITON_CPU_*`
   env vars
 - `python/tutorials/cpu/` — CPU tutorials, copied from triton-cpu
-- `third_party/sleef` submodule + `.gitmodules`
 - `.github/workflows/`, `.github/scripts/bisect_failure.sh` — CI builds the
   CPU backend
 
