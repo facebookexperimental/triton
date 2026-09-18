@@ -1028,6 +1028,24 @@ The pytest consumes the manifest path supplied by the driver. Safe tuples run
 the numerical check and report latency; validator failures are recorded as
 `rejected` and do not make the overall sweep fail.
 
+The completed annotation-free BM128 FA-backward sweep requested nominal caps
+of `5 × 2 × 3 × 4 = 120`, but the manifest exposed only one distinct SMEM rank
+for schedule ranks 0, 2, 3, and 4. Schedule rank 1 exposed all three. The actual
+Cartesian frontier was therefore:
+
+```text
+schedule 1:          2 memory-space × 3 SMEM × 4 TMEM = 24
+schedules 0,2,3,4: 4 × (2 memory-space × 1 SMEM × 4 TMEM) = 32
+total:                                                        56
+```
+
+Of those 56 tuples, 6 passed numerical correctness and 50 were classified
+before launch: 31 unsafe channel cycles, 12 unorderable TMEM groups, and 7
+SMEM resource failures. There were no timeouts or unclassified failures. Every
+executable tuple had a `Safe` validator result with zero unsupported channels.
+This is one sweep over a shared graph model, not 56 validator patterns; the
+reusable protocol taxonomy is documented in the design document.
+
 #### D120426461 example
 
 The measured set includes at least:

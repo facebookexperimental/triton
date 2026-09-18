@@ -416,7 +416,41 @@ subtile.
 Endpoint selection and cadence calculations must be factored from
 `insertAsyncComm` so insertion and validation cannot disagree.
 
-### 8.3 Weighted-cycle algorithm
+### 8.3 Protocol taxonomy, not workload patterns
+
+The validator does not contain one rule for each search tuple or kernel. The
+current IR-to-graph adapter has six supported cadence shapes:
+
+1. finite straight-line;
+2. producer and consumer in the same scheduled `scf.for`;
+3. function scope to an inner `scf.for`;
+4. inner `scf.for` to function scope;
+5. outer `scf.for` to one directly nested `scf.for`;
+6. one directly nested `scf.for` to its outer `scf.for`.
+
+Across those cadences it admits ten protocol families:
+
+1. ordinary SMEM channels;
+2. inner-to-outer one-copy operand-D TMEM accumulators;
+3. same-loop one-copy MMAv5-to-TMEM-load results;
+4. finite one-copy operand-D TMEM channels;
+5. A1 circular multi-copy SMEM reuse;
+6. A2 two-member SMEM dependency reuse;
+7. A3 N-member SMEM linear-chain reuse;
+8. A2 two-member TMEM temporal reuse;
+9. A5 N-member TMEM dependency-chain reuse;
+10. `allocation.reuseTarget` cross-tile WAR protection.
+
+These two lists are not multiplied into 60 hard-coded cases. Cadence determines
+transaction boundaries and edge distances; the protocol family determines the
+physical ownership edges added to the same normalized graph. Same-task staging
+and finite same-iteration guard allocations are deliberately ignored because
+they emit no cross-task protocol. `WhileLoop`, directly modeled subtiled, A4,
+A6, multi-CTA, and other unclassified shapes remain fail-closed as
+`Unsupported`; `ttng.subtiled_region` is transparent when it only wraps an
+otherwise supported cadence.
+
+### 8.4 Weighted-cycle algorithm
 
 A valid circular pipeline must advance at least one logical iteration around
 every directed cycle. To detect a non-positive-distance cycle:
