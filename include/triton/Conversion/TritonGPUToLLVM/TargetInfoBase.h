@@ -6,6 +6,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace mlir::triton {
 enum class ProgramIDDim : uint32_t;
@@ -109,10 +110,16 @@ public:
   virtual Value programId(RewriterBase &rewriter, Location loc,
                           ModuleOp moduleOp, ProgramIDDim axis) const = 0;
 
+  // Attempt a warp-wide reduction of `acc` with target-specific instructions.
+  // Returns false to fall back to a shuffle-based reduction. `numLaneToReduce`
+  // is the number of participating contiguous lanes, `interleave` the stride
+  // between them, and `broadcastLaneIdMask` optionally identifies zero lane
+  // bases in this step's layout (layout path only).
   virtual bool warpReduce(RewriterBase &rewriter, Location loc,
                           SmallVector<Value> &acc, triton::ReduceOp op,
-                          unsigned numLaneToReduce,
-                          unsigned interleave) const = 0;
+                          unsigned numLaneToReduce, unsigned interleave,
+                          std::optional<unsigned> broadcastLaneIdMask =
+                              std::nullopt) const = 0;
 
   // Emits LLVM code with |rewriter| to print a message following the given
   // format from the device. |formatStrStart| is the pointer to the start of

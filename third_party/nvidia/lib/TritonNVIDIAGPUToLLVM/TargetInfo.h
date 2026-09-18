@@ -3,6 +3,7 @@
 
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h"
+#include <optional>
 
 namespace mlir::triton::NVIDIA {
 
@@ -90,7 +91,9 @@ public:
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
-                  unsigned interleave) const override;
+                  unsigned interleave,
+                  std::optional<unsigned> broadcastLaneIdMask =
+                      std::nullopt) const override;
   unsigned getReductionTreeArity(Operation *combinerOp) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,

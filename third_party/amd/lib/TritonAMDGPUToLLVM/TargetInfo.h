@@ -94,7 +94,9 @@ public:
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
-                  unsigned interleave) const override;
+                  unsigned interleave,
+                  std::optional<unsigned> broadcastLaneIdMask =
+                      std::nullopt) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,
               int formatStrByteCount, ValueRange args,
