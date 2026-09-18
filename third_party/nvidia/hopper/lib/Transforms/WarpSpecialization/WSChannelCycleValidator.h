@@ -31,9 +31,10 @@ PostMemoryProtocolAnalysis
 analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
                                   ReuseConfig *reuseConfig);
 
-/// Re-derive endpoint plans from post-memory channels, run the common solver,
-/// and optionally attach test-only audit attributes to the function.
-void auditPostMemoryChannelProtocols(
+/// Re-derive endpoint plans from post-memory channels and run the common
+/// solver. Unsafe cycles fail validation; safe and not-yet-supported protocol
+/// components continue. Test-only audit attributes are optional.
+LogicalResult validatePostMemoryChannelProtocols(
     triton::FuncOp funcOp, ArrayRef<Channel *> orderedChannels,
     const DenseMap<Channel *, SmallVector<Channel *>> &consumerGroups,
     ReuseConfig *reuseConfig, bool emitAuditAttributes);

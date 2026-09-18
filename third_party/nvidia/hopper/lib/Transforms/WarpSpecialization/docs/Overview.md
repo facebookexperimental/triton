@@ -117,7 +117,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
 | `WSChannelCycleAnalysis.cpp` | `validateProtocolCycles` | Normalized channel-protocol graph and deterministic non-positive-distance cycle solver |
 | `WSChannelProtocol.cpp` | `buildChannelProtocolPlan` | Shared, non-mutating endpoint and cadence planning for synchronization insertion and validation |
-| `WSChannelCycleValidator.cpp` | `auditPostMemoryChannelProtocols` | Post-memory protocol-graph construction, validation, and audit diagnostics |
+| `WSChannelCycleValidator.cpp` | `validatePostMemoryChannelProtocols` | Post-memory protocol-graph construction, unsafe-candidate rejection, and audit diagnostics |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
 | `PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a bounded partition-local masked prefix, folding its predicates and leaving an unmasked remainder |
 | `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `optimizeTMALoads` | Converts `tt.descriptor_load` to buffered `nvws.descriptor_load` before buffer hoisting, then lowers it to async TMA copies after planning |

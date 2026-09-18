@@ -224,13 +224,19 @@ classes contribute schedule-order edges whose distance is
 `next.stage - current.stage`, plus one on the wrap edge. Events at the same
 anchor and on the same side of it form an unordered equivalence class.
 
-This first integration is audit-only: production builds compute and debug-log
-the result without rejecting the selected candidate; the test pass can emit
-`nvws.test.channel_cycle_*` attributes. Physical reuse groups, TMEM, subtiled,
-straight-line, and `scf.while` protocols are reported as unsupported. An unsafe
-cycle in a supported component takes priority over unsupported coverage. The
-captured D120 B-early schedule is detected as a zero-distance cycle through
-the real post-memory channel-planning path.
+Production rejects only `Unsafe`: in this first slice that means a proven
+zero-distance cycle in a single-CTA, non-nested scheduled loop. The diagnostic
+includes its total iteration distance, channel IDs, and edge distances.
+`Safe` and `Unsupported` continue, so incomplete coverage cannot reject a
+candidate. The test pass can additionally emit `nvws.test.channel_cycle_*`
+attributes. Physical reuse groups, TMEM, subtiled, straight-line, nested-loop,
+multi-CTA, and `scf.while` protocols are currently reported as unsupported.
+Nested loops need the enclosing persistent-loop cadence and cross-tile
+synchronization in the graph; multi-CTA needs cluster synchronization; and
+negative-distance witnesses need prologue/drain boundary semantics before they
+can be rejected soundly. The captured D120 B-early schedules are rejected with
+a zero-distance cycle through the real post-memory channel-planning path, while
+A-early continues.
 
 ### Channel Loop Detection
 

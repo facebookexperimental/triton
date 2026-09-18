@@ -11,6 +11,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -188,6 +189,15 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
       unsupported("only scf.for loop-cadence channels are supported");
       continue;
     }
+    if (plan.cadenceScope->getParentOfType<scf::ForOp>() ||
+        plan.cadenceScope->getParentOfType<scf::WhileOp>()) {
+      unsupported("nested loop-cadence channels are not yet supported");
+      continue;
+    }
+    if (triton::gpu::isPhysicalCluster(plan.cadenceScope)) {
+      unsupported("multi-CTA channel protocols are not yet supported");
+      continue;
+    }
     if (channel->channelKind != DataChannelKind::SMEMAlloc) {
       unsupported("only ordinary SMEM channels are supported");
       continue;
@@ -297,6 +307,13 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
       unsupportedReason = "task protocol events span multiple blocks";
   }
   analysis.validation = validateProtocolCycles(analysis.graph);
+  if (analysis.validation.status == ProtocolStatus::Unsafe &&
+      analysis.validation.cycleIterationDistance < 0) {
+    analysis.validation.status = ProtocolStatus::Unsupported;
+    analysis.validation.cycleEdgeIds.clear();
+    analysis.validation.reason =
+        "negative-distance cycles require boundary-aware validation";
+  }
   if (analysis.validation.status == ProtocolStatus::Safe &&
       analysis.unsupportedChannelCount != 0) {
     analysis.validation.status = ProtocolStatus::Unsupported;
@@ -305,7 +322,7 @@ analyzePostMemoryChannelProtocols(ArrayRef<ChannelProtocolPlan> plans,
   return analysis;
 }
 
-void auditPostMemoryChannelProtocols(
+LogicalResult validatePostMemoryChannelProtocols(
     triton::FuncOp funcOp, ArrayRef<Channel *> orderedChannels,
     const DenseMap<Channel *, SmallVector<Channel *>> &consumerGroups,
     ReuseConfig *reuseConfig, bool emitAuditAttributes) {
@@ -328,6 +345,28 @@ void auditPostMemoryChannelProtocols(
        << ", unsupported=" << analysis.unsupportedChannelCount);
   if (emitAuditAttributes)
     attachAuditAttributes(funcOp, analysis);
+  if (analysis.validation.status != ProtocolStatus::Unsafe)
+    return success();
+
+  InFlightDiagnostic diagnostic = funcOp.emitError(
+      "warp specialization rejected an unsafe post-memory channel protocol");
+  diagnostic << ": total iteration distance "
+             << analysis.validation.cycleIterationDistance << ", channels [";
+  for (auto [index, edgeId] :
+       llvm::enumerate(analysis.validation.cycleEdgeIds)) {
+    if (index)
+      diagnostic << ", ";
+    diagnostic << analysis.graph.edges[edgeId].channelId;
+  }
+  diagnostic << "], edge distances [";
+  for (auto [index, edgeId] :
+       llvm::enumerate(analysis.validation.cycleEdgeIds)) {
+    if (index)
+      diagnostic << ", ";
+    diagnostic << analysis.graph.edges[edgeId].iterationDistance;
+  }
+  diagnostic << "]";
+  return failure();
 }
 
 } // namespace mlir

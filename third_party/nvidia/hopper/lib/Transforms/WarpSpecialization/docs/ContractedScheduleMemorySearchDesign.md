@@ -510,20 +510,20 @@ Implemented:
   per-task consumer wait/release anchors, buffer depth, and cadence. Existing
   synchronization insertion consumes this plan; reuse-specific acquire
   relocation updates the same record.
-- An audit-only post-memory graph builder for ordinary `scf.for` SMEM channels.
+- A post-memory graph builder and candidate gate for ordinary, single-CTA SMEM
+  channels in a top-level scheduled `scf.for`.
   It lowers planned endpoints to Acquire/Ready/Wait/Release events, adds copy
   depth and stage-delta edges, and runs the common weighted-cycle solver. The
   production-shaped D120 B-early fixture reports the expected zero-credit
-  cycle through this real channel path. Specialized protocols remain
-  unsupported and no candidate is rejected yet. Endpoint planning lives in
+  cycle through this real channel path. Only `Unsafe` is rejected;
+  `Unsupported` continues. Endpoint planning lives in
   `WSChannelProtocol.{h,cpp}`, graph lowering and audit diagnostics in
   `WSChannelCycleValidator.{h,cpp}`, and the generic solver remains isolated in
   `WSChannelCycleAnalysis.{h,cpp}`.
 
 Next:
 
-1. Complete post-memory coverage for the specialized protocol shapes, retain
-   A-early as a positive control, and turn the audit into candidate rejection.
+1. Complete post-memory coverage for the specialized protocol shapes.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.
@@ -539,9 +539,9 @@ Current limitations:
 - Scaled-MMA and subtiled TMEM cases may use the legacy allocator.
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
-- The ordinary-loop post-memory builder is connected in audit-only mode;
-  specialized protocol coverage, candidate rejection, and the post-insertion
-  builder remain open.
+- The ordinary-loop post-memory builder rejects proven zero-distance cycles.
+  Negative-distance, nested-loop, multi-CTA, specialized-protocol, and
+  post-insertion coverage remain open.
 
 ## 12. Controls and diagnostics
 

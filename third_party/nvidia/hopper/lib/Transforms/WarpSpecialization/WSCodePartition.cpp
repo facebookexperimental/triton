@@ -5527,8 +5527,8 @@ static void lowerMultiTaskSubtiledRegions(triton::FuncOp funcOp) {
 
 } // namespace
 
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
-                     bool emitChannelCycleAudit) {
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
+                              bool emitChannelCycleAudit) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAllocChannels(channelsOrigin, funcOp);
@@ -5537,7 +5537,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
     channels.push_back(c.get());
   }
   if (channels.empty()) {
-    return;
+    return success();
   }
   SmallVector<Channel *> orderedChannels;
   orderedChannels = channels;
@@ -5726,9 +5726,10 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
           "in the same basic block");
   }
 
-  auditPostMemoryChannelProtocols(funcOp, orderedChannels,
-                                  channelsGroupedByConsumers, &config,
-                                  emitChannelCycleAudit);
+  if (failed(validatePostMemoryChannelProtocols(
+          funcOp, orderedChannels, channelsGroupedByConsumers, &config,
+          emitChannelCycleAudit)))
+    return failure();
 
   appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
                         &config);
@@ -6010,6 +6011,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSCODEPARTITION
@@ -6044,7 +6046,10 @@ public:
         signalPassFailure();
         return;
       }
-      doCodePartition(funcOp, numBuffers, channelCycleAudit);
+      if (failed(doCodePartition(funcOp, numBuffers, channelCycleAudit))) {
+        signalPassFailure();
+        return;
+      }
     }
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at

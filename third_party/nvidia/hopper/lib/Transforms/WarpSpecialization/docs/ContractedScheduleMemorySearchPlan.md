@@ -113,12 +113,14 @@ loop-cadence SMEM endpoint plans into the normalized protocol graph immediately
 after reuse-group validation and before accumulation-counter rewriting. Each
 channel contributes zero-distance Acquire/Ready/Wait/Release edges plus a
 copy-depth slot-reuse edge; task serialization contributes stage-delta edges
-in cluster/source order. The common weighted-cycle solver runs in production
-as an audit without changing candidate selection, while the test pass exposes
+in cluster/source order. The common weighted-cycle solver rejects only proven
+`Unsafe` cycles; `Safe` and `Unsupported` continue. The test pass exposes
 status, coverage counts, graph size, and the witness. The production-shaped
-D120 B-early fixture reaches this path and reports its zero-credit cycle.
-Reuse-group, TMEM, subtiled, straight-line, and while protocols remain
-explicitly unsupported in this slice.
+D120 B-early A2/B2 and A2/B3 candidates are rejected with the same zero-credit
+cycle, while A-early/A2-B3 passes the gate. Reuse-group, TMEM, subtiled,
+straight-line, nested-loop, multi-CTA, and while protocols remain explicitly
+unsupported in this slice. Negative-distance witnesses also remain unsupported
+until prologue/drain boundary semantics are represented.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -1143,17 +1145,17 @@ The implementation sequence is:
    anchor, consumer-release anchor, buffer depth, and cadence. Existing
    operand-D and reuse rules update the plan's acquire anchor before
    `insertAsyncComm` consumes it.
-4. **Audit implemented; rejection pending:** `doCodePartition` calls the
+4. **Implemented:** `doCodePartition` calls the
    dedicated validator helper after `ReuseConfig` construction,
    consumer-group merging, and reuse-group shape checks, but before
-   `appendAccumCntsForOps`. The rejection unit will change `doCodePartition`
-   to return `LogicalResult` and propagate failure through production and
-   test-only passes.
+   `appendAccumCntsForOps`. `doCodePartition` returns `LogicalResult` and
+   propagates unsafe-cycle failure through production and test-only passes.
 5. Initially support ordinary channels whose relevant endpoints share one
-   scheduled `scf.for` cadence and have affine one-transaction-per-iteration
-   behavior. Analyze supported SCCs even when unrelated channels are outside
-   that scope. A proven cycle is `Unsafe`; an unsupported component is reported
-   as unvalidated and does not cause a false rejection during bring-up.
+   top-level, single-CTA scheduled `scf.for` cadence and have affine
+   one-transaction-per-iteration behavior. Analyze supported SCCs even when
+   unrelated channels are outside that scope. A proven zero-distance cycle is
+   `Unsafe`; negative-distance and unsupported components are reported as
+   unvalidated and do not cause a false rejection during bring-up.
 6. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
@@ -1392,9 +1394,9 @@ a hard correctness floor on the structural path.
 - [x] D120 candidates exist without lhs/rhs depth annotations.
 - [x] D120 schedule rank 1 with the A3/B2 memory plan passes the actual
       1024x12800x1024 bf16 correctness run on B200.
-- [x] The audit-only post-memory builder detects D120 B-early through real
+- [x] The post-memory builder detects D120 B-early through real
       planned channels and returns a zero-distance witness.
-- [ ] Post-memory channel-cycle validation rejects D120 B-early before launch
+- [x] Post-memory channel-cycle validation rejects D120 B-early before launch
       while retaining A-early with the A2/B3 memory plan.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [x] FA-backward target schedule exists without stage/order annotations.

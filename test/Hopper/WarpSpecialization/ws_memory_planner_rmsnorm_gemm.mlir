@@ -38,44 +38,60 @@
 // RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
 // RUN:   --nvgpu-warp-specialization="num-stages=3 smem-budget=232448" | \
 // RUN:   FileCheck %s --check-prefix=CODEPART
-// RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=1 \
-// RUN:   triton-opt \
-// RUN:   %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir \
-// RUN:   -allow-unregistered-dialect \
-// RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
-// RUN:   --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" | \
-// RUN:   FileCheck %s --check-prefix=CYCLE-AUDIT
 // RUN: env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=2 \
-// RUN:   triton-opt \
-// RUN:   %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir \
+// RUN:   triton-opt %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir \
 // RUN:   -allow-unregistered-dialect \
 // RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
 // RUN:   --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" | \
-// RUN:   FileCheck %s --check-prefix=CYCLE-AUDIT
+// RUN:   FileCheck %s --check-prefix=CYCLE-POSITIVE
+// RUN: sed \
+// RUN:   -e '/nvws.descriptor_load %a_desc/s/loop.cluster = 1 : i32, loop.stage = 0 : i32/loop.cluster = 0 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/%a_47 = ttg.local_load/s/loop.cluster = 2 : i32, loop.stage = 0 : i32/loop.cluster = 1 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/ttg.local_store %a_47/s/loop.cluster = 2 : i32, loop.stage = 0 : i32/loop.cluster = 1 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/nvws.descriptor_load %b_desc/s/loop.cluster = 0 : i32, loop.stage = 1 : i32/loop.cluster = 1 : i32, loop.stage = 0 : i32/' \
+// RUN:   -e '/%a_f32 = arith.extf/s/loop.cluster = 2 : i32, loop.stage = 0 : i32/loop.cluster = 1 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/loc(#loc65)/s/loop.cluster = 3 : i32, loop.stage = 0 : i32/loop.cluster = 2 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/}) {async_task_id = array<i32: 0>, loop.cluster = 4/s/loop.cluster = 4 : i32, loop.stage = 0 : i32/loop.cluster = 3 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/loc(#loc67)/s/loop.cluster = 1 : i32, loop.stage = 1 : i32/loop.cluster = 4 : i32, loop.stage = 1 : i32/' \
+// RUN:   -e '/%acc_51 = ttg.memdesc_trans/s/loop.cluster = 1 : i32, loop.stage = 1 : i32/loop.cluster = 2 : i32, loop.stage = 0 : i32/' \
+// RUN:   %S/Inputs/d120-rmsnorm-gemm-post-buffer-allocation.mlir > %t.bearly.mlir
+// RUN: not env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=1 \
+// RUN:   triton-opt %t.bearly.mlir \
+// RUN:   -allow-unregistered-dialect \
+// RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" 2>&1 | \
+// RUN:   FileCheck %s --check-prefix=CYCLE-REJECT
+// RUN: not env TRITON_WS_MEM_PLAN_TOPK=3 TRITON_WS_MEM_PLAN_PICK=2 \
+// RUN:   triton-opt %t.bearly.mlir \
+// RUN:   -allow-unregistered-dialect \
+// RUN:   --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=3 channel-cycle-audit=true" 2>&1 | \
+// RUN:   FileCheck %s --check-prefix=CYCLE-REJECT
 
 // Production-shaped D120426461 memory-planner oracle. A feeds both the RMS
 // reduction and the MMA, while B feeds only the MMA. The existing heuristic
 // therefore assigns A3/B2. Eight output subtiles share one three-copy staging
 // ring. Fixed-group search preserves that ring and exposes A2/B2 and A2/B3 as
 // the first two alternatives without operand-specific annotations.
-// The captured loop schedule is the unsafe B-early rank: A/relay is at stage
-// 1, B is at stage 0, and the MMA is at stage 2.
+// The checked-in loop schedule is the safe A-early rank: A/relay is at stage
+// 0, B is at stage 1, and the MMA is at stage 2. The sed pipeline above changes
+// only those captured schedule coordinates to reconstruct the B-early rank.
 
-// The real post-memory channel builder finds the zero-credit A-relay/B cycle
-// for both the A2/B2 and A2/B3 memory ranks.
+// A-early/A2-B3 passes the gate. Specialized output-staging and TMEM channels
+// remain explicitly unsupported, so the overall coverage status is
+// "unsupported" rather than "safe"; crucially, no supported SCC is unsafe.
+// CYCLE-POSITIVE-LABEL: tt.func public @d120_rmsnorm_gemm
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_edge_count = 28 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_event_count = 12 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_status = "unsupported"
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_supported_channels = 3 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
+
+// The B-early reconstruction is rejected for both A2/B2 and A2/B3 with the
+// same zero-credit A-relay/B witness.
 // Specialized output-staging and TMEM channels remain explicitly unsupported
-// in this first audit-only slice, but an unsafe supported SCC takes priority.
-// CYCLE-AUDIT-LABEL: tt.func public @d120_rmsnorm_gemm
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_channels = array<i64: 1, 1, 4, 4, 4, 1>
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_distance = 0 : i64
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_edge_count = 28 : i64
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_edge_distances = array<i64: 0, 0, 1, 0, -1, 0>
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_edges = array<i64: 5, 21, 11, 14, 15, 16>
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_event_count = 12 : i64
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_reason = "channel protocol contains a non-positive-distance cycle"
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_status = "unsafe"
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_supported_channels = 3 : i64
-// CYCLE-AUDIT-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
+// in this first slice, but an unsafe supported SCC takes priority.
+// CYCLE-REJECT: error: warp specialization rejected an unsafe post-memory channel protocol: total iteration distance 0, channels [1, 1, 4, 4, 4, 1], edge distances [0, 0, 1, 0, -1, 0]
 
 // HEURISTIC-LABEL: tt.func public @d120_rmsnorm_gemm
 // HEURISTIC: %a = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32}
