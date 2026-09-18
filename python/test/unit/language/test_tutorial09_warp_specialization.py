@@ -8,6 +8,7 @@ Blackwell and Hopper GPUs.
 
 import json
 import os
+from pathlib import Path
 from typing import NamedTuple
 
 import pytest
@@ -788,7 +789,8 @@ def test_d120_rmsnorm_gemm_search(monkeypatch, tmp_path):
     ttgir = compiled.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
 
-    records = [json.loads(line) for line in (tmp_path / "search.jsonl").read_text().splitlines()]
+    manifest = Path(os.environ.get("TRITON_WS_SEARCH_MANIFEST", tmp_path / "search.jsonl"))
+    records = [json.loads(line) for line in manifest.read_text().splitlines()]
     selected = {(record["kind"], record.get("pool")): record["rank"] for record in records if record.get("selected")}
     assert selected[("schedule", None)] == int(os.environ["TRITON_MODULO_PICK"])
     assert selected[("memory-space", None)] == int(os.environ["TRITON_WS_MEMORY_SPACE_PICK"])
@@ -804,6 +806,28 @@ def test_d120_rmsnorm_gemm_search(monkeypatch, tmp_path):
     reference = torch.matmul(a_f32, b.float().T)
     reference *= torch.rsqrt(torch.mean(a_f32 * a_f32, dim=1) + 1e-5)[:, None]
     torch.testing.assert_close(c, reference.to(torch.bfloat16), atol=0.03, rtol=0.03)
+
+    if os.environ.get("TRITON_D120_BENCHMARK") == "1":
+        monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "0")
+
+        def launch():
+            rmsnorm_gemm_kernel_tma_ws[grid](
+                a_desc,
+                b_desc,
+                c_desc,
+                M=M,
+                N=N,
+                K=K,
+                BLOCK_SIZE_M=block_m,
+                BLOCK_SIZE_N=block_n,
+                BLOCK_SIZE_K=block_k,
+                EPILOGUE_SUBTILE=epilogue_subtile,
+                num_stages=3,
+                num_warps=4,
+                early_tma_store_lowering=True,
+            )
+
+        print(f"latency_ms={triton.testing.do_bench(launch)}")
 
 
 @pytest.mark.parametrize("M, N, K", [(8192, 8192, 1024)])

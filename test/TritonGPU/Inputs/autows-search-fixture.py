@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 
 schedule_topk = int(os.environ["TRITON_MODULO_TOPK"])
@@ -50,3 +51,7 @@ with manifest.open("a") as output:
             )
 
 print(f"latency_ms={1000 * schedule_pick + 100 * memory_space_pick + 10 * smem_pick + tmem_pick + 0.5}")
+
+if schedule_pick == int(os.environ.get("AUTOWS_SEARCH_FIXTURE_REJECT_SCHEDULE", "-1")):
+    print("candidate rejected by validator", file=sys.stderr)
+    raise SystemExit(3)

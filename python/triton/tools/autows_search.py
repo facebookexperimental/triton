@@ -2,8 +2,10 @@
 
 The child command must compile exactly one searched loop and append its
 compiler records to ``TRITON_WS_SEARCH_MANIFEST``. A zero exit status is the
-candidate's correctness/validation result. If ``--metric-regex`` is provided,
-the final capture group in the child's stdout is recorded as its metric.
+candidate's correctness/validation result. ``--reject-regex`` identifies an
+expected compile-time candidate rejection, which is recorded separately from
+an unexpected failure. If ``--metric-regex`` is provided, the final capture
+group in the child's stdout is recorded as its metric.
 """
 
 from __future__ import annotations
@@ -152,9 +154,16 @@ def _selection_error(run: RunResult) -> str | None:
     return None
 
 
-def _result_record(run: RunResult, pattern: re.Pattern[str] | None) -> dict[str, Any]:
-    metric = _metric(run.stdout, pattern)
-    status = "passed" if run.returncode == 0 else "failed"
+def _result_record(run: RunResult, pattern: re.Pattern[str] | None,
+                   reject_pattern: re.Pattern[str] | None) -> dict[str, Any]:
+    rejection = reject_pattern.search(run.stderr) if reject_pattern is not None and run.returncode != 0 else None
+    metric = _metric(run.stdout, pattern) if run.returncode == 0 else None
+    if run.returncode == 0:
+        status = "passed"
+    elif rejection is not None:
+        status = "rejected"
+    else:
+        status = "failed"
     selection_error = None if status == "failed" else _selection_error(run)
     if selection_error is not None:
         status = "manifest-mismatch"
@@ -170,6 +179,7 @@ def _result_record(run: RunResult, pattern: re.Pattern[str] | None) -> dict[str,
         "elapsed_seconds": round(run.elapsed_seconds, 6),
         "metric": metric,
         "error": selection_error,
+        "rejection": rejection.group(0) if rejection is not None else None,
         "schedule": _selected(run.records, "schedule"),
         "memory_space": _selected(run.records, "memory-space"),
         "memory": _selected(run.records, "memory"),
@@ -185,6 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--tmem-topk", type=int, help="TMEM top-K (defaults to --memory-topk)")
     parser.add_argument("--results", type=Path, required=True, help="JSONL output path")
     parser.add_argument("--metric-regex", help="Regex whose final match and first capture group is a metric")
+    parser.add_argument("--reject-regex", help="Regex identifying an expected compile-time candidate rejection")
     parser.add_argument("--timeout", type=float, default=None, help="Per-candidate timeout in seconds")
     parser.add_argument("--set-env", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to compile, validate, and measure")
@@ -203,6 +214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         base_env = _parse_env(args.set_env)
         pattern = re.compile(args.metric_regex) if args.metric_regex else None
+        reject_pattern = re.compile(args.reject_regex) if args.reject_regex else None
     except (ValueError, re.error) as exc:
         parser.error(str(exc))
 
@@ -229,10 +241,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         run = discovery if smem_rank == 0 and tmem_rank == 0 else _run_candidate(
                             command, base_env, manifest, schedule_rank, memory_space_rank, smem_rank, tmem_rank,
                             args.schedule_topk, args.memory_space_topk, smem_topk, tmem_topk, args.timeout)
-                        record = _result_record(run, pattern)
+                        record = _result_record(run, pattern, reject_pattern)
                         output.write(json.dumps(record, sort_keys=True) + "\n")
                         output.flush()
-                        if record["status"] != "passed":
+                        if record["status"] not in {"passed", "rejected"}:
                             failures += 1
                             if run.stderr:
                                 print(run.stderr, end="", file=os.sys.stderr)

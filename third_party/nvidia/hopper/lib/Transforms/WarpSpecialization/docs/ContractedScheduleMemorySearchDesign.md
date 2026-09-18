@@ -317,9 +317,11 @@ facts from IR. `TRITON_WS_SEARCH_MANIFEST` records:
 - validation and process status.
 
 `python/triton/tools/autows_search.py` discovers the frontiers, verifies that
-requested ranks were applied, and records results. The driver may execute
-independent tuples in parallel, but the compiler pipeline within each tuple is
-ordered schedule-first, memory-second.
+requested ranks were applied, and records results. An expected validator
+diagnostic can be classified as `rejected`, separately from a compilation or
+correctness `failed` result. The driver may execute independent tuples in
+parallel, but the compiler pipeline within each tuple is ordered schedule-first,
+memory-second.
 
 ## 8. Schedule-aware channel validation
 

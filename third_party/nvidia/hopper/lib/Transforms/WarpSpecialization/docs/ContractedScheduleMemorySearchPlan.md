@@ -8,22 +8,19 @@ This file tracks implementation history, remaining work, and validation status.
 **Status:** Milestones A-C are complete. Milestone D has reached a focused
 annotation-free FA-backward correctness result, but broad correctness and
 performance validation are still required before removing the annotated
-fallback. Milestone E has not started. For D120426461, the production-shaped
-A3/B2 candidate passes correctness; the B-early/A2-B3 candidate still hangs and
-must be fixed or rejected before evaluating the full frontier.
+fallback. Milestone E has not started. For D120426461, the full bounded
+4-schedule × 3-SMEM-plan product is executable: nine tuples pass numerical
+correctness and all three B-early tuples are rejected before launch.
 
 The remaining work is:
 
-1. Connect the implemented weighted-cycle solver to a post-memory,
-   schedule-aware protocol builder and use it to reject the unsafe D120
-   B-early candidates before GPU execution.
-2. Measure D120 candidates on the target shapes and confirm whether A3/B2 wins.
-3. Validate annotation-free FA backward over its supported correctness matrix,
+1. Measure D120 candidates on the target shapes and confirm whether A3/B2 wins.
+2. Validate annotation-free FA backward over its supported correctness matrix,
    then compare it with the annotated baseline under sanitizers and performance
    measurement.
-4. Remove the remaining source memtype annotations only if the annotation-free
+3. Remove the remaining source memtype annotations only if the annotation-free
    candidate passes those gates.
-5. Verify search-off neutrality, measure compile-time/candidate-count growth,
+4. Verify search-off neutrality, measure compile-time/candidate-count growth,
    and choose production search caps and fallback policy.
 
 **Implemented first slice:** Contracted search now derives its lower II from
@@ -157,9 +154,10 @@ passes numerical correctness on B200 for schedule rank 1 plus the A3/B2 SMEM
 plan. Direct-grid output staging rotates the eight straight-line stores through
 the selected three-copy ring; its data slots and barrier phases are checked at
 the code-partition boundary. The adjacent A-early/A2-B2 candidate also passes
-correctness. The currently paired B-early/A2-B3 cross-product candidate still
-hangs and remains an explicit candidate-safety gap; it must be fixed or rejected
-before claiming the entire D120 frontier is executable.
+correctness. The committed product command evaluates all four schedule ranks
+against all three SMEM ranks. Nine tuples pass numerical correctness; the three
+B-early tuples are classified as compile-time `rejected`, with no GPU launch or
+timeout.
 
 **Production-shaped FA-backward oracle:** The existing BM64 pre-modulo fixture
 already proves that Contracted top-K retains the target five-GEMM schedule with
@@ -878,6 +876,24 @@ python python/triton/tools/autows_search.py \
   python path/to/kernel_correctness_and_benchmark.py
 ```
 
+The production-shaped D120 sweep is:
+
+```shell
+python python/triton/tools/autows_search.py \
+  --schedule-topk=4 --memory-space-topk=1 \
+  --smem-topk=3 --tmem-topk=1 \
+  --reject-regex='warp specialization rejected an unsafe post-memory channel protocol' \
+  --metric-regex='latency_ms=([0-9.]+)' \
+  --set-env=TRITON_D120_BENCHMARK=1 \
+  --results=/tmp/d120-rmsnorm-gemm-search.jsonl -- \
+  python -m pytest -s --tb=short \
+  python/test/unit/language/test_tutorial09_warp_specialization.py::test_d120_rmsnorm_gemm_search
+```
+
+The pytest consumes the manifest path supplied by the driver. Safe tuples run
+the numerical check and report latency; validator failures are recorded as
+`rejected` and do not make the overall sweep fail.
+
 #### D120426461 example
 
 The measured set includes at least:
@@ -1405,6 +1421,8 @@ a hard correctness floor on the structural path.
       planned channels and returns a zero-distance witness.
 - [x] Post-memory channel-cycle validation rejects D120 B-early before launch
       while retaining A-early with the A2/B3 memory plan.
+- [x] The full bounded D120 product runs without hangs: nine tuples pass
+      correctness and the three B-early tuples are rejected before launch.
 - [ ] D120 measured winner is A3/B2 on the target shapes.
 - [x] FA-backward target schedule exists without stage/order annotations.
 - [x] FA-backward target memory plan exists without copy/id/offset pins.
