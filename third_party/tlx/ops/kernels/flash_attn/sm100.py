@@ -682,17 +682,26 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
 
     # allocate SMEM buffers and barriers
     NUM_Q_BUFS: tl.constexpr = NUM_GROUPS_PER_CTA * NUM_BUFFERS_Q
-    q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_Q_BUFS)
+    # In 2CTA mode the epilogue output tile shares Q's SMEM backing. O has
+    # fewer buffers than Q (same shape); the shared group tiles O from
+    # offset 0 of Q's backing.
+    qo_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_Q_BUFS, reuse=qo_smem_alias)
     BLOCK_N_KV: tl.constexpr = BLOCK_N // NUM_CTAS
     if USE_2CTA:
         # Separate k_tiles and v_tiles. K loaded as (N/2, D), local_trans to (D, N/2).
         # V loaded as (N, D/2).
         k_tiles = tlx.local_alloc((BLOCK_N_KV, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
         v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM_KV), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
-        o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_GROUPS_PER_CTA, reuse=q_tiles)
+        o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_GROUPS_PER_CTA, reuse=qo_smem_alias)
     else:
         kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
         o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_MMA_GROUPS)
+
+    if USE_2CTA:
+        qo_smem_alias.set_buffer_overlap(
+            tlx.reuse_group(q_tiles, o_tiles, group_type=tlx.reuse_group_type.shared)
+        )
 
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_Q_BUFS)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_Q_BUFS)
@@ -2622,8 +2631,11 @@ def _attn_bwd_ws(
     # =========================================================================
     # Allocate SMEM and TMEM buffers
     # =========================================================================
-    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
-    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
+    # dK/dV epilogue staging shares K/V SMEM (see sdv/sdk_store_buf below).
+    k_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    v_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV, reuse=k_smem_alias)
+    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV, reuse=v_smem_alias)
     q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
     do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
 
@@ -2640,12 +2652,19 @@ def _attn_bwd_ws(
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
-    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
-    #   the dpT dot — precedes dv_fulls).
-    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
-    #   so the compute task must wait on k_mma_done before writing sdk).
-    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
-    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
+    # - sdv shares v_tiles' backing (free after dv_fulls; MMA's last
+    #   v_tiles read — the dpT dot — precedes dv_fulls).
+    # - sdk shares k_tiles' backing (MMA's dq dot still reads k_tiles after
+    #   dk_fulls, so the compute task must wait on k_mma_done before writing
+    #   sdk).
+    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_smem_alias)
+    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_smem_alias)
+    v_smem_alias.set_buffer_overlap(
+        tlx.reuse_group(v_tiles, sdv_store_buf, group_type=tlx.reuse_group_type.shared)
+    )
+    k_smem_alias.set_buffer_overlap(
+        tlx.reuse_group(k_tiles, sdk_store_buf, group_type=tlx.reuse_group_type.shared)
+    )
 
     sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
     sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
