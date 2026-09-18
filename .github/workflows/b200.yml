@@ -16,6 +16,10 @@ on:
       - '!python/test/unit/language/test_tlx_*_gfx1250.py'
       - '!python/test/unit/language/test_tlx_*_hip.py'
       - '!python/test/unit/tlx_ops/*_gfx950.py'
+      - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/tlx_ops/*_gfx1250.py'
+      - '!python/test/unit/tlx_ops/*_hip.py'
+      - '!python/test/unit/tlx_ops/*_sm90.py'
       - '!python/test/unit/language/test_tlx_*_sm90.py'
       # Agent instructions and skills do not affect generated code.
       - '!.agents/**'
@@ -37,6 +41,10 @@ on:
       - '!python/test/unit/language/test_tlx_*_gfx1250.py'
       - '!python/test/unit/language/test_tlx_*_hip.py'
       - '!python/test/unit/tlx_ops/*_gfx950.py'
+      - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/tlx_ops/*_gfx1250.py'
+      - '!python/test/unit/tlx_ops/*_hip.py'
+      - '!python/test/unit/tlx_ops/*_sm90.py'
       - '!python/test/unit/language/test_tlx_*_sm90.py'
       # Agent instructions and skills do not affect generated code.
       - '!.agents/**'
@@ -236,7 +244,7 @@ jobs:
             python/test/unit/language/test_tlx_*_any.py
             python/test/unit/language/test_tlx_*sm90up*.py
             python/test/unit/language/test_tlx_*sm100*.py
-            python/test/unit/tlx_ops/test_*sm100*.py
+            python/test/unit/tlx_ops/test_*_sm100.py
           )
           # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
           # separate b200-torchtlx-test job below, not this pinned-PyTorch job.

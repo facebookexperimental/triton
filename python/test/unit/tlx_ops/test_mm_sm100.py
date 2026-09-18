@@ -1,35 +1,42 @@
-"""Split-K workspace layout for ``tlx.ops.mm`` (sm100).
+"""sm100 L1 correctness for ``tlx.ops.mm``.
 
-White-box: the public API cannot pin ``SPLIT_K``/``NUM_CTAS``, and the invariant
-is host arithmetic whose only symptom is silently wrong rows.
+Runs the synthetic list plus the sm100 focus list -- the same set the perf
+suite measures. Shapes live in ``triton.tlx.ops.kernels.mm._shapes``, so one
+disabled for a correctness bug is automatically not benchmarked either.
 
-The bug: workspace was ``(SPLIT_K * M, N)``, giving split ``s`` the rows
-``[s*M, (s+1)*M)``, but the epilogue stores whole ``BLOCK_SIZE_M`` tiles on a
-``padded_num_pid_m`` grid. The overhang is interior to the descriptor, so TMA
-does not drop it and it overwrites split ``s+1``'s partials.
+A shape the op declines is reported as a skip with the reason, never as a
+pass.
 
-Two triggers: ``M % BLOCK_SIZE_M != 0``, or ``NUM_CTAS=2`` with an odd tile
-count, which pads by a whole tile row even when ``M % BLOCK_SIZE_M == 0``.
+TODO: cover the config variants dropped with the tutorial copy of this kernel --
+USE_WARP_BARRIER and NUM_CTAS=2. Only the heuristic-selected config runs today.
 
-The layout tests need no GPU and no compile.
+The split-K tests include white-box workspace-layout coverage because the
+public API cannot pin ``SPLIT_K``/``NUM_CTAS``. A split's region must cover the
+whole padded tile grid; otherwise an epilogue tile can overwrite the next
+split's partials.
 """
+
 import contextlib
 import time
+
 import pytest
 import torch
 import triton
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops.kernels.mm import sm100
+from triton.tlx.ops.kernels.mm._shapes import SM100_FOCUS
 
-pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.mm split-K is sm100-only")
+from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case, shapes
 
-torch.manual_seed(0)
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires sm100")
 
 ARCH = "sm100"
 
-MAX_SECONDS_PER_CASE = 60
 
-REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", shapes(SM100_FOCUS))
+def test_mm(M, N, K, a_strides, b_strides, dtype_name):
+    run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
+
 
 GEOMETRIES = [
     # No overhang: M is a whole number of tiles and the count already divides
@@ -115,11 +122,7 @@ def test_heuristic_configs_have_a_sound_workspace(M, N, K):
 
 @contextlib.contextmanager
 def _pinned_config(overrides):
-    """Force ``space="heuristic"`` to compile exactly one config.
-
-    Overrides are applied on top of the shape's own heuristic config, so every
-    required key is present and only the axes under test move.
-    """
+    """Force ``space="heuristic"`` to compile exactly one config."""
     original = sm100.heuristic_config
 
     def one_config(M, N, K):
@@ -154,7 +157,6 @@ GPU_SHAPES = [
 SPLIT_KS_GPU = [1, 4]
 
 
-@pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.mm is sm100-only today")
 @pytest.mark.parametrize("SPLIT_K", SPLIT_KS_GPU)
 @pytest.mark.parametrize("M, N, K, NUM_CTAS", GPU_SHAPES)
 def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, SPLIT_K):
