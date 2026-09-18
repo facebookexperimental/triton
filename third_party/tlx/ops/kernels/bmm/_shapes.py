@@ -1,30 +1,49 @@
-"""Shared L1/L2 shapes for the gfx950 TorchTLX ``bmm`` provider."""
-
 from __future__ import annotations
 
-# Entries are [B, M, N, K, a_strides, b_strides, dtype]. A is (B, M, K),
-# B is (B, K, N). A batch stride of zero selects the shared-LHS specialization.
-SYNTHETIC: list[list] = [
-    [8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "fp16"],
-    [8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "bf16"],
-    # Unaligned K selects the register-load fallback rather than async LDS.
-    [2, 128, 128, 259, (128 * 259, 259, 1), (259 * 128, 128, 1), "fp16"],
-    # Exact shape handled by the shared-LHS specialization.
-    [2, 40, 256, 1956, (0, 1956, 1), (1956 * 256, 256, 1), "fp16"],
-]
+from typing import NamedTuple
 
-# The general aligned path and the specialized shared-LHS path are the current
-# performance targets. The odd-K register fallback remains L1-only.
-GFX950_FOCUS: list[list] = [
-    [8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "fp16"],
-    [8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "bf16"],
-    [2, 448, 160, 931, (0, 931, 1), (931 * 160, 160, 1), "fp16"],
-    [2, 1195, 256, 2309, (0, 2309, 1), (2309 * 256, 256, 1), "fp16"],
-]
+from .._shape_suites import FocusRegistry, FocusSuite
+
+
+class BMMShape(NamedTuple):
+    batch: int
+    m: int
+    n: int
+    k: int
+    a_strides: tuple[int, int, int]
+    b_strides: tuple[int, int, int]
+    dtype: str
+
+
+SYNTHETIC: tuple[BMMShape, ...] = (
+    BMMShape(8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "fp16"),
+    BMMShape(8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "bf16"),
+    # PERF: Exercises the register-load fallback.
+    BMMShape(2, 128, 128, 259, (128 * 259, 259, 1), (259 * 128, 128, 1), "fp16"),
+    # PERF: Exercises the shared-LHS specialization.
+    BMMShape(2, 40, 256, 1956, (0, 1956, 1), (1956 * 256, 256, 1), "fp16"),
+)
+
+# PERF: The odd-K fallback stays synthetic-only until it is competitive.
+GFX950_FOCUS_SUITE = FocusSuite(
+    name="gfx950_baseline",
+    op="bmm",
+    shapes=(
+        BMMShape(8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "fp16"),
+        BMMShape(8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "bf16"),
+        BMMShape(2, 448, 160, 931, (0, 931, 1), (931 * 160, 160, 1), "fp16"),
+        BMMShape(2, 1195, 256, 2309, (0, 2309, 1), (2309 * 256, 256, 1), "fp16"),
+    ),
+)
+
+FOCUS_SUITES = (GFX950_FOCUS_SUITE, )
+DEFAULT_SUITES = {"gfx950": ("gfx950_baseline", )}
+FOCUS = FocusRegistry("bmm", FOCUS_SUITES, DEFAULT_SUITES)
+
+GFX950_FOCUS = FOCUS.shapes("gfx950")
 
 
 def operand(batch, rows, cols, strides, dtype, device="cuda"):
-    """A dense or shared-batch tensor with exactly the recorded strides."""
     import torch
 
     batch_stride, row_stride, col_stride = strides

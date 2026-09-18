@@ -9,9 +9,11 @@ import torch
 
 try:
     from triton.tlx.ops.kernels.addmm import gfx950_torch
+    from triton.tlx.ops.kernels.addmm._shapes import FOCUS as SHAPE_SUITES
     from triton.tlx.ops.kernels.addmm._shapes import SYNTHETIC, flops, inputs, label
 except ImportError:  # not the fbtriton fork
     gfx950_torch = None
+    SHAPE_SUITES = None
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -26,16 +28,16 @@ DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 REL_PRECISION = {"float16": 2e-2, "bfloat16": 2e-2}
 
 
-def shapes(synthetic: bool = False) -> list[list]:
+def shapes(synthetic: bool = False, suites=None) -> list:
     if gfx950_torch is None:
         return []
-    return list(SYNTHETIC if synthetic else gfx950_torch.PERF_SHAPES)
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes("gfx950", suites))
 
 
-def cases(synthetic: bool = False) -> list[Case]:
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
     return [
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
-             label=label(*entry)) for entry in shapes(synthetic)
+             label=label(*entry)) for entry in shapes(synthetic, suites)
     ]
 
 
