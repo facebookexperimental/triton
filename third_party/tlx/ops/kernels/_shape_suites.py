@@ -10,7 +10,8 @@ ShapeT = TypeVar("ShapeT", bound=Hashable)
 class FocusSuite(Generic[ShapeT]):
     name: str
     op: str
-    shapes: tuple[ShapeT, ...]
+    shapes: tuple[ShapeT, ...] = ()
+    includes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,11 @@ class FocusRegistry(Generic[ShapeT]):
             raise ValueError(f"focus suite(s) {mismatched} do not map to op {self.op!r}")
 
         by_name = {suite.name: suite for suite in self.suites}
+        for suite in self.suites:
+            unknown = [name for name in suite.includes if name not in by_name]
+            if unknown:
+                raise ValueError(f"unknown focus suite(s) {unknown} included by {suite.name!r}")
+            self.resolved_shapes(suite.name)
         for arch, default_names in self.defaults.items():
             if len(default_names) != len(set(default_names)):
                 raise ValueError(f"duplicate default {self.op} focus suites for architecture {arch!r}")
@@ -52,12 +58,26 @@ class FocusRegistry(Generic[ShapeT]):
             requested = tuple(names)
         return tuple(self.suite(name) for name in dict.fromkeys(requested))
 
+    def resolved_shapes(self, name: str) -> tuple[ShapeT, ...]:
+
+        def resolve(suite_name: str, stack: tuple[str, ...]) -> tuple[ShapeT, ...]:
+            if suite_name in stack:
+                cycle = " -> ".join((*stack, suite_name))
+                raise ValueError(f"cyclic {self.op} focus suite includes: {cycle}")
+            suite = self.suite(suite_name)
+            result = list(suite.shapes)
+            for included in suite.includes:
+                result.extend(resolve(included, (*stack, suite_name)))
+            return tuple(dict.fromkeys(result))
+
+        return resolve(name, ())
+
     def shapes(self, arch: str, suites: Iterable[str] | None = None) -> tuple[ShapeT, ...]:
         selected = self._selected(arch, suites)
         seen: set[ShapeT] = set()
         result: list[ShapeT] = []
         for suite in selected:
-            for shape in suite.shapes:
+            for shape in self.resolved_shapes(suite.name):
                 if shape not in seen:
                     seen.add(shape)
                     result.append(shape)

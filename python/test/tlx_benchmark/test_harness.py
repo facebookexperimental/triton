@@ -667,6 +667,19 @@ def test_focus_suites_are_hardware_agnostic_and_deduplicate_in_definition_order(
     assert registry.shapes("gfx942", ("workload", )) == ((2, ), (3, ))
 
 
+def test_focus_suite_can_union_other_suites():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    first = FocusSuite("first", "mm", ((1, ), (2, )))
+    second = FocusSuite("second", "mm", ((2, ), (3, )))
+    combined = FocusSuite("all", "mm", includes=("first", "second"))
+    registry = FocusRegistry("mm", (first, second, combined), {"gfx950": ("all", )})
+
+    assert registry.resolved_shapes("all") == ((1, ), (2, ), (3, ))
+    assert registry.shapes("gfx950") == ((1, ), (2, ), (3, ))
+    assert registry.selected_suite_names("gfx950") == ("all", )
+
+
 def test_focus_suite_selection_rejects_unknown_names():
     from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
 
@@ -749,14 +762,17 @@ def test_suite_listing_shows_defaults():
 
     common = FocusSuite("common", "mm", ((1, ), ))
     optional = FocusSuite("optional", "mm", ((2, ), ))
-    bench = type(
-        "Bench", (),
-        {"SHAPE_SUITES": FocusRegistry("mm", (common, optional), {
+    combined = FocusSuite("all", "mm", includes=("common", "optional"))
+    bench = type("Bench", (), {
+        "SHAPE_SUITES":
+        FocusRegistry("mm", (common, optional, combined), {
+            "gfx950": ("all", ),
             "gfx942": ("common", ),
-            "gfx950": ("common", ),
-        })})
+        })
+    })
 
-    assert driver.suite_listing(bench) == ("common: default_for=gfx942,gfx950\noptional: default_for=-")
+    assert driver.suite_listing(bench) == ("gfx950 default => all => common+optional\n"
+                                           "gfx942 default => common")
 
 
 def test_suite_shape_listing_shows_typed_shapes():
