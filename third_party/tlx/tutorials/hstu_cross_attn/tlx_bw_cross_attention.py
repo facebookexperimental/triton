@@ -240,12 +240,18 @@ def attn_bwd_ws(  # noqa C901
 
     # allocate TMEM buffers and barriers
     # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem
+    )
+    # pyrefly: ignore [missing-attribute]
     qk_trans_tiles = tlx.local_alloc(
         (BLOCK_N, BLOCK_M),
         tl.float32,
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
 
     # P
@@ -257,7 +263,17 @@ def attn_bwd_ws(  # noqa C901
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_trans_tiles,
+        reuse=qk_tmem_alias,
+    )
+    # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            qk_trans_tiles,
+            p_tiles,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        )
     )
     # TRANSPOSE: store dq transposed as dq^T ([DimQ, BLOCK_M]) instead of
     # [BLOCK_M, DimQ]. With BLOCK_M < DimQ this shrinks its TMEM column footprint
@@ -265,6 +281,13 @@ def attn_bwd_ws(  # noqa C901
     # the same [*, BLOCK_M] footprint as dp ([BLOCK_N, BLOCK_M]) so dp can
     # time-share it cleanly. dq^T = (dS @ K)^T = K^T @ dS^T; the reduce epilogue
     # transposes it back before the dQ store.
+    # dp shares dq's backing (see dp_tiles below): dP buffer i aliases dQ
+    # buffer i's region with sequential lifetimes.
+    # pyrefly: ignore [missing-attribute]
+    dp_dq_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem
+    )
     if TRANSPOSE:
         # pyrefly: ignore [missing-attribute]
         dq_tiles = tlx.local_alloc(
@@ -273,6 +296,7 @@ def attn_bwd_ws(  # noqa C901
             NUM_BUFFERS_TMEM,
             # pyrefly: ignore [missing-attribute]
             tlx.storage_kind.tmem,
+            reuse=dp_dq_alias,
         )
     else:
         # pyrefly: ignore [missing-attribute]
@@ -282,19 +306,31 @@ def attn_bwd_ws(  # noqa C901
             NUM_BUFFERS_TMEM,
             # pyrefly: ignore [missing-attribute]
             tlx.storage_kind.tmem,
+            reuse=dp_dq_alias,
         )
 
     # pyrefly: ignore [missing-attribute]
     dp_tiles = tlx.local_alloc(
         (BLOCK_N, BLOCK_M),
         tl.float32,
-        1,
+        NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        # dp time-shares dq's (larger) TMEM. Without this reuse the standalone
-        # tiles overflow 512 TMEM columns at BLOCK_M=128, so dk_tiles overlaps a
-        # neighbor and its upper column-subtiles get corrupted.
-        reuse=dq_tiles,
+        # dp time-shares dq's (larger) TMEM. Without this sharing the
+        # standalone tiles overflow 512 TMEM columns at BLOCK_M=128, so
+        # dk_tiles overlaps a neighbor and its upper column-subtiles get
+        # corrupted.
+        reuse=dp_dq_alias,
+    )
+    # pyrefly: ignore [missing-attribute]
+    dp_dq_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            dq_tiles,
+            dp_tiles,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        )
     )
     # pyrefly: ignore [missing-attribute]
     dk_tiles = tlx.local_alloc(
@@ -1325,12 +1361,18 @@ def attn_bwd_ws_2kv(  # noqa C901
 
     # allocate TMEM buffers and barriers
     # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem
+    )
+    # pyrefly: ignore [missing-attribute]
     qk_trans_tiles = tlx.local_alloc(
         (BLOCK_N, BLOCK_M),
         tl.float32,
         2,  # double-KV: depth-2 (n0, n1) so the two pT recomputes overlap
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
 
     # P
@@ -1339,10 +1381,20 @@ def attn_bwd_ws_2kv(  # noqa C901
         (BLOCK_N, BLOCK_M),
         # pyrefly: ignore [missing-attribute]
         tlx.dtype_of(desc_do),
-        2,  # double-KV: matches qk_trans depth (reuse aliasing)
+        2,  # double-KV: matches qk_trans depth (shared backing)
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_trans_tiles,
+        reuse=qk_tmem_alias,
+    )
+    # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            qk_trans_tiles,
+            p_tiles,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        )
     )
     # Transpose-only variant: dq is stored transposed as dq^T
     # ([DimQ, BLOCK_M]) instead of [BLOCK_M, DimQ]. With BLOCK_M < DimQ this shrinks
