@@ -103,6 +103,14 @@ def _cluster_llir(src, size, multicast, synchronization):
     cond = re.search(r"(%[\w.]+) = icmp ugt i32 " + re.escape(wave[1]) + r", 1\n", src) if wave else None
     if cond is None:
         raise RuntimeError("cluster experiment could not identify the fused A/B wave split")
+    entry = re.search(r"(?m)^v\d+:\n", src)
+    if re.search(r"(?m)^[\w.$]+:", src[entry.end():wave.start()]):
+        raise RuntimeError("cluster experiment expected wave.id in the entry block")
+    # A single group lets LLVM move the existing predicate into the tile loop,
+    # after the priming loads. Define our predicate in the entry block so it
+    # dominates every multicast load, including priming and peeled refills.
+    wave_end = src.index("\n", wave.end()) + 1
+    src = src[:wave_end] + f"  %cluster_is_b = icmp ugt i32 {wave[1]}, 1\n" + src[wave_end:]
     if size == 4:
         entry = re.search(r"(?m)^v\d+:\n", src)
         rank = ("  %cluster_rank = call i32 @llvm.amdgcn.cluster.workgroup.id.x()\n"
@@ -120,10 +128,10 @@ def _cluster_llir(src, size, multicast, synchronization):
         count += 1
         mask, desc = f"%cluster_mask_{count}", f"%cluster_desc_{count}"
         if size == 2:
-            code = (f"  {mask} = select i1 {cond[1]}, <8 x i32> <i32 3, i32 0, i32 0, i32 0, "
+            code = (f"  {mask} = select i1 %cluster_is_b, <8 x i32> <i32 3, i32 0, i32 0, i32 0, "
                     "i32 0, i32 0, i32 0, i32 0>, <8 x i32> zeroinitializer\n")
         else:
-            code = (f"  %cluster_scalar_{count} = select i1 {cond[1]}, i32 %cluster_bmask, i32 %cluster_amask\n"
+            code = (f"  %cluster_scalar_{count} = select i1 %cluster_is_b, i32 %cluster_bmask, i32 %cluster_amask\n"
                     f"  {mask} = insertelement <8 x i32> zeroinitializer, i32 %cluster_scalar_{count}, i64 0\n")
         return code + f"  {desc} = or <8 x i32> {match[2]}, {mask}\n" + match[1] + desc + match[3]
 
