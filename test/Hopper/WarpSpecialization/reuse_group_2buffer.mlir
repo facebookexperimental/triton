@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 channel-cycle-audit=true" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 //
 // Verify that 2-buffer reuse group logic moves the late buffer's (dq)
 // producer_acquire before the early buffer's (dpT) producer.
@@ -16,6 +16,11 @@
 // CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
 // CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
 // CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
+// CHECK: tt.func public @_attn_bwd_persist{{.*}}nvws.test.channel_cycle_edge_count = 84 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 36 : i64
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 9 : i64
+// CHECK-SAME: nvws.test.channel_cycle_tmem_a2_groups = 2 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 8 : i64
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 // CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
 // CHECK: %dpT_{{[0-9]+}} = ttng.tc_gen5_mma

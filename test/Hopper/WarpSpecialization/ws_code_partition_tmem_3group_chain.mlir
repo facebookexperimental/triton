@@ -13,10 +13,12 @@
 // CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
 // CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
 // CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
-// CHECK: tt.func public @_attn_bwd_persist{{.*}}nvws.test.channel_cycle_event_count = 32 : i64
-// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 8 : i64
+// CHECK: tt.func public @_attn_bwd_persist{{.*}}nvws.test.channel_cycle_edge_count = 96 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 40 : i64
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 10 : i64
+// CHECK-SAME: nvws.test.channel_cycle_tmem_a2_groups = 1 : i64
 // CHECK-SAME: nvws.test.channel_cycle_tmem_a5_groups = 1 : i64
-// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 8 : i64
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

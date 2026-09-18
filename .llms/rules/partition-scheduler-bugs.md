@@ -385,6 +385,26 @@
   `ws_memory_planner_bwd_buffer_reuse.mlir` checks dynamic and finite nested-loop
   behavior with the search-selected A5 plan.
 
+### 41. Post-memory validation omitted two-member TMEM temporal reuse (2026-09-17, fixed)
+
+- **Symptom**: FA-backward fixtures with valid overlapping two-member TMEM
+  reuse groups remained partially `Unsupported` after their three-member A5
+  group was modeled.
+- **Root cause**: The normalized ownership-chain implementation admitted A2
+  only from the SMEM collector, even though code partitioning uses the same
+  `verifyReuseGroup2`/`orderReuseGroup2` protocol for overlapping TMEM pairs.
+- **Fix**: Admit single-copy, non-subtiled TMEM A2 pairs with one unambiguous
+  common cadence. Retain both ordinary token edges and add the same-transaction
+  early-to-late plus next-transaction late-to-early physical-slot edges.
+  A non-positive task-timeline wrap into an asynchronously seeded wait receives
+  one unit of prologue credit. A wrap into an acquire receives it only when a
+  positive-distance slot edge proves initial empty-slot credit. Disjoint A4,
+  whole-overwrite A6, and unclassified TMEM remain fail-closed.
+- **Lit tests**: `reuse_group_2buffer.mlir` checks two admitted A2 groups;
+  `ws_code_partition_tmem_3group_chain.mlir` and
+  `ws_memory_planner_bwd_buffer_reuse.mlir` check A2 alongside A5 on captured
+  FA-backward TTGIR.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

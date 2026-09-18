@@ -222,7 +222,12 @@ protocol graph. Each ordinary loop-cadence SMEM channel contributes
 `Release(i) -> Acquire(i + copies)` slot-reuse edge. The task-local
 `Acquire -> Ready` and `Wait -> Release` spans carry the difference between
 their endpoint stages. Per-task serialized event classes likewise contribute
-`next.stage - current.stage`, plus one on the wrap edge. Events at the same
+`next.stage - current.stage`, plus one on the wrap edge. Wraps are tagged
+separately from ordinary task-order edges. A non-positive wrap into a consumer
+wait whose asynchronous ready event is seeded by the nested-loop prologue gets
+one additional unit of startup credit. A wrap into a producer acquire receives
+credit only when a positive-distance slot-reuse edge proves an initially empty
+physical slot; ordinary acquire edges do not. Events at the same
 anchor and on the same side of it form an unordered equivalence class.
 TMA-ready, MMAv5-producer-ready, and MMAv5-release events are asynchronous
 completions: preceding task events order their issue, but the completion does
@@ -276,7 +281,9 @@ case. Single-copy A2 dependency pairs and A3 same-block SMEM chains are also
 supported. They retain each channel's ordinary one-copy edge and add the
 physical ownership chain: adjacent releases gate the next producer in the same
 iteration, and the final release gates the first producer in the next
-iteration. A finite straight-line chain omits that wrap. A5 cross-partition
+iteration. A finite straight-line chain omits that wrap. Overlapping
+two-member TMEM A2 groups use the same dependency-pair graph after passing the
+TMEM range and dependency checks in `verifyReuseGroup2`. A5 cross-partition
 TMEM chains retain their ordinary per-channel edges and add only the first/last
 endpoint pair used by synchronization insertion: first release to last acquire
 within a transaction, then last release to first acquire in the next

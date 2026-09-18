@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 channel-cycle-audit=true" | FileCheck %s
 
 // A TMEM reuse-group channel that ping-pongs through async MMAs must keep its
 // WAR reuse barrier; needExplicitReuseWait must NOT elide it just because the
@@ -16,6 +16,10 @@
 // elided and the CHECK-NEXT below does not match.
 
 // CHECK-LABEL: tt.func public @reuse_war_async
+// CHECK-SAME: nvws.test.channel_cycle_status = "unsupported"
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 4 : i64
+// CHECK-SAME: nvws.test.channel_cycle_tmem_a2_groups = 1 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 1 : i64
 // CHECK: ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>{{.*}}direction = "backward"{{.*}}dstTask = 2 : i32
 // CHECK-NEXT: ttng.tc_gen5_mma {{.*}}, %false, %true,
 

@@ -175,8 +175,25 @@ next. MMAv5 producer-ready events are classified as asynchronous completions.
 Exact finite-loop expansion retains negative task edges so the prologue/drain
 boundary removes nonexistent instances rather than manufacturing a
 zero-distance cycle. The production FA-backward three-group fixture now reports
-one supported A5 group; unrelated ordinary and A2/A4/A6 TMEM protocols remain
+one supported A5 group; unrelated ordinary and A4/A6 TMEM protocols remain
 unsupported.
+
+**Implemented sixteenth slice:** Overlapping two-member TMEM A2 groups now
+enter the post-memory graph through the same `verifyReuseGroup2` and
+`orderReuseGroup2` predicates used by synchronization insertion. Admission is
+limited to single-copy, non-subtiled members with one unambiguous plan and one
+common single-CTA scheduled loop or finite straight-line scope. Each member
+retains its ordinary token edge; the physical slot adds early-release to
+late-acquire in the same transaction and late-release to early-acquire in the
+next. The production FA-backward fixtures now validate an additional A2 group
+alongside A5. Disjoint A4 packing, A6 whole-allocation overwrite, and ordinary
+non-reused TMEM protocols remain unsupported. For a late MMAv5 reader, a
+non-positive task-timeline wrap into an asynchronously seeded wait receives
+one unit of prologue credit, matching the explicit WAR protocol's startup.
+A wrap into an acquire receives credit only when a positive-distance slot edge
+proves an initially empty physical slot, preserving the D120 B-early non-wrap
+rejection. `ws_code_partition_reuse_war_async_consumer.mlir` covers this A2
+startup case.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -1005,7 +1022,13 @@ The intended internal representation is:
 using EventId = unsigned;
 
 enum class ProtocolEventKind { Acquire, Ready, Wait, Release };
-enum class ProtocolEdgeKind { TaskOrder, DataReady, SlotReuse, ControlFlow };
+enum class ProtocolEdgeKind {
+  TaskOrder,
+  DataReady,
+  SlotReuse,
+  ControlFlow,
+  TaskWrap
+};
 
 struct SchedulePoint {
   Operation *scope; // The scheduled loop or straight-line parent.
@@ -1248,10 +1271,10 @@ The implementation sequence is:
    unambiguous plan per member. Replace member-local copy-depth edges with the
    actual cross-channel physical-slot predecessor. Model loop groups cyclically
    and direct-grid groups as finite sequences without a fabricated wraparound.
-   The same representation supports A2/A3 single-copy SMEM chains while
-   retaining their ordinary per-channel token edges. A5 cross-partition TMEM
-   groups reuse their unique dependency-chain order and add only the endpoint
-   constraints emitted by code partitioning.
+   The same representation supports A2/A3 single-copy SMEM chains and A2
+   overlapping TMEM pairs while retaining their ordinary per-channel token
+   edges. A5 cross-partition TMEM groups reuse their unique dependency-chain
+   order and add only the endpoint constraints emitted by code partitioning.
 7. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
@@ -1268,8 +1291,8 @@ The implementation sequence is:
    launching it.
 
 The audit slice does not inspect emitted tokens/barriers or claim that every
-unsupported control-flow shape is safe. A5 full-overlap TMEM aliasing is
-covered; ordinary and A2/A4/A6 TMEM shapes remain follow-up extensions to the
+unsupported control-flow shape is safe. A2/A5 temporal TMEM aliasing is
+covered; ordinary and A4/A6 TMEM shapes remain follow-up extensions to the
 planned graph, followed by the materialized graph. The planned-protocol gate
 now eliminates the D120 runtime hang by rejecting the proven cycle before
 code-partition mutation.

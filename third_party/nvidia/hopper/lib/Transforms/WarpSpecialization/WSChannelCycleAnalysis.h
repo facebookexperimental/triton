@@ -30,6 +30,7 @@ enum class ProtocolEdgeKind {
   DataReady,
   SlotReuse,
   ControlFlow,
+  TaskWrap,
 };
 
 /// One event in a normalized channel protocol. The post-memory and

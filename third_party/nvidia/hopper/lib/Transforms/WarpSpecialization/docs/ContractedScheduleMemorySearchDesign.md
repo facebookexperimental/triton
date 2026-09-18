@@ -86,7 +86,7 @@ WSMemoryPlanner remain authoritative for physical buffering.
 | Logical memory space | Which ambiguous values use SMEM or TMEM | Representability and explicit annotation overrides | Heuristic rank zero; deterministic subset order | Implemented for direct/transposed LHS siblings |
 | SMEM plan | Copy count per logical block | Safety floors and byte budget | Heuristic plan rank zero; structural copy neighbors | Implemented, including fixed-group mode |
 | TMEM plan | Reuse groups and column placement | Dependency order and 512-column capacity | Heuristic rank zero; low-aliasing representative; remaining score order | Implemented for ordinary allocations |
-| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Post-memory builder covers ordinary SMEM, staging WAR, A1/A2/A3 SMEM reuse, and A5 TMEM reuse |
+| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Post-memory builder covers ordinary SMEM, staging WAR, A1/A2/A3 SMEM reuse, and A2/A5 TMEM reuse |
 
 Ranks are local enumeration positions, not stable semantic identities. Tests,
 manifests, and result databases should retain canonical signatures as well as
@@ -350,7 +350,13 @@ The graph solver is independent of MLIR synchronization op classes:
 
 ```cpp
 enum class ProtocolEventKind { Acquire, Ready, Wait, Release };
-enum class ProtocolEdgeKind { TaskOrder, DataReady, SlotReuse, ControlFlow };
+enum class ProtocolEdgeKind {
+  TaskOrder,
+  DataReady,
+  SlotReuse,
+  ControlFlow,
+  TaskWrap
+};
 
 struct ProtocolEvent {
   EventId id;
@@ -584,8 +590,8 @@ Current limitations:
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
 - The post-memory builder rejects proven zero-distance cycles and covers A1
-  multi-buffered plus A2/A3 single-copy SMEM reuse and A5 cross-partition TMEM
-  reuse. Dynamic negative-total cycles, ordinary/A2/A4/A6 TMEM protocols,
+  multi-buffered plus A2/A3 single-copy SMEM reuse and A2/A5 temporal TMEM
+  reuse. Dynamic negative-total cycles, ordinary/A4/A6 TMEM protocols,
   multi-CTA, other specialized protocols, and post-insertion coverage remain
   open.
 

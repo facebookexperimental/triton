@@ -648,15 +648,23 @@ pp: producer = local_store (task 3, comp)     → consumer = tc_gen5_mma (task 1
   `needExplicitReuseWait` returns `false`.
 - Action: No change. Partition-internal ordering guarantees correctness.
 
-The post-memory validator models single-copy SMEM A2 pairs using the same
-`verifyReuseGroup2` and `orderReuseGroup2` helpers. Each logical channel keeps
-its ordinary `release(c, i) -> acquire(c, i+1)` edge because A2 uses distinct
-per-channel tokens. The shared physical slot adds
+The post-memory validator models single-copy SMEM and overlapping-TMEM A2
+pairs using the same `verifyReuseGroup2` and `orderReuseGroup2` helpers. Each
+logical channel keeps its ordinary `release(c, i) -> acquire(c, i+1)` edge
+because A2 uses distinct per-channel tokens. The shared physical slot adds
 `release(early, i) -> acquire(late, i)` and
 `release(late, i) -> acquire(early, i+1)`. These normalized edges represent
 either the explicit reuse waits above or the same-task order that proves those
 waits redundant. Initial support requires one unambiguous plan per channel,
-one common `scf.for` or finite straight-line scope, and no subtiled member.
+one common single-CTA `scf.for` or finite straight-line scope, one copy per
+member, and no subtiled member. Disjoint TMEM A4 packing and A6 whole-overwrite
+groups remain fail-closed. When the late reader is an MMAv5, code partitioning
+makes it asynchronous before deciding the backward WAR. The validator models
+the resulting pipeline startup as one unit of prologue credit on a
+non-positive task-timeline wrap into an asynchronously seeded wait; it does
+not grant that credit to an ordinary producer acquire. A task wrap into an A2
+acquire does receive the slot's initial-empty credit when the graph also has
+the matching positive-distance physical reuse edge.
 
 ### FA-forward P publication: schedule-proven empty-edge elision
 
@@ -925,8 +933,9 @@ The intermediate `first -> ... -> last` ownership transitions are already
 represented by data-ready and task-order edges; adding a second synthetic
 chain would over-constrain the graph. Initial validation support requires a
 full-overlap TMEM group (one starting offset), one unambiguous protocol per
-member, and one common single-CTA scheduled `scf.for`. A4/A6 spatial packing,
-subtiled members, and other TMEM channels remain unsupported.
+member, and one common single-CTA scheduled `scf.for`. A2 is handled by the
+two-member path above; A4/A6 spatial packing, subtiled members, and ordinary
+non-reused TMEM channels remain unsupported.
 
 ### Status / caveats
 
