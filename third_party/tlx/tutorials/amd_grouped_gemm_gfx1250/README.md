@@ -189,9 +189,10 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py
 ```
 
 Each tuple is `(G, M_per_group, N, K)`. The default cases cover the requested
-`G=1/8/32`, `M_per_group=32768/65536`, `N=4096/8192`, `K=4096`
-combinations plus the `16x4096x4096x4096` reference. The `G=1` cases run
-ordinary GEMM through the same kernel and configuration.
+`G=8/32`, `M_per_group=32768/65536`, `N=4096/8192`, `K=4096`
+combinations plus the `16x4096x4096x4096` reference. The `G=1` cases use
+`M=N=K=4096`, `8192`, and `16384` and run ordinary GEMM through the same
+kernel and configuration.
 
 The sweep defaults to `256x256x128`, depth 2, and the within-group hybrid with
 cross-tile prefetch and TDM output stores enabled for every shape. It uses
@@ -220,7 +221,7 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
 
 # Run a single-group (ordinary GEMM) case.
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
-  --case 1,32768,8192,4096
+  --case 1,4096,4096,4096
 ```
 
 ## Cluster and Operand Reuse Options
