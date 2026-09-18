@@ -1088,6 +1088,20 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
     dqk_trans = dqk_trans.to(k.dtype)
 
+    # Match TLX's dK-before-dQ epilogue order. dK and dQ share the same
+    # stage/order annotation, so their source order is their scheduled order.
+    dk += tl.dot(
+        dqk_trans,
+        tl.trans(q_trans),
+        allow_tf32=ALLOW_TF32,
+        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
+        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
+        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
+        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
+        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
+        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if DQ_REUSE else None),
+    )
+
     if DQ_REDUCE and ENABLE_TMA:
         # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
         # (tl.trans(k) is a cheap memdesc_trans on the SMEM k tile), then transpose
@@ -1138,20 +1152,6 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             ALLOW_TF32=ALLOW_TF32,
         )
 
-    # dQ and dK intentionally share the same stage/order annotation. Equal-cluster
-    # MMAs retain program order, so placing dK after dQ matches the TLX schedule.
-    # The factor `alpha` is delayed until the end of the function to reduce cost.
-    dk += tl.dot(
-        dqk_trans,
-        tl.trans(q_trans),
-        allow_tf32=ALLOW_TF32,
-        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
-        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
-        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
-        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
-        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
-        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if DQ_REUSE else None),
-    )
     return dk, dv
 
 
