@@ -94,29 +94,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
-// Once a user layout is materialized, require_layout becomes an identity
-// boundary. The concrete layout nested under its wrappers must remain available
-// to downstream layout scoring, including when the pass is run again.
+// After placeholder resolution, require_layout retains user_layout as an
+// identity anchor. Re-running RLC must keep both the boundary and its pin
+// provenance while propagating the effective physical MMA layout downstream.
 
 #pin_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
 #pin_user = #tlx.user_layout<#pin_mma>
-#pin = #tlx.no_verify_layout<#pin_user>
-#pin_dot = #ttg.dot_op<{opIdx = 0, parent = #pin_mma, kWidth = 4}>
-#pin_mid = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 1, 64], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK-LABEL: tt.func @require_layout_concrete_candidate_is_idempotent
-  tt.func @require_layout_concrete_candidate_is_idempotent(
-      %src: tensor<32x32xf32, #pin_mma>) -> tensor<32x32xf32, #pin_dot> {
-    // CHECK: %[[PIN_REQ:.*]] = ttg.require_layout
-    %req = ttg.require_layout %src : tensor<32x32xf32, #pin_mma> -> tensor<32x32xf32, #pin>
-    // CHECK: %[[PIN_MID:.*]] = tt.reshape %[[PIN_REQ]]
-    %mid = tt.reshape %req : tensor<32x32xf32, #pin> -> tensor<32x2x16xf32, #tlx.no_verify_layout<#pin_mid>>
-    // CHECK: %[[PIN_FLAT:.*]] = tt.reshape %[[PIN_MID]] {{.*}} -> tensor<32x32xf32, #ttg.dot_op
-    // CHECK-NEXT: tt.return %[[PIN_FLAT]]
-    %flat = tt.reshape %mid : tensor<32x2x16xf32, #tlx.no_verify_layout<#pin_mid>> -> tensor<32x32xf32, #tlx.no_verify_layout<#pin_mma>>
-    %out = ttg.convert_layout %flat : tensor<32x32xf32, #tlx.no_verify_layout<#pin_mma>> -> tensor<32x32xf32, #pin_dot>
-    tt.return %out : tensor<32x32xf32, #pin_dot>
+  // CHECK-LABEL: tt.func @require_layout_user_candidate_is_idempotent
+  tt.func @require_layout_user_candidate_is_idempotent(
+      %src: tensor<32x32xf32, #pin_mma>) -> tensor<32x32xf32, #pin_user> {
+    // CHECK: %[[PIN_TO_USER:.*]] = ttg.convert_layout %{{.*}} : tensor<32x32xf32, #{{.*}}> -> tensor<32x32xf32, #[[$PIN_USER:.*]]>
+    // CHECK: %[[PIN_REQ:.*]] = ttg.require_layout %[[PIN_TO_USER]] : tensor<32x32xf32, #[[$PIN_USER]]> -> tensor<32x32xf32, #[[$PIN_USER]]>
+    %req = ttg.require_layout %src : tensor<32x32xf32, #pin_mma> -> tensor<32x32xf32, #pin_user>
+    // CHECK: %[[PIN_NEXT:.*]] = arith.addf %[[PIN_REQ]], %[[PIN_REQ]] : tensor<32x32xf32, #[[$PIN_USER]]>
+    %next = arith.addf %req, %req : tensor<32x32xf32, #pin_user>
+    // CHECK-NEXT: tt.return %[[PIN_NEXT]]
+    tt.return %next : tensor<32x32xf32, #pin_user>
   }
 }
 

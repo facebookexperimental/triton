@@ -76,11 +76,7 @@ public:
   mlir::LogicalResult
   matchAndRewrite(ReleaseLayoutOp releaseLayoutOp,
                   mlir::PatternRewriter &rewriter) const override {
-    if (releaseLayoutOp.getSrc().getType() == releaseLayoutOp.getType()) {
-      rewriter.replaceOp(releaseLayoutOp, releaseLayoutOp.getSrc());
-      return success();
-    }
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
+    rewriter.replaceOpWithNewOp<ttg::ReleaseLayoutOp>(
         releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
     return success();
   }

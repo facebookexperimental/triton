@@ -481,6 +481,26 @@ static void lowerRequireLayouts(ModuleOp moduleOp) {
   }
 }
 
+static void lowerReleaseLayouts(ModuleOp moduleOp) {
+  SmallVector<ttg::ReleaseLayoutOp> releaseLayouts;
+  moduleOp.walk(
+      [&](ttg::ReleaseLayoutOp op) { releaseLayouts.push_back(op); });
+
+  for (ttg::ReleaseLayoutOp op : releaseLayouts) {
+    if (op.getSrc().getType() == op.getType()) {
+      op.getResult().replaceAllUsesWith(op.getSrc());
+      op.erase();
+      continue;
+    }
+
+    OpBuilder builder(op);
+    auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
+                                                op.getType(), op.getSrc());
+    op.getResult().replaceAllUsesWith(convert.getResult());
+    op.erase();
+  }
+}
+
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   SmallVector<::mlir::triton::ReshapeOp> wrappedReshapes;
   moduleOp.walk([&](::mlir::triton::ReshapeOp reshape) {
@@ -526,6 +546,7 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
     return failure();
 
   lowerRequireLayouts(moduleOp);
+  lowerReleaseLayouts(moduleOp);
 
   SmallVector<ttg::ConvertLayoutOp> identityConversions;
   moduleOp.walk([&](ttg::ConvertLayoutOp convert) {

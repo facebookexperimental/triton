@@ -89,3 +89,45 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32,
     tt.return %a : tensor<64x32xf16, #dot0>
   }
 }
+
+// -----
+
+// A TLX release remains a semantic TTG boundary during layout propagation, but
+// finalization retires it to the physical conversion selected for its result.
+
+#release_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#release_user = #tlx.user_layout<#release_src>
+#release_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [1, 4], order = [0, 1]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @finalize_release_layout
+  tt.func @finalize_release_layout(
+      %src: tensor<128x64xf16, #release_user>)
+      -> tensor<128x64xf16, #release_dst> {
+    // CHECK-NOT: #tlx.user_layout
+    // CHECK-NOT: ttg.release_layout
+    // CHECK: %[[CONVERTED:.*]] = ttg.convert_layout %{{.*}} : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #{{.*}}>
+    %released = tlx.release_layout %src : tensor<128x64xf16, #release_user> -> tensor<128x64xf16, #release_dst>
+    // CHECK: tt.return %[[CONVERTED]]
+    tt.return %released : tensor<128x64xf16, #release_dst>
+  }
+}
+
+// -----
+
+// Identity releases are kept until finalization, then removed without leaving
+// an identity convert_layout.
+
+#identity = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @finalize_identity_release_layout
+  tt.func @finalize_identity_release_layout(
+      %src: tensor<128x64xf16, #identity>) -> tensor<128x64xf16, #identity> {
+    // CHECK-NOT: ttg.release_layout
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: tt.return %arg0
+    %released = ttg.release_layout %src : tensor<128x64xf16, #identity> -> tensor<128x64xf16, #identity>
+    tt.return %released : tensor<128x64xf16, #identity>
+  }
+}
