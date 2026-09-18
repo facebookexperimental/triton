@@ -631,10 +631,12 @@ def async_dot_scaled(
     assert version == 5, "async_dot_scaled is only available on Blackwell"
 
     M, K, N = A.shape[0], A.shape[1], B.shape[1]
-    # Blackwell block-scaled tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA
-    # instruction shape is fixed to M=128 with N a multiple of 8 in [8, 256]. K is
-    # only lower-bounded because the lowering splits the K blocks across instructions.
-    assert M == 128, f"M must be 128 for the scaled MMA, but got {M}"
+    # PTX ISA 9.4 Table 50 supports aggregate M=128 for cta_group::2. TLX
+    # represents each CTA's half as M=64 with a TwoCTA_RHS accumulator.
+    is_two_cta_m64 = M == 64 and two_ctas and acc.type.layout.blockM == 64
+    assert M == 128 or is_two_cta_m64, (
+        f"M must be 128, or 64 with a matching two-CTA accumulator, but got {M}"
+    )
     assert K >= 16, "K must be at least 16"
     assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
 
