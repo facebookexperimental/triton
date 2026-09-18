@@ -517,10 +517,16 @@ Implemented:
   It lowers planned endpoints to Acquire/Ready/Wait/Release events, adds copy
   depth and stage-delta edges, distinguishes asynchronous TMA/MMAv5 completion
   from task-serializing endpoints, and runs the common weighted-cycle solver.
-  Mixed-distance cycles inside a nested loop remain `Unsupported` until the
-  graph represents the enclosing prologue/drain boundary. The production-shaped
-  D120 B-early fixture reports the expected zero-credit cycle through this real
-  channel path. Only `Unsafe` is rejected;
+  Nested scheduled loops are validated as finite transaction domains when
+  their trip count is constant: `(event, inner iteration)` expansion removes
+  edges outside the prologue/drain boundary and retains only realizable
+  cycles. For dynamic inner loops, an asynchronous producer-ready and consumer
+  wait in the same early stage provides explicit prologue credit to a negative
+  task-order edge ending at that wait. A negative edge ending at producer
+  acquire receives no credit. This accepts FA backward's seeded `m/Di/dS`
+  recurrence while preserving rejection of D120's unseeded B-early A-relay
+  cycle. Dynamic negative-total recurrences remain `Unsupported`. Only
+  `Unsafe` is rejected;
   `Unsupported` continues. Endpoint planning lives in
   `WSChannelProtocol.{h,cpp}`, graph lowering and audit diagnostics in
   `WSChannelCycleValidator.{h,cpp}`, and the generic solver remains isolated in
@@ -545,8 +551,8 @@ Current limitations:
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
 - The ordinary-loop post-memory builder rejects proven zero-distance cycles.
-  Negative-total cycles, mixed-distance nested cycles, multi-CTA,
-  specialized-protocol, and post-insertion coverage remain open.
+  Dynamic negative-total cycles, multi-CTA, specialized-protocol, and
+  post-insertion coverage remain open.
 
 ## 12. Controls and diagnostics
 

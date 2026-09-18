@@ -11,10 +11,15 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <optional>
 
 namespace mlir {
 
@@ -45,6 +50,11 @@ struct ProtocolTaskTimeline {
   AsyncTaskId task;
   Operation *scope;
   SmallVector<ScheduledProtocolEvent> events;
+};
+
+struct MappedProtocolGraph {
+  ProtocolGraph graph;
+  SmallVector<unsigned> originalEdgeIds;
 };
 
 static bool getScheduleCoordinate(Operation *op, int64_t &stage,
@@ -134,6 +144,249 @@ static bool addTaskOrderEdges(ProtocolGraph &graph,
   return true;
 }
 
+static std::optional<int64_t> getConstantTripCount(scf::ForOp loop) {
+  APInt lowerBound;
+  APInt upperBound;
+  APInt stepValue;
+  if (!matchPattern(loop.getLowerBound(), m_ConstantInt(&lowerBound)) ||
+      !matchPattern(loop.getUpperBound(), m_ConstantInt(&upperBound)) ||
+      !matchPattern(loop.getStep(), m_ConstantInt(&stepValue)))
+    return std::nullopt;
+
+  int64_t lower = lowerBound.getSExtValue();
+  int64_t upper = upperBound.getSExtValue();
+  int64_t step = stepValue.getSExtValue();
+  if (step <= 0)
+    return std::nullopt;
+  if (upper <= lower)
+    return 0;
+
+  int64_t distance;
+  if (llvm::SubOverflow(upper, lower, distance))
+    return std::nullopt;
+  int64_t roundedDistance;
+  if (llvm::AddOverflow(distance, step - 1, roundedDistance))
+    return std::nullopt;
+  return roundedDistance / step;
+}
+
+// A nested software pipeline re-enters through its prologue on every
+// invocation of the enclosing loop. An async producer and its consumer wait
+// in the same early stage can therefore complete the first transaction before
+// a later-stage event in that task exists. A negative task-order edge ending
+// at that wait carries exactly that prologue credit; treating it as an
+// ordinary steady-state backedge creates a false zero-credit cycle.
+//
+// This deliberately does not apply to a negative edge ending at Acquire. An
+// acquire consumes initial slot credit rather than producing progress; that is
+// the distinction between FA backward's seeded m/Di/dS recurrence and D120's
+// unseeded B-early A-relay recurrence.
+static bool hasNestedPrologueCredit(
+    const ProtocolGraph &graph, const ProtocolEdge &edge, Operation *scope,
+    const DenseMap<ProtocolEventId, ScheduledProtocolEvent> &eventSchedules) {
+  if (edge.kind != ProtocolEdgeKind::TaskOrder || edge.iterationDistance >= 0 ||
+      graph.events[edge.to].kind != ProtocolEventKind::Wait)
+    return false;
+  auto waitIt = eventSchedules.find(edge.to);
+  if (waitIt == eventSchedules.end() || waitIt->second.scope != scope)
+    return false;
+
+  const ScheduledProtocolEvent &wait = waitIt->second;
+  return llvm::any_of(eventSchedules, [&](const auto &entry) {
+    const ScheduledProtocolEvent &event = entry.second;
+    return event.scope == scope && event.channelId == wait.channelId &&
+           graph.events[event.id].kind == ProtocolEventKind::Ready &&
+           !event.ordersFollowingEvents && event.stage == wait.stage;
+  });
+}
+
+static int64_t getScopeEdgeDistance(
+    const ProtocolGraph &graph, const ProtocolEdge &edge, Operation *scope,
+    bool isNested,
+    const DenseMap<ProtocolEventId, ScheduledProtocolEvent> &eventSchedules) {
+  if (isNested && hasNestedPrologueCredit(graph, edge, scope, eventSchedules))
+    return 0;
+  return edge.iterationDistance;
+}
+
+static ProtocolValidation
+mapValidationToOriginalEdges(ProtocolValidation validation,
+                             ArrayRef<unsigned> originalEdgeIds,
+                             const ProtocolGraph &originalGraph) {
+  if (validation.cycleEdgeIds.empty())
+    return validation;
+  int64_t totalDistance = 0;
+  for (unsigned &edgeId : validation.cycleEdgeIds) {
+    assert(edgeId < originalEdgeIds.size() && "missing original edge mapping");
+    edgeId = originalEdgeIds[edgeId];
+    if (llvm::AddOverflow(totalDistance,
+                          originalGraph.edges[edgeId].iterationDistance,
+                          totalDistance)) {
+      return {ProtocolStatus::Unsupported,
+              {},
+              0,
+              "cycle witness distance overflowed after boundary expansion"};
+    }
+  }
+  validation.cycleIterationDistance = totalDistance;
+  return validation;
+}
+
+static MappedProtocolGraph buildScopeGraph(
+    const ProtocolGraph &graph,
+    const DenseMap<ProtocolEventId, Operation *> &eventScopes,
+    const DenseMap<ProtocolEventId, ScheduledProtocolEvent> &eventSchedules,
+    Operation *scope, bool isNested) {
+  MappedProtocolGraph mapped;
+  DenseMap<ProtocolEventId, ProtocolEventId> eventMap;
+  for (const ProtocolEvent &event : graph.events) {
+    auto scopeIt = eventScopes.find(event.id);
+    if (scopeIt == eventScopes.end() || scopeIt->second != scope)
+      continue;
+    eventMap[event.id] = mapped.graph.addEvent(event.kind, event.label);
+  }
+  for (auto [edgeId, edge] : llvm::enumerate(graph.edges)) {
+    auto from = eventMap.find(edge.from);
+    auto to = eventMap.find(edge.to);
+    if (from == eventMap.end() || to == eventMap.end())
+      continue;
+    mapped.graph.addEdge(
+        from->second, to->second,
+        getScopeEdgeDistance(graph, edge, scope, isNested, eventSchedules),
+        edge.kind, edge.channelId);
+    mapped.originalEdgeIds.push_back(edgeId);
+  }
+  return mapped;
+}
+
+// A scheduled inner loop is a finite transaction domain. Its software
+// pipeline enters through a prologue and leaves through a drain before the
+// enclosing loop starts the next invocation. Expand that finite domain so an
+// edge from event(i) to event(i + distance) exists only when both transaction
+// indices are in the same invocation. This removes negative-distance walks
+// that terminate at the prologue while retaining zero-distance wait-for
+// cycles that fit in the loop body.
+static ProtocolValidation validateFiniteNestedScope(
+    const ProtocolGraph &graph,
+    const DenseMap<ProtocolEventId, Operation *> &eventScopes,
+    const DenseMap<ProtocolEventId, ScheduledProtocolEvent> &eventSchedules,
+    Operation *scope, int64_t tripCount) {
+  if (tripCount <= 0)
+    return {};
+
+  SmallVector<ProtocolEventId> scopeEvents;
+  DenseMap<ProtocolEventId, unsigned> localEventIds;
+  for (const ProtocolEvent &event : graph.events) {
+    auto scopeIt = eventScopes.find(event.id);
+    if (scopeIt == eventScopes.end() || scopeIt->second != scope)
+      continue;
+    localEventIds[event.id] = scopeEvents.size();
+    scopeEvents.push_back(event.id);
+  }
+
+  constexpr int64_t maxExpandedEvents = 4096;
+  if (scopeEvents.empty() ||
+      tripCount > maxExpandedEvents / int64_t(scopeEvents.size())) {
+    return {ProtocolStatus::Unsupported,
+            {},
+            0,
+            "nested loop is too large for exact boundary expansion"};
+  }
+
+  MappedProtocolGraph expanded;
+  for (int64_t iteration = 0; iteration < tripCount; ++iteration)
+    for (ProtocolEventId eventId : scopeEvents) {
+      const ProtocolEvent &event = graph.events[eventId];
+      expanded.graph.addEvent(event.kind, event.label);
+    }
+
+  auto getExpandedEvent = [&](ProtocolEventId eventId, int64_t iteration) {
+    return ProtocolEventId(iteration * scopeEvents.size() +
+                           localEventIds.lookup(eventId));
+  };
+  for (auto [edgeId, edge] : llvm::enumerate(graph.edges)) {
+    auto from = localEventIds.find(edge.from);
+    auto to = localEventIds.find(edge.to);
+    if (from == localEventIds.end() || to == localEventIds.end())
+      continue;
+    int64_t iterationDistance = getScopeEdgeDistance(
+        graph, edge, scope, /*isNested=*/true, eventSchedules);
+    for (int64_t iteration = 0; iteration < tripCount; ++iteration) {
+      int64_t targetIteration;
+      if (llvm::AddOverflow(iteration, iterationDistance, targetIteration) ||
+          targetIteration < 0 || targetIteration >= tripCount)
+        continue;
+      expanded.graph.addEdge(getExpandedEvent(edge.from, iteration),
+                             getExpandedEvent(edge.to, targetIteration),
+                             /*iterationDistance=*/0, edge.kind,
+                             edge.channelId);
+      expanded.originalEdgeIds.push_back(edgeId);
+    }
+  }
+
+  return mapValidationToOriginalEdges(validateProtocolCycles(expanded.graph),
+                                      expanded.originalEdgeIds, graph);
+}
+
+static ProtocolValidation validateProtocolScopes(
+    const ProtocolGraph &graph,
+    const DenseMap<ProtocolEventId, Operation *> &eventScopes,
+    const DenseMap<ProtocolEventId, ScheduledProtocolEvent> &eventSchedules) {
+  SmallVector<Operation *> scopes;
+  for (const ProtocolEvent &event : graph.events) {
+    auto it = eventScopes.find(event.id);
+    if (it != eventScopes.end() && !llvm::is_contained(scopes, it->second))
+      scopes.push_back(it->second);
+  }
+
+  std::optional<ProtocolValidation> unsupported;
+  for (Operation *scope : scopes) {
+    bool isNested = scope->getParentOfType<scf::ForOp>() ||
+                    scope->getParentOfType<scf::WhileOp>();
+    ProtocolValidation result;
+    if (isNested) {
+      auto loop = cast<scf::ForOp>(scope);
+      if (std::optional<int64_t> tripCount = getConstantTripCount(loop)) {
+        result = validateFiniteNestedScope(graph, eventScopes, eventSchedules,
+                                           scope, *tripCount);
+      } else {
+        MappedProtocolGraph mapped = buildScopeGraph(
+            graph, eventScopes, eventSchedules, scope, /*isNested=*/true);
+        result =
+            mapValidationToOriginalEdges(validateProtocolCycles(mapped.graph),
+                                         mapped.originalEdgeIds, graph);
+        if (result.status == ProtocolStatus::Unsafe &&
+            result.cycleIterationDistance < 0) {
+          result.status = ProtocolStatus::Unsupported;
+          result.cycleEdgeIds.clear();
+          result.reason =
+              "dynamic nested loop has a negative-distance recurrence";
+        }
+      }
+    } else {
+      MappedProtocolGraph mapped = buildScopeGraph(
+          graph, eventScopes, eventSchedules, scope, /*isNested=*/false);
+      result = mapValidationToOriginalEdges(
+          validateProtocolCycles(mapped.graph), mapped.originalEdgeIds, graph);
+      if (result.status == ProtocolStatus::Unsafe &&
+          result.cycleIterationDistance < 0) {
+        result.status = ProtocolStatus::Unsupported;
+        result.cycleEdgeIds.clear();
+        result.reason =
+            "negative-distance cycles require boundary-aware validation";
+      }
+    }
+
+    if (result.status == ProtocolStatus::Unsafe)
+      return result;
+    if (result.status == ProtocolStatus::Unsupported && !unsupported)
+      unsupported = std::move(result);
+  }
+  if (unsupported)
+    return std::move(*unsupported);
+  return {};
+}
+
 static void attachAuditAttributes(triton::FuncOp funcOp,
                                   const PostMemoryProtocolAnalysis &analysis) {
   MLIRContext *context = funcOp.getContext();
@@ -185,7 +438,8 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     const DenseSet<int64_t> &specializedBufferIds) {
   PostMemoryProtocolAnalysis analysis;
   SmallVector<ProtocolTaskTimeline> timelines;
-  DenseSet<ProtocolEventId> nestedCadenceEvents;
+  DenseMap<ProtocolEventId, Operation *> eventCadenceScopes;
+  DenseMap<ProtocolEventId, ScheduledProtocolEvent> eventSchedules;
   std::string unsupportedReason;
 
   for (const ChannelProtocolPlan &plan : plans) {
@@ -314,12 +568,9 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
       continue;
     }
 
-    if (plan.cadenceScope->getParentOfType<scf::ForOp>() ||
-        plan.cadenceScope->getParentOfType<scf::WhileOp>()) {
-      for (ProtocolEventId event = eventStart;
-           event < analysis.graph.events.size(); ++event)
-        nestedCadenceEvents.insert(event);
-    }
+    for (ProtocolEventId event = eventStart;
+         event < analysis.graph.events.size(); ++event)
+      eventCadenceScopes[event] = plan.cadenceScope;
 
     auto getEventStage = [&](ProtocolEventId id) {
       auto event = llvm::find_if(pendingEvents,
@@ -334,9 +585,11 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
       return getEventStage(to) - getEventStage(from);
     };
 
-    for (const ScheduledProtocolEvent &event : pendingEvents)
+    for (const ScheduledProtocolEvent &event : pendingEvents) {
       getTaskTimeline(timelines, event.task, event.scope)
           .events.push_back(event);
+      eventSchedules.try_emplace(event.id, event);
+    }
     analysis.graph.addEdge(acquire, ready, getTaskSpanDistance(acquire, ready),
                            ProtocolEdgeKind::TaskOrder, channelId);
     for (const ConsumerEvents &consumer : consumerEvents) {
@@ -359,29 +612,8 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     if (unsupportedReason.empty())
       unsupportedReason = "task protocol events span multiple blocks";
   }
-  analysis.validation = validateProtocolCycles(analysis.graph);
-  bool hasNegativeNestedEdge =
-      analysis.validation.status == ProtocolStatus::Unsafe &&
-      llvm::any_of(analysis.validation.cycleEdgeIds, [&](unsigned edgeId) {
-        const ProtocolEdge &edge = analysis.graph.edges[edgeId];
-        return edge.iterationDistance < 0 &&
-               (nestedCadenceEvents.contains(edge.from) ||
-                nestedCadenceEvents.contains(edge.to));
-      });
-  if (hasNegativeNestedEdge) {
-    analysis.validation.status = ProtocolStatus::Unsupported;
-    analysis.validation.cycleEdgeIds.clear();
-    analysis.validation.reason =
-        "mixed-distance cycles in nested loops require outer-boundary "
-        "validation";
-  }
-  if (analysis.validation.status == ProtocolStatus::Unsafe &&
-      analysis.validation.cycleIterationDistance < 0) {
-    analysis.validation.status = ProtocolStatus::Unsupported;
-    analysis.validation.cycleEdgeIds.clear();
-    analysis.validation.reason =
-        "negative-distance cycles require boundary-aware validation";
-  }
+  analysis.validation = validateProtocolScopes(
+      analysis.graph, eventCadenceScopes, eventSchedules);
   if (analysis.validation.status == ProtocolStatus::Safe &&
       analysis.unsupportedChannelCount != 0) {
     analysis.validation.status = ProtocolStatus::Unsupported;

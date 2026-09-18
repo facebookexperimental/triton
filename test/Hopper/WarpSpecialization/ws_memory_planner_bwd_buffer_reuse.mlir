@@ -20,6 +20,31 @@
 // RUN:   --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=231000" \
 // RUN:   --verify-each | FileCheck %s --check-prefix=SEARCHED-E2E \
 // RUN:   --implicit-check-not=tt.autows
+// RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
+// RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' %s | \
+// RUN:   env TRITON_WS_SMEM_PLAN_TOPK=3 TRITON_WS_SMEM_PLAN_PICK=1 \
+// RUN:   TRITON_WS_TMEM_PLAN_TOPK=4 TRITON_WS_TMEM_PLAN_PICK=1 \
+// RUN:   triton-opt - --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=2 channel-cycle-audit=true" | \
+// RUN:   FileCheck %s --check-prefix=NESTED-DYNAMIC
+// RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
+// RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' \
+// RUN:   -e '/descriptor_load %desc_m/s/loop.stage = 0/loop.stage = 1/' \
+// RUN:   -e 's/to %num_steps step/to %c1_i32 step/' %s | \
+// RUN:   env TRITON_WS_SMEM_PLAN_TOPK=3 TRITON_WS_SMEM_PLAN_PICK=1 \
+// RUN:   TRITON_WS_TMEM_PLAN_TOPK=4 TRITON_WS_TMEM_PLAN_PICK=1 \
+// RUN:   triton-opt - --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=2 channel-cycle-audit=true" | \
+// RUN:   FileCheck %s --check-prefix=NESTED-ONE
+// RUN: sed -e 's/, tt.autows = "[^"]*"//g' \
+// RUN:   -e '/%dq_102 = ttng.tc_gen5_mma/s/loop.cluster = 2/loop.cluster = 3/' \
+// RUN:   -e '/descriptor_load %desc_m/s/loop.stage = 0/loop.stage = 1/' \
+// RUN:   -e 's/to %num_steps step/to %c128_i32 step/' %s | \
+// RUN:   not env TRITON_WS_SMEM_PLAN_TOPK=3 TRITON_WS_SMEM_PLAN_PICK=1 \
+// RUN:   TRITON_WS_TMEM_PLAN_TOPK=4 TRITON_WS_TMEM_PLAN_PICK=1 \
+// RUN:   triton-opt - --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000 reserve-auxiliary-smem=0 smem-plan-search" \
+// RUN:   --nvgpu-test-ws-code-partition="num-buffers=2 channel-cycle-audit=true" \
+// RUN:   2>&1 | FileCheck %s --check-prefix=NESTED-MANY
 
 // BWD FA persistent kernel (BLOCK_M1=128, EPILOGUE_SUBTILE=2) with TMA
 // descriptor_load for M/Di and early_tma_store_lowering for dQ/dK/dV.
@@ -93,6 +118,29 @@
 // SEARCHED-E2E-LABEL: tt.func public @_attn_bwd_persist
 // SEARCHED-E2E-COUNT-3: ttng.tmem_alloc {allocation.searchPlan
 // SEARCHED-E2E: ttg.warp_specialize
+
+// SMEM rank one leaves m single-buffered. Its apparent mixed -1/+1 recurrence
+// is seeded by the nested-loop prologue: the asynchronous stage-0 m load and
+// stage-0 consumer complete before the stage-1 dS event. Other specialized
+// channels remain outside this validator slice, so aggregate coverage is
+// still unsupported rather than safe.
+// NESTED-DYNAMIC-LABEL: tt.func public @_attn_bwd_persist
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_reason = "only ordinary SMEM channels are supported"
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_status = "unsupported"
+
+// Moving the m producer out of the wait's stage removes that async prologue
+// credit. The same schedule and memory plan is nevertheless acyclic when the
+// inner loop has exactly one transaction: the -1 edge falls into the prologue
+// boundary and the positive edge falls into the drain boundary. Other
+// specialized channels remain outside this validator slice, so aggregate
+// coverage is still unsupported.
+// NESTED-ONE-LABEL: tt.func public @_attn_bwd_persist
+// NESTED-ONE-SAME: nvws.test.channel_cycle_reason = "only ordinary SMEM channels are supported"
+// NESTED-ONE-SAME: nvws.test.channel_cycle_status = "unsupported"
+
+// With 128 inner transactions, the same unseeded recurrence fits inside the
+// finite invocation and must still be rejected.
+// NESTED-MANY: error: warp specialization rejected an unsafe post-memory channel protocol: total iteration distance 0
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
