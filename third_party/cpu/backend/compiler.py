@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
+from triton import knobs
 from triton._C.libtriton import cpu, ir, llvm, passes, getenv_bool
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.backends.cpu.build import build_kernel_from_asm
@@ -40,19 +41,16 @@ class CPUOptions:
     debug: bool = False
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e5b16", "fp8e4nv")
     deprecated_fp8_dtypes: Tuple[str] = ()
-    default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "tf32", "tf32x3")
     deprecated_fp8_dot_operand_dtypes: Tuple[str, ...] = ()
     allow_fp8e4nv: bool = True
     allow_fp8e4b15: bool = True
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
-    launch_cluster: bool = False
-    multicast: bool = False
-    enable_tree_reduction: bool = False
     max_num_imprecise_acc_default: int = 0
     enable_fast_math: bool = True
     # For now, don't use libsleef to avoid library-not-found issues.
+    # (fbtriton divergence from OSS, see #3365.)
     vec_lib: Optional[str] = None
     # TODO: Try to enable it.
     sanitize_overflow: bool = False
@@ -70,8 +68,7 @@ class CPUOptions:
     # GPU-only knobs do not affect the generated x86 code. num_cpu_threads is
     # launch metadata, so it must remain in the key until launch options are
     # stored separately from cached compiler metadata.
-    _RUNTIME_ONLY_FIELDS = frozenset(
-        {"num_warps", "num_stages", "num_ctas", "launch_cluster", "multicast", "enable_tree_reduction"})
+    _RUNTIME_ONLY_FIELDS = frozenset({"num_warps", "num_stages", "num_ctas"})
 
     def hash(self):
         hash_dict = {k: v for k, v in self.__dict__.items() if k not in self._RUNTIME_ONLY_FIELDS}
@@ -244,7 +241,7 @@ class CPUBackend(BaseBackend):
         promote_lib_math_to_fp32 = True
         cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, promote_bf16_to_fp32, convert_mixed_precision_matmul,
                                                        promote_lib_math_to_fp32)
-        decompose_bf16_conv = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
+        decompose_bf16_conv = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features and "avxneconvert" not in self.cpu_features
         decompose_fp8_conv = True
         cpu.passes.ttcpuir.add_decompose_fp_conversions(pm, decompose_bf16_conv, decompose_fp8_conv)
         if os.getenv("TRITON_CPU_UNROLL_AND_REORDER_ELEMENTWISE_OPS", "0") == "1":
@@ -321,6 +318,10 @@ class CPUBackend(BaseBackend):
         # Get some metadata
         metadata["shared"] = 0
         metadata["name"] = kernel_names[0]
+
+        # Add Triton and LLVM versions to the dumped IR.
+        if knobs.compilation.dump_ir:
+            llvm.add_version_info(llvm_mod)
         ret = str(llvm_mod)
         del llvm_mod
         del context
