@@ -1493,8 +1493,10 @@ gate.
 ### Milestone D: annotation-free FA backward
 
 **Status: in progress.** The target schedule, memory-space choice, and physical
-memory topology are searchable, and focused BM128 correctness passes. The
-broader correctness/performance gates and source annotation removal remain.
+memory topology are searchable. The complete bounded BM128 frontier finishes
+without hangs or unclassified failures, and every executable tuple passes
+correctness with a fully supported `Safe` audit. Broader-shape correctness,
+performance gates, and source annotation removal remain.
 
 - Remove schedule and physical-allocation pins.
 - Add memory-space selection or a general memory-space heuristic. The first
@@ -1605,6 +1607,10 @@ a hard correctness floor on the structural path.
       expansion with scheduled TMA waits predicated safely.
 - [x] An annotation-free BM128 FA-backward candidate reproduces the annotated
       memory topology and passes focused backward-only numerical correctness.
+- [x] The full bounded annotation-free BM128 FA-backward frontier completes:
+      six tuples pass correctness, 50 are rejected before launch, and no tuple
+      times out or fails without classification. Every executable tuple has a
+      `Safe` audit with zero unsupported channels.
 - [ ] Remove the source memtype annotations after correctness and performance
       select the annotation-free candidate.
 - [ ] Default-off compilation remains unchanged.
