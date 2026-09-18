@@ -18,6 +18,7 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+constexpr int32_t kMinRegisters = 24;
 constexpr int32_t kMinRegistersForAssertOrPrint = 32;
 
 static bool regionUsesAssertOrPrint(Region &region) {
@@ -289,8 +290,8 @@ struct AllocateWarpGroups
       SmallVector<WarpGroupPartition> orderedPartitions;
       for (auto [startId, partition, estRegs, numWarps] : llvm::zip(
                startIds, op.getPartitionRegions(), requestedRegisters, arr)) {
-        int minRegs =
-            minRegistersForRegion(*partition, laterInstrumentation, estRegs);
+        int minRegs = minRegistersForRegion(*partition, laterInstrumentation,
+                                            std::max(estRegs, kMinRegisters));
         orderedPartitions.push_back({startId, partition, minRegs, numWarps});
       }
       llvm::sort(orderedPartitions,
@@ -378,7 +379,7 @@ struct AllocateWarpGroups
       if (sharingThreads > 0) {
         sharedRegs = remainingRegs / sharingThreads;
         sharedRegs = sharedRegs / 8 * 8;
-        int minSharedRegs = 24;
+        int minSharedRegs = kMinRegisters;
         if (defaultRegs < 0)
           minSharedRegs = minRegistersForRegion(
               op.getDefaultRegion(), laterInstrumentation, minSharedRegs);
