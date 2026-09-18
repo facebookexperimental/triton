@@ -5,7 +5,7 @@ baseline path uses BN128/BM16 phases and supports non-causal MHA/GQA plus
 causal self-attention MHA; long non-causal split-GQA uses masked BN256/BM32
 phases and forms dQ as two native BM16 accumulator chains.  Split workgroups
 preserve FP32 dK/dV partials through their final reduction.  Independent KV
-owners combine dQ contributions with BF16 atomics in a guarded native layout,
+owners combine dQ contributions with FP32 atomics in a guarded native layout,
 followed by a conversion to packed THD order.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
@@ -397,12 +397,16 @@ def validate_varlen_backward_plan(plan: VarlenBackwardPlan, *, causal: bool = Fa
                          f"{requirement}")
 
 
-def _validate_i32_buffer_offsets(*, total_q: int, total_kv: int, batch: int, q_heads: int, kv_heads: int) -> None:
+def _validate_i32_buffer_offsets(
+    *,
+    total_kv: int,
+    max_q: int,
+    kv_heads: int,
+) -> None:
     if total_kv * kv_heads * _HEAD_DIM > _I32_BUFFER_BF16_ELEMENTS:
         raise ValueError("KV tensor size exceeds the signed 32-bit byte-offset range")
-    total_q_padded = total_q + batch * (_BLOCK_M - 1)
-    if total_q_padded * q_heads * _HEAD_DIM > _I32_BUFFER_BF16_ELEMENTS:
-        raise ValueError("padded dQ size exceeds the signed 32-bit byte-offset range")
+    if (max_q + _WIDE_BLOCK_M - 1) * _HEAD_DIM > _I32_BUFFER_FP32_ELEMENTS:
+        raise ValueError("dQ sequence size exceeds the signed 32-bit byte-offset range")
 
 
 def _select_varlen_kv_splits(max_q: int, group_size: int) -> int:
@@ -616,22 +620,23 @@ def _load_dq_tail_previous(
     BLOCK_M: tl.constexpr,
     MMA_MD: tl.constexpr,
 ):
-    # This is the finalizer's existing native BF16 read, moved earlier only
+    # This is the finalizer's existing native FP32 read, moved earlier only
     # for the guarded steady phase. Its value stays packed until final add.
     local_m = tlx.rematerialized_range(0, BLOCK_M, 40, placement=step)
     offs_d = tlx.rematerialized_range(0, D, 41, placement=step)
     valid = tl.broadcast_to((step * BLOCK_M + local_m < q_len)[:, None], (BLOCK_M, D))
     valid = tlx.require_layout(valid, MMA_MD, pin=True)
-    d_swizzled = ((offs_d & 1)
+    d_swizzled = (((offs_d & 1) << 6)
                   | ((offs_d & 2) << 6)
-                  | ((offs_d & 12) << 3)
+                  | ((offs_d & 4) << 3)
+                  | ((offs_d & 8) >> 3)
                   | ((offs_d & 48) << 5)
                   | ((offs_d & 64) << 2))
-    offsets = dq_base + step * BLOCK_M * D + ((local_m[:, None] << 1) | d_swizzled[None, :])
-    offsets = tl.max_contiguous(offsets.to(tl.int32), [1, 2])
+    offsets = step * BLOCK_M * D + ((local_m[:, None] << 1) | d_swizzled[None, :])
+    offsets = tl.max_contiguous(offsets.to(tl.int32), [1, 1])
     offsets = tlx.require_layout(offsets, MMA_MD, pin=True)
-    zero = tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=MMA_MD)
-    previous = tlx.buffer_load(DQ_ACC, offsets, mask=valid, other=zero, contiguity=2)
+    zero = tlx.zeros((BLOCK_M, D), tl.float32, layout=MMA_MD)
+    previous = tlx.buffer_load(DQ_ACC + dq_base, offsets, mask=valid, other=zero, contiguity=1)
     previous = tlx.require_layout(previous, MMA_MD, pin=True)
     return previous
 
@@ -651,13 +656,12 @@ def _store_dq_tail_final_preloaded(
     BLOCK_M: tl.constexpr,
     MMA_MD: tl.constexpr,
 ):
-    # Keep the parent's two BF16 roundings and final packed-output layout.
-    # previous is a required BF16 tensor, never a None-valued loop input.
+    # previous is a required FP32 tensor, never a None-valued loop input.
     dq = tlx.require_layout(dq, MMA_MD, pin=False)
     scale = tlx.require_layout(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), MMA_MD, pin=False)
-    partial = (dq * scale).to(tl.bfloat16)
+    partial = dq * scale
     partial = tlx.require_layout(partial, MMA_MD, pin=True)
-    combined = (previous.to(tl.float32) + partial.to(tl.float32)).to(tl.bfloat16)
+    combined = (previous + partial).to(tl.bfloat16)
     combined = tlx.require_layout(combined, MMA_MD, pin=True)
 
     store_layout: tl.constexpr = tlx.layout(shape=((2, 16, 2, 4), (8, )), stride=((8, 128, 64, 16), (1, )))
@@ -693,8 +697,7 @@ def _store_dq_tail_final(
     # remaining owner of this sequence/head, so it can write final dQ.
     dq = tlx.require_layout(dq, MMA_MD, pin=False)
     scale = tlx.require_layout(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), MMA_MD, pin=False)
-    # Match the atomic path's first rounding before adding its BF16 partial.
-    partial = (dq * scale).to(tl.bfloat16)
+    partial = dq * scale
     partial = tlx.require_layout(partial, MMA_MD, pin=True)
     # Retire dQ MFMA operands before loading the prior scratch partial.
     # Allow VALU/SALU and LDS scheduling across this compiler-only boundary.
@@ -704,19 +707,19 @@ def _store_dq_tail_final(
     offs_d = tlx.rematerialized_range(0, D, 41, placement=step)
     valid = tl.broadcast_to((step * BLOCK_M + local_m < q_len)[:, None], (BLOCK_M, D))
     valid = tlx.require_layout(valid, MMA_MD, pin=True)
-    d_swizzled = ((offs_d & 1)
+    d_swizzled = (((offs_d & 1) << 6)
                   | ((offs_d & 2) << 6)
-                  | ((offs_d & 12) << 3)
+                  | ((offs_d & 4) << 3)
+                  | ((offs_d & 8) >> 3)
                   | ((offs_d & 48) << 5)
                   | ((offs_d & 64) << 2))
-    offsets = dq_base + step * BLOCK_M * D + ((local_m[:, None] << 1) | d_swizzled[None, :])
-    offsets = tl.max_contiguous(offsets.to(tl.int32), [1, 2])
+    offsets = step * BLOCK_M * D + ((local_m[:, None] << 1) | d_swizzled[None, :])
+    offsets = tl.max_contiguous(offsets.to(tl.int32), [1, 1])
     offsets = tlx.require_layout(offsets, MMA_MD, pin=True)
-    zero = tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=MMA_MD)
-    # Keep adjacent native BF16 pairs together through the load and add.
-    previous = tlx.buffer_load(DQ_ACC, offsets, mask=valid, other=zero, contiguity=2)
+    zero = tlx.zeros((BLOCK_M, D), tl.float32, layout=MMA_MD)
+    previous = tlx.buffer_load(DQ_ACC + dq_base, offsets, mask=valid, other=zero, contiguity=1)
     previous = tlx.require_layout(previous, MMA_MD, pin=True)
-    combined = (previous.to(tl.float32) + partial.to(tl.float32)).to(tl.bfloat16)
+    combined = (previous + partial).to(tl.bfloat16)
     combined = tlx.require_layout(combined, MMA_MD, pin=True)
 
     # Keep each wave's two native 16-column D stripes during final output.
@@ -745,6 +748,7 @@ def _store_dq_native(
     MMA_MD: tl.constexpr,
     REMATERIALIZE_COORDS: tl.constexpr = True,
     MASK_ROWS: tl.constexpr = True,
+    REBASE_POINTER: tl.constexpr = True,
 ):
     dq = tlx.require_layout(dq, MMA_MD, pin=False)
     scale = tlx.require_layout(
@@ -766,22 +770,31 @@ def _store_dq_native(
         valid = tlx.require_layout(valid, MMA_MD, pin=False)
     else:
         valid = None
-    d_swizzled = ((offs_d & 1)
+    # Put the lane-varying d3 bit at the bottom of the scratch address so each
+    # wave's scalar FP32 atomics touch the minimum number of cache sectors.
+    d_swizzled = (((offs_d & 1) << 6)
                   | ((offs_d & 2) << 6)
-                  | ((offs_d & 12) << 3)
+                  | ((offs_d & 4) << 3)
+                  | ((offs_d & 8) >> 3)
                   | ((offs_d & 48) << 5)
                   | ((offs_d & 64) << 2))
     tile_offset = step * BLOCK_M * D
-    offsets = dq_base + tile_offset + ((local_m[:, None] << 1) | d_swizzled[None, :])
-    offsets = tl.max_contiguous(offsets.to(tl.int32), [1, 2])
+    native_offsets = tile_offset + ((local_m[:, None] << 1) | d_swizzled[None, :])
+    if REBASE_POINTER:
+        dq_acc = DQ_ACC + dq_base
+        offsets = native_offsets
+    else:
+        dq_acc = DQ_ACC
+        offsets = dq_base + native_offsets
+    offsets = tl.max_contiguous(offsets.to(tl.int32), [1, 1])
     offsets = tlx.require_layout(offsets, MMA_MD, pin=False)
     tlx.buffer_atomic_add(
-        DQ_ACC,
+        dq_acc,
         offsets,
-        dq.to(tl.bfloat16),
+        dq,
         mask=valid,
         sem="relaxed",
-        contiguity=2,
+        contiguity=1,
     )
 
 
@@ -1320,9 +1333,9 @@ def _store_dq_bm32_native(
     MASK_ROWS: tl.constexpr = True,
 ):
     _store_dq_native(dq_lo, DQ_ACC, dq_base, q_len, outer_block * 2, SM_SCALE, D, 16, MMA_MD,
-                     REMATERIALIZE_COORDS=False, MASK_ROWS=MASK_ROWS)
+                     REMATERIALIZE_COORDS=False, MASK_ROWS=MASK_ROWS, REBASE_POINTER=False)
     _store_dq_native(dq_hi, DQ_ACC, dq_base, q_len, outer_block * 2 + 1, SM_SCALE, D, 16, MMA_MD,
-                     REMATERIALIZE_COORDS=False, MASK_ROWS=MASK_ROWS)
+                     REMATERIALIZE_COORDS=False, MASK_ROWS=MASK_ROWS, REBASE_POINTER=False)
 
 
 @triton.jit
@@ -1858,6 +1871,9 @@ def _varlen_bwd_interleaved_kernel(
     V_STRIDE_T: tl.constexpr,
     QDO_ALIGNED: tl.constexpr = False,
     CACHE_MHA_STATS: tl.constexpr = False,
+    INTERLEAVE_MHA_TASKS: tl.constexpr = False,
+    MHA_TASK_GROUPS=1,
+    MHA_TASKS_PER_GROUP=1,
     DQ_OUTPUT=None,
     FINALIZE_DQ: tl.constexpr = False,
     DQ_TAIL_K96: tl.constexpr = False,
@@ -1879,6 +1895,10 @@ def _varlen_bwd_interleaved_kernel(
     tl.static_assert(not DQ_TAIL_K96 or FINALIZE_DQ)
     if NONCAUSAL_MHA:
         task = tl.program_id(1)
+        if INTERLEAVE_MHA_TASKS:
+            # Equal-length sequences occupy contiguous schedule runs. Visit
+            # one KV block from each run before returning to the same dQ tile.
+            task = (task % MHA_TASK_GROUPS) * MHA_TASKS_PER_GROUP + task // MHA_TASK_GROUPS
         kv_head_split = tl.program_id(0)
     else:
         task = tl.program_id(0)
@@ -2079,7 +2099,7 @@ def _varlen_bwd_interleaved_kernel(
             if DQ_TAIL_K96 and phase > 0:
                 # Cached MHA has one query head per owner. Define this tensor
                 # inside each steady iteration, after the current Q/dO wait.
-                preload_dq_base = ((q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
+                preload_dq_base = (q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
                 preloaded_previous = _load_dq_tail_previous(DQ_ACC, preload_dq_base, q_len, step - 1, D, BLOCK_M,
                                                             mma_md)
                 # Pin VMEM reads before subsequent MFMA work; allow ALU/LDS.
@@ -2191,8 +2211,7 @@ def _varlen_bwd_interleaved_kernel(
                         previous_group_index = previous_step // active_q_blocks
                         previous_q_step = first_q_block + previous_step % active_q_blocks
                         previous_q_head = kv_head * group_size + split * heads_per_split + previous_group_index
-                    previous_dq_acc_base = ((previous_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(
-                        tl.int32)
+                    previous_dq_acc_base = (previous_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
                     if DQ_TAIL_K96:
                         dq_part = _compute_dq_tail_k96(tlx.local_view(ds_buffers, 1 - current_slot),
                                                        tlx.local_view(k_buffer, 0), mma_md, initial_wait)
@@ -2258,7 +2277,7 @@ def _varlen_bwd_interleaved_kernel(
         last_group_index = last_step // active_q_blocks
         last_q_step = first_q_block + last_step % active_q_blocks
         last_q_head = kv_head * group_size + split * heads_per_split + last_group_index
-    last_dq_acc_base = ((last_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
+    last_dq_acc_base = (last_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
     if DQ_TAIL_K96:
         dq_part = _compute_dq_tail_k96(tlx.local_view(ds_buffers, last_step % 2), tlx.local_view(k_buffer, 0), mma_md)
     else:
@@ -2423,13 +2442,14 @@ def _varlen_dq_convert_kernel(
 
     local_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
-    d_swizzled = ((offs_d & 1)
+    d_swizzled = (((offs_d & 1) << 6)
                   | ((offs_d & 2) << 6)
-                  | ((offs_d & 12) << 3)
+                  | ((offs_d & 4) << 3)
+                  | ((offs_d & 8) >> 3)
                   | ((offs_d & 48) << 5)
                   | ((offs_d & 64) << 2))
     native_offsets = ((local_m[:, None] << 1) | d_swizzled[None, :]).to(tl.int32)
-    native_offsets = tl.max_contiguous(native_offsets, [1, 2])
+    native_offsets = tl.max_contiguous(native_offsets, [1, 1])
     valid = tl.broadcast_to((start_m + local_m < q_len)[:, None], (BLOCK_M, D))
     q_scratch_start = q_start + batch.to(tl.int64) * (BLOCK_M - 1)
     native_base = (head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start + start_m) * D
@@ -2477,10 +2497,10 @@ def _varlen_mha_dq_convert_coalesced_kernel(
     native_layout: ttgl.constexpr = ttgl.BlockedLayout([8], [64], [4], [0])
     native_offsets = ttgl.arange(0, BLOCK_M * D, layout=native_layout)
     native_values = ttgl.load(DQ_ACC + native_base + native_offsets)
-    # Native bit order: [d5,d4,d6,d1,d3,d2,m3,m2,m1,m0,d0].
+    # Native bit order: [d5,d4,d6,d1,d0,d2,m3,m2,m1,m0,d3].
     # Reorder dimensions into logical [m3,m2,m1,m0,d6,d5,d4,d3,d2,d1,d0].
-    values = native_values.reshape((4, 2, 2, 4, 16, 2))
-    values = values.permute((4, 1, 0, 3, 2, 5)).reshape((BLOCK_M, D))
+    values = native_values.reshape((4, 2, 2, 2, 2, 16, 2))
+    values = values.permute((5, 1, 0, 6, 4, 2, 3)).reshape((BLOCK_M, D))
     output_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
     values = ttgl.convert_layout(values, output_layout)
     local_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, output_layout))
@@ -2513,10 +2533,8 @@ def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal):
     if head_dim != 128 or kv_dim != 128:
         raise ValueError("packed backward currently requires head dimension 128")
     _validate_i32_buffer_offsets(
-        total_q=total_q,
         total_kv=total_kv,
-        batch=plan.batch,
-        q_heads=heads,
+        max_q=plan.max_q,
         kv_heads=kv_heads,
     )
     q_tensors = {"q": q, "o": o, "do": do}
@@ -4196,10 +4214,15 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     if dk_part is None:
         kv_splits = 1
     block_m, block_n = _select_varlen_kernel_blocks(group_size, kv_splits)
-    # Retain masked BM16 scratch if the larger footprint exceeds the existing
-    # signed-byte-offset limit. Input validation already proved the BM16 size.
+    wide_dq_bm16_padding_fits_i32 = (
+        total_q + plan.batch * (_BLOCK_M - 1)) * heads * head_dim <= _I32_BUFFER_FP32_ELEMENTS
+    if (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N) and not wide_dq_bm16_padding_fits_i32:
+        block_m, block_n = _BLOCK_M, _BLOCK_N
+    # Retain masked BM16 scratch if the larger padded footprint would exceed
+    # the signed-byte-offset limit used by the register-critical wide kernel.
     pad_dq_to_bm32 = ((block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
-                      and (total_q + plan.batch * (_WIDE_BLOCK_M - 1)) * heads * head_dim <= _I32_BUFFER_BF16_ELEMENTS)
+                      and (total_q + plan.batch * (_WIDE_BLOCK_M - 1)) * heads * head_dim <=
+                      _I32_BUFFER_FP32_ELEMENTS)
     dq_pad_rows = _WIDE_BLOCK_M if pad_dq_to_bm32 else _BLOCK_M
     total_q_padded = total_q + plan.batch * (dq_pad_rows - 1)
     use_dq_aux = group_size == 1 or (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
@@ -4209,7 +4232,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
     delta_shape = (heads, 2 * total_q_padded) if pack_stats else (total_q, heads)
     delta = torch.empty(delta_shape, dtype=torch.float32, device=q.device)
     allocate_dq_acc = torch.empty if use_dq_aux else torch.zeros
-    dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=torch.bfloat16, device=q.device)
+    dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=torch.float32, device=q.device)
 
     owner_tasks = plan.wide_task_count if rolling_fp32_case and plan.wide_task_count is not None else 0
     owner_groups = kv_heads * owner_tasks
@@ -4291,6 +4314,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
         # Contiguous views with shifted storage retain the generic copy path.
         qdo_aligned = not causal and group_size == 1 and q.data_ptr() % 16 == 0 and do.data_ptr() % 16 == 0
         cache_mha_stats = not causal and group_size == 1 and plan.max_q <= 512
+        uniform_kv = total_kv == plan.batch * plan.max_kv
         # Causal tail owners skip earlier Q rows, which still need conversion.
         finalize_tail_dq = (not causal and cache_mha_stats and qdo_aligned and plan.dq_full_kv_sequence is not None
                             and plan.dq_full_kv_start is not None)
@@ -4347,6 +4371,9 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
                 V_STRIDE_T=v.stride(0),
                 QDO_ALIGNED=qdo_aligned,
                 CACHE_MHA_STATS=cache_mha_stats,
+                INTERLEAVE_MHA_TASKS=(not causal and group_size == 1 and full_kv_tile and uniform_kv),
+                MHA_TASK_GROUPS=plan.batch,
+                MHA_TASKS_PER_GROUP=plan.max_kv // _BLOCK_N,
                 DQ_OUTPUT=dq if finalize_tail_dq and not full_kv_tile else None,
                 FINALIZE_DQ=finalize_tail_dq and not full_kv_tile,
                 DQ_TAIL_K96=finalize_tail_dq and not full_kv_tile and plan.dq_tail_k96,
