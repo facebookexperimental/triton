@@ -120,6 +120,13 @@ D120 B-early fixture reaches this path and reports its zero-credit cycle.
 Reuse-group, TMEM, subtiled, straight-line, and while protocols remain
 explicitly unsupported in this slice.
 
+The implementation is split by responsibility rather than extending the
+already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
+`WSChannelCycleValidator` owns IR-to-graph lowering and audit diagnostics, and
+`WSChannelCycleAnalysis` owns only graph types and the weighted-cycle solver.
+`WSCodePartition` retains narrow call sites because it owns the live channel
+and reuse topology at both synchronization insertion and the validation point.
+
 **Current Milestone D status:** The annotation-free BM128 FA-backward candidate
 compiles through software-pipeline expansion. Pre-lowered
 `ttng.async_tma_store_wait` operations selected into a peeled pipeline stage
@@ -1136,11 +1143,12 @@ The implementation sequence is:
    anchor, consumer-release anchor, buffer depth, and cadence. Existing
    operand-D and reuse rules update the plan's acquire anchor before
    `insertAsyncComm` consumes it.
-4. In `doCodePartition`, call
-   `validatePlannedChannelCycles(...)` after `ReuseConfig` construction,
+4. **Audit implemented; rejection pending:** `doCodePartition` calls the
+   dedicated validator helper after `ReuseConfig` construction,
    consumer-group merging, and reuse-group shape checks, but before
-   `appendAccumCntsForOps`. Change `doCodePartition` to return `LogicalResult`
-   and propagate failure through the production and test-only passes.
+   `appendAccumCntsForOps`. The rejection unit will change `doCodePartition`
+   to return `LogicalResult` and propagate failure through production and
+   test-only passes.
 5. Initially support ordinary channels whose relevant endpoints share one
    scheduled `scf.for` cadence and have affine one-transaction-per-iteration
    behavior. Analyze supported SCCs even when unrelated channels are outside
@@ -1197,9 +1205,11 @@ cycle. Persistent `scf.while`, same-task staging, MMAv5 inline completion, and
 multi-member reuse remain explicit coverage requirements before enabling the
 validator for all nonzero search candidates.
 
-**Planned implementation areas:** `WSCodePartition.cpp`,
-`CodePartitionUtility.{h,cpp}`, a focused channel-cycle analysis utility,
-`WarpSpecializationPipeline.h`, and `autows_search.py` manifest handling.
+**Implementation areas:** `WSChannelProtocol.{h,cpp}` for shared endpoint
+planning, `WSChannelCycleAnalysis.{h,cpp}` for the generic solver,
+`WSChannelCycleValidator.{h,cpp}` for IR lowering and diagnostics, narrow hooks
+in `WSCodePartition.cpp` / `WarpSpecializationPipeline.h`, and
+`autows_search.py` for future manifest rejection handling.
 
 ### Phase 11: Remove manual annotations incrementally
 

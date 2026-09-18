@@ -1,7 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "TMEMUtils.h"
 #include "WSBarrierAnalysis.h"
-#include "WSChannelCycleAnalysis.h"
+#include "WSChannelCycleValidator.h"
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -5726,74 +5726,9 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
           "in the same basic block");
   }
 
-  // Build the synchronization-independent protocol graph at the last point
-  // where both the selected memory plan and the original scheduled operations
-  // are available. This first integration is audit-only: it records or logs
-  // the result but does not yet reject a selected search candidate.
-  PostDominanceInfo protocolPostDominance(funcOp);
-  SmallVector<ChannelProtocolPlan, 0> protocolPlans;
-  for (Channel *channel : orderedChannels) {
-    auto groupIt = channelsGroupedByConsumers.find(channel);
-    if (groupIt == channelsGroupedByConsumers.end())
-      continue;
-    protocolPlans.push_back(
-        buildChannelProtocolPlan(groupIt->second, protocolPostDominance));
-  }
-  PostMemoryProtocolAnalysis protocolAnalysis =
-      analyzePostMemoryChannelProtocols(protocolPlans, &config);
-  LLVM_DEBUG({
-    LDBG("post-memory channel-cycle audit: "
-         << stringifyProtocolStatus(protocolAnalysis.validation.status)
-         << ", events=" << protocolAnalysis.graph.events.size()
-         << ", edges=" << protocolAnalysis.graph.edges.size()
-         << ", supported=" << protocolAnalysis.supportedChannelCount
-         << ", unsupported=" << protocolAnalysis.unsupportedChannelCount);
-  });
-  if (emitChannelCycleAudit) {
-    MLIRContext *context = funcOp.getContext();
-    funcOp->setAttr(
-        "nvws.test.channel_cycle_status",
-        StringAttr::get(context, stringifyProtocolStatus(
-                                     protocolAnalysis.validation.status)));
-    funcOp->setAttr("nvws.test.channel_cycle_event_count",
-                    IntegerAttr::get(IntegerType::get(context, 64),
-                                     protocolAnalysis.graph.events.size()));
-    funcOp->setAttr("nvws.test.channel_cycle_edge_count",
-                    IntegerAttr::get(IntegerType::get(context, 64),
-                                     protocolAnalysis.graph.edges.size()));
-    funcOp->setAttr("nvws.test.channel_cycle_supported_channels",
-                    IntegerAttr::get(IntegerType::get(context, 64),
-                                     protocolAnalysis.supportedChannelCount));
-    funcOp->setAttr("nvws.test.channel_cycle_unsupported_channels",
-                    IntegerAttr::get(IntegerType::get(context, 64),
-                                     protocolAnalysis.unsupportedChannelCount));
-    if (!protocolAnalysis.validation.reason.empty())
-      funcOp->setAttr(
-          "nvws.test.channel_cycle_reason",
-          StringAttr::get(context, protocolAnalysis.validation.reason));
-    if (!protocolAnalysis.validation.cycleEdgeIds.empty()) {
-      SmallVector<int64_t> cycleEdges(
-          protocolAnalysis.validation.cycleEdgeIds.begin(),
-          protocolAnalysis.validation.cycleEdgeIds.end());
-      SmallVector<int64_t> cycleChannels;
-      SmallVector<int64_t> cycleDistances;
-      for (unsigned edgeId : protocolAnalysis.validation.cycleEdgeIds) {
-        const ProtocolEdge &edge = protocolAnalysis.graph.edges[edgeId];
-        cycleChannels.push_back(edge.channelId);
-        cycleDistances.push_back(edge.iterationDistance);
-      }
-      funcOp->setAttr("nvws.test.channel_cycle_edges",
-                      DenseI64ArrayAttr::get(context, cycleEdges));
-      funcOp->setAttr("nvws.test.channel_cycle_channels",
-                      DenseI64ArrayAttr::get(context, cycleChannels));
-      funcOp->setAttr("nvws.test.channel_cycle_edge_distances",
-                      DenseI64ArrayAttr::get(context, cycleDistances));
-      funcOp->setAttr(
-          "nvws.test.channel_cycle_distance",
-          IntegerAttr::get(IntegerType::get(context, 64),
-                           protocolAnalysis.validation.cycleIterationDistance));
-    }
-  }
+  auditPostMemoryChannelProtocols(funcOp, orderedChannels,
+                                  channelsGroupedByConsumers, &config,
+                                  emitChannelCycleAudit);
 
   appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
                         &config);

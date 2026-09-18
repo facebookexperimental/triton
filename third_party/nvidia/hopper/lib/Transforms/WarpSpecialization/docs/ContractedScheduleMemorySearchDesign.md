@@ -14,7 +14,9 @@ For the physical allocator in more detail, see
 - `third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlan*`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSMemoryPlanner.cpp`
+- `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSChannelProtocol.{h,cpp}`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSChannelCycleAnalysis.{h,cpp}`
+- `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSChannelCycleValidator.{h,cpp}`
 - `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSCodePartition.cpp`
 - `python/triton/tools/autows_search.py`
 
@@ -513,7 +515,10 @@ Implemented:
   depth and stage-delta edges, and runs the common weighted-cycle solver. The
   production-shaped D120 B-early fixture reports the expected zero-credit
   cycle through this real channel path. Specialized protocols remain
-  unsupported and no candidate is rejected yet.
+  unsupported and no candidate is rejected yet. Endpoint planning lives in
+  `WSChannelProtocol.{h,cpp}`, graph lowering and audit diagnostics in
+  `WSChannelCycleValidator.{h,cpp}`, and the generic solver remains isolated in
+  `WSChannelCycleAnalysis.{h,cpp}`.
 
 Next:
 

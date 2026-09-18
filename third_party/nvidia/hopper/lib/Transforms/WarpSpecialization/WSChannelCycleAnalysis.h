@@ -16,9 +16,6 @@
 
 namespace mlir {
 
-struct ChannelProtocolPlan;
-struct ReuseConfig;
-
 using ProtocolEventId = unsigned;
 
 enum class ProtocolEventKind {
@@ -78,16 +75,6 @@ struct ProtocolValidation {
   std::string reason;
 };
 
-/// Result of lowering post-memory channel plans into the normalized protocol
-/// graph. Unsupported plans are omitted from the graph and reported
-/// separately, allowing an unsafe supported component to take precedence.
-struct PostMemoryProtocolAnalysis {
-  ProtocolGraph graph;
-  ProtocolValidation validation;
-  unsigned supportedChannelCount = 0;
-  unsigned unsupportedChannelCount = 0;
-};
-
 /// Detect a directed cycle whose iteration-distance sum is non-positive.
 /// Such a cycle has no startup credit and therefore cannot make progress.
 ///
@@ -96,13 +83,6 @@ struct PostMemoryProtocolAnalysis {
 /// `(N + 1) * sum(d) - L`, which is negative exactly when `sum(d) <= 0`.
 /// Bellman-Ford supplies both the decision and a deterministic edge witness.
 ProtocolValidation validateProtocolCycles(const ProtocolGraph &graph);
-
-/// Build and validate the ordinary loop-cadence channel protocols represented
-/// by post-memory endpoint plans. Reuse groups and other specialized protocol
-/// shapes are conservatively reported as unsupported by this first builder.
-PostMemoryProtocolAnalysis
-analyzePostMemoryChannelProtocols(llvm::ArrayRef<ChannelProtocolPlan> plans,
-                                  ReuseConfig *reuseConfig);
 
 llvm::StringRef stringifyProtocolStatus(ProtocolStatus status);
 

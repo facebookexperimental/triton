@@ -205,7 +205,8 @@ detailed decision tree, code paths, and a worked FA BWD example.
    call site ensures the replacement is only attempted when data partitioning
    has produced multiple distinct per-MMA channels.
 
-Before mutating IR for a consumer group, `buildChannelProtocolPlan` collects
+Before mutating IR for a consumer group, `WSChannelProtocol.cpp`'s
+`buildChannelProtocolPlan` collects
 its shared endpoint facts in one non-owning record: producer head/tail, TMA
 producer head, ordinary producer acquire/ready anchors, per-task consumer
 wait/release anchors, the actual consumer used to schedule each wait, copy
@@ -214,7 +215,8 @@ post-dominance heuristic. Reuse and operand-D rules may relocate the acquire
 anchor, but write the result back to the same plan before insertion.
 
 Immediately after reuse-group validation and before accumulation counters
-rewrite the loops, `doCodePartition` lowers supported plans to a normalized
+rewrite the loops, `doCodePartition` calls the dedicated
+`WSChannelCycleValidator.cpp` helper to lower supported plans to a normalized
 protocol graph. Each ordinary loop-cadence SMEM channel contributes
 `Acquire -> Ready -> Wait -> Release` edges at logical distance zero and a
 `Release(i) -> Acquire(i + copies)` slot-reuse edge. Per-task serialized event
