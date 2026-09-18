@@ -1,35 +1,61 @@
 from __future__ import annotations
 
-# Entries are [Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype]. The op is
-# causal-only, so `causal` is True throughout and is carried for the label
-# rather than as a knob.
+from typing import NamedTuple
+
+from .._shape_suites import FocusRegistry, FocusSuite
+
+
+class HSTUAttentionShape(NamedTuple):
+    batch: int
+    max_seq_len: int
+    heads: int
+    head_dim: int
+    causal: bool
+    dtype: str
+
 
 #: Identical to `test_hstu_attn.py::SM100_SHAPES`.
-SYNTHETIC: list[list] = [
-    [1, 256, 4, 128, True, "bf16"],
-    [2, 512, 4, 128, True, "bf16"],
-    [2, 512, 8, 64, True, "bf16"],
-    [1, 1024, 4, 64, True, "bf16"],
-    [4, 256, 4, 128, True, "bf16"],
-    [2, 1024, 4, 128, True, "bf16"],
-    [8, 128, 4, 128, True, "bf16"],
-    [2, 256, 16, 64, True, "bf16"],
-    [1, 2048, 2, 128, True, "bf16"],
-]
+SYNTHETIC: tuple[HSTUAttentionShape, ...] = (
+    HSTUAttentionShape(1, 256, 4, 128, True, "bf16"),
+    HSTUAttentionShape(2, 512, 4, 128, True, "bf16"),
+    HSTUAttentionShape(2, 512, 8, 64, True, "bf16"),
+    HSTUAttentionShape(1, 1024, 4, 64, True, "bf16"),
+    HSTUAttentionShape(4, 256, 4, 128, True, "bf16"),
+    HSTUAttentionShape(2, 1024, 4, 128, True, "bf16"),
+    HSTUAttentionShape(8, 128, 4, 128, True, "bf16"),
+    HSTUAttentionShape(2, 256, 16, 64, True, "bf16"),
+    HSTUAttentionShape(1, 2048, 2, 128, True, "bf16"),
+)
 
-#: TODO: placeholder shapes, not a capture. The production shape is
-#: heads=4 seq=4096 sparsity=0.95 batch=512 (`tutorials/hstu_self_attn/bench_self.py:41`),
-#: which needs the sparse length draw below before it can be used here.
-SM100_FOCUS: list[list] = [
-    [32, 1024, 4, 128, True, "bf16"],
-    [64, 512, 4, 128, True, "bf16"],
-    [16, 2048, 4, 128, True, "bf16"],
-    [32, 1024, 8, 128, True, "bf16"],
-    [32, 1024, 4, 128, True, "fp16"],
-]
+FOCUS_SUITES = (
+    # TODO: Replace placeholders with captured sparse-length shapes.
+    FocusSuite(
+        name="sm100_baseline",
+        op="hstu_attn",
+        shapes=(
+            HSTUAttentionShape(32, 1024, 4, 128, True, "bf16"),
+            HSTUAttentionShape(64, 512, 4, 128, True, "bf16"),
+            HSTUAttentionShape(16, 2048, 4, 128, True, "bf16"),
+            HSTUAttentionShape(32, 1024, 8, 128, True, "bf16"),
+            HSTUAttentionShape(32, 1024, 4, 128, True, "fp16"),
+        ),
+    ),
+    # TODO: Add gfx950 shapes after validating its forward reference.
+    FocusSuite[HSTUAttentionShape](
+        name="gfx950_baseline",
+        op="hstu_attn",
+        shapes=(),
+    ),
+)
 
-#: Empty: the AMD entry is forward-only and the reference is unvalidated there.
-GFX950_FOCUS: list[list] = []
+DEFAULT_SUITES = {
+    "sm100": ("sm100_baseline", ),
+    "gfx950": ("gfx950_baseline", ),
+}
+FOCUS = FocusRegistry("hstu_attn", FOCUS_SUITES, DEFAULT_SUITES)
+
+SM100_FOCUS = FOCUS.shapes("sm100")
+GFX950_FOCUS = FOCUS.shapes("gfx950")
 
 #: How sequence lengths are drawn. The distribution dominates ragged-attention
 #: performance, so a number taken under one is not comparable to one taken under
@@ -40,7 +66,6 @@ RAGGED = "uniform"
 
 
 def inputs(Z, max_seq_len, H, head_dim, dtype, requires_grad=False, device="cuda"):
-    """A uniform-length ragged batch: every sequence is exactly max_seq_len."""
     import torch
 
     offsets = torch.arange(0, (Z + 1) * max_seq_len, max_seq_len, device=device, dtype=torch.int64)
@@ -68,6 +93,5 @@ def flops(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, direction="fwd", tokens=None):
 
 
 def label(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype, direction="fwd") -> str:
-    """The report's input column."""
     return (f"((), {{'dtype': '{dtype}', 'ragged': '{RAGGED}', 'dir': '{direction}', "
             f"'Z': '{Z}', 'MAX_SEQ_LEN': '{MAX_SEQ_LEN}', 'H': '{H}', 'HEAD_DIM': '{HEAD_DIM}'}})")
