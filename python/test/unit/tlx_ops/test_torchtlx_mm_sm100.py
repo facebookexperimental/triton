@@ -12,8 +12,8 @@ import torch._inductor.kernel.mm as inductor_mm
 from torch._inductor.utils import fresh_cache
 from triton._internal_testing import is_blackwell
 try:
-    from triton.tlx.ops.kernels.mm import sm100_torch
-    from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, operand
+    from triton.language.extra.tlx.inductor import sm100_torch
+    from triton.tlx.ops.kernels.mm._shapes import SM100_FOCUS, SYNTHETIC, operand
 except ImportError:  # not the fbtriton fork
     sm100_torch = None
 
@@ -22,6 +22,13 @@ pytestmark = pytest.mark.skipif(sm100_torch is None or not is_blackwell(), reaso
 torch.manual_seed(0)
 
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+
+
+def test_catalog_resolves_inductor_provider():
+    from triton.tlx.ops._catalog import impl_for
+
+    implementation, _ = impl_for("mm_torchtlx", arch="sm100")
+    assert implementation is sm100_torch.mm
 
 
 def test_forced_mode_assesses_only_tlx_candidates(monkeypatch):
@@ -54,7 +61,7 @@ FAILED_SHAPES = [
 
 
 def _cases():
-    entries = [] if sm100_torch is None else list(SYNTHETIC) + list(sm100_torch.PERF_SHAPES)
+    entries = [] if sm100_torch is None else list(SYNTHETIC) + list(SM100_FOCUS)
     return [entry for entry in entries if tuple(entry[:3]) not in FAILED_SHAPES]
 
 
