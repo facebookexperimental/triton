@@ -21,6 +21,8 @@ on:
       - '!python/test/unit/language/test_tlx_*_hip.py'
       - '!python/test/unit/tlx_ops/*_gfx950.py'
       - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/tlx_ops/*_gfx1250.py'
+      - '!python/test/unit/tlx_ops/*_hip.py'
       - '!python/test/unit/language/test_tlx_*_sm100.py'
       - '!python/test/unit/tlx_ops/*_sm100.py'
       # Agent instructions and skills do not affect generated code.
@@ -48,6 +50,8 @@ on:
       - '!python/test/unit/language/test_tlx_*_hip.py'
       - '!python/test/unit/tlx_ops/*_gfx950.py'
       - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/tlx_ops/*_gfx1250.py'
+      - '!python/test/unit/tlx_ops/*_hip.py'
       - '!python/test/unit/language/test_tlx_*_sm100.py'
       - '!python/test/unit/tlx_ops/*_sm100.py'
       # Agent instructions and skills do not affect generated code.
@@ -242,7 +246,7 @@ jobs:
             python/test/unit/language/test_tlx_*_any.py
             python/test/unit/language/test_tlx_*sm90up*.py
             python/test/unit/language/test_tlx_*sm90.py
-            python/test/unit/tlx_ops/test_*sm90.py
+            python/test/unit/tlx_ops/test_*_sm90.py
           )
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
           echo "h100 collects:" "${FILES[@]}"

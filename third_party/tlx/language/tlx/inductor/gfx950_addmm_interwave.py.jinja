@@ -1,9 +1,10 @@
 {{def_kernel("A", "B")}}
-    # gfx950 8-wave inter-wave addmm. This is intentionally a separate template
-    # from the general warp-pipe: it requires row-major A, a square 128 or 256
-    # tile, BLOCK_K=64, and exactly two LDS buffers. B remains logically [K, N]
-    # in LDS for both physical layouts; the swizzle's contiguous axis follows
-    # the globally contiguous B dimension.
+    # This gfx950 8-wave inter-wave GEMM source is shared by the distinct mm
+    # and addmm template identities. It remains separate from the general
+    # warp-pipe: it requires row-major A, a square 128 or 256 tile, BLOCK_K=64,
+    # and exactly two LDS buffers. B remains logically [K, N] in LDS for both
+    # physical layouts; the swizzle's contiguous axis follows the globally
+    # contiguous B dimension.
     M = {{size("A", 0)}}
     N = {{size("B", 1)}}
     K = {{size("A", 1)}}

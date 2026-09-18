@@ -1,408 +1,406 @@
-"""MI300X (gfx942 / CDNA3) GEMM -- the `tlx.ops.mm` implementation.
+"""MI300X (gfx942/CDNA3) ``tlx.ops.mm`` and ``addmm`` implementation.
 
-Promoted from `tutorials/amd_gemm_gfx942.py`, which is now frozen. The kernel
-below is that file's kernel verbatim; what is new here is the search-space
-plumbing every op needs -- lazy `_tuned`, a `heuristic_config` so a first call
-does not autotune, and a `smoke` space.
-
-The operand path is register-staged, which is what separates CDNA3 from the
-gfx950 kernels next door:
-
-    global --tl.load--> VGPR --tlx.local_store--> LDS --tlx.local_load--> MFMA
-
-Three things the kernel does, and why:
-
-* **Sized to the 64 KB CDNA3 LDS budget**, not CDNA4's 160 KB. The gfx950
-  kernels' 256x256x64 two-buffer ring wants ~128 KB and cannot be made to fit.
-  `_prune_configs` drops anything over budget before it is compiled.
-* **Program ids remapped across the 8 XCDs.** Measured *neutral* here -- 0.86x
-  aten with the remap vs 0.87x without at 4096^3, inside the noise -- because
-  the GROUP_M swizzle already captures that reuse. Kept as the standard MI300X
-  grid transform; set `NUM_XCDS=1` to A/B it.
-* **`matrix_instr_nonkdim=16`** -- gfx942 fp16 MFMA is 16x16x16 / 32x32x8, half
-  the K of CDNA4's 16x16x32 / 32x32x16.
-
-Unlike sm100, this op has no TMA, so it reads operands through plain strided
-pointers and imposes no alignment constraint. That is why it admits the odd-K
-production shape that sm100 declines.
+One direct-load kernel serves both fundamental operations. Five BF16
+row-major-A/column-major-B shapes have frozen configurations; other supported
+shapes and layouts use the same kernel through a compact heuristic or autotune
+space.
 """
+
 import functools
 
 import torch
+
 import triton
 import triton.language as tl
-import triton.language.extra.tlx as tlx
 
 from ._shapes import GFX942_FOCUS
 
-#: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
-#: of every arch's list; perf runs only its own.
+#: The shapes ``bench_mm.py`` gates on for this architecture.
 PERF_SHAPES = GFX942_FOCUS
 
-# MI300X: 8 XCDs, 304 CUs. Consecutive program ids are dispatched round-robin
-# across the XCDs, so the remap below undoes that to restore tile locality.
-NUM_XCDS = 8
-
-#: Compute units on an MI300X.
-NUM_CUS = 304
-
-#: Workgroup count the heuristic requires before it will accept a wider tile.
-#:
-#: Deliberately *below* `NUM_CUS`, which is the counter-intuitive part. Three of
-#: the six autotuned winners below land on exactly 256 workgroups -- 0.84 of a
-#: wave, leaving ~48 CUs idle -- and beat the next tile down, which fills the
-#: chip several times over. The wider tile's MFMA efficiency is worth more than
-#: the idle CUs. A `>= NUM_CUS` threshold was tried first and mispredicted both
-#: 2048^3 and 4096^3 by one rung.
-_MIN_WORKGROUPS = 256
-
-# A long-running grid just over one full device wave leaves only a handful of
-# CUs working through its tail.  For those extreme-K shapes, prefer the
-# single-buffer specialization of the next ladder rung so the work decomposes
-# into several better-filled waves without consuming the full LDS budget.
-_LONG_K_TAIL_THRESHOLD = 16 * 1024
-
-# Per-workgroup LDS on CDNA3. Configs are checked against this so an oversized
-# tile is dropped before compilation instead of failing out-of-resources.
-CDNA3_LDS_BYTES = 64 * 1024
+# Cache policy understood by _policy_load. Keeping the integer in the
+# kernel signature makes every selected policy a compile-time branch.
+_CACHE_DEFAULT = 0
+_CACHE_CA_EVICT_LAST = 2
+_CACHE_CA_EVICT_FIRST = 3
+_CACHE_EVICT_LAST = 5
 
 
 @triton.jit
-def _xcd_remap(pid, grid_mn, num_xcds: tl.constexpr):
-    """Undo the hardware's round-robin XCD dispatch of consecutive program ids.
-
-    Workgroup ``pid`` runs on XCD ``pid % num_xcds``. Left alone, tiles that
-    should share B columns land on different chiplets with different L2s. This
-    maps each XCD's slice of the grid back to a contiguous range of tile ids.
-    Handles a grid that is not a multiple of ``num_xcds``: the first
-    ``grid_mn % num_xcds`` XCDs get one extra tile.
-    """
-    pids_per_xcd = (grid_mn + num_xcds - 1) // num_xcds
-    tall_xcds = grid_mn % num_xcds
-    tall_xcds = num_xcds if tall_xcds == 0 else tall_xcds
-    xcd = pid % num_xcds
-    local_pid = pid // num_xcds
-    if xcd < tall_xcds:
-        return xcd * pids_per_xcd + local_pid
-    return tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+def _policy_load(ptrs, mask, even_k: tl.constexpr, policy: tl.constexpr):
+    if policy == 2:
+        return tl.load(ptrs, cache_modifier=".ca", eviction_policy="evict_last") if even_k else tl.load(
+            ptrs, mask=mask, other=0.0, cache_modifier=".ca", eviction_policy="evict_last")
+    if policy == 3:
+        return tl.load(ptrs, cache_modifier=".ca", eviction_policy="evict_first") if even_k else tl.load(
+            ptrs, mask=mask, other=0.0, cache_modifier=".ca", eviction_policy="evict_first")
+    if policy == 5:
+        return tl.load(ptrs, eviction_policy="evict_last") if even_k else tl.load(ptrs, mask=mask, other=0.0,
+                                                                                  eviction_policy="evict_last")
+    return tl.load(ptrs) if even_k else tl.load(ptrs, mask=mask, other=0.0)
 
 
 @triton.jit
 def matmul_kernel_gfx942(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    NUM_BUFFERS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
+    XCD_CHUNK: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    A_POLICY: tl.constexpr,
+    B_POLICY: tl.constexpr,
 ):
-    """C = A @ B, staging global -> VGPR -> LDS (the fastest operand path on CDNA3)."""
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
+    """Register-staged GEMM with per-operand cache and XCD policy."""
+    pid = tl.program_id(0).to(tl.int32)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    grid_mn = grid_m * grid_n
 
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    # Stripe complete chunks over the eight XCDs.  Leave a short tail in its
+    # original order so no remapped pid can escape the output-tile grid.
     if NUM_XCDS != 1:
-        pid = _xcd_remap(pid, num_pid_m * num_pid_n, NUM_XCDS)
+        aligned = (grid_mn // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
+        if pid < aligned:
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = ((local_pid // XCD_CHUNK) * NUM_XCDS * XCD_CHUNK + xcd * XCD_CHUNK + local_pid % XCD_CHUNK)
 
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
 
-    # Wrap the row/column offsets so an edge tile re-reads valid memory; the
-    # epilogue store is masked, so the duplicated work is discarded. This keeps
-    # the hot loop's loads unmasked in M/N -- only K needs a mask.
-    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    offs_k = tl.arange(0, BLOCK_K)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+    reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
 
-    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+        k = k_idx * BLOCK_K
+        a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+        b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+        a = _policy_load(a_ptrs, offs_k[None, :] < K - k, K % BLOCK_K == 0, A_POLICY)
+        b = _policy_load(b_ptrs, offs_k[:, None] < K - k, K % BLOCK_K == 0, B_POLICY)
+        acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
 
-    K_ITERS = tl.cdiv(K, BLOCK_K)
-
-    # The bank-conflict-avoiding padded shared layout is inferred by the compiler
-    # from how these buffers feed tl.dot -- see gfx9_gemm/a16w16 v3 vs v4 for the
-    # explicit form and why the inferred one is identical.
-    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
-    smem_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
-
-    # Prologue: fill the whole LDS ring.
-    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
-        a_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_K)
-        b_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_K)
-        tlx.local_store(tlx.local_view(smem_a, i), a_reg)
-        tlx.local_store(tlx.local_view(smem_b, i), b_reg)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # Main loop. Iteration k multiplies K tile ``k - NUM_BUFFERS``, which lives in
-    # buffer ``k % NUM_BUFFERS`` (since ``(k - NUM_BUFFERS) % NUM_BUFFERS ==
-    # k % NUM_BUFFERS``), and refills that same buffer with tile k. Both global
-    # loads are issued first so their latency overlaps the MFMA burst below; the
-    # local_store then lands on a buffer the dot has already consumed.
-    #
-    # num_stages=1 disables the automatic software pipeliner: the ring and the
-    # prefetch distance are managed by hand.
-    for k in tl.range(NUM_BUFFERS, K_ITERS, num_stages=1):
-        buf = k % NUM_BUFFERS
-        a_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K)
-        b_reg = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K)
-
-        a_tile = tlx.local_load(tlx.local_view(smem_a, buf))
-        b_tile = tlx.local_load(tlx.local_view(smem_b, buf))
-        acc = tl.dot(a_tile, b_tile, acc)
-
-        tlx.local_store(tlx.local_view(smem_a, buf), a_reg)
-        tlx.local_store(tlx.local_view(smem_b, buf), b_reg)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Epilogue: drain the NUM_BUFFERS tiles still sitting in the ring. Tile
-    # ``K_ITERS - NUM_BUFFERS + i`` is in buffer ``(K_ITERS + i) % NUM_BUFFERS``.
-    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
-        buf = (K_ITERS + i) % NUM_BUFFERS
-        a_tile = tlx.local_load(tlx.local_view(smem_a, buf))
-        b_tile = tlx.local_load(tlx.local_view(smem_b, buf))
-        acc = tl.dot(a_tile, b_tile, acc)
-
-    c = acc.to(tlx.dtype_of(c_ptr))
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+    idx_m = rows[:, None]
+    idx_n = cols[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+    if ADD_BIAS:
+        bias = tl.load(
+            bias_ptr + idx_m * stride_bias_m + idx_n * stride_bias_n,
+            mask=mask,
+            eviction_policy="evict_last",
+        )
+        acc += bias.to(tl.float32)
+    tl.store(c_ptr + idx_m * stride_cm + idx_n * stride_cn, acc, mask=mask)
 
 
-def lds_bytes(block_m, block_n, block_k, num_buffers, elem_bytes=2):
-    """LDS footprint of a tile, ignoring shared-layout padding."""
-    return (block_m * block_k + block_k * block_n) * elem_bytes * num_buffers
+# Public, reviewable record of the five selected configurations. The keys are
+# (M, N, K) for A[M, K] @ B[K, N]. Backend flags are separated from kernel
+# meta-parameters by ``_launch_config`` so they are never forwarded as kernel
+# arguments.
+TUNED_CONFIGS = {
+    (819200, 1024, 192): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 32,
+        "GROUP_M": 32,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 4,
+        "A_POLICY": _CACHE_CA_EVICT_FIRST,
+        "B_POLICY": _CACHE_DEFAULT,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 2,
+        "num_warps": 4,
+        "num_stages": 2,
+        "LLVM_SCHED_STRATEGY": "max-memory-clause",
+    },
+    (4096, 1894, 242432): {
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_K": 256,
+        "GROUP_M": 32,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 8,
+        "A_POLICY": _CACHE_EVICT_LAST,
+        "B_POLICY": _CACHE_DEFAULT,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "DISABLE_AGPR": True,
+        "REVERSE_LOCAL_ASSIGNMENT": True,
+        "SINK_INSTS_TO_AVOID_SPILLS": True,
+        "REGCLASS_PRIORITY": False,
+        "DISABLE_HIGH_RP_RESCHEDULE": False,
+    },
+    (1024, 6144, 20480): {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_M": 2,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 8,
+        "A_POLICY": _CACHE_DEFAULT,
+        "B_POLICY": _CACHE_EVICT_LAST,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "ENABLE_SCHED_BARRIER": True,
+        "SINK_INSTS_TO_AVOID_SPILLS": True,
+    },
+    (2048, 25408, 10240): {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "GROUP_M": 8,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 16,
+        "A_POLICY": _CACHE_CA_EVICT_LAST,
+        "B_POLICY": _CACHE_DEFAULT,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 1,
+        "kpack": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "ENABLE_SCHED_BARRIER": True,
+        "DISABLE_AGPR": True,
+        "REGCLASS_PRIORITY": True,
+        "LLVM_SCHED_STRATEGY": "iterative-ilp",
+    },
+    (61440, 2048, 5120): {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 16,
+        "A_POLICY": _CACHE_EVICT_LAST,
+        "B_POLICY": _CACHE_DEFAULT,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 1,
+        "kpack": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "ENABLE_SCHED_BARRIER": True,
+        "DISABLE_AGPR": True,
+    },
+}
+
+_BACKEND_OPTIONS = {
+    "ENABLE_SCHED_BARRIER": "enable_sched_group_barrier_scheduler",
+    "REVERSE_LOCAL_ASSIGNMENT": "reverse_local_assignment",
+    "SINK_INSTS_TO_AVOID_SPILLS": "sink_insts_to_avoid_spills",
+    "REGCLASS_PRIORITY": "regclass_priority_trumps_globalness",
+    "DISABLE_HIGH_RP_RESCHEDULE": "disable_unclustered_high_rp_reschedule",
+}
 
 
-def _config(block_m, block_n, block_k, group_m, num_buffers, num_warps):
+def tuned_config(a: torch.Tensor, b: torch.Tensor):
+    """Return an exact-shape fast path, or ``None`` for the generic path.
+
+    The configurations were measured with contiguous ``A[M, K]`` storage and
+    a transposed contiguous ``B[K, N]`` view. Keeping the layout guard here
+    prevents a shape match from silently applying a layout-specific choice to
+    a different memory-access pattern.
+    """
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        return None
+    if a.dtype != torch.bfloat16 or b.dtype != a.dtype:
+        return None
+    if not a.is_contiguous() or b.stride() != (1, b.shape[0]):
+        return None
+    return TUNED_CONFIGS.get((a.shape[0], b.shape[1], a.shape[1]))
+
+
+def _launch_config(a, b, bias, bias_strides, out, selected):
+    """Launch one frozen configuration into a validated output tensor."""
+    meta = dict(selected)
+
+    backend = {}
+    llvm_attrs = []
+    if meta.pop("DISABLE_AGPR", False):
+        llvm_attrs.append(("amdgpu-agpr-alloc", "0,0"))
+    sched_strategy = meta.pop("LLVM_SCHED_STRATEGY", "")
+    if sched_strategy:
+        llvm_attrs.append(("amdgpu-sched-strategy", sched_strategy))
+    if llvm_attrs:
+        backend["llvm_fn_attrs"] = tuple(llvm_attrs)
+    for key, option in _BACKEND_OPTIONS.items():
+        if key in meta:
+            backend[option] = meta.pop(key)
+
+    m, k = a.shape
+    n = b.shape[1]
+    bias_ptr = bias if bias is not None else out
+    args = (
+        a,
+        b,
+        bias_ptr,
+        out,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        bias_strides[0],
+        bias_strides[1],
+        out.stride(0),
+        out.stride(1),
+    )
+    grid = (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]), )
+    matmul_kernel_gfx942[grid](*args, ADD_BIAS=bias is not None, **meta, **backend)
+
+
+def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1):
     return triton.Config(
         {
             "BLOCK_M": block_m,
             "BLOCK_N": block_n,
             "BLOCK_K": block_k,
             "GROUP_M": group_m,
-            "NUM_BUFFERS": num_buffers,
-            "NUM_XCDS": NUM_XCDS,
-            "waves_per_eu": 0,
+            "NUM_XCDS": 8,
+            "XCD_CHUNK": 8,
+            "A_POLICY": _CACHE_DEFAULT,
+            "B_POLICY": _CACHE_DEFAULT,
+            "waves_per_eu": waves_per_eu,
+            "kpack": kpack,
         },
         num_warps=num_warps,
-        # The manual LDS ring does the pipelining, so the automatic software
-        # pipeliner must bail out -- which it does at num_stages=1.
-        num_stages=1,
+        num_stages=2,
     )
 
 
 def _configs():
-    """Tiles worth trying on MI300X. Used by `space="full"`.
-
-    Deliberately small: with 304 CUs the useful range runs from a 64x64 tile
-    (enough workgroups to fill the chip on a 1024^2 output, which only
-    decomposes into 16 tiles of 256x256) up to 256x256 (which needs a 4096^2
-    output before it saturates). BLOCK_K is mostly 32 because the 64 KB budget
-    will not hold a deep K tile at the wide end -- 256x256x64 would want 128 KB.
-
-    NUM_BUFFERS spans 1..3, so the single-buffered ring is in the space as the
-    degenerate case rather than as a separate kernel. Depth is not the lever it
-    looks like: it costs LDS linearly, and on a 64 KB budget that LDS is often
-    better spent on a wider tile.
-    """
-    tiles = [
-        (64, 64, 64, 4),
-        (128, 128, 32, 4),
-        (128, 128, 32, 8),
-        (128, 128, 64, 8),
-        (256, 128, 32, 8),
-        (128, 256, 32, 8),
-        (256, 256, 32, 8),
+    """Compact generic search space for the direct-load kernel."""
+    return [
+        _config(64, 64, 64, 4, 4),
+        _config(64, 64, 128, 8, 8),
+        _config(128, 64, 64, 4, 8),
+        _config(64, 128, 64, 8, 8),
+        _config(128, 128, 32, 8, 4),
+        _config(128, 128, 64, 8, 8),
+        _config(256, 128, 32, 8, 8),
+        _config(128, 256, 32, 8, 8),
+        _config(256, 256, 64, 8, 8),
     ]
-    return [_config(bm, bn, bk, gm, nb, warps) for (bm, bn, bk, warps) in tiles for gm in (4, 8) for nb in (1, 2, 3)]
 
 
 CONFIGS = _configs
 
 
 def _smoke_configs():
-    """One config per distinct lowering path, for shapes the heuristic declines.
-
-    The paths that actually differ here are ring depth (1 is the degenerate
-    no-double-buffer case, >1 rotates), the XCD remap, and the two warp counts.
-    """
-    return [
-        _config(64, 64, 64, 4, 1, 4),
-        _config(128, 128, 32, 8, 2, 4),
-        _config(128, 128, 32, 8, 3, 8),
-    ]
+    return [_config(64, 64, 64, 4, 4), _config(128, 128, 32, 8, 4)]
 
 
 SMOKE_CONFIGS = _smoke_configs
 
-#: Tile ladder for `heuristic_config`, widest first, each with the ring depth,
-#: group size and warp count that won for it during autotuning.
-#:
-#: Calibrated against a full-space autotune sweep on MI300X, fp16. Measured
-#: winners, and what this ladder picks:
-#:
-#:     shape               autotuned winner              ladder picks
-#:     1024^3              64x64x64   GM4 nb1 w4         same
-#:     2048^3              128x128x64 GM8 nb2 w8         same
-#:     4096^3              256x256x32 GM8 nb2 w8         same
-#:     8192^3              256x256x32 GM8 nb2 w8         same
-#:     8192x1024x8192      128x128x32 GM8 nb1 w4         same
-#:     1024x8192x8192      128x128x32 GM4 nb1 w4         GM8 (only GROUP_M differs)
-#:
-#: Five of six exact. Six points is not a lot of calibration, which is why
-#: `space="full"` stays available and the perf suite gates the heuristic.
-_TILE_LADDER = [
-    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, NUM_BUFFERS, num_warps)
-    (256, 256, 32, 8, 2, 8),
-    (128, 128, 64, 8, 2, 8),
-    (64, 64, 64, 4, 1, 4),
-]
-
-#: The tile every narrow shape gets. Both measured rectangular cases chose it
-#: over the wider tile with the same workgroup count, so grid size alone does
-#: not decide: at BLOCK_M=256 a shape with M=1024 has only four M-tiles, and the
-#: GROUP_M swizzle has too little to work with to keep B resident in L2.
-_NARROW_TILE = (128, 128, 32, 8, 1, 4)
-
-# The long-K tail fallback keeps the same tile geometry as the next ladder
-# rung, but uses one LDS buffer.  Its 128x128x64 two-buffer form consumes the
-# entire LDS budget; the fallback already has several device waves available,
-# so test whether freeing half of that per-workgroup LDS is worth giving up one
-# tile of prefetch distance.
-_LONG_K_TAIL_TILE = (128, 128, 64, 8, 1, 8)
-
-#: A shape is "narrow" when one side is this small while the other is large.
-_NARROW_SIDE = 1024
-_WIDE_SIDE = 4096
-
 
 def heuristic_config(M, N, K):
-    """The shape-picked config as a one-element space, or None if it declines.
-
-    Two rules, both read off the sweep in `_TILE_LADDER`:
-
-    1. A narrow shape -- one side <= 1024 while the other is >= 4096 -- takes
-       `_NARROW_TILE` regardless of how many workgroups a wider tile would make.
-    2. Otherwise take the widest tile that still produces at least
-       `_MIN_WORKGROUPS`, except that an extreme-K grid between one and two
-       full device waves takes the single-buffer specialization of the next
-       rung to avoid a long under-filled tail. Fall back to the narrowest tile.
-
-    Returns None when nothing in the ladder fits the LDS budget at this K, which
-    sends the caller to the smoke space rather than off a cliff.
-    """
-    if min(M, N) <= _NARROW_SIDE <= _WIDE_SIDE <= max(M, N):
-        candidates = [_NARROW_TILE]
-    else:
-        candidates = []
-        long_k_tail = False
-        for tile in _TILE_LADDER:
-            workgroups = triton.cdiv(M, tile[0]) * triton.cdiv(N, tile[1])
-            if workgroups < _MIN_WORKGROUPS:
-                continue
-            if K >= _LONG_K_TAIL_THRESHOLD and NUM_CUS < workgroups < 2 * NUM_CUS:
-                long_k_tail = True
-                continue
-            candidates.append(tile)
-        if long_k_tail:
-            candidates = [_LONG_K_TAIL_TILE]
-        candidates = candidates or [_TILE_LADDER[-1]]
-
-    for block_m, block_n, block_k, group_m, num_buffers, num_warps in candidates:
-        # K must supply at least one tile per buffer, and the ring must fit.
-        depth = min(num_buffers, max(triton.cdiv(K, block_k), 1))
-        if lds_bytes(block_m, block_n, block_k, depth) > CDNA3_LDS_BYTES:
-            continue
-        return [_config(block_m, block_n, block_k, group_m, depth, num_warps)]
-    return None
-
-
-def _prune_configs(configs, named_args, **kwargs):
-    """Drop tiles that cannot run on this shape before anything is compiled."""
-    K = named_args["K"]
-    elem_bytes = named_args["a_ptr"].element_size()
-    kept = []
-    for config in configs:
-        bm = config.kwargs["BLOCK_M"]
-        bn = config.kwargs["BLOCK_N"]
-        bk = config.kwargs["BLOCK_K"]
-        nb = config.kwargs["NUM_BUFFERS"]
-        # K must supply at least one tile per buffer.
-        if triton.cdiv(K, bk) < nb:
-            continue
-        if lds_bytes(bm, bn, bk, nb, elem_bytes) > CDNA3_LDS_BYTES:
-            continue
-        kept.append(config)
-    if not kept:
-        raise RuntimeError(f"No config fits K={K} within the {CDNA3_LDS_BYTES} B gfx942 LDS budget")
-    return kept
+    """Choose one direct-load configuration without runtime autotuning."""
+    if min(M, N) <= 64:
+        return [_config(64, 64, 64, 4, 4)]
+    if K <= 256:
+        return [_config(128, 128, 32, 8, 4)]
+    wide_workgroups = triton.cdiv(M, 256) * triton.cdiv(N, 256)
+    if M >= 2048 and N >= 2048 and wide_workgroups >= 256:
+        return [_config(256, 256, 64, 8, 8)]
+    if M < N:
+        return [_config(128, 256, 32, 8, 8)]
+    if N < M:
+        return [_config(256, 128, 32, 8, 8)]
+    return [_config(128, 128, 64, 8, 8)]
 
 
 @functools.lru_cache(maxsize=None)
 def _tuned(space, shape=None):
-    """Autotuned kernel per search space; `shape` keys only the heuristic one."""
+    """Autotuned direct-load kernel per search space."""
     if space == "heuristic":
-        configs = heuristic_config(*shape) or SMOKE_CONFIGS()
+        configs = heuristic_config(*shape)
     else:
         configs = {"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space]()
-    return triton.autotune(
-        configs=configs,
-        key=["M", "N", "K"],
-        prune_configs_by={"early_config_prune": _prune_configs},
-    )(matmul_kernel_gfx942)
+    return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS"])(matmul_kernel_gfx942)
 
 
-def mm(a, b, *, space="heuristic"):
-    """Matrix multiply ``a @ b`` on MI300X.
-
-    `space` selects the search space -- "full" for perf, "heuristic" (one
-    config) for a first call that stays interactive, "smoke" for path coverage.
-    Not exposed on `tlx.ops.mm`.
-
-    Either operand may be column-major: the kernel indexes through explicit
-    strides, so a transposed view costs nothing and needs no copy.
-    """
-    assert a.shape[1] == b.shape[0], f"K mismatch: A={tuple(a.shape)}, B={tuple(b.shape)}"
-    assert a.dtype == b.dtype, "A and B must have the same dtype"
+def _validate_operands(a, b, out):
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Expected A[M, K] and B[K, N], got {tuple(a.shape)} and {tuple(b.shape)}")
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(f"K mismatch: A={tuple(a.shape)}, B={tuple(b.shape)}")
+    if a.device.type != "cuda" or b.device != a.device:
+        raise ValueError("A and B must be on the same GPU")
+    if a.dtype != b.dtype:
+        raise ValueError("A and B must have the same dtype")
     M, K = a.shape
-    K, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    N = b.shape[1]
+    if out is not None:
+        if out.shape != (M, N) or out.device != a.device or out.dtype != a.dtype or not out.is_contiguous():
+            raise ValueError(f"out must be a contiguous {a.dtype} tensor with shape ({M}, {N}) on A's device")
+    return M, N, K
+
+
+def _bias_strides(bias, M, N, a):
+    if bias.device != a.device or bias.dtype != a.dtype:
+        raise ValueError("input must match A's device and dtype")
+    if bias.ndim == 1:
+        if bias.shape[0] != N:
+            raise ValueError(f"1-D addmm input must have shape ({N},), got {tuple(bias.shape)}")
+        return 0, bias.stride(0)
+    if bias.ndim == 2 and bias.shape[0] in (1, M) and bias.shape[1] in (1, N):
+        return (0 if bias.shape[0] == 1 else bias.stride(0), 0 if bias.shape[1] == 1 else bias.stride(1))
+    raise ValueError(f"addmm input with shape {tuple(bias.shape)} is not broadcastable to ({M}, {N})")
+
+
+def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
+    M, N, K = _validate_operands(a, b, out)
+    bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
+    if out is None:
+        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    selected = tuned_config(a, b)
+    if selected is not None:
+        _launch_config(a, b, bias, bias_strides, out, selected)
+        return out
 
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )  # noqa: E731
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
+    bias_ptr = bias if bias is not None else out
     kernel[grid](
         a,
         b,
-        c,
+        bias_ptr,
+        out,
         M,
         N,
         K,
@@ -410,20 +408,29 @@ def mm(a, b, *, space="heuristic"):
         a.stride(1),
         b.stride(0),
         b.stride(1),
-        c.stride(0),
-        c.stride(1),
-        # 16x16x16 MFMA on gfx942 fp16.
+        bias_strides[0],
+        bias_strides[1],
+        out.stride(0),
+        out.stride(1),
+        ADD_BIAS=bias is not None,
         matrix_instr_nonkdim=16,
     )
-    return c
+    return out
 
 
-#: The kernel-optimization agent loads a source file and calls `matmul(a, b)`.
-#: Aliasing it here means the agent can be pointed at the shipped op rather than
-#: at a tutorial copy, so a win it finds lands on the code users run.
-#:
-#: Note this reaches `mm`'s default `space="heuristic"`, so the agent measures
-#: one config rather than an autotuned winner. That is the right target -- the
-#: heuristic is what a caller gets -- but it means an agent result is not
-#: comparable to a `space="full"` number.
+def mm(a, b, *, out=None, space="heuristic"):
+    """Compute ``a @ b`` using the gfx942 direct-load GEMM kernel."""
+    return _gemm(a, b, out=out, space=space)
+
+
+def addmm(input, a, b, *, out=None, space="heuristic"):
+    """Compute ``input + a @ b`` with a fused broadcast epilogue.
+
+    ``input`` may be ``(N,)`` or a two-dimensional tensor broadcastable to
+    ``(M, N)``. Matrix and input scale factors are both one.
+    """
+    return _gemm(a, b, input, out=out, space=space)
+
+
+# Compatibility entry point used by the kernel-optimization agent.
 matmul = mm

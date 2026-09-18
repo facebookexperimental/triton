@@ -7,14 +7,14 @@ the forward's number would hide it.
 
 from __future__ import annotations
 
-import importlib
 import pathlib
 import sys
 
 import torch
 import torch.nn.functional as F
 
-from triton.tlx.ops.kernels.flash_attn._shapes import flops, label, qkv
+from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.flash_attn._shapes import SYNTHETIC, flops, label, qkv
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -49,19 +49,15 @@ DIRECTIONS = ("fwd", "bwd")
 REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
 
-def shapes(synthetic: bool = False) -> list[list]:
-    if synthetic:
-        from triton.tlx.ops.kernels.flash_attn._shapes import SYNTHETIC
-
-        return list(SYNTHETIC)
-    return list(importlib.import_module(f"triton.tlx.ops.kernels.flash_attn.{driver.arch()}").PERF_SHAPES)
+def shapes(synthetic: bool = False, suites=None) -> list:
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
-def cases(synthetic: bool = False) -> list[Case]:
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
     return [
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
              direction=direction, label=label(*entry, direction))
-        for entry in shapes(synthetic)
+        for entry in shapes(synthetic, suites)
         for direction in DIRECTIONS
     ]
 

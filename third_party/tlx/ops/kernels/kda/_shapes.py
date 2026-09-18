@@ -1,51 +1,89 @@
 from __future__ import annotations
 
-# Entries are [B, T, H, HEAD_DIM, dtype], where B is the number of packed
-# sequences and T the tokens in each; the op takes them as one `[1, B*T, H, D]`
-# tensor plus `cu_seqlens`. HEAD_DIM is 128 throughout -- the catalog entry
-# accepts nothing else.
+from typing import NamedTuple
 
-#: The L1 shape, from `test_kimi_delta_attention.py::_inputs`.
-SYNTHETIC: list[list] = [
-    [2, 64, 2, 128, "bf16"],
-]
+from .._shape_suites import FocusRegistry, FocusSuite
 
-#: TODO: placeholder shapes, not a capture. Awaiting real ones.
-SM100_FOCUS: list[list] = [
-    [4, 4096, 8, 128, "bf16"],
-    [4, 4096, 16, 128, "bf16"],
-    [2, 8192, 8, 128, "bf16"],
-    [8, 2048, 8, 128, "bf16"],
-]
 
-#: Prepared-input gfx950 prefill shapes: total tokens, sequences, H, K, V, dtype.
-GFX950_PREFILL_SYNTHETIC: list[list] = [
-    [64, 1, 4, 128, 128, "bf16"],
-]
+class KDAShape(NamedTuple):
+    batch: int
+    tokens: int
+    heads: int
+    head_dim: int
+    dtype: str
 
-GFX950_PREFILL_FOCUS: list[list] = [
-    [4096, 1, 4, 128, 128, "bf16"],
-    [4096, 4, 4, 128, 128, "bf16"],
-    [131072, 1, 4, 128, 128, "bf16"],
-    [131072, 8, 4, 128, 128, "bf16"],
-    [4096, 1, 12, 128, 128, "bf16"],
-    [4096, 4, 12, 128, 128, "bf16"],
-    [131072, 1, 12, 128, 128, "bf16"],
-    [131072, 8, 12, 128, 128, "bf16"],
-]
 
-#: Indexed one-token gfx950 decode shapes: batch, H, K, V, dtype.
-GFX950_DECODE_SYNTHETIC: list[list] = [
-    [1, 4, 128, 128, "bf16"],
-]
+class KDAPrefillShape(NamedTuple):
+    total_tokens: int
+    sequences: int
+    heads: int
+    key_dim: int
+    value_dim: int
+    dtype: str
 
-GFX950_DECODE_FOCUS: list[list] = [
-    [batch, heads, 128, 128, "bf16"]
-    for heads in (4, 12)
-    for batch in (1, 2, 4, 8, 16, 32)
-]
 
-#: Chunk length the kernel works in. Used only by `flops`.
+class KDADecodeShape(NamedTuple):
+    batch: int
+    heads: int
+    key_dim: int
+    value_dim: int
+    dtype: str
+
+
+SYNTHETIC: tuple[KDAShape, ...] = (KDAShape(2, 64, 2, 128, "bf16"), )
+
+# TODO: Replace placeholders with captured shapes.
+SM100_FOCUS_SUITE = FocusSuite(
+    name="sm100_baseline",
+    op="kimi_delta_attention",
+    shapes=(
+        KDAShape(4, 4096, 8, 128, "bf16"),
+        KDAShape(4, 4096, 16, 128, "bf16"),
+        KDAShape(2, 8192, 8, 128, "bf16"),
+        KDAShape(8, 2048, 8, 128, "bf16"),
+    ),
+)
+FOCUS_SUITES = (SM100_FOCUS_SUITE, )
+
+GFX950_PREFILL_SYNTHETIC: tuple[KDAPrefillShape, ...] = (KDAPrefillShape(64, 1, 4, 128, 128, "bf16"), )
+
+GFX950_PREFILL_FOCUS_SUITE = FocusSuite(
+    name="gfx950_prefill_baseline",
+    op="kda_paged_prefill",
+    shapes=(
+        KDAPrefillShape(4096, 1, 4, 128, 128, "bf16"),
+        KDAPrefillShape(4096, 4, 4, 128, 128, "bf16"),
+        KDAPrefillShape(131072, 1, 4, 128, 128, "bf16"),
+        KDAPrefillShape(131072, 8, 4, 128, 128, "bf16"),
+        KDAPrefillShape(4096, 1, 12, 128, 128, "bf16"),
+        KDAPrefillShape(4096, 4, 12, 128, 128, "bf16"),
+        KDAPrefillShape(131072, 1, 12, 128, 128, "bf16"),
+        KDAPrefillShape(131072, 8, 12, 128, 128, "bf16"),
+    ),
+)
+PREFILL_FOCUS_SUITES = (GFX950_PREFILL_FOCUS_SUITE, )
+
+GFX950_DECODE_SYNTHETIC: tuple[KDADecodeShape, ...] = (KDADecodeShape(1, 4, 128, 128, "bf16"), )
+
+GFX950_DECODE_FOCUS_SUITE = FocusSuite(
+    name="gfx950_decode_baseline",
+    op="kda_recurrent_decode",
+    shapes=tuple(KDADecodeShape(batch, heads, 128, 128, "bf16") for heads in (4, 12) for batch in (1, 2, 4, 8, 16, 32)),
+)
+DECODE_FOCUS_SUITES = (GFX950_DECODE_FOCUS_SUITE, )
+
+DEFAULT_SUITES = {"sm100": ("sm100_baseline", )}
+PREFILL_DEFAULT_SUITES = {"gfx950": ("gfx950_prefill_baseline", )}
+DECODE_DEFAULT_SUITES = {"gfx950": ("gfx950_decode_baseline", )}
+
+FOCUS = FocusRegistry("kimi_delta_attention", FOCUS_SUITES, DEFAULT_SUITES)
+PREFILL_FOCUS = FocusRegistry("kda_paged_prefill", PREFILL_FOCUS_SUITES, PREFILL_DEFAULT_SUITES)
+DECODE_FOCUS = FocusRegistry("kda_recurrent_decode", DECODE_FOCUS_SUITES, DECODE_DEFAULT_SUITES)
+
+SM100_FOCUS = FOCUS.shapes("sm100")
+GFX950_PREFILL_FOCUS = PREFILL_FOCUS.shapes("gfx950")
+GFX950_DECODE_FOCUS = DECODE_FOCUS.shapes("gfx950")
+
 CHUNK = 64
 
 #: Absolute TFLOP/s gate -- the only perf gate available, since KDA has no
@@ -95,6 +133,5 @@ def flops(B, T, H, HEAD_DIM, direction="fwd", chunk=CHUNK):
 
 
 def label(B, T, H, HEAD_DIM, dtype, direction="fwd") -> str:
-    """The report's input column."""
     return (f"((), {{'dtype': '{dtype}', 'dir': '{direction}', "
             f"'B': '{B}', 'T': '{T}', 'H': '{H}', 'HEAD_DIM': '{HEAD_DIM}'}})")

@@ -18,8 +18,10 @@ on:
       - 'python/test/unit/language/test_tlx_dot_hip_or_sm90.py'
       - '!python/test/unit/language/test_tlx_*_sm90up.py'
       - '!python/test/unit/language/test_tlx_*_sm100.py'
+      - '!python/test/unit/tlx_ops/*_sm90.py'
       - '!python/test/unit/tlx_ops/*_sm100.py'
       - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/tlx_ops/*_gfx1250.py'
       - '!third_party/proton/test/**'
       # Agent instructions and skills do not affect generated code.
       - '!.agents/**'
@@ -43,8 +45,10 @@ on:
       - 'python/test/unit/language/test_tlx_dot_hip_or_sm90.py'
       - '!python/test/unit/language/test_tlx_*_sm90up.py'
       - '!python/test/unit/language/test_tlx_*_sm100.py'
+      - '!python/test/unit/tlx_ops/*_sm90.py'
       - '!python/test/unit/tlx_ops/*_sm100.py'
       - '!python/test/unit/tlx_ops/*_gfx942.py'
+      - '!python/test/unit/tlx_ops/*_gfx1250.py'
       - '!third_party/proton/test/**'
       # Agent instructions and skills do not affect generated code.
       - '!.agents/**'
@@ -265,9 +269,16 @@ jobs:
             python/test/unit/language/test_tlx_*_any.py
             python/test/unit/language/test_tlx_*hip*.py
             python/test/unit/language/test_tlx_*gfx950*.py
-            python/test/unit/tlx_ops/test_*hip*.py
-            python/test/unit/tlx_ops/test_*gfx950*.py
+            python/test/unit/tlx_ops/test_*_hip.py
+            python/test/unit/tlx_ops/test_*_gfx950.py
           )
+          # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
+          # separate mi350-torchtlx-test job below, not this pinned-PyTorch job.
+          TLX_FILES=()
+          for file in "${FILES[@]}"; do
+            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
+          done
+          FILES=("${TLX_FILES[@]}")
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
           echo "mi350 collects:" "${FILES[@]}"
           pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
@@ -292,6 +303,102 @@ jobs:
             --budget /tmp/tlx-core.xml=30 --budget /tmp/tlx-correctness.xml=30 \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "mi350-tlx-test" \
+            ${FAILED_FLAG}
+
+  mi350-torchtlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: linux-fb-triton-mi350-1
+    env:
+      TORCHINDUCTOR_TLX_MODE: "allow"
+      TORCHTLX_ARCH: gfx950
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Create isolated TorchTLX environment
+        run: |
+          set -eux
+          BASE_PYTHON="$(command -v python3)"
+          TORCHTLX_VENV="${RUNNER_TEMP}/torchtlx-venv"
+          uv venv --python "${BASE_PYTHON}" "${TORCHTLX_VENV}"
+          TORCHTLX_PYTHON="${TORCHTLX_VENV}/bin/python"
+
+          # Force the freshest floating ROCm nightly. A stable release sorts
+          # above a nightly with the same version in a pre-existing environment;
+          # this clean job-local venv has no installed release to outrank it.
+          uv pip install --python "${TORCHTLX_PYTHON}" --pre torch \
+            --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          from torch._inductor import config
+
+          print(f"torch -> {torch.__version__} ({torch.__file__})")
+          if not hasattr(config.triton, "tlx_mode"):
+              raise RuntimeError(
+                  "the ROCm PyTorch nightly has no TorchTLX Inductor support "
+                  "(torch._inductor.config.triton.tlx_mode)"
+              )
+          PY
+      - name: Compile Triton
+        run: |
+          set -eux
+          TORCHTLX_PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          uv pip install --python "${TORCHTLX_PYTHON}" \
+            -r python/requirements.txt -r python/test-requirements.txt
+          uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
+            -e . --no-build-isolation
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          import triton
+
+          print(f"torch  -> {torch.__version__} ({torch.__file__})")
+          print(f"triton -> {triton.__file__}")
+          PY
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 60
+        run: |
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
+      - name: Run TorchTLX L2 perf
+        id: run_torchtlx_perf
+        if: always() && github.event_name == 'schedule'
+        timeout-minutes: 50
+        run: |
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          bash scripts/run_torchtlx_tests.sh --perf \
+            --junitxml=/tmp/torchtlx_perf.xml
+      - name: Upload TorchTLX perf artifacts
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi350-torchtlx-gemm-perf
+          path: /tmp/tlx_benchmark/*_torchtlx.gfx950.json
+          if-no-files-found: ignore
+      - name: Collect nightly failures (TorchTLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
+                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket mi350-torchtlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "mi350-torchtlx-test" \
             ${FAILED_FLAG}
 
   mi350-gluon-test:
@@ -430,6 +537,32 @@ jobs:
       external_dep_reason: ${{ matrix.item.external_dep_reason }}
       platform: mi350
 
+  report-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always() && github.event_name == 'schedule' && needs.mi350-torchtlx-test.outputs.failures != '' && needs.mi350-torchtlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-torchtlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
   report-mi350-gluon:
     needs: mi350-gluon-test
     if: always() && github.event_name == 'schedule' && needs.mi350-gluon-test.outputs.failures != '' && needs.mi350-gluon-test.outputs.failures != '[]'
@@ -483,6 +616,19 @@ jobs:
       workflow_name: ${{ github.workflow }}
       job_name: mi350-tlx-test
       failures: ${{ needs.mi350-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-torchtlx-test.result == 'success' || needs.mi350-torchtlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-torchtlx-test
+      failures: ${{ needs.mi350-torchtlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   reconcile-mi350-gluon:

@@ -17,13 +17,13 @@ tt.func @two_stage_backend(%n: index, %ptr: !tt.ptr<f32>) {
     scf.execute_region {
       tt.store %ptr, %v0 : !tt.ptr<f32>
       scf.yield
-    } {triton.warp_pipeline.stage = "stage0"}
+    } {triton.warp_pipeline.allow_memory_reorder, triton.warp_pipeline.stage = "stage0"}
 
     // Stage 1 cluster
     scf.execute_region {
       tt.store %ptr, %v1 : !tt.ptr<f32>
       scf.yield
-    } {triton.warp_pipeline.stage = "stage1"}
+    } {triton.warp_pipeline.allow_memory_reorder, triton.warp_pipeline.stage = "stage1"}
 
     scf.yield
   } {triton.warp_pipeline.pipelined_for}
@@ -46,11 +46,13 @@ tt.func @two_stage_backend(%n: index, %ptr: !tt.ptr<f32>) {
 // CHECK: amdg.cond_barrier %[[WARPHIGH]]
 
 // After conversion, the for body is flattened and cluster barriers inserted.
+// Reorderable stages do not add a per-memory-op ordering barrier.
 // CHECK: scf.for
 // CHECK-NOT:   scf.execute_region
-// CHECK: rocdl.sched.barrier
-// CHECK: rocdl.s.barrier
-// CHECK: rocdl.sched.barrier
+// CHECK: tt.store
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NOT:   scf.execute_region
 
 // CHECK: amdg.cond_barrier %[[WARPLOW]]
@@ -98,9 +100,23 @@ tt.func @three_stage_backend(%n: index, %ptr0: !tt.ptr<f32>, %ptr1: !tt.ptr<f32>
 // CHECK: amdg.cond_barrier
 // CHECK: scf.for
 // CHECK-NOT:   scf.execute_region
-// CHECK: rocdl.sched.barrier
-// CHECK: rocdl.s.barrier
-// CHECK: rocdl.sched.barrier
+// Unmarked stages retain source order by placing an ordering barrier after
+// every memory operation, before the barrier that separates stages.
+// CHECK: tt.store
+// CHECK-NEXT: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: tt.store
+// CHECK-NEXT: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: tt.store
+// CHECK-NEXT: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
 // CHECK: amdg.cond_barrier
 // CHECK: tt.return
 

@@ -54,12 +54,20 @@ CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
         op="mm",
         arch="gfx942",
-        variant="lds_ring",
+        variant="direct_load",
         impl="kernels.mm.gfx942:mm",
         dtypes=_FP16,
         # No `accepts`: operands are read through explicit strides rather than a
         # descriptor, so there is no alignment rule to fail. This arch therefore
         # admits shapes sm100 declines -- see kernels/mm/_shapes.py.
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="addmm",
+        arch="gfx942",
+        variant="fused_gemm",
+        impl="kernels.mm.gfx942:addmm",
+        dtypes=_FP16,
         requires=frozenset(),
     ),
     OpSpec(
@@ -69,6 +77,35 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="kernels.mm.gfx950:mm",
         # LocalSplitU remains FP16-only; the register fallback also supports
         # BF16 and performs the narrower per-plan validation.
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
+        # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
+        op="mm_torchtlx",
+        arch="sm100",
+        variant="inductor_blackwell_gemm_ws",
+        impl="kernels.mm.sm100_torch:mm",
+        dtypes=_FP16,
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        # TorchTLX providers are benchmark/catalog entries rather than public
+        # wrappers: their API is torch.addmm, with TLX selected by Inductor.
+        op="addmm_torchtlx",
+        arch="gfx950",
+        variant="inductor_gfx950_addmm",
+        impl="kernels.addmm.gfx950_torch:addmm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="bmm_torchtlx",
+        arch="gfx950",
+        variant="inductor_gfx950_bmm",
+        impl="kernels.bmm.gfx950_torch:bmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),

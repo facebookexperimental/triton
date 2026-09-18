@@ -1,0 +1,183 @@
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        return
+
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    MACRO_K: tl.constexpr = WAVE_K * LOCAL_SPLIT_U
+
+    pid_n = tl.program_id(0).to(tl.int32)
+    split_ids = tl.arange(0, LOCAL_SPLIT_U).to(tl.int32)
+    rows = tl.arange(0, TILE_M).to(tl.int32)
+    global_rows = tl.where(rows < M, rows, 0)
+    local_cols = tl.arange(0, TILE_N).to(tl.int32)
+    output_cols = pid_n * TILE_N + local_cols
+    global_cols = tl.where(output_cols < N, output_cols, 0)
+    rk = tl.arange(0, WAVE_K).to(tl.int32)
+
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[LOCAL_SPLIT_U, 1, 1],
+    )
+    dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=K_WIDTH)
+    dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=K_WIDTH)
+
+    acc = tlx.zeros(
+        (LOCAL_SPLIT_U, TILE_M, TILE_N),
+        ACC_TYPE,
+        layout=mma,
+    )
+    current_a, current_b = _gfx950_local_split_u_load_dot_operands(
+        A,
+        B,
+        global_rows,
+        global_cols,
+        split_ids,
+        rk,
+        0,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        WAVE_K,
+        K_WIDTH,
+        dot_a,
+        dot_b,
+    )
+
+    for macro in tl.range(0, K // MACRO_K - 1, num_stages=1):
+        next_k = (macro + 1) * MACRO_K
+        next_a, next_b = _gfx950_local_split_u_load_dot_operands(
+            A,
+            B,
+            global_rows,
+            global_cols,
+            split_ids,
+            rk,
+            next_k,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            WAVE_K,
+            K_WIDTH,
+            dot_a,
+            dot_b,
+        )
+        acc = tl.dot(
+            current_a,
+            current_b,
+            acc,
+            allow_tf32=ALLOW_TF32,
+            out_dtype=ACC_TYPE,
+        )
+        current_a = next_a
+        current_b = next_b
+
+    acc = tl.dot(
+        current_a,
+        current_b,
+        acc,
+        allow_tf32=ALLOW_TF32,
+        out_dtype=ACC_TYPE,
+    )
+
+    if LOCAL_SPLIT_U == 16 and TILE_N == 32:
+        partial_layout: tl.constexpr = tlx.swizzled_layout(
+            2,
+            2,
+            3,
+            order=[2, 1, 0],
+        )
+        partial_buffer = tlx.local_alloc(
+            (LOCAL_SPLIT_U, TILE_M, TILE_N),
+            ACC_TYPE,
+            1,
+            layout=partial_layout,
+        )
+    else:
+        partial_buffer = tlx.local_alloc(
+            (LOCAL_SPLIT_U, TILE_M, TILE_N),
+            ACC_TYPE,
+            1,
+        )
+    partial_view = tlx.local_view(partial_buffer, 0)
+    tlx.local_store(partial_view, acc)
+    tl.debug_barrier()
+
+    tl.static_assert(
+        LOCAL_SPLIT_U == 2
+        or LOCAL_SPLIT_U == 4
+        or LOCAL_SPLIT_U == 8
+        or LOCAL_SPLIT_U == 16
+    )
+    result = tl.reshape(
+        tlx.local_load(
+            tlx.local_slice(
+                partial_view,
+                [0, 0, 0],
+                [1, TILE_M, TILE_N],
+            )
+        ),
+        (TILE_M, TILE_N),
+    )
+    for split in tl.static_range(1, LOCAL_SPLIT_U):
+        partial = tlx.local_load(
+            tlx.local_slice(
+                partial_view,
+                [split, 0, 0],
+                [1, TILE_M, TILE_N],
+            )
+        )
+        result += tl.reshape(partial, (TILE_M, TILE_N))
+
+    idx_m = tl.arange(0, TILE_M).to(tl.int32)[:, None]
+    idx_n = output_cols[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+    {{store_output(("idx_m", "idx_n"), "result", "mask", val_shape=("TILE_M", "TILE_N"))}}
+
+
+@triton.jit
+def _gfx950_local_split_u_load_dot_operands(
+    a_ptr,
+    b_ptr,
+    global_rows,
+    global_cols,
+    split_ids,
+    rk,
+    macro_k_base,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    WAVE_K: tl.constexpr,
+    K_WIDTH: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+):
+    split_k = macro_k_base + split_ids[:, None, None] * WAVE_K
+    a_offsets = (
+        global_rows[None, :, None] * stride_am
+        + (split_k + rk[None, None, :]) * stride_ak
+    )
+    b_offsets = (
+        (split_k + rk[None, :, None]) * stride_bk
+        + global_cols[None, None, :] * stride_bn
+    )
+    a_offsets = tlx.require_layout(a_offsets, dot_a)
+    b_offsets = tlx.require_layout(b_offsets, dot_b)
+    a = tlx.buffer_load(a_ptr, a_offsets, contiguity=K_WIDTH)
+    b = tlx.buffer_load(b_ptr, b_offsets, cache=".cg", contiguity=K_WIDTH)
+    return a, b

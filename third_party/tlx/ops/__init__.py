@@ -3,15 +3,20 @@
     from triton.tlx.ops import mm as tlx_mm
     c = tlx_mm(a, b)
 
+    from triton.tlx.ops import addmm as tlx_addmm
+    c = tlx_addmm(bias, a, b)
+
 This module is the API contract; everything under it is private -- reaching into
 `triton.tlx.ops.kernels.*` is not supported. Exactly one implementation ships
 per (op, arch), so there is no `variant=` argument, and architecture never
 appears in caller code.
 
-Two keyword-only overrides exist for testing and benchmarking: `arch=` pins an
-entry instead of detecting one, and `space=` selects an implementation-defined
+Keyword-only overrides support testing and benchmarking: `arch=` pins an entry
+instead of detecting one, and `space=` selects an implementation-defined
 autotune search space. Passing a space that the selected implementation does
 not provide raises `InvalidInput` rather than silently choosing another space.
+`mm` and `addmm` also accept `out=` for implementations that support a
+preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
 any op that offers one, so that a first call stays interactive. Measured on
@@ -37,12 +42,12 @@ from __future__ import annotations
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
 __all__ = [
-    "mm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "mm", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
     "UnsupportedOp", "InvalidInput"
 ]
 
 
-def mm(a, b, *, arch=None, space="heuristic"):
+def mm(a, b, *, out=None, arch=None, space="heuristic"):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     Defaults to a single analytically chosen config so the first call stays
@@ -66,7 +71,20 @@ def mm(a, b, *, arch=None, space="heuristic"):
     b_src = b if b.is_contiguous() else b.T
     check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
                  row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
-    return fn(a, b, space=space)
+    if out is None:
+        return fn(a, b, space=space)
+    return fn(a, b, out=out, space=space)
+
+
+def addmm(input, a, b, *, out=None, arch=None, space="heuristic"):
+    """Fused ``input + a @ b`` for two-dimensional fp16/bf16 matrices.
+
+    ``input`` may be ``(N,)`` or two-dimensional and broadcastable to the
+    ``(M, N)`` result. Matrix and input scale factors are both one.
+    """
+    fn, spec = impl_for("addmm", arch)
+    check_inputs(spec, dtype=a.dtype)
+    return fn(input, a, b, out=out, space=space)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full"):

@@ -14,9 +14,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from . import _sm100_core as _core
 from ._shapes import SM100_FOCUS
 
 #: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
@@ -456,16 +456,6 @@ def matmul_tma_set_block_size_hook(nargs):
     ]
 
 
-@triton.jit
-def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
-    group_id = tile_id // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (tile_id % group_size_m)
-    pid_n = (tile_id % num_pid_in_group) // group_size_m
-    return pid_m, pid_n
-
-
 def preprocess_configs(configs, named_args, **kwargs):
     # Blackwell B200A resource limits
     NUM_SMS = _get_num_sms()
@@ -671,31 +661,6 @@ def preprocess_configs(configs, named_args, **kwargs):
 
 
 @triton.jit
-def _compute_grid_info(
-    M,
-    N,
-    K,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    BLOCK_SIZE_K,
-    GROUP_SIZE_M,
-    SPLIT_K,
-    NUM_CTAS: tl.constexpr,
-):
-    """Compute common grid information used across async tasks."""
-    start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    # Pad num_pid_m to multiple of NUM_CTAS so CTA clusters tile evenly along M.
-    num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    num_mn_tiles = num_pid_m * num_pid_n
-    num_tiles = num_mn_tiles * SPLIT_K
-    k_tiles_total = tl.cdiv(K, BLOCK_SIZE_K)
-    return start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_mn_tiles, num_tiles, k_tiles_total
-
-
-@triton.jit
 def _process_tile_epilogue_inner(
     tile_id,
     num_pid_in_group,
@@ -721,7 +686,7 @@ def _process_tile_epilogue_inner(
 ):
     """Process epilogue for a single tile."""
     mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
-    pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+    pid_m, pid_n = _core._compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
 
@@ -853,258 +818,6 @@ def _process_tile_epilogue_inner(
 
     # Wait for all TMA stores to complete
     tlx.async_descriptor_store_wait(0)
-
-
-@triton.jit
-def _process_tile_mma_inner(
-    k_tile_start,
-    k_tile_end,
-    NUM_SMEM_BUFFERS,
-    NUM_MMA_GROUPS,
-    NUM_TMEM_BUFFERS,
-    buffers_A,
-    buffers_B,
-    tmem_buffers,
-    A_smem_full_bars,
-    B_smem_full_bars,
-    A_smem_empty_bars,
-    tmem_full_bars,
-    cur_tmem_buf,
-    tmem_empty_bars,
-    tmem_write_phase,
-    smem_accum_cnt,
-    NUM_CTAS,
-    A_ROW_MAJOR: tl.constexpr = True,
-    B_ROW_MAJOR: tl.constexpr = True,
-):
-    """Process MMA for a single tile over [k_tile_start, k_tile_end). Returns updated smem_accum_cnt."""
-    local_k_tiles = k_tile_end - k_tile_start
-
-    # Peeled first K-iteration
-    buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
-
-    if NUM_MMA_GROUPS == 1:
-        tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase ^ 1)
-
-    # In the single-group path B_smem_full_bars aliases A_smem_full_bars, so
-    # this one wait covers both TMA loads. Multi-group waits on B here and each
-    # A subtile below.
-    tlx.barrier_wait(B_smem_full_bars[buf], phase)
-
-    # Process first K iteration (peeled) with use_acc=False
-    for group_id in tl.static_range(NUM_MMA_GROUPS):
-        # Calculate buffer indices
-        a_buf = group_id * NUM_SMEM_BUFFERS + buf
-        acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
-
-        if NUM_MMA_GROUPS > 1:
-            # Wait for this A subtile buffer to be loaded.
-            tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
-
-            cur_barrier_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
-            tlx.barrier_wait(tmem_empty_bars[cur_barrier_idx], tmem_write_phase ^ 1)
-
-        # Transpose SMEM buffers if inputs were column-major
-        a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
-        b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
-
-        # Perform MMA: use_acc=False for first K iteration (clears accumulator).
-        # This helper only runs on CTA0 in 2-CTA mode.
-        tlx.async_dot(
-            a_operand,
-            b_operand,
-            tmem_buffers[acc_buf],
-            use_acc=False,
-            mBarriers=[A_smem_empty_bars[a_buf]],
-            two_ctas=NUM_CTAS == 2,
-            out_dtype=tl.float32,
-        )
-
-    smem_accum_cnt += 1
-
-    # Remaining K iterations with use_acc=True
-    for _ in range(1, local_k_tiles):
-        # Advance the ring buffer incrementally (avoids the non-power-of-2
-        # divide/modulo of get_bufidx_phase in the hot K-loop).
-        buf += 1
-        if buf == NUM_SMEM_BUFFERS:
-            buf = 0
-            phase ^= 1
-
-        # In the single-group path this aliases the combined A/B full barrier.
-        tlx.barrier_wait(B_smem_full_bars[buf], phase)
-
-        # Process all subtiles for this K iteration
-        for group_id in tl.static_range(NUM_MMA_GROUPS):
-            # Calculate buffer indices
-            a_buf = group_id * NUM_SMEM_BUFFERS + buf
-            acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
-
-            if NUM_MMA_GROUPS > 1:
-                # Wait for this A subtile buffer to be loaded.
-                tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
-
-            # Transpose SMEM buffers if inputs were column-major
-            a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
-            b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
-
-            # Perform MMA: use_acc=True for remaining K iterations.
-            tlx.async_dot(
-                a_operand,
-                b_operand,
-                tmem_buffers[acc_buf],
-                use_acc=True,
-                mBarriers=[A_smem_empty_bars[a_buf]],
-                two_ctas=NUM_CTAS == 2,
-                out_dtype=tl.float32,
-            )
-
-        smem_accum_cnt += 1
-
-    # Signal the epilogue when the MMAs complete via an async tcgen05 commit,
-    # instead of blocking on the last MMA's A_smem_empty and then arriving on
-    # tmem_full. The commit makes tmem_full track completion of the prior
-    # tcgen05 MMAs asynchronously, so the MMA warpgroup can return and start
-    # the next tile's MMAs while this tile's final MMAs still drain -- closing
-    # the per-tile pipeline bubble between consecutive K-loops. In 2-CTA mode
-    # the commit multicasts the mbarrier signal to both CTAs' tmem_full (one
-    # arrive each), matching the previous local + remote_cta_rank arrives.
-    for group_id in tl.static_range(NUM_MMA_GROUPS):
-        acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
-        tlx.tcgen05_commit(tmem_full_bars[acc_buf], two_ctas=NUM_CTAS == 2)
-
-    return smem_accum_cnt
-
-
-@triton.jit
-def _process_tile_producer_inner(
-    tile_id,
-    num_pid_in_group,
-    num_pid_m,
-    num_mn_tiles,
-    GROUP_SIZE_M,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    BLOCK_SIZE_K,
-    NUM_MMA_GROUPS,
-    k_tile_start,
-    k_tile_end,
-    NUM_SMEM_BUFFERS,
-    a_desc,
-    b_desc,
-    buffers_A,
-    buffers_B,
-    A_smem_full_bars,
-    B_smem_full_bars,
-    A_smem_empty_bars,
-    smem_accum_cnt,
-    NUM_CTAS,
-    cluster_cta_rank,
-    SPLIT_K: tl.constexpr,
-    A_ROW_MAJOR: tl.constexpr = True,
-    B_ROW_MAJOR: tl.constexpr = True,
-):
-    """Process TMA loads for a single tile with all subtiles over [k_tile_start, k_tile_end)."""
-    mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
-    pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
-    dsize: tl.constexpr = tlx.size_of(tlx.dtype_of(b_desc))
-    BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
-    offs_bn = pid_n * BLOCK_SIZE_N + cluster_cta_rank * (BLOCK_SIZE_N // NUM_CTAS)
-    expected_bytes: tl.constexpr = dsize * BLOCK_SIZE_N * BLOCK_SIZE_K // NUM_CTAS
-    leader_only_mma: tl.constexpr = NUM_CTAS == 2
-    is_leader = cluster_cta_rank == 0
-
-    local_k_tiles = k_tile_end - k_tile_start
-
-    # Ring-buffer index tracked incrementally (avoids the non-power-of-2
-    # divide/modulo of get_bufidx_phase in the hot K-loop).
-    buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
-    # Iterate along K dimension for this split's range
-    for k_idx in range(0, local_k_tiles):
-        k = k_tile_start + k_idx
-        offs_k = k * BLOCK_SIZE_K
-
-        offs_am = pid_m * BLOCK_SIZE_M
-        if NUM_MMA_GROUPS == 1:
-            tlx.barrier_wait(A_smem_empty_bars[buf], phase ^ 1)
-            # Both TMA loads contribute bytes to the same full barrier.
-            a_expected_bytes: tl.constexpr = dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K
-            combined_bytes: tl.constexpr = expected_bytes + a_expected_bytes
-            if leader_only_mma:
-                tlx.barrier_expect_bytes(A_smem_full_bars[buf], combined_bytes * NUM_CTAS, pred=is_leader)
-            else:
-                tlx.barrier_expect_bytes(A_smem_full_bars[buf], combined_bytes)
-            if not B_ROW_MAJOR:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], A_smem_full_bars[buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-            else:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], A_smem_full_bars[buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-
-            if not A_ROW_MAJOR:
-                tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_k, offs_am], A_smem_full_bars[buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-            else:
-                tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], A_smem_full_bars[buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-        else:
-            a0_buf = buf
-            tlx.barrier_wait(A_smem_empty_bars[a0_buf], phase ^ 1)
-            a_expected_bytes: tl.constexpr = dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K
-            if leader_only_mma:
-                tlx.barrier_expect_bytes(A_smem_full_bars[a0_buf], a_expected_bytes * NUM_CTAS, pred=is_leader)
-            else:
-                tlx.barrier_expect_bytes(A_smem_full_bars[a0_buf], a_expected_bytes)
-            if not A_ROW_MAJOR:
-                tlx.async_descriptor_load(a_desc, buffers_A[a0_buf], [offs_k, offs_am], A_smem_full_bars[a0_buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-            else:
-                tlx.async_descriptor_load(a_desc, buffers_A[a0_buf], [offs_am, offs_k], A_smem_full_bars[a0_buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-
-            a1_buf = NUM_SMEM_BUFFERS + buf
-            tlx.barrier_wait(A_smem_empty_bars[a1_buf], phase ^ 1)
-            if leader_only_mma:
-                tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes * NUM_CTAS, pred=is_leader)
-            else:
-                tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-            if not B_ROW_MAJOR:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-            else:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
-
-            if leader_only_mma:
-                tlx.barrier_expect_bytes(A_smem_full_bars[a1_buf], a_expected_bytes * NUM_CTAS, pred=is_leader)
-            else:
-                tlx.barrier_expect_bytes(A_smem_full_bars[a1_buf], a_expected_bytes)
-            if not A_ROW_MAJOR:
-                tlx.async_descriptor_load(
-                    a_desc,
-                    buffers_A[a1_buf],
-                    [offs_k, offs_am + BLOCK_M_SPLIT],
-                    A_smem_full_bars[a1_buf],
-                    eviction_policy="evict_last",
-                    two_ctas=leader_only_mma,
-                )
-            else:
-                tlx.async_descriptor_load(
-                    a_desc,
-                    buffers_A[a1_buf],
-                    [offs_am + BLOCK_M_SPLIT, offs_k],
-                    A_smem_full_bars[a1_buf],
-                    eviction_policy="evict_last",
-                    two_ctas=leader_only_mma,
-                )
-
-        smem_accum_cnt += 1
-        buf += 1
-        if buf == NUM_SMEM_BUFFERS:
-            buf = 0
-            phase ^= 1
-
-    return smem_accum_cnt
 
 
 TORCH_DTYPE_TO_TRITON = {
@@ -1287,7 +1000,7 @@ def matmul_kernel_tma_ws_blackwell(
                 num_mn_tiles,
                 num_tiles,
                 k_tiles_total,
-            ) = _compute_grid_info(
+            ) = _core._compute_grid_info(
                 M,
                 N,
                 K,
@@ -1309,18 +1022,9 @@ def matmul_kernel_tma_ws_blackwell(
                 # the current tile to cover the persistent-loop boundary.
                 tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=NUM_CTAS == 2)
                 clc_phase_producer ^= 1
-                if SPLIT_K == 1:
-                    # Fast path: one split covers all K-tiles; avoids the
-                    # runtime-divisor `tile_id // num_mn_tiles` division.
-                    k_tile_start = 0
-                    k_tile_end = k_tiles_total
-                else:
-                    split_id = tile_id // num_mn_tiles
-                    k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
-                    k_tile_start = split_id * k_tiles_per_split
-                    k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                k_tile_start, k_tile_end = _core._compute_k_tile_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K)
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
-                    cur_tmem_buf, tmem_read_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    cur_tmem_buf, tmem_read_phase = _core.get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                     _process_tile_epilogue_inner(
                         tile_id=tile_id,
                         num_pid_in_group=num_pid_in_group,
@@ -1357,7 +1061,7 @@ def matmul_kernel_tma_ws_blackwell(
                 num_mn_tiles,
                 num_tiles,
                 k_tiles_total,
-            ) = _compute_grid_info(
+            ) = _core._compute_grid_info(
                 M,
                 N,
                 K,
@@ -1375,17 +1079,7 @@ def matmul_kernel_tma_ws_blackwell(
             clc_phase_consumer = 0
 
             while tile_id != -1:
-                # Compute K range for this split
-                if SPLIT_K == 1:
-                    # Fast path: one split covers all K-tiles; avoids the
-                    # runtime-divisor `tile_id // num_mn_tiles` division.
-                    k_tile_start = 0
-                    k_tile_end = k_tiles_total
-                else:
-                    split_id = tile_id // num_mn_tiles
-                    k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
-                    k_tile_start = split_id * k_tiles_per_split
-                    k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                k_tile_start, k_tile_end = _core._compute_k_tile_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K)
 
                 # Skip tiles whose split has zero K-tiles
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
@@ -1395,8 +1089,8 @@ def matmul_kernel_tma_ws_blackwell(
                     # the inner MMA loop on CTA1 avoids duplicating its address,
                     # predicate, and wait bookkeeping.
                     if NUM_CTAS == 1 or cluster_cta_rank == 0:
-                        cur_tmem_buf, tmem_write_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                        smem_accum_cnt = _process_tile_mma_inner(
+                        cur_tmem_buf, tmem_write_phase = _core.get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                        smem_accum_cnt = _core._process_tile_mma_inner(
                             k_tile_start=k_tile_start,
                             k_tile_end=k_tile_end,
                             NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
@@ -1437,7 +1131,7 @@ def matmul_kernel_tma_ws_blackwell(
                 num_mn_tiles,
                 num_tiles,
                 k_tiles_total,
-            ) = _compute_grid_info(
+            ) = _core._compute_grid_info(
                 M,
                 N,
                 K,
@@ -1454,21 +1148,11 @@ def matmul_kernel_tma_ws_blackwell(
             clc_phase_consumer = 0
 
             while tile_id != -1:
-                # Compute K range for this split
-                if SPLIT_K == 1:
-                    # Fast path: one split covers all K-tiles; avoids the
-                    # runtime-divisor `tile_id // num_mn_tiles` division.
-                    k_tile_start = 0
-                    k_tile_end = k_tiles_total
-                else:
-                    split_id = tile_id // num_mn_tiles
-                    k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
-                    k_tile_start = split_id * k_tiles_per_split
-                    k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                k_tile_start, k_tile_end = _core._compute_k_tile_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K)
 
                 # Skip tiles whose split has zero K-tiles
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
-                    smem_accum_cnt = _process_tile_producer_inner(
+                    smem_accum_cnt = _core._process_tile_producer_inner(
                         tile_id=tile_id,
                         num_pid_in_group=num_pid_in_group,
                         num_pid_m=num_pid_m,
@@ -1588,7 +1272,7 @@ def _tuned(space, shape=None):
     )(matmul_kernel_tma_ws_blackwell)
 
 
-def mm(a, b, *, space="full"):
+def mm(a, b, *, out=None, space="full"):
     """Matrix multiply ``a @ b`` on Blackwell.
 
     `space` selects the search space -- "full" for perf, "heuristic" (one
@@ -1598,7 +1282,12 @@ def mm(a, b, *, space="full"):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    if out is not None:
+        if out.shape != (M, N) or out.device != a.device or out.dtype != a.dtype or not out.is_contiguous():
+            raise ValueError(f"out must be a contiguous {a.dtype} tensor with shape ({M}, {N}) on A's device")
+        c = out
+    else:
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only

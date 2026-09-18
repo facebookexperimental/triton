@@ -7,12 +7,13 @@ window, the verdict, the table and the artifact all live here, so adding an op
 does not mean copying a CLI.
 
 The adapter is the bench module itself, duck-typed, because `test_ops_perf.py`
-already discovers and calls bench modules that way. Five names:
+already discovers and calls bench modules that way. Six names:
 
     OP              str                       -- catalog op name
     REF_NAME        str                       -- what `ref_fn` is; lands in env["ref"]
     EXTRA_COLUMNS   ((header, key), ...)      -- which Result.extra keys get a column
-    cases(synthetic)            -> list[Case]
+    SHAPE_SUITES    FocusRegistry | None      -- focus-suite selection and validation
+    cases(synthetic, suites)    -> list[Case]
     prepare(case, space)        -> Prepared
 
 and one line of wiring:
@@ -72,8 +73,8 @@ class Prepared:
     cap_s: float = COLD_COMPILE_CAP_S
 
 
-#: The GPU this run is about. Everything downstream -- which `PERF_SHAPES` are
-#: imported, which `arch=` the op is pinned to, which device's clocks are
+#: The GPU this run is about. Everything downstream -- which focus suites are
+#: selected, which `arch=` the op is pinned to, which device's clocks are
 #: captured, what the artifact is named -- has to agree with it.
 #:
 #: Set once by `select`, from `main`'s `--device`. Absent that (the pytest
@@ -136,8 +137,35 @@ def supported(bench) -> bool:
     return arch() is not None and has_impl(bench.OP, arch())
 
 
-def default_json(bench) -> str:
-    return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}.json"
+def default_json(bench, suites=None) -> str:
+    suite_suffix = "" if not suites else "." + "+".join(suites)
+    return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}{suite_suffix}.json"
+
+
+def _selected_suite_names(bench, suites=None) -> tuple[str, ...]:
+    registry = bench.SHAPE_SUITES
+    return () if registry is None else registry.selected_suite_names(arch(), suites)
+
+
+def suite_listing(bench) -> str:
+    registry = bench.SHAPE_SUITES
+    if registry is None:
+        return "no focus suites available"
+    lines = []
+    for suite in registry.suites:
+        defaults = ",".join(arch for arch, names in registry.defaults.items() if suite.name in names) or "-"
+        lines.append(f"{suite.name}: default_for={defaults}")
+    return "\n".join(lines)
+
+
+def suite_shape_listing(bench, name: str) -> str:
+    registry = bench.SHAPE_SUITES
+    if registry is None:
+        raise ValueError("no focus suites available")
+    suite = registry.suite(name)
+    shapes = "\n".join(repr(shape) for shape in suite.shapes)
+    header = f"{suite.name} ({len(suite.shapes)} shapes)"
+    return f"{header}\n{shapes}" if shapes else header
 
 
 def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: str = "wallclock") -> Result:
@@ -244,14 +272,16 @@ def _head_per_direction(cases, head: int):
     return kept
 
 
-def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_compile_mode=None, directions=None,
-        latency_mode="wallclock"):
+def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=None, cold_compile_mode=None,
+        directions=None, latency_mode="wallclock"):
+    if synthetic and suites:
+        raise ValueError("--synthetic and --suite cannot be used together")
     space = resolve_space(bench, space)
     cold_mode = resolve_cold_compile(bench, cold_compile_mode)
     env = capture_env(device_index())
     if governor is not None:
         env["governed"] = governor.to_dict()
-    cases = bench.cases(synthetic)
+    cases = bench.cases(synthetic, suites)
     if directions:
         cases = [c for c in cases if c.direction in directions]
     if head:
@@ -282,6 +312,8 @@ def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_co
     if head:
         env["head"] = head
     env["shapes"] = "synthetic" if synthetic else "focus"
+    if not synthetic:
+        env["shape_suites"] = list(_selected_suite_names(bench, suites))
     env["run"] = {k: info[k] for k in ("problems", "clock_trace", "elapsed_s") if k in info}
     return results, env
 
@@ -295,10 +327,16 @@ def main(bench, argv=None) -> int:
         "uses by default, and measuring anything else measures a path users do not take")
     parser.add_argument("--head", type=int, default=None, metavar="N",
                         help="only the first N cases per direction, for a quick look")
-    parser.add_argument(
+    shape_options = parser.add_mutually_exclusive_group()
+    shape_options.add_argument(
         "--synthetic", action="store_true",
         help="run the correctness shapes instead of this arch's focus list; they are "
         "mostly too small to time, so this is for looking, not for gating")
+    shape_options.add_argument(
+        "--suite", action="append", default=None,
+        help="run one focus suite; repeat to combine suites (default: this architecture's configured set)")
+    shape_options.add_argument("--list-suites", action="store_true", help="list focus suites and exit")
+    shape_options.add_argument("--list-suite", metavar="NAME", help="list one focus suite's shapes and exit")
     # An op with a backward reports both by default, in two tables.
     only = parser.add_mutually_exclusive_group()
     only.add_argument("--fwd-only", action="store_true", help="skip the backward cases")
@@ -313,8 +351,17 @@ def main(bench, argv=None) -> int:
         help=f"how often to time a first call on a fresh cache (default {resolve_cold_compile(bench, None)}); "
         "'all' is per case, 'first' samples one case per direction, 'none' skips it")
     parser.add_argument("--json", default=None,
-                        help="machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>.json)")
+                        help="machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>[.<suites>].json)")
     args = parser.parse_args(argv)
+    if args.list_suites:
+        print(suite_listing(bench))
+        return 0
+    if args.list_suite:
+        try:
+            print(suite_shape_listing(bench, args.list_suite))
+        except ValueError as exc:
+            parser.error(str(exc))
+        return 0
     directions = ("fwd", ) if args.fwd_only else ("bwd", ) if args.bwd_only else None
 
     # Pick and pin the GPU before torch touches CUDA. Selection has to happen
@@ -331,6 +378,11 @@ def main(bench, argv=None) -> int:
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")
+    try:
+        if not args.synthetic:
+            _selected_suite_names(bench, args.suite)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Governing is unconditional: a number taken on an ungoverned machine is not
     # comparable to anything, so there is no switch to take one.
@@ -340,7 +392,8 @@ def main(bench, argv=None) -> int:
         for step in governor.skipped:
             print(f"  denoise: SKIPPED {step}")
         results, env = run(bench, space=args.space, head=args.head, synthetic=args.synthetic, governor=governor,
-                           cold_compile_mode=args.cold_compile, directions=directions, latency_mode=args.latency_mode)
+                           suites=args.suite, cold_compile_mode=args.cold_compile, directions=directions,
+                           latency_mode=args.latency_mode)
     if not results:
         # An empty focus list is legitimate -- an arch may have no capture yet --
         # but a silent zero-row table reads like a pass. Say what was empty.
@@ -349,7 +402,9 @@ def main(bench, argv=None) -> int:
             what += f" with direction in {sorted(directions)}"
         print(f"{what}; nothing measured")
         return 0
-    print(report_mod.render(results, env, args.json or default_json(bench), getattr(bench, "EXTRA_COLUMNS", ())))
+    print(
+        report_mod.render(results, env, args.json or default_json(bench, args.suite),
+                          getattr(bench, "EXTRA_COLUMNS", ())))
 
     return 1 if report_mod.failures(results) else 0
 

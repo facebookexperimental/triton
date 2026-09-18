@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import importlib
 import pathlib
 import sys
 
 import torch
 
-from triton.tlx.ops.kernels.mm._shapes import flops, label, operand
+from triton.tlx.ops.kernels.mm._shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, flops, label, operand
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -28,20 +28,16 @@ DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
 
-def shapes(synthetic: bool = False) -> list[list]:
-    if synthetic:
-        from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC
-
-        return list(SYNTHETIC)
-    return list(importlib.import_module(f"triton.tlx.ops.kernels.mm.{driver.arch()}").PERF_SHAPES)
+def shapes(synthetic: bool = False, suites=None) -> list:
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
-def cases(synthetic: bool = False) -> list[Case]:
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
     # dtype is a Case field, so it is dropped from `shape` -- carrying it in
     # both duplicates it in the key and in the report.
     return [
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
-             label=label(*entry)) for entry in shapes(synthetic)
+             label=label(*entry)) for entry in shapes(synthetic, suites)
     ]
 
 

@@ -13,13 +13,13 @@ one config would measure a kernel nobody runs.
 
 from __future__ import annotations
 
-import importlib
 import pathlib
 import sys
 
 import torch
 
-from triton.tlx.ops.kernels.hstu_attn._shapes import flops, inputs, label
+from triton.tlx.ops.kernels.hstu_attn._shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.hstu_attn._shapes import SYNTHETIC, flops, inputs, label
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -43,19 +43,15 @@ DIRECTIONS = ("fwd", "bwd")
 REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
 
-def shapes(synthetic: bool = False) -> list[list]:
-    if synthetic:
-        from triton.tlx.ops.kernels.hstu_attn._shapes import SYNTHETIC
-
-        return list(SYNTHETIC)
-    return list(importlib.import_module(f"triton.tlx.ops.kernels.hstu_attn.{driver.arch()}").PERF_SHAPES)
+def shapes(synthetic: bool = False, suites=None) -> list:
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
-def cases(synthetic: bool = False) -> list[Case]:
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
     return [
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
              direction=direction, label=label(*entry, direction))
-        for entry in shapes(synthetic)
+        for entry in shapes(synthetic, suites)
         for direction in DIRECTIONS
     ]
 

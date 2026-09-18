@@ -647,6 +647,44 @@ def test_the_speedup_floor_wins_when_a_reference_exists():
 
 
 # --------------------------------------------------------------------------
+# focus suites: composition and selection
+# --------------------------------------------------------------------------
+
+
+def test_focus_suites_are_hardware_agnostic_and_deduplicate_in_definition_order():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    common = FocusSuite("common", "mm", ((1, ), (2, )))
+    workload = FocusSuite("workload", "mm", ((2, ), (3, )))
+    defaults = {"gfx942": ("common", ), "gfx950": ("common", )}
+    registry = FocusRegistry("mm", (common, workload), defaults)
+
+    assert registry.shapes("gfx950") == ((1, ), (2, ))
+    assert registry.shapes("gfx942") == ((1, ), (2, ))
+    assert registry.selected_suite_names("gfx950") == ("common", )
+    assert registry.shapes("gfx950", ("common", "workload")) == ((1, ), (2, ), (3, ))
+    assert registry.shapes("gfx950", ("workload", )) == ((2, ), (3, ))
+    assert registry.shapes("gfx942", ("workload", )) == ((2, ), (3, ))
+
+
+def test_focus_suite_selection_rejects_unknown_names():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    baseline = FocusSuite("baseline", "mm", ((1, ), ))
+    registry = FocusRegistry("mm", (baseline, ), {"sm100": ("baseline", )})
+    with pytest.raises(ValueError, match="unknown focus suite.*missing.*baseline"):
+        registry.shapes("sm100", ("missing", ))
+
+
+def test_focus_suite_op_mismatch_is_rejected_explicitly():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    wrong_op = FocusSuite("baseline", "bmm", ((1, ), ))
+    with pytest.raises(ValueError, match="baseline.*do not map to op 'mm'"):
+        FocusRegistry("mm", (wrong_op, ), {"sm100": ("baseline", )})
+
+
+# --------------------------------------------------------------------------
 # driver: the adapter contract
 # --------------------------------------------------------------------------
 
@@ -658,7 +696,8 @@ def test_every_bench_module_satisfies_the_adapter_contract(module_name):
     import importlib
 
     bench = importlib.import_module(module_name)
-    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "cases", "prepare", "supported", "default_json", "run", "main"):
+    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "SHAPE_SUITES", "cases", "prepare", "supported", "default_json",
+                 "run", "main"):
         assert hasattr(bench, name), f"{module_name} is missing {name}"
     assert all(len(col) == 2 for col in bench.EXTRA_COLUMNS)
     # An op with no reference must say so rather than leave it implicit.
@@ -701,6 +740,33 @@ def test_bind_returns_the_four_entry_points_bound_to_the_module():
     supported, default_json, run, main = driver.bind(bench)
     assert callable(supported) and callable(run) and callable(main)
     assert default_json() == bench.default_json()
+    assert default_json(("common", "large_m")).endswith(".common+large_m.json")
+
+
+def test_suite_listing_shows_defaults():
+    from _harness import driver
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    common = FocusSuite("common", "mm", ((1, ), ))
+    optional = FocusSuite("optional", "mm", ((2, ), ))
+    bench = type(
+        "Bench", (),
+        {"SHAPE_SUITES": FocusRegistry("mm", (common, optional), {
+            "gfx942": ("common", ),
+            "gfx950": ("common", ),
+        })})
+
+    assert driver.suite_listing(bench) == ("common: default_for=gfx942,gfx950\noptional: default_for=-")
+
+
+def test_suite_shape_listing_shows_typed_shapes():
+    from _harness import driver
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    suite = FocusSuite("baseline", "mm", ((1, 2), (3, 4)))
+    bench = type("Bench", (), {"SHAPE_SUITES": FocusRegistry("mm", (suite, ), {"sm100": ("baseline", )})})
+
+    assert driver.suite_shape_listing(bench, "baseline") == "baseline (2 shapes)\n(1, 2)\n(3, 4)"
 
 
 # --------------------------------------------------------------------------
@@ -714,14 +780,17 @@ class _FakeBench:
     OP = "fake"
     REF_NAME = ""
     EXTRA_COLUMNS = ()
+    SHAPE_SUITES = None
 
     def __init__(self, cold_compile=None, directions=("fwd", "bwd"), n=3):
         if cold_compile is not None:
             self.COLD_COMPILE = cold_compile
         self._directions = directions
         self._n = n
+        self.requested_suites = None
 
-    def cases(self, synthetic=False):
+    def cases(self, synthetic=False, suites=None):
+        self.requested_suites = suites
         return [
             Case(op=self.OP, arch="sm100", dtype="bfloat16", shape=(i, ), direction=d)
             for i in range(self._n)
@@ -778,6 +847,25 @@ def test_an_unknown_cold_compile_mode_is_rejected():
 
     with pytest.raises(ValueError, match="cold_compile"):
         driver.resolve_cold_compile(_FakeBench(), "sometimes")
+
+
+def test_focus_suite_selection_is_forwarded_and_recorded(monkeypatch):
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    bench = _FakeBench(cold_compile="none")
+    common = FocusSuite("common", "fake", ((1, ), ))
+    large_m = FocusSuite("large_m", "fake", ((2, ), ))
+    bench.SHAPE_SUITES = FocusRegistry("fake", (common, large_m), {"sm100": ("common", )})
+    _, env = _picked(monkeypatch, bench, suites=("common", "large_m"))
+    assert bench.requested_suites == ("common", "large_m")
+    assert env["shape_suites"] == ["common", "large_m"]
+
+
+def test_synthetic_and_focus_suite_selection_are_mutually_exclusive(monkeypatch):
+    from _harness import driver
+
+    with pytest.raises(ValueError, match="--synthetic and --suite"):
+        driver.run(_FakeBench(), space="full", synthetic=True, suites=("baseline", ))
 
 
 def test_mm_still_times_every_case_and_the_full_space_ops_do_not():
