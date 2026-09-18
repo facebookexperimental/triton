@@ -224,11 +224,12 @@ protocol graph. Each ordinary loop-cadence SMEM channel contributes
 their endpoint stages. Per-task serialized event classes likewise contribute
 `next.stage - current.stage`, plus one on the wrap edge. Events at the same
 anchor and on the same side of it form an unordered equivalence class.
-TMA-ready and MMAv5-release events are asynchronous completions: preceding
-task events order their issue, but the completion does not serialize later
-task instructions. `ChannelProtocolPlan` carries this endpoint classification,
-shared with `createToken`, and the task timeline bypasses an asynchronous
-completion when choosing the predecessor of the following event.
+TMA-ready, MMAv5-producer-ready, and MMAv5-release events are asynchronous
+completions: preceding task events order their issue, but the completion does
+not serialize later task instructions. `ChannelProtocolPlan` carries this
+endpoint classification, shared with `createToken`, and the task timeline
+bypasses an asynchronous completion when choosing the predecessor of the
+following event.
 
 Production rejects only `Unsafe`: this includes a proven zero-distance cycle
 in a single-CTA scheduled loop. A nested `scf.for` is supported when all
@@ -275,9 +276,12 @@ case. Single-copy A2 dependency pairs and A3 same-block SMEM chains are also
 supported. They retain each channel's ordinary one-copy edge and add the
 physical ownership chain: adjacent releases gate the next producer in the same
 iteration, and the final release gates the first producer in the next
-iteration. A finite straight-line chain omits that wrap. TMEM, subtiled,
-general straight-line, multi-CTA, and ordinary `scf.while` protocols are
-currently reported as unsupported.
+iteration. A finite straight-line chain omits that wrap. A5 cross-partition
+TMEM chains retain their ordinary per-channel edges and add only the first/last
+endpoint pair used by synchronization insertion: first release to last acquire
+within a transaction, then last release to first acquire in the next
+transaction. Other TMEM shapes, subtiled, general straight-line, multi-CTA,
+and ordinary `scf.while` protocols are currently reported as unsupported.
 Staging-to-operand reuse is identified from both sides of each
 `allocation.reuseTarget` relation and validated with its cross-tile WAR token.
 Multi-CTA needs cluster synchronization, and

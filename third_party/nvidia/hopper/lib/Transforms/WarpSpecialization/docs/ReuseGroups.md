@@ -912,6 +912,22 @@ consumer, `createToken` allocates a **dedicated gen5 consumer barrier** for
 that consumer task — otherwise `dsT`'s consumer-release silently drops and `dk`
 deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
 
+The post-memory channel-cycle validator recognizes the same A5 predicate and
+chain order. It keeps every member's ordinary single-copy channel edge, then
+adds only the endpoint reuse constraints that insertion materializes:
+
+```text
+release(first, i) -> acquire(last, i)
+release(last, i)  -> acquire(first, i + 1)
+```
+
+The intermediate `first -> ... -> last` ownership transitions are already
+represented by data-ready and task-order edges; adding a second synthetic
+chain would over-constrain the graph. Initial validation support requires a
+full-overlap TMEM group (one starting offset), one unambiguous protocol per
+member, and one common single-CTA scheduled `scf.for`. A4/A6 spatial packing,
+subtiled members, and other TMEM channels remain unsupported.
+
 ### Status / caveats
 
 - A5 enters via the `group->channels.size() > 2` clause of the dispatch gate;

@@ -162,6 +162,22 @@ acquire in the next iteration. Finite straight-line chains omit that wrap.
 Focused real-TTGIR functions cover safe two- and three-member cyclic SMEM
 groups. A4-A6 TMEM and subtiled protocols remain unsupported.
 
+**Implemented fifteenth slice:** The post-memory graph now admits A5
+cross-partition TMEM reuse using the same
+`verifyReuseGroupCrossPartition`/`orderReuseGroupChain` contract as code
+partitioning. Only full-overlap, single-copy groups with one unambiguous plan
+per member in one scheduled `scf.for` qualify; distinct-offset A4/A6 packing
+continues to fail closed. Ordinary member token edges and task ordering model
+the inherent middle transitions (`dpT -> dsT -> dQ`), while two explicit
+physical edges model the emitted endpoint synchronization: first release to
+last acquire in the same transaction and last release to first acquire in the
+next. MMAv5 producer-ready events are classified as asynchronous completions.
+Exact finite-loop expansion retains negative task edges so the prologue/drain
+boundary removes nonexistent instances rather than manufacturing a
+zero-distance cycle. The production FA-backward three-group fixture now reports
+one supported A5 group; unrelated ordinary and A2/A4/A6 TMEM protocols remain
+unsupported.
+
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
 `WSChannelCycleValidator` owns IR-to-graph lowering and audit diagnostics, and
@@ -1233,7 +1249,9 @@ The implementation sequence is:
    actual cross-channel physical-slot predecessor. Model loop groups cyclically
    and direct-grid groups as finite sequences without a fabricated wraparound.
    The same representation supports A2/A3 single-copy SMEM chains while
-   retaining their ordinary per-channel token edges.
+   retaining their ordinary per-channel token edges. A5 cross-partition TMEM
+   groups reuse their unique dependency-chain order and add only the endpoint
+   constraints emitted by code partitioning.
 7. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
@@ -1249,10 +1267,11 @@ The implementation sequence is:
    search driver treat a proven `Unsafe` result as a rejected tuple and avoid
    launching it.
 
-The audit slice does not inspect emitted tokens/barriers, validate TMEM alias
-reads, or claim that every unsupported control-flow shape is safe. Those are
-follow-up extensions to the second graph builder. The planned-protocol gate now
-eliminates the D120 runtime hang by rejecting the proven cycle before
+The audit slice does not inspect emitted tokens/barriers or claim that every
+unsupported control-flow shape is safe. A5 full-overlap TMEM aliasing is
+covered; ordinary and A2/A4/A6 TMEM shapes remain follow-up extensions to the
+planned graph, followed by the materialized graph. The planned-protocol gate
+now eliminates the D120 runtime hang by rejecting the proven cycle before
 code-partition mutation.
 
 Each implementation commit must rebuild Triton in the `metamain` environment
@@ -1284,9 +1303,9 @@ The selected annotation-free schedule and `{dpT, dsT, dQ}` TMEM plan must
 validate as a positive control. Its cross-partition reuse dependencies advance
 through real data-ready and release edges rather than forming a non-positive
 cycle. Persistent `scf.while`, same-task staging, MMAv5 inline completion, and
-single-copy/TMEM reuse remain explicit coverage requirements before enabling
-the validator for all nonzero search candidates. Multi-member A1 SMEM reuse is
-now covered separately.
+remaining single-copy/TMEM shapes remain explicit coverage requirements before
+enabling the validator for all nonzero search candidates. Multi-member A1 SMEM
+reuse and the A5 `{dpT, dsT, dQ}` chain are now covered separately.
 
 **Implementation areas:** `WSChannelProtocol.{h,cpp}` for shared endpoint
 planning, `WSChannelCycleAnalysis.{h,cpp}` for the generic solver,
@@ -1482,6 +1501,8 @@ a hard correctness floor on the structural path.
 - [x] Post-memory validation models D120's eight-member/three-copy A1 output
       staging ring and reports only the two TMEM protocols unsupported.
 - [x] Post-memory validation models A2 and A3 single-copy SMEM reuse chains.
+- [x] Post-memory validation models FA backward's A5 `{dpT, dsT, dQ}` TMEM
+      reuse chain.
 - [x] The full bounded D120 product runs without hangs: nine tuples pass
       correctness and the three B-early tuples are rejected before launch.
 - [ ] D120 measured winner is A3/B2 on the target shapes.

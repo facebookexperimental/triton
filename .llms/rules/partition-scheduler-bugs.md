@@ -364,6 +364,27 @@
   real scheduled TTGIR for safe two- and three-member single-copy SMEM groups
   and checks full validator coverage.
 
+### 40. Post-memory validation omitted FA-backward A5 TMEM reuse (2026-09-17, fixed)
+
+- **Symptom**: The annotation-free FA-backward target formed the intended
+  `{dpT, dsT, dQ}` TMEM reuse group, but the channel-cycle audit excluded all
+  three members and could not validate the selected schedule-memory tuple.
+- **Root cause**: The planned graph admitted only SMEM channels and A1-A3 SMEM
+  reuse. A5 has a different topology: its dependency-chain middle edges are
+  inherent in SSA/task order, while code partitioning synchronizes only the
+  first/last endpoints.
+- **Fix**: Admit only full-overlap, single-copy A5 groups accepted by
+  `verifyReuseGroupCrossPartition` and `orderReuseGroupChain`. Retain ordinary
+  member edges, add first-release to last-acquire at distance zero and
+  last-release to first-acquire at distance one, and classify MMAv5 producer
+  readiness as asynchronous. Exact finite-loop expansion keeps negative edges
+  so the prologue boundary removes nonexistent dependencies instead of turning
+  them into a false zero-distance cycle.
+- **Lit tests**: `ws_code_partition_tmem_3group_chain.mlir` checks one admitted
+  A5 group on captured FA-backward TTGIR;
+  `ws_memory_planner_bwd_buffer_reuse.mlir` checks dynamic and finite nested-loop
+  behavior with the search-selected A5 plan.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

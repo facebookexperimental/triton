@@ -126,13 +126,14 @@
 // still unsupported rather than safe. The V/dO staging aliases contribute
 // one coalesced cross-tile WAR protocol.
 // NESTED-DYNAMIC-LABEL: tt.func public @_attn_bwd_persist
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_edge_count = 63 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_event_count = 30 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_reason = "only ordinary SMEM channels are supported"
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_edge_count = 96 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_event_count = 42 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_reason = "dynamic nested loop has a negative-distance recurrence"
 // NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
 // NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_status = "unsupported"
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_supported_channels = 7 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_unsupported_channels = 13 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_supported_channels = 10 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_tmem_a5_groups = 1 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
 
 // Moving the m producer out of the wait's stage removes that async prologue
 // credit. The same schedule and memory plan is nevertheless acyclic when the
@@ -141,13 +142,14 @@
 // specialized channels remain outside this validator slice, so aggregate
 // coverage is still unsupported.
 // NESTED-ONE-LABEL: tt.func public @_attn_bwd_persist
-// NESTED-ONE-SAME: nvws.test.channel_cycle_edge_count = 63 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_event_count = 30 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_reason = "only ordinary SMEM channels are supported"
+// NESTED-ONE-SAME: nvws.test.channel_cycle_edge_count = 96 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_event_count = 42 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_reason = "only ordinary SMEM and A5 TMEM channels are supported"
 // NESTED-ONE-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
 // NESTED-ONE-SAME: nvws.test.channel_cycle_status = "unsupported"
-// NESTED-ONE-SAME: nvws.test.channel_cycle_supported_channels = 7 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_unsupported_channels = 13 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_supported_channels = 10 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_tmem_a5_groups = 1 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
 
 // With 128 inner transactions, the same unseeded recurrence fits inside the
 // finite invocation and must still be rejected.

@@ -276,7 +276,12 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
       getProtocolSameLevelOp(plan.headConsumer, plan.tmaHeadProducer);
   plan.producerReadyAnchor =
       getProtocolSameLevelOp(plan.headConsumer, plan.tailProducer);
-  plan.producerReadyIsAsync = !plan.tmaProducers.empty();
+  // A TMA ready event and an MMAv5 completion event are both asynchronous:
+  // their issue point does not serialize later task instructions. This was
+  // immaterial while the planned validator admitted SMEM only, but is required
+  // when modeling A5 TMEM channels produced by MMAv5.
+  plan.producerReadyIsAsync = !plan.tmaProducers.empty() ||
+                              isa<ttng::MMAv5OpInterface>(plan.tailProducer);
   plan.tmaConsumerWaitAnchor =
       getProtocolSameLevelOp(plan.tmaHeadProducer, plan.headConsumer);
   ProtocolCadence cadence =
