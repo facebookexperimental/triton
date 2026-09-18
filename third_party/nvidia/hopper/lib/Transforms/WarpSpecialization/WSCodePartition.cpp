@@ -5706,51 +5706,14 @@ LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
     LDBG("\n\nafter appendAccumCntsForOps");
     funcOp.dump();
   });
-  // Step 4.5: Collect TMA staging reuse info before createBufferForAllocs
-  // rewrites the alloc ops (which would lose the local_store users).
-  struct StagingReuseInfo {
-    unsigned targetBufferId;
-    AsyncTaskId drainedStoreTask;
-    Operation *firstStore;
-  };
-  SmallVector<StagingReuseInfo> stagingReuseInfos;
-  funcOp.walk([&](ttg::LocalAllocOp allocOp) {
-    auto reuseAttr =
-        allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
-    auto stagingAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
-    auto bufferIdAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
-    if (!reuseAttr || !stagingAttr || !bufferIdAttr)
-      return;
-    // Find the first local_store user and the task that launches the TMA store.
-    Operation *firstStore = nullptr;
-    SmallVector<AsyncTaskId> drainedStoreTasks;
-    for (auto *user : allocOp->getUsers()) {
-      if (isa<ttg::LocalStoreOp>(user)) {
-        if (!firstStore || user->isBeforeInBlock(firstStore))
-          firstStore = user;
-      }
-      if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-              user)) {
-        auto taskIds = getAsyncTaskIds(user);
-        drainedStoreTasks.append(taskIds.begin(), taskIds.end());
-      }
-    }
-    if (!firstStore || drainedStoreTasks.empty() ||
-        !llvm::all_of(drainedStoreTasks, [&](AsyncTaskId task) {
-          return task == drainedStoreTasks.front();
-        })) {
-      LDBG("Step 4.5: staging alloc has reuseTarget="
-           << reuseAttr.getInt()
-           << " but does not have one local_store/drained-store task");
-      return;
-    }
-    stagingReuseInfos.push_back(
-        {(unsigned)reuseAttr.getInt(), drainedStoreTasks.front(), firstStore});
-    LDBG("Step 4.5: collected staging reuse: target buffer.id="
-         << reuseAttr.getInt() << " firstStore found");
-  });
-  LDBG("Step 4.5: collected " << stagingReuseInfos.size()
-                              << " staging reuse entries");
+  // Step 4.5: Re-derive the TMA staging-reuse protocol after loop-counter
+  // rewriting and before createBufferForAllocs rewrites the alloc ops. The
+  // post-memory validator calls the same pure planner before this rewrite.
+  StagingReuseProtocolPlan stagingReusePlan =
+      buildStagingReuseProtocolPlan(funcOp, orderedChannels);
+  LDBG("Step 4.5: matched " << stagingReusePlan.matchedPairCount << " of "
+                            << stagingReusePlan.reuseTargetCount
+                            << " staging reuse entries");
 
   // Step 5: Create buffers. An array of buffers for each channel.
   DenseMap<Channel *, Value> bufferMap =
@@ -5799,74 +5762,22 @@ LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
   // MUST run BEFORE Step 8 (insertAsyncComm), whose removeTokenfNotUsed cleanup
   // sweep would otherwise free the freshly-created token (it only has uses once
   // the acquire/release below are inserted).
-  if (!stagingReuseInfos.empty()) {
-    DenseMap<unsigned, Channel *> bufferIdToChannel;
-    for (auto *ch : orderedChannels) {
-      auto *allocOp = ch->getAllocOp();
-      if (!allocOp)
-        continue;
-      if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.id"))
-        bufferIdToChannel[attr.getInt()] = ch;
-    }
-
-    // Resolve every staging pair to its (outer loop, drained-store task, load
-    // task). The task filling the staging allocation is not necessarily the
-    // task draining it: FA forward has two computation tasks filling two output
-    // stagings, while one epilogue-store task launches and waits for both TMA
-    // stores. Releasing from the fill task would either reject the pair as
-    // inconsistent or let the next tile overwrite SMEM while the store reads
-    // it.
-    // The cross-tile WAR token is intentionally coarse: a single
-    // producer_acquire at the top of the outer-loop body (before *all* operand
-    // loads) and a single consumer_release at the bottom (after *all* staging
-    // stores) serialize tile N+1's loads behind tile N's staging stores. That
-    // covers every aliasing pair *provided* they share one outer loop, one
-    // drained-store task, and one load task. If a future kernel spreads staging
-    // pairs across different tasks or loops, a single token cannot cover them
-    // all, so detect that and skip rather than emit a barrier that silently
-    // guards only one pair.
-    //
-    // Derive staging/load tasks from the *matched* entry (not from
-    // stagingReuseInfos.front(), which may have been skipped above) so the
-    // barrier's task IDs always agree with the selected outer loop.
-    LoopLikeOpInterface outerLoop;
-    AsyncTaskId drainedStoreTask = -1;
-    AsyncTaskId loadTask = -1;
-    unsigned matched = 0;
-    bool consistent = true;
-    for (auto &info : stagingReuseInfos) {
-      auto it = bufferIdToChannel.find(info.targetBufferId);
-      if (it == bufferIdToChannel.end() || !it->second->getSrcOp())
-        continue;
-      LoopLikeOpInterface loop = getParentPersistentLoop(info.firstStore);
-      if (!loop)
-        continue;
-      auto lTaskIds = getAsyncTaskIds(it->second->getSrcOp());
-      if (lTaskIds.empty())
-        continue;
-      AsyncTaskId storeTask = info.drainedStoreTask;
-      AsyncTaskId lTask = lTaskIds.front();
-      if (matched++ == 0) {
-        outerLoop = loop;
-        drainedStoreTask = storeTask;
-        loadTask = lTask;
-      } else if (loop != outerLoop || storeTask != drainedStoreTask ||
-                 lTask != loadTask) {
-        consistent = false;
-      }
-    }
-
-    if (matched && !consistent) {
+  if (stagingReusePlan.hasMatchedPairs()) {
+    if (!stagingReusePlan.consistent) {
       LDBG("Step 7.5: staging-reuse pairs span multiple outer loops / load / "
            "drained-store tasks; cross-tile WAR barrier not inserted "
            "(unhandled)");
-    } else if (matched && outerLoop && loadTask == drainedStoreTask) {
+    } else if (stagingReusePlan.outerLoop &&
+               stagingReusePlan.loadTask == stagingReusePlan.drainedStoreTask) {
       LDBG("Step 7.5: load and drained store share task "
-           << loadTask << "; cross-tile WAR barrier not needed "
+           << stagingReusePlan.loadTask
+           << "; cross-tile WAR barrier not needed "
            << "(same-partition staging)");
-    } else if (matched && outerLoop && loadTask != drainedStoreTask) {
+    } else if (stagingReusePlan.outerLoop &&
+               stagingReusePlan.loadTask != stagingReusePlan.drainedStoreTask) {
       MLIRContext *ctx = funcOp.getContext();
 
+      auto outerLoop = cast<LoopLikeOpInterface>(stagingReusePlan.outerLoop);
       Block *outerBody = getPersistentLoopBody(outerLoop);
       // A `for` exposes its iteration count as the induction variable; a
       // `while` has none, so fall back to the AutoWS iteration counter carried
@@ -5896,7 +5807,7 @@ LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
         Operation *firstBodyOp = &outerBody->front();
         OpBuilderWithAsyncTaskIds acqBuilder(firstBodyOp);
         acqBuilder.setInsertionPoint(firstBodyOp);
-        acqBuilder.setAsynTaskIdsFromArray({loadTask});
+        acqBuilder.setAsynTaskIdsFromArray({stagingReusePlan.loadTask});
         Location acqLoc = firstBodyOp->getLoc();
         if (auto forOp = dyn_cast<scf::ForOp>(outerLoop.getOperation())) {
           APInt lbVal, stepVal;
@@ -5921,21 +5832,24 @@ LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers,
             getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
         acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
             acqLoc, reuseToken, idxPhase.first, idxPhase.second,
-            WSBarrierAttr::forDstTask(ctx, drainedStoreTask).build(ctx));
+            WSBarrierAttr::forDstTask(ctx, stagingReusePlan.drainedStoreTask)
+                .build(ctx));
 
         // consumer_release at the bottom of the drained-store task, after its
         // TMA store waits have completed.
         Operation *term = outerBody->getTerminator();
         OpBuilderWithAsyncTaskIds relBuilder(term);
         relBuilder.setInsertionPoint(term);
-        relBuilder.setAsynTaskIdsFromArray({drainedStoreTask});
+        relBuilder.setAsynTaskIdsFromArray({stagingReusePlan.drainedStoreTask});
         Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
             term->getLoc(), 0, 32);
         relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
             term->getLoc(), reuseToken, bufIdx,
-            WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
+            WSBarrierAttr::forDstTask(ctx, stagingReusePlan.loadTask)
+                .build(ctx));
         LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
-             << loadTask << " -> drained store " << drainedStoreTask << ")");
+             << stagingReusePlan.loadTask << " -> drained store "
+             << stagingReusePlan.drainedStoreTask << ")");
       }
     }
   }

@@ -405,6 +405,10 @@ static void attachAuditAttributes(triton::FuncOp funcOp,
   funcOp->setAttr("nvws.test.channel_cycle_unsupported_channels",
                   IntegerAttr::get(IntegerType::get(context, 64),
                                    analysis.unsupportedChannelCount));
+  funcOp->setAttr(
+      "nvws.test.channel_cycle_staging_reuse_protocols",
+      IntegerAttr::get(IntegerType::get(context, 64),
+                       analysis.supportedStagingReuseProtocolCount));
   if (!analysis.validation.reason.empty())
     funcOp->setAttr("nvws.test.channel_cycle_reason",
                     StringAttr::get(context, analysis.validation.reason));
@@ -435,12 +439,16 @@ static void attachAuditAttributes(triton::FuncOp funcOp,
 
 PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
-    const DenseSet<int64_t> &specializedBufferIds) {
+    const StagingReuseProtocolPlan &stagingReusePlan) {
   PostMemoryProtocolAnalysis analysis;
   SmallVector<ProtocolTaskTimeline> timelines;
   DenseMap<ProtocolEventId, Operation *> eventCadenceScopes;
   DenseMap<ProtocolEventId, ScheduledProtocolEvent> eventSchedules;
   std::string unsupportedReason;
+  bool hasUnsupportedProtocol =
+      stagingReusePlan.hasReuseTargets() && !stagingReusePlan.isSupported();
+  if (hasUnsupportedProtocol)
+    unsupportedReason = stagingReusePlan.unsupportedReason;
 
   for (const ChannelProtocolPlan &plan : plans) {
     Channel *channel = plan.masterChannel;
@@ -451,6 +459,19 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     };
     if (!channel || plan.channels.empty() || plan.copies == 0) {
       unsupported("channel plan has incomplete identity or copy depth");
+      continue;
+    }
+    bool isStagingReuseChannel =
+        llvm::any_of(plan.channels, [&](Channel *member) {
+          Operation *alloc = member->getAllocOp();
+          if (!alloc)
+            return false;
+          auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+          return bufferId &&
+                 stagingReusePlan.affectedBufferIds.contains(bufferId.getInt());
+        });
+    if (isStagingReuseChannel && !stagingReusePlan.isSupported()) {
+      unsupported(stagingReusePlan.unsupportedReason);
       continue;
     }
     bool isInnerLoopCadence = plan.cadence == ChannelProtocolCadence::Loop &&
@@ -491,16 +512,6 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
                  member->getNumBuffers() != plan.copies;
         })) {
       unsupported("grouped producers do not share one SMEM protocol");
-      continue;
-    }
-    if (llvm::any_of(plan.channels, [&](Channel *member) {
-          Operation *alloc = member->getAllocOp();
-          if (!alloc)
-            return false;
-          auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id");
-          return bufferId && specializedBufferIds.contains(bufferId.getInt());
-        })) {
-      unsupported("staging-reuse channel protocols are not yet supported");
       continue;
     }
     if (reuseConfig && llvm::any_of(plan.channels, [&](Channel *member) {
@@ -643,6 +654,45 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     ++analysis.supportedChannelCount;
   }
 
+  if (stagingReusePlan.isSupported()) {
+    analysis.supportedStagingReuseProtocolCount = 1;
+    if (stagingReusePlan.needsCrossTaskWar()) {
+      unsigned channelId = stagingReusePlan.diagnosticChannelId;
+      ProtocolEventId acquire = analysis.graph.addEvent(
+          ProtocolEventKind::Acquire, "staging reuse acquire");
+      ProtocolEventId release = analysis.graph.addEvent(
+          ProtocolEventKind::Release, "staging reuse release");
+      ScheduledProtocolEvent acquireEvent{acquire,
+                                          stagingReusePlan.loadTask,
+                                          stagingReusePlan.outerLoop,
+                                          stagingReusePlan.acquireAnchor,
+                                          ProtocolEventSide::BeforeAnchor,
+                                          /*stage=*/0,
+                                          /*cluster=*/0,
+                                          channelId,
+                                          /*ordersFollowingEvents=*/true};
+      ScheduledProtocolEvent releaseEvent{release,
+                                          stagingReusePlan.drainedStoreTask,
+                                          stagingReusePlan.outerLoop,
+                                          stagingReusePlan.releaseAnchor,
+                                          ProtocolEventSide::BeforeAnchor,
+                                          /*stage=*/0,
+                                          /*cluster=*/0,
+                                          channelId,
+                                          /*ordersFollowingEvents=*/true};
+      getTaskTimeline(timelines, acquireEvent.task, acquireEvent.scope)
+          .events.push_back(acquireEvent);
+      getTaskTimeline(timelines, releaseEvent.task, releaseEvent.scope)
+          .events.push_back(releaseEvent);
+      eventCadenceScopes[acquire] = stagingReusePlan.outerLoop;
+      eventCadenceScopes[release] = stagingReusePlan.outerLoop;
+      eventSchedules[acquire] = acquireEvent;
+      eventSchedules[release] = releaseEvent;
+      analysis.graph.addEdge(release, acquire, /*iterationDistance=*/1,
+                             ProtocolEdgeKind::SlotReuse, channelId);
+    }
+  }
+
   for (ProtocolTaskTimeline &timeline : timelines) {
     if (addTaskOrderEdges(analysis.graph, timeline))
       continue;
@@ -653,7 +703,7 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
   analysis.validation = validateProtocolScopes(
       analysis.graph, eventCadenceScopes, eventSchedules);
   if (analysis.validation.status == ProtocolStatus::Safe &&
-      analysis.unsupportedChannelCount != 0) {
+      (analysis.unsupportedChannelCount != 0 || hasUnsupportedProtocol)) {
     analysis.validation.status = ProtocolStatus::Unsupported;
     analysis.validation.reason = unsupportedReason;
   }
@@ -673,25 +723,18 @@ LogicalResult validatePostMemoryChannelProtocols(
     plans.push_back(buildChannelProtocolPlan(groupIt->second, postDominance));
   }
 
-  DenseSet<int64_t> specializedBufferIds;
-  funcOp.walk([&](triton::gpu::LocalAllocOp alloc) {
-    auto reuseTarget =
-        alloc->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
-    if (!reuseTarget)
-      return;
-    specializedBufferIds.insert(reuseTarget.getInt());
-    if (auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
-      specializedBufferIds.insert(bufferId.getInt());
-  });
+  StagingReuseProtocolPlan stagingReusePlan =
+      buildStagingReuseProtocolPlan(funcOp, orderedChannels);
 
-  PostMemoryProtocolAnalysis analysis = analyzePostMemoryChannelProtocols(
-      plans, reuseConfig, specializedBufferIds);
+  PostMemoryProtocolAnalysis analysis =
+      analyzePostMemoryChannelProtocols(plans, reuseConfig, stagingReusePlan);
   LDBG("post-memory channel-cycle audit: "
        << stringifyProtocolStatus(analysis.validation.status)
        << ", events=" << analysis.graph.events.size()
        << ", edges=" << analysis.graph.edges.size()
        << ", supported=" << analysis.supportedChannelCount
-       << ", unsupported=" << analysis.unsupportedChannelCount);
+       << ", unsupported=" << analysis.unsupportedChannelCount
+       << ", staging-reuse=" << analysis.supportedStagingReuseProtocolCount);
   LLVM_DEBUG({
     for (unsigned edgeId : analysis.validation.cycleEdgeIds) {
       const ProtocolEdge &edge = analysis.graph.edges[edgeId];

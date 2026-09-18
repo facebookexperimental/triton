@@ -325,4 +325,134 @@ ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
   return plan;
 }
 
+StagingReuseProtocolPlan
+buildStagingReuseProtocolPlan(triton::FuncOp funcOp,
+                              ArrayRef<Channel *> orderedChannels) {
+  StagingReuseProtocolPlan plan;
+  DenseMap<int64_t, Channel *> bufferIdToChannel;
+  for (Channel *channel : orderedChannels) {
+    Operation *alloc = channel->getAllocOp();
+    if (!alloc)
+      continue;
+    if (auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
+      bufferIdToChannel[bufferId.getInt()] = channel;
+  }
+
+  struct ReusePair {
+    int64_t targetBufferId;
+    AsyncTaskId drainedStoreTask;
+    Operation *firstStore;
+  };
+  SmallVector<ReusePair> pairs;
+  auto unsupported = [&](StringRef reason) {
+    plan.complete = false;
+    if (plan.unsupportedReason.empty())
+      plan.unsupportedReason = reason.str();
+  };
+
+  funcOp.walk([&](ttg::LocalAllocOp alloc) {
+    auto reuseTarget =
+        alloc->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
+    if (!reuseTarget)
+      return;
+    ++plan.reuseTargetCount;
+    plan.affectedBufferIds.insert(reuseTarget.getInt());
+
+    auto staging = alloc->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
+    auto bufferId = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+    if (bufferId)
+      plan.affectedBufferIds.insert(bufferId.getInt());
+    if (!staging || !bufferId) {
+      unsupported("staging reuse is missing buffer metadata");
+      return;
+    }
+
+    Operation *firstStore = nullptr;
+    SmallVector<AsyncTaskId> drainedStoreTasks;
+    for (Operation *user : alloc->getUsers()) {
+      if (isa<ttg::LocalStoreOp>(user)) {
+        if (!firstStore) {
+          firstStore = user;
+        } else if (user->getBlock() != firstStore->getBlock()) {
+          unsupported("staging reuse stores span multiple blocks");
+          return;
+        } else if (user->isBeforeInBlock(firstStore)) {
+          firstStore = user;
+        }
+      }
+      if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+              user)) {
+        auto taskIds = getAsyncTaskIds(user);
+        drainedStoreTasks.append(taskIds.begin(), taskIds.end());
+      }
+    }
+    if (!firstStore || drainedStoreTasks.empty() ||
+        !llvm::all_of(drainedStoreTasks, [&](AsyncTaskId task) {
+          return task == drainedStoreTasks.front();
+        })) {
+      unsupported(
+          "staging reuse requires one store block and drained-store task");
+      return;
+    }
+    pairs.push_back(
+        {reuseTarget.getInt(), drainedStoreTasks.front(), firstStore});
+  });
+
+  LoopLikeOpInterface outerLoop;
+  for (const ReusePair &pair : pairs) {
+    auto target = bufferIdToChannel.find(pair.targetBufferId);
+    if (target == bufferIdToChannel.end() || !target->second->getSrcOp()) {
+      unsupported("staging reuse target has no operand-load channel");
+      continue;
+    }
+    LoopLikeOpInterface loop = getParentPersistentLoop(pair.firstStore);
+    auto loadTasks = getAsyncTaskIds(target->second->getSrcOp());
+    if (!loop || loadTasks.empty() ||
+        !llvm::all_of(loadTasks, [&](AsyncTaskId task) {
+          return task == loadTasks.front();
+        })) {
+      unsupported("staging reuse lacks one persistent loop or load task");
+      continue;
+    }
+
+    AsyncTaskId loadTask = loadTasks.front();
+    ++plan.matchedPairCount;
+    if (plan.matchedPairCount == 1) {
+      outerLoop = loop;
+      plan.loadTask = loadTask;
+      plan.drainedStoreTask = pair.drainedStoreTask;
+      plan.diagnosticChannelId = target->second->uniqID;
+    } else {
+      plan.diagnosticChannelId =
+          std::min(plan.diagnosticChannelId, target->second->uniqID);
+      if (loop != outerLoop || loadTask != plan.loadTask ||
+          pair.drainedStoreTask != plan.drainedStoreTask)
+        plan.consistent = false;
+    }
+  }
+
+  if (!plan.hasReuseTargets())
+    return plan;
+  if (!plan.hasMatchedPairs()) {
+    unsupported("staging reuse has no matched operand channel");
+    return plan;
+  }
+  if (!plan.consistent) {
+    if (plan.unsupportedReason.empty())
+      plan.unsupportedReason =
+          "staging reuse pairs span multiple loops or tasks";
+    return plan;
+  }
+
+  plan.outerLoop = outerLoop.getOperation();
+  Block *body = getPersistentLoopBody(outerLoop);
+  if (!body) {
+    unsupported("staging reuse has no persistent-loop body");
+    return plan;
+  }
+  plan.acquireAnchor = &body->front();
+  plan.releaseAnchor = body->getTerminator();
+  return plan;
+}
+
 } // namespace mlir

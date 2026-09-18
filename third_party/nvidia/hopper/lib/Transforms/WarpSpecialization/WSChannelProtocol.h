@@ -12,6 +12,8 @@
 #include "CodePartitionUtility.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <string>
+
 namespace mlir {
 
 class PostDominanceInfo;
@@ -68,6 +70,35 @@ struct ChannelProtocolPlan {
   const ChannelConsumerProtocolPlan *findConsumer(AsyncTaskId task) const;
 };
 
+/// Non-owning description of the synthetic cross-tile WAR protocol required
+/// when one or more TMA staging allocations alias descriptor-loaded operand
+/// storage through `allocation.reuseTarget`. Compatible pairs share one coarse
+/// token from the top to the bottom of their common persistent loop.
+struct StagingReuseProtocolPlan {
+  DenseSet<int64_t> affectedBufferIds;
+  Operation *outerLoop = nullptr;
+  Operation *acquireAnchor = nullptr;
+  Operation *releaseAnchor = nullptr;
+  AsyncTaskId loadTask = -1;
+  AsyncTaskId drainedStoreTask = -1;
+  unsigned diagnosticChannelId = 0;
+  unsigned reuseTargetCount = 0;
+  unsigned matchedPairCount = 0;
+  bool complete = true;
+  bool consistent = true;
+  std::string unsupportedReason;
+
+  bool hasReuseTargets() const { return reuseTargetCount != 0; }
+  bool hasMatchedPairs() const { return matchedPairCount != 0; }
+  bool isSupported() const {
+    return hasReuseTargets() && complete && consistent && hasMatchedPairs() &&
+           outerLoop && acquireAnchor && releaseAnchor;
+  }
+  bool needsCrossTaskWar() const {
+    return isSupported() && loadTask != drainedStoreTask;
+  }
+};
+
 /// Return true when every consumer in `consumerTaskId` uses an MMAv5 inline
 /// completion barrier. This classification is shared by token creation and
 /// protocol validation.
@@ -90,6 +121,13 @@ Operation *getProtocolConsumerReleaseAnchor(PostDominanceInfo &postDominance,
 /// plan.
 ChannelProtocolPlan buildChannelProtocolPlan(ArrayRef<Channel *> channels,
                                              PostDominanceInfo &postDominance);
+
+/// Re-derive the coalesced staging-to-operand reuse protocol from post-memory
+/// IR and channel topology. Calling this again after accumulation-counter
+/// rewriting returns anchors in the rewritten persistent loop.
+StagingReuseProtocolPlan
+buildStagingReuseProtocolPlan(triton::FuncOp funcOp,
+                              ArrayRef<Channel *> orderedChannels);
 
 } // namespace mlir
 

@@ -1,5 +1,6 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2 channel-cycle-audit=true" | FileCheck %s
-// RUN: sed -e '/^    %%c0_i32 = arith.constant/a\    %%c0_i64 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 0 : i64\n    %%c1_i64 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 1 : i64' -e '/^    %%28 = scf.for %%arg48 = %%c0_i32 to %%16 step %%c1_i32 iter_args(%%arg49 = %%9)/c\    %%28:2 = scf.while (%%valid = %%true, %%arg49 = %%9, %%iter = %%c0_i64) : (i1, i32, i64) -> (i32, i64) { scf.condition(%%valid) %%arg49, %%iter : i32, i64 } do { ^bb0(%%arg49: i32, %%iter: i64):' -e '/^      %%65 = arith.addi %%arg49, %%10/a\      %%iter_next = arith.addi %%iter, %%c1_i64 {async_task_id = array<i32: 0, 1, 2, 3>} : i64' -e 's/^      scf.yield {async_task_id = array<i32: 0, 2, 3>} %%65 : i32/      scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %%true, %%65, %%iter_next : i1, i32, i64/' -e 's/^    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation/    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s --check-prefix=WHILE
+// RUN: sed -e '/^    %%c0_i32 = arith.constant/a\    %%c0_i64 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 0 : i64\n    %%c1_i64 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 1 : i64' -e '/^    %%28 = scf.for %%arg48 = %%c0_i32 to %%16 step %%c1_i32 iter_args(%%arg49 = %%9)/c\    %%28:2 = scf.while (%%valid = %%true, %%arg49 = %%9, %%iter = %%c0_i64) : (i1, i32, i64) -> (i32, i64) { scf.condition(%%valid) %%arg49, %%iter : i32, i64 } do { ^bb0(%%arg49: i32, %%iter: i64):' -e '/^      %%65 = arith.addi %%arg49, %%10/a\      %%iter_next = arith.addi %%iter, %%c1_i64 {async_task_id = array<i32: 0, 1, 2, 3>} : i64' -e 's/^      scf.yield {async_task_id = array<i32: 0, 2, 3>} %%65 : i32/      scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %%true, %%65, %%iter_next : i1, i32, i64/' -e 's/^    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation/    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=2 channel-cycle-audit=true" | FileCheck %s --check-prefix=WHILE
+// RUN: sed 's/allocation.reuseTarget = 3/allocation.reuseTarget = 99/g' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=2 channel-cycle-audit=true" | FileCheck %s --check-prefix=MISSING-TARGET
 
 // Regression test for the persistent FA-bwd dv/dk staging SMEM cross-tile race
 // (bug #9 in .llms/rules/partition-scheduler-bugs.md / D109859261).
@@ -28,12 +29,17 @@
 // to a no-op -> cross-tile SMEM race (non-deterministic wrong dv/dk gradients on
 // the persistent path). E2E regression: test_bwd_tmem_dsT_reuse_3group_persistent.
 
-// Four ordinary SMEM channels in the nested scheduled loop are validated, and
-// the outer-produced K channel is summarized from inner-loop entry to drain.
-// The remaining specialized protocols keep the overall result unsupported.
+// Four ordinary SMEM channels in the nested scheduled loop are validated. The
+// outer-produced K, V, and dO channels are summarized from inner-loop entry to
+// drain, and the two staging aliases share one cross-tile WAR protocol. The
+// remaining specialized protocols keep the overall result unsupported.
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
+// CHECK-SAME: nvws.test.channel_cycle_edge_count = 63 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 30 : i64
+// CHECK-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
 // CHECK-SAME: nvws.test.channel_cycle_status = "unsupported"
-// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 5 : i64
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 7 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 15 : i64
 // Load task (2) acquires the dedicated single-buffered reuse token at the top of
 // the persistent outer loop (loop-carried phase), targeting the staging task.
 // CHECK: nvws.producer_acquire %[[WAR_TOK:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 3 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32, i1
@@ -44,8 +50,16 @@
 // CLC keeps the persistent loop as scf.while. Its AutoWS accumulation counter
 // must drive the same dedicated cross-tile token and alternating phase.
 // WHILE-LABEL: @_attn_bwd_persist
+// WHILE-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
 // WHILE: nvws.producer_acquire %[[WHILE_WAR:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {{{.*}}dstTask = 3 : i32{{.*}}}}} : tensor<1x!nvws.token>, i32, i1
 // WHILE: nvws.consumer_release %[[WHILE_WAR]], %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 3>, constraints = {WSBarrier = {{{.*}}dstTask = 2 : i32{{.*}}}}} : tensor<1x!nvws.token>, i32
+
+// An unresolved alias target must remain explicitly unsupported rather than
+// silently claiming that the synthetic protocol was validated.
+// MISSING-TARGET-LABEL: @_attn_bwd_persist
+// MISSING-TARGET-SAME: nvws.test.channel_cycle_reason = "staging reuse target has no operand-load channel"
+// MISSING-TARGET-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 0 : i64
+// MISSING-TARGET-SAME: nvws.test.channel_cycle_status = "unsupported"
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

@@ -22,14 +22,15 @@ struct PostMemoryProtocolAnalysis {
   ProtocolValidation validation;
   unsigned supportedChannelCount = 0;
   unsigned unsupportedChannelCount = 0;
+  unsigned supportedStagingReuseProtocolCount = 0;
 };
 
-/// Build and validate the ordinary loop-cadence channel protocols represented
-/// by post-memory endpoint plans. Reuse groups and other specialized protocol
-/// shapes are conservatively reported as unsupported by this first builder.
+/// Build and validate ordinary loop-cadence channel protocols plus the
+/// coalesced staging-to-operand reuse WAR protocol. Physical reuse groups and
+/// other specialized protocol shapes remain conservatively unsupported.
 PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
-    const DenseSet<int64_t> &specializedBufferIds);
+    const StagingReuseProtocolPlan &stagingReusePlan);
 
 /// Re-derive endpoint plans from post-memory channels and run the common
 /// solver. Unsafe cycles fail validation; safe and not-yet-supported protocol

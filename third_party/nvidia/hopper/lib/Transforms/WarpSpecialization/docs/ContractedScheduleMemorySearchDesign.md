@@ -533,11 +533,17 @@ Implemented:
   `Unsupported` continues. Endpoint planning lives in
   `WSChannelProtocol.{h,cpp}`, graph lowering and audit diagnostics in
   `WSChannelCycleValidator.{h,cpp}`, and the generic solver remains isolated in
-  `WSChannelCycleAnalysis.{h,cpp}`.
+  `WSChannelCycleAnalysis.{h,cpp}`. TMA staging allocations linked to operand
+  storage by `allocation.reuseTarget` contribute the coalesced cross-tile WAR
+  edge that code partitioning will materialize: staging drain in transaction
+  `i` precedes operand overwrite in transaction `i + 1`. The shared protocol
+  planner fails closed when the aliases do not share one persistent loop and
+  task pair.
 
 Next:
 
-1. Complete post-memory coverage for the specialized protocol shapes.
+1. Complete post-memory coverage for physical reuse groups, TMEM, and subtiled
+   protocol shapes.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.

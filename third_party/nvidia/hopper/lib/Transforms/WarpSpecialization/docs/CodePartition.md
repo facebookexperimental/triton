@@ -247,15 +247,26 @@ inner scope is a terminating region for the outer summary, while an unsafe
 inner scope still rejects the candidate. Sibling consumer loops and consumers
 hidden behind an intervening control-flow block remain unsupported.
 
+`allocation.reuseTarget` adds a synthetic cross-tile WAR protocol on top of
+the ordinary channels for the aliased host buffers. `WSChannelProtocol.cpp`
+derives one coalesced plan for all compatible staging/host pairs: their common
+persistent loop, operand-load task, drained-store task, and loop-boundary
+anchors. Both the validator and Step 7.5 consume that plan. The normalized
+graph places an acquire at the top of the load task and a release at the bottom
+of the drained-store task, with `Release(i) -> Acquire(i + 1)` representing the
+single slot of initial credit. Same-task pairs need no synthetic edge because
+program order already provides the WAR ordering. Missing targets, multiple
+loops, or inconsistent task pairs remain `Unsupported`.
+
 The diagnostic includes its total iteration distance, channel IDs, and edge
 distances.
 `Safe` and `Unsupported` continue, so incomplete coverage cannot reject a
 candidate. The test pass can additionally emit `nvws.test.channel_cycle_*`
-attributes. Physical reuse groups, staging-to-operand reuse, TMEM, subtiled,
-straight-line, multi-CTA, and `scf.while` protocols are currently reported as
-unsupported. Staging-to-operand reuse is identified from both sides of each
-`allocation.reuseTarget` relation because its cross-tile WAR token changes the
-physical protocol. Multi-CTA needs cluster synchronization, and
+attributes. Physical reuse groups, TMEM, subtiled, straight-line, multi-CTA,
+and ordinary `scf.while` protocols are currently reported as unsupported.
+Staging-to-operand reuse is identified from both sides of each
+`allocation.reuseTarget` relation and validated with its cross-tile WAR token.
+Multi-CTA needs cluster synchronization, and
 dynamic negative-total witnesses need additional boundary semantics before
 they can be rejected soundly. The captured top-level D120 B-early schedules are
 rejected with a zero-distance cycle through the real post-memory

@@ -283,6 +283,14 @@ Both mirror the manual TLX empties-token idiom. They differ only in the
 `getBufferIdxAndPhase(numBuffers)`; the Step 7.5 token uses `numBuffers = 1` with
 a loop-carried phase derived from the outer induction variable.
 
+The staging-to-operand topology is planned by
+`buildStagingReuseProtocolPlan` before either validation or insertion. It
+requires every alias pair to resolve to one common persistent loop,
+operand-load task, and drained-store task. The post-memory channel-cycle graph
+includes the same coalesced `Release(i) -> Acquire(i + 1)` edge that Step 7.5
+later emits; malformed or inconsistent alias sets remain explicitly
+unsupported.
+
 **Redundancy (candidate for a helper).** The two sites currently duplicate (a)
 the func-entry token-mint idiom (`OpBuilder(funcOp)` →
 `setInsertionPointToStart(&funcOp.getBody().front())` → `CreateTokenOp::create`)

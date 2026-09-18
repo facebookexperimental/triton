@@ -118,14 +118,24 @@ pass exposes status, coverage counts, graph size, and the witness. The
 production-shaped
 D120 B-early A2/B2 and A2/B3 candidates are rejected with the same zero-credit
 cycle, while A-early/A2-B3 passes the gate. Reuse-group, TMEM, subtiled,
-straight-line, multi-CTA, staging-to-operand reuse, and while protocols remain
-explicitly unsupported in this slice. Ordinary channels in a common nested
+straight-line, multi-CTA, and ordinary while protocols remain explicitly
+unsupported in this slice. Ordinary channels in a common nested
 `scf.for` cadence are supported. Constant-trip nested loops are expanded over
 their exact finite transaction domain, and same-stage asynchronous
 producer/consumer paths contribute their pipeline-prologue credit. Dynamic
 negative-total witnesses remain unsupported. An outer-produced ordinary SMEM
 channel consumed by one directly nested `scf.for` is summarized at inner-loop
 entry/drain and validated at outer cadence.
+
+**Implemented twelfth slice:** `allocation.reuseTarget` staging aliases are no
+longer blanket-excluded from the planned graph. A shared, non-mutating protocol
+planner derives the common persistent loop, operand-load task, drained-store
+task, and boundary anchors used by both validation and Step 7.5 insertion. The
+validator adds the coalesced single-slot WAR dependency
+`staging release(i) -> operand acquire(i + 1)` and admits the aliased V/dO
+ordinary channels. The production FA-backward fixture checks this graph for
+both `scf.for` and CLC-style `scf.while`; missing targets or inconsistent
+loop/task topology remain explicitly unsupported.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -1189,7 +1199,9 @@ The implementation sequence is:
    nested loop contribute one outer-cadence transaction, with wait at loop
    entry and release at loop drain. Dynamic negative-total recurrences remain
    unsupported. Unsupported components do not cause a false rejection during
-   bring-up.
+   bring-up. A staging allocation linked to operand storage through
+   `allocation.reuseTarget` adds one coalesced cross-tile WAR protocol whose
+   topology is shared with Step 7.5 insertion.
 6. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
