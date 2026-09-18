@@ -418,7 +418,11 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  std::replace(name.begin(), name.end(), '#', '_');
+  // MLIR names may carry characters Python identifiers cannot, notably the
+  // dots in block-pointer-derived names like `V_block_ptr.offsets.1`.
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
   if (!name.empty() && std::isdigit(name.front()))
     name = "var_" + name;
   return name;
@@ -435,26 +439,59 @@ static DenseMap<Value, std::string> *getValueNameCachePtr() {
 static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
   DenseMap<Value, std::string> cache;
   AsmState asmState(rootOp, OpPrintingFlags().printNameLocAsPrefix(true));
-  rootOp->walk([&](Operation *op) {
-    for (Value result : op->getResults()) {
-      std::string buf;
-      llvm::raw_string_ostream os(buf);
-      result.printAsOperand(os, asmState);
-      os.flush();
-      cache[result] = formatSSAName(buf);
-    }
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        for (BlockArgument arg : block.getArguments()) {
-          std::string buf;
-          llvm::raw_string_ostream os(buf);
-          arg.printAsOperand(os, asmState);
-          os.flush();
-          cache[arg] = formatSSAName(buf);
+
+  // Sanitization is many-to-one -- `a.b` and `a_b` both become `a_b` -- and two
+  // values sharing a name in one emitted function would shadow each other,
+  // which is valid Python but a different program. Deduplicate within a
+  // function, not across the module: separate functions get separate Python
+  // scopes, and each legitimately has its own `arg0`.
+  auto nameScope = [&](Operation *scope) {
+    llvm::StringMap<unsigned> used;
+    auto claim = [&](StringRef raw) {
+      std::string name = formatSSAName(raw);
+      auto [it, inserted] = used.try_emplace(name, 0);
+      if (inserted)
+        return name;
+      // Copy the counter out rather than holding `it` across the loop: the
+      // insertions below can grow the map, and StringMap iterators point into
+      // a bucket table that growth reallocates.
+      unsigned suffix = it->second;
+      std::string candidate;
+      do {
+        candidate = name + "_" + std::to_string(++suffix);
+      } while (!used.try_emplace(candidate, 0).second);
+      used[name] = suffix;
+      return candidate;
+    };
+    scope->walk([&](Operation *op) {
+      for (Value result : op->getResults()) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        result.printAsOperand(os, asmState);
+        os.flush();
+        cache[result] = claim(buf);
+      }
+      for (Region &region : op->getRegions()) {
+        for (Block &block : region) {
+          for (BlockArgument arg : block.getArguments()) {
+            std::string buf;
+            llvm::raw_string_ostream os(buf);
+            arg.printAsOperand(os, asmState);
+            os.flush();
+            cache[arg] = claim(buf);
+          }
         }
       }
-    }
+    });
+  };
+
+  bool sawFunc = false;
+  rootOp->walk([&](tt::FuncOp f) {
+    sawFunc = true;
+    nameScope(f);
   });
+  if (!sawFunc)
+    nameScope(rootOp);
   return cache;
 }
 
