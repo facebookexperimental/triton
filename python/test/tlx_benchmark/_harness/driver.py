@@ -151,10 +151,20 @@ def suite_listing(bench) -> str:
     registry = bench.SHAPE_SUITES
     if registry is None:
         return "no focus suites available"
+
+    def components(name):
+        suite = registry.suite(name)
+        if not suite.includes:
+            return (name, )
+        return tuple(component for included in suite.includes for component in components(included))
+
     lines = []
-    for suite in registry.suites:
-        defaults = ",".join(arch for arch, names in registry.defaults.items() if suite.name in names) or "-"
-        lines.append(f"{suite.name}: default_for={defaults}")
+    for arch_name, defaults in registry.defaults.items():
+        names = dict.fromkeys(component for name in defaults for component in components(name))
+        selected = "+".join(defaults)
+        expanded = "+".join(names)
+        suffix = f" => {expanded}" if expanded != selected else ""
+        lines.append(f"{arch_name} default => {selected}{suffix}")
     return "\n".join(lines)
 
 
@@ -163,8 +173,9 @@ def suite_shape_listing(bench, name: str) -> str:
     if registry is None:
         raise ValueError("no focus suites available")
     suite = registry.suite(name)
-    shapes = "\n".join(repr(shape) for shape in suite.shapes)
-    header = f"{suite.name} ({len(suite.shapes)} shapes)"
+    suite_shapes = registry.resolved_shapes(name)
+    shapes = "\n".join(repr(shape) for shape in suite_shapes)
+    header = f"{suite.name} ({len(suite_shapes)} shapes)"
     return f"{header}\n{shapes}" if shapes else header
 
 
