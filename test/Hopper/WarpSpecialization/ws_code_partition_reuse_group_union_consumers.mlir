@@ -47,11 +47,12 @@
 
 // The second function is a real A2 SMEM dependency chain: A's local_load
 // directly feeds B's producer. The post-memory validator models the ordinary
-// one-copy channel edges plus A.release(i) -> B.acquire(i) and
-// B.release(i) -> A.acquire(i+1).
+// one-copy channel edges plus A.release(i) -> B.reuse_wait(i) and
+// B.release(i) -> A.acquire(i+1). The producer-side reuse wait is a distinct
+// event from B's asynchronous ready completion.
 // CHECK-LABEL: tt.func public @smem_reuse_a2
 // CHECK-SAME: nvws.test.channel_cycle_edge_count = 18 : i64
-// CHECK-SAME: nvws.test.channel_cycle_event_count = 8 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 9 : i64
 // CHECK-SAME: nvws.test.channel_cycle_smem_a1_groups = 0 : i64
 // CHECK-SAME: nvws.test.channel_cycle_smem_a2_groups = 1 : i64
 // CHECK-SAME: nvws.test.channel_cycle_smem_a3_groups = 0 : i64

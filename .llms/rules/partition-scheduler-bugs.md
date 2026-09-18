@@ -476,7 +476,10 @@
   intended FA-backward tuple (schedule 1 / memory-space 1 / SMEM 0 / TMEM 1)
   remains correct and validates `safe` with 18 supported and zero unsupported
   channels. The formerly hanging TMEM-rank-0 tuple is rejected before launch
-  with a zero-distance witness.
+  with a zero-distance witness. The complete 56-tuple bounded frontier finishes
+  with 6 numerical passes and 50 classified compile-time rejections, with no
+  timeout or unclassified failure; every executable tuple has zero unsupported
+  channels.
 
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)

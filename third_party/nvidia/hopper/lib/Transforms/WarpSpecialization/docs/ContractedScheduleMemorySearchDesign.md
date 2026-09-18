@@ -602,14 +602,21 @@ Implemented:
 
 Next:
 
-1. Complete post-memory coverage for remaining TMEM and subtiled protocol
-   shapes.
+1. Extend post-memory coverage beyond the completed FA-backward frontier to
+   remaining TMEM and subtiled protocol shapes.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.
 5. Select production search caps and fallback policy.
 6. Remove remaining source annotations only after correctness and performance
    gates pass.
+
+The annotation-free BM128 FA-backward bounded frontier currently enumerates 56
+distinct schedule/memory tuples. Six executable tuples pass numerical
+correctness and validate `Safe` with zero unsupported channels. The other 50
+are rejected before launch: 31 by a proven unsafe channel cycle, 12 by the
+existing unorderable-TMEM-group structural gate, and 7 by the SMEM resource
+limit. No tuple times out or fails without classification.
 
 Current limitations:
 

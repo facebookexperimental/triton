@@ -241,7 +241,12 @@ original recurrences terminate at the prologue and are discharged. The
 formerly hanging TMEM-rank-0 tuple is now rejected before launch with a
 zero-distance witness, while the intended schedule-1 / memory-space-1 /
 SMEM-0 / TMEM-1 tuple remains numerically correct and validates `safe` with 18
-supported and zero unsupported cross-task channels.
+supported and zero unsupported cross-task channels. The complete requested
+frontier contains 56 actually enumerable tuples: 6 pass numerical correctness
+and 50 are rejected before launch (31 unsafe channel cycles, 12 unorderable
+TMEM groups, and 7 SMEM resource failures), with no timeout or unclassified
+failure. All six executable tuples validate `safe` with zero unsupported
+channels.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -260,7 +265,8 @@ topology at schedule rank 1, memory-space rank 1, SMEM rank 0, and TMEM rank 1.
 A focused backward-only correctness test passes for this annotation-free
 candidate. The direct-grid candidate's post-memory protocol graph is now fully
 modeled and proven safe, and the first formerly hanging alternate is rejected
-at compile time. The full Cartesian correctness sweep and performance
+at compile time. The complete bounded Cartesian correctness sweep finishes
+without a hang or unclassified failure. Performance
 validation remain open.
 
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
