@@ -262,8 +262,18 @@ The diagnostic includes its total iteration distance, channel IDs, and edge
 distances.
 `Safe` and `Unsupported` continue, so incomplete coverage cannot reject a
 candidate. The test pass can additionally emit `nvws.test.channel_cycle_*`
-attributes. Physical reuse groups, TMEM, subtiled, straight-line, multi-CTA,
-and ordinary `scf.while` protocols are currently reported as unsupported.
+attributes. Multi-buffered SMEM circular reuse groups (A1) are supported when
+every logical channel has one unambiguous protocol plan and the group satisfies
+`verifyReuseGroup1`. Members are ordered by consumer program order, matching
+the slot-staggering implementation. For a group with `N` transactions and `K`
+physical copies, the graph replaces the member-local slot edge with the real
+physical predecessor `release(j - K) -> acquire(j)`. Loop groups include the
+corresponding cross-iteration distance; direct-grid groups are finite and omit
+both initial-slot predecessors and the last-to-first task-order wrap. The D120
+eight-subtile/three-copy output ring is the production fixture for the finite
+case. Single-copy reuse groups, TMEM, subtiled, general straight-line,
+multi-CTA, and ordinary `scf.while` protocols are currently reported as
+unsupported.
 Staging-to-operand reuse is identified from both sides of each
 `allocation.reuseTarget` relation and validated with its cross-tile WAR token.
 Multi-CTA needs cluster synchronization, and

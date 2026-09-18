@@ -77,20 +77,22 @@
 // 0, B is at stage 1, and the MMA is at stage 2. The sed pipeline above changes
 // only those captured schedule coordinates to reconstruct the B-early rank.
 
-// A-early/A2-B3 passes the gate. Specialized output-staging and TMEM channels
-// remain explicitly unsupported, so the overall coverage status is
-// "unsupported" rather than "safe"; crucially, no supported SCC is unsafe.
+// A-early/A2-B3 passes the gate. The eight output-staging channels are modeled
+// as one finite three-slot circular reuse group. TMEM channels remain
+// explicitly unsupported, so the overall coverage status is "unsupported"
+// rather than "safe"; crucially, no supported SCC is unsafe.
 // CYCLE-POSITIVE-LABEL: tt.func public @d120_rmsnorm_gemm
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_edge_count = 28 : i64
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_event_count = 12 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_edge_count = 87 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_event_count = 44 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_reuse_groups = 1 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_status = "unsupported"
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_supported_channels = 3 : i64
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_supported_channels = 11 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_unsupported_channels = 2 : i64
 
 // The B-early reconstruction is rejected for both A2/B2 and A2/B3 with the
 // same zero-credit A-relay/B witness.
-// Specialized output-staging and TMEM channels remain explicitly unsupported
-// in this first slice, but an unsafe supported SCC takes priority.
+// The output-staging group is also covered, while an unsafe supported SCC
+// still takes priority over the remaining unsupported TMEM channels.
 // CYCLE-REJECT: error: warp specialization rejected an unsafe post-memory channel protocol: total iteration distance 0, channels [1, 1, 4, 4, 4, 1], edge distances [0, 0, 1, 0, -1, 0]
 
 // HEURISTIC-LABEL: tt.func public @d120_rmsnorm_gemm

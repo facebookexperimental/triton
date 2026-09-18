@@ -117,9 +117,9 @@ rejects only proven `Unsafe` cycles; `Safe` and `Unsupported` continue. The test
 pass exposes status, coverage counts, graph size, and the witness. The
 production-shaped
 D120 B-early A2/B2 and A2/B3 candidates are rejected with the same zero-credit
-cycle, while A-early/A2-B3 passes the gate. Reuse-group, TMEM, subtiled,
-straight-line, multi-CTA, and ordinary while protocols remain explicitly
-unsupported in this slice. Ordinary channels in a common nested
+cycle, while A-early/A2-B3 passes the gate. TMEM, subtiled, straight-line,
+multi-CTA, and ordinary while protocols remain explicitly unsupported in this
+slice. Ordinary channels in a common nested
 `scf.for` cadence are supported. Constant-trip nested loops are expanded over
 their exact finite transaction domain, and same-stage asynchronous
 producer/consumer paths contribute their pipeline-prologue credit. Dynamic
@@ -136,6 +136,20 @@ validator adds the coalesced single-slot WAR dependency
 ordinary channels. The production FA-backward fixture checks this graph for
 both `scf.for` and CLC-style `scf.while`; missing targets or inconsistent
 loop/task topology remain explicitly unsupported.
+
+**Implemented thirteenth slice:** The post-memory graph now models A1
+multi-buffered SMEM circular reuse instead of blanket-rejecting every physical
+reuse group. It accepts only groups already proven by `verifyReuseGroup1`, with
+one unambiguous channel plan per member, a common cadence/block, and no
+subtiled members. Members are ordered by consumer program order, matching
+`getReuseChannels` and the emitted slot staggering. For `N` member transactions
+and `K` physical copies, member-local slot edges are replaced by the actual
+cross-channel predecessor relation `j-K -> j`. Cyclic loop groups carry the
+derived outer-iteration distance; finite direct-grid groups omit initial-slot
+and end-to-start edges. The D120 fixture now validates all eight output
+subtiles as one three-copy ring: supported coverage rises from 3 to 11 channels
+and only its two TMEM protocols remain unsupported. Its A-early candidate is
+accepted and both B-early memory ranks retain the same zero-credit rejection.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -167,11 +181,12 @@ A2/B3 as the first two alternatives. The actual 1024x12800x1024 bf16 kernel now
 passes numerical correctness on B200 for schedule rank 1 plus the A3/B2 SMEM
 plan. Direct-grid output staging rotates the eight straight-line stores through
 the selected three-copy ring; its data slots and barrier phases are checked at
-the code-partition boundary. The adjacent A-early/A2-B2 candidate also passes
-correctness. The committed product command evaluates all four schedule ranks
-against all three SMEM ranks. Nine tuples pass numerical correctness; the three
-B-early tuples are classified as compile-time `rejected`, with no GPU launch or
-timeout.
+the code-partition boundary, and the post-memory validator now models the same
+finite physical-slot sequence. The adjacent A-early/A2-B2 candidate also
+passes correctness. The committed product command evaluates all four schedule
+ranks against all three SMEM ranks. Nine tuples pass numerical correctness;
+the three B-early tuples are classified as compile-time `rejected`, with no GPU
+launch or timeout.
 
 **Production-shaped FA-backward oracle:** The existing BM64 pre-modulo fixture
 already proves that Contracted top-K retains the target five-GEMM schedule with
@@ -279,9 +294,9 @@ pipeline depth, physical copy counts, buffer IDs, or reuse groups.
 production-shaped D120 and FA-backward fixtures. The frontier intentionally
 retains the D120 B-early schedule because schedule generation alone cannot know
 whether the later memory plan gives every relay enough capacity. Its selected
-schedule-memory combination currently deadlocks. The authoritative fix is the
-post-memory channel-cycle validator in Phase 10; an earlier scheduler rule may
-eventually prune candidates only when it can prove the same result.
+schedule-memory combination is rejected by the post-memory channel-cycle
+validator in Phase 10. An earlier scheduler rule may eventually prune
+candidates only when it can prove the same result without the physical plan.
 
 #### Logical memory space
 
@@ -1202,24 +1217,30 @@ The implementation sequence is:
    bring-up. A staging allocation linked to operand storage through
    `allocation.reuseTarget` adds one coalesced cross-tile WAR protocol whose
    topology is shared with Step 7.5 insertion.
-6. Add debug output and a manifest validation record. The error must include
+6. **Implemented:** support A1 multi-buffered SMEM reuse groups with one
+   unambiguous plan per member. Replace member-local copy-depth edges with the
+   actual cross-channel physical-slot predecessor. Model loop groups cyclically
+   and direct-grid groups as finite sequences without a fabricated wraparound.
+7. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
-7. Capture the actual B-early D120 IR at the post-buffer-allocation boundary so
-   the lit pipeline still runs memory planning before validation. Extend the
+8. **Implemented:** capture the actual B-early D120 IR at the
+   post-buffer-allocation boundary so the lit pipeline still runs memory
+   planning before validation. Extend the
    existing D120 memory-planner test rather than creating a disconnected toy
    test file: B-early with A2/B2 and A2/B3 must fail with the same cycle;
    A-early/A2-B3 must pass.
-8. Run the existing annotation-free FA-backward memory and code-partition lit
-   tests as positive coverage. Only after these stay clean should the external
+9. **Implemented:** run the existing annotation-free FA-backward memory and
+   code-partition lit tests as positive coverage. Only after these stay clean
+   should the external
    search driver treat a proven `Unsafe` result as a rejected tuple and avoid
    launching it.
 
 The audit slice does not inspect emitted tokens/barriers, validate TMEM alias
 reads, or claim that every unsupported control-flow shape is safe. Those are
-follow-up extensions to the second graph builder. The following rejection
-slice will eliminate the D120 runtime hang by rejecting the proven cycle
-before code-partition mutation.
+follow-up extensions to the second graph builder. The planned-protocol gate now
+eliminates the D120 runtime hang by rejecting the proven cycle before
+code-partition mutation.
 
 Each implementation commit must rebuild Triton in the `metamain` environment
 with `/home/mren/OpenSource2/llvm-build`, run the focused D120 and FA-backward
@@ -1250,8 +1271,9 @@ The selected annotation-free schedule and `{dpT, dsT, dQ}` TMEM plan must
 validate as a positive control. Its cross-partition reuse dependencies advance
 through real data-ready and release edges rather than forming a non-positive
 cycle. Persistent `scf.while`, same-task staging, MMAv5 inline completion, and
-multi-member reuse remain explicit coverage requirements before enabling the
-validator for all nonzero search candidates.
+single-copy/TMEM reuse remain explicit coverage requirements before enabling
+the validator for all nonzero search candidates. Multi-member A1 SMEM reuse is
+now covered separately.
 
 **Implementation areas:** `WSChannelProtocol.{h,cpp}` for shared endpoint
 planning, `WSChannelCycleAnalysis.{h,cpp}` for the generic solver,
@@ -1444,6 +1466,8 @@ a hard correctness floor on the structural path.
       planned channels and returns a zero-distance witness.
 - [x] Post-memory channel-cycle validation rejects D120 B-early before launch
       while retaining A-early with the A2/B3 memory plan.
+- [x] Post-memory validation models D120's eight-member/three-copy A1 output
+      staging ring and reports only the two TMEM protocols unsupported.
 - [x] The full bounded D120 product runs without hangs: nine tuples pass
       correctness and the three B-early tuples are rejected before launch.
 - [ ] D120 measured winner is A3/B2 on the target shapes.

@@ -324,6 +324,28 @@
   cycle witness for A2/B2 and A2/B3. A-early/A2-B3 and the annotation-free
   FA-backward fixtures remain accepted.
 
+### 38. Post-memory validation omitted A1 shared-slot ownership (2026-09-17, fixed)
+
+- **Symptom**: D120's safe A-early candidate compiled, but the channel-cycle
+  audit remained `Unsupported`: only 3 ordinary channels were modeled while
+  its eight output subtiles were excluded because they shared one three-copy
+  SMEM staging ring.
+- **Root cause**: The first post-memory graph builder represented slot reuse as
+  a per-channel edge `release(c, i) -> acquire(c, i + copies)` and blanket-
+  rejected every physical reuse group. In A1 the slot owner is instead another
+  logical channel selected by the group's staggered transaction count. A
+  direct-grid group is additionally finite, so the normal task-timeline
+  last-to-first wrap would invent a transaction that never executes.
+- **Fix**: Validate the same A1 preconditions as code partitioning, order group
+  members by consumer program order, and replace self-reuse edges with the
+  physical predecessor `j-K -> j` for `N` transactions and `K` copies. Cyclic
+  loop groups carry the derived iteration distance; direct-grid groups omit
+  initial-slot predecessors and timeline wraparound.
+- **Lit test**: `ws_memory_planner_rmsnorm_gemm.mlir` now audits the real D120
+  eight-subtile/three-copy output group: 11 supported channels, one supported
+  A1 group, and only the two TMEM channels unsupported. A-early remains
+  accepted; B-early A2/B2 and A2/B3 retain the same zero-credit rejection.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

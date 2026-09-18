@@ -86,7 +86,7 @@ WSMemoryPlanner remain authoritative for physical buffering.
 | Logical memory space | Which ambiguous values use SMEM or TMEM | Representability and explicit annotation overrides | Heuristic rank zero; deterministic subset order | Implemented for direct/transposed LHS siblings |
 | SMEM plan | Copy count per logical block | Safety floors and byte budget | Heuristic plan rank zero; structural copy neighbors | Implemented, including fixed-group mode |
 | TMEM plan | Reuse groups and column placement | Dependency order and 512-column capacity | Heuristic rank zero; low-aliasing representative; remaining score order | Implemented for ordinary allocations |
-| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Common graph/solver implemented; IR builder planned |
+| Channel progress | Selected schedule-memory combination | Absence of a non-progressing channel cycle | Not ranked; reject with witness | Post-memory builder covers ordinary SMEM, staging WAR, and A1 SMEM reuse |
 
 Ranks are local enumeration positions, not stable semantic identities. Tests,
 manifests, and result databases should retain canonical signatures as well as
@@ -385,8 +385,17 @@ The graph contains:
 
 - `Ready(i) -> Wait(i)` with distance zero;
 - `Release(i) -> Acquire(i + copies)` for physical slot reuse;
+- for an A1 SMEM group, cross-channel slot edges from the transaction that
+  last owned the same physical slot, replacing each member's self edge;
 - schedule-aware program-order edges between consecutive events in each task;
 - explicit control-flow and transaction-stride edges.
+
+For an A1 group with `N` logical transactions per loop iteration and `K`
+physical slots, target member `j` has predecessor `p = (j - K) mod N` and edge
+`release(p, i) -> acquire(j, i + (p + K - j) / N)`. A direct-grid group uses
+the finite form `release(j-K) -> acquire(j)` only for `j >= K`; it has neither
+an end-to-start task-order wrap nor a fabricated transaction after the final
+subtile.
 
 Endpoint selection and cadence calculations must be factored from
 `insertAsyncComm` so insertion and validation cannot disagree.
@@ -538,12 +547,16 @@ Implemented:
   edge that code partitioning will materialize: staging drain in transaction
   `i` precedes operand overwrite in transaction `i + 1`. The shared protocol
   planner fails closed when the aliases do not share one persistent loop and
-  task pair.
+  task pair. Multi-buffered A1 SMEM reuse groups are also lowered using their
+  actual shared-slot predecessor relation. Both cyclic `scf.for` groups and
+  finite direct-grid groups are represented; the D120 eight-subtile,
+  three-copy staging ring contributes 32 events and five physical slot-reuse
+  edges.
 
 Next:
 
-1. Complete post-memory coverage for physical reuse groups, TMEM, and subtiled
-   protocol shapes.
+1. Complete post-memory coverage for single-copy reuse groups, TMEM, and
+   subtiled protocol shapes.
 2. Add the post-insertion conformance builder over the same protocol graph.
 3. Validate the complete supported correctness matrix and sanitizer cases.
 4. Measure D120 and FA-backward candidate frontiers on target hardware.
@@ -559,9 +572,10 @@ Current limitations:
 - Scaled-MMA and subtiled TMEM cases may use the legacy allocator.
 - Candidate ranks are not stable across compiler changes; signatures must be
   used for durable comparisons.
-- The ordinary-loop post-memory builder rejects proven zero-distance cycles.
-  Dynamic negative-total cycles, multi-CTA, specialized-protocol, and
-  post-insertion coverage remain open.
+- The post-memory builder rejects proven zero-distance cycles and covers A1
+  multi-buffered SMEM reuse. Dynamic negative-total cycles, single-copy/TMEM
+  reuse, multi-CTA, other specialized protocols, and post-insertion coverage
+  remain open.
 
 ## 12. Controls and diagnostics
 

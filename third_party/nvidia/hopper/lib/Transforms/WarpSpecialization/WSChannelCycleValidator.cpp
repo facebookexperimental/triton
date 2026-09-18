@@ -49,7 +49,19 @@ struct ScheduledProtocolEvent {
 struct ProtocolTaskTimeline {
   AsyncTaskId task;
   Operation *scope;
+  bool cyclic;
   SmallVector<ScheduledProtocolEvent> events;
+};
+
+struct SmemCircularReuseGroupPlan {
+  SmallVector<Channel *> transactions;
+  unsigned copies;
+  bool finite;
+};
+
+struct ChannelEventSet {
+  ProtocolEventId acquire;
+  SmallVector<ProtocolEventId> releases;
 };
 
 struct MappedProtocolGraph {
@@ -72,13 +84,15 @@ static bool getScheduleCoordinate(Operation *op, int64_t &stage,
 
 static ProtocolTaskTimeline &
 getTaskTimeline(SmallVectorImpl<ProtocolTaskTimeline> &timelines,
-                AsyncTaskId task, Operation *scope) {
+                AsyncTaskId task, Operation *scope, bool cyclic = true) {
   auto it = llvm::find_if(timelines, [&](const ProtocolTaskTimeline &timeline) {
     return timeline.task == task && timeline.scope == scope;
   });
-  if (it != timelines.end())
+  if (it != timelines.end()) {
+    assert(it->cyclic == cyclic && "inconsistent protocol cadence for task");
     return *it;
-  timelines.push_back({task, scope, {}});
+  }
+  timelines.push_back({task, scope, cyclic, {}});
   return timelines.back();
 }
 
@@ -133,13 +147,18 @@ static bool addTaskOrderEdges(ProtocolGraph &graph,
       return event.ordersFollowingEvents;
     });
   };
-  for (size_t target = 0; target < classes.size(); ++target) {
-    size_t source = (target + classes.size() - 1) % classes.size();
-    while (source != target && !hasOrderingSource(classes[source]))
-      source = (source + classes.size() - 1) % classes.size();
+  size_t firstTarget = timeline.cyclic ? 0 : 1;
+  for (size_t target = firstTarget; target < classes.size(); ++target) {
+    size_t source = target == 0 ? classes.size() - 1 : target - 1;
+    while (source != target && !hasOrderingSource(classes[source])) {
+      if (!timeline.cyclic && source == 0)
+        break;
+      source = source == 0 ? classes.size() - 1 : source - 1;
+    }
     if (!hasOrderingSource(classes[source]))
       continue;
-    connect(classes[source], classes[target], source >= target);
+    connect(classes[source], classes[target],
+            timeline.cyclic && source >= target);
   }
   return true;
 }
@@ -387,6 +406,93 @@ static ProtocolValidation validateProtocolScopes(
   return {};
 }
 
+static SmallVector<SmemCircularReuseGroupPlan>
+collectSupportedSmemCircularReuseGroups(
+    ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
+    DenseMap<Channel *, unsigned> &groupByChannel) {
+  SmallVector<SmemCircularReuseGroupPlan> groups;
+  if (!reuseConfig)
+    return groups;
+
+  DenseMap<Channel *, const ChannelProtocolPlan *> planByChannel;
+  DenseSet<Channel *> ambiguousChannels;
+  for (const ChannelProtocolPlan &plan : plans) {
+    for (Channel *channel : plan.channels) {
+      if (!planByChannel.try_emplace(channel, &plan).second)
+        ambiguousChannels.insert(channel);
+    }
+  }
+
+  for (unsigned groupIndex = 0; groupIndex < reuseConfig->getGroupSize();
+       ++groupIndex) {
+    ReuseGroup *group = reuseConfig->getGroup(groupIndex);
+    if (group->channels.size() <= 1)
+      continue;
+    Channel *representative = group->channels.front();
+    unsigned copies = representative->getNumBuffers();
+    if (copies <= 1 || !verifyReuseGroup1(group) ||
+        llvm::any_of(group->channels, [](Channel *channel) {
+          return channel->channelKind != DataChannelKind::SMEMAlloc ||
+                 channelIsSubtiled(channel);
+        }))
+      continue;
+
+    Operation *scope = nullptr;
+    Block *transactionBlock = nullptr;
+    std::optional<bool> finite;
+    SmallVector<Channel *> transactions;
+    bool supported = true;
+    for (Channel *channel : group->channels) {
+      auto planIt = planByChannel.find(channel);
+      if (channel->getNumBuffers() != copies ||
+          ambiguousChannels.contains(channel) ||
+          planIt == planByChannel.end() ||
+          planIt->second->channels.size() != 1) {
+        supported = false;
+        break;
+      }
+      const ChannelProtocolPlan &plan = *planIt->second;
+      bool planIsFinite = plan.cadence == ChannelProtocolCadence::StraightLine;
+      bool planIsLoop = plan.cadence == ChannelProtocolCadence::Loop &&
+                        isa_and_nonnull<scf::ForOp>(plan.cadenceScope);
+      Operation *destination = channel->getDstOp();
+      if ((!planIsFinite && !planIsLoop) || !plan.cadenceScope ||
+          !destination) {
+        supported = false;
+        break;
+      }
+      if (!finite) {
+        finite = planIsFinite;
+        scope = plan.cadenceScope;
+        transactionBlock = destination->getBlock();
+      } else if (*finite != planIsFinite || scope != plan.cadenceScope ||
+                 transactionBlock != destination->getBlock()) {
+        supported = false;
+        break;
+      }
+      transactions.push_back(channel);
+    }
+    if (!supported)
+      continue;
+
+    // A1 assigns each member an accumCnt offset in consumer program order.
+    // Use that exact logical transaction order for physical-slot ownership.
+    llvm::stable_sort(transactions, [](Channel *lhs, Channel *rhs) {
+      return lhs->getDstOp()->isBeforeInBlock(rhs->getDstOp());
+    });
+    if (llvm::adjacent_find(transactions, [](Channel *lhs, Channel *rhs) {
+          return lhs->getDstOp() == rhs->getDstOp();
+        }) != transactions.end())
+      continue;
+
+    unsigned supportedIndex = groups.size();
+    groups.push_back({std::move(transactions), copies, *finite});
+    for (Channel *channel : groups.back().transactions)
+      groupByChannel[channel] = supportedIndex;
+  }
+  return groups;
+}
+
 static void attachAuditAttributes(triton::FuncOp funcOp,
                                   const PostMemoryProtocolAnalysis &analysis) {
   MLIRContext *context = funcOp.getContext();
@@ -409,6 +515,9 @@ static void attachAuditAttributes(triton::FuncOp funcOp,
       "nvws.test.channel_cycle_staging_reuse_protocols",
       IntegerAttr::get(IntegerType::get(context, 64),
                        analysis.supportedStagingReuseProtocolCount));
+  funcOp->setAttr("nvws.test.channel_cycle_smem_reuse_groups",
+                  IntegerAttr::get(IntegerType::get(context, 64),
+                                   analysis.supportedSmemReuseGroupCount));
   if (!analysis.validation.reason.empty())
     funcOp->setAttr("nvws.test.channel_cycle_reason",
                     StringAttr::get(context, analysis.validation.reason));
@@ -444,6 +553,12 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
   SmallVector<ProtocolTaskTimeline> timelines;
   DenseMap<ProtocolEventId, Operation *> eventCadenceScopes;
   DenseMap<ProtocolEventId, ScheduledProtocolEvent> eventSchedules;
+  DenseMap<Channel *, ChannelEventSet> channelEvents;
+  DenseMap<Channel *, unsigned> smemReuseGroupByChannel;
+  SmallVector<SmemCircularReuseGroupPlan> smemReuseGroups =
+      collectSupportedSmemCircularReuseGroups(plans, reuseConfig,
+                                              smemReuseGroupByChannel);
+  analysis.supportedSmemReuseGroupCount = smemReuseGroups.size();
   std::string unsupportedReason;
   bool hasUnsupportedProtocol =
       stagingReusePlan.hasReuseTargets() && !stagingReusePlan.isSupported();
@@ -480,7 +595,16 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
         plan.cadence == ChannelProtocolCadence::OuterToInnerLoop &&
         isa_and_nonnull<scf::ForOp>(plan.cadenceScope) &&
         isa_and_nonnull<scf::ForOp>(plan.innerCadenceScope);
-    if (!isInnerLoopCadence && !isOuterToInnerCadence) {
+    auto smemReuseGroupIt = smemReuseGroupByChannel.find(channel);
+    const SmemCircularReuseGroupPlan *smemReuseGroup =
+        smemReuseGroupIt == smemReuseGroupByChannel.end()
+            ? nullptr
+            : &smemReuseGroups[smemReuseGroupIt->second];
+    bool isFiniteSmemReuseCadence =
+        smemReuseGroup && smemReuseGroup->finite &&
+        plan.cadence == ChannelProtocolCadence::StraightLine;
+    if (!isInnerLoopCadence && !isOuterToInnerCadence &&
+        !isFiniteSmemReuseCadence) {
       unsupported("only scf.for loop-cadence channels are supported");
       continue;
     }
@@ -516,7 +640,8 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     }
     if (reuseConfig && llvm::any_of(plan.channels, [&](Channel *member) {
           return channelInReuseGroup(member, reuseConfig,
-                                     /*reuseBarrier=*/false) >= 0;
+                                     /*reuseBarrier=*/false) >= 0 &&
+                 !smemReuseGroupByChannel.contains(member);
         })) {
       unsupported("physical reuse-group protocols are not yet supported");
       continue;
@@ -546,13 +671,17 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
       int64_t cluster;
       if (!anchor)
         return false;
-      if (isOuterToInnerCadence) {
-        if (anchor->getBlock() != plan.innerCadenceScope->getBlock())
+      if (isOuterToInnerCadence || isFiniteSmemReuseCadence) {
+        Block *expectedBlock =
+            isOuterToInnerCadence
+                ? plan.innerCadenceScope->getBlock()
+                : smemReuseGroup->transactions.front()->getDstOp()->getBlock();
+        if (anchor->getBlock() != expectedBlock)
           return false;
-        // Cross-scope events form an outer-iteration protocol. Producer
-        // events retain their outer-block source position; consumer wait and
-        // release events are placed immediately before and after the nested
-        // loop, which summarizes its prologue and drain as one transaction.
+        // Cross-scope events form an outer-iteration protocol. A finite A1
+        // group instead uses its straight-line block as one transaction
+        // sequence. Neither shape has inner-pipeline schedule coordinates at
+        // these anchors.
         stage = 0;
         cluster = 0;
       } else {
@@ -633,12 +762,15 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     };
 
     for (const ScheduledProtocolEvent &event : pendingEvents) {
-      getTaskTimeline(timelines, event.task, event.scope)
+      getTaskTimeline(timelines, event.task, event.scope,
+                      /*cyclic=*/!isFiniteSmemReuseCadence)
           .events.push_back(event);
       eventSchedules.try_emplace(event.id, event);
     }
     analysis.graph.addEdge(acquire, ready, getTaskSpanDistance(acquire, ready),
                            ProtocolEdgeKind::TaskOrder, channelId);
+    ChannelEventSet &events = channelEvents[channel];
+    events.acquire = acquire;
     for (const ConsumerEvents &consumer : consumerEvents) {
       analysis.graph.addEdge(ready, consumer.wait, 0,
                              ProtocolEdgeKind::DataReady, channelId);
@@ -648,10 +780,59 @@ PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
           isOuterToInnerCadence ? ProtocolEdgeKind::ControlFlow
                                 : ProtocolEdgeKind::TaskOrder,
           channelId);
-      analysis.graph.addEdge(consumer.release, acquire, plan.copies,
-                             ProtocolEdgeKind::SlotReuse, channelId);
+      events.releases.push_back(consumer.release);
+      if (!smemReuseGroup)
+        analysis.graph.addEdge(consumer.release, acquire, plan.copies,
+                               ProtocolEdgeKind::SlotReuse, channelId);
     }
     ++analysis.supportedChannelCount;
+  }
+
+  for (const SmemCircularReuseGroupPlan &group : smemReuseGroups) {
+    if (llvm::any_of(group.transactions, [&](Channel *channel) {
+          return !channelEvents.contains(channel);
+        })) {
+      --analysis.supportedSmemReuseGroupCount;
+      continue;
+    }
+    size_t transactionCount = group.transactions.size();
+    for (size_t target = 0; target < transactionCount; ++target) {
+      if (group.finite && target < group.copies)
+        continue;
+
+      size_t predecessor;
+      int64_t iterationDistance;
+      if (group.finite) {
+        // There is no predecessor for the first K direct-grid transactions:
+        // they consume the ring's initially empty slots. Later transactions
+        // reuse the slot held by the transaction exactly K positions earlier.
+        predecessor = target - group.copies;
+        iterationDistance = 0;
+      } else {
+        // For a cyclic N-transaction sequence, solve
+        //   predecessorIteration * N + predecessor + K
+        //       = targetIteration * N + target
+        // for the previous logical transaction that owned this physical slot.
+        int64_t unwrappedPredecessor = int64_t(target) - int64_t(group.copies);
+        int64_t predecessorRemainder =
+            unwrappedPredecessor % int64_t(transactionCount);
+        if (predecessorRemainder < 0)
+          predecessorRemainder += transactionCount;
+        predecessor = predecessorRemainder;
+        iterationDistance =
+            (int64_t(predecessor) + int64_t(group.copies) - int64_t(target)) /
+            int64_t(transactionCount);
+      }
+
+      Channel *sourceChannel = group.transactions[predecessor];
+      Channel *targetChannel = group.transactions[target];
+      const ChannelEventSet &sourceEvents = channelEvents.lookup(sourceChannel);
+      const ChannelEventSet &targetEvents = channelEvents.lookup(targetChannel);
+      for (ProtocolEventId release : sourceEvents.releases)
+        analysis.graph.addEdge(release, targetEvents.acquire, iterationDistance,
+                               ProtocolEdgeKind::SlotReuse,
+                               targetChannel->uniqID);
+    }
   }
 
   if (stagingReusePlan.isSupported()) {
@@ -734,7 +915,8 @@ LogicalResult validatePostMemoryChannelProtocols(
        << ", edges=" << analysis.graph.edges.size()
        << ", supported=" << analysis.supportedChannelCount
        << ", unsupported=" << analysis.unsupportedChannelCount
-       << ", staging-reuse=" << analysis.supportedStagingReuseProtocolCount);
+       << ", staging-reuse=" << analysis.supportedStagingReuseProtocolCount
+       << ", smem-reuse-groups=" << analysis.supportedSmemReuseGroupCount);
   LLVM_DEBUG({
     for (unsigned edgeId : analysis.validation.cycleEdgeIds) {
       const ProtocolEdge &edge = analysis.graph.edges[edgeId];

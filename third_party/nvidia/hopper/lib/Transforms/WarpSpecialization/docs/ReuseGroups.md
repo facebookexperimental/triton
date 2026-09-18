@@ -232,6 +232,25 @@ every multi-buffered group and `report_fatal_error`s if it fails:
 A violation is a hard error (not a silent fallback) because the buffers are
 already physically aliased; proceeding would emit incorrect synchronization.
 
+The post-memory channel-cycle validator also models A1 groups before barriers
+are inserted. It orders logical transactions by `getDstOp()` program order,
+which is the same order used by `getReuseChannels` and the direct-grid
+staggering fallback. For `N` logical transactions sharing `K` physical slots,
+transaction `j` reuses the slot last owned by `j - K`:
+
+```text
+cyclic loop: release((j - K) mod N, i) -> acquire(j, i + delta)
+              delta = (((j - K) mod N) + K - j) / N
+direct grid: release(j - K) -> acquire(j), for j >= K
+```
+
+The direct-grid form is a finite transaction sequence: its first `K`
+transactions consume initially empty slots and it has no last-to-first task
+wrap. This is what validates D120's eight output subtiles over three staging
+copies (`0,1,2,0,1,2,0,1`) without inventing a nonexistent next grid tile.
+Groups with ambiguous channel plans, duplicate consumer endpoints, subtiled
+members, or mixed cadence remain unsupported.
+
 #### SMEM vs TMEM accumulation
 
 The `accumCnt` stagger is a **temporal** mechanism: it cycles the channels of a
