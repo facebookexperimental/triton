@@ -57,6 +57,7 @@ class CPUOptions:
     # TODO: Try to enable it.
     sanitize_overflow: bool = False
     instrumentation_mode: str = ""
+    fpsan_homomorphic_casts: bool = False
 
     # TODO: We may introduce CPU-specific options like # of cores.
     ukernels: str = None
