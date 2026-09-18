@@ -16,6 +16,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <optional>
 #include <tuple>
 #include <unordered_set>
 
@@ -30,6 +31,15 @@ static Operation *getEffectiveProtocolParent(Operation *op) {
   Operation *parent = op->getParentOp();
   while (parent && isa<ttng::SubtiledRegionOp>(parent))
     parent = parent->getParentOp();
+  return parent;
+}
+
+static Operation *getCadenceParentOutsideSubtiledRegions(Operation *op) {
+  Operation *parent = op->getParentOp();
+  while (auto subtiled = op->getParentOfType<ttng::SubtiledRegionOp>()) {
+    parent = subtiled->getParentOp();
+    op = subtiled;
+  }
   return parent;
 }
 
@@ -166,17 +176,24 @@ struct ProtocolCadence {
 
 static ProtocolCadence classifyProtocolCadence(Operation *producer,
                                                Operation *consumer) {
-  if (producer->getParentOfType<ttng::SubtiledRegionOp>() ||
-      consumer->getParentOfType<ttng::SubtiledRegionOp>())
-    return {ChannelProtocolCadence::Subtiled};
-
   auto producerFor = producer->getParentOfType<scf::ForOp>();
   auto consumerFor = consumer->getParentOfType<scf::ForOp>();
   if (producerFor && producerFor == consumerFor)
     return {ChannelProtocolCadence::Loop, producerFor.getOperation()};
+  if (!producerFor && consumerFor &&
+      producer->getBlock() == consumerFor->getBlock())
+    return {ChannelProtocolCadence::OutsideToInnerLoop,
+            consumerFor->getParentOp(), consumerFor.getOperation()};
+  if (producerFor && !consumerFor &&
+      producerFor->getBlock() == consumer->getBlock())
+    return {ChannelProtocolCadence::InnerToOutsideLoop,
+            producerFor->getParentOp(), producerFor.getOperation()};
   if (producerFor && consumerFor && producerFor->isProperAncestor(consumerFor))
     return {ChannelProtocolCadence::OuterToInnerLoop,
             producerFor.getOperation(), consumerFor.getOperation()};
+  if (producerFor && consumerFor && consumerFor->isProperAncestor(producerFor))
+    return {ChannelProtocolCadence::InnerToOuterLoop,
+            consumerFor.getOperation(), producerFor.getOperation()};
 
   auto producerWhile = producer->getParentOfType<scf::WhileOp>();
   auto consumerWhile = consumer->getParentOfType<scf::WhileOp>();
@@ -184,8 +201,10 @@ static ProtocolCadence classifyProtocolCadence(Operation *producer,
     return {ChannelProtocolCadence::WhileLoop, producerWhile.getOperation()};
 
   if (!producerFor && !consumerFor && !producerWhile && !consumerWhile &&
-      producer->getBlock() == consumer->getBlock())
-    return {ChannelProtocolCadence::StraightLine, producer->getParentOp()};
+      getCadenceParentOutsideSubtiledRegions(producer) ==
+          getCadenceParentOutsideSubtiledRegions(consumer))
+    return {ChannelProtocolCadence::StraightLine,
+            getCadenceParentOutsideSubtiledRegions(producer)};
   return {};
 }
 
@@ -404,6 +423,7 @@ buildStagingReuseProtocolPlan(triton::FuncOp funcOp,
   });
 
   LoopLikeOpInterface outerLoop;
+  std::optional<bool> finiteSingleTile;
   for (const ReusePair &pair : pairs) {
     auto target = bufferIdToChannel.find(pair.targetBufferId);
     if (target == bufferIdToChannel.end() || !target->second->getSrcOp()) {
@@ -412,25 +432,27 @@ buildStagingReuseProtocolPlan(triton::FuncOp funcOp,
     }
     LoopLikeOpInterface loop = getParentPersistentLoop(pair.firstStore);
     auto loadTasks = getAsyncTaskIds(target->second->getSrcOp());
-    if (!loop || loadTasks.empty() ||
-        !llvm::all_of(loadTasks, [&](AsyncTaskId task) {
+    if (loadTasks.empty() || !llvm::all_of(loadTasks, [&](AsyncTaskId task) {
           return task == loadTasks.front();
         })) {
-      unsupported("staging reuse lacks one persistent loop or load task");
+      unsupported("staging reuse lacks one load task");
       continue;
     }
 
+    bool pairFiniteSingleTile = !loop;
     AsyncTaskId loadTask = loadTasks.front();
     ++plan.matchedPairCount;
     if (plan.matchedPairCount == 1) {
       outerLoop = loop;
+      finiteSingleTile = pairFiniteSingleTile;
       plan.loadTask = loadTask;
       plan.drainedStoreTask = pair.drainedStoreTask;
       plan.diagnosticChannelId = target->second->uniqID;
     } else {
       plan.diagnosticChannelId =
           std::min(plan.diagnosticChannelId, target->second->uniqID);
-      if (loop != outerLoop || loadTask != plan.loadTask ||
+      if (pairFiniteSingleTile != *finiteSingleTile || loop != outerLoop ||
+          loadTask != plan.loadTask ||
           pair.drainedStoreTask != plan.drainedStoreTask)
         plan.consistent = false;
     }
@@ -448,6 +470,10 @@ buildStagingReuseProtocolPlan(triton::FuncOp funcOp,
           "staging reuse pairs span multiple loops or tasks";
     return plan;
   }
+
+  plan.finiteSingleTile = *finiteSingleTile;
+  if (plan.finiteSingleTile)
+    return plan;
 
   plan.outerLoop = outerLoop.getOperation();
   Block *body = getPersistentLoopBody(outerLoop);

@@ -244,6 +244,15 @@ invocation remain. Dynamic nested loops recognize the startup credit from a
 same-stage asynchronous producer/consumer transaction; a negative edge into a
 producer acquire receives no such credit.
 
+When a dynamic one-sided scope has both positive and negative recurrences, the
+validator does not classify the SCC from its aggregate signs. It removes
+positive `SlotReuse` edges, because their physical slot is initialized empty,
+and searches the remaining graph for a simple zero-distance wait cycle with at
+most one prologue crossing. The search is bounded and returns `Unsupported` if
+its budget is exhausted. A strictly negative original recurrence ends at the
+prologue and is not promoted to a zero-distance rejection merely by scoped
+normalization.
+
 An ordinary SMEM channel produced directly in an outer `scf.for` and consumed
 only in one directly nested `scf.for` is summarized in the outer cadence. Its
 consumer wait is placed at inner-loop entry and its release at inner-loop
@@ -268,7 +277,24 @@ The diagnostic includes its total iteration distance, channel IDs, and edge
 distances.
 `Safe` and `Unsupported` continue, so incomplete coverage cannot reject a
 candidate. The test pass can additionally emit `nvws.test.channel_cycle_*`
-attributes. Multi-buffered SMEM circular reuse groups (A1) are supported when
+attributes.
+
+An allocation discovered by `collectAllocChannels` is not necessarily a
+cross-task protocol. Same-task TMA staging has an empty consumer-task set and
+therefore creates no token in `createToken`; the validator records it under
+`channel_cycle_ignored_intra_task_channels` and adds no wait-for edge. For the
+dual nested-loop shape used by FA backward's dV/dK accumulators, MMAv5 produces
+one single-copy operand-D TMEM value throughout the inner loop and a different
+task drains it after the loop. Endpoint planning classifies this as
+`InnerToOuterLoop`, with acquire/ready at inner entry/drain and wait/release at
+the post-loop TMEM load.
+
+An ordinary one-copy MMAv5 result consumed by a TMEM load in the same scheduled
+loop is also a supported loop-cadence protocol. This is distinct from a reuse
+group: it retains the ordinary acquire, ready, wait, release, and slot-reuse
+edges.
+
+Multi-buffered SMEM circular reuse groups (A1) are supported when
 every logical channel has one unambiguous protocol plan and the group satisfies
 `verifyReuseGroup1`. Members are ordered by consumer program order, matching
 the slot-staggering implementation. For a group with `N` transactions and `K`
@@ -291,11 +317,11 @@ transaction. Other TMEM shapes, subtiled, general straight-line, multi-CTA,
 and ordinary `scf.while` protocols are currently reported as unsupported.
 Staging-to-operand reuse is identified from both sides of each
 `allocation.reuseTarget` relation and validated with its cross-tile WAR token.
-Multi-CTA needs cluster synchronization, and
-dynamic negative-total witnesses need additional boundary semantics before
-they can be rejected soundly. The captured top-level D120 B-early schedules are
-rejected with a zero-distance cycle through the real post-memory
-channel-planning path, while A-early continues.
+Multi-CTA needs cluster synchronization. Dynamic one-sided scopes use the
+bounded boundary analysis described above; scopes outside that model remain
+unsupported. The captured top-level D120 B-early schedules are rejected with a
+zero-distance cycle through the real post-memory channel-planning path, while
+A-early continues.
 
 ### Channel Loop Detection
 

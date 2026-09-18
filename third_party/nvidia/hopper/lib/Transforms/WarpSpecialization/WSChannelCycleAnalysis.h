@@ -85,6 +85,16 @@ struct ProtocolValidation {
 /// Bellman-Ford supplies both the decision and a deterministic edge witness.
 ProtocolValidation validateProtocolCycles(const ProtocolGraph &graph);
 
+/// Validate a one-sided finite transaction domain whose trip count is not
+/// known statically. A strictly-negative simple recurrence cannot close after
+/// the prologue boundary and is safe. A zero-distance simple cycle remains
+/// unsafe unless it contains a positive slot-reuse edge, whose initially empty
+/// physical slot supplies startup credit. Mixed-sign SCCs are searched for an
+/// uncredited zero cycle with at most one prologue crossing: distinct boundary
+/// recurrences do not become one simultaneous circular wait merely by
+/// concatenating them through repeated transaction boundaries.
+ProtocolValidation validateBoundaryProtocolCycles(const ProtocolGraph &graph);
+
 llvm::StringRef stringifyProtocolStatus(ProtocolStatus status);
 
 } // namespace mlir

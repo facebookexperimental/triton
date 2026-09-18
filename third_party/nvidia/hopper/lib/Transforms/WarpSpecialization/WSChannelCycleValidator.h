@@ -21,8 +21,11 @@ struct PostMemoryProtocolAnalysis {
   ProtocolGraph graph;
   ProtocolValidation validation;
   unsigned supportedChannelCount = 0;
+  unsigned ignoredIntraTaskChannelCount = 0;
+  unsigned ignoredFiniteGuardChannelCount = 0;
   unsigned unsupportedChannelCount = 0;
   unsigned supportedStagingReuseProtocolCount = 0;
+  unsigned supportedFiniteStagingReuseProtocolCount = 0;
   unsigned supportedSmemReuseGroupCount = 0;
   unsigned supportedSmemA1GroupCount = 0;
   unsigned supportedSmemA2GroupCount = 0;
@@ -31,10 +34,10 @@ struct PostMemoryProtocolAnalysis {
   unsigned supportedTmemA5GroupCount = 0;
 };
 
-/// Build and validate ordinary loop-cadence SMEM channel protocols, A1/A2/A3
-/// SMEM reuse groups, A2/A5 TMEM reuse groups, and the coalesced
-/// staging-to-operand reuse WAR protocol. Ordinary and specialized TMEM shapes
-/// outside those classified reuse groups remain conservatively unsupported.
+/// Build and validate ordinary loop-cadence SMEM channel protocols,
+/// inner-to-outer operand-D TMEM drains, A1/A2/A3 SMEM reuse groups, A2/A5
+/// TMEM reuse groups, and the coalesced staging-to-operand reuse WAR protocol.
+/// Other specialized TMEM shapes remain conservatively unsupported.
 PostMemoryProtocolAnalysis analyzePostMemoryChannelProtocols(
     ArrayRef<ChannelProtocolPlan> plans, ReuseConfig *reuseConfig,
     const StagingReuseProtocolPlan &stagingReusePlan);

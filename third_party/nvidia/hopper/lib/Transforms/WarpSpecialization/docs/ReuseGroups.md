@@ -912,7 +912,10 @@ and only the cross-iteration WAR needs an explicit barrier:
   relocated ahead of the early channel's producer so the shared slot's empty
   barrier (flipped by `dq`'s consumer release) gates the `dpT` overwrite, plus an
   intra-iteration wait of the late writer on the early reader (subsumed by
-  program order; kept for parity with A2).
+  program order; kept for parity with A2). The normalized validator represents
+  the latter as its own producer-side `Wait` immediately before the late
+  writer. It must not be attached to the writer's asynchronous `Ready` event,
+  which records completion rather than the blocking point.
 
 Because each channel still gets **its own per-channel barrier** and `dsT`'s
 consumer (`dk` MMA) lives in a *different task* than the representative's
@@ -925,7 +928,7 @@ chain order. It keeps every member's ordinary single-copy channel edge, then
 adds only the endpoint reuse constraints that insertion materializes:
 
 ```text
-release(first, i) -> acquire(last, i)
+release(first, i) -> reuse_wait(last, i)
 release(last, i)  -> acquire(first, i + 1)
 ```
 
@@ -936,6 +939,14 @@ full-overlap TMEM group (one starting offset), one unambiguous protocol per
 member, and one common single-CTA scheduled `scf.for`. A2 is handled by the
 two-member path above; A4/A6 spatial packing, subtiled members, and ordinary
 non-reused TMEM channels remain unsupported.
+
+FA backward also has ordinary, non-reused operand-D TMEM accumulators whose
+MMAv5 writes occur in the inner loop and whose epilogue task loads once after
+that loop. These are not reuse-group members, but the validator models their
+direct `InnerToOuterLoop` cadence as one outer transaction. Conversely, a
+same-task TMA-staging allocation has no consumer task and emits no channel
+token; it is counted as an ignored internal allocation rather than an
+unsupported protocol.
 
 ### Status / caveats
 

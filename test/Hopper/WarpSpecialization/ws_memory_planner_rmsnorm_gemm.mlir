@@ -78,19 +78,18 @@
 // only those captured schedule coordinates to reconstruct the B-early rank.
 
 // A-early/A2-B3 passes the gate. The eight output-staging channels are modeled
-// as one finite three-slot circular reuse group. TMEM channels remain
-// explicitly unsupported, so the overall coverage status is "unsupported"
-// rather than "safe"; crucially, no supported SCC is unsafe.
+// as one finite three-slot circular reuse group, and its two finite operand-D
+// TMEM lifecycles are modeled as ordinary straight-line channels.
 // CYCLE-POSITIVE-LABEL: tt.func public @d120_rmsnorm_gemm
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_edge_count = 87 : i64
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_event_count = 44 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_edge_count = 101 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_event_count = 52 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_a1_groups = 1 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_a2_groups = 0 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_a3_groups = 0 : i64
 // CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_smem_reuse_groups = 1 : i64
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_status = "unsupported"
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_supported_channels = 11 : i64
-// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_unsupported_channels = 2 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_status = "safe"
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_supported_channels = 13 : i64
+// CYCLE-POSITIVE-SAME: nvws.test.channel_cycle_unsupported_channels = 0 : i64
 
 // The B-early reconstruction is rejected for both A2/B2 and A2/B3 with the
 // same zero-credit A-relay/B witness.

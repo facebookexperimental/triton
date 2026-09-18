@@ -46,7 +46,9 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"invalid manifest JSON at {path}:{line_number}: {exc}") from exc
-        if not isinstance(record, dict) or record.get("kind") not in {"schedule", "memory-space", "memory"}:
+        if not isinstance(record, dict) or record.get("kind") not in {
+                "schedule", "memory-space", "memory", "validation"
+        }:
             raise RuntimeError(f"invalid search record at {path}:{line_number}")
         records.append(record)
     return records
@@ -70,12 +72,19 @@ def _memory_ranks(records: Sequence[dict[str, Any]], schedule_rank: int, pool_pr
 
 
 def _memory_space_ranks(records: Sequence[dict[str, Any]]) -> list[int]:
-    ranks = _contiguous_ranks(records, "memory-space")
+    memory_space_records = [record for record in records if record.get("kind") == "memory-space"]
+    searched = [record for record in memory_space_records if int(record.get("candidate_count", 0)) > 0]
+    ranks = _contiguous_ranks(searched or memory_space_records, "memory-space")
     return ranks or [0]
 
 
 def _selected(records: Sequence[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-    return [record for record in records if record.get("kind") == kind and record.get("selected") is True]
+    matching = [record for record in records if record.get("kind") == kind]
+    if kind == "memory-space":
+        searched = [record for record in matching if int(record.get("candidate_count", 0)) > 0]
+        if searched:
+            matching = searched
+    return [record for record in matching if record.get("selected") is True]
 
 
 def _run_candidate(command: Sequence[str], base_env: dict[str, str], manifest: Path, schedule_rank: int,
@@ -135,9 +144,11 @@ def _selection_error(run: RunResult) -> str | None:
 
     memory_space_records = [record for record in run.records if record.get("kind") == "memory-space"]
     if memory_space_records:
-        available = _contiguous_ranks(memory_space_records, "memory-space")
+        searched = [record for record in memory_space_records if int(record.get("candidate_count", 0)) > 0]
+        active_records = searched or memory_space_records
+        available = _contiguous_ranks(active_records, "memory-space")
         expected = min(run.memory_space_rank, available[-1])
-        selected = {int(record["rank"]) for record in memory_space_records if record.get("selected") is True}
+        selected = {int(record["rank"]) for record in active_records if record.get("selected") is True}
         if selected != {expected}:
             return f"selected memory-space ranks {sorted(selected)}; expected [{expected}]"
 
@@ -156,7 +167,8 @@ def _selection_error(run: RunResult) -> str | None:
 
 def _result_record(run: RunResult, pattern: re.Pattern[str] | None,
                    reject_pattern: re.Pattern[str] | None) -> dict[str, Any]:
-    rejection = reject_pattern.search(run.stderr) if reject_pattern is not None and run.returncode != 0 else None
+    diagnostic_output = f"{run.stderr}\n{run.stdout}"
+    rejection = reject_pattern.search(diagnostic_output) if reject_pattern is not None and run.returncode != 0 else None
     metric = _metric(run.stdout, pattern) if run.returncode == 0 else None
     if run.returncode == 0:
         status = "passed"
@@ -183,6 +195,7 @@ def _result_record(run: RunResult, pattern: re.Pattern[str] | None,
         "schedule": _selected(run.records, "schedule"),
         "memory_space": _selected(run.records, "memory-space"),
         "memory": _selected(run.records, "memory"),
+        "validation": [record for record in run.records if record.get("kind") == "validation"],
     }
 
 

@@ -183,9 +183,10 @@ enter the post-memory graph through the same `verifyReuseGroup2` and
 `orderReuseGroup2` predicates used by synchronization insertion. Admission is
 limited to single-copy, non-subtiled members with one unambiguous plan and one
 common single-CTA scheduled loop or finite straight-line scope. Each member
-retains its ordinary token edge; the physical slot adds early-release to
-late-acquire in the same transaction and late-release to early-acquire in the
-next. The production FA-backward fixtures now validate an additional A2 group
+retains its ordinary token edge. When insertion needs an explicit reuse wait,
+the late token's acquire moves before the early producer and the early
+completion separately gates the late producer. The production FA-backward
+fixtures now validate an additional A2 group
 alongside A5. Disjoint A4 packing, A6 whole-allocation overwrite, and ordinary
 non-reused TMEM protocols remain unsupported. For a late MMAv5 reader, a
 non-positive task-timeline wrap into an asynchronously seeded wait receives
@@ -194,6 +195,53 @@ A wrap into an acquire receives credit only when a positive-distance slot edge
 proves an initially empty physical slot, preserving the D120 B-early non-wrap
 rejection. `ws_code_partition_reuse_war_async_consumer.mlir` covers this A2
 startup case.
+
+**Implemented seventeenth slice:** The production FA-backward graph now covers
+every cross-task channel. Ordinary single-copy operand-D TMEM accumulators
+whose MMAv5 producer is in one directly nested loop and whose TMEM load drains
+once afterward are summarized as one outer transaction. Same-task TMA-staging
+allocations with an empty consumer-task set are recorded as ignored internal
+buffers because code partitioning emits no token or cross-task wait for them.
+The audit distinguishes those from unsupported protocols. The generic solver
+also exposes a one-sided-boundary mode: zero-distance SCCs remain unsafe,
+strictly-negative-only SCCs are discharged by the prologue boundary, and
+mixed-sign SCCs remain unsupported without an exact trip count. On the
+production fixture this raises modeled cross-task coverage from 12 to 14,
+records six internal staging buffers, and reduces unsupported channels from
+eight to zero. Its dynamic inner loop still reports a mixed-sign boundary
+rather than claiming a complete progress proof.
+
+**Implemented eighteenth slice:** Direct-grid FA backward is now fully covered
+and its known-correct schedule-1/memory-space-0/SMEM-0/TMEM-3 tuple validates
+`safe`. Ordinary finite straight-line channels are admitted in any common
+non-loop scope, including endpoints lifted through `ttng.subtiled_region`;
+the two accumulator initialization-to-drain lifecycles are therefore modeled
+instead of reported unsupported. The A2/A5 graph now mirrors the two distinct
+waits emitted by code partitioning: the late channel's ordinary EMPTY acquire
+is relocated before the early producer for the cross-iteration dependency,
+while the early channel's completion gates the late producer through a
+separate intra-iteration edge. The prior graph folded both dependencies onto
+the default late acquire, creating a false mixed-sign SCC. Top-level scheduled
+`scf.for` loops now receive the same finite prologue/drain analysis as nested
+loops. The end-to-end annotation-free test checks 17 modeled cross-task
+channels, zero unsupported channels, a `safe` result, and numerical accuracy.
+
+**Implemented nineteenth slice:** The remaining loop-cadence, one-copy
+MMAv5-to-TMEM-load result channel is now admitted as an ordinary TMEM
+protocol. This exposed a real deadlock in schedule rank 1 / memory-space rank
+0 / SMEM rank 0 / TMEM rank 0 rather than leaving that tuple unsupported. The
+A2/A5 graph now represents the early-reader completion with a dedicated
+producer-side `Wait` immediately before the late writer; attaching that edge
+to the late writer's asynchronous `Ready` event had hidden the circular wait.
+For dynamic one-sided transaction domains, the boundary solver removes
+positive `SlotReuse` edges whose initialized empty slot provides startup
+credit, then performs a bounded search for an uncredited, simple
+zero-distance cycle with at most one prologue crossing. Strictly negative
+original recurrences terminate at the prologue and are discharged. The
+formerly hanging TMEM-rank-0 tuple is now rejected before launch with a
+zero-distance witness, while the intended schedule-1 / memory-space-1 /
+SMEM-0 / TMEM-1 tuple remains numerically correct and validates `safe` with 18
+supported and zero unsupported cross-task channels.
 
 The implementation is split by responsibility rather than extending the
 already-large code-partition utility: `WSChannelProtocol` owns endpoint plans,
@@ -210,7 +258,10 @@ side effects. Separating the SMEM and TMEM rank coordinates and retaining a
 conservative low-aliasing TMEM frontier candidate exposes the annotated memory
 topology at schedule rank 1, memory-space rank 1, SMEM rank 0, and TMEM rank 1.
 A focused backward-only correctness test passes for this annotation-free
-candidate. Broader correctness and performance validation remain open.
+candidate. The direct-grid candidate's post-memory protocol graph is now fully
+modeled and proven safe, and the first formerly hanging alternate is rejected
+at compile time. The full Cartesian correctness sweep and performance
+validation remain open.
 
 **Production-shaped D120 oracle:** An annotation-free bf16 fused RMSNorm + GEMM
 with 128x128x128 tiles and eight-way output subtiling has been captured at the
@@ -929,6 +980,7 @@ Emit a manifest containing:
 - independent SMEM and TMEM ranks and signatures;
 - SMEM bytes and TMEM columns;
 - fallback/fixed-grouping reason;
+- post-memory validation status, coverage counts, and cycle witness;
 - deduplication key.
 
 Use generic schedule and memory picks; do not expose per-operand controls.
@@ -938,7 +990,10 @@ external `python/triton/tools/autows_search.py` driver discovers ranks from that
 manifest and sweeps the bounded four-dimensional product. Its child command
 must compile exactly one searched loop, return nonzero on validation failure,
 and may print a numeric value selected by `--metric-regex` for performance
-ranking.
+ranking. Expected rejection matching inspects both stdout and stderr because
+pytest reports compiler exceptions such as `OutOfResources` in stdout. Each
+result also retains the compiler's `validation` manifest record, so a
+correctness pass is distinguishable from a complete progress proof.
 For example:
 
 ```shell
@@ -1262,9 +1317,11 @@ The implementation sequence is:
    producer-ready event is in the same stage; producer-acquire edges never gain
    credit. Outer-produced channels whose consumers all live in one directly
    nested loop contribute one outer-cadence transaction, with wait at loop
-   entry and release at loop drain. Dynamic negative-total recurrences remain
-   unsupported. Unsupported components do not cause a false rejection during
-   bring-up. A staging allocation linked to operand storage through
+   entry and release at loop drain. For a dynamic one-sided scope, remove
+   initialized positive slot-credit edges and search the uncredited graph for
+   a simple zero-distance cycle with at most one prologue crossing; bounded
+   search exhaustion remains unsupported. Unsupported components do not cause
+   a false rejection during bring-up. A staging allocation linked to operand storage through
    `allocation.reuseTarget` adds one coalesced cross-tile WAR protocol whose
    topology is shared with Step 7.5 insertion.
 6. **Implemented:** support A1 multi-buffered SMEM reuse groups with one
@@ -1273,8 +1330,10 @@ The implementation sequence is:
    and direct-grid groups as finite sequences without a fabricated wraparound.
    The same representation supports A2/A3 single-copy SMEM chains and A2
    overlapping TMEM pairs while retaining their ordinary per-channel token
-   edges. A5 cross-partition TMEM groups reuse their unique dependency-chain
-   order and add only the endpoint constraints emitted by code partitioning.
+   edges. A2/A5 explicit synchronization uses the actual two insertion points:
+   the late token's relocated acquire before the early producer and the early
+   completion's separate wait at the late producer. A5 cross-partition TMEM
+   groups reuse their unique dependency-chain order.
 7. Add debug output and a manifest validation record. The error must include
    the cycle's channel IDs, task IDs, source locations, buffer IDs/copies,
    stage/cluster coordinates, and edge distances.
@@ -1526,6 +1585,8 @@ a hard correctness floor on the structural path.
 - [x] Post-memory validation models A2 and A3 single-copy SMEM reuse chains.
 - [x] Post-memory validation models FA backward's A5 `{dpT, dsT, dQ}` TMEM
       reuse chain.
+- [x] Post-memory validation models FA backward's post-loop dV/dK TMEM drains
+      and distinguishes same-task staging buffers from channel protocols.
 - [x] The full bounded D120 product runs without hangs: nine tuples pass
       correctness and the three B-early tuples are rejected before launch.
 - [ ] D120 measured winner is A3/B2 on the target shapes.

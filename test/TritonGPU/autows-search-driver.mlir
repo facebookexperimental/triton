@@ -12,7 +12,7 @@
 
 // The driver discovers two ranks in each dimension and evaluates all sixteen
 // schedule x memory-space x SMEM x TMEM candidates.
-// CHECK: "memory_space_rank": 0, "metric": 0.5, {{.*}}"schedule_rank": 0, "smem_rank": 0, "status": "passed", "tmem_rank": 0
+// CHECK: "memory_space_rank": 0, "metric": 0.5, {{.*}}"schedule_rank": 0, "smem_rank": 0, "status": "passed", "tmem_rank": 0, "validation": [{"kind": "validation", "status": "safe", "supported_channels": 3, "unsupported_channels": 0}]
 // CHECK-NEXT: "memory_space_rank": 0, "metric": 1.5, {{.*}}"schedule_rank": 0, "smem_rank": 0, "status": "passed", "tmem_rank": 1
 // CHECK-NEXT: "memory_space_rank": 0, "metric": 10.5, {{.*}}"schedule_rank": 0, "smem_rank": 1, "status": "passed", "tmem_rank": 0
 // CHECK-NEXT: "memory_space_rank": 0, "metric": 11.5, {{.*}}"schedule_rank": 0, "smem_rank": 1, "status": "passed", "tmem_rank": 1

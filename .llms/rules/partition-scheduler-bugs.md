@@ -375,9 +375,10 @@
   first/last endpoints.
 - **Fix**: Admit only full-overlap, single-copy A5 groups accepted by
   `verifyReuseGroupCrossPartition` and `orderReuseGroupChain`. Retain ordinary
-  member edges, add first-release to last-acquire at distance zero and
-  last-release to first-acquire at distance one, and classify MMAv5 producer
-  readiness as asynchronous. Exact finite-loop expansion keeps negative edges
+  member edges and mirror A2 insertion on the chain endpoints: relocate the
+  last member's ordinary acquire before the first producer, and separately
+  gate the last producer on the first member's completion. Classify MMAv5
+  producer readiness as asynchronous. Exact finite-loop expansion keeps negative edges
   so the prologue boundary removes nonexistent dependencies instead of turning
   them into a false zero-distance cycle.
 - **Lit tests**: `ws_code_partition_tmem_3group_chain.mlir` checks one admitted
@@ -394,8 +395,10 @@
   only from the SMEM collector, even though code partitioning uses the same
   `verifyReuseGroup2`/`orderReuseGroup2` protocol for overlapping TMEM pairs.
 - **Fix**: Admit single-copy, non-subtiled TMEM A2 pairs with one unambiguous
-  common cadence. Retain both ordinary token edges and add the same-transaction
-  early-to-late plus next-transaction late-to-early physical-slot edges.
+  common cadence. Retain both ordinary token edges. For an explicit reuse wait,
+  mirror insertion's two distinct endpoints: relocate the late channel's own
+  acquire before the early producer, then add the early-release dependency at
+  the late producer. Do not collapse both dependencies into one acquire.
   A non-positive task-timeline wrap into an asynchronously seeded wait receives
   one unit of prologue credit. A wrap into an acquire receives it only when a
   positive-distance slot edge proves initial empty-slot credit. Disjoint A4,
@@ -404,6 +407,76 @@
   `ws_code_partition_tmem_3group_chain.mlir` and
   `ws_memory_planner_bwd_buffer_reuse.mlir` check A2 alongside A5 on captured
   FA-backward TTGIR.
+
+### 42. FA-backward audit confused post-loop TMEM drains and same-task staging with unsupported channels (2026-09-17, fixed)
+
+- **Symptom**: The selected annotation-free FA-backward graph still reported
+  eight unsupported channels after A2/A5 reuse support landed.
+- **Root cause**: Two ordinary operand-D TMEM accumulators are produced by
+  MMAv5 inside the inner loop and drained once after it, a cadence dual to the
+  existing outer-to-inner summary. The other six entries are same-task TMA
+  staging allocations whose consumer-task set is empty; code partitioning
+  emits no token for them, but the validator counted their absent endpoints as
+  unsupported synchronization.
+- **Fix**: Add a direct `InnerToOuterLoop` cadence for one-copy MMAv5 operand-D
+  TMEM channels, summarized at inner-loop entry/drain and post-loop load.
+  Record empty-consumer same-task staging separately and add no graph edge.
+  Boundary analysis now distinguishes zero, strictly-negative-only, and mixed-
+  sign SCCs; the dynamic mixed-sign case remains fail-closed.
+- **Tests**: `ws_memory_planner_bwd_buffer_reuse.mlir` reaches 14 modeled
+  cross-task channels, six ignored same-task buffers, and zero unsupported
+  channels; its one-trip variant is fully safe. The common solver test covers
+  negative-only, zero, and mixed-sign boundary SCCs.
+
+### 43. Direct-grid FA audit conflated A2 waits and omitted finite channels (2026-09-18, fixed)
+
+- **Symptom**: The numerically correct annotation-free FA-backward tuple at
+  schedule rank 1, memory-space rank 0, SMEM rank 0, and TMEM rank 3 reported
+  two unsupported channels and a mixed-sign cycle.
+- **Root cause**: Ordinary straight-line channels were classified but omitted
+  from the validator admission predicate, so the two finite operand-D
+  initialization-to-drain channels were skipped. Separately, the normalized A2
+  graph attached both the cross-iteration late-token acquire and the
+  intra-iteration early-token wait to the late producer. Code partitioning
+  actually relocates the former before the early producer and emits the latter
+  separately at the late producer.
+- **Fix**: Admit same-scope finite straight-line protocols, treating
+  `ttng.subtiled_region` as transparent for cadence. Reconstruct A2/A5 with the
+  relocated ordinary acquire plus a separate early-release-to-late-producer
+  wait edge.
+  Apply finite prologue/drain analysis to top-level scheduled `scf.for` loops
+  as well as nested loops.
+- **Tests**: The D120 lit fixture now covers its two finite operand-D channels
+  and remains safe for A-early and unsafe for both B-early depths. The
+  annotation-free BM128 FA-backward correctness test asserts a `safe` manifest
+  with 17 supported and zero unsupported cross-task channels.
+
+### 44. FA-backward TMEM rank 0 hides its reuse wait behind asynchronous readiness (2026-09-18, fixed)
+
+- **Symptom**: The schedule-rank-1 / memory-space-rank-0 / SMEM-rank-0 /
+  TMEM-rank-0 annotation-free FA-backward candidate passed the post-memory
+  audit and then deadlocked on Blackwell. It had one ordinary one-copy
+  MMAv5-to-TMEM-load result channel that was initially reported unsupported.
+- **Root cause**: After admitting that ordinary channel, the A2/A5 normalized
+  graph still connected the early reader's completion to the late writer's
+  asynchronous `Ready` event. Code partitioning emits a blocking reuse wait
+  immediately *before* the late writer. Attaching the dependency to completion
+  omitted the producer-side stall and hid the zero-credit circular wait.
+  Separately, classifying a dynamic mixed-sign SCC as a unit conflated a real
+  simple wait cycle with walks made by concatenating independent boundary
+  recurrences.
+- **Fix**: Give every explicit A2/A5 producer wait its own scheduled `Wait`
+  event before the late writer. Dynamic one-sided boundary analysis removes
+  positive `SlotReuse` edges backed by initialized empty slots, then performs a
+  bounded simple zero-distance-cycle search with at most one prologue crossing.
+  Strictly negative original recurrences terminate at the prologue; search
+  exhaustion remains fail-closed as `Unsupported`.
+- **Tests**: Focused solver lit covers mixed recurrences, a real zero-distance
+  boundary cycle, initialized slot credit, and two-boundary-crossing walks. The
+  intended FA-backward tuple (schedule 1 / memory-space 1 / SMEM 0 / TMEM 1)
+  remains correct and validates `safe` with 18 supported and zero unsupported
+  channels. The formerly hanging TMEM-rank-0 tuple is rejected before launch
+  with a zero-distance witness.
 
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)

@@ -107,9 +107,9 @@ static void canonicalizeCycle(llvm::SmallVectorImpl<unsigned> &cycle) {
   std::rotate(cycle.begin(), first, cycle.end());
 }
 
-static ProtocolValidation
-validateSCC(const ProtocolGraph &graph,
-            llvm::ArrayRef<ProtocolEventId> component) {
+static ProtocolValidation validateSCC(const ProtocolGraph &graph,
+                                      llvm::ArrayRef<ProtocolEventId> component,
+                                      int64_t distanceMultiplier = 1) {
   llvm::SmallDenseSet<ProtocolEventId> members(component.begin(),
                                                component.end());
   llvm::SmallVector<unsigned> internalEdges;
@@ -131,9 +131,16 @@ validateSCC(const ProtocolGraph &graph,
   llvm::SmallVector<int64_t> weights;
   weights.reserve(internalEdges.size());
   for (unsigned edgeId : internalEdges) {
+    int64_t signedDistance;
+    if (llvm::MulOverflow(graph.edges[edgeId].iterationDistance,
+                          distanceMultiplier, signedDistance)) {
+      return {ProtocolStatus::Unsupported,
+              {},
+              0,
+              "iteration distance is too large for cycle analysis"};
+    }
     int64_t product;
-    if (llvm::MulOverflow(graph.edges[edgeId].iterationDistance, coefficient,
-                          product) ||
+    if (llvm::MulOverflow(signedDistance, coefficient, product) ||
         product == std::numeric_limits<int64_t>::min()) {
       return {ProtocolStatus::Unsupported,
               {},
@@ -212,6 +219,118 @@ validateSCC(const ProtocolGraph &graph,
           "channel protocol contains a non-positive-distance cycle"};
 }
 
+struct ZeroCycleSearchResult {
+  llvm::SmallVector<unsigned> cycle;
+  bool exhausted = false;
+};
+
+// Boundary analysis may contain a strictly-negative prologue recurrence and
+// an independent positive-credit recurrence in one SCC. Their signs alone do
+// not form one circular wait: concatenating two cycles repeats a protocol
+// event, while a simultaneous wait-for cycle is simple in the normalized
+// event graph. Search those simple cycles directly. A positive SlotReuse edge
+// contributes a physically initialized empty slot, so a cycle containing one
+// is marked and cannot be a zero-credit deadlock; omit such edges from this
+// search. The search is deliberately budgeted; unusually dense graphs still
+// fail closed instead of making compilation exponential.
+static ZeroCycleSearchResult
+findZeroDistanceSimpleCycle(const ProtocolGraph &graph,
+                            llvm::ArrayRef<ProtocolEventId> component) {
+  llvm::SmallDenseSet<ProtocolEventId> members(component.begin(),
+                                               component.end());
+  ProtocolGraph uncredited;
+  for (const ProtocolEvent &event : graph.events)
+    uncredited.addEvent(event.kind, event.label);
+  llvm::SmallVector<unsigned> originalEdgeIds;
+  for (auto [edgeId, edge] : llvm::enumerate(graph.edges)) {
+    if (!members.contains(edge.from) || !members.contains(edge.to) ||
+        (edge.kind == ProtocolEdgeKind::SlotReuse &&
+         edge.iterationDistance > 0))
+      continue;
+    uncredited.addEdge(edge.from, edge.to, edge.iterationDistance, edge.kind,
+                       edge.channelId);
+    originalEdgeIds.push_back(edgeId);
+  }
+
+  llvm::SmallVector<llvm::SmallVector<unsigned>> outgoing(graph.events.size());
+  for (auto [edgeId, edge] : llvm::enumerate(uncredited.edges))
+    outgoing[edge.from].push_back(edgeId);
+
+  constexpr uint64_t maxExploredEdges = 1'000'000;
+  uint64_t exploredEdges = 0;
+  ZeroCycleSearchResult result;
+  llvm::SmallDenseSet<ProtocolEventId> visited;
+  llvm::SmallVector<unsigned> path;
+
+  for (const auto &uncreditedComponent : computeSCCs(uncredited)) {
+    if (uncreditedComponent.empty() ||
+        !members.contains(uncreditedComponent.front()))
+      continue;
+    llvm::SmallDenseSet<ProtocolEventId> uncreditedMembers(
+        uncreditedComponent.begin(), uncreditedComponent.end());
+    for (ProtocolEventId start : uncreditedComponent) {
+      visited.clear();
+      visited.insert(start);
+      path.clear();
+      std::function<bool(ProtocolEventId, int64_t, unsigned)> visit =
+          [&](ProtocolEventId event, int64_t distance,
+              unsigned backwardCrossings) {
+            for (unsigned edgeId : outgoing[event]) {
+              if (++exploredEdges > maxExploredEdges) {
+                result.exhausted = true;
+                return true;
+              }
+              const ProtocolEdge &edge = uncredited.edges[edgeId];
+              if (!uncreditedMembers.contains(edge.to))
+                continue;
+              // Enumerate every simple cycle once, from its smallest event ID.
+              if (edge.to < start)
+                continue;
+              int64_t nextDistance;
+              if (llvm::AddOverflow(distance, edge.iterationDistance,
+                                    nextDistance)) {
+                result.exhausted = true;
+                return true;
+              }
+              unsigned nextBackwardCrossings =
+                  backwardCrossings + (edge.iterationDistance < 0);
+              // A minimal wait cycle in a one-sided transaction domain crosses
+              // the prologue boundary at most once. A walk with multiple
+              // backward crossings composes distinct boundary recurrences; it
+              // is not one simultaneously active circular wait.
+              if (nextBackwardCrossings > 1)
+                continue;
+              if (edge.to == start) {
+                if (nextDistance != 0)
+                  continue;
+                result.cycle = path;
+                result.cycle.push_back(edgeId);
+                canonicalizeCycle(result.cycle);
+                return true;
+              }
+              if (visited.contains(edge.to) ||
+                  path.size() + 1 >= uncreditedComponent.size())
+                continue;
+              visited.insert(edge.to);
+              path.push_back(edgeId);
+              if (visit(edge.to, nextDistance, nextBackwardCrossings))
+                return true;
+              path.pop_back();
+              visited.erase(edge.to);
+            }
+            return false;
+          };
+      if (!visit(start, 0, 0))
+        continue;
+      for (unsigned &edgeId : result.cycle)
+        edgeId = originalEdgeIds[edgeId];
+      canonicalizeCycle(result.cycle);
+      return result;
+    }
+  }
+  return result;
+}
+
 } // namespace
 
 StringRef stringifyProtocolStatus(ProtocolStatus status) {
@@ -255,6 +374,50 @@ ProtocolValidation validateProtocolCycles(const ProtocolGraph &graph) {
   return {};
 }
 
+ProtocolValidation validateBoundaryProtocolCycles(const ProtocolGraph &graph) {
+  for (auto [eventId, event] : llvm::enumerate(graph.events)) {
+    if (event.id != eventId)
+      return {ProtocolStatus::Unsupported,
+              {},
+              0,
+              "protocol event IDs must be contiguous"};
+  }
+  for (const ProtocolEdge &edge : graph.edges) {
+    if (edge.from >= graph.events.size() || edge.to >= graph.events.size())
+      return {ProtocolStatus::Unsupported,
+              {},
+              0,
+              "protocol edge references an unknown event"};
+  }
+
+  std::optional<ProtocolValidation> unsupported;
+  for (const auto &component : computeSCCs(graph)) {
+    ProtocolValidation nonPositive = validateSCC(graph, component);
+    if (nonPositive.status == ProtocolStatus::Unsupported) {
+      if (!unsupported)
+        unsupported = std::move(nonPositive);
+      continue;
+    }
+    if (nonPositive.status == ProtocolStatus::Safe)
+      continue;
+
+    ZeroCycleSearchResult zeroCycle =
+        findZeroDistanceSimpleCycle(graph, component);
+    if (!zeroCycle.cycle.empty())
+      return {ProtocolStatus::Unsafe, std::move(zeroCycle.cycle), 0,
+              "channel protocol contains a zero-distance boundary cycle"};
+    if (zeroCycle.exhausted && !unsupported)
+      unsupported = ProtocolValidation{
+          ProtocolStatus::Unsupported,
+          {},
+          0,
+          "mixed-sign boundary cycle search exceeded its exploration budget"};
+  }
+  if (unsupported)
+    return std::move(*unsupported);
+  return {};
+}
+
 // This pass is intentionally only a direct lit harness for the common solver.
 // Production graph builders do not consume these attributes. The edge array is
 // a flat sequence of (from, to, iteration-distance, channel-id) records.
@@ -274,8 +437,11 @@ public:
         module->getAttrOfType<IntegerAttr>("nvws.test.protocol_event_count");
     auto edgeValues =
         module->getAttrOfType<DenseI64ArrayAttr>("nvws.test.protocol_edges");
+    auto edgeKinds = module->getAttrOfType<DenseI64ArrayAttr>(
+        "nvws.test.protocol_edge_kinds");
     if (!eventCount || eventCount.getInt() < 0 || !edgeValues ||
-        edgeValues.size() % 4 != 0) {
+        edgeValues.size() % 4 != 0 ||
+        (edgeKinds && edgeKinds.size() != edgeValues.size() / 4)) {
       module->setAttr("nvws.test.protocol_status",
                       StringAttr::get(module.getContext(), "unsupported"));
       module->setAttr("nvws.test.protocol_reason",
@@ -289,7 +455,11 @@ public:
       graph.addEvent(ProtocolEventKind::Acquire);
     ArrayRef<int64_t> values = edgeValues.asArrayRef();
     for (size_t i = 0; i < values.size(); i += 4) {
-      if (values[i] < 0 || values[i + 1] < 0 || values[i + 3] < 0) {
+      size_t edgeIndex = i / 4;
+      int64_t kind = edgeKinds ? edgeKinds.asArrayRef()[edgeIndex]
+                               : int64_t(ProtocolEdgeKind::TaskOrder);
+      if (values[i] < 0 || values[i + 1] < 0 || values[i + 3] < 0 || kind < 0 ||
+          kind > int64_t(ProtocolEdgeKind::TaskWrap)) {
         module->setAttr("nvws.test.protocol_status",
                         StringAttr::get(module.getContext(), "unsupported"));
         module->setAttr("nvws.test.protocol_reason",
@@ -298,10 +468,13 @@ public:
         return;
       }
       graph.addEdge(values[i], values[i + 1], values[i + 2],
-                    ProtocolEdgeKind::TaskOrder, values[i + 3]);
+                    static_cast<ProtocolEdgeKind>(kind), values[i + 3]);
     }
 
-    ProtocolValidation result = validateProtocolCycles(graph);
+    ProtocolValidation result =
+        module->hasAttr("nvws.test.protocol_boundary_aware")
+            ? validateBoundaryProtocolCycles(graph)
+            : validateProtocolCycles(graph);
     module->setAttr("nvws.test.protocol_status",
                     StringAttr::get(module.getContext(),
                                     stringifyProtocolStatus(result.status)));

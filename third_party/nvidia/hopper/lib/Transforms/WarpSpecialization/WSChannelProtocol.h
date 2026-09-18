@@ -21,12 +21,17 @@ class PostDominanceInfo;
 /// Transaction cadence understood by the planned channel-protocol builder.
 /// OuterToInnerLoop summarizes a producer in an outer scf.for and all of its
 /// consumers in one directly nested scf.for; cadenceScope is the outer loop and
-/// innerCadenceScope is the nested loop. Other values remain explicit so an
-/// unsupported shape is never mistaken for a simple loop.
+/// innerCadenceScope is the nested loop. InnerToOuterLoop is the dual shape:
+/// an accumulator is produced in one directly nested loop and drained once in
+/// the containing loop body. Other values remain explicit so an unsupported
+/// shape is never mistaken for a simple loop.
 enum class ChannelProtocolCadence {
   StraightLine,
   Loop,
+  OutsideToInnerLoop,
+  InnerToOutsideLoop,
   OuterToInnerLoop,
+  InnerToOuterLoop,
   WhileLoop,
   Subtiled,
   Unsupported,
@@ -86,16 +91,17 @@ struct StagingReuseProtocolPlan {
   unsigned matchedPairCount = 0;
   bool complete = true;
   bool consistent = true;
+  bool finiteSingleTile = false;
   std::string unsupportedReason;
 
   bool hasReuseTargets() const { return reuseTargetCount != 0; }
   bool hasMatchedPairs() const { return matchedPairCount != 0; }
   bool isSupported() const {
     return hasReuseTargets() && complete && consistent && hasMatchedPairs() &&
-           outerLoop && acquireAnchor && releaseAnchor;
+           (finiteSingleTile || (outerLoop && acquireAnchor && releaseAnchor));
   }
   bool needsCrossTaskWar() const {
-    return isSupported() && loadTask != drainedStoreTask;
+    return isSupported() && !finiteSingleTile && loadTask != drainedStoreTask;
   }
 };
 

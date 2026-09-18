@@ -121,37 +121,37 @@
 
 // SMEM rank one leaves m single-buffered. Its apparent mixed -1/+1 recurrence
 // is seeded by the nested-loop prologue: the asynchronous stage-0 m load and
-// stage-0 consumer complete before the stage-1 dS event. Other specialized
-// channels remain outside this validator slice, so aggregate coverage is
-// still unsupported rather than safe. The V/dO staging aliases contribute
-// one coalesced cross-tile WAR protocol.
+// stage-0 consumer complete before the stage-1 dS event. Every cross-task
+// channel is modeled; the six same-task TMA-staging buffers emit no channel
+// protocol and are counted separately. The dynamic boundary distinguishes the
+// independent prologue recurrences from a simple zero-credit circular wait.
+// The V/dO staging aliases contribute one coalesced cross-tile WAR protocol.
 // NESTED-DYNAMIC-LABEL: tt.func public @_attn_bwd_persist
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_edge_count = 115 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_event_count = 50 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_reason = "dynamic nested loop has a negative-distance recurrence"
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_edge_count = 152 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_event_count = 59 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_ignored_intra_task_channels = 6 : i64
 // NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_status = "unsupported"
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_supported_channels = 12 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_status = "safe"
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_supported_channels = 14 : i64
 // NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_tmem_a2_groups = 1 : i64
 // NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_tmem_a5_groups = 1 : i64
-// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_unsupported_channels = 8 : i64
+// NESTED-DYNAMIC-SAME: nvws.test.channel_cycle_unsupported_channels = 0 : i64
 
 // Moving the m producer out of the wait's stage removes that async prologue
 // credit. The same schedule and memory plan is nevertheless acyclic when the
 // inner loop has exactly one transaction: the -1 edge falls into the prologue
 // boundary and the positive edge falls into the drain boundary. Other
-// specialized channels remain outside this validator slice, so aggregate
-// coverage is still unsupported.
+// specialized cross-task channels are modeled, so aggregate coverage is safe.
 // NESTED-ONE-LABEL: tt.func public @_attn_bwd_persist
-// NESTED-ONE-SAME: nvws.test.channel_cycle_edge_count = 115 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_event_count = 50 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_reason = "only scf.for loop-cadence channels are supported"
+// NESTED-ONE-SAME: nvws.test.channel_cycle_edge_count = 152 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_event_count = 59 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_ignored_intra_task_channels = 6 : i64
 // NESTED-ONE-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_status = "unsupported"
-// NESTED-ONE-SAME: nvws.test.channel_cycle_supported_channels = 12 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_status = "safe"
+// NESTED-ONE-SAME: nvws.test.channel_cycle_supported_channels = 14 : i64
 // NESTED-ONE-SAME: nvws.test.channel_cycle_tmem_a2_groups = 1 : i64
 // NESTED-ONE-SAME: nvws.test.channel_cycle_tmem_a5_groups = 1 : i64
-// NESTED-ONE-SAME: nvws.test.channel_cycle_unsupported_channels = 8 : i64
+// NESTED-ONE-SAME: nvws.test.channel_cycle_unsupported_channels = 0 : i64
 
 // With 128 inner transactions, the same unseeded recurrence fits inside the
 // finite invocation and must still be rejected.

@@ -2605,7 +2605,7 @@ def test_bwd_bm128_memtype_only():
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
-def test_bwd_bm128_annotation_free_search(monkeypatch):
+def test_bwd_bm128_annotation_free_search(monkeypatch, tmp_path):
     # Compile only the backward kernel so the process-wide search ranks select
     # this loop rather than an unrelated forward loop. The selected structural
     # schedule, logical memory space, SMEM plan, and TMEM plan reproduce the
@@ -2624,7 +2624,11 @@ def test_bwd_bm128_annotation_free_search(monkeypatch):
         "TRITON_WS_TMEM_PLAN_PICK": "1",
     }
     for name, value in search_env.items():
-        monkeypatch.setenv(name, value)
+        if name not in os.environ:
+            monkeypatch.setenv(name, value)
+
+    if "TRITON_WS_SEARCH_MANIFEST" not in os.environ:
+        monkeypatch.setenv("TRITON_WS_SEARCH_MANIFEST", str(tmp_path / "search.jsonl"))
 
     torch.manual_seed(20)
     z, h, n_ctx, head_dim = 1, 1, 256, 128
@@ -2675,6 +2679,24 @@ def test_bwd_bm128_annotation_free_search(monkeypatch):
     finally:
         _attn_bwd.configs = saved_configs
         _attn_bwd.cache = saved_cache
+
+    with open(os.environ["TRITON_WS_SEARCH_MANIFEST"]) as manifest:
+        records = [json.loads(line) for line in manifest]
+    selected = {(record["kind"], record.get("pool")): record["rank"] for record in records if record.get("selected")}
+    assert selected[("schedule", None)] == int(os.environ["TRITON_MODULO_PICK"])
+    for kind, pool, env_name in (
+        ("memory-space", None, "TRITON_WS_MEMORY_SPACE_PICK"),
+        ("memory", "smem-fixed", "TRITON_WS_SMEM_PLAN_PICK"),
+        ("memory", "tmem", "TRITON_WS_TMEM_PLAN_PICK"),
+    ):
+        available = [record["rank"] for record in records if record["kind"] == kind and record.get("pool") == pool]
+        assert selected[(kind, pool)] == min(int(os.environ[env_name]), max(available))
+
+    validation = [record for record in records if record["kind"] == "validation"]
+    assert len(validation) == 1
+    assert validation[0]["status"] == "safe"
+    assert validation[0]["supported_channels"] >= 17
+    assert validation[0]["unsupported_channels"] == 0
 
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result.float(), reference, atol=1e-2, rtol=0)

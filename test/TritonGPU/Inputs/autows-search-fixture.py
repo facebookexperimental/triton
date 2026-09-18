@@ -1,6 +1,5 @@
 import json
 import os
-import sys
 from pathlib import Path
 
 schedule_topk = int(os.environ["TRITON_MODULO_TOPK"])
@@ -25,6 +24,19 @@ with manifest.open("a") as output:
             }),
             file=output,
         )
+    # A second loop with no promotable ambiguity may emit a selected fallback
+    # rank zero. The driver must ignore that no-op record when this loop emits a
+    # real memory-space frontier.
+    print(
+        json.dumps({
+            "kind": "memory-space",
+            "rank": 0,
+            "selected": True,
+            "candidate_count": 0,
+            "lhs_tmem": [],
+        }),
+        file=output,
+    )
     for rank in range(memory_space_topk):
         print(
             json.dumps({
@@ -49,9 +61,18 @@ with manifest.open("a") as output:
                 }),
                 file=output,
             )
+    print(
+        json.dumps({
+            "kind": "validation",
+            "status": "safe",
+            "supported_channels": 3,
+            "unsupported_channels": 0,
+        }),
+        file=output,
+    )
 
 print(f"latency_ms={1000 * schedule_pick + 100 * memory_space_pick + 10 * smem_pick + tmem_pick + 0.5}")
 
 if schedule_pick == int(os.environ.get("AUTOWS_SEARCH_FIXTURE_REJECT_SCHEDULE", "-1")):
-    print("candidate rejected by validator", file=sys.stderr)
+    print("candidate rejected by validator")
     raise SystemExit(3)

@@ -29,20 +29,22 @@
 // to a no-op -> cross-tile SMEM race (non-deterministic wrong dv/dk gradients on
 // the persistent path). E2E regression: test_bwd_tmem_dsT_reuse_3group_persistent.
 
-// Four ordinary SMEM channels and the three A5 TMEM members in the nested
-// scheduled loop are validated. The outer-produced K, V, and dO channels are
-// summarized from inner-loop entry to drain, and the two staging aliases share
-// one cross-tile WAR protocol. The remaining specialized protocols keep the
-// overall result unsupported.
+// Four ordinary SMEM channels, the three A5 TMEM members, and the two
+// inner-produced/post-loop-drained TMEM accumulators are validated. The
+// outer-produced K, V, and dO channels are summarized from inner-loop entry to
+// drain, and the two staging aliases share one cross-tile WAR protocol. Eight
+// same-task TMA-staging buffers emit no channel synchronization and are counted
+// separately. Boundary analysis proves the distinct prologue recurrences safe.
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
-// CHECK-SAME: nvws.test.channel_cycle_edge_count = 115 : i64
-// CHECK-SAME: nvws.test.channel_cycle_event_count = 50 : i64
+// CHECK-SAME: nvws.test.channel_cycle_edge_count = 152 : i64
+// CHECK-SAME: nvws.test.channel_cycle_event_count = 59 : i64
+// CHECK-SAME: nvws.test.channel_cycle_ignored_intra_task_channels = 8 : i64
 // CHECK-SAME: nvws.test.channel_cycle_staging_reuse_protocols = 1 : i64
-// CHECK-SAME: nvws.test.channel_cycle_status = "unsupported"
-// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 12 : i64
+// CHECK-SAME: nvws.test.channel_cycle_status = "safe"
+// CHECK-SAME: nvws.test.channel_cycle_supported_channels = 14 : i64
 // CHECK-SAME: nvws.test.channel_cycle_tmem_a2_groups = 1 : i64
 // CHECK-SAME: nvws.test.channel_cycle_tmem_a5_groups = 1 : i64
-// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 10 : i64
+// CHECK-SAME: nvws.test.channel_cycle_unsupported_channels = 0 : i64
 // Load task (2) acquires the dedicated single-buffered reuse token at the top of
 // the persistent outer loop (loop-carried phase), targeting the staging task.
 // CHECK: nvws.producer_acquire %[[WAR_TOK:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 3 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32, i1

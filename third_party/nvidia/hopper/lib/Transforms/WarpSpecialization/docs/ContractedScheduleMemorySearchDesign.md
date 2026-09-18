@@ -316,6 +316,13 @@ facts from IR. `TRITON_WS_SEARCH_MANIFEST` records:
 - fallback or fixed-group reason;
 - validation and process status.
 
+The validator appends its own `kind=validation` record after building the
+post-memory graph, including modeled, ignored-internal, and unsupported channel
+counts plus any cycle witness. The external result preserves that record even
+when compilation is rejected. Expected-rejection matching examines both child
+stdout and stderr so pytest-formatted compiler failures are classified rather
+than reported as unexplained search failures.
+
 `python/triton/tools/autows_search.py` discovers the frontiers, verifies that
 requested ranks were applied, and records results. An expected validator
 diagnostic can be classified as `rejected`, separately from a compilation or
@@ -393,6 +400,9 @@ The graph contains:
 - `Release(i) -> Acquire(i + copies)` for physical slot reuse;
 - for an A1 SMEM group, cross-channel slot edges from the transaction that
   last owned the same physical slot, replacing each member's self edge;
+- for an explicit A2/A5 reuse protocol, the late channel's ordinary acquire at
+  the early producer and a separate early-release dependency at the late
+  producer, matching the two waits inserted by code partitioning;
 - schedule-aware program-order edges between consecutive events in each task;
 - explicit control-flow and transaction-stride edges.
 
@@ -568,7 +578,27 @@ Implemented:
   FA-backward `{dpT, dS, dQ}` fixture checks this coverage. Exact finite-loop
   expansion preserves negative task edges and lets the prologue boundary omit
   nonexistent predecessors instead of collapsing them into false zero-distance
-  cycles.
+  cycles. The same boundary semantics apply to top-level scheduled `scf.for`
+  loops, not only loops nested in another control-flow operation. Ordinary
+  single-copy operand-D TMEM accumulators produced in one
+  directly nested loop and drained once afterward are summarized at the outer
+  cadence. Same-task TMA-staging allocations with no consumer task emit no
+  synchronization and are reported separately from unsupported channels.
+  Ordinary loop-cadence, single-copy MMAv5-to-TMEM-load results are admitted
+  directly. For a dynamic one-sided boundary, positive `SlotReuse` edges carry
+  initialized-slot credit and are excluded from the uncredited wait graph.
+  The solver then performs a bounded search for a simple zero-distance cycle
+  with at most one prologue crossing. This distinguishes a real simultaneous
+  circular wait from a walk that concatenates independent positive and
+  negative boundary recurrences; exhaustion remains `Unsupported`.
+  Finite straight-line channel plans are accepted in any common non-loop scope,
+  including endpoints lifted through a transparent `ttng.subtiled_region`.
+  For A2/A5 reuse, the graph mirrors insertion's two distinct synchronization
+  points: the late token's acquire is relocated before the early producer, and
+  the early completion reaches a dedicated blocking `Wait` immediately before
+  the late producer. Keeping this separate from the late producer's
+  asynchronous `Ready` completion both avoids false SCCs and exposes real
+  producer-side circular waits.
 
 Next:
 
@@ -591,9 +621,11 @@ Current limitations:
   used for durable comparisons.
 - The post-memory builder rejects proven zero-distance cycles and covers A1
   multi-buffered plus A2/A3 single-copy SMEM reuse and A2/A5 temporal TMEM
-  reuse. Dynamic negative-total cycles, ordinary/A4/A6 TMEM protocols,
-  multi-CTA, other specialized protocols, and post-insertion coverage remain
-  open.
+  reuse, ordinary one-copy MMAv5 results, and the FA-backward finite and nested
+  operand-D cadences. Unclassified/A4/A6 and subtiled TMEM protocols,
+  multi-CTA, ordinary `scf.while`, other specialized protocols, and
+  post-insertion coverage remain open. The bounded dynamic-boundary search can
+  still return `Unsupported` when its exploration budget is exhausted.
 
 ## 12. Controls and diagnostics
 
