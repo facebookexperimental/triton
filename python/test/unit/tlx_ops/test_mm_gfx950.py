@@ -7,6 +7,7 @@ import torch
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops import InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import GFX950_FOCUS, operand
+from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -21,7 +22,10 @@ def _assert_strides(tensor, wanted):
 
 @pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", GFX950_FOCUS)
 def test_mm(m, n, k, a_strides, b_strides, dtype_name):
-    dtype = {"fp16": torch.float16}[dtype_name]
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[dtype_name]
     from triton.tlx.ops import mm as tlx_mm
 
     a = operand(m, k, a_strides, dtype)
@@ -41,11 +45,12 @@ def test_mm(m, n, k, a_strides, b_strides, dtype_name):
                                             f"over the {MAX_SECONDS_PER_CASE}s budget")
 
     expected = torch.matmul(a, b)
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(
         out,
         expected,
-        atol=1e-3 * expected.abs().max().item(),
-        rtol=1e-3,
+        atol=tolerance * expected.abs().max().item(),
+        rtol=tolerance,
     )
 
 
@@ -123,15 +128,183 @@ def test_mm_rejects_unsupported_operands():
 
     a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
     b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
-    unsupported_a = torch.randn((17, 2048), device="cuda", dtype=torch.float16)
+    unsupported_a = torch.randn((17, 64), device="cuda", dtype=torch.float16)
+    unsupported_b = torch.randn((8192, 64), device="cuda", dtype=torch.float16).T
     assert supports(a, b)
-    assert not supports(unsupported_a, b)
+    assert not supports(unsupported_a, unsupported_b)
     assert not supports(a.to(torch.float32), b.to(torch.float32))
     assert not supports(a, b.contiguous())
     with pytest.raises(InvalidInput, match="does not support"):
-        mm(unsupported_a, b)
+        mm(unsupported_a, unsupported_b)
     with pytest.raises(InvalidInput, match="does not support"):
-        matmul(unsupported_a, b)
+        matmul(unsupported_a, unsupported_b)
+
+
+def test_mm_lds_respects_output_strides():
+    from triton.tlx.ops.kernels.mm.gfx950 import matmul
+
+    m, n, k = 2048, 512, 2048
+    assert _gfx950._dispatch_plan(m, n, k, torch.float16, 2) == (
+        "lds",
+        (128, 128, 2),
+    )
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).T
+    out = torch.empty((n, m), device="cuda", dtype=torch.float16).T
+
+    actual = matmul(a, b, out=out)
+    expected = torch.matmul(a, b)
+
+    assert actual is out
+    assert out.stride() == (1, m)
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=1e-3 * expected.abs().max().item(),
+        rtol=1e-3,
+    )
+
+
+def test_mm_offset_width_selection():
+    i32_max_element = (1 << 30) - 1
+    within_i32 = torch.empty(
+        (i32_max_element + 1,), device="meta", dtype=torch.float16
+    )
+    beyond_i32 = torch.empty(
+        (i32_max_element + 2,), device="meta", dtype=torch.float16
+    )
+
+    assert not _gfx950._needs_i64_offsets(within_i32)
+    assert _gfx950._needs_i64_offsets(beyond_i32)
+
+
+def test_mm_output_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["USE_I64_C_OFFSETS"]))
+
+            return launch
+
+    monkeypatch.setattr(_gfx950, "a16w16_8wave", FakeKernel())
+    for m, n in [(256, 256), (925210, 4096)]:
+        a = torch.empty((m, 128), device="meta", dtype=torch.float16)
+        b = torch.empty((128, n), device="meta", dtype=torch.float16)
+        _gfx950._launch_lds(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert [use_i64_c_offsets for _, use_i64_c_offsets in launches] == [
+        False,
+        True,
+    ]
+
+
+def test_mm_input_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(
+                    (
+                        kwargs["USE_I64_A_OFFSETS"],
+                        kwargs["USE_I64_B_OFFSETS"],
+                        kwargs["HAS_M_TAIL"],
+                        kwargs["HAS_N_TAIL"],
+                    )
+                )
+
+            return launch
+
+    monkeypatch.setattr(_gfx950, "a16w16_8wave", FakeKernel())
+    cases = [
+        ((256, 256, 4096), (False, False, False, False)),
+        ((257, 256, 4096), (False, False, True, False)),
+        ((256, 257, 4096), (False, False, False, True)),
+        ((262400, 256, 4096), (True, False, False, False)),
+        ((256, 262400, 4096), (False, True, False, False)),
+    ]
+    for (m, n, k), _ in cases:
+        a = torch.empty((m, k), device="meta", dtype=torch.float16)
+        b = torch.empty((k, n), device="meta", dtype=torch.float16)
+        _gfx950._launch_lds(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert launches == [expected for _, expected in cases]
+
+
+def test_mm_irregular_shape_policy():
+    assert _gfx950._lds_plan_for_shape(677, 4096, 8192) == (256, 256, 4)
+    assert _gfx950._strong_lds_plan(677, 4096, 8192) == (192, 256, 4)
+
+    square_focus = _gfx950._register_plan_for_shape(2041, 2041, 2048)
+    assert (
+        square_focus["BLOCK_M"],
+        square_focus["BLOCK_N"],
+        square_focus["BLOCK_K"],
+        square_focus["GROUP_M"],
+        square_focus["NUM_XCDS"],
+        square_focus["num_warps"],
+    ) == (128, 128, 128, 16, 8, 8)
+
+    thin_focus = _gfx950._register_plan_for_shape(2048, 256, 1024)
+    assert (
+        thin_focus["BLOCK_M"],
+        thin_focus["BLOCK_N"],
+        thin_focus["BLOCK_K"],
+        thin_focus["GROUP_M"],
+        thin_focus["NUM_XCDS"],
+        thin_focus["num_warps"],
+    ) == (128, 128, 64, 16, 1, 4)
+
+    deep_k = _gfx950._intermediate_register_config(677, 2048, 4096)
+    assert (
+        deep_k["BLOCK_M"],
+        deep_k["BLOCK_N"],
+        deep_k["BLOCK_K"],
+        deep_k["matrix_instr_nonkdim"],
+        deep_k["num_warps"],
+        deep_k["num_stages"],
+    ) == (128, 64, 128, 32, 8, 3)
+
+    high_padding = _gfx950._intermediate_register_config(279, 2048, 4096)
+    assert (
+        high_padding["BLOCK_M"],
+        high_padding["BLOCK_N"],
+        high_padding["matrix_instr_nonkdim"],
+    ) == (64, 32, 16)
+
+
+def test_mm_rejects_large_workspace():
+    m, n, k = 262145, 2048, 256
+    a = torch.empty((m, k), device="meta", dtype=torch.float16)
+    b = torch.empty((k, n), device="meta", dtype=torch.float16)
+
+    with pytest.raises(
+        ValueError,
+        match="FP32 workspace exceeds signed-i32 byte offsets",
+    ):
+        _gfx950._launch_lds(
+            a,
+            b,
+            SPLIT_K=2,
+            TILE=(256, 256),
+        )
+
+
+def test_mm_validated_register_launch_still_checks_bias():
+    a = torch.empty((279, 4096), device="meta", dtype=torch.float16)
+    b = torch.empty((4096, 256), device="meta", dtype=torch.float16)
+    bias = torch.empty((278, 256), device="meta", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="Bias must expand"):
+        _gfx950._launch_register_plan(
+            a,
+            b,
+            config=_gfx950._register_plan_for_shape(279, 256, 4096),
+            bias=bias,
+            _validated=True,
+        )
 
 
 @pytest.mark.parametrize("failure", ["type", "shape", "dtype", "device"])
