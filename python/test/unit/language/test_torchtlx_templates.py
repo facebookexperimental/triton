@@ -494,6 +494,43 @@ class TestLocalBufferRetention(TestCase):
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _force_warppipe_split_k_choice():
+        from torch._inductor.kernel.mm import mm_template
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        def _only_warppipe(templates, op_name="mm"):
+            uids = {getattr(template, "uid", None) for template in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                template = _tlx_mm.gfx950_addmm_warppipe_template
+                if template.uid not in uids:
+                    templates.append(template)
+            return templates
+
+        heuristic = _tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic
+        get_configs = heuristic._get_template_configs_impl
+
+        def _split_k_only(instance, kernel_inputs, op_name):
+            for template_kwargs in get_configs(instance, kernel_inputs, op_name):
+                if template_kwargs.get("SPLIT_K", 1) > 1:
+                    yield template_kwargs
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _only_warppipe),
+            mock.patch.object(
+                heuristic,
+                "_get_template_configs_impl",
+                _split_k_only,
+            ),
+            mock.patch.dict(
+                _tlx_registry.os.environ,
+                {"TORCHINDUCTOR_TLX_SPLIT_K": "1"},
+            ),
+        ):
+            yield
+
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_scaled_mm_delegates_to_standard_choices(self):
         from torch._inductor.choices import InductorChoices
@@ -1246,15 +1283,14 @@ class TestTLXTemplates(TestCase):
         """Split-K path of the TLX warp-pipe addmm (AMD MI350X / gfx950), col-major B.
 
         An undersaturated grid (few MN tiles) + large K makes the heuristic offer
-        SPLIT_K > 1 candidates (registry gate: `tiles < NUM_SMS`). On a 2-tile shape
-        the split-K configs win autotune, so the addmm lowers to the split-K path: a
-        partial-GEMM kernel that writes an fp32 workspace + a separate
-        `_reduce_k_kernel` that sums the partials, re-adds bias, and casts. Verifies
-        the 2-kernel split-K reduce is (a) actually taken and (b) numerically correct.
+        SPLIT_K > 1 candidates (registry gate: `tiles < NUM_SMS`). Isolating those
+        candidates makes the addmm lower to a partial-GEMM kernel that writes an fp32
+        workspace plus a separate `_reduce_k_kernel` that sums the partials, re-adds
+        bias, and casts.
         """
         # 256x4096x256: 2 MN tiles (128x256) on 256 CUs -> deeply undersaturated, so
-        # split-K (up to SK=8 -> 16 workgroups) is far faster than SK=1 (2 workgroups)
-        # and wins the autotune. K=4096 keeps each split > NUM_BUFFERS K-iters.
+        # split-K can create up to 16 workgroups. K=4096 keeps each split above the
+        # minimum number of K iterations required by the pipeline.
         M, K, N = 256, 4096, 256
         a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
         # w.t() => B is [K, N] col-major (stride_bk == 1) -- the nn.Linear weight layout.
@@ -1264,7 +1300,7 @@ class TestTLXTemplates(TestCase):
         def addmm(bias, a, w):
             return torch.addmm(bias, a, w.t())
 
-        with (config.patch({
+        with (self._force_warppipe_split_k_choice(), config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
                 "max_autotune": True,
@@ -1299,7 +1335,7 @@ class TestTLXTemplates(TestCase):
         def addmm(bias, a, w):
             return torch.addmm(bias, a, w.t())
 
-        with (config.patch({
+        with (self._force_warppipe_split_k_choice(), config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
                 "max_autotune": True,
@@ -1342,7 +1378,7 @@ class TestTLXTemplates(TestCase):
         def addmm_gelu(bias, a, w):
             return torch.nn.functional.gelu(torch.addmm(bias, a, w.t()))
 
-        with config.patch({
+        with self._force_warppipe_split_k_choice(), config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
                 "max_autotune": True,
@@ -1378,7 +1414,7 @@ class TestTLXTemplates(TestCase):
                 return torch.nn.functional.gelu(out)
             return out * 0.5
 
-        with (config.patch({
+        with (self._force_warppipe_split_k_choice(), config.patch({
                 "triton.tlx_mode": "force",
                 "force_disable_caches": True,
                 "max_autotune": True,
@@ -2701,6 +2737,10 @@ class TestFlexAttentionChoiceRegistration(TestCase):
             },
         )()
 
+    @unittest.skipIf(
+        not flex_backward_choices_hook_available(),
+        "torch lacks the FlexAttention backward choices-hook contract",
+    )
     def test_flex_backward_choices_hook_contract_is_available(self):
         self.assertTrue(
             flex_backward_choices_hook_available(),

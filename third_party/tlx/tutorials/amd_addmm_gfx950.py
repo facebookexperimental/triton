@@ -10,10 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
-from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+from triton.tlx.ops.kernels.mm.gfx950 import (
     BLOCK_K,
-    _launch,
     _launch_register,
+    _launch_lds as _launch,
 )
 
 _PATH_AUTOTUNE_WARMUP = 25

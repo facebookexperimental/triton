@@ -73,8 +73,8 @@ CATALOG: tuple[OpSpec, ...] = (
         arch="gfx950",
         variant="heuristic",
         impl="triton.tlx.ops.kernels.mm.gfx950:mm",
-        # LocalSplitU remains FP16-only; the register fallback also supports
-        # BF16 and performs the narrower per-plan validation.
+        # LocalSplitU and persistent plans remain FP16-only; the register and
+        # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -206,8 +206,9 @@ def _load(impl: str) -> Callable[..., Any]:
     return getattr(importlib.import_module(mod), attr)
 
 
-def _arches_for(op: str) -> list[str]:
-    return sorted(s.arch for s in CATALOG if s.op == op)
+@functools.lru_cache(maxsize=None)
+def _arches_for(op: str) -> tuple[str, ...]:
+    return tuple(sorted(s.arch for s in CATALOG if s.op == op))
 
 
 def has_impl(op: str, arch: str) -> bool:
@@ -218,6 +219,15 @@ def has_impl(op: str, arch: str) -> bool:
     shape and reporting each one as an error.
     """
     return (op, arch) in _BY_KEY
+
+
+@functools.lru_cache(maxsize=None)
+def _impl_for_arch(op: str, arch: str) -> tuple[Callable[..., Any], OpSpec]:
+    spec = _BY_KEY.get((op, arch))
+    if spec is None:
+        available = ", ".join(_arches_for(op)) or "(nothing yet)"
+        raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
+    return _load(spec.impl), spec
 
 
 def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:
@@ -231,13 +241,14 @@ def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], O
     pinned arch against the running device would reject the very case pinning
     exists for.
     """
-    available = ", ".join(_arches_for(op)) or "(nothing yet)"
     if arch is None:
         target = _target()
         if not target.key:
+            available = ", ".join(_arches_for(op)) or "(nothing yet)"
             raise UnsupportedOp(f"tlx.ops.{op}: no GPU visible. Available on: {available}")
         spec = _BY_KEY.get((op, target.key))
         if spec is None:
+            available = ", ".join(_arches_for(op)) or "(nothing yet)"
             raise UnsupportedOp(f"tlx.ops.{op} has no implementation for {target.key}. "
                                 f"Available on: {available}")
         missing = spec.requires - _capabilities(target)
@@ -245,10 +256,7 @@ def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], O
             raise UnsupportedOp(f"{spec} needs {sorted(missing)}, which {target.key} does not report")
         return _load(spec.impl), spec
 
-    spec = _BY_KEY.get((op, arch))
-    if spec is None:
-        raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
-    return _load(spec.impl), spec
+    return _impl_for_arch(op, arch)
 
 
 def check_inputs(spec: OpSpec, dtype=None, **dims) -> None:

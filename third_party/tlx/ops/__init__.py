@@ -65,12 +65,15 @@ def mm(a, b, *, out=None, arch=None, space="heuristic"):
         raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
                            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
     fn, spec = impl_for("mm", arch)
-    # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
-    # descriptor transposed, so that is the stride TMA must find aligned.
-    a_src = a if a.is_contiguous() else a.T
-    b_src = b if b.is_contiguous() else b.T
-    check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
-                 row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
+    if spec.accepts is None:
+        check_inputs(spec, dtype=a.dtype)
+    else:
+        # Mirror the kernel's operand prep: a non-contiguous operand is fed to
+        # its descriptor transposed, so that is the stride TMA must find aligned.
+        a_src = a if a.is_contiguous() else a.T
+        b_src = b if b.is_contiguous() else b.T
+        check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
+                     row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
