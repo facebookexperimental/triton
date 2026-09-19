@@ -8,6 +8,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/JSON.h"
 #include <list>
 #include <unordered_set>
@@ -886,19 +887,9 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
 // flows into another", used by both the memory planner (hasPotentialReuse) and
 // code partitioning (hasDependencyChain).  A memory hop is needed for chains
 // that pass through a shared buffer, e.g. dpT -> dsT (stored to smem) -> read
-// by the dq MMA. Climb memdesc view ops (index/subslice/reinterpret/trans) to
-// the underlying buffer value, so different slots/views of one multi-buffered
-// alloc share a root.
-static Value getRootBuffer(Value v) {
-  while (auto *def = v.getDefiningOp()) {
-    if (isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
-            ttg::MemDescReinterpretOp, ttg::MemDescTransOp>(def))
-      v = def->getOperand(0);
-    else
-      break;
-  }
-  return v;
-}
+// by the dq MMA. Climb allocation-preserving memdesc view ops via
+// MemDescViewTrait to the underlying buffer value, so different slots/views of
+// one multi-buffered alloc share a root.
 
 bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
                           bool followBufferReuse) {
@@ -929,7 +920,8 @@ bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
     if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp>(op))
       for (auto operand : op->getOperands())
         if (isa<ttg::MemDescType>(operand.getType())) {
-          Value buf = followBufferReuse ? getRootBuffer(operand) : operand;
+          Value buf =
+              followBufferReuse ? mlir::getMemDescRoot(operand) : operand;
           for (auto *user : buf.getUsers())
             if (user != op && visited.insert(user).second)
               worklist.push_back(user);

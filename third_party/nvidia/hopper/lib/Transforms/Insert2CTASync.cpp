@@ -28,6 +28,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
 
@@ -186,40 +187,11 @@ static SlotAndPhase computeSlotAndPhase(OpBuilder &builder, Location loc,
           arith::TruncIOp::create(builder, loc, i32Ty, phase)};
 }
 
-// Walk a memdesc value back to the MemDescIndexOp that selects its buffer,
-// looking through the view ops that preserve the underlying allocation.
-// MemDescViewTrait is the canonical set for "view that does not change the
-// underlying allocation", so this cannot drift as view ops are added. The walk
-// has to cover them: a transposed B operand reaches the MMA through a
-// memdesc_trans, and stopping there would report it as unbuffered and shrink
-// the barrier back to one slot, which is the deadlock this pass exists to
-// prevent.
-static ttg::MemDescIndexOp findBufferIndex(Value v) {
-  while (v) {
-    Operation *def = v.getDefiningOp();
-    if (!def)
-      return {};
-    // Checked before the trait: memdesc_index carries MemDescViewTrait too, and
-    // walking past it would lose the buffer array whose depth we are after.
-    if (auto idxOp = dyn_cast<ttg::MemDescIndexOp>(def))
-      return idxOp;
-    // Also carries the trait, but it crosses CTAs. The depth question is about
-    // this CTA's own operand pipeline, so stop rather than follow it.
-    if (isa<ttng::MapToRemoteBufferOp>(def))
-      return {};
-    if (def->hasTrait<OpTrait::MemDescViewTrait>()) {
-      v = def->getOperand(0);
-      continue;
-    }
-    return {};
-  }
-  return {};
-}
 
 // Buffer count of the allocation behind `v`. Returns 0 when it is not a view
 // into a buffer array -- i.e. a single, non-rotating buffer.
 static unsigned getAllocDepth(Value v) {
-  auto idxOp = findBufferIndex(v);
+  auto idxOp = mlir::getMemDescBufferIndex(v);
   if (!idxOp)
     return 0;
 
@@ -247,7 +219,7 @@ static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
 
   // Cross-check the planner's own annotation when it is still present; they
   // are emitted together, so a mismatch means something rewrote one of them.
-  if (auto idxOp = findBufferIndex(mma.getB())) {
+  if (auto idxOp = mlir::getMemDescBufferIndex(mma.getB())) {
     if (auto *allocOp = idxOp.getSrc().getDefiningOp()) {
       if (auto copies = allocOp->getAttrOfType<IntegerAttr>("buffer.copy")) {
         unsigned annotated = copies.getInt();
