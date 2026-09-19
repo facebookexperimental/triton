@@ -98,6 +98,19 @@ KPACK: int = 1
 # MI350X has eight XCDs; logical devices in partitioned modes expose fewer.
 GFX950_CUS_PER_XCD: int = 32
 GFX950_MAX_XCDS: int = 8
+# Bound dummy slots to one full-device XCD share (one eighth of a launch).
+GFX950_MAX_DUMMY_SEQUENCE_DENOMINATOR: int = GFX950_MAX_XCDS
+# tl.program_id() is represented as a signed i32 in this kernel's remapper.
+TRITON_MAX_PROGRAM_ID: int = 2**31 - 1
+
+
+def _gfx950_fa_schedule_launch_sequences(sequence_count: int, num_xcds: int) -> Tuple[int, bool]:
+    """Choose whole-sequence XCD mapping without excessive dummy slots."""
+    padded_count = triton.cdiv(sequence_count, num_xcds) * num_xcds
+    dummy_count = padded_count - sequence_count
+    padding_within_budget = dummy_count * GFX950_MAX_DUMMY_SEQUENCE_DENOMINATOR <= padded_count
+    use_sequence_xcd = sequence_count >= num_xcds and padding_within_budget
+    return (padded_count if use_sequence_xcd else sequence_count), use_sequence_xcd
 
 
 def _get_fw_configs() -> List[triton.Config]:
@@ -3116,14 +3129,8 @@ def _tlx_gfx950_hstu_fa_outer_block(
 
 
 @triton.jit
-def _tlx_gfx950_hstu_remap_xcd(pid, grid_size, NUM_XCDS: tl.constexpr):
-    """Keep contiguous ``(batch, K/V tile, head)`` work in one XCD.
-
-    gfx950 dispatches consecutive physical program IDs across XCDs.  Map each
-    physical-XCD residue to a balanced contiguous logical range so neighboring
-    K/V owners reuse Q/dO and relaxed dQ atomics through one L2.
-    """
-    # Avoid overflowing tl.num_programs()'s signed i32 type in ceildiv.
+def _tlx_gfx950_hstu_remap_balanced_xcd(pid, grid_size, NUM_XCDS: tl.constexpr):
+    """Balance individual programs across XCDs for undersubscribed batches."""
     pids_per_xcd = (grid_size - 1) // NUM_XCDS + 1
     tall_xcds = grid_size % NUM_XCDS
     tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
@@ -3132,6 +3139,23 @@ def _tlx_gfx950_hstu_remap_xcd(pid, grid_size, NUM_XCDS: tl.constexpr):
     if xcd < tall_xcds:
         return xcd * pids_per_xcd + local_pid
     return tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+
+@triton.jit
+def _tlx_gfx950_hstu_remap_sequence_xcd(pid, PROGRAMS_PER_SEQUENCE: tl.constexpr, NUM_XCDS: tl.constexpr):
+    """Assign complete sequences round-robin across gfx950 XCDs.
+
+    gfx950 dispatches consecutive physical program IDs across XCDs. Each
+    physical-XCD residue consumes complete logical sequence footprints, keeping
+    related Q/dO reads and relaxed dQ atomics in one L2 without concentrating a
+    contiguous run of long ragged sequences on one XCD.
+    """
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    sequence_slot = local_pid // PROGRAMS_PER_SEQUENCE
+    sequence_pid = local_pid % PROGRAMS_PER_SEQUENCE
+    off_z = sequence_slot * NUM_XCDS + xcd
+    return off_z, sequence_pid
 
 
 @triton.jit
@@ -3160,10 +3184,13 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
     stride_dvh,
     alpha,
     PADDED_L,
+    Z,
     H: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_XCDS: tl.constexpr,
+    USE_SEQUENCE_XCD: tl.constexpr,
+    HAS_SEQUENCE_PADDING: tl.constexpr,
     DIRECT_QDO_G2L: tl.constexpr,
     MASK_PEEL: tl.constexpr,
     RESIDENT_K_SCORE: tl.constexpr,
@@ -3174,11 +3201,27 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
     OUTER_M: tl.constexpr = 64
     D: tl.constexpr = 128
     num_n_blocks: tl.constexpr = tl.cdiv(MAX_SEQ_LEN, BLOCK_N)
-    tpid = _tlx_gfx950_hstu_remap_xcd(tl.program_id(0), tl.num_programs(0), NUM_XCDS)
-    off_h = tpid % H
-    off_zn = tpid // H
-    pid_n = off_zn % num_n_blocks
-    off_z = off_zn // num_n_blocks
+    programs_per_sequence: tl.constexpr = num_n_blocks * H
+    if USE_SEQUENCE_XCD:
+        off_z, sequence_pid = _tlx_gfx950_hstu_remap_sequence_xcd(
+            tl.program_id(0),
+            programs_per_sequence,
+            NUM_XCDS,
+        )
+        if HAS_SEQUENCE_PADDING:
+            # Reject host-added sequence slots before touching seq_offsets.
+            if off_z >= Z:
+                return
+        off_h = sequence_pid % H
+        pid_n = sequence_pid // H
+    else:
+        # With fewer sequences than XCDs, strict sequence ownership leaves
+        # most of the device idle. Retain balanced program-level distribution.
+        tpid = _tlx_gfx950_hstu_remap_balanced_xcd(tl.program_id(0), tl.num_programs(0), NUM_XCDS)
+        off_h = tpid % H
+        off_zn = tpid // H
+        pid_n = off_zn % num_n_blocks
+        off_z = off_zn // num_n_blocks
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     seq_end = tl.load(seq_offsets + off_z + 1)
     seq_len = (seq_end - seq_start).to(tl.int32)
@@ -5447,7 +5490,12 @@ def tlx_gfx950_ragged_attention_bwd(
         dq_acc.zero_()
         cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
         num_xcds = max(1, min(GFX950_MAX_XCDS, cu_count // GFX950_CUS_PER_XCD))
-        _tlx_gfx950_hstu_fa_schedule_bwd_kernel[(H * triton.cdiv(N, fa_schedule_block_n) * Z, )](
+        scheduled_z, use_sequence_xcd = _gfx950_fa_schedule_launch_sequences(Z, num_xcds)
+        has_sequence_padding = scheduled_z != Z
+        fa_schedule_grid = H * triton.cdiv(N, fa_schedule_block_n) * scheduled_z
+        if fa_schedule_grid > TRITON_MAX_PROGRAM_ID:
+            raise ValueError(f"FA-schedule grid exceeds signed i32 program IDs: {fa_schedule_grid}")
+        _tlx_gfx950_hstu_fa_schedule_bwd_kernel[(fa_schedule_grid, )](
             Q=q,
             K=k,
             V=v,
@@ -5471,10 +5519,13 @@ def tlx_gfx950_ragged_attention_bwd(
             stride_dvh=dv.stride(1),
             alpha=alpha,
             PADDED_L=padded_l,
+            Z=Z,
             H=H,
             MAX_SEQ_LEN=N,
             BLOCK_N=fa_schedule_block_n,
             NUM_XCDS=num_xcds,
+            USE_SEQUENCE_XCD=use_sequence_xcd,
+            HAS_SEQUENCE_PADDING=has_sequence_padding,
             DIRECT_QDO_G2L=fa_schedule_direct_qdo_g2l,
             MASK_PEEL=fa_schedule_mask_peel,
             RESIDENT_K_SCORE=fa_schedule_resident_k_score,

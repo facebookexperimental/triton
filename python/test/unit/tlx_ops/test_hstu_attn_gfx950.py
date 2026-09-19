@@ -1,6 +1,5 @@
 """tlx.ops.hstu_attn correctness -- gfx950."""
 from pathlib import Path
-
 import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
@@ -66,6 +65,57 @@ def _load_gfx950_hstu_tutorial():
     return hstu
 
 
+def _load_gfx950_hstu_benchmark():
+    """Load the benchmark helpers without requiring a GPU workload."""
+    _load_gfx950_hstu_tutorial()
+    import bench_gfx950_bwd as benchmark
+
+    return benchmark
+
+
+def test_hstu_attn_gfx950_fixture_launch_coverage(tmp_path):
+    benchmark = _load_gfx950_hstu_benchmark()
+
+    # Issue #2005 intentionally has a length one row beyond N, but every
+    # forward configuration still launches through row 1023.
+    assert benchmark._validate_fixture_launch_coverage(996, torch.tensor([898, 997])) == 1024
+    assert benchmark._validate_fixture_launch_coverage(1024, torch.tensor([1024])) == 1024
+
+    with pytest.raises(ValueError, match=r"sequence 1 has length 1153.*N=1024.*at most 1024"):
+        benchmark._validate_fixture_launch_coverage(1024, torch.tensor([1024, 1153]))
+
+    invalid_fixture = {
+        "N": 1024,
+        "alpha": 1.0 / 128,
+        "q_shape": (2177, 4, 128),
+        "seq_offsets": torch.tensor([0, 1024, 2177]),
+        "invalid_attn_mask_type": "lower_triangular",
+        "num_targets": torch.tensor([20, 20]),
+        "attn_bias": None,
+        "seq2_offsets": None,
+        "max_attn_len": 0,
+        "contextual_seq_len": 0,
+        "sort_by_length": False,
+    }
+    fixture_path = tmp_path / "invalid_hstu_fixture.pt"
+    torch.save(invalid_fixture, fixture_path)
+    with pytest.raises(ValueError, match=r"sequence 1 has length 1153.*N=1024.*at most 1024"):
+        benchmark._make_input_fixture_workload(fixture_path)
+
+
+def test_hstu_attn_gfx950_sequence_xcd_padding_budget():
+    hstu = _load_gfx950_hstu_tutorial()
+
+    assert hstu._gfx950_fa_schedule_launch_sequences(7, 8) == (7, False)
+    assert hstu._gfx950_fa_schedule_launch_sequences(9, 8) == (9, False)
+    assert hstu._gfx950_fa_schedule_launch_sequences(13, 8) == (13, False)
+    assert hstu._gfx950_fa_schedule_launch_sequences(14, 8) == (16, True)
+    assert hstu._gfx950_fa_schedule_launch_sequences(512, 8) == (512, True)
+    assert hstu._gfx950_fa_schedule_launch_sequences(513, 8) == (520, True)
+    for num_xcds in (2, 4, 8):
+        assert hstu._gfx950_fa_schedule_launch_sequences(15, num_xcds) == (16, True)
+
+
 def _target_causal_hstu_ref(q, k, v, offsets, num_targets, max_seq_len, alpha):
     """Float reference for history-causal plus independent-target masking."""
     qf = q.float().detach().requires_grad_()
@@ -110,22 +160,32 @@ def _assert_per_sequence_close(name, got, expected, offsets, tolerance=8e-3, tai
     ],
 )
 def test_hstu_attn_gfx950_backward_target_causal(bwd_variant):
-    """Cover ragged tails in the generic and PR-2798-style schedules."""
+    """Cover ragged tails and padded XCD sequence slots in all schedules."""
     hstu = _load_gfx950_hstu_tutorial()
     torch.manual_seed(7)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     max_seq_len, heads, head_dim = 512, 2, 128
     alpha = 1.0 / head_dim**0.5
+    # Fifteen sequences pad to sixteen on 2-, 4-, and 8-XCD partitions while
+    # staying within the launch's dummy-sequence budget.
     # Exercise a wholly invalid second Q/dO pipeline slot, both sides of the
     # 64-, 128-, and 256-row boundaries, partial final K/V tiles, and two
     # exact BN256 tiles.
-    lengths = torch.tensor([1, 63, 65, 127, 129, 193, 255, 256, 257, 321, 511, 512], device=device, dtype=torch.int64)
+    lengths = torch.tensor(
+        [1, 17, 33, 63, 65, 97, 127, 129, 193, 255, 256, 257, 321, 511, 512],
+        device=device,
+        dtype=torch.int64,
+    )
     offsets = torch.zeros(lengths.numel() + 1, device=device, dtype=torch.int64)
     offsets[1:] = torch.cumsum(lengths, dim=0)
     # Include a diagonal-only all-target sequence and history/target boundaries
     # that fall inside 64-, 128-, and 256-row tiles.
-    num_targets = torch.tensor([1, 1, 65, 17, 20, 33, 5, 20, 17, 20, 5, 20], device=device, dtype=torch.int32)
+    num_targets = torch.tensor(
+        [1, 1, 5, 1, 65, 17, 20, 33, 5, 20, 17, 20, 17, 5, 20],
+        device=device,
+        dtype=torch.int32,
+    )
     total = int(offsets[-1])
 
     q, k, v = (torch.empty((total, heads, head_dim), device=device, dtype=dtype).uniform_(-2.0, 2.0).requires_grad_()

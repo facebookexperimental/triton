@@ -43,10 +43,12 @@ DEFAULT_VARIANTS = (
 )
 
 
-def _make_workload(max_seq_len, batch, heads, head_dim, sparsity, max_targets, seed):
+def _make_workload(max_seq_len, batch, heads, head_dim, sparsity, max_targets, seed, length_order="random"):
     device = torch.device("cuda")
     if not 0.5 <= sparsity <= 1.0:
         raise ValueError("this benchmark expects sparsity in [0.5, 1.0]")
+    if length_order not in ("random", "ascending", "descending"):
+        raise ValueError(f"unknown length order: {length_order}")
 
     length_gen = torch.Generator(device=device).manual_seed(seed)
     low = max(1, int((2 * sparsity - 1.0) * max_seq_len))
@@ -61,6 +63,8 @@ def _make_workload(max_seq_len, batch, heads, head_dim, sparsity, max_targets, s
             dtype=torch.int64,
             generator=length_gen,
         )
+    if length_order != "random":
+        lengths = torch.sort(lengths, descending=length_order == "descending").values
 
     target_gen = torch.Generator(device=device).manual_seed(seed + 1)
     targets = torch.randint(
@@ -96,6 +100,22 @@ def _make_workload(max_seq_len, batch, heads, head_dim, sparsity, max_targets, s
     return q, k, v, offsets, targets, lengths_cpu, targets_cpu, int(valid_pairs), flops, digest
 
 
+def _validate_fixture_launch_coverage(max_seq_len, lengths):
+    """Reject lengths beyond the smallest forward launch extent for N."""
+    if max_seq_len <= 0:
+        raise ValueError(f"fixture N must be positive, got {max_seq_len}")
+    if lengths.numel() == 0:
+        raise ValueError("fixture must contain at least one sequence")
+    launch_extent = min(
+        triton.cdiv(max_seq_len, config.kwargs["BLOCK_M"]) * config.kwargs["BLOCK_M"]
+        for config in hstu._get_fw_configs())
+    max_length, max_index = torch.max(lengths, dim=0)
+    if int(max_length) > launch_extent:
+        raise ValueError(f"fixture sequence {int(max_index)} has length {int(max_length)}, but N={max_seq_len} "
+                         f"launches cover at most {launch_extent} rows")
+    return launch_extent
+
+
 def _make_input_fixture_workload(path):
     """Reconstruct a no-bias workload saved by the issue #2005 harness."""
     inputs = torch.load(path, map_location="cpu", weights_only=True)
@@ -128,20 +148,24 @@ def _make_input_fixture_workload(path):
     if inputs["sort_by_length"]:
         raise ValueError("the optimized gfx950 schedule does not support length sorting")
 
+    max_seq_len = int(inputs["N"])
     total_tokens, heads, head_dim = map(int, inputs["q_shape"])
     if head_dim != 128:
         raise ValueError(f"the specialized gfx950 backward requires D=128, got {head_dim}")
-    offsets = inputs["seq_offsets"].to(device="cuda", dtype=torch.int64)
-    targets = inputs["num_targets"].to(device="cuda", dtype=torch.int64)
-    if offsets.ndim != 1 or targets.ndim != 1 or offsets.numel() != targets.numel() + 1:
+    offsets_cpu = inputs["seq_offsets"].to(device="cpu", dtype=torch.int64)
+    targets_cpu = inputs["num_targets"].to(device="cpu", dtype=torch.int64)
+    if offsets_cpu.ndim != 1 or targets_cpu.ndim != 1 or offsets_cpu.numel() != targets_cpu.numel() + 1:
         raise ValueError("seq_offsets and num_targets must describe the same one-dimensional batch")
-    lengths = offsets[1:] - offsets[:-1]
-    if int(offsets[0]) != 0 or bool(torch.any(lengths <= 0)):
+    lengths_cpu = offsets_cpu[1:] - offsets_cpu[:-1]
+    if int(offsets_cpu[0]) != 0 or bool(torch.any(lengths_cpu <= 0)):
         raise ValueError("seq_offsets must start at zero and be strictly increasing")
-    if bool(torch.any(targets < 0)) or bool(torch.any(targets > lengths)):
+    if bool(torch.any(targets_cpu < 0)) or bool(torch.any(targets_cpu > lengths_cpu)):
         raise ValueError("num_targets must be between zero and the corresponding sequence length")
-    if int(offsets[-1]) != total_tokens:
-        raise ValueError(f"q_shape has {total_tokens} tokens but offsets end at {int(offsets[-1])}")
+    if int(offsets_cpu[-1]) != total_tokens:
+        raise ValueError(f"q_shape has {total_tokens} tokens but offsets end at {int(offsets_cpu[-1])}")
+    _validate_fixture_launch_coverage(max_seq_len, lengths_cpu)
+    offsets = offsets_cpu.to(device="cuda")
+    targets = targets_cpu.to(device="cuda")
 
     # Match the linked reproducer: Q/K/V are disjoint views of one [T, 4H, D]
     # allocation, so their token stride is 4 * H * D rather than H * D.
@@ -154,14 +178,12 @@ def _make_input_fixture_workload(path):
     q, k, v, _ = torch.split(backing, [heads, heads, heads, heads], dim=1)
     q, k, v = (tensor.detach().requires_grad_() for tensor in (q, k, v))
 
-    lengths_cpu = lengths.cpu()
-    targets_cpu = targets.cpu()
     history = lengths_cpu - targets_cpu
     valid_pairs = (history * (history + 1) // 2 + targets_cpu * (history + 1)).sum().item()
     flops = int(valid_pairs) * heads * (6 * head_dim + 4 * head_dim)
     digest = hashlib.sha256(lengths_cpu.numpy().tobytes() + targets_cpu.numpy().tobytes()).hexdigest()[:12]
     workload = q, k, v, offsets, targets, lengths_cpu, targets_cpu, int(valid_pairs), flops, digest
-    return int(inputs["N"]), float(inputs["alpha"]), workload
+    return max_seq_len, float(inputs["alpha"]), workload
 
 
 def _time_variant(args, variant, max_seq_len, alpha, q, k, v, offsets, targets, dout):
@@ -223,6 +245,12 @@ def _parse_args():
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--sparsity", type=float, default=0.95,
                         help="length density: 0.95 samples lengths uniformly from [0.9*N, N)")
+    parser.add_argument(
+        "--length-order",
+        choices=("random", "ascending", "descending"),
+        default="random",
+        help="optionally order generated lengths to expose XCD load imbalance",
+    )
     parser.add_argument("--max-targets", type=int, default=20,
                         help="sample each sequence's target count uniformly from [1, max-targets]")
     parser.add_argument("--seq-lens", type=int, nargs="+", default=[1024, 2048, 4096, 8192])
@@ -274,10 +302,12 @@ def main():
                 args.sparsity,
                 args.max_targets,
                 args.seed,
+                args.length_order,
             ),
         ) for max_seq_len in args.seq_lens)
         workload_description = (f"B={args.batch} H={args.heads} D={args.head_dim} sparsity={args.sparsity} "
-                                f"max_targets={args.max_targets} seed={args.seed} alpha=1/D")
+                                f"length_order={args.length_order} max_targets={args.max_targets} "
+                                f"seed={args.seed} alpha=1/D")
     else:
         fixture_n, fixture_alpha, fixture_workload = _make_input_fixture_workload(args.input_fixture)
         workloads = [(fixture_n, fixture_alpha, fixture_workload)]
