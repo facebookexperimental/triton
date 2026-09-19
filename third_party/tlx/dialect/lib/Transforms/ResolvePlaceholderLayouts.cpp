@@ -222,6 +222,20 @@ collectValuesWithEncodings(ModuleOp moduleOp,
   });
 }
 
+// DenseElementsAttr stores its own shaped type. AttrTypeReplacer updates an
+// arith.constant result but does not rebuild that nested type, so wrapper
+// removal must realign the value attribute before the operation is verified.
+static void realignDenseConstantTypes(ModuleOp moduleOp) {
+  moduleOp->walk([&](arith::ConstantOp cst) {
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense)
+      return;
+    auto resultType = dyn_cast<ShapedType>(cst.getType());
+    if (resultType && dense.getType() != resultType)
+      cst.setValueAttr(dense.reshape(resultType));
+  });
+}
+
 static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
   // Strip #tlx.no_verify_layout everywhere it appears -- including nested
   // inside other encodings (e.g. slice<parent = ...>) and inside a user-layout
@@ -243,6 +257,7 @@ static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
         for (BlockArgument arg : block.getArguments())
           arg.setType(replacer.replace(arg.getType()));
   });
+  realignDenseConstantTypes(moduleOp);
 
   bool residual = false;
   moduleOp.walk([&](Operation *op) {
@@ -530,17 +545,7 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
           arg.setType(replacer.replace(arg.getType()));
   });
 
-  // A constant's `value` DenseElementsAttr carries its own (shaped) type, which
-  // AttrTypeReplacer does not rebuild; realign it with the unwrapped result
-  // type.
-  moduleOp->walk([&](arith::ConstantOp cst) {
-    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
-    if (!dense)
-      return;
-    auto resultType = dyn_cast<ShapedType>(cst.getType());
-    if (resultType && dense.getType() != resultType)
-      cst.setValueAttr(dense.reshape(resultType));
-  });
+  realignDenseConstantTypes(moduleOp);
 
   if (failed(repairUnwrappedReshapes(wrappedReshapes)))
     return failure();
