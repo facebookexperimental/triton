@@ -7,6 +7,7 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
+    cond_barrier,
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
@@ -14,6 +15,7 @@ from .barrier import (
     amd_sched_barrier,
     sched_barrier,
     set_priority,
+    workgroup_barrier,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -225,6 +227,8 @@ __all__ = [
     "prefetch",
     # barriers
     "cluster_barrier",
+    "cond_barrier",
+    "workgroup_barrier",
     "alloc_barriers",
     "alloc_warp_barrier",
     "barrier_expect_bytes",
