@@ -4123,8 +4123,12 @@ def _attn_bwd_ws(
     # =========================================================================
     # Allocate SMEM and TMEM buffers
     # =========================================================================
-    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
-    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
+    # dK/dV epilogue staging shares K/V SMEM (see sdv/sdk_store_buf below):
+    # each staging buffer (kv, iter) aliases KV buffer kv's region.
+    k_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    v_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV, reuse=k_smem_alias)
+    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV, reuse=v_smem_alias)
     q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
     do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
 
@@ -4143,16 +4147,37 @@ def _attn_bwd_ws(
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
     DKV_STORE_ITERS: tl.constexpr = HEAD_DIM // DKV_STORE_NCOL
-    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
-    #   the dpT dot — precedes dv_fulls).
-    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
-    #   so the compute task must wait on k_mma_done before writing sdk).
+    # - sdv shares v_tiles' backing (free after dv_fulls; MMA's last v_tiles
+    #   read — the dpT dot — precedes dv_fulls).
+    # - sdk shares k_tiles' backing (MMA's dq dot still reads k_tiles after
+    #   dk_fulls, so the compute task must wait on k_mma_done before writing
+    #   sdk).
     sdv_store_buf = tlx.local_alloc(
         (BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv),
-        NUM_BUFFERS_KV * DKV_STORE_ITERS, reuse=v_tiles)
+        NUM_BUFFERS_KV * DKV_STORE_ITERS, reuse=v_smem_alias)
     sdk_store_buf = tlx.local_alloc(
         (BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk),
-        NUM_BUFFERS_KV * DKV_STORE_ITERS, reuse=k_tiles)
+        NUM_BUFFERS_KV * DKV_STORE_ITERS, reuse=k_smem_alias)
+    v_smem_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            v_tiles,
+            tlx.reuse_group(
+                sdv_store_buf,
+                group_size=DKV_STORE_ITERS,
+            ),
+            group_type=tlx.reuse_group_type.shared,
+        )
+    )
+    k_smem_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            k_tiles,
+            tlx.reuse_group(
+                sdk_store_buf,
+                group_size=DKV_STORE_ITERS,
+            ),
+            group_type=tlx.reuse_group_type.shared,
+        )
+    )
 
     if PRENORMALIZED_DO:
         sM_tiles = None
