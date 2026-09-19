@@ -133,7 +133,7 @@ def _clc_subprocess_env(dq_fp32):
     return env
 
 
-def _torch_ref(q, k, v, do, so, asc):
+def _torch_ref(q, k, v, do, so, asc, num_targets=None):
     """Float autograd HSTU-SiLU causal self-attention reference."""
     qf = q.detach().float().requires_grad_(True)
     kf = k.detach().float().requires_grad_(True)
@@ -146,7 +146,15 @@ def _torch_ref(q, k, v, do, so, asc):
         qk = torch.einsum("qhd,khd->hqk", qf[s:e], kf[s:e]) * alpha
         sig = qk * torch.sigmoid(qk) * scale
         i = torch.arange(n, device=qk.device)
-        sig = sig * (i[:, None] >= i[None, :]).float()[None]
+        if num_targets is None:
+            valid = i[:, None] >= i[None, :]
+        else:
+            max_id = n - int(num_targets[z])
+            clamped_i = torch.minimum(i, torch.tensor(max_id, device=i.device))
+            valid = (i[:, None] == i[None, :]) | (
+                clamped_i[:, None] > clamped_i[None, :]
+            )
+        sig = sig * valid.float()[None]
         outs.append(torch.einsum("hqk,khd->qhd", sig, vf[s:e]))
     torch.cat(outs, 0).backward(do.float())
     return qf.grad, kf.grad, vf.grad
@@ -156,7 +164,7 @@ def _rel_l2(a, b):
     return (torch.norm(a.float() - b.float()) / (torch.norm(b.float()) + 1e-12)).item()
 
 
-def _run_autows_bwd(L, Z, jagged=False):
+def _run_autows_bwd(L, Z, jagged=False, target_count=0):
     """Run the (already-imported) autoWS kernel fwd+bwd and return the grads plus
     the torch-float reference grads. Config is whatever env was baked at import."""
     torch.manual_seed(0)
@@ -172,8 +180,13 @@ def _run_autows_bwd(L, Z, jagged=False):
     so = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device="cuda", dtype=torch.int64)
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
     do = g()
+    num_targets = None
+    if target_count:
+        num_targets = torch.tensor(
+            [min(target_count, n) for n in lens], device="cuda", dtype=torch.int64
+        )
 
-    rq, rk, rv = _torch_ref(q, k, v, do, so, asc)
+    rq, rk, rv = _torch_ref(q, k, v, do, so, asc, num_targets)
 
     for tsr in (q, k, v):
         tsr.grad = None
@@ -186,6 +199,7 @@ def _run_autows_bwd(L, Z, jagged=False):
         seq_offsets=so,
         attn_scale=asc,
         enable_tma=True,
+        num_targets=num_targets,
     )
     o.backward(do)
     return (q.grad.clone(), k.grad.clone(), v.grad.clone()), (rq, rk, rv)
@@ -293,14 +307,22 @@ def test_self_attention_bwd_autows_clc(L, Z, dq_fp32):
 
 
 @pytest.mark.parametrize("L,Z", [(4096, 2), (256, 120)])
-def test_self_attention_bwd_autows_clc_jagged_production(L, Z):
-    """Exercise jagged tails at production depth and across reused CTAs."""
+@pytest.mark.parametrize("target_count", [0, 20], ids=["causal", "target-20"])
+@pytest.mark.parametrize("dq_fp32", [False, True], ids=["dq-bf16", "dq-fp32"])
+def test_self_attention_bwd_autows_clc_jagged_production(L, Z, target_count, dq_fp32):
+    """Exercise both dQ precisions and mask modes across reused CLC CTAs.
+
+    The Z=120 grid reuses physical CTAs and exercises the persistent-while
+    accumulation-counter path. With num_targets=20, the full target-aware mask
+    remains active; causal-prefix peeling is intentionally disabled. The matrix
+    test separately covers the split-loop empty-sibling release.
+    """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     r = subprocess.run(
         [sys.executable, __file__, "--run-clc-jagged", str(L),
-         str(Z)],
-        env=dict(os.environ),
+         str(Z), str(target_count)],
+        env=_clc_subprocess_env(dq_fp32),
         capture_output=True,
         text=True,
         timeout=900,
@@ -374,7 +396,17 @@ if __name__ == "__main__":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
         assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged"))
-        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z, jagged=sys.argv[1] == "--run-clc-jagged")
+        target_count = (
+            int(sys.argv[4])
+            if sys.argv[1] == "--run-clc-jagged" and len(sys.argv) > 4
+            else 0
+        )
+        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(
+            _L,
+            _Z,
+            jagged=sys.argv[1] == "--run-clc-jagged",
+            target_count=target_count,
+        )
         rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
         print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
               f"(L={_L} Z={_Z}, dq_fp32={A._AUTOWS_CFG.dq_fp32})")
