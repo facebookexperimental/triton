@@ -76,8 +76,18 @@ public:
   mlir::LogicalResult
   matchAndRewrite(ReleaseLayoutOp releaseLayoutOp,
                   mlir::PatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<ttg::ReleaseLayoutOp>(
-        releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
+    if (!releaseLayoutOp.getRelaxed()) {
+      rewriter.replaceOpWithNewOp<ttg::ReleaseLayoutOp>(
+          releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
+      return success();
+    }
+
+    if (releaseLayoutOp.getSrc().getType() == releaseLayoutOp.getType()) {
+      rewriter.replaceOp(releaseLayoutOp, releaseLayoutOp.getSrc());
+    } else {
+      rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
+          releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
+    }
     return success();
   }
 };
