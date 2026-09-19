@@ -222,6 +222,7 @@ def test_line_info_env(monkeypatch, status: str):
     kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=shape[0], grid=(1, ))
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     assert len(file_lines) == 0 if status == "1" else len(file_lines) > 0
+    kernel_single.device_caches.clear()
 
 
 @pytest.mark.parametrize("status", ["ttir", ""])
@@ -263,7 +264,7 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":265:5)
+        # CHECK: #loc = loc("{{.*}}":266:5)
         # CHECK-LABEL:  tt.func public @kernel_basic(
         # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
         # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc12)
@@ -503,7 +504,7 @@ def test_line_and_column_numbers(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":505:5)
+        # CHECK: #loc = loc("{{.*}}":506:5)
         # CHECK: #loc10 = loc("src"(#loc))
         # CHECK: #loc11 = loc("N"(#loc))
         # CHECK-LABEL:  tt.func public @kernel_basic(
@@ -526,15 +527,15 @@ def test_line_and_column_numbers(fresh_triton_cache):
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
-        # CHECK: #loc1 = loc({{.*}}:551:20)
+        # CHECK: #loc1 = loc({{.*}}:552:20)
         # CHECK: #loc2 = loc(unknown)
-        # CHECK: #loc3 = loc({{.*}}:546:15)
-        # CHECK: #loc4 = loc({{.*}}:547:18)
-        # CHECK: #loc5 = loc({{.*}}:548:28)
-        # CHECK: #loc6 = loc({{.*}}:548:19)
-        # CHECK: #loc7 = loc({{.*}}:549:30)
-        # CHECK: #loc8 = loc({{.*}}:550:16)
-        # CHECK: #loc9 = loc({{.*}}:552:9)
+        # CHECK: #loc3 = loc({{.*}}:547:15)
+        # CHECK: #loc4 = loc({{.*}}:548:18)
+        # CHECK: #loc5 = loc({{.*}}:549:28)
+        # CHECK: #loc6 = loc({{.*}}:549:19)
+        # CHECK: #loc7 = loc({{.*}}:550:30)
+        # CHECK: #loc8 = loc({{.*}}:551:16)
+        # CHECK: #loc9 = loc({{.*}}:553:9)
         # CHECK: #loc12 = loc("x_plus_1"(#loc1))
         # CHECK: #loc13 = loc("pid"(#loc3))
         # CHECK: #loc14 = loc("offset"(#loc4))

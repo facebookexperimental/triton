@@ -522,9 +522,7 @@ int64_t getAllocationElems(Attribute encoding, ArrayRef<int64_t> shape,
   if (!llvm::all_of(layoutShape, llvm::isPowerOf2_64) ||
       !llvm::all_of(allocationShape, llvm::isPowerOf2_64))
     return product<int64_t>(getAllocationShapePerCTA(encoding, allocShape));
-  auto layout = isPaddedEncoding(encoding)
-                    ? paddedLinearLayout(allocationShape, encoding)
-                    : toLinearLayout(allocationShape, encoding);
+  auto layout = toLinearLayoutIgnoringPadding(allocationShape, encoding);
   auto offsetDim = StringAttr::get(encoding.getContext(), "offset");
   int64_t stages = product<int64_t>(shape.drop_back(layoutShape.size()));
   int64_t elems = stages * layout.getInDimSize(offsetDim);
@@ -3905,6 +3903,8 @@ struct TritonGPUVerifyTensorLayoutInterface
       return true;
     return isa<triton::MakeRangeOp, triton::SplatOp, triton::BroadcastOp,
                triton::LoadOp, triton::StoreOp, triton::JoinOp, triton::SplitOp,
+               triton::DotOp, triton::DotScaledOp, triton::CallOp,
+               triton::ReturnOp, triton::FuncOp, triton::AssertOp,
                triton::gpu::ConvertLayoutOp, triton::gpu::Fp4ToFpOp,
                triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op);
   }

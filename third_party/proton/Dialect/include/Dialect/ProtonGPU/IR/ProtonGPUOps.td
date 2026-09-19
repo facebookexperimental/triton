@@ -5,6 +5,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/EnumAttr.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUMemoryEffects.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -19,14 +20,13 @@ include "proton/Dialect/include/Dialect/ProtonGPU/IR/ProtonGPUTypes.td"
 //===----------------------------------------------------------------------===//
 
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
-def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 
 //===----------------------------------------------------------------------===//
 // Base Class
 //===----------------------------------------------------------------------===//
 
-class PTG_Op<string mnemonic, list<Trait> traits = []> :
-    Op<ProtonGPU_Dialect, mnemonic, !listconcat(traits, [])> {
+class PTG_Op<string mnemonic, list<Trait> traits = []>
+    : Op<ProtonGPU_Dialect, mnemonic, !listconcat(traits, [])> {
 }
 
 //===----------------------------------------------------------------------===//
@@ -34,27 +34,33 @@ class PTG_Op<string mnemonic, list<Trait> traits = []> :
 //===----------------------------------------------------------------------===//
 
 def PTG_CircularStoreOp : PTG_Op<"circular_store", [
+    AttrSizedOperandSegments,
     MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
 ]> {
   let summary = "Store the value into a circular buffer";
 
   let description = [{
     Store a metric `counter` into a circular buffer backed by the internal memory `segment`.
-    automatically updated. Older metric counters are dropped if the `segment` buffer is full.
+    `scopeId` contains a compile-time scope identifier, while `dynamicScopeId`
+    contains a runtime scope identifier. Exactly one must be present. Older
+    metric counters are dropped if the `segment` buffer is full.
   }];
 
   let arguments = (ins
     PTG_SegmentType:$segment,
     AnyTypeOf<[I32, I64]>:$counter,
+    Optional<I32>:$dynamicScopeId,
     UnitAttr:$isStart,
-    I32Attr:$scopeId,
+    OptionalAttr<I32Attr>:$scopeId,
     Optional<I1>:$predicate
   );
 
   let builders = [
     OpBuilder<(ins "Value":$segment, "Value":$counter, "bool":$isStart,
                    "int32_t":$scopeId), [{
-      build($_builder, $_state, segment, counter, isStart, scopeId,
+      build($_builder, $_state, segment, counter,
+            /*dynamicScopeId=*/static_cast<mlir::Value>(nullptr), isStart,
+            $_builder.getI32IntegerAttr(scopeId),
             /*predicate=*/static_cast<mlir::Value>(nullptr));
     }]>
   ];
@@ -62,7 +68,8 @@ def PTG_CircularStoreOp : PTG_Op<"circular_store", [
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    (`start` $isStart^):(`end`)? $segment `,` $counter (`if` $predicate^)? attr-dict `:`
+    (`start` $isStart^):(`end`)? $segment `,` $counter
+    (`,` $dynamicScopeId^)? (`if` $predicate^)? attr-dict `:`
     qualified(type($segment)) `,` type($counter)
   }];
 }
@@ -106,7 +113,7 @@ def PTG_InitializeOp : PTG_Op<"initialize", [
 
 
 def PTG_FinalizeOp : PTG_Op<"finalize", [
-    MemoryEffects<[MemRead<SharedMemory>]>, // FIXME: it shouldn't always have shared memory effects
+    MemoryEffects<GenericSharedRead>, // FIXME: it shouldn't always have shared memory effects
     MemoryEffects<[MemRead<GlobalMemory>]>,
     MemoryEffects<[MemWrite<GlobalMemory>]>
 ]> {

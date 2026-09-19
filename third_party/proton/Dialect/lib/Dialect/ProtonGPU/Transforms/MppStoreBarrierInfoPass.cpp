@@ -691,10 +691,13 @@ private:
                           DenseMap<int, CircularStoreOp> &endMap) {
     for (Operation &op : block) {
       if (auto store = dyn_cast<CircularStoreOp>(&op)) {
+        auto scopeId = store.getScopeId();
+        if (!scopeId)
+          continue;
         if (store.getIsStart())
           stack.push_back(store);
         else
-          endMap[store.getScopeId()] = store;
+          endMap[*scopeId] = store;
         continue;
       }
 
@@ -801,7 +804,10 @@ private:
     };
 
     for (auto &si : stores) {
-      auto endStore = endMap.lookup(si.startStore.getScopeId());
+      auto scopeId = si.startStore.getScopeId();
+      if (!scopeId)
+        continue;
+      auto endStore = endMap.lookup(*scopeId);
       if (!endStore)
         continue;
 

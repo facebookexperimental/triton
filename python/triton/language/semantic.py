@@ -75,10 +75,8 @@ class TritonSemantic(Generic[TensorTy]):
         if a_is_scalar != b_is_scalar:
             scalar_ty, tensor_ty = (a_ty, b_ty) if a_is_scalar else (b_ty, a_ty)
             if scalar_ty.kind().value <= tensor_ty.kind().value:
-                # Upcast because of 2) below!
-                if div_or_mod and tensor_ty.is_floating():
-                    return tl.float32
-                return tensor_ty
+                # Ignore the scalar and apply the remaining promotion rules.
+                a_ty, b_ty = tensor_ty, tensor_ty
 
         # 1) if one operand is double, the other is implicitly
         #    converted to double
@@ -1053,8 +1051,7 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Create loaded result type `dst_ty`
         if ptr.type.is_block():
-            shape = ptr.type.get_block_shapes()
-            dst_ty = tl.block_type(elt_ty, shape)
+            dst_ty = ptr.type.with_element_ty(elt_ty)
         else:
             # Load by de-referencing the pointer of scalar
             dst_ty = elt_ty
@@ -1080,9 +1077,9 @@ class TritonSemantic(Generic[TensorTy]):
         dst_ty, ptr, mask, other, is_bool = self._prepare_load(ptr, mask, other, boundary_check, padding)
         # Build IR
         if mask is None:
-            x = tl.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
+            x = self.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
         else:
-            x = tl.tensor(
+            x = self.tensor(
                 self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache,
                                                 eviction, is_volatile),
                 dst_ty,

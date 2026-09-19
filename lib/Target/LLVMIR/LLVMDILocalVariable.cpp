@@ -10,6 +10,7 @@
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "triton/Target/LLVMIR/Passes.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Path.h"
 
@@ -242,7 +243,11 @@ struct LLVMDILocalVariablePass
       LLVM::DITypeAttr typeAttr;
     };
     llvm::SmallVector<ArgInfo> argInfos;
+#if LLVM_VERSION_MAJOR >= 24
+    llvm::SmallVector<mlir::Attribute> retainedNodes;
+#else
     llvm::SmallVector<mlir::LLVM::DINodeAttr> retainedNodes;
+#endif
 
     for (unsigned idx = resNum; idx < argTypeAttrs.size(); idx++) {
       LLVM::DITypeAttr argTypeAttr = argTypeAttrs[idx];

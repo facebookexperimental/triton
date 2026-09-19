@@ -35,6 +35,7 @@ namespace nvidia_gpu {
 #define GEN_PASS_DEF_TRITONNVIDIAGPUCLCSPLITPASS
 #define GEN_PASS_DEF_TRITONNVIDIAGPUCLCHOISTPASS
 #define GEN_PASS_DEF_TRITONNVIDIAGPUCLCMATERIALIZEPASS
+#define GEN_PASS_DEF_TRITONNVIDIAGPULOWERCLCPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace ttg = triton::gpu;
@@ -63,6 +64,118 @@ Value createClcResponseAlloc(OpBuilder &b, Location loc) {
                                   /*mutableMemory=*/true);
   return ttg::LocalAllocOp::create(b, loc, ty);
 }
+
+ttg::MemDescType getSyncResponseType(MLIRContext *ctx, unsigned numCTAs) {
+  Attribute memorySpace = ttg::SharedMemorySpaceAttr::get(ctx);
+  auto cgaLayout = ttg::CGAEncodingAttr::fromSplitParams(
+      ctx, {numCTAs}, /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+  auto encoding =
+      ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, cgaLayout);
+  return ttg::MemDescType::get({2}, IntegerType::get(ctx, 64), encoding,
+                               memorySpace, /*mutableMemory=*/true);
+}
+
+ttg::MemDescType getSyncBarrierType(MLIRContext *ctx, unsigned numCTAs) {
+  Attribute memorySpace = ttg::SharedMemorySpaceAttr::get(ctx);
+  auto cgaLayout = ttg::CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  auto encoding =
+      ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, cgaLayout);
+  return ttg::MemDescType::get({numCTAs}, IntegerType::get(ctx, 64), encoding,
+                               memorySpace, /*mutableMemory=*/true);
+}
+
+LogicalResult lowerSyncSite(CLCTryCancelSyncOp issue) {
+  auto oldLoop = issue->getParentOfType<scf::WhileOp>();
+  if (!oldLoop)
+    return issue.emitOpError("expected to be nested in an scf.while");
+  if (!issue.getResponse().hasOneUse())
+    return issue.emitOpError(
+        "expected response to have exactly one ttg.local_alloc user");
+  auto markerAlloc =
+      dyn_cast<ttg::LocalAllocOp>(*issue.getResponse().getUsers().begin());
+  if (!markerAlloc)
+    return issue.emitOpError("expected response user to be ttg.local_alloc");
+  if (!markerAlloc.getResult().hasOneUse())
+    return issue.emitOpError(
+        "expected response marker to have exactly one ttng.clc_load_result "
+        "user");
+  auto markerLoad =
+      dyn_cast<CLCLoadResultOp>(*markerAlloc.getResult().getUsers().begin());
+  if (!markerLoad)
+    return issue.emitOpError(
+        "expected response marker user to be ttng.clc_load_result");
+
+  MLIRContext *ctx = oldLoop.getContext();
+  Location loc = issue.getLoc();
+  unsigned numCTAs = ttg::lookupNumCTAs(oldLoop);
+  OpBuilder builder(oldLoop);
+
+  auto response = ttg::LocalAllocOp::create(
+      builder, loc, getSyncResponseType(ctx, numCTAs), Value(), 16);
+  auto barrier =
+      ttg::LocalAllocOp::create(builder, loc, getSyncBarrierType(ctx, numCTAs));
+  InitBarrierOp::create(builder, loc, barrier, 1);
+  auto phaseZero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+  auto one = arith::ConstantIntOp::create(builder, loc, 1, 32);
+  auto pred = arith::ConstantIntOp::create(builder, loc, 1, 1);
+
+  auto loop = replaceWhileOpWithNewSignature(
+      builder, oldLoop, ValueRange{phaseZero}, TypeRange{builder.getI32Type()});
+  oldLoop.erase();
+
+  Value beforePhase = loop.getBeforeArguments().back();
+  loop.getConditionOp().getArgsMutable().append(beforePhase);
+
+  Value afterPhase = loop.getAfterArguments().back();
+  auto yield = loop.getYieldOp();
+  builder.setInsertionPoint(yield);
+  Value nextPhase =
+      arith::XOrIOp::create(builder, yield.getLoc(), afterPhase, one);
+  yield.getResultsMutable().append(nextPhase);
+
+  builder.setInsertionPoint(issue);
+  auto expect =
+      BarrierExpectOp::create(builder, loc, barrier, kClcResponseBytes, pred);
+  expect->setAttr("fromCTA", builder.getI32IntegerAttr(0));
+  CLCTryCancelOp::create(builder, loc, response, barrier);
+
+  builder.setInsertionPoint(markerLoad);
+  WaitBarrierOp::create(builder, markerLoad.getLoc(), barrier, afterPhase,
+                        pred);
+  markerLoad.getSrcMutable().set(response);
+
+  markerAlloc.erase();
+  issue.erase();
+
+  builder.setInsertionPointAfter(loop);
+  InvalBarrierOp::create(builder, loop.getLoc(), barrier);
+  ttg::LocalDeallocOp::create(builder, loop.getLoc(), barrier);
+  ttg::LocalDeallocOp::create(builder, loop.getLoc(), response);
+  return success();
+}
+
+class TritonNvidiaGPULowerCLCPass
+    : public impl::TritonNvidiaGPULowerCLCPassBase<
+          TritonNvidiaGPULowerCLCPass> {
+public:
+  using Base =
+      impl::TritonNvidiaGPULowerCLCPassBase<TritonNvidiaGPULowerCLCPass>;
+  using Base::Base;
+
+  void runOnOperation() override {
+    SmallVector<CLCTryCancelSyncOp> issues;
+    getOperation().walk(
+        [&](CLCTryCancelSyncOp issue) { issues.push_back(issue); });
+    for (CLCTryCancelSyncOp issue : issues) {
+      if (ttg::lookupNumCTAs(issue) != 1) {
+        issue.emitError("CLC lowering supports num_cta=1 at the moment");
+        return signalPassFailure();
+      }
+      if (failed(lowerSyncSite(issue)))
+        return signalPassFailure();
+    }
+  }
+};
 
 //===--------------------------------------------------------------------===//
 // Stage 1 - split clc_advance into the token form.

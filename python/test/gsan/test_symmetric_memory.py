@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import socket
+import time
+from datetime import timedelta
 
 import pytest
 import torch
@@ -20,11 +22,35 @@ from triton.experimental.gsan._testing_utils import (
 
 pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
 
+pytestmark = pytest.mark.xdist_group("gsan-symmetric-memory")
+_PROCESS_GROUP_TIMEOUT = timedelta(seconds=30)
+_SPAWN_TIMEOUT_SECONDS = 60
+
 
 def _get_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _spawn_distributed(worker, world_size, *args):
+    context = mp.spawn(worker, args=(world_size, *args), nprocs=world_size, join=False)
+    deadline = time.monotonic() + _SPAWN_TIMEOUT_SECONDS
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"distributed GSan worker {worker.__name__} exceeded its {_SPAWN_TIMEOUT_SECONDS}-second timeout")
+            if context.join(timeout=remaining, grace_period=5):
+                return
+    except BaseException:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
+        for process in context.processes:
+            process.join()
+        raise
 
 
 def _assert_barrier_synchronizes_stream_clocks(hdl, device_index: int, group: dist.ProcessGroup) -> None:
@@ -126,7 +152,7 @@ def _run_symmetric_memory_checks(rank: int, world_size: int) -> None:
 
 
 def _run_subgroup_symmetric_memory_checks(rank: int) -> None:
-    subgroup = dist.new_group(ranks=[1, 2], backend="nccl")
+    subgroup = dist.new_group(ranks=[1, 2], backend="nccl", timeout=_PROCESS_GROUP_TIMEOUT)
     try:
         if rank in (1, 2):
             dev = torch.device(f"cuda:{rank}")
@@ -188,7 +214,8 @@ def _distributed_worker(rank: int, world_size: int, master_port: int, run_subgro
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=torch.device(dev))
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=torch.device(dev),
+                            timeout=_PROCESS_GROUP_TIMEOUT)
     try:
         if run_subgroup_check:
             _run_subgroup_symmetric_memory_checks(rank)
@@ -205,12 +232,7 @@ def test_gsan_symmetric_memory_rendezvous():
 
     world_size = 2
     master_port = _get_free_tcp_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, master_port, False),
-        nprocs=world_size,
-        join=True,
-    )
+    _spawn_distributed(_distributed_worker, world_size, master_port, False)
 
 
 def test_gsan_symmetric_memory_rendezvous_subgroup_without_global_zero():
@@ -219,12 +241,7 @@ def test_gsan_symmetric_memory_rendezvous_subgroup_without_global_zero():
 
     world_size = 3
     master_port = _get_free_tcp_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, master_port, True),
-        nprocs=world_size,
-        join=True,
-    )
+    _spawn_distributed(_distributed_worker, world_size, master_port, True)
 
 
 def _run_multi_node_simulated_symmetric_memory_checks(rank: int, world_size: int, device_index: int) -> None:
@@ -380,7 +397,7 @@ def _distributed_worker_multi_node_simulated(rank: int, world_size: int, master_
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size, timeout=_PROCESS_GROUP_TIMEOUT)
     try:
         _run_multi_node_simulated_symmetric_memory_checks(rank, world_size, device_index)
         dist.barrier()
@@ -393,7 +410,7 @@ def _distributed_worker_triton_kernels_convert_dp_to_ep(rank: int, world_size: i
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size, timeout=_PROCESS_GROUP_TIMEOUT)
     torch.cuda.set_device(dev)
     try:
         _run_triton_kernels_convert_dp_to_ep_with_gsan_pool(rank, world_size)
@@ -408,12 +425,7 @@ def test_gsan_symmetric_memory_rendezvous_multi_node_simulated():
 
     world_size = 4
     master_port = _get_free_tcp_port()
-    mp.spawn(
-        _distributed_worker_multi_node_simulated,
-        args=(world_size, master_port, 2),
-        nprocs=world_size,
-        join=True,
-    )
+    _spawn_distributed(_distributed_worker_multi_node_simulated, world_size, master_port, 2)
 
 
 def test_gsan_symmetric_memory_with_triton_kernels_convert_dp_to_ep():
@@ -423,9 +435,4 @@ def test_gsan_symmetric_memory_with_triton_kernels_convert_dp_to_ep():
 
     world_size = 2
     master_port = _get_free_tcp_port()
-    mp.spawn(
-        _distributed_worker_triton_kernels_convert_dp_to_ep,
-        args=(world_size, master_port),
-        nprocs=world_size,
-        join=True,
-    )
+    _spawn_distributed(_distributed_worker_triton_kernels_convert_dp_to_ep, world_size, master_port)

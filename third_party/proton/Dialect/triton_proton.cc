@@ -86,6 +86,22 @@ void init_triton_proton(py::module_ &m) {
       py::arg("opBuilder"), py::arg("isStart"), py::arg("name"),
       py::arg("predicate").none() = py::none());
 
+  m.def(
+      "create_proton_allocate_event",
+      [](TritonOpBuilder &opBuilder, const std::string &name) -> mlir::Value {
+        auto nameAttr = mlir::StringAttr::get(opBuilder.getContext(), name);
+        auto op = opBuilder.create<proton::AllocateEventOp>(
+            mlir::TypeRange{mlir::IntegerType::get(opBuilder.getContext(), 32)},
+            nameAttr);
+        return op.getEvent();
+      });
+
+  m.def(
+      "create_proton_event",
+      [](TritonOpBuilder &opBuilder, bool isStart, mlir::Value event) -> void {
+        opBuilder.create<proton::EventOp>(isStart, event);
+      });
+
   m.def("add_convert_proton_to_protongpu",
         [](mlir::PassManager &pm, proton::MetricType &metricType,
            proton::SamplingStrategy samplingStrategy,

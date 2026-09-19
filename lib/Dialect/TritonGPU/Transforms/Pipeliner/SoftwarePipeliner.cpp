@@ -347,7 +347,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
 
     {
       auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
-      SmallVector<scf::ForOp> loops;
+      SmallVector<LoopLikeOpInterface> loops;
       bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {
         // Bail out for loops with num_stage <= 1.
@@ -357,10 +357,15 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
           hasWarpSpec = true;
       });
 
+      if (numStages > 1) {
+        getOperation()->walk(
+            [&](scf::WhileOp whileOp) { loops.push_back(whileOp); });
+      }
+
       // With Meta's warpspec, we are handling this in AutoWS.
       if (!metaWS || !hasWarpSpec)
-        for (scf::ForOp forOp : loops) {
-          mlir::triton::pipelineTMAStores(forOp);
+        for (LoopLikeOpInterface loop : loops) {
+          mlir::triton::pipelineTMAStores(loop);
         }
     }
   }
