@@ -7,12 +7,12 @@
 #operand_b = #tlx.no_verify_layout<#tlx.user_layout<#ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  // RESOLVE-DAG: #[[$A:.*]] = #tlx.user_layout<#ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>
-  // RESOLVE-DAG: #[[$B:.*]] = #tlx.user_layout<#ttg.dot_op<{opIdx = 1, parent = #{{.*}}, kWidth = 8}>>
+  // RESOLVE-DAG: #[[$MMA:.*]] = #ttg.amd_mfma<{{.*}}>
+  // RESOLVE-NOT: #tlx.user_layout
   // RESOLVE-NOT: #tlx.no_verify_layout
   // CHECK-LABEL: tt.func @pinned_dot
   // RESOLVE-LABEL: tt.func @pinned_dot
-  // RESOLVE: tt.dot {{.*}} tensor<256x64xbf16, #[[$A]]> * tensor<64x64xbf16, #[[$B]]>
+  // RESOLVE: tt.dot {{.*}} tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA]], kWidth = 8}>> * tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 8}>>
   // CHECK-NOT: #ttg.blocked
   // CHECK-NOT: ttg.convert_layout
   // CHECK: tt.dot {{.*}} -> tensor<256x64xf32, #{{.*}}>

@@ -40,6 +40,16 @@ namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
 namespace ttag = triton::amdgpu;
 
+static tlx::RequireLayoutOp
+createPinnedRegisterLayoutBoundary(TritonOpBuilder &builder, Value src,
+                                   Attribute encoding) {
+  auto srcType = cast<RankedTensorType>(src.getType());
+  Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
+  auto pinnedType = srcType.cloneWithEncoding(tlx::wrapNoVerifyLayout(
+      tlx::wrapUserLayout(physicalEncoding)));
+  return builder.create<tlx::RequireLayoutOp>(pinnedType, src);
+}
+
 // Element type of a CLC (Cluster Launch Control) response buffer. A CLC
 // response is a 16-byte opaque hardware object, so each stage is stored as one
 // `ui128`. Single source of truth: both `create_alloc_clc_responses` and the
@@ -257,22 +267,20 @@ void init_triton_tlx_ir(py::module_ &m) {
                             self.getBuilder().getUnitAttr());
               return op;
             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-              // `pin`: wrap in #tlx.no_verify_layout(#tlx.user_layout) -- the
-              // #tlx.user_layout carries PinnedEncodingTrait so the requirement
-              // is honored as a hard anchor by Coalesce /
-              // RemoveLayoutConversions / OptimizeEpilogue (e.g. to pin an
-              // epilogue store's register layout), and the outer
-              // #tlx.no_verify_layout defers operand-layout verification until
-              // ResolvePlaceholderLayouts peels it (so a pinned store whose
-              // ptr/mask layouts don't yet match verifies fine). Non-pin is a
-              // soft requirement (#tlx.no_verify_layout only, e.g. dot
-              // operands).
-              Attribute tensorEncoding =
-                  pin ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(encoding))
-                      : tlx::wrapNoVerifyLayout(encoding);
-              newType = RankedTensorType::get(
-                  type.getShape(), type.getElementType(), tensorEncoding);
-              auto op = self.create<tlx::RequireLayoutOp>(newType, v);
+              // A pin always becomes the same first-class SSA boundary. The
+              // wrappers are temporary TLX inference metadata; the operation
+              // itself survives as ttg.require_layout for repeated RLC.
+              tlx::RequireLayoutOp op;
+              if (pin) {
+                op = createPinnedRegisterLayoutBoundary(self, v, encoding);
+              } else {
+                Attribute physicalEncoding =
+                    tlx::getEffectiveEncoding(encoding);
+                newType = RankedTensorType::get(
+                    type.getShape(), type.getElementType(),
+                    tlx::wrapNoVerifyLayout(physicalEncoding));
+                op = self.create<tlx::RequireLayoutOp>(newType, v);
+              }
               if (lateAddressCompute)
                 op->setAttr("tlx.rematerialize_coordinates",
                             self.getBuilder().getUnitAttr());
@@ -287,14 +295,15 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,
              Type &elementType, Attribute &encoding, Value &scalar) -> Value {
-            // Constants created with an explicit MFMA/dot layout are a
-            // genuine layout anchor, not a late metadata retag.  Defer the
-            // normal tensor-layout verifier until placeholder resolution,
-            // matching the existing TLX require/local-load APIs.
-            Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
-            auto resultType =
-                RankedTensorType::get(shape, elementType, tensorEncoding);
-            return self.createOrFold<tt::SplatOp>(resultType, scalar);
+            // Keep the producer verifier-deferred, then represent the explicit
+            // user pin with the same SSA boundary used by every other source.
+            Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
+            auto resultType = RankedTensorType::get(
+                shape, elementType,
+                tlx::wrapNoVerifyLayout(physicalEncoding));
+            Value result = self.createOrFold<tt::SplatOp>(resultType, scalar);
+            return createPinnedRegisterLayoutBoundary(self, result,
+                                                        physicalEncoding);
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
@@ -329,43 +338,22 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::optional<Value> asyncToken,
              std::optional<Attribute> layoutEncoding) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
-            RankedTensorType newType;
-            if (layoutEncoding.has_value()) {
-              // CDNA MFMA dot operands are concrete hardware encodings.  Keep
-              // them bare so tt.dot's verifier sees DotOperandEncodingAttr
-              // directly; wrapping one in #tlx.user_layout would hide the
-              // operand parent and make the dot unverifiable during TTIR.
-              bool isAmdMfmaDot = false;
-              if (auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(
-                      layoutEncoding.value()))
-                isAmdMfmaDot = isa<ttg::AMDMfmaEncodingAttr>(dot.getParent());
-              if (isAmdMfmaDot) {
-                newType = RankedTensorType::get(subViewType.getShape(),
-                                                subViewType.getElementType(),
-                                                layoutEncoding.value());
-                return self.create<ttg::LocalLoadOp>(
-                    newType, subView, asyncToken.value_or(Value()));
-              }
-              // Pin the load result to the requested register layout, wrapped
-              // as a user layout (#tlx.user_layout). The wrapper carries
-              // PinnedEncodingTrait so remove-layout-conversions anchors the
-              // load and never rewrites it to a "preferred" layout; it is
-              // unwrapped to the concrete layout after the layout passes have
-              // run. Keep the inner no-verify wrapper (register encodings
-              // arrive wrapped so they defer tensor verification through
-              // inlining): resolve-placeholder-layouts strips the nested
-              // no-verify (keeping the user-layout marker) once inlining is
-              // done.
-              Attribute enc = tlx::wrapUserLayout(
-                  tlx::wrapNoVerifyLayout(layoutEncoding.value()));
-              newType = RankedTensorType::get(
-                  subViewType.getShape(), subViewType.getElementType(), enc);
-            } else {
-              newType = RankedTensorType::get(subViewType.getShape(),
-                                              subViewType.getElementType());
+            if (!layoutEncoding.has_value()) {
+              auto resultType = RankedTensorType::get(
+                  subViewType.getShape(), subViewType.getElementType());
+              return self.create<ttg::LocalLoadOp>(
+                  resultType, subView, asyncToken.value_or(Value()));
             }
-            return self.create<ttg::LocalLoadOp>(newType, subView,
-                                                 asyncToken.value_or(Value()));
+
+            Attribute physicalEncoding =
+                tlx::getEffectiveEncoding(layoutEncoding.value());
+            auto rawType = RankedTensorType::get(
+                subViewType.getShape(), subViewType.getElementType(),
+                tlx::wrapNoVerifyLayout(physicalEncoding));
+            Value load = self.create<ttg::LocalLoadOp>(
+                rawType, subView, asyncToken.value_or(Value()));
+            return createPinnedRegisterLayoutBoundary(self, load,
+                                                        physicalEncoding);
           },
           py::arg("subView"), py::arg("asyncToken").none(),
           py::arg("layoutEncoding") = std::nullopt)
@@ -971,21 +959,11 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding already carries an inner no_verify (from
-            // make_linear_encoding_attr). Strip it, wrap with #tlx.user_layout
-            // (the hard anchor), then a single outer #tlx.no_verify_layout, so
-            // the encoding is exactly no_verify<user_layout<L>> -- no-verify
-            // outermost (deferred for verifiers keyed off the top-level attr,
-            // e.g. TritonGPU verifyTensorLayout), user-layout inside.
-            // resolve-placeholder-layouts strips the no-verify (keeping the
-            // user-layout marker) once inlining is done and num-warps is set.
-            Attribute tensorEncoding =
-                userLayout ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(
-                                 tlx::unwrapNoVerifyLayout(layoutEncoding)))
-                           : tlx::wrapNoVerifyLayout(layoutEncoding);
-            auto newType = RankedTensorType::get(subViewType.getShape(),
-                                                 subViewType.getElementType(),
-                                                 tensorEncoding);
+            Attribute physicalEncoding =
+                tlx::getEffectiveEncoding(layoutEncoding);
+            auto newType = RankedTensorType::get(
+                subViewType.getShape(), subViewType.getElementType(),
+                tlx::wrapNoVerifyLayout(physicalEncoding));
             ttng::TMEMLoadOp loadOp =
                 asyncToken.has_value()
                     ? ttng::TMEMLoadOp::create(
@@ -994,7 +972,10 @@ void init_triton_tlx_ir(py::module_ &m) {
                     : ttng::TMEMLoadOp::create(self.getBuilder(),
                                                self.getLastLoc(), newType,
                                                subView);
-            return loadOp;
+            if (!userLayout)
+              return loadOp;
+            return createPinnedRegisterLayoutBoundary(self, loadOp,
+                                                        physicalEncoding);
           },
           py::arg("subView"), py::arg("layoutEncoding"),
           py::arg("asyncToken").none(), py::arg("userLayout") = false)

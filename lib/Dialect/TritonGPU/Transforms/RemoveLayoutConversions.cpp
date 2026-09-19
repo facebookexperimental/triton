@@ -431,9 +431,9 @@ bool isLayoutAnchor(Operation *op) {
       if (containsPinnedEncoding(rankedTy.getEncoding()))
         return true;
 
-  // A release ends propagation from the pinned side and starts a new layout
-  // region from the compiler-selected result encoding.
-  if (isa<ReleaseLayoutOp>(op))
+  // Require is a hard user-selected layout boundary; release ends that
+  // region and starts a new compiler-selected layout domain.
+  if (isa<RequireLayoutOp, ReleaseLayoutOp>(op))
     return true;
 
   if (isa<DescriptorOpInterface>(op))
@@ -464,9 +464,11 @@ bool isLayoutAnchor(Operation *op) {
 void LayoutPropagation::initAnchorLayout() {
   auto addAnchor = [&](Value v) {
     if (auto tensorType = dyn_cast<RankedTensorType>(v.getType())) {
-      // User-pinned values are unconditional anchors. Do not let the ordinary
-      // MMA profitability heuristic suppress an explicit semantic constraint.
-      if (containsPinnedEncoding(tensorType.getEncoding())) {
+      // Explicit requirements and legacy pinned encodings are unconditional
+      // anchors. Do not let the ordinary MMA profitability heuristic suppress
+      // a semantic constraint.
+      if ((v.getDefiningOp() && isa<RequireLayoutOp>(v.getDefiningOp())) ||
+          containsPinnedEncoding(tensorType.getEncoding())) {
         layouts.insert({v, LayoutInfo(tensorType.getEncoding())});
         return;
       }
@@ -1155,12 +1157,12 @@ void LayoutPropagation::resolveConflicts() {
     }
     if (info.encodings.size() <= 1)
       continue;
-    if ((op && op->hasAttr("tlx.preserve_layout")) ||
+    if ((op && (isa<RequireLayoutOp>(op) ||
+                op->hasAttr("tlx.preserve_layout"))) ||
         containsPinnedEncoding(originalType.getEncoding())) {
-      // A user pin is an invariant, not merely another profitable anchor.
-      // In particular, a nested no_verify<user_layout<MMA>> must beat a
-      // competing high-vectorization linear layout propagated from its
-      // producer.
+      // An explicit requirement is an invariant, not merely another
+      // profitable anchor. Legacy pinned wrappers follow the same rule until
+      // their frontend lowers them to a require-layout boundary.
       info.encodings.clear();
       info.encodings.insert(originalType.getEncoding());
       continue;
@@ -1574,7 +1576,8 @@ void LayoutPropagation::rewriteRequireLayoutOp(RequireLayoutOp requireOp) {
 }
 
 bool canBeRemat(Operation *op) {
-  if (op->hasAttr("tlx.preserve_layout") || isa<ReleaseLayoutOp>(op))
+  if (op->hasAttr("tlx.preserve_layout") ||
+      isa<RequireLayoutOp, ReleaseLayoutOp>(op))
     return false;
   // A pinned result is a semantic boundary.  Cloning its producer in a
   // different encoding would bypass the user-requested layout even if the

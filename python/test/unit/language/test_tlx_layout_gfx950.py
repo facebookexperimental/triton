@@ -314,8 +314,8 @@ def test_amd_mfma_layout_anchors_on_cdna4():
     compiled = kernel.warmup(x, y, shared, dot0, mma, x_store, acc_store, grid=(1, ), num_warps=4)
     ttir = compiled.asm["ttir"]
     ttgir = compiled.asm["ttgir"]
-    # Hard destination anchors express both conversions without a public
-    # release-layout operation.
+    # Explicit-layout producers and public pins use the same SSA boundary.
+    assert ttir.count("tlx.require_layout") >= 4
     assert "#ttg.amd_mfma" in ttir
     assert "#ttg.dot_op" in ttir
     assert "#tlx.user_layout" not in ttgir

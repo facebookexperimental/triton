@@ -1,4 +1,5 @@
 // RUN: triton-opt -split-input-file --tlx-propagate-layout %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-resolve-placeholder-layouts %s | FileCheck %s --check-prefix=LOWERED
 
 // -----
 
@@ -632,6 +633,13 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
   // CHECK-DAG: #[[$PINNED_DST:.*]] = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
   // CHECK-DAG: #[[$PINNED_USER:.*]] = #tlx.user_layout<#[[$PINNED_DST]]>
   // CHECK-LABEL: @pinned_require_layout_on_tensor
+  // LOWERED-NOT: #tlx.user_layout
+  // LOWERED-NOT: #tlx.no_verify_layout
+  // LOWERED-LABEL: @pinned_require_layout_on_tensor
+  // LOWERED-NOT: tlx.preserve_layout
+  // LOWERED: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #{{.*}}>
+  // LOWERED-NOT: tlx.preserve_layout
+  // LOWERED: tt.return
   // CHECK-NOT: ttg.convert_layout
   // CHECK: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #tlx.no_verify_layout<#[[$PINNED_USER]]>>
   tt.func public @pinned_require_layout_on_tensor(%arg0: tensor<64x64xf32, #pinned_src>) -> tensor<64x64xf32, #pinned_user> attributes {noinline = false} {
