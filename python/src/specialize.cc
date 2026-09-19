@@ -149,6 +149,8 @@ static PyObject *nvTmaDesc_str = nullptr;
 static PyObject *base_attr = nullptr;
 static PyObject *data_ptr_attr = nullptr;
 static PyObject *dtype_attr = nullptr;
+static PyObject *untyped_storage_attr = nullptr;
+static PyObject *size_attr = nullptr;
 static PyObject *cache_key_attr = nullptr;
 static PyObject *_fields_attr = nullptr;
 static PyObject *block_shape_attr = nullptr;
@@ -197,6 +199,8 @@ void init_interned_strings() {
   base_attr = intern_from_string("base");
   data_ptr_attr = intern_from_string("data_ptr");
   dtype_attr = intern_from_string("dtype");
+  untyped_storage_attr = intern_from_string("untyped_storage");
+  size_attr = intern_from_string("size");
   cache_key_attr = intern_from_string("cache_key");
   _fields_attr = intern_from_string("_fields");
   block_shape_attr = intern_from_string("block_shape");
@@ -1089,17 +1093,41 @@ slow_path:
   return is_const ? (TC_PTR_CONST_BASE + code) : (TC_PTR_BASE + code);
 }
 
+static bool fc_get_tensor_metadata_slow(PyObject *arg, uint64_t *ptr,
+                                        uint64_t *storage_size) {
+  PyObject *ptr_obj = PyObject_CallMethodNoArgs(arg, data_ptr_attr);
+  if (!ptr_obj)
+    return false;
+  *ptr = PyLong_AsUnsignedLongLong(ptr_obj);
+  Py_DECREF(ptr_obj);
+  if (PyErr_Occurred())
+    return false;
+
+  PyObject *storage_obj = PyObject_CallMethodNoArgs(arg, untyped_storage_attr);
+  if (!storage_obj)
+    return false;
+  PyObject *size_obj = PyObject_CallMethodNoArgs(storage_obj, size_attr);
+  Py_DECREF(storage_obj);
+  if (!size_obj)
+    return false;
+  *storage_size = PyLong_AsUnsignedLongLong(size_obj);
+  Py_DECREF(size_obj);
+  return !PyErr_Occurred();
+}
+
 static int fc_get_tensor_specialization(PyObject *arg, uint64_t threshold,
                                         bool align) {
   int size_bit = 0;
   if (threshold) {
-    // Unknown size cannot be keyed safely; use Python specialization.
-    if (!g_tensor_api || !g_tensor_api->extract_tensor_metadata)
-      return -1;
     uint64_t ptr;
     uint64_t storage_size;
-    if (g_tensor_api->extract_tensor_metadata(arg, &ptr, &storage_size) < 0)
+    if (g_tensor_api && g_tensor_api->extract_tensor_metadata) {
+      if (g_tensor_api->extract_tensor_metadata(arg, &ptr, &storage_size) < 0)
+        return -1;
+    } else if (!fc_get_tensor_metadata_slow(arg, &ptr, &storage_size)) {
+      // Unknown size cannot be keyed safely; use Python specialization.
       return -1;
+    }
     size_bit = storage_size <= threshold ? 2 : 0;
     if (!align)
       return size_bit;
@@ -1645,6 +1673,8 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
   PyObject **merged_args = nullptr;
   PyObject *const *effective_args = args;
   int effective_nargs = (int)nargs;
+  uint64_t effective_options_hash = self->options_hash;
+  PyObject *option_items = nullptr;
 
   // When kwargs are present, merge them into positional args in C.
   // This mirrors the Python-side logic in jit.py run() c_cache path.
@@ -1659,7 +1689,10 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     // Copy positional args
     for (int i = 0; i < total; i++)
       merged_args[i] = (i < (int)nargs) ? (PyObject *)args[i] : Py_None;
-    // Merge kwargs by name lookup
+    // Merge kernel kwargs by name lookup.  Keywords that are not kernel
+    // parameters are compiler options (for example num_warps and
+    // waves_per_eu).  Hash those exactly like JITFunction.run() instead of
+    // forcing every fixed-option launch back through Python specialization.
     for (Py_ssize_t ki = 0; ki < nkw; ki++) {
       PyObject *name = PyTuple_GET_ITEM(kwnames, ki);
       PyObject *idx_obj = PyDict_GetItem(self->param_name_to_idx, name);
@@ -1667,12 +1700,31 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
         int idx = (int)PyLong_AsLong(idx_obj);
         if (idx >= 0 && idx < total)
           merged_args[idx] = (PyObject *)args[nargs + ki];
+      } else {
+        if (!option_items) {
+          option_items = PyList_New(0);
+          if (!option_items)
+            goto error;
+        }
+        PyObject *item = PyTuple_Pack(2, name, args[nargs + ki]);
+        if (!item || PyList_Append(option_items, item) < 0) {
+          Py_XDECREF(item);
+          goto error;
+        }
+        Py_DECREF(item);
       }
-      // kwargs not in param_name_to_idx are "options" — affect hash only.
-      // For now, treat them as cache-miss (different options_hash) and
-      // fallback.
-      else
-        goto fallback;
+    }
+    if (option_items) {
+      if (PyList_Sort(option_items) < 0)
+        goto error;
+      PyObject *option_tuple = PyList_AsTuple(option_items);
+      if (!option_tuple)
+        goto error;
+      Py_hash_t option_hash = PyObject_Hash(option_tuple);
+      Py_DECREF(option_tuple);
+      if (option_hash == -1)
+        goto error;
+      effective_options_hash = (uint64_t)option_hash;
     }
     effective_args = merged_args;
     effective_nargs = total;
@@ -1699,7 +1751,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
 
     FCCacheKey key;
     if (!fc_build_key(key, cache, effective_args, effective_nargs,
-                      self->options_hash))
+                      effective_options_hash))
       goto fallback;
 
     FCEntry *entry = cache->lookup(key, effective_args);
@@ -1767,20 +1819,27 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     if (!result) {
       // Propagate error — dispatcher may have partially launched.
       // Do NOT fallback (would risk double-launch).
+      Py_XDECREF(option_items);
       return nullptr;
     }
     Py_DECREF(result);
     Py_INCREF(kernel);
     if (g_cache_stats)
       cache_stats_record(self->kernel_name, "jit_proxy_hit");
+    Py_XDECREF(option_items);
     return kernel;
   }
+
+error:
+  Py_XDECREF(option_items);
+  return nullptr;
 
 fallback:
   // Fall through to Python: self.run(*args, grid=grid, warmup=False, **kwargs)
   // Use Vectorcall to preserve any keyword arguments from kwnames.
   if (g_cache_stats)
     cache_stats_record(self->kernel_name, "jit_proxy_fallback");
+  Py_XDECREF(option_items);
   return PyObject_Vectorcall(self->run_partial, args, nargsf, kwnames);
 }
 

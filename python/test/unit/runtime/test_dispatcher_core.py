@@ -17,9 +17,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import knobs
-from triton._internal_testing import is_cuda
-
-pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+from triton._internal_testing import is_cuda, is_hip
 
 
 @contextlib.contextmanager
@@ -59,6 +57,9 @@ def _disp_scalar_mix(x_ptr, out_ptr, fscale, iadd, N, BLOCK: tl.constexpr):
 @triton.jit
 def _disp_nop():
     pass
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_add_numerics():
     N = 4096
     x = torch.randn(N, device="cuda")
@@ -68,6 +69,9 @@ def test_dispatcher_core_add_numerics():
     with force_dispatcher():
         _disp_add[grid](x, y, out, N, BLOCK=256)
     torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_uses_default_profile_allocator(fresh_knobs):
     from triton.runtime import _allocation
 
@@ -92,6 +96,9 @@ def test_dispatcher_core_uses_default_profile_allocator(fresh_knobs):
         _allocation.set_profile_allocator(previous_profile_allocator)
 
     torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_mixed_scalar_args():
     N = 2048
     x = torch.randn(N, device="cuda")
@@ -100,10 +107,16 @@ def test_dispatcher_core_mixed_scalar_args():
     with force_dispatcher():
         _disp_scalar_mix[grid](x, out, 2.5, 3, N, BLOCK=128)
     torch.testing.assert_close(out, x * 2.5 + 3)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_nop():
     with force_dispatcher():
         _disp_nop[(1, )]()
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_empty_grid():
     N = 1024
     x = torch.randn(N, device="cuda")
@@ -113,6 +126,77 @@ def test_dispatcher_core_empty_grid():
         _disp_add[(0, )](x, y, out, N, BLOCK=256)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, torch.zeros(N, device="cuda"))
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
+def test_hip_dispatcher_add_numerics_and_direct_call():
+    """HIP binds launch metadata once and uses the vectorcall dispatcher."""
+    N = 4096
+    BLOCK = 256
+    x = torch.randn(N, device="cuda")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+    grid = triton.cdiv(N, BLOCK)
+
+    with force_dispatcher():
+        compiled = _disp_add.warmup(x, y, out, N, BLOCK=BLOCK, grid=(grid, ))
+        compiled._init_handles()
+        dispatcher = getattr(compiled, "_dispatcher", None)
+        assert dispatcher is not None
+
+        device = triton.runtime.driver.active.get_current_device()
+        stream = triton.runtime.driver.active.get_current_stream(device)
+        dispatcher(grid, 1, 1, stream, x, y, out, N)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
+def test_hip_jit_proxy_accepts_fixed_compiler_options(monkeypatch):
+    """Fixed launch-option kwargs must not force repeat Python dispatch."""
+    N = 4096
+    BLOCK = 256
+    x = torch.randn(N, device="cuda")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+
+    with force_dispatcher():
+        # Populate the compiled-kernel and C specialization caches.
+        _disp_add[(17, )](x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0)
+        torch.cuda.synchronize()
+
+        # Use a fresh static-grid proxy with the same specialization. If the
+        # compiler-option kwargs make the proxy miss, its fallback calls this
+        # replacement and fails the test. A C-cache hit bypasses run().
+        def fail_python_dispatch(*args, **kwargs):
+            raise AssertionError("fixed compiler options fell back to JITFunction.run")
+
+        monkeypatch.setattr(_disp_add, "run", fail_python_dispatch)
+        _disp_add[(19, )](x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
+def test_hip_dispatcher_rejects_pageable_cpu_pointer():
+    N = 256
+    x = torch.randn(N, device="cpu")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty_like(y)
+
+    with force_dispatcher():
+        compiled = _disp_add.warmup(y, y, out, N, BLOCK=N, grid=(1, ))
+        compiled._init_handles()
+        dispatcher = compiled._dispatcher
+        device = triton.runtime.driver.active.get_current_device()
+        stream = triton.runtime.driver.active.get_current_stream(device)
+        with pytest.raises(ValueError, match="cannot be accessed from Triton"):
+            dispatcher(1, 1, 1, stream, x, y, out, N)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_built_and_converged_path():
     """Directly verify a dispatcher is created (proves the dispatcher path is
     active, not a launchKernel fallback) and that calling it launches correctly
@@ -147,6 +231,9 @@ def _disp_pid_write(out_ptr, GX: tl.constexpr, GY: tl.constexpr):
     pid_z = tl.program_id(2)
     offset = pid_x + GX * (pid_y + GY * pid_z)
     tl.store(out_ptr + offset, offset)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_multidim_cluster():
     """An explicit multi-dimensional cluster (ctas_per_cga, which forces
     cluster_dims=(x,y,z) and num_ctas==1) must launch correctly through the
