@@ -3272,7 +3272,8 @@ struct TritonGPUInferLayoutInterface
     auto mmaBEncoding =
         dyn_cast_or_null<NvidiaMmaEncodingAttr>(bEncoding.getParent());
     auto dotOp = cast<DotOpInterface>(op);
-    auto resEnc = cast<RankedTensorType>(dotOp.getD().getType()).getEncoding();
+    auto resEnc = unwrapTlxWrappers(
+        cast<RankedTensorType>(dotOp.getD().getType()).getEncoding());
     auto mmaResEncoding = dyn_cast<NvidiaMmaEncodingAttr>(resEnc);
     if (mmaAEncoding || mmaBEncoding || mmaResEncoding) {
       // Check that they are all set and have the same version.
