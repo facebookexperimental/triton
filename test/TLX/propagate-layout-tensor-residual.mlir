@@ -12,7 +12,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK: %[[REQ:.*]] = ttg.convert_layout %{{.*}} : tensor<8x8xf16, #{{.*}}> -> tensor<8x8xf16, #{{.*}}>
     %req = tlx.require_layout %arg : tensor<8x8xf16, #blocked_a> -> tensor<8x8xf16, #blocked_b>
     // CHECK: %[[REL:.*]] = ttg.convert_layout %[[REQ]] : tensor<8x8xf16, #{{.*}}> -> tensor<8x8xf16, #{{.*}}>
-    %rel = tlx.release_layout %req : tensor<8x8xf16, #blocked_b> -> tensor<8x8xf16, #blocked_a>
+    %rel = tlx.release_layout %req {relaxed = true} : tensor<8x8xf16, #blocked_b> -> tensor<8x8xf16, #blocked_a>
     // CHECK: tt.return %[[REL]]
     tt.return %rel : tensor<8x8xf16, #blocked_a>
   }
@@ -45,7 +45,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK-NOT: tlx.release_layout
     // CHECK-NOT: ttg.convert_layout
     // CHECK: tt.return %{{.*}} : tensor<8x8xf16, #{{.*}}>
-    %rel = tlx.release_layout %arg : tensor<8x8xf16, #blocked_id> -> tensor<8x8xf16, #blocked_id>
+    %rel = tlx.release_layout %arg {relaxed = true} : tensor<8x8xf16, #blocked_id> -> tensor<8x8xf16, #blocked_id>
     tt.return %rel : tensor<8x8xf16, #blocked_id>
   }
 }

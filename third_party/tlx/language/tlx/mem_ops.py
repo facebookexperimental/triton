@@ -1072,7 +1072,7 @@ def local_load(
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
-        output = _semantic.builder.create_release_layout(load_handle)
+        output = _semantic.builder.create_release_layout(load_handle, relaxed=True)
         return tl.tensor(output, block_type)
     else:
         if layout is not None:
