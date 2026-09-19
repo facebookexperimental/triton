@@ -2816,7 +2816,8 @@ def _emit_lds_consumer_order(state, op):
         if target_value.type.representation == "token":
             dependencies.append(value)
             continue
-        dependencies.extend(state.builder.after(component) for component in _value_components(state, value, op))
+        dependencies.extend(
+            state.builder.schedule_token(component) for component in _value_components(state, value, op))
     state.values[_single_result(op)] = state.builder.after(*dependencies)
 
 

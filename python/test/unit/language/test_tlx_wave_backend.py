@@ -5356,8 +5356,9 @@ def test_tlx_wave_barrier_token_carries_lds_consumer_frontier():
     consumer_order = next(op for op in ordered.ops if op.kind == "lds_consumer_order")
     barrier = ordered.ops[barrier_id]
     assert consumer_order.operands == (consumed, )
-    assert barrier.operands[0] == consumer_order.results[0]
+    assert barrier.operands == (consumer_order.results[0], completion)
     assert converter_target_ir.attrs_dict(barrier)["dependency_count"] == 1
+    assert converter_target_ir.attrs_dict(barrier)["lds_read_dependency_count"] == 1
     assert ordered.values[consumer_order.results[0]].event_domain == (
         converter_target_ir.EVENT_DOMAIN_LDS_CONSUMER_ORDER)
 
@@ -18680,7 +18681,7 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     ]
     assert len(barrier_indices) == 1
     assert barrier_indices[0] < refill_index
-    assert "wave.after" in raw_wave
+    assert "wave.schedule_token" in raw_wave
     barrier_lines = [lines[index] for index in barrier_indices]
     assert len(barrier_lines) == 1
     release_token = _ssa_result_name(barrier_lines[0])
@@ -18701,6 +18702,15 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     assert order_projection.operands == full_barrier.results
     assert converter_target_ir.attrs_dict(full_barrier)["compiler_membar_barrier"] is True
     assert converter_target_ir.attrs_dict(full_barrier)["orders_memory_issue"] is True
+    barrier_attrs = converter_target_ir.attrs_dict(full_barrier)
+    dependency_count = int(barrier_attrs["dependency_count"])
+    lds_read_count = int(barrier_attrs["lds_read_dependency_count"])
+    lds_read_tokens = full_barrier.operands[dependency_count:dependency_count + lds_read_count]
+    local_load_tokens = tuple(result for op in output.target_program.ops if op.kind == "local_load"
+                              for result in op.results
+                              if output.target_program.values[result].type.representation == "token")
+    assert local_load_tokens
+    assert set(lds_read_tokens) == set(local_load_tokens)
     assert full_barrier.operands[0] == consumer_order.results[0]
     _run_wave_verify(wave)
     del ctx
