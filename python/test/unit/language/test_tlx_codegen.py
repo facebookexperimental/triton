@@ -918,6 +918,7 @@ def _concrete_dot_loop_helper_kernel(
     bias_ptr,
     out_ptr,
     CAST_BEFORE_RELEASE: tl.constexpr,
+    RELAXED_RELEASE: tl.constexpr,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -947,7 +948,7 @@ def _concrete_dot_loop_helper_kernel(
     result += bias
     if CAST_BEFORE_RELEASE:
         result = result.to(tl.bfloat16)
-    result = tlx.release_layout(result)
+    result = tlx.release_layout(result, relaxed=RELAXED_RELEASE)
     result = tlx.require_layout(result, consumer_layout, pin=False)
     output = tlx.require_layout(out_ptr + offsets, consumer_layout, pin=False)
     tl.store(output, result)
@@ -962,7 +963,7 @@ def test_concrete_dot_loop_helper_result_layout_compiles_gfx950():
             "bias_ptr": "*fp32",
             "out_ptr": "*fp32",
         },
-        constexprs={"CAST_BEFORE_RELEASE": False},
+        constexprs={"CAST_BEFORE_RELEASE": False, "RELAXED_RELEASE": False},
     )
     assert "amdgcn" in compiled.asm
     assert "scf.for" in compiled.asm["ttir"]
@@ -970,7 +971,8 @@ def test_concrete_dot_loop_helper_result_layout_compiles_gfx950():
     assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
 
 
-def test_release_layout_accepts_cast_helper_result_gfx950():
+@pytest.mark.parametrize("relaxed", [False, True])
+def test_release_layout_accepts_cast_helper_result_gfx950(relaxed):
     module = make_ir_for_target(
         _concrete_dot_loop_helper_kernel,
         signature={
@@ -979,14 +981,15 @@ def test_release_layout_accepts_cast_helper_result_gfx950():
             "bias_ptr": "*fp32",
             "out_ptr": "*bf16",
         },
-        constexprs={"CAST_BEFORE_RELEASE": True},
+        constexprs={"CAST_BEFORE_RELEASE": True, "RELAXED_RELEASE": relaxed},
         target=GFX950,
     )
     ttir = str(module)
     assert "tt.call" in ttir
     assert "arith.addf" in ttir
     assert "arith.truncf" in ttir
-    assert "tlx.release_layout" in ttir
+    release_line = next(line for line in ttir.splitlines() if "tlx.release_layout" in line)
+    assert ("relaxed = true" in release_line) == relaxed
     assert ttir.index("arith.truncf") < ttir.index("tlx.release_layout")
 
 
