@@ -131,6 +131,11 @@ def is_xpu():
     return False if target is None else target.backend == "xpu"
 
 
+def is_cpu():
+    target = get_current_target()
+    return False if target is None else target.backend == "cpu"
+
+
 def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None, low=None, high=None):
     """
     Override `rs` if you're calling this function twice and don't want the same
