@@ -11,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <optional>
@@ -302,16 +303,6 @@ static bool sameMemDescValue(Value lhs, Value rhs) {
   return true;
 }
 
-static Value findMemDescBase(Value value) {
-  while (Operation *def = value.getDefiningOp()) {
-    if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
-             ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
-             ttg::MemDescReshapeOp>(def))
-      break;
-    value = def->getOperand(0);
-  }
-  return value;
-}
 
 // Only a distinct local allocation proves two memory descriptors cannot
 // overlap. A block argument does not: two memdesc arguments of the same
@@ -324,8 +315,8 @@ static bool isKnownMemDescBase(Value value) {
 }
 
 static bool memDescMayAlias(Value lhs, Value rhs) {
-  Value lhsBase = findMemDescBase(lhs);
-  Value rhsBase = findMemDescBase(rhs);
+  Value lhsBase = mlir::getMemDescRoot(lhs);
+  Value rhsBase = mlir::getMemDescRoot(rhs);
   if (lhsBase == rhsBase)
     return true;
   return !(isKnownMemDescBase(lhsBase) && isKnownMemDescBase(rhsBase));
