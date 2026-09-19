@@ -2808,6 +2808,18 @@ def _emit_issue_token(state, op):
     state.values[_single_result(op)] = state.builder.issue_token(*tokens)
 
 
+def _emit_lds_consumer_order(state, op):
+    dependencies = []
+    for target_value_id in op.operands:
+        value = _require_value(state, target_value_id, op)
+        target_value = state.target_program.values[target_value_id]
+        if target_value.type.representation == "token":
+            dependencies.append(value)
+            continue
+        dependencies.extend(state.builder.after(component) for component in _value_components(state, value, op))
+    state.values[_single_result(op)] = state.builder.after(*dependencies)
+
+
 def _join_memory_tokens(state, tokens):
     tokens = _unique_tokens(tokens)
     if not tokens:
@@ -4628,6 +4640,7 @@ _TARGET_EMITTERS = {
     "token": _emit_token,
     "token_join": _emit_token_join,
     "issue_token": _emit_issue_token,
+    "lds_consumer_order": _emit_lds_consumer_order,
     "async_commit_group": _emit_async_commit_group,
     "async_wait": _emit_async_wait,
     "return": _emit_return,

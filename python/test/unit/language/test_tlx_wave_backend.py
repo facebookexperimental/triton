@@ -1148,7 +1148,7 @@ def test_tlx_fa_precompile_reuses_runtime_launch_configuration(monkeypatch):
 
 @pytest.mark.parametrize(
     "backend,simple_waves,prefetch_waves",
-    [("hip", 0, 1), ("tlx_wave", 2, 0)],
+    [("hip", 0, 1), ("tlx_wave", 2, 2)],
 )
 def test_tlx_fa_d64_causal_occupancy_is_backend_specific(monkeypatch, backend, simple_waves, prefetch_waves):
     pytest.importorskip("torch")
@@ -1175,6 +1175,9 @@ def test_tlx_fa_d64_causal_occupancy_is_backend_specific(monkeypatch, backend, s
 
     assert calls["async_simple"]["waves_per_eu"] == simple_waves
     assert calls["async_prefetch"]["waves_per_eu"] == prefetch_waves
+    if backend == "tlx_wave":
+        bench.compile_kernel_config(("async_prefetch", 1, 64, 16384, 64, True, "bf16"), num_sms=304)
+        assert calls["async_prefetch"]["waves_per_eu"] == 0
 
 
 def test_tlx_glu_parallel_precompile_defers_device_query_to_worker(monkeypatch):
@@ -5296,6 +5299,67 @@ def test_tlx_wave_converter_preserves_async_wait_source_order():
         "local_load",
         "async_wait",
     ]
+
+
+def test_tlx_wave_barrier_token_carries_lds_consumer_frontier():
+    builder = converter_target_ir.TargetBuilder()
+    token_type = converter_target_ir.TargetType("token", "token")
+    memdesc_type = converter_target_ir.TargetType("memdesc", "memdesc", "f16")
+    tensor_type = converter_target_ir.TargetType("tensor", "simd_tuple", "f16", 64, 1)
+    memdesc = builder.add_value(memdesc_type)
+    loaded = builder.add_value(tensor_type)
+    completion = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+    )
+    consumed = builder.add_value(tensor_type)
+    after = builder.add_value(tensor_type)
+    builder.add_op(
+        "local_load",
+        operands=(memdesc, ),
+        results=(loaded, completion),
+        attrs={
+            "data_result_count": 1,
+            "completion_result_count": 1,
+            "explicit_dependency_count": 0,
+            "barrier_order_dependency_count": 0,
+        },
+        source_op_index=0,
+    )
+    builder.add_op(
+        "binary",
+        operands=(loaded, loaded),
+        results=(consumed, ),
+        attrs={"operation": "addi"},
+        source_op_index=1,
+    )
+    barrier_id = builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 31,
+            "dependency_count": 0,
+            "orders_memory_issue": True,
+            "compiler_membar_barrier": True,
+        },
+        source_op_index=2,
+    )
+    builder.add_op(
+        "binary",
+        operands=(consumed, consumed),
+        results=(after, ),
+        attrs={"operation": "addi"},
+        source_op_index=3,
+    )
+
+    ordered = converter_barrier_order.thread_barrier_issue_order(builder.build())
+
+    consumer_order = next(op for op in ordered.ops if op.kind == "lds_consumer_order")
+    barrier = ordered.ops[barrier_id]
+    assert consumer_order.operands == (consumed, )
+    assert barrier.operands[0] == consumer_order.results[0]
+    assert converter_target_ir.attrs_dict(barrier)["dependency_count"] == 1
+    assert ordered.values[consumer_order.results[0]].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_LDS_CONSUMER_ORDER)
 
 
 def _target_async_wait_local_load_program(load_kind):
@@ -18569,18 +18633,23 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     %acc = arith.constant dense<0.000000e+00> : tensor<64x128xf32, #mma>
     %dot = tt.dot %lhs, %rhs, %acc : tensor<64x32xf16, #dot0> * tensor<32x128xf16, #dot1> -> tensor<64x128xf32, #mma>
     %out_offset = arith.constant dense<0> : tensor<64x128xi32, #mma>
-    amdg.buffer_store %dot, %out[%out_offset] {contiguity = 1 : i32} : tensor<64x128xf32, #mma>
-    rocdl.sched.barrier none {triton.warp_pipeline.border = "mfma", triton.warp_pipeline.priority = 0 : i32}
-    ttg.barrier all
     %refill = amdg.buffer_load_to_local %arg0[%offset] mask = %mask_b stride = %stride into %a_alloc {contiguity = 2 : i32} : <f16>[tensor<64x32xi32, #linear>] -> <64x32xf16, #shared_a, #smem, mutable>
     %refill_group = ttg.async_commit_group tokens %refill
     %final_wait = ttg.async_wait %refill_group {num = 0 : i32}
+    amdg.buffer_store %dot, %out[%out_offset] {contiguity = 1 : i32} : tensor<64x128xf32, #mma>
     tt.return
   }
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
 
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    existing_barriers = frozenset(tlx_wave_compiler._barrier_ops(mod))
+    tlx_wave_compiler.amd.run_membar(mod, "gfx950")
+    compiler_barriers = tuple(op for op in tlx_wave_compiler._barrier_ops(mod) if op not in existing_barriers)
+    assert compiler_barriers
+    output = converter_pipeline.convert_ttgir_to_wave(
+        mod,
+        compiler_membar_barriers=compiler_barriers,
+    )
 
     raw_wave = output.emitted_module.text
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
@@ -18593,9 +18662,10 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
         "exec_where",
         "exec_where",
     ]
-    assert [(converter_target_ir.attrs_dict(op)["border"], converter_target_ir.attrs_dict(op)["mask"])
-            for op in output.target_program.ops
-            if op.kind == "sched_barrier"] == [("mfma", 0)]
+    assert all(op.kind != "sched_barrier" for op in output.target_program.ops)
+    mma = next(op for op in output.target_program.ops if op.kind == "mma")
+    consumer_order = next(op for op in output.target_program.ops
+                          if op.kind == "lds_consumer_order" and mma.results[0] in op.operands)
     assert raw_wave.count("wave.where") == 2
     assert sum("wave.gather" in line and "#waveamd.buffer" in line for line in raw_wave.splitlines()) == 2
     assert sum("wave.scatter" in line and "#wave.shared" in line for line in raw_wave.splitlines()) == 2
@@ -18608,10 +18678,9 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     barrier_indices = [
         index for index, line in enumerate(lines[mma_index + 1:refill_index], mma_index + 1) if "wave.barrier" in line
     ]
-    sched_barrier_indices = [index for index, line in enumerate(lines) if "wave.sched_barrier" in line]
     assert len(barrier_indices) == 1
-    assert len(sched_barrier_indices) == 1
-    assert sched_barrier_indices[0] < barrier_indices[0] < refill_index
+    assert barrier_indices[0] < refill_index
+    assert "wave.after" in raw_wave
     barrier_lines = [lines[index] for index in barrier_indices]
     assert len(barrier_lines) == 1
     release_token = _ssa_result_name(barrier_lines[0])
@@ -18630,7 +18699,9 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
         kind="barrier",
     )
     assert order_projection.operands == full_barrier.results
-    assert converter_target_ir.attrs_dict(full_barrier)["address_space"] == 31
+    assert converter_target_ir.attrs_dict(full_barrier)["compiler_membar_barrier"] is True
+    assert converter_target_ir.attrs_dict(full_barrier)["orders_memory_issue"] is True
+    assert full_barrier.operands[0] == consumer_order.results[0]
     _run_wave_verify(wave)
     del ctx
 

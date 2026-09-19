@@ -1035,12 +1035,16 @@ def _async_simple_default_waves_per_eu(head_dim, causal):
     return 2 if is_wave and causal and head_dim <= 64 else 0
 
 
-def _async_prefetch_default_waves_per_eu(head_dim, causal):
-    # LLVM's D64 causal prefetch schedule needs one resident wave to prevent
-    # LLVM from selecting the slower unconstrained allocation. Wave already
-    # selects that allocation without an occupancy constraint.
+def _async_prefetch_default_waves_per_eu(head_dim, causal, n_ctx):
+    # D64 causal prefetch needs occupancy on shorter loops, where latency
+    # hiding outweighs the spill cost. Longer loops amortize the one-wave
+    # schedule and retain more of the accumulator in registers.
     is_wave = triton.runtime.driver.active.get_current_target().backend == "tlx_wave"
-    return 1 if not is_wave and causal and head_dim <= 64 else 0
+    if not causal or head_dim > 64:
+        return 0
+    if is_wave:
+        return 2 if n_ctx <= 8192 else 0
+    return 1
 
 
 def flash_attn_async_simple(q, k, v, sm_scale, causal=False, *, out=None, warmup=False, **kw):
@@ -1084,7 +1088,7 @@ def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, *, out=None, warm
     # D=128 it blows the 64KB LDS budget for double-buffered K+V.
     BLOCK_N = kw.pop("BLOCK_N", 128 if (D <= 64 and not causal) else 64)
     num_warps = kw.pop("num_warps", 4)
-    waves_per_eu = kw.pop("waves_per_eu", _async_prefetch_default_waves_per_eu(D, causal))
+    waves_per_eu = kw.pop("waves_per_eu", _async_prefetch_default_waves_per_eu(D, causal, N_CTX))
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
     compile_kwargs = {

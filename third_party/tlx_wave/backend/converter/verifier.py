@@ -400,6 +400,7 @@ def _verify_ops(target_program, source_program):
         if op.kind in {
                 "token",
                 "issue_token",
+                "lds_consumer_order",
                 "barrier",
                 "buffer_load_to_local",
                 "async_commit_group",
@@ -861,6 +862,24 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         )
         return
 
+    if op.kind == "lds_consumer_order":
+        input_count = int(attrs.get("input_count", -1))
+        if (not op.operands or len(op.results) != 1 or input_count != len(op.operands)):
+            fail(
+                "TLXW_VERIFY_PROGRAM_ORDER_SHAPE",
+                STAGE,
+                "LDS-consumer-order token requires dependencies and one result",
+                target_op_id=op.target_op_id,
+            )
+        for operand in op.operands:
+            _require_value_dominates_op(target_program, operand, op)
+        require_token(
+            op.results[0],
+            "LDS-consumer-order result",
+            {target_ir.EVENT_DOMAIN_LDS_CONSUMER_ORDER},
+        )
+        return
+
     if op.kind == "barrier":
         dependency_count = int(attrs.get("dependency_count", -1))
         lds_read_dependency_count = int(attrs.get("lds_read_dependency_count", 0))
@@ -908,7 +927,10 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             require_token(
                 operand,
                 "barrier source wait-order dependency",
-                {target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY},
+                {
+                    target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
+                    target_ir.EVENT_DOMAIN_LDS_CONSUMER_ORDER,
+                },
             )
             _require_value_dominates_op(target_program, operand, op)
         for operand in lds_read_operands:
