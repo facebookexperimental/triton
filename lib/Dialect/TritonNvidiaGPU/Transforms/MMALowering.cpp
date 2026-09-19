@@ -4,6 +4,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
@@ -59,8 +60,10 @@ struct TCGen5MMAScaleSharedToTmemConversion
 
   // Create a tmem_copy of scales from shared memory to tmem. `rows` is the M or
   // N of the MMA operation (for LHS or RHS respectively).
-  bool lowerScaleToTmem(OpOperand &operand, PatternRewriter &rewriter, int rows,
-                        TensorMemoryScalesBlockRepOrder blockRepOrder) const {
+  bool lowerScaleToTmem(
+      OpOperand &operand, PatternRewriter &rewriter, int rows,
+      TensorMemoryScalesBlockRepOrder blockRepOrder,
+      TensorMemoryCTAMode ctaMode = TensorMemoryCTAMode::DEFAULT) const {
     Location loc = operand.getOwner()->getLoc();
     MLIRContext *context = operand.getOwner()->getContext();
     Attribute tensorMemorySpace = TensorMemorySpaceAttr::get(context);
@@ -88,13 +91,40 @@ struct TCGen5MMAScaleSharedToTmemConversion
     }
     // Distribute the scales across the rows of the MMA operation.
     SmallVector<int64_t> shape = {rows, numElems / rows};
-    Attribute scaleEncoding =
-        TensorMemoryScalesEncodingAttr::get(context, CGALayout, blockRepOrder);
+    Attribute scaleEncoding = TensorMemoryScalesEncodingAttr::get(
+        context, CGALayout, blockRepOrder, ctaMode);
     Type scaleAType =
         ttg::MemDescType::get(shape, elType, scaleEncoding, tensorMemorySpace,
                               /*mutableMemory=*/true);
     auto tmemAlloc = TMEMAllocOp::create(rewriter, loc, scaleAType, Value());
-    TMEMCopyOp::create(rewriter, loc, operand.get(), tmemAlloc);
+    if (ctaMode == TensorMemoryCTAMode::TwoCTA_RHS) {
+      // The M=128 cta_group::2 Layout-B RHS consumes the high N half from
+      // row partition 64. Reinterpret the packed scale SMEM as its canonical
+      // 2D tensor and let the TMEM store layout move that basis from columns
+      // to rows. The paired MMA may issue from CTA0 only, so publish both
+      // CTAs' local stores before it can proceed.
+      auto sharedLayout = ttg::getScaleSmemLayoutForTMEMCopy(
+          context, shape, ttg::CGAEncodingAttr::get1CTALayout(context, 2));
+      auto sharedEncoding = ttg::SharedLinearEncodingAttr::get(
+          context, std::move(sharedLayout), /*alignment=*/128);
+      auto sharedViewType = ttg::MemDescType::get(
+          shape, elType, sharedEncoding, oldType.getMemorySpace(),
+          oldType.getMutableMemory());
+      Value sharedView = ttg::MemDescReinterpretOp::create(
+          rewriter, loc, sharedViewType, operand.get());
+      auto registerEncoding = getDefaultLayoutForTmemLdSt(
+          cast<ttg::MemDescType>(scaleAType),
+          ttg::lookupNumWarps(operand.getOwner()));
+      auto registerType =
+          RankedTensorType::get(shape, elType, registerEncoding);
+      Value scale = ttg::LocalLoadOp::create(rewriter, loc, registerType,
+                                             sharedView, Value());
+      Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+      TMEMStoreOp::create(rewriter, loc, tmemAlloc, scale, pred);
+      ClusterBarrierOp::create(rewriter, loc);
+    } else {
+      TMEMCopyOp::create(rewriter, loc, operand.get(), tmemAlloc);
+    }
     operand.set(tmemAlloc);
     return true;
   }
@@ -110,6 +140,16 @@ struct TCGen5MMAScaleSharedToTmemConversion
     }
     int blockM = op.getBlockM();
     int blockN = op.getBlockN();
+    auto dEncoding = cast<TensorMemoryEncodingAttr>(
+        op.getD().getType().getEncoding());
+    bool isTwoCTAM64 =
+        op.getTwoCtas() && dEncoding.getBlockM() == 64 &&
+        dEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS;
+    if (isTwoCTAM64) {
+      // A scales remain per-CTA along M. B scales describe the complete N
+      // dimension and use the Layout-B row partition selected by TwoCTA_RHS.
+      blockN *= 2;
+    }
     auto aScaleBlockRepOrder = getTensorMemoryScalesBlockRepOrder(
         op, /*isA=*/true, op.getAType(), op.getBType(),
         aScaleType.getElementType(), bScaleType.getElementType());
@@ -123,8 +163,10 @@ struct TCGen5MMAScaleSharedToTmemConversion
                    anyChanged;
     }
     if (isa<ttg::SharedMemorySpaceAttr>(bScaleType.getMemorySpace())) {
+      auto bScaleCTAMode = isTwoCTAM64 ? TensorMemoryCTAMode::TwoCTA_RHS
+                                      : TensorMemoryCTAMode::DEFAULT;
       anyChanged = lowerScaleToTmem(op.getBScaleMutable(), rewriter, blockN,
-                                    bScaleBlockRepOrder) ||
+                                    bScaleBlockRepOrder, bScaleCTAMode) ||
                    anyChanged;
     }
     return LogicalResult::success(anyChanged);

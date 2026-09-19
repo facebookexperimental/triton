@@ -1621,8 +1621,11 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   }
   if (enc.getFp4Padded())
     return emitOpError("accumulator layout must not be fp4_padded");
-  if (enc.getBlockM() != 128)
-    return emitOpError("only supports instruction shape blockM=128");
+  bool isTwoCTAM64 = getTwoCtas() && enc.getBlockM() == 64 &&
+                     enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS;
+  if (enc.getBlockM() != 128 && !isTwoCTAM64)
+    return emitOpError(
+        "only supports blockM=128 or two-CTA blockM=64 with TwoCTA_RHS");
   if (auto lhsEnc =
           dyn_cast<TensorMemoryEncodingAttr>(getA().getType().getEncoding())) {
     if (failed(verifyScaledLHSOperand(getOperation(),

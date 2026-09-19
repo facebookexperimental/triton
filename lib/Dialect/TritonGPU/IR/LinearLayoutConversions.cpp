@@ -17,6 +17,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
+using mlir::triton::nvidia_gpu::TensorMemoryCTAMode;
 using mlir::triton::nvidia_gpu::TensorMemoryEncodingAttr;
 using mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder;
 using mlir::triton::nvidia_gpu::TensorMemoryScalesEncodingAttr;
@@ -1287,6 +1288,19 @@ tensorMemoryScalesToLinearLayout(ArrayRef<int64_t> shape,
     // mnThenK uses repOrder = [0, 1] at the repeated block level.
     tile *= LinearLayout::identity1D(repsMn, kCol, dims[0]) *
             LinearLayout::identity1D(repsK, kCol, dims[1]);
+  }
+
+  if (encoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS) {
+    assert(shapePerCTA == ArrayRef<int64_t>({128, 4}) &&
+           "two-CTA RHS scales require an N128 x K4 tile");
+    // In the M=128 cta_group::2 Layout-B data path, the high N half is
+    // selected through TMEM row partition 64 (PTX Figure 213). Move that N
+    // basis from columns to rows while retaining partition 32 as a broadcast.
+    auto bases = tile.getBases();
+    bases[kRow].back() = bases[kCol].back();
+    bases[kCol].pop_back();
+    tile = LinearLayout(std::move(bases), tile.getOutDims(),
+                        tile.isSurjective());
   }
   // Add a trivial block dimension
   tile *= LinearLayout::identity1D(1, kBlock, dims[0]);

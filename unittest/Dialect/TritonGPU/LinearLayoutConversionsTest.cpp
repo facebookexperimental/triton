@@ -3474,9 +3474,11 @@ TEST_F(LinearLayoutConversionsTest, TensorMemoryScales_BlockRepOrder) {
   auto kCol = S("col");
   auto cgaLayout = CGAEncodingAttr::get1CTALayout(&ctx, /*rank=*/2);
   auto encKThenMn = TensorMemoryScalesEncodingAttr::get(
-      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::K_THEN_MN);
+      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::K_THEN_MN,
+      nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
   auto encMnThenK = TensorMemoryScalesEncodingAttr::get(
-      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K);
+      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
+      nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
 
   LinearLayout expectedKThenMn = LinearLayout::identity1D(32, kRow, d0) *
                                  LinearLayout::zeros1D(4, kRow, d0) *
@@ -3490,6 +3492,30 @@ TEST_F(LinearLayoutConversionsTest, TensorMemoryScales_BlockRepOrder) {
 
   EXPECT_NE(toLinearLayout({256, 8}, encKThenMn),
             toLinearLayout({256, 8}, encMnThenK));
+}
+
+TEST_F(LinearLayoutConversionsTest, TensorMemoryScales_TwoCTARHS) {
+  auto d0 = S("dim0");
+  auto d1 = S("dim1");
+  auto kBlock = S("block");
+  auto kRow = S("row");
+  auto kCol = S("col");
+  auto cgaLayout = CGAEncodingAttr::get1CTALayout(&ctx, /*rank=*/2);
+  auto enc = TensorMemoryScalesEncodingAttr::get(
+      &ctx, cgaLayout,
+      nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
+      nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS);
+
+  // N[0:32] selects rows 0:32, N[32:64] advances one TMEM column,
+  // and N[64:128] selects row partition 64. Partition 32 remains a
+  // broadcast so both M warp partitions see the same B scales.
+  LinearLayout expected(
+      {{kRow,
+        {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}, {64, 0}}},
+       {kCol, {{0, 1}, {0, 2}, {32, 0}}},
+       {kBlock, {}}},
+      {d0, d1});
+  EXPECT_EQ(toLinearLayout({128, 4}, enc), expected);
 }
 
 // Tests for SM120 DotScaled Scale Layout
