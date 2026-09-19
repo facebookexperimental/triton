@@ -31,3 +31,62 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %1#0 : tensor<64x2xf32, #blocked>
   }
 }
+
+// -----
+
+// Multiple rematerializations of the same region result must remain live in
+// the cache while the region is rewritten.
+
+// CHECK-LABEL: @if_result_multi_encoding_cache
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.return
+#remat_blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#remat_blocked2 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#remat_blocked3 = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @if_result_multi_encoding_cache(%arg0: i1) -> (tensor<32xf32, #remat_blocked2>, tensor<32xf32, #remat_blocked3>) {
+    %cst = arith.constant dense<1.000000e+00> : tensor<32xf32, #remat_blocked1>
+    %cst_0 = arith.constant dense<3.000000e+00> : tensor<32xf32, #remat_blocked1>
+    %0 = scf.if %arg0 -> (tensor<32xf32, #remat_blocked1>) {
+      scf.yield %cst_0 : tensor<32xf32, #remat_blocked1>
+    } else {
+      scf.yield %cst : tensor<32xf32, #remat_blocked1>
+    }
+    %1 = ttg.convert_layout %0 : tensor<32xf32, #remat_blocked1> -> tensor<32xf32, #remat_blocked2>
+    %2 = ttg.convert_layout %0 : tensor<32xf32, #remat_blocked1> -> tensor<32xf32, #remat_blocked3>
+    tt.return %1, %2 : tensor<32xf32, #remat_blocked2>, tensor<32xf32, #remat_blocked3>
+  }
+}
+
+// -----
+
+// A narrowing cast must stay before a cross-thread layout conversion. Moving
+// the conversion above the cast communicates the wider input representation
+// and can double the shared-memory traffic.
+
+// CHECK-LABEL: @narrow_before_cross_thread_convert
+// CHECK: %[[DOT:.*]] = tt.dot_scaled
+// CHECK-NEXT: %[[NARROW:.*]] = arith.truncf %[[DOT]] : tensor<256x128xf32, #mma> to tensor<256x128xbf16, #mma>
+// CHECK-NEXT: %[[CONVERT:.*]] = ttg.convert_layout %[[NARROW]]
+// CHECK-NEXT: tt.return %[[CONVERT]]
+#narrow_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#scale_a = #ttg.linear<{register = [[0, 4], [32, 0], [64, 0], [128, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[0, 0], [16, 0]], block = []}>
+#scale_b = #ttg.linear<{register = [[0, 4], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[16, 0], [0, 0]], block = []}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [32, 0], [64, 0], [128, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @narrow_before_cross_thread_convert(
+      %a: tensor<256x128xi8, #dot0>,
+      %a_scale: tensor<256x8xi8, #scale_a>,
+      %b: tensor<128x128xi8, #dot1>,
+      %b_scale: tensor<128x8xi8, #scale_b>,
+      %acc: tensor<256x128xf32, #mma>) -> tensor<256x128xbf16, #linear> {
+    %dot = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %acc lhs = e2m1 rhs = e2m1 {fastMath = false} : tensor<256x128xi8, #dot0>, tensor<256x8xi8, #scale_a> * tensor<128x128xi8, #dot1>, tensor<128x8xi8, #scale_b> -> tensor<256x128xf32, #mma>
+    %0 = ttg.convert_layout %dot : tensor<256x128xf32, #mma> -> tensor<256x128xf32, #narrow_blocked>
+    %1 = arith.truncf %0 : tensor<256x128xf32, #narrow_blocked> to tensor<256x128xbf16, #narrow_blocked>
+    %2 = ttg.convert_layout %1 : tensor<256x128xbf16, #narrow_blocked> -> tensor<256x128xbf16, #linear>
+    tt.return %2 : tensor<256x128xbf16, #linear>
+  }
+}

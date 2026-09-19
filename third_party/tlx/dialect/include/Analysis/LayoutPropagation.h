@@ -6,12 +6,62 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include <optional>
 #include <utility>
 
 using namespace mlir::dataflow;
 
 namespace mlir::triton::tlx {
+
+//===----------------------------------------------------------------------===//
+// LogicalInvariantBits
+//===----------------------------------------------------------------------===//
+
+/// Tracks logical coordinate bits that may be toggled without changing a
+/// tensor value. Unlike AxisInfo constancy, this represents periodic equality
+/// through flatten/reshape operations. The bit numbering concatenates the
+/// little-endian bits of each logical dimension in dimension order, matching
+/// Triton's LinearLayout output-coordinate convention.
+class LogicalInvariantBits {
+public:
+  LogicalInvariantBits() = default;
+  explicit LogicalInvariantBits(llvm::SmallBitVector bits)
+      : bits(std::move(bits)) {}
+
+  bool isUninitialized() const { return !bits.has_value(); }
+  const llvm::SmallBitVector &getBits() const {
+    assert(bits.has_value());
+    return *bits;
+  }
+
+  bool operator==(const LogicalInvariantBits &rhs) const {
+    return bits == rhs.bits;
+  }
+  static LogicalInvariantBits join(const LogicalInvariantBits &lhs,
+                                   const LogicalInvariantBits &rhs);
+  void print(raw_ostream &os) const;
+
+private:
+  std::optional<llvm::SmallBitVector> bits;
+};
+
+class LogicalInvariantBitsLattice : public Lattice<LogicalInvariantBits> {
+public:
+  using Lattice::Lattice;
+};
+
+class LogicalInvariantBitsAnalysis
+    : public SparseForwardDataFlowAnalysis<LogicalInvariantBitsLattice> {
+public:
+  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
+
+  LogicalResult
+  visitOperation(Operation *op,
+                 ArrayRef<const LogicalInvariantBitsLattice *> operands,
+                 ArrayRef<LogicalInvariantBitsLattice *> results) override;
+  void setToEntryState(LogicalInvariantBitsLattice *lattice) override;
+};
 
 /// Region carriers are transparent to both the insert-time dot-path discovery
 /// and the later tensor-constraint propagation pass.

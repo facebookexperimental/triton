@@ -725,7 +725,6 @@ public:
     if (rank == 3) {
       tilesPerWarp.insert(tilesPerWarp.begin(), 1);
     }
-
     ttg::AMDMfmaEncodingAttr mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
         oldRetType.getContext(), mfmaVersion, warpsPerTile, {mDim, nDim, kDim},
         isTransposed, CGALayout, tilesPerWarp,
