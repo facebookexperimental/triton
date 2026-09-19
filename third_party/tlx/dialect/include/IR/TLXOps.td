@@ -291,10 +291,13 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
     propagation may choose an encoding independently of the source. The
     source may be encoding-free, in which case there is no layout to release
     and the operation is a no-op. The result may be unencoded in TTIR or carry
-    the layout selected during TTGIR propagation.
+    the layout selected during TTGIR propagation. A relaxed release inserted
+    by TLX implementation details may be optimized through; the default release
+    remains a boundary across repeated layout propagation.
   }];
 
-  let arguments = (ins TT_Tensor:$src);
+  let arguments = (ins TT_Tensor:$src,
+                       DefaultValuedAttr<BoolAttr, "false">:$relaxed);
 
   let results = (outs TT_Tensor:$result);
 

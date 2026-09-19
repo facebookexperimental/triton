@@ -298,17 +298,19 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
-      .def("create_release_layout",
-           [](TritonOpBuilder &self, Value &v) -> Value {
-             if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               auto newType = RankedTensorType::get(type.getShape(),
-                                                    type.getElementType());
-               return self.create<tlx::ReleaseLayoutOp>(newType, v);
-             } else {
-               throw std::runtime_error(
-                   "release_layout expects a ranked tensor");
-             }
-           })
+      .def(
+          "create_release_layout",
+          [](TritonOpBuilder &self, Value &v, bool relaxed) -> Value {
+            if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+              auto newType =
+                  RankedTensorType::get(type.getShape(), type.getElementType());
+              return self.create<tlx::ReleaseLayoutOp>(newType, v, relaxed);
+            } else {
+              throw std::runtime_error(
+                  "release_layout expects a ranked tensor");
+            }
+          },
+          py::arg("v"), py::arg("relaxed") = false)
       .def("create_assert_same_layout",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> void {
              self.create<tlx::AssertSameLayoutOp>(lhs, rhs);
