@@ -123,6 +123,7 @@ def _make_varlen_d128_reference_case(
     kv_heads,
     seed,
     causal=False,
+    window_size=0,
     strided_v=False,
     sm_scale=None,
 ):
@@ -170,6 +171,11 @@ def _make_varlen_d128_reference_case(
                 query_positions = torch.arange(q_length, device="cuda")
                 key_positions = torch.arange(kv_length, device="cuda")
                 scores = scores.masked_fill(key_positions[None, :] > query_positions[:, None], float("-inf"))
+                if window_size > 0:
+                    scores = scores.masked_fill(
+                        key_positions[None, :] + window_size <= query_positions[:, None],
+                        float("-inf"),
+                    )
             lse_tile = torch.logsumexp(scores, dim=1)
             p = torch.exp(scores - lse_tile[:, None])
             out_tile = (p @ v_tile).to(torch.bfloat16)
@@ -411,8 +417,10 @@ def _make_seeded_extend_attention_lengths(batch, max_context, seed):
 
 def test_varlen_d128_backward_api_defaults_to_noncausal():
     causal = inspect.signature(amd_fa_varlen_bwd.fa_varlen_backward).parameters["causal"]
+    window_size = inspect.signature(amd_fa_varlen_bwd.fa_varlen_backward).parameters["window_size"]
 
     assert causal.default is False
+    assert window_size.default == 0
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -515,6 +523,7 @@ def test_varlen_d128_kv_partial_workspace_shapes():
         pytest.param([7, 31, 65], [33, 257, 7], 2, 2, (0, 0), id="mha-mixed-full-tail"),
         pytest.param([1, 17], [1, 127], 2, 2, (0, 0), id="mha-all-tail"),
         pytest.param([16, 32], [128, 256], 2, 2, (0, 0), id="mha-all-full"),
+        pytest.param([17, 17, 17], [257, 257, 257], 2, 2, (0, 0), id="mha-uniform-interleaved"),
         pytest.param([1, 17], [1, 96], 4, 4, (0, 0), id="mha-k96-all-tail"),
         pytest.param([1, 17, 33], [96, 224, 128], 4, 4, (0, 0), id="mha-tail-96"),
         pytest.param([1, 17, 33], [97, 225, 128], 4, 4, (0, 0), id="mha-tail-97"),
@@ -598,6 +607,63 @@ def test_varlen_d128_causal_mha_boundaries_gfx950():
         relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
             reference.float())
         assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("split_dq", (False, True), ids=("atomic", "q-owner"))
+def test_varlen_d128_causal_window_split_dq_gfx950(monkeypatch, split_dq):
+    core_kernel = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
+    owner_kernel = amd_fa_varlen_bwd._varlen_bwd_dq_owner_kernel
+    core_kernel.device_caches.clear()
+    owner_kernel.device_caches.clear()
+    lengths = [65, 129]
+    window_size = 33
+    case = _make_varlen_d128_reference_case(
+        lengths,
+        lengths,
+        q_heads=2,
+        kv_heads=2,
+        seed=543,
+        causal=True,
+        window_size=window_size,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    threshold = 1 if split_dq else 1 << 30
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_SPLIT_DQ_MIN_AVERAGE_Q", threshold)
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=True,
+        window_size=window_size,
+    )
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    core_objects = tuple(core_kernel.device_caches[device][0].values())
+    assert len(core_objects) == 2
+    if split_dq:
+        owner_objects = tuple(owner_kernel.device_caches[device][0].values())
+        assert len(owner_objects) == 1
+        for compiled in (*core_objects, *owner_objects):
+            _assert_scratch_free("split_dq", compiled)
+            assert not re.search(r"\b\w*atomic\w*\b", compiled.asm["amdgcn"])
+    else:
+        assert not owner_kernel.device_caches[device][0]
+        assert all("buffer_atomic_add_f32" in compiled.asm["amdgcn"] for compiled in core_objects)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1210,7 +1276,8 @@ def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
         assert "amdg.rematerialized_range 0 to 128 identity 32" not in ttir
         assert "amdg.rematerialized_range 0 to 16 identity 33" not in ttir
         assert "arith.cmpi sle" not in ttir
-        assert "buffer_atomic_pk_add_bf16" in interleaved.asm["amdgcn"]
+        assert "buffer_atomic_add_f32" in interleaved.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in interleaved.asm["amdgcn"]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1245,7 +1312,8 @@ def test_varlen_d128_causal_codegen_is_scratch_free_gfx950():
         assert ttir.count("arith.cmpi sle") == 1
         assert "arith.select" in ttir
         assert re.search(r"tt\.addptr %V, %\w+ : !tt\.ptr<bf16>, i64", ttir)
-        assert "buffer_atomic_pk_add_bf16" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_add_f32" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in compiled.asm["amdgcn"]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1280,4 +1348,5 @@ def test_varlen_d128_split_codegen_is_scratch_free_gfx950():
             assert compiled.metadata.num_warps == 4
             assert compiled.metadata.shared == expected_shared
     for compiled in kernels[0].device_caches[device][0].values():
-        assert "buffer_atomic_pk_add_bf16" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_add_f32" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in compiled.asm["amdgcn"]
