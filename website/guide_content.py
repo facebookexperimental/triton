@@ -45,7 +45,7 @@ pip install --pre fbtriton \
   --index-url https://facebookexperimental.github.io/triton/nightly/simple/
 ```
 
-Each nightly is built from the newest `main` commit whose GPU and CI checks are all green, and reports a version of the form `3.8.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies are retained for about 30 days. Binary wheels cover CPython 3.10 through 3.14.
+Each nightly is built from the newest `main` commit whose GPU and CI checks are all green, and reports a version of the form `3.9.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies are retained for about 30 days. Binary wheels cover CPython 3.10 through 3.14.
 
 FBTriton is intended as a drop-in replacement for upstream Triton on a best-effort basis: it tracks upstream closely, and existing Triton kernels are expected to work unchanged. That is not a formal guarantee — if something that works upstream breaks here, please file an issue.
 
