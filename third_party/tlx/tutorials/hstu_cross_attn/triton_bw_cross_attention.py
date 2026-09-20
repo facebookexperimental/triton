@@ -233,6 +233,46 @@ _HSTU_BWD_DOT_ATTRS_2KV_B1 = FrozenDotAttrs({
     # blocks); only its input operand (opndB smem) is b1's own (id 9).
     "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,9", "opndD,tmem,1,11"]},
 })
+
+# TLX keeps Q and dO in depth-two SMEM rings while its MMA/compute task loops
+# remain single-stage. This alternate channel set isolates that buffering choice
+# from software-pipelining the entire AutoWS loop.
+_HSTU_BWD_DOT_ATTRS_2KV_QDO2 = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndB,smem,2,1", "opndD,tmem,1,2"]},
+    "dv": {
+        "stage": "0",
+        "order": "2",
+        "channels": ["opndA,tmem,1,2", "opndB,smem,2,3", "opndD,tmem,1,7"],
+    },
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndB,smem,2,3", "opndD,tmem,1,5"]},
+    "dk_shared": {
+        "stage": "1",
+        "order": "1",
+        "channels": ["opndA,smem,1,8", "opndB,smem,2,1", "opndD,tmem,1,7"],
+    },
+})
+_HSTU_BWD_DOT_ATTRS_2KV_B1_QDO2 = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndB,smem,2,1", "opndD,tmem,1,12"]},
+    "dv": {
+        "stage": "0",
+        "order": "2",
+        "channels": ["opndA,tmem,1,12", "opndB,smem,2,3", "opndD,tmem,1,17"],
+    },
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndB,smem,2,3", "opndD,tmem,1,5"]},
+    "dk_shared": {
+        "stage": "1",
+        "order": "1",
+        "channels": ["opndA,smem,1,9", "opndB,smem,2,1", "opndD,tmem,1,17"],
+    },
+})
+_HSTU_ATTRS_QKT_2KV_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_QDO2.get("qkT"))
+_HSTU_ATTRS_DV_2KV_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_QDO2.get("dv"))
+_HSTU_ATTRS_DPT_2KV_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_QDO2.get("dpT"))
+_HSTU_ATTRS_DK_SHARED_2KV_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_QDO2.get("dk_shared"))
+_HSTU_ATTRS_QKT_2KV_B1_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1_QDO2.get("qkT"))
+_HSTU_ATTRS_DV_2KV_B1_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1_QDO2.get("dv"))
+_HSTU_ATTRS_DPT_2KV_B1_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1_QDO2.get("dpT"))
+_HSTU_ATTRS_DK_SHARED_2KV_B1_QDO2 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1_QDO2.get("dk_shared"))
 _HSTU_ATTRS_QKT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("qkT"))
 _HSTU_ATTRS_DV_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dv"))
 _HSTU_ATTRS_DPT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dpT"))
@@ -2079,9 +2119,11 @@ def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
                 "BLOCK_M": M,
                 "BLOCK_N": N,
                 "INNER_PICK": pick,
+                "QDO_BUFFER_DEPTH": 1,
             },
             num_stages=ns,
             num_warps=nw,
+            minRegAutoWS=40,
             maxRegAutoWS=192,
             pre_hook=_bwd_pre_hook_redq_v3,
         )
@@ -2175,6 +2217,8 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
     # TRITON_USE_LIST_SCHEDULE=1. See _get_triton_bw_redq_2kv_configs.
     # pyrefly: ignore [bad-function-definition]
     INNER_PICK: tl.constexpr = 0,
+    # pyrefly: ignore [bad-function-definition]
+    QDO_BUFFER_DEPTH: tl.constexpr = 1,
 ):
     """MANUAL 2-KV-block data-partition fork of `_hstu_attn_bwd_redq`.
 
@@ -2312,6 +2356,7 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
             AUTOWS,
             WS_ON,
             INNER_PICK,
+            QDO_BUFFER_DEPTH,
         )
 
 
@@ -3701,6 +3746,8 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     # otherwise. Only the inner loop is autotuned (outer keeps one schedule).
     # pyrefly: ignore [bad-function-definition]
     INNER_PICK: tl.constexpr = 0,
+    # pyrefly: ignore [bad-function-definition]
+    QDO_BUFFER_DEPTH: tl.constexpr = 1,
 ):
     """MANUAL 2-KV-block fork of `_hstu_attn_bwd_inner`.
 
@@ -3761,12 +3808,19 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # q/do are loaded ONCE and shared by both KV blocks.
         q = desc_q.load([q_offset.to(tl.int32), off_h * stride_qh])
         do = desc_do.load([q_offset.to(tl.int32), off_h * stride_doh])
+        if num_softmax_heads > 0:
+            # Both KV halves use the same per-Q softmax statistics. Hoist the
+            # loads to match the TLX compute task instead of loading M/Delta
+            # once for each half.
+            m = tl.load(M_off + offs_m * stride_mm, mask=mask_m)
+            Di = tl.load(Delta_off + offs_m * stride_mm, mask=mask_m)
 
         # ---- KV block b0 (SHARED_KV + compute fold) ----
         qk_trans0 = tl.dot(
             k0,
             tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_QKT_2KV_QDO2 if QDO_BUFFER_DEPTH == 2 else _HSTU_ATTRS_QKT_2KV) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         ######### computation/activation for P0
@@ -3775,27 +3829,29 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         else:
             valid_mask_trans0 = offs_m[None, :] < seq_len_q
         if num_softmax_heads > 0:
-            qk_trans0, act_qk_trans0, pT0 = (_backward_softmax_activation_scaled_alpha_f32x2(
-                qk_trans0,
-                scaled_alpha,
-                valid_mask_trans0,
-                M_off,
-                offs_m,
-                stride_mm,
-                mask_m,
-                k0,
-            ))
+            qk_trans0 = fast_fma(qk_trans0, scaled_alpha, -m[None, :])
+            pT0 = tl.math.exp2(qk_trans0)
+            pT0 = tl.where(valid_mask_trans0, pT0, 0.0)
+            act_qk_trans0 = pT0.to(k0.dtype)
         else:
             qk_trans0, act_qk_trans0, pT0 = backward_silu_activation(qk_trans0, alpha, valid_mask_trans0, k0.dtype,
                                                                      scale)
-        dact_qk_trans0 = tl.dot(
-            v0,
-            tl.trans(do),
-            allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
-        )
+        if QDO_BUFFER_DEPTH == 2:
+            dact_qk_trans0 = tl.dot(
+                v0,
+                tl.trans(do),
+                allow_tf32=ALLOW_TF32,
+                attrs=_HSTU_ATTRS_DPT_2KV_QDO2 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            )
+        else:
+            dact_qk_trans0 = tl.dot(
+                v0,
+                tl.trans(do),
+                allow_tf32=ALLOW_TF32,
+                attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            )
         if num_softmax_heads > 0:
-            dqk_trans0 = _backward_d_softmax_activation_f32x2(dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0)
+            dqk_trans0 = fast_mul(pT0, dact_qk_trans0 - Di[None, :])
         else:
             dqk_trans0 = backward_d_silu_activation(dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0)
         ######### computation/activation for P1
@@ -3805,7 +3861,8 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         qk_trans1 = tl.dot(
             k1,
             tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_QKT_2KV_B1_QDO2 if QDO_BUFFER_DEPTH == 2 else _HSTU_ATTRS_QKT_2KV_B1) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans1 = backward_valid_mask(offs_m, offs_n1, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
@@ -3813,28 +3870,30 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             valid_mask_trans1 = offs_m[None, :] < seq_len_q
         # calculate pT
         if num_softmax_heads > 0:
-            qk_trans1, act_qk_trans1, pT1 = (_backward_softmax_activation_scaled_alpha_f32x2(
-                qk_trans1,
-                scaled_alpha,
-                valid_mask_trans1,
-                M_off,
-                offs_m,
-                stride_mm,
-                mask_m,
-                k1,
-            ))
+            qk_trans1 = fast_fma(qk_trans1, scaled_alpha, -m[None, :])
+            pT1 = tl.math.exp2(qk_trans1)
+            pT1 = tl.where(valid_mask_trans1, pT1, 0.0)
+            act_qk_trans1 = pT1.to(k1.dtype)
         else:
             qk_trans1, act_qk_trans1, pT1 = backward_silu_activation(qk_trans1, alpha, valid_mask_trans1, k1.dtype,
                                                                      scale)
-        dact_qk_trans1 = tl.dot(
-            v1,
-            tl.trans(do),
-            allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
-        )
+        if QDO_BUFFER_DEPTH == 2:
+            dact_qk_trans1 = tl.dot(
+                v1,
+                tl.trans(do),
+                allow_tf32=ALLOW_TF32,
+                attrs=_HSTU_ATTRS_DPT_2KV_B1_QDO2 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            )
+        else:
+            dact_qk_trans1 = tl.dot(
+                v1,
+                tl.trans(do),
+                allow_tf32=ALLOW_TF32,
+                attrs=_HSTU_ATTRS_DPT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            )
         # calculate dqk_trans
         if num_softmax_heads > 0:
-            dqk_trans1 = _backward_d_softmax_activation_f32x2(dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1)
+            dqk_trans1 = fast_mul(pT1, dact_qk_trans1 - Di[None, :])
         else:
             dqk_trans1 = backward_d_silu_activation(dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1)
 
@@ -3855,14 +3914,16 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             do,
             dk0,
             allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_DV_2KV_QDO2 if QDO_BUFFER_DEPTH == 2 else _HSTU_ATTRS_DV_2KV) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk0 = tl.dot(
             dqk_trans0,
             q,
             dk0,
             allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_DK_SHARED_2KV_QDO2 if QDO_BUFFER_DEPTH == 2 else _HSTU_ATTRS_DK_SHARED_2KV) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         # ---- KV block b1 (SHARED_KV + compute fold) ----
@@ -3882,14 +3943,16 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             do,
             dk1,
             allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_DV_2KV_B1_QDO2 if QDO_BUFFER_DEPTH == 2 else _HSTU_ATTRS_DV_2KV_B1) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk1 = tl.dot(
             dqk_trans1,
             q,
             dk1,
             allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DK_SHARED_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_DK_SHARED_2KV_B1_QDO2 if QDO_BUFFER_DEPTH == 2 else _HSTU_ATTRS_DK_SHARED_2KV_B1) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         # ONE store per Q: dq_trans already holds b0+b1.
