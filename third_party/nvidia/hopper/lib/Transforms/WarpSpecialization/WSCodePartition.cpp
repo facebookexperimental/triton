@@ -564,26 +564,13 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     // consumer-before-producer pair it has no way to synchronize. Refuse to
     // hoist an op above another op that touches one of the same underlying
     // buffers. Sinking, and ops with no memdesc operand, are unaffected.
-    auto isMemDescView = [](Operation *op) {
-      return isa<ttg::MemDescIndexOp, ttg::MemDescTransOp,
-                 ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp,
-                 ttg::MemDescSubsliceOp>(op);
-    };
-    auto memDescRoot = [&](Value v) {
-      while (Operation *def = v.getDefiningOp()) {
-        if (!isMemDescView(def))
-          break;
-        v = def->getOperand(0);
-      }
-      return v;
-    };
     auto hoistsAcrossMemoryOp = [&](Operation *op, Operation *insertAfter) {
       if (!insertAfter->isBeforeInBlock(op))
         return false;
       DenseSet<Value> roots;
       for (Value v : op->getOperands())
         if (isa<ttg::MemDescType>(v.getType()))
-          roots.insert(memDescRoot(v));
+          roots.insert(mlir::getMemDescRoot(v));
       if (roots.empty())
         return false;
       for (Operation *cur = insertAfter->getNextNode(); cur && cur != op;
@@ -592,7 +579,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
           continue;
         for (Value v : cur->getOperands())
           if (isa<ttg::MemDescType>(v.getType()) &&
-              roots.contains(memDescRoot(v)))
+              roots.contains(mlir::getMemDescRoot(v)))
             return true;
       }
       return false;
@@ -5351,13 +5338,7 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   SmallVector<ttg::LocalAllocOp> buffers;
   DenseSet<Operation *> seen;
   WalkResult result = funcOp.walk([&](ttnvws::DescriptorLoadOp load) {
-    Value buffer = load.getResult();
-    while (Operation *def = buffer.getDefiningOp()) {
-      if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-               ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp>(def))
-        break;
-      buffer = def->getOperand(0);
-    }
+    Value buffer = mlir::getMemDescRoot(load.getResult());
     auto alloc = buffer.getDefiningOp<ttg::LocalAllocOp>();
     if (!alloc) {
       load.emitError("expected descriptor load destination to be backed by "

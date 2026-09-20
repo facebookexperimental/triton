@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=300000" --tritongpu-pipeline="num-stages=2" --canonicalize | FileCheck %s
+// RUN: env TRITON_WS_TMA_REDUCE_STAGING_COPIES=2 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=1 smem-budget=300000" --canonicalize | FileCheck %s --check-prefix=REDUCE2
 //
 // Reduced from the post-doTaskIdPropagate dump of the HSTU self-attention
 // CLC backward benchmark with runtime masked/unmasked activation branches.
@@ -7,6 +8,12 @@
 // tile must be peeled from the unmasked remainder loop in partition3.
 //
 // CHECK-LABEL: @_hstu_attn_bwd_clc
+// REDUCE2-LABEL: @_hstu_attn_bwd_clc
+// REDUCE2: ttg.warp_specialize
+// REDUCE2: ttg.local_alloc {{.*}}buffer.copy = 2 : i32{{.*}}buffer.tmaStaging = 2 : i32{{.*}}memdesc<2x128x32xbf16
+// REDUCE2: ttng.async_tma_store_wait {{.*}}pendings = 1 : i32
+// REDUCE2: ttng.async_tma_reduce
+// REDUCE2: ttng.async_tma_store_wait {{.*}}pendings = 0 : i32
 // CHECK: ttg.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["reduction", "gemm", "load", "computation"]
 // Task 3 is the third physical WS region (partition2; the default region is

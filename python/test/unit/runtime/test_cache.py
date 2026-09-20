@@ -15,7 +15,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_cpu
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
 
 
@@ -1226,6 +1226,8 @@ def test_preload_higher_order_kernels(device, fresh_triton_cache) -> None:
 
 
 def test_module_load_unload(device, fresh_knobs):
+    if is_cpu():
+        pytest.xfail("Requires CUDA; unclear whether applicable to CPU backend")
 
     @triton.jit
     def kernel(out_ptr, val) -> None:
@@ -1255,3 +1257,77 @@ def test_module_load_unload(device, fresh_knobs):
     assert pre_compile.module is None
     # turn on garbage collector
     gc.enable()
+
+
+def test_module_unload_uses_loading_driver(monkeypatch, fresh_knobs):
+    from types import SimpleNamespace
+    from triton.compiler import compiler
+
+    module = object()
+    function = object()
+    loading_driver_unloads = []
+    current_driver_unloads = []
+
+    loading_driver = SimpleNamespace(
+        get_current_device=lambda: 0,
+        get_current_target=lambda: SimpleNamespace(warp_size=32),
+        launcher_cls=lambda src, metadata: object(),
+        utils=SimpleNamespace(
+            load_binary=lambda *args: (module, function, 0, 0, 1024),
+            unload_module=loading_driver_unloads.append,
+        ),
+    )
+    current_driver = SimpleNamespace(utils=SimpleNamespace(unload_module=current_driver_unloads.append), )
+
+    compiled = object.__new__(compiler.CompiledKernel)
+    compiled.src = object()
+    # fbtriton-only: _build_dispatcher reads metadata.target.
+    compiled.metadata = SimpleNamespace(shared=0, num_warps=1, target=None)
+    compiled.metadata_group = {}
+    compiled.hash = "hash"
+    compiled.name = "kernel"
+    compiled.kernel = b"binary"
+    compiled.module = None
+    compiled.function = None
+    compiled._run = None
+
+    monkeypatch.setattr(compiler, "_max_shared_mem", lambda device, driver_utils: 1024)
+    monkeypatch.setattr(compiler.driver, "_active", loading_driver)
+
+    compiled._init_handles()
+    compiler.driver.set_active(current_driver)
+    compiled.__del__()
+
+    assert loading_driver_unloads == [module]
+    assert current_driver_unloads == []
+    assert compiled.module is None
+
+
+def test_max_shared_mem_cache_is_driver_specific(monkeypatch):
+    from types import SimpleNamespace
+    from triton.compiler import compiler
+
+    class DriverUtils:
+
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def get_device_properties(self, device):
+            self.calls += 1
+            return {"max_shared_mem": self.value}
+
+    cpu_utils = DriverUtils(0)
+    gpu_utils = DriverUtils(65536)
+    compiler._max_shared_mem.cache_clear()
+
+    monkeypatch.setattr(compiler.driver, "_active", SimpleNamespace(utils=cpu_utils))
+    assert compiler.max_shared_mem(0) == 0
+    compiler.driver.set_active(SimpleNamespace(utils=gpu_utils))
+    assert compiler.max_shared_mem(0) == 65536
+    compiler.driver.set_active(SimpleNamespace(utils=cpu_utils))
+    assert compiler.max_shared_mem(0) == 0
+    assert cpu_utils.calls == 1
+    assert gpu_utils.calls == 1
+
+    compiler._max_shared_mem.cache_clear()
