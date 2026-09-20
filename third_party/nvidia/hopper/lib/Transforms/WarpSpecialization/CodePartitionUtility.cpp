@@ -3379,8 +3379,31 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           firstProducer = currentProds.front();
         lastConsumer = user;
         numChannelsCreated++;
-        createChannelsForProducers(currentProds, producerTaskId, consumerIds,
-                                   tmemAllocOp.getOperation(), user, channels);
+        // Match the in-loop chained-accumulator handling above when the final
+        // consumer is immediately after the loop. Multiple same-task MMA
+        // writers form one accumulator lifecycle: acquire before the first
+        // fresh overwrite, commit after the last writer, then let the
+        // post-loop load release that single channel. Creating one channel per
+        // writer adds redundant full/empty handshakes around every outer tile.
+        if (currentProds.size() > 1 &&
+            isFreshOverwriteMMA(currentProds.front()) &&
+            isa<ttng::MMAv5OpInterface>(currentProds.back())) {
+          auto channelID = channels.size();
+          channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
+              producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+              /*isOperandD=*/true, /*isOperandDNoAcc=*/false, channelID));
+          auto *tmemCh =
+              static_cast<ttng::TmemAllocChannel *>(channels.back().get());
+          tmemCh->acquireBeforeOp = currentProds.front();
+          channels.back()->srcName =
+              getOutermostNameFromLoc(tmemAllocOp->getLoc());
+          setTmemChannelAttr(currentProds.back(), channelID, "tmem.start");
+          setTmemChannelAttr(user, channelID, "tmem.end");
+        } else {
+          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                     tmemAllocOp.getOperation(), user,
+                                     channels);
+        }
       } else {
         assert(false && "Unexpected Producer Found");
       }

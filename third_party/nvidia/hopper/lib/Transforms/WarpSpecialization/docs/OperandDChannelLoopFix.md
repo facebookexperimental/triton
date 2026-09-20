@@ -125,10 +125,21 @@ if hasBodyChannelLoop and initStore:
                                             // downstream emit acquire
                                             // outside the loop)
 
-// Step G: post-loop consumers (unchanged).
+// Step G: post-loop consumers.
 //  - For each unhandled tmem_load user outside the loop:
-//      channel P: producer = mma, consumer = load_post.
+//      If currentProds is a same-task serial MMA chain whose first writer is
+//      a fresh overwrite, create one lifecycle channel. Acquire before the
+//      first writer, commit from the last writer, and release at load_post.
+//      Otherwise create the ordinary per-producer channels.
 ```
+
+Collapsing the post-loop case is important for accumulators such as HSTU dV and
+dK. Each output tile is produced by two serial MMAs but consumed only after the
+inner loop. Treating each MMA as an independent channel adds a second
+full/empty handshake even though the accumulator is one logical lifecycle.
+The collapsed channel matches the in-loop chained-writer handling: the first
+`use_accumulator=false` MMA owns the EMPTY acquire and the last MMA owns the
+FULL completion.
 
 ### Diagnostic to Add
 
