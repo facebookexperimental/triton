@@ -14,7 +14,7 @@ import sys
 import torch
 
 try:
-    from triton.tlx.ops.kernels.mm import sm100_torch
+    from triton.language.extra.tlx.inductor import sm100_torch
     from triton.tlx.ops.kernels.mm._shapes import FOCUS as SHAPE_SUITES
     from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, flops, label, operand
 except ImportError:  # not the fbtriton fork

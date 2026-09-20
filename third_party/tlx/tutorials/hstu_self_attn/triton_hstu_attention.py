@@ -1088,38 +1088,50 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
     dqk_trans = dqk_trans.to(k.dtype)
 
+    # Match TLX's dK-before-dQ epilogue order. dK and dQ share the same
+    # stage/order annotation, so their source order is their scheduled order.
+    dk += tl.dot(
+        dqk_trans,
+        tl.trans(q_trans),
+        allow_tf32=ALLOW_TF32,
+        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
+        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
+        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
+        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
+        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
+        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if DQ_REUSE else None),
+    )
+
     if DQ_REDUCE and ENABLE_TMA:
-        # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
-        # (tl.trans(k) is a cheap memdesc_trans on the SMEM k tile), then transpose
-        # the small [BLOCK_D_Q, BLOCK_M] result to [BLOCK_M, BLOCK_D_Q] and atomic-add
-        # into global dq. Transposing the *result* (not the dqk register operand)
-        # keeps the MMA structure meta-WS can partition. DQ is pre-zeroed; the head
-        # slice is selected by the store column offset (device_desc_dq base has only
-        # the seq offset). Mirrors triton_bw_cross_attention.py's autoWS dq reduce.
-        dq_trans = (
-            tl.dot(
-                tl.trans(k),
-                dqk_trans,
+        # Direct physical dQ subtiling only helps the target-aware FP32 path.
+        # Preserve the parent transposed accumulator for target-free and BF16
+        # kernels, where the direct form regresses throughput.
+        if DQ_FP32 and HAS_NUM_TARGETS:
+            dq = tl.dot(
+                tl.trans(dqk_trans),
+                k,
                 allow_tf32=ALLOW_TF32,
-                # Keep dQ in a distinct TMEM allocation, matching TLX. Reusing
-                # dP's id5 leaves 128 columns free, which the persistent TMEM
-                # post-pass spends on a second dV accumulator copy.
                 attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
-            ) * alpha)
-        dq = tl.trans(dq_trans)
-        if not DQ_FP32:
-            dq = dq.to(k.dtype)
-        # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
-        # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
-        # compiler stages separately (the source-level analog of TLX's subtiled +
-        # depth-2 dq_store_buf staging). _split_n_2D does the register split that
-        # `dq[:, a:b]` cannot.
+            )
+        else:
+            dq = tl.trans(
+                tl.dot(
+                    tl.trans(k),
+                    dqk_trans,
+                    allow_tf32=ALLOW_TF32,
+                    attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
+                ) * alpha)
+            if not DQ_FP32:
+                dq = dq.to(k.dtype)
         dq_slice_size: tl.constexpr = BLOCK_D_Q // DQ_ITERS
         dqs = _split_n_2D(dq, DQ_ITERS)
         for _s in tl.static_range(DQ_ITERS):
+            dq_slice = dqs[_s]
+            if DQ_FP32 and HAS_NUM_TARGETS:
+                dq_slice = dq_slice * alpha
             device_desc_dq.store(
                 [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
-                dqs[_s],
+                dq_slice,
                 store_reduce="add",
             )
     else:
@@ -1138,20 +1150,6 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             ALLOW_TF32=ALLOW_TF32,
         )
 
-    # dQ and dK intentionally share the same stage/order annotation. Equal-cluster
-    # MMAs retain program order, so placing dK after dQ matches the TLX schedule.
-    # The factor `alpha` is delayed until the end of the function to reduce cost.
-    dk += tl.dot(
-        dqk_trans,
-        tl.trans(q_trans),
-        allow_tf32=ALLOW_TF32,
-        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
-        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
-        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
-        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
-        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
-        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if DQ_REUSE else None),
-    )
     return dk, dv
 
 
@@ -1953,8 +1951,11 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
         )
+    # Match the parent scaling placement outside the winning target-aware FP32
+    # specialization so the other configurations retain their prior lowering.
+    if not (DQ_FP32 and HAS_NUM_TARGETS):
+        dk = dk * alpha
     # write-back
-    dk = dk * alpha
     if ENABLE_TMA:
         dv_slices = _split_n_2D(dv, DKDV_SUBTILE)
         dv_slice_size: tl.constexpr = BLOCK_D_V // DKDV_SUBTILE
@@ -1966,9 +1967,14 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         dk_slices = _split_n_2D(dk, DKDV_SUBTILE)
         dk_slice_size: tl.constexpr = BLOCK_D_Q // DKDV_SUBTILE
         for slice_id in tl.static_range(DKDV_SUBTILE):
+            dk_slice = dk_slices[slice_id]
+            if DQ_FP32 and HAS_NUM_TARGETS:
+                # Scale after splitting so the target-aware FP32 path unloads
+                # and converts one accumulator slice at a time.
+                dk_slice = dk_slice * alpha
             device_desc_dk.store(
                 [(desc_row_kv + start_n).to(tl.int32), (off_h * stride_dkh + slice_id * dk_slice_size).to(tl.int32)],
-                dk_slices[slice_id].to(k.dtype),
+                dk_slice.to(k.dtype),
             )
     else:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])

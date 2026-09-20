@@ -7,8 +7,6 @@ import functools
 import importlib
 from typing import Any, Callable, Mapping, Optional
 
-_PKG = __name__.rsplit(".", 1)[0]
-
 
 class UnsupportedOp(RuntimeError):
     """No catalog entry for this op on the current target."""
@@ -23,7 +21,7 @@ class OpSpec:
     op: str
     arch: str  # must equal Target.key
     variant: str  # label only; not a dispatch input, not user visible
-    impl: str  # "module:attr", relative to this package, imported on first use
+    impl: str  # "absolute.module:attr", imported on first use
     dtypes: frozenset = frozenset()  # bare torch names, so the table needs no torch
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
@@ -43,7 +41,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="mm",
         arch="sm100",
         variant="ws",
-        impl="kernels.mm.sm100:mm",
+        impl="triton.tlx.ops.kernels.mm.sm100:mm",
         dtypes=_FP16,
         # TMA needs 16-byte-aligned descriptor row strides. Checked against the
         # real strides, not M/N/K: a column-major operand is fed to its
@@ -55,7 +53,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="mm",
         arch="gfx942",
         variant="direct_load",
-        impl="kernels.mm.gfx942:mm",
+        impl="triton.tlx.ops.kernels.mm.gfx942:mm",
         dtypes=_FP16,
         # No `accepts`: operands are read through explicit strides rather than a
         # descriptor, so there is no alignment rule to fail. This arch therefore
@@ -66,7 +64,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="addmm",
         arch="gfx942",
         variant="fused_gemm",
-        impl="kernels.mm.gfx942:addmm",
+        impl="triton.tlx.ops.kernels.mm.gfx942:addmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -74,9 +72,9 @@ CATALOG: tuple[OpSpec, ...] = (
         op="mm",
         arch="gfx950",
         variant="heuristic",
-        impl="kernels.mm.gfx950:mm",
-        # LocalSplitU remains FP16-only; the register fallback also supports
-        # BF16 and performs the narrower per-plan validation.
+        impl="triton.tlx.ops.kernels.mm.gfx950:mm",
+        # LocalSplitU and persistent plans remain FP16-only; the register and
+        # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -86,7 +84,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="mm_torchtlx",
         arch="sm100",
         variant="inductor_blackwell_gemm_ws",
-        impl="kernels.mm.sm100_torch:mm",
+        impl="triton.language.extra.tlx.inductor.sm100_torch:mm",
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma", "tmem"}),
@@ -97,7 +95,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="addmm_torchtlx",
         arch="gfx950",
         variant="inductor_gfx950_addmm",
-        impl="kernels.addmm.gfx950_torch:addmm",
+        impl="triton.tlx.ops.kernels.addmm.gfx950_torch:addmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -105,7 +103,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="bmm_torchtlx",
         arch="gfx950",
         variant="inductor_gfx950_bmm",
-        impl="kernels.bmm.gfx950_torch:bmm",
+        impl="triton.tlx.ops.kernels.bmm.gfx950_torch:bmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -113,7 +111,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="flash_attn",
         arch="sm90",
         variant="ws_pipelined_pingpong",
-        impl="kernels.flash_attn.sm90:flash_attn",
+        impl="triton.tlx.ops.kernels.flash_attn.sm90:flash_attn",
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma"}),
@@ -122,7 +120,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
-        impl="kernels.flash_attn.sm100:flash_attn",
+        impl="triton.tlx.ops.kernels.flash_attn.sm100:flash_attn",
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma", "tmem"}),
@@ -131,7 +129,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="flash_attn_mxfp8",
         arch="sm100",
         variant="ws_pipelined_persistent_mxfp8",
-        impl="kernels.flash_attn_mxfp8.sm100:flash_attn_mxfp8",
+        impl="triton.tlx.ops.kernels.flash_attn_mxfp8.sm100:flash_attn_mxfp8",
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset({"tma", "tmem"}),
@@ -140,7 +138,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
-        impl="kernels.hstu_attn.sm100:hstu_attn",
+        impl="triton.tlx.ops.kernels.hstu_attn.sm100:hstu_attn",
         dtypes=_FP16,
         # Causal-only, non-causal is not supported yet
         accepts=lambda d: bool(d.get("causal", True)),
@@ -150,14 +148,14 @@ CATALOG: tuple[OpSpec, ...] = (
         op="hstu_attn_dev",
         arch="gfx950",
         variant="tlx",
-        impl="kernels.hstu_attn.gfx950:hstu_attn",
+        impl="triton.tlx.ops.kernels.hstu_attn.gfx950:hstu_attn",
         dtypes=_FP16,
     ),
     OpSpec(
         op="kimi_delta_attention",
         arch="sm100",
         variant="ws",
-        impl="kernels.kda.sm100:kimi_delta_attention",
+        impl="triton.tlx.ops.kernels.kda.sm100:kimi_delta_attention",
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma", "tmem"}),
@@ -166,7 +164,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="kda_paged_prefill",
         arch="gfx950",
         variant="tlx",
-        impl="kernels.kda.gfx950_prefill:kda_paged_prefill",
+        impl="triton.tlx.ops.kernels.kda.gfx950_prefill:kda_paged_prefill",
         dtypes=_BF16,
         accepts=lambda d: d.get("KEY_DIM") == 128 and d.get("VALUE_DIM") == 128,
     ),
@@ -174,7 +172,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="kda_recurrent_decode",
         arch="gfx950",
         variant="tlx",
-        impl="kernels.kda.gfx950_decode:kda_recurrent_decode",
+        impl="triton.tlx.ops.kernels.kda.gfx950_decode:kda_recurrent_decode",
         dtypes=_BF16,
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
@@ -205,11 +203,12 @@ def _capabilities(target) -> frozenset:
 @functools.lru_cache(maxsize=None)
 def _load(impl: str) -> Callable[..., Any]:
     mod, _, attr = impl.partition(":")
-    return getattr(importlib.import_module(f".{mod}", package=_PKG), attr)
+    return getattr(importlib.import_module(mod), attr)
 
 
-def _arches_for(op: str) -> list[str]:
-    return sorted(s.arch for s in CATALOG if s.op == op)
+@functools.lru_cache(maxsize=None)
+def _arches_for(op: str) -> tuple[str, ...]:
+    return tuple(sorted(s.arch for s in CATALOG if s.op == op))
 
 
 def has_impl(op: str, arch: str) -> bool:
@@ -220,6 +219,15 @@ def has_impl(op: str, arch: str) -> bool:
     shape and reporting each one as an error.
     """
     return (op, arch) in _BY_KEY
+
+
+@functools.lru_cache(maxsize=None)
+def _impl_for_arch(op: str, arch: str) -> tuple[Callable[..., Any], OpSpec]:
+    spec = _BY_KEY.get((op, arch))
+    if spec is None:
+        available = ", ".join(_arches_for(op)) or "(nothing yet)"
+        raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
+    return _load(spec.impl), spec
 
 
 def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:
@@ -233,13 +241,14 @@ def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], O
     pinned arch against the running device would reject the very case pinning
     exists for.
     """
-    available = ", ".join(_arches_for(op)) or "(nothing yet)"
     if arch is None:
         target = _target()
         if not target.key:
+            available = ", ".join(_arches_for(op)) or "(nothing yet)"
             raise UnsupportedOp(f"tlx.ops.{op}: no GPU visible. Available on: {available}")
         spec = _BY_KEY.get((op, target.key))
         if spec is None:
+            available = ", ".join(_arches_for(op)) or "(nothing yet)"
             raise UnsupportedOp(f"tlx.ops.{op} has no implementation for {target.key}. "
                                 f"Available on: {available}")
         missing = spec.requires - _capabilities(target)
@@ -247,10 +256,7 @@ def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], O
             raise UnsupportedOp(f"{spec} needs {sorted(missing)}, which {target.key} does not report")
         return _load(spec.impl), spec
 
-    spec = _BY_KEY.get((op, arch))
-    if spec is None:
-        raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
-    return _load(spec.impl), spec
+    return _impl_for_arch(op, arch)
 
 
 def check_inputs(spec: OpSpec, dtype=None, **dims) -> None:

@@ -39,6 +39,7 @@ from triton._internal_testing import (
     is_hip_rdna4,
     is_hip_gfx1250,
     is_xpu,
+    is_cpu,
     torch_float8_dtypes,
     torch_dtypes,
     numpy_random,
@@ -132,6 +133,8 @@ def check_type_supported(dtype, device):
     if is_interpreter():
         if dtype in [tl.bfloat16, "bfloat16", torch.bfloat16]:
             pytest.skip("bfloat16 is not supported in the interpreter")
+    if dtype == 'float8e4b15' and is_cpu():
+        pytest.skip("float8e4b15 not supported on CPU")
 
 
 def get_src_element_ty_size(dtype_str):
@@ -1300,6 +1303,8 @@ def test_abs_fp8(in_dtype, device):
             pytest.skip("float8e4nv not supported on CUDA < 8.9")
         if in_dtype in (tl.float8e4b8, tl.float8e5b16):
             pytest.skip("float8e4b8/float8e5b16 not supported on CUDA")
+    elif is_cpu():
+        pytest.skip('CPU not supports "fp8e4b15"')
 
     @triton.jit
     def abs_kernel(X, Z, SIZE: tl.constexpr):
@@ -1896,6 +1901,8 @@ def test_tensor_atomic_rmw(shape, axis, num_ctas, dtype_x_str, check_return_val,
 )
 def test_tensor_atomic_add_non_exclusive_offset(size, num_ctas, dtype_x_str, device):
     check_type_supported(dtype_x_str, device)
+    if is_cpu() and size == 128:
+        pytest.xfail("Test hangs")
 
     @triton.jit
     def kernel(X, val, NUM: tl.constexpr):
@@ -2031,6 +2038,8 @@ def test_tensor_atomic_rmw_block(num_ctas, device):
 def test_atomic_cas(sem, num_ctas, dtype_str, device):
     if is_hip_cdna2():
         pytest.skip("Disabled due to being flaky on CDNA2")
+    if is_cpu():
+        pytest.xfail("Barriers not yet implemented for CPU backend")
 
     # 1. make sure that atomic_cas changes the original value (Lock)
     @triton.jit
@@ -2124,6 +2133,8 @@ def test_tensor_atomic_cas(sem, size, dtype_str, num_ctas, device):
     check_type_supported(dtype_str, device)
     if is_hip_cdna2():
         pytest.skip("Disabled due to being flaky on CDNA2")
+    if "float" in dtype_str and is_cpu():
+        pytest.xfail("CPU does not support atomic cas with float types yet")
 
     @triton.jit
     def change_value(X, BLOCK_SIZE: tl.constexpr, sem: tl.constexpr, dtype: tl.constexpr):
@@ -2293,6 +2304,21 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
         if (not (is_hip_cdna4() or is_hip_gfx1250())) and ((dtype_x == "bfloat16" and dtype_z == "float8_e4m3fn") or
                                                            (dtype_x == "float8_e4m3fn" and dtype_z == "bfloat16")):
             pytest.skip(f"test_cast{(dtype_x, dtype_z)} only supported on HIP CDNA4 and above.")
+
+    if is_cpu() and (dtype_x in torch_float8_dtypes or dtype_z in torch_float8_dtypes):
+        pytest.skip(f'test_cast{(dtype_x, dtype_z)} is not supported on CPU.')
+
+    # fptrunc fp32->fp16 is broken in LLVM for large vectors:
+    #   https://github.com/llvm/llvm-project/issues/95274
+    # TODO: remove the change after the bug is fixed.
+    if is_cpu() and dtype_x == "float32" and dtype_z == "float16":
+        size = 512
+
+    # bf16 vector cast is broken in LLVM for large vectors:
+    #   https://github.com/llvm/llvm-project/issues/92471
+    # TODO: Remove the change after the bug is fixed.
+    if is_cpu() and dtype_x == 'bfloat16' and size > 128:
+        size = 128
 
     torch.manual_seed(0)
     # This is tricky because numpy doesn't have bfloat, and torch doesn't have uints.
@@ -3266,6 +3292,12 @@ def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
             pytest.skip("Skipping linear_recurrence scan on bfloat16 due to accuracy issues")
     numpy_dtype_str = "float32" if dtype_str == "bfloat16" else dtype_str
 
+    # bf16 vector cast is broken in LLVM for large vectors:
+    #   https://github.com/llvm/llvm-project/issues/92471
+    # TODO: Remove the change after the bug is fixed.
+    if is_cpu() and dtype_str == 'bfloat16':
+        shape = (min(shape[0], 128), min(shape[1], 128))
+
     # triton kernel
     @triton.jit
     def kernel(X, Y, Z, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, AXIS: tl.constexpr):
@@ -3553,7 +3585,7 @@ def test_optimize_thread_locality(op, BLOCK_N, N, num_pid_n, device):
     x = torch.randn((BLOCK_M, N), dtype=torch.float32, device=device)
     y = torch.randn((BLOCK_M, num_pid_n), dtype=torch.float32, device=device)
     h = kernel[(1, num_pid_n, 1)](x, y, N, BLOCK_M, BLOCK_N)
-    if not is_interpreter():
+    if not is_interpreter() and not is_cpu():
         assert (h.asm["ttgir"].count('"tt.reduce"') == 2
                 ), "tt.reduce should be called twice, otherwise the optimization didn't work"
     y_ref = numpy_op(x.cpu().numpy(), axis=1, keepdims=True)
@@ -4113,6 +4145,8 @@ def test_trans_2d(dtype_str, shape, perm, device):
 @pytest.mark.parametrize("shape", [(2, 2, 8, 64), (4, 4, 4, 16)])
 @pytest.mark.parametrize("perm", list(itertools.permutations([0, 1, 2, 3])))
 def test_trans_4d(dtype_str, shape, perm, device, with_allocator):
+    if is_cpu() and math.prod(shape) > 1024 and perm[0] == 3:
+        pytest.xfail("Codegen explosion on CPU")
 
     @triton.jit
     def kernel(
@@ -4453,6 +4487,16 @@ def test_dot(
             pytest.skip("bfloat16 is not supported in the interpreter")
         if input_precision == "bf16x3" or input_precision == "bf16x6":
             pytest.skip(f"input_precision {input_precision} is not supported in the interpreter")
+    elif is_cpu():
+        # This test kernel runs in a single thread and can take a long time
+        # for bigger sizes with the current codegen on CPU. Limit input sizes
+        # by default to get more reasonable tests execution time.
+        if os.environ.get('TRITON_CPU_TEST_DOT_FULL_SIZE', '0') != '1':
+            M = min(M, 32 if epilogue == "chain-dot" else 64)
+            N = min(N, 32 if epilogue == "chain-dot" else 64)
+            K = min(K, 16 if epilogue == "chain-dot" else 32)
+        if input_precision == "bf16x3" or input_precision == "bf16x6":
+            pytest.xfail(f"input_precision {input_precision} is not supported by the CPU backend")
     else:
         if not is_hip() and K < 16:
             tf32_n8 = (in_dtype == 'float32' and N == 8 and K == 8 and input_precision == 'tf32')
@@ -5123,7 +5167,7 @@ def test_scaled_dot(
     [(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str)
      for B in [1, 2, 4, 8]
      for num_warps in [1, 2, 4, 8, 16]
-     for BLOCK_M, BLOCK_N in [(32, 32)]
+     for BLOCK_M, BLOCK_N in [(32, 32) if not is_cpu() else (4, 4)]
      for M, N, K in [(64, 64, 64), (32, 32, 32)]
      for in_dtype_str, out_dtype_str in [
          ("int8", "int8"),
@@ -5157,6 +5201,12 @@ def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_
                 pytest.skip(f"{out_dtype_str} has low precision in WMMA dot")
         if in_dtype_str == "float64":
             pytest.skip("float64 not supported on HIP yet")
+    elif is_cpu():
+        if out_dtype_str == "float16":
+            pytest.skip("Test is skipped due to float16 accuracy issue")
+        input_precision = "tf32" if in_dtype_str == 'float32' else "ieee"
+        if not is_interpreter() and (BLOCK_M < 4 or BLOCK_N < 4):
+            pytest.skip("small dots are supported only on HIP at the moment")
     else:
         input_precision = "tf32" if is_cuda() and in_dtype_str == "float32" else "ieee"
         if not is_interpreter() and (BLOCK_M < 16 or BLOCK_N < 16):
@@ -5905,6 +5955,10 @@ def test_assume(device):
     pgm = _kernel[(1024 // 128, )](output, N=1024, BLOCK_N=128)
 
     if is_interpreter():
+        return
+
+    if is_cpu():
+        assert 'llvm.assume' in pgm.asm['llir']
         return
 
     assert "llvm.intr.assume" in pgm.asm["ttgir"]
@@ -7366,7 +7420,8 @@ def matmul_kernel(  #
 
 @pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(128, 256, 256)])
-@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 256, 128), (64, 64, 64)])
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 256, 128),
+                                                       (64, 64, 64)] if not is_cpu() else [(32, 32, 128), (32, 32, 32)])
 @pytest.mark.parametrize(
     "in_type_str",
     (["float8e5", "float8e5b16", "float8e4b8", "float8e4nv"]

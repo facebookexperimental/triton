@@ -24,6 +24,7 @@ case "${TORCHTLX_ARCH:-all}" in
     ;;
   gfx950)
     ARCH_TESTS=(
+      python/test/unit/tlx_ops/test_mm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
     )
@@ -32,6 +33,7 @@ case "${TORCHTLX_ARCH:-all}" in
   all)
     ARCH_TESTS=(
       python/test/unit/tlx_ops/test_torchtlx_mm_sm100.py
+      python/test/unit/tlx_ops/test_mm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
     )

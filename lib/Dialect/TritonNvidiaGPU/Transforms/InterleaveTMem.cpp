@@ -6,6 +6,7 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/AddressRanges.h"
 #include "llvm/Support/Debug.h"
+#include <cassert>
 #include <cstdlib>
 
 #define DEBUG_TYPE "triton-nvidia-interleave-tmem"
@@ -225,15 +226,19 @@ bool tmemMayAlias(Value a, Value b) {
 // alias; every other root, including a block argument that does not resolve to
 // a capture, is treated conservatively by smemMayAlias below.
 Value findSMemBase(Value value) {
+  auto type = cast<ttg::MemDescType>(value.getType());
+  assert(isa<ttg::SharedMemorySpaceAttr>(type.getMemorySpace()) &&
+         "expected an SMEM memdesc");
+
+  // getMemDescRoot is memory-space agnostic, but memdesc views preserve memory
+  // space, so walking from an SMEM value cannot reach a TMEM allocation.
   while (true) {
-    if (Operation *def = value.getDefiningOp()) {
-      if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
-               ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
-               ttg::MemDescReshapeOp>(def))
-        break;
-      value = def->getOperand(0);
+    if (Value root = mlir::getMemDescRoot(value); root != value) {
+      value = root;
       continue;
     }
+    if (value.getDefiningOp())
+      break;
     auto arg = dyn_cast<BlockArgument>(value);
     if (!arg)
       break;

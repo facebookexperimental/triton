@@ -32,6 +32,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// This pass runs before tt.dot_scaled is lowered to tc_gen5_mma_scaled, so it
+// must match the scaled op too. Without it the module attribute stays false for
+// the scaled 2-CTA path and every downstream tcgen05 lowering -- including the
+// cluster mbarrier-init fence -- sees false, deadlocking the cross-CTA barrier.
+// CHECK-LABEL: module
+// CHECK-SAME: "ttng.two-ctas" = true
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @two_cta_dot_scaled(
+      %a: tensor<128x64xi8>,
+      %scale_a: tensor<128x2xi8>,
+      %b: tensor<64x128xi8>,
+      %scale_b: tensor<128x2xi8>,
+      %acc: tensor<128x128xf32>) {
+    %d = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %acc lhs = e4m3 rhs = e4m3 {fastMath = false, two_ctas} : tensor<128x64xi8>, tensor<128x2xi8> * tensor<64x128xi8>, tensor<128x2xi8> -> tensor<128x128xf32>
+    tt.return
+  }
+}
+
+// -----
+
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
   tt.func @dependent_two_cta_dot_chain(
       %q: tensor<128x64xf16>,
@@ -43,6 +63,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %qk_f16 = arith.truncf %qk : tensor<128x128xf32> to tensor<128x128xf16>
     // expected-error @+1 {{two_ctas=True does not currently support dependent matmul chains}}
     %pv = tt.dot %qk_f16, %v, %acc {two_ctas} : tensor<128x128xf16> * tensor<128x128xf16> -> tensor<128x128xf32>
+    tt.return
+  }
+}
+
+// -----
+
+// A dependent chain must be rejected when the consumer is a scaled dot. The
+// dependent-chain machinery downstream (Analyze2CTADependencies,
+// Plan2CTAExchange) only handles TCGen5MMAOp, so a scaled dot reaching it would
+// silently take an unsupported lowering path instead of erroring here.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @dependent_two_cta_plain_to_scaled_chain(
+      %q: tensor<128x64xf16>,
+      %k: tensor<64x128xf16>,
+      %scale_a: tensor<128x4xi8>,
+      %b: tensor<128x128xi8>,
+      %scale_b: tensor<128x4xi8>,
+      %acc: tensor<128x128xf32>) {
+    // expected-note @+1 {{producer 2-CTA dot result is consumed by this dot.}}
+    %qk = tt.dot %q, %k, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+    %qk_i8 = arith.fptosi %qk : tensor<128x128xf32> to tensor<128x128xi8>
+    // expected-error @+1 {{two_ctas=True does not currently support dependent matmul chains}}
+    %pv = tt.dot_scaled %qk_i8 scale %scale_a, %b scale %scale_b, %acc lhs = e4m3 rhs = e4m3 {fastMath = false, two_ctas} : tensor<128x128xi8>, tensor<128x4xi8> * tensor<128x128xi8>, tensor<128x4xi8> -> tensor<128x128xf32>
+    tt.return
+  }
+}
+
+// -----
+
+// Same for a scaled producer feeding a scaled consumer.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @dependent_two_cta_scaled_chain(
+      %a: tensor<128x128xi8>,
+      %scale_a: tensor<128x4xi8>,
+      %b: tensor<128x128xi8>,
+      %scale_b: tensor<128x4xi8>,
+      %acc: tensor<128x128xf32>) {
+    // expected-note @+1 {{producer 2-CTA dot result is consumed by this dot.}}
+    %d0 = tt.dot_scaled %a scale %scale_a, %b scale %scale_b, %acc lhs = e4m3 rhs = e4m3 {fastMath = false, two_ctas} : tensor<128x128xi8>, tensor<128x4xi8> * tensor<128x128xi8>, tensor<128x4xi8> -> tensor<128x128xf32>
+    %d0_i8 = arith.fptosi %d0 : tensor<128x128xf32> to tensor<128x128xi8>
+    // expected-error @+1 {{two_ctas=True does not currently support dependent matmul chains}}
+    %d1 = tt.dot_scaled %d0_i8 scale %scale_a, %b scale %scale_b, %acc lhs = e4m3 rhs = e4m3 {fastMath = false, two_ctas} : tensor<128x128xi8>, tensor<128x4xi8> * tensor<128x128xi8>, tensor<128x4xi8> -> tensor<128x128xf32>
     tt.return
   }
 }
