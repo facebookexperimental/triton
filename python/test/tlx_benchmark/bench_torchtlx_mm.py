@@ -14,10 +14,11 @@ import sys
 import torch
 
 try:
-    from triton.language.extra.tlx.inductor import sm100_torch
+    from triton.language.extra.tlx.inductor import gfx950_torch, sm100_torch
     from triton.tlx.ops.kernels.mm._shapes import FOCUS as SHAPE_SUITES
     from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, flops, label, operand
 except ImportError:  # not the fbtriton fork
+    gfx950_torch = None
     sm100_torch = None
     SHAPE_SUITES = None
 
@@ -42,9 +43,9 @@ FAILED_SHAPES = set()
 
 
 def shapes(synthetic: bool = False, suites=None) -> list:
-    if sm100_torch is None:
+    if _provider() is None:
         return []
-    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes("sm100", suites)
+    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites)
     return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
 
 
@@ -56,12 +57,14 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
 
 
 def prepare(case: Case, space: str) -> Prepared:
+    provider = _provider()
+    assert provider is not None
     M, N, K, a_strides, b_strides = case.shape
     dtype = getattr(torch, case.dtype)
     a, b = operand(M, K, a_strides, dtype), operand(K, N, b_strides, dtype)
 
-    tlx_fn = lambda: sm100_torch.mm(a, b, mode="force")  # noqa: E731
-    ref_fn = lambda: sm100_torch.ref(a, b)  # noqa: E731
+    tlx_fn = lambda: provider.mm(a, b, mode="force")  # noqa: E731
+    ref_fn = lambda: provider.ref(a, b)  # noqa: E731
     return Prepared(
         tlx_fn=tlx_fn,
         ref_fn=ref_fn,
@@ -73,8 +76,12 @@ def prepare(case: Case, space: str) -> Prepared:
 _supported, default_json, run, main = driver.bind(sys.modules[__name__])
 
 
+def _provider():
+    return {"gfx950": gfx950_torch, "sm100": sm100_torch}.get(driver.arch())
+
+
 def supported() -> bool:
-    return sm100_torch is not None and _supported()
+    return _provider() is not None and _supported()
 
 
 if __name__ == "__main__":

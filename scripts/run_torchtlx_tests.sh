@@ -25,15 +25,17 @@ case "${TORCHTLX_ARCH:-all}" in
   gfx950)
     ARCH_TESTS=(
       python/test/unit/tlx_ops/test_mm_gfx950.py
+      python/test/unit/tlx_ops/test_torchtlx_mm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
     )
-    PERF_FILTER="addmm_torchtlx or bmm_torchtlx"
+    PERF_FILTER="mm_torchtlx or addmm_torchtlx or bmm_torchtlx"
     ;;
   all)
     ARCH_TESTS=(
       python/test/unit/tlx_ops/test_torchtlx_mm_sm100.py
       python/test/unit/tlx_ops/test_mm_gfx950.py
+      python/test/unit/tlx_ops/test_torchtlx_mm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
     )

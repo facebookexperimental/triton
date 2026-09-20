@@ -69,7 +69,7 @@ a `smoke` space no user takes.
 The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
 They force the TLX template (`tlx_mode="force"`) and race it against the same
 compile with TLX off, so `speedup > 1` is exactly "TLX would have won the
-autotune under `tlx_mode="allow"`". `mm_torchtlx` covers Blackwell;
+autotune under `tlx_mode="allow"`". `mm_torchtlx` covers Blackwell and MI350X;
 `addmm_torchtlx` and `bmm_torchtlx` cover MI350X. They need `torch >= 2.14` for
 `config.triton.tlx_mode`. A shape where Inductor emits no TLX kernel at all is
 an error row, not a quiet 1.00x.
