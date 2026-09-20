@@ -1,7 +1,8 @@
 """
 TLX Warp-Level Operations
 
-This module provides GPU warp-level synchronization and voting primitives.
+This module provides warp-level synchronization and voting primitives
+for NVIDIA GPUs.
 """
 
 import triton

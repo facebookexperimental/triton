@@ -22,6 +22,8 @@ add_triton_ut(
     TritonGPUModuloCore
     TritonGPUTransforms
     TritonNvidiaGPUTransforms
+    TritonNvidiaGPUIR
+    TLXIR
 )
 
 add_triton_ut(

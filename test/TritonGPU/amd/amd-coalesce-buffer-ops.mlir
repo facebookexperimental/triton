@@ -178,3 +178,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// Test 10: Explicit TLX layouts are preserved, but their free physical
+// variables are recorded so alternate backends can suppress redundant stores.
+// CHECK-LABEL: buffer_store_explicit_ownership
+// CHECK: amdg.buffer_store {{.*}} {amdgpu.redundant_lane_mask = 1 : i32, amdgpu.redundant_register_mask = 2 : i32, amdgpu.redundant_wave_mask = 7 : i32, tlx.layout_is_explicit}
+#linear = #ttg.linear<{
+  register = [[1], [0]],
+  lane = [[0], [2], [4], [8], [16], [32]],
+  warp = [[0], [0], [0]],
+  block = []
+}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_store_explicit_ownership(
+      %value: tensor<64xf16, #linear>,
+      %ptr: !tt.ptr<f16>,
+      %offsets: tensor<64xi32, #linear>) {
+    amdg.buffer_store %value, %ptr[%offsets] {tlx.layout_is_explicit} : tensor<64xf16, #linear>
+    tt.return
+  }
+}
