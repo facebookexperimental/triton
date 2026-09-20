@@ -268,6 +268,12 @@
 - **Fix**: When one outer-produced operand channel has MMAv5 consumers in multiple sibling loops, emit a single `tcgen5.commit` after the final sibling loop instead of an inline MMA completion. The post-loop commit drains every MMA issued by any nonempty sibling and still executes when the final loop is empty, restoring the one-load/one-release outer cadence.
 - **Validation**: HSTU CLC backward passes `L=128, Z=80` (160 tiles, empty unmasked loop, reused CTAs), `L=256, Z=120` uniform, and the 480-tile jagged production case. Relative-L2 for dQ/dK/dV is about `2.34e-3 / 2.34e-3 / 2.35e-3`. The existing high-grid jagged E2E is the deadlock regression.
 
+### 36. Serial post-loop accumulator consumers create redundant lifecycle channels (2026-09-19, fixed)
+- **Symptom**: HSTU cross-attention backward emits two EMPTY/FULL handshakes for each dV and dK accumulator even though two same-task MMAs serially form one output tile. The extra barriers contribute to the AutoWS/TLX latency gap.
+- **Root cause** (`CodePartitionUtility.cpp`, `handleOperandD`): chained-writer collapsing existed only when the `tmem_load` consumer was inside the loop. A consumer immediately after the loop fell through to `createChannelsForProducers`, which created one channel per MMA writer.
+- **Fix**: apply the existing chained-accumulator rule to post-loop consumers: when the first writer is a fresh whole-tile overwrite and the last writer is an MMAv5 op, acquire once before the first writer, commit once after the last writer, and release at the post-loop load.
+- **Lit test**: `ws_code_partition_chained_accum_channels.mlir::chained_accum_post_loop` checks two serial MMAs have one producer acquire and one post-loop `tcgen5.commit`.
+
 ### 37. HSTU dS publication carries a redundant loop-carried EMPTY edge (2026-09-19, fixed)
 - **Symptom**: each of the two single-copy dS buffers in HSTU cross-attention backward waits for an EMPTY barrier before publication and makes dK signal a matching completion. Removing those four operations by TTGIR ablation improves target-256 latency from about 2.09 ms to 1.99 ms.
 - **Root cause** (`WSCodePartition.cpp`, `insertAsyncComm`): channel insertion considered each dS store-to-dK-MMA edge independently. It did not recognize the already-existing dependency cycle `dK(i) -> dP MMA(i+1) -> dP load(i+1) -> dS store(i+1)` supplied by same-task program order plus the cross-task dP result channel.

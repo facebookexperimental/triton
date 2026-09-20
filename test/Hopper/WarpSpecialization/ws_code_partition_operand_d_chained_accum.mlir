@@ -19,14 +19,15 @@
 //
 // CHECK-LABEL: @_hstu_attn_bwd_redq
 //
-// dk_0 tile: folded-dv writer (reads opndA tmem channel 2, produces opndD
-// channel 3) and dk_attn writer (produces opndD channel 4), both in task 1.
-// Neither carries a tmem.end for the other's operand-D channel, i.e. no
-// MMA->MMA channel is created for the same-task chain.
-// CHECK: ttng.tc_gen5_mma {{.*}}async_task_id = array<i32: 1>{{.*}}tmem.end = array<i32: 2>, tmem.start = array<i32: 3>
-// CHECK: ttng.tc_gen5_mma {{.*}}async_task_id = array<i32: 1>{{.*}}tmem.start = array<i32: 4>
-// The task-4 consumer waits on both writers via the operand-D channels.
-// CHECK: ttng.tmem_load {{.*}}async_task_id = array<i32: 4>{{.*}}tmem.end = array<i32: 3, 4, 5>
+// dk_0 tile: the folded-dv writer reads opndA tmem channel 2 and the dk_attn
+// writer produces the single collapsed operand-D channel 3, both in task 1.
+// The EMPTY acquire is placed before folded-dv while the FULL completion stays
+// on dk_attn. No MMA->MMA channel is created for the same-task chain.
+// CHECK: ttng.tc_gen5_mma {{.*}}async_task_id = array<i32: 1>, is_async, tmem.end = array<i32: 2>, tt.autows
+// CHECK: ttng.tc_gen5_mma {{.*}}async_task_id = array<i32: 1>, is_async, tmem.start = array<i32: 3>, tt.autows
+// The task-4 consumer waits on the collapsed lifecycle channel and the
+// wrap-around channel.
+// CHECK: ttng.tmem_load {{.*}}async_task_id = array<i32: 4>, tmem.end = array<i32: 3, 4>, tmem.start = array<i32: 5>
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>

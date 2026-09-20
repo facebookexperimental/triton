@@ -156,4 +156,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
+// ---- Case 4: chained writers in an inner loop, one post-loop consumer ----
+// The final tmem_load consumes the accumulator after the inner loop. The two
+// same-task MMA writers still form one lifecycle channel: one EMPTY wait before
+// the inner loop and one FULL completion on the last writer.
+//
+// CHECK-LABEL: @chained_accum_post_loop
+// CHECK: ttg.warp_specialize
+// computation/default partition: one FULL wait and one post-loop load.
+// CHECK: ttng.wait_barrier
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_load
+// gemm partition: one EMPTY acquire before the first writer, and no second
+// acquire for the second writer.
+// CHECK: partition0
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: nvws.producer_acquire
+// CHECK-NOT: nvws.producer_acquire
+// The two MMAs are followed by one completion commit after the inner loop.
+// CHECK: ttng.tc_gen5_mma
+// CHECK: ttng.tc_gen5_mma
+// CHECK-NOT: ttng.tc_gen5_mma
+// CHECK: ttng.tc_gen5_commit
+  tt.func public @chained_accum_post_loop(
+      %a: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %b: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %c: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %d: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %o: !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>,
+      %lb: i32, %ub: i32, %step: i32) attributes {noinline = false} {
+    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
+    %false = arith.constant {async_task_id = array<i32: 0, 1>} false
+    %acc, %acc_tok = ttng.tmem_alloc {async_task_id = array<i32: 1>, buffer.copy = 1 : i32, buffer.id = 3 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %outer = scf.for %outer_iv = %lb to %ub step %step iter_args(%outer_tok = %acc_tok) -> (!ttg.async.token) : i32 {
+      %inner = scf.for %inner_iv = %lb to %ub step %step iter_args(%tok = %outer_tok) -> (!ttg.async.token) : i32 {
+        %t1 = ttng.tc_gen5_mma %a, %b, %acc[%tok], %false, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        %t2 = ttng.tc_gen5_mma %c, %d, %acc[%t1], %true, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        scf.yield %t2 : !ttg.async.token
+      } {async_task_id = array<i32: 0, 1>}
+      %val, %load_tok = ttng.tmem_load %acc[%inner] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttg.local_store %val, %o {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
+      scf.yield %load_tok : !ttg.async.token
+    } {async_task_id = array<i32: 0, 1>}
+    tt.return
+  }
+
 }
