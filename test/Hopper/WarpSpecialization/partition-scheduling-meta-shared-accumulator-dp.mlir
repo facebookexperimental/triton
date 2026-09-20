@@ -1,4 +1,5 @@
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=100 num-stages=1 smem-budget=232448' --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=REUSE
 
 // Test for the accumulator-chain data-partition grouping.
 //
@@ -24,6 +25,25 @@
 // Both dq MMAs (accumulator memdesc #tmem1) share the same partition:
 // CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[DQP:[0-9]+]]>{{.*}}memdesc<128x64xf32, #tmem1
 // CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[DQP]]>{{.*}}memdesc<128x64xf32, #tmem1
+
+// QK and P reuse one TMEM allocation. In this one-stage loop, the QK load and
+// P store are ordered in one computation task, while the QK and P-consuming
+// MMAs are ordered in one GEMM task. Those edges close the reuse cycle, so no
+// redundant QK-empty wait is needed immediately before publishing P.
+// REUSE-LABEL: @_hstu_attn_bwd_redq_2kv
+// REUSE: arith.truncf {{.*}}async_task_id = array<i32: 4>
+// REUSE-NOT: ttng.wait_barrier
+// REUSE: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>
+// The dK consumer in the GEMM task precedes the next iteration's dP producer;
+// that result's FULL edge orders the compute task's dS publication. Therefore
+// neither single-copy dS buffer needs a separate EMPTY wait before its store.
+// REUSE: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>
+// REUSE: arith.truncf {{.*}}async_task_id = array<i32: 4>
+// REUSE-NOT: ttng.wait_barrier
+// REUSE: ttg.local_store {{.*}}async_task_id = array<i32: 4>
+// REUSE: arith.truncf {{.*}}async_task_id = array<i32: 4>
+// REUSE-NOT: ttng.wait_barrier
+// REUSE: ttg.local_store {{.*}}async_task_id = array<i32: 4>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
