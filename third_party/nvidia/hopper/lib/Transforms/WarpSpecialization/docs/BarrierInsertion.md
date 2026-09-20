@@ -147,6 +147,15 @@ AutoWS instead emits one `tcgen5.commit` after the final sibling loop. The
 commit follows all MMAs issued by any nonempty sibling and executes even when
 the final sibling is empty.
 
+A single-copy SMEM publication can omit its loop-carried EMPTY edge when an
+independent cross-task result channel proves the same ordering. The HSTU dS
+case is `dK(i) -> dP MMA(i+1) -> dP load(i+1) -> dS store(i+1)`: the first and
+last links are same-task program order and the middle link is the dP FULL
+channel. The proof requires all four operations in the same loop, the two MMAs
+in one task, the load/store in another task, and schedule-aware positive order.
+If any condition is missing, the ordinary dS EMPTY wait and matching MMA
+completion remain.
+
 ## Path for gen5 as Producer (`producerBarrier` set)
 
 When the **producer** is gen5, `desyncTCGen5MMAOp()` is called with
