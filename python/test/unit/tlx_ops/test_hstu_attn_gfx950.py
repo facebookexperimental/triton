@@ -167,41 +167,59 @@ def _assert_per_sequence_close(name, got, expected, offsets, tolerance=8e-3, tai
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize(
-    "bwd_variant",
+    "bwd_variant,sequence_xcd_case",
     [
-        "default",
-        "kv_parallel_fa_schedule",
-        "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t",
-        "kv_parallel_fa_schedule_bn256_direct_qdo_g2l",
+        pytest.param("default", "padded", id="default"),
+        pytest.param("kv_parallel_fa_schedule", "padded", id="fa-schedule"),
+        pytest.param(
+            "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t",
+            "padded",
+            id="fa-schedule-production",
+        ),
+        pytest.param(
+            "kv_parallel_fa_schedule_bn256_direct_qdo_g2l",
+            "padded",
+            id="fa-schedule-bn256",
+        ),
+        pytest.param(
+            "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t",
+            "unpadded",
+            id="fa-schedule-production-unpadded-sequence-xcd",
+        ),
     ],
 )
-def test_hstu_attn_gfx950_backward_target_causal(bwd_variant):
-    """Cover ragged tails and padded XCD sequence slots in all schedules."""
+def test_hstu_attn_gfx950_backward_target_causal(bwd_variant, sequence_xcd_case):
+    """Cover ragged tails and padded/unpadded XCD sequence scheduling."""
     hstu = _load_gfx950_hstu_tutorial()
     torch.manual_seed(7)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     max_seq_len, heads, head_dim = 512, 2, 128
     alpha = 1.0 / head_dim**0.5
-    # Fifteen sequences pad to sixteen on 2-, 4-, and 8-XCD partitions while
-    # staying within the launch's dummy-sequence budget.
+    # The padded cases use fifteen sequences, which pad to sixteen on 2-, 4-,
+    # and 8-XCD partitions while staying within the dummy-sequence budget.
     # Exercise a wholly invalid second Q/dO pipeline slot, both sides of the
     # 64-, 128-, and 256-row boundaries, partial final K/V tiles, and two
     # exact BN256 tiles.
-    lengths = torch.tensor(
-        [1, 17, 33, 63, 65, 97, 127, 129, 193, 255, 256, 257, 321, 511, 512],
-        device=device,
-        dtype=torch.int64,
-    )
+    lengths_list = [1, 17, 33, 63, 65, 97, 127, 129, 193, 255, 256, 257, 321, 511, 512]
+    if sequence_xcd_case == "unpadded":
+        # A multiple of every supported gfx950 XCD count selects sequence-XCD
+        # scheduling without compiling the padded-slot guard.
+        lengths_list.insert(-2, 400)
+    lengths = torch.tensor(lengths_list, device=device, dtype=torch.int64)
     offsets = torch.zeros(lengths.numel() + 1, device=device, dtype=torch.int64)
     offsets[1:] = torch.cumsum(lengths, dim=0)
     # Include a diagonal-only all-target sequence and history/target boundaries
     # that fall inside 64-, 128-, and 256-row tiles.
-    num_targets = torch.tensor(
-        [1, 1, 5, 1, 65, 17, 20, 33, 5, 20, 17, 20, 17, 5, 20],
-        device=device,
-        dtype=torch.int32,
-    )
+    num_targets_list = [1, 1, 5, 1, 65, 17, 20, 33, 5, 20, 17, 20, 17, 5, 20]
+    if sequence_xcd_case == "unpadded":
+        num_targets_list.insert(-2, 20)
+        cu_count = torch.cuda.get_device_properties(device).multi_processor_count
+        num_xcds = max(1, min(hstu.GFX950_MAX_XCDS, cu_count // hstu.GFX950_CUS_PER_XCD))
+        scheduled_z, use_sequence_xcd = hstu._gfx950_fa_schedule_launch_sequences(len(lengths_list), num_xcds)
+        assert use_sequence_xcd
+        assert scheduled_z == len(lengths_list)
+    num_targets = torch.tensor(num_targets_list, device=device, dtype=torch.int32)
     total = int(offsets[-1])
 
     q, k, v = (torch.empty((total, heads, head_dim), device=device, dtype=dtype).uniform_(-2.0, 2.0).requires_grad_()
