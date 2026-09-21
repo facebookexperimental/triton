@@ -903,9 +903,8 @@ private:
                   unsigned numLaneToReduce, unsigned interleave,
                   Value pred = {},
                   std::optional<unsigned> broadcastMask = std::nullopt) const {
-    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,
-                                         numLaneToReduce, interleave,
-                                         broadcastMask);
+    auto success = targetInfo.warpReduce(
+        rewriter, loc, acc, op, numLaneToReduce, interleave, broadcastMask);
     if (success)
       return;
 

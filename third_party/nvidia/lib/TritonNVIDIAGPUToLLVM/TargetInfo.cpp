@@ -768,9 +768,8 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
         return false;
     }
     Value mask = b.i32_val(0xFFFFFFFF);
-    bool maskBroadcast =
-        broadcastMask && (*kind == NVVM::ReductionKind::ADD ||
-                          *kind == NVVM::ReductionKind::XOR);
+    bool maskBroadcast = broadcastMask && (*kind == NVVM::ReductionKind::ADD ||
+                                           *kind == NVVM::ReductionKind::XOR);
     Value identity, firstGroup, uniqueLane;
     if (partitioned || maskBroadcast) {
       identity = createReduxIdentity(b, *kind, useNanQualifier);

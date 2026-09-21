@@ -650,10 +650,10 @@ bool TargetInfo::warpReduceInnerTree(RewriterBase &rewriter, Location loc,
   return true;
 }
 
-bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
-                            SmallVector<Value> &acc, triton::ReduceOp op,
-                            unsigned numLaneToReduce, unsigned interleave,
-                            std::optional<unsigned> /*broadcastLaneIdMask*/) const {
+bool TargetInfo::warpReduce(
+    RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+    triton::ReduceOp op, unsigned numLaneToReduce, unsigned interleave,
+    std::optional<unsigned> /*broadcastLaneIdMask*/) const {
   // A defined reduction ordering (currently only "inner_tree") requires a
   // fixed, layout-invariant reduction tree so the result is bitwise-identical
   // across num_warps / BLOCK_SIZE. Emit it via the dedicated count-up path; the

@@ -73,8 +73,8 @@ reduceWarpHistograms(HistogramOp op, ArrayRef<Value> counts,
       UnrealizedConversionCastOp::create(rewriter, loc, type, packed)
           .getResult(0);
   auto reduce = ReduceOp::create(rewriter, loc, ValueRange{partials},
-                                  rewriter.getI32IntegerAttr(0),
-                                  /*reduction_ordering=*/StringAttr());
+                                 rewriter.getI32IntegerAttr(0),
+                                 /*reduction_ordering=*/StringAttr());
   {
     OpBuilder::InsertionGuard guard(rewriter);
     auto *body = rewriter.createBlock(

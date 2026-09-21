@@ -115,11 +115,10 @@ public:
   // is the number of participating contiguous lanes, `interleave` the stride
   // between them, and `broadcastLaneIdMask` optionally identifies zero lane
   // bases in this step's layout (layout path only).
-  virtual bool warpReduce(RewriterBase &rewriter, Location loc,
-                          SmallVector<Value> &acc, triton::ReduceOp op,
-                          unsigned numLaneToReduce, unsigned interleave,
-                          std::optional<unsigned> broadcastLaneIdMask =
-                              std::nullopt) const = 0;
+  virtual bool warpReduce(
+      RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+      triton::ReduceOp op, unsigned numLaneToReduce, unsigned interleave,
+      std::optional<unsigned> broadcastLaneIdMask = std::nullopt) const = 0;
 
   // Emits LLVM code with |rewriter| to print a message following the given
   // format from the device. |formatStrStart| is the pointer to the start of
