@@ -1095,23 +1095,22 @@ slow_path:
 
 static bool fc_get_tensor_metadata_slow(PyObject *arg, uint64_t *ptr,
                                         uint64_t *storage_size) {
-  PyObject *ptr_obj = PyObject_CallMethodNoArgs(arg, data_ptr_attr);
+  auto ptr_obj = from_new_ref(PyObject_CallMethodNoArgs(arg, data_ptr_attr));
   if (!ptr_obj)
     return false;
-  *ptr = PyLong_AsUnsignedLongLong(ptr_obj);
-  Py_DECREF(ptr_obj);
+  *ptr = PyLong_AsUnsignedLongLong(ptr_obj.ptr());
   if (PyErr_Occurred())
     return false;
 
-  PyObject *storage_obj = PyObject_CallMethodNoArgs(arg, untyped_storage_attr);
+  auto storage_obj =
+      from_new_ref(PyObject_CallMethodNoArgs(arg, untyped_storage_attr));
   if (!storage_obj)
     return false;
-  PyObject *size_obj = PyObject_CallMethodNoArgs(storage_obj, size_attr);
-  Py_DECREF(storage_obj);
+  auto size_obj =
+      from_new_ref(PyObject_CallMethodNoArgs(storage_obj.ptr(), size_attr));
   if (!size_obj)
     return false;
-  *storage_size = PyLong_AsUnsignedLongLong(size_obj);
-  Py_DECREF(size_obj);
+  *storage_size = PyLong_AsUnsignedLongLong(size_obj.ptr());
   return !PyErr_Occurred();
 }
 
@@ -1656,6 +1655,7 @@ typedef struct {
   PyObject *device_getter;     // driver.active.get_current_device
   PyObject *param_name_to_idx; // dict: param_name → positional index
   PyObject *kernel_name;       // interned _fn_name for stats (may be NULL)
+  PyObject *base_options;      // compiler options bound into run_partial
   uint64_t options_hash;
   int n_params;
 } JITCacheProxy;
@@ -1664,6 +1664,20 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
                                           PyObject *const *args, size_t nargsf,
                                           PyObject *kwnames);
 static void JITCacheProxy_dealloc(PyObject *o);
+
+static bool fc_hash_options_dict(PyObject *options, uint64_t *result) {
+  auto items = from_new_ref(PyDict_Items(options));
+  if (!items || PyList_Sort(items.ptr()) < 0)
+    return false;
+  auto item_tuple = from_new_ref(PyList_AsTuple(items.ptr()));
+  if (!item_tuple)
+    return false;
+  Py_hash_t hash = PyObject_Hash(item_tuple.ptr());
+  if (hash == -1)
+    return false;
+  *result = (uint64_t)hash;
+  return true;
+}
 
 static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
                                           PyObject *const *args, size_t nargsf,
@@ -1674,7 +1688,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
   PyObject *const *effective_args = args;
   int effective_nargs = (int)nargs;
   uint64_t effective_options_hash = self->options_hash;
-  PyObject *option_items = nullptr;
+  PyObject *effective_options = nullptr;
 
   // When kwargs are present, merge them into positional args in C.
   // This mirrors the Python-side logic in jit.py run() c_cache path.
@@ -1701,30 +1715,25 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
         if (idx >= 0 && idx < total)
           merged_args[idx] = (PyObject *)args[nargs + ki];
       } else {
-        if (!option_items) {
-          option_items = PyList_New(0);
-          if (!option_items)
+        if (!effective_options) {
+          effective_options = self->base_options
+                                  ? PyDict_Copy(self->base_options)
+                                  : PyDict_New();
+          if (!effective_options)
             goto error;
         }
-        PyObject *item = PyTuple_Pack(2, name, args[nargs + ki]);
-        if (!item || PyList_Append(option_items, item) < 0) {
-          Py_XDECREF(item);
+        // Call-time options override options bound by an autotuner config,
+        // matching functools.partial and JITFunction.run semantics.
+        if (PyDict_SetItem(effective_options, name, args[nargs + ki]) < 0)
           goto error;
-        }
-        Py_DECREF(item);
       }
     }
-    if (option_items) {
-      if (PyList_Sort(option_items) < 0)
-        goto error;
-      PyObject *option_tuple = PyList_AsTuple(option_items);
-      if (!option_tuple)
-        goto error;
-      Py_hash_t option_hash = PyObject_Hash(option_tuple);
-      Py_DECREF(option_tuple);
-      if (option_hash == -1)
-        goto error;
-      effective_options_hash = (uint64_t)option_hash;
+    if (effective_options &&
+        !fc_hash_options_dict(effective_options, &effective_options_hash)) {
+      // Python's _hash_fc_opts also supports container-valued options. Keep
+      // those uncommon cases correct by using the Python path.
+      PyErr_Clear();
+      goto fallback;
     }
     effective_args = merged_args;
     effective_nargs = total;
@@ -1819,19 +1828,19 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     if (!result) {
       // Propagate error — dispatcher may have partially launched.
       // Do NOT fallback (would risk double-launch).
-      Py_XDECREF(option_items);
+      Py_XDECREF(effective_options);
       return nullptr;
     }
     Py_DECREF(result);
     Py_INCREF(kernel);
     if (g_cache_stats)
       cache_stats_record(self->kernel_name, "jit_proxy_hit");
-    Py_XDECREF(option_items);
+    Py_XDECREF(effective_options);
     return kernel;
   }
 
 error:
-  Py_XDECREF(option_items);
+  Py_XDECREF(effective_options);
   return nullptr;
 
 fallback:
@@ -1839,7 +1848,7 @@ fallback:
   // Use Vectorcall to preserve any keyword arguments from kwnames.
   if (g_cache_stats)
     cache_stats_record(self->kernel_name, "jit_proxy_fallback");
-  Py_XDECREF(option_items);
+  Py_XDECREF(effective_options);
   return PyObject_Vectorcall(self->run_partial, args, nargsf, kwnames);
 }
 
@@ -1856,6 +1865,7 @@ static void JITCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->device_getter);
   Py_XDECREF(self->param_name_to_idx);
   Py_XDECREF(self->kernel_name);
+  Py_XDECREF(self->base_options);
   Py_TYPE(o)->tp_free(o);
 }
 
@@ -1871,6 +1881,7 @@ static int JITCacheProxy_traverse(PyObject *o, visitproc visit, void *arg) {
   Py_VISIT(self->device_getter);
   Py_VISIT(self->param_name_to_idx);
   Py_VISIT(self->kernel_name);
+  Py_VISIT(self->base_options);
   return 0;
 }
 
@@ -1881,6 +1892,7 @@ static int JITCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->run_partial);
   Py_CLEAR(self->param_name_to_idx);
   Py_CLEAR(self->kernel_name);
+  Py_CLEAR(self->base_options);
   Py_CLEAR(self->grid_py[0]);
   Py_CLEAR(self->grid_py[1]);
   Py_CLEAR(self->grid_py[2]);
@@ -1986,6 +1998,14 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   if (!run_partial)
     return nullptr;
 
+  PyObject *base_options = extra_kwargs && PyDict_Check(extra_kwargs)
+                               ? PyDict_Copy(extra_kwargs)
+                               : nullptr;
+  if (extra_kwargs && PyDict_Check(extra_kwargs) && !base_options) {
+    Py_DECREF(run_partial);
+    return nullptr;
+  }
+
   // Extract grid values
   Py_ssize_t gs = PyTuple_Check(grid_tuple) ? PyTuple_GET_SIZE(grid_tuple) : 0;
   static PyObject *one_obj = nullptr;
@@ -1995,6 +2015,7 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   JITCacheProxy *proxy =
       (JITCacheProxy *)PyObject_GC_New(JITCacheProxy, &JITCacheProxyType);
   if (!proxy) {
+    Py_XDECREF(base_options);
     Py_DECREF(run_partial);
     return nullptr;
   }
@@ -2004,6 +2025,7 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   proxy->params_list = params_list;
   Py_INCREF(params_list);
   proxy->run_partial = run_partial;
+  proxy->base_options = base_options;
   proxy->grid_py[0] = (gs > 0) ? PyTuple_GET_ITEM(grid_tuple, 0) : one_obj;
   Py_INCREF(proxy->grid_py[0]);
   proxy->grid_py[1] = (gs > 1) ? PyTuple_GET_ITEM(grid_tuple, 1) : one_obj;

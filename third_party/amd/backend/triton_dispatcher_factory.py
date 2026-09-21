@@ -10,12 +10,13 @@ def _load_module():
     global _bridge_registered
     utils = driver.active.utils
     if not _bridge_registered:
-        _bridge_registered = True
         try:
             from triton._C._torch_bridge import get_tensor_access_capsule
             utils.register_tensor_bridge(get_tensor_access_capsule())
         except (ImportError, AttributeError):
             pass
+        else:
+            _bridge_registered = True
     return utils
 
 

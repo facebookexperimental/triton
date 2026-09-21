@@ -1154,7 +1154,7 @@ cleanup:
  * the invariant launch state once and exposes a vectorcall hot path:
  *   dispatcher(grid_x, grid_y, grid_z, stream, *kernel_args)
  * Tensor descriptors and compiler-managed scratch deliberately fall back to
- * the generic launcher for now; paged decode uses neither. */
+ * the generic launcher. */
 #define HIP_TD_MAX_KERNEL_ARGS 128
 #define HIP_TD_FIXED_ARGS 4
 
