@@ -1484,3 +1484,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// An op with no TLX mapping is emitted as its raw MLIR name, which is not
+// valid Python. Say so inline, so the gap shows up in the dump instead of as
+// an unexplained NameError when the regenerated kernel is launched.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def unsupported_op_is_flagged(
+  // The marker word is escaped below, and avoided in prose here, because lit
+  // treats that word followed by a colon as one of its own directives and
+  // tries to parse the rest of the line as a boolean expression.
+  // CHECK: arith.remf({{.*}}) # {{UNSUPPORTED}}: no TLX mapping for arith.remf
+  tt.func public @unsupported_op_is_flagged(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %r = arith.remf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
