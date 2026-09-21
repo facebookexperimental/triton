@@ -874,6 +874,15 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
     }
     // Restore insertion point to user
     builder.setInsertionPoint(user);
+  } else if (reuseGrp >= 0 && channel) {
+    // No enclosing loop anywhere, but this allocation is the shared circular
+    // buffer of a reuse group: every member owns a distinct slot. accumCnt is 0
+    // (no iteration) and getStaggeredAccumCnt adds the member's group position,
+    // which is what keeps the data partitions of an epilogue store apart.
+    // `channel` must be the channel that owns `user`, not the group
+    // representative, or all users collapse onto the representative's slot.
+    getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                         bufferIdx, _phase, config, reuseGrp, channel);
   } else {
     // Fallback: if we can't find a parent loop, use constant 0
     // (this should only happen for operations truly outside any loop)
@@ -1930,6 +1939,21 @@ DenseMap<Channel *, Value> createBufferForAllocs(
     DenseMap<Operation *, Value> userToBufIdx;
     int reuseGrp = channelInReuseGroup(channel, config);
 
+    // One allocation can back several channels (one producer/consumer pair per
+    // data partition or epilogue subtile). Slot selection is per channel, so a
+    // user must be attributed to the channel it actually belongs to; `channel`
+    // is only the group representative.
+    SmallVector<Channel *> allocChannels;
+    for (auto *c : orderedChannels)
+      if (c->getAllocOp() == oldAllocOp)
+        allocChannels.push_back(c);
+    auto ownerChannelFor = [&](Operation *user) -> Channel * {
+      for (auto *c : allocChannels)
+        if (c->getSrcOp() == user || c->getDstOp() == user)
+          return c;
+      return channel;
+    };
+
     bool isOperandDTmem = false;
     if (channel->channelKind == DataChannelKind::TMEMAlloc) {
       auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(channel);
@@ -1967,7 +1991,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
                                bufferIdx, _phase, config, reuseGrp, channel);
         } else {
           std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
-              builder, user, channel, oldAllocOp, numBuffers,
+              builder, user, ownerChannelFor(user), oldAllocOp, numBuffers,
               regionsWithChannels, config, reuseGrp);
         }
       } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
@@ -2018,8 +2042,8 @@ DenseMap<Channel *, Value> createBufferForAllocs(
         // iteration. Find the parent loop that this
         // operation came from by walking up the IR.
         std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
-            builder, user, channel, oldAllocOp, numBuffers, regionsWithChannels,
-            config, reuseGrp);
+            builder, user, ownerChannelFor(user), oldAllocOp, numBuffers,
+            regionsWithChannels, config, reuseGrp);
       }
       userToBufIdx[user] = bufferIdx;
     }
@@ -3446,6 +3470,17 @@ void insertAsyncComm(
         LDBG("call getBufferIdxAndPhase2 ");
         headProducer->dump();
       });
+      getBufferIdxAndPhase(builder, headProducer,
+                           kv.second.front()->getNumBuffers(),
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, masterChannel);
+    } else if (reuseGrp >= 0) {
+      // Producer is outside any loop but shares one barrier array with the
+      // other members of its reuse group (buffer.copy > 1 -- see
+      // channelInReuseGroup). There is no iteration to count, so accumCnt is 0,
+      // but the members must still land on distinct slots; getStaggeredAccumCnt
+      // supplies the member's group position.
+      builder.setInsertionPoint(tmaHeadProducer);
       getBufferIdxAndPhase(builder, headProducer,
                            kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
