@@ -1244,7 +1244,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %plain = amdg.buffer_load %ptr[%offs] : tensor<64x64xf16, #blocked>
     %other = amdg.buffer_load %ptr[%offs], %mask, %val : tensor<64x64xf16, #blocked>
     %dst = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
-    %tok = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %dst : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    %tok = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %dst : <f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
     amdg.buffer_store %val, %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
     tt.return
   }
@@ -1274,8 +1274,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                                     %mask: tensor<64x64xi1, #blocked>) attributes {noinline = false} {
     %d0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %d1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
-    %t0 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d0 : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
-    %t1 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d1 : <f16>[tensor<64x64xi32, #blocked>] tensor<64x64xf16, #blocked> -> <64x64xf16, #shared, #smem, mutable>
+    %t0 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d0 : <f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
+    %t1 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d1 : <f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
     %g = ttg.async_commit_group tokens %t0, %t1
     %w = ttg.async_wait %g {num = 1 : i32}
     tt.return

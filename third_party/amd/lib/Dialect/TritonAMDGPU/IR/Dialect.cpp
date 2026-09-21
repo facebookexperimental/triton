@@ -147,19 +147,43 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
   if (!descPartitioned && allocPartitioned)
     effectiveAllocLayout = allocPartitioned.getPartitionLayout();
 
+  int descRank = descTy.getShape().size();
+  int allocRank = smemTy.getRank();
+  int rankDifference = descRank - allocRank;
+  bool dropsOnlyLeadingUnitDims =
+      rankDifference > 0 &&
+      llvm::all_of(descTy.getShape().take_front(rankDifference),
+                   [](int64_t dim) { return dim == 1; });
+  bool ranksAreCompatible = descRank == allocRank || dropsOnlyLeadingUnitDims;
   bool compatible =
-      descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
-                                    descLayout == effectiveAllocLayout);
+      ranksAreCompatible &&
+      (descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
+                                     descLayout == effectiveAllocLayout));
+  // Rank-reducing descriptor loads drop leading unit dimensions from the
+  // allocation, so the two swizzled encodings have different ranks even though
+  // they describe the same LDS layout. Compare the physical layouts with the
+  // dropped dimensions projected away.
+  if (!compatible && dropsOnlyLeadingUnitDims &&
+      llvm::isa<gpu::SwizzledSharedEncodingAttr>(descLayout) &&
+      llvm::isa<gpu::SwizzledSharedEncodingAttr>(effectiveAllocLayout)) {
+    auto descLL = gpu::toLinearLayout(descTy.getShape(), descLayout);
+    for (int i = 0; i < descRank - allocRank; ++i)
+      descLL = triton::removeStandardDim(descLL, 0);
+    compatible =
+        descLL == gpu::toLinearLayout(smemTy.getShape(), effectiveAllocLayout);
+  }
   // Padded encodings include the allocation shape. Compare padding here and
   // the physical address mapping over the copied tile below.
   auto descPad = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(descLayout);
   auto allocPad =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(effectiveAllocLayout);
   if (descPad && allocPad)
-    compatible = descPad.getIntervals() == allocPad.getIntervals() &&
+    compatible = ranksAreCompatible &&
+                 descPad.getIntervals() == allocPad.getIntervals() &&
                  descPad.getPaddings() == allocPad.getPaddings();
 
-  if (!compatible && descTy.getShape() != smemTy.getShape() &&
+  if (!compatible && descRank == allocRank &&
+      descTy.getShape() != smemTy.getShape() &&
       llvm::isa<gpu::SwizzledSharedEncodingAttr>(descLayout)) {
     auto descEncoding = llvm::cast<gpu::SharedEncodingTrait>(descLayout);
     auto smemTensorTy = RankedTensorType::get(
@@ -199,7 +223,9 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
            << descLayout
            << ") is inconsistent with the shared memory allocation layout ("
            << allocLayout
-           << "); TDM uses a single shared layout so they must match";
+           << "); TDM accesses shared memory through the descriptor's layout, "
+              "so the allocation must describe the same physical layout, up to "
+              "leading unit dimensions dropped by a rank-reducing access";
   return success();
 }
 
@@ -884,13 +910,8 @@ LogicalResult LocalLoadPackedTransposedOp::verify() {
   if (!dotEnc)
     return emitOpError("only works with DotOperandEncodingAttr dst encoding");
 
-  auto sharedEnc =
-      dyn_cast<triton::gpu::SwizzledSharedEncodingAttr>(srcTy.getEncoding());
-  if (!sharedEnc)
-    return emitOpError(
-        "only works with SwizzledSharedEncodingAttr src encoding");
-
-  auto order = sharedEnc.getOrder();
+  auto order = triton::gpu::getOrder(srcTy);
+  ArrayRef<unsigned> orderRef(order);
   bool isA = dotEnc.getOpIdx() == 0;
 
   // operand A: [0, 1] / [1, 2, 0]
@@ -899,7 +920,7 @@ LogicalResult LocalLoadPackedTransposedOp::verify() {
 
   if (isA) {
     bool matchingOrderA =
-        order.equals({0, 1}) || (hasBatchDim && order.equals({1, 2, 0}));
+        orderRef.equals({0, 1}) || (hasBatchDim && orderRef.equals({1, 2, 0}));
     if (!matchingOrderA)
       return emitOpError("Order of dimensions don't match expected");
 
@@ -913,7 +934,7 @@ LogicalResult LocalLoadPackedTransposedOp::verify() {
           "Input and output dimensions don't match after packing changes");
   } else {
     bool matchingOrderB =
-        order.equals({1, 0}) || (hasBatchDim && order.equals({2, 1, 0}));
+        orderRef.equals({1, 0}) || (hasBatchDim && orderRef.equals({2, 1, 0}));
     if (!matchingOrderB)
       return emitOpError("Order of dimensions don't match expected");
 

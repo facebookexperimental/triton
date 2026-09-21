@@ -597,9 +597,10 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     # Refilling immediately after the second-half reads starts the next pair one
     # stage earlier. This deliberately pays a RAW-to-refill wait/barrier; moving
     # the copy across the next existing barrier shortens DMA latency hiding and
-    # regresses both measured benchmark shapes.
+    # regresses both measured benchmark shapes. The gfx950 backedge-head
+    # heuristic adds a compensating post-loop barrier before reconvergence.
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 66
-    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 43
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert ".private_segment_fixed_size: 0" in amdgcn

@@ -79,9 +79,9 @@ Operation *wrapInMaskOp(RewriterBase &rewriter, Operation *op, Value pred);
 // lowering to predicated operations
 void resolveMaskOp(ModuleOp moduleOp);
 
-// Return true if the given ForOp has the attribute
+// Return true if the given loop has the attribute
 // `tt.disallow_acc_multi_buffer` set to true.
-bool getDisallowAccMultiBuffer(scf::ForOp forOp);
+bool getDisallowAccMultiBuffer(LoopLikeOpInterface loop);
 
 // Return the definition of the given value. If the value is a loop-carried
 // dependency, return the definition and the distance to it.
@@ -162,7 +162,7 @@ gpu::SharedEncodingTrait getSharedEncoding(Operation *loadOp);
 
 // Get the number of stages to pipeline the loop with, if it is explicitly
 // specified.
-int getNumStagesOrDefault(scf::ForOp forOp, int defaultNumStages);
+int getNumStagesOrDefault(LoopLikeOpInterface loop, int defaultNumStages);
 
 // Given a result of MemDescIndex, or Alloca, create a MemDescIndex with a
 // single buffer slice (leading dimension equal to 1), at the given index.
@@ -177,7 +177,8 @@ Value createIncrementModulo(OpBuilder &builder, Location loc, Value counter,
                             Value modulus, Value zero, Value one,
                             Value *outWrapCond = nullptr);
 
-scf::ForOp lowerTMADescriptors(scf::ForOp forOp, CoarseSchedule &schedule);
+LoopLikeOpInterface lowerTMADescriptors(LoopLikeOpInterface loop,
+                                        CoarseSchedule &schedule);
 
 DenseSet<Operation *>
 getTopLevelUsersInLoop(Operation *op, scf::ForOp forOp,

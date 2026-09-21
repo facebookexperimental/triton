@@ -3,14 +3,14 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.h"
-#include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/IR/Use.h"
 
 using namespace mlir;
 using namespace triton;
@@ -51,10 +51,10 @@ LogicalResult verifyPartitionAttrs(Operation *op) {
   // META_WS_CHANGE: PSM intentionally leaves some nested operations without
   // partition annotations for later task-id propagation.
   if (op->hasAttr(kWarpSpecializeAttrName) && !useMetaWS) {
-    if (!isa<scf::ForOp>(op)) {
+    if (!isa<scf::ForOp, scf::WhileOp>(op)) {
       return op->emitOpError("has unexpected attribute ")
              << kWarpSpecializeAttrName
-             << " which is expected only on `scf.for` ops";
+             << " which is expected only on `scf.for` or `scf.while` ops";
     }
 
     Operation *failedOp = nullptr;
@@ -117,7 +117,7 @@ LogicalResult verifyPartitionAttrs(Operation *op) {
   }
 
   if (auto outputsAttr = op->getAttr(kPartitionOutputsAttrName)) {
-    if (!isa<scf::ForOp, scf::IfOp, triton::ReduceOp>(op))
+    if (!isa<scf::ForOp, scf::WhileOp, scf::IfOp, triton::ReduceOp>(op))
       return op->emitOpError("has unexpected attribute ")
              << kPartitionOutputsAttrName;
 
@@ -248,7 +248,7 @@ void Partition::iterateUses(
     LoopLikeOpInterface loop,
     function_ref<void(OpResult, OpOperand &, unsigned)> callback) const {
   SmallVector<std::tuple<OpResult, OpOperand *, unsigned>> uses;
-  iterateOutputs(loop, [&](Operation *owner, OpOperand &use) {
+  iterateOutputs(loop, [&](Operation *, OpOperand &use) {
     uses.emplace_back(cast<OpResult>(use.get()), &use, 0);
   });
   while (!uses.empty()) {
@@ -360,7 +360,7 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   for (auto [idx, attr] : llvm::enumerate(stages)) {
     auto stage = dyn_cast<IntegerAttr>(attr);
     if (!stage || stage.getInt() < 0) {
-      return mlir::emitError(loop.getLoc(), "partition stages attribute '")
+      return mlir::emitError(loop->getLoc(), "partition stages attribute '")
              << kPartitionStagesAttrName << "' has invalid element " << attr;
     }
 
@@ -424,44 +424,22 @@ void PartitionSet::dump() const {
 
 namespace mlir::triton::gpu {
 
-SetVector<int> getPartitionIds(Operation *op) {
-  auto attrs = op->getAttr(kPartitionAttrName);
-  SmallVector<int> partitionIds;
-  for (auto id : cast<DenseI32ArrayAttr>(attrs).asArrayRef()) {
-    partitionIds.push_back(id);
-  }
-  llvm::sort(partitionIds);
-  return SetVector<int>(partitionIds.begin(), partitionIds.end());
-}
-
-SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
-  SmallVector<SetVector<int>, 4> partitionOutputsIds;
-  if (op->getNumResults() == 0)
-    return partitionOutputsIds;
-
-  assert(op->hasAttr(kPartitionOutputsAttrName));
-  auto arrayAttr = cast<ArrayAttr>(op->getAttr(kPartitionOutputsAttrName));
-  for (Attribute attr : arrayAttr) {
-    auto ids = cast<DenseI32ArrayAttr>(attr).asArrayRef();
-    partitionOutputsIds.push_back(SetVector<int>(ids.begin(), ids.end()));
-  }
-  return partitionOutputsIds;
-}
-
 SetVector<int> getPartitionIds(OpOperand *use) {
-  auto owner = use->getOwner();
-  if (isa<scf::YieldOp>(owner)) {
-    return getPartitionOutputs(owner->getParentOp())[use->getOperandNumber()];
+  Operation *owner = use->getOwner();
+  auto pos = use->getOperandNumber();
+  if (isa<scf::YieldOp, scf::ConditionOp>(owner)) {
+    unsigned numControlOperands = isa<scf::ConditionOp>(owner) ? 1 : 0;
+    if (pos < numControlOperands)
+      return getPartitionIds(owner);
+    return getPartitionOutputs(owner->getParentOp())[pos - numControlOperands];
   }
-  if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
-    int idx = use->getOperandNumber() - forOp.getNumControlOperands();
-    return idx >= 0 ? getPartitionOutputs(owner)[idx] : getPartitionIds(forOp);
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(owner)) {
+    auto numControlOperands = owner->getNumOperands() - loop.getInits().size();
+    if (pos < numControlOperands)
+      return getPartitionIds(owner);
+    return getPartitionOutputs(owner)[pos - numControlOperands];
   }
   return getPartitionIds(owner);
-}
-
-bool hasPartition(Operation *op) {
-  return op && op->hasAttr(kPartitionAttrName);
 }
 
 bool hasWarpSpecializeTag(Operation *op) {
@@ -474,7 +452,7 @@ std::optional<int> getWarpSpecializeTag(Operation *op) {
   return std::nullopt;
 }
 
-LogicalResult verifyPartitionedLoop(scf::ForOp loop) {
+LogicalResult verifyPartitionedLoop(LoopLikeOpInterface loop) {
   if (failed(verifyPartitionAttrs(loop)))
     return failure();
 
