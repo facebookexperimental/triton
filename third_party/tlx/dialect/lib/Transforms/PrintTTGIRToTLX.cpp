@@ -2438,6 +2438,12 @@ void printSimplifiedOp(
   }
   os << ")";
 
+  // An unmapped op is emitted as its raw MLIR name, which is not valid Python.
+  // Flag it inline so the gap is visible in the dump rather than surfacing as
+  // an unexplained NameError when the regenerated kernel is launched.
+  if (it == opNameMap.end())
+    os << "  # UNSUPPORTED: no TLX mapping for " << opName;
+
   printLocComment(op, os);
 }
 
