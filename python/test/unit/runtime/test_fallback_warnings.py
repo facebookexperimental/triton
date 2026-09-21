@@ -183,6 +183,7 @@ class TestCCacheFallbackWarning:
         fast_kernel[(1, )](x, N, BLOCK=1024)
 
         # Second call should hit C fast path — no warning
+        monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "0")
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             fast_kernel[(1, )](x, N, BLOCK=1024)
