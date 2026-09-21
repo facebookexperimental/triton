@@ -270,9 +270,12 @@ def test_global_var_access():
     def kernel():
         a = GLOBAL  # noqa
 
-    with pytest.raises(CompilationError) as e:
-        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
-    assert "global variable" in str(e.value)
+    source = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    if triton.knobs.compilation.allow_non_constexpr_globals:
+        assert triton.compile(source) is not None
+    else:
+        with pytest.raises(CompilationError, match="Cannot access global variable"):
+            triton.compile(source)
 
 
 CONSTEXPR_ANNOTATED_GLOBAL: tl.constexpr = 42
@@ -284,12 +287,12 @@ def test_constexpr_annotated_global_var_access():
     def kernel():
         a = CONSTEXPR_ANNOTATED_GLOBAL  # noqa
 
-    # No error.
-    try:
-        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
-        assert False, "Using a constexpr annotated global variable should not be allowed"
-    except CompilationError as e:
-        assert "Cannot access global variable" in str(e)
+    source = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    if triton.knobs.compilation.allow_non_constexpr_globals:
+        assert triton.compile(source) is not None
+    else:
+        with pytest.raises(CompilationError, match="Cannot access global variable"):
+            triton.compile(source)
 
 
 CONSTEXPR_GLOBAL = tl.constexpr(42)
