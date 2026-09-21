@@ -1,0 +1,115 @@
+name: Report CI Failure
+
+# Deterministic PR callout when a hardware/LIT CI lane fails.
+#
+# No LLM, no secrets beyond the auto-provided GITHUB_TOKEN — so this works
+# today, independent of secrets.ANTHROPIC_API_KEY. It pairs with:
+#   - the Claude reviewers (.claude/reviewers/, on `/claude review`), and
+#   - the deferred LLM-triage variant (adds a root-cause blurb; needs the key).
+#
+# Uses `workflow_run` (not `pull_request_target`) so untrusted fork code never
+# runs here — only this trusted workflow does, with a write token.
+
+on:
+  workflow_run:
+    workflows:
+      - "Meta Triton H100 Tests"
+      - "Meta Triton MI350 Tests"
+      - "Compiler LIT Tests"
+    types:
+      - completed
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  callout:
+    # Only PR-triggered runs have a PR to comment on (skip push/schedule).
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Comment on PR when a CI lane fails (and resolve when it passes)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const failed = run.conclusion === 'failure';
+            // One stable comment per lane, keyed by a hidden marker so re-runs
+            // update in place instead of stacking new comments.
+            const marker = `<!-- ci-failure-callout:${run.name} -->`;
+            const shortSha = run.head_sha.slice(0, 9);
+
+            // Resolve the PR(s) for this run's head commit (robust for forks).
+            const { data: prs } =
+              await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: run.head_sha,
+              });
+            if (!prs.length) {
+              core.info(`No PR associated with ${run.head_sha}; nothing to do.`);
+              return;
+            }
+
+            // On failure, enumerate the failed jobs for a precise callout.
+            let failedJobs = [];
+            if (failed) {
+              const jobs = await github.paginate(
+                github.rest.actions.listJobsForWorkflowRun,
+                { owner: context.repo.owner, repo: context.repo.repo,
+                  run_id: run.id, per_page: 100 });
+              failedJobs = jobs
+                .filter(j => j.conclusion === 'failure')
+                .map(j => j.name);
+            }
+
+            const body = failed
+              ? [
+                  marker,
+                  `### ❌ \`${run.name}\` failed`,
+                  '',
+                  '| Field | Value |',
+                  '| --- | --- |',
+                  `| Lane | \`${run.name}\` |`,
+                  `| Commit | \`${shortSha}\` |`,
+                  `| Failed jobs | ${failedJobs.length ? failedJobs.map(n => '`' + n + '`').join(', ') : '_see run_'} |`,
+                  `| Run | ${run.html_url} |`,
+                  '',
+                  '> Auto-posted by `report-ci-failure`. Re-runs update this comment in place.',
+                ].join('\n')
+              : [
+                  marker,
+                  `### ✅ \`${run.name}\` passed`,
+                  '',
+                  `A previously reported failure on this lane is resolved as of \`${shortSha}\`.`,
+                  '',
+                  `[Run](${run.html_url})`,
+                ].join('\n');
+
+            for (const pr of prs) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: pr.number, per_page: 100 });
+              const existing = comments.find(c => c.body && c.body.includes(marker));
+
+              if (existing) {
+                // Update in place: failure → red, recovery → green.
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  comment_id: existing.id, body });
+                core.info(`Updated callout on PR #${pr.number} for ${run.name}`);
+              } else if (failed) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: pr.number, body });
+                core.info(`Created callout on PR #${pr.number} for ${run.name}`);
+              } else {
+                // Passed with no prior failure comment — stay silent (no spam).
+                core.info(`No prior callout on PR #${pr.number}; nothing to resolve.`);
+              }
+            }
