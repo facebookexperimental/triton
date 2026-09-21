@@ -758,22 +758,28 @@ def _attn_fwd_single_q(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
     kv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
     # allocate TMEM buffers and barriers
+    # p_tiles (bf16/fp6) shares qk_tiles' (fp32) backing: P buffer cid aliases
+    # QK buffer cid's region with sequential lifetimes, so q0k can't
+    # overwrite p1. The compiler owns the exact placement.
+    qk_tmem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc(
         (BLOCK_M, BLOCK_N),
         tl.float32,
         NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
-    # p_tiles is in bf16/fp6, when reusing qk_tiles which is fp32,
-    # we need to create 2xNUM_MMA_GROUPS of p_tiles and use the
-    # lower half for p1 so that
-    # q0k won't overwrite p1.
     p_tiles = tlx.local_alloc(
         (BLOCK_M, BLOCK_N),
         tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS * 2,
+        NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
+    )
+    qk_tmem_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            qk_tiles, p_tiles, group_type=tlx.reuse_group_type.shared
+        )
     )
 
     acc_tiles = tlx.local_alloc(
@@ -830,7 +836,7 @@ def _attn_fwd_single_q(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                     silu = fast_dividef(qk, 1.0 + tl.exp(-qk))
                     act_qk = tl.where(valid_mask, silu, 0.0)
                     act_qk = act_qk.to(tlx.dtype_of(desc_v))
-                    tlx.local_store(p_tiles[cid * 2], act_qk)
+                    tlx.local_store(p_tiles[cid], act_qk)
                     tlx.barrier_arrive(p_fulls[cid])
                     phase ^= 1
         # mma group
@@ -884,7 +890,7 @@ def _attn_fwd_single_q(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                     tlx.barrier_wait(p_fulls[qk_id_prev], p_phase_prev)
                     # Use p[0] for cid=0, and p[2] for cid=1
                     tlx.async_dot(
-                        p_tiles[qk_id_prev * 2],
+                        p_tiles[qk_id_prev],
                         kv_tiles[v_buf_id],
                         acc_tiles[0],
                         use_acc=acc_pv,
@@ -900,7 +906,7 @@ def _attn_fwd_single_q(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                 tlx.barrier_wait(p_fulls[qk_id], p_phase)
                 # Use p[0] for cid=0, and p[2] for cid=1
                 tlx.async_dot(
-                    p_tiles[qk_id * 2],
+                    p_tiles[qk_id],
                     kv_tiles[v_buf_id],
                     acc_tiles[0],
                     use_acc=acc_pv,
@@ -1003,22 +1009,28 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
     v_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
 
     # allocate TMEM buffers and barriers
+    # p_tiles (bf16/fp6) shares qk_tiles' (fp32) backing: P buffer cid aliases
+    # QK buffer cid's region with sequential lifetimes, so q0k can't
+    # overwrite p1. The compiler owns the exact placement.
+    qk_tmem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N),
         tl.float32,
         NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
-    # p_tiles is in bf16/fp6, when reusing qk_tiles which is fp32,
-    # we need to create 2xNUM_MMA_GROUPS of p_tiles and use the
-    # lower half for p1 so that
-    # q0k won't overwrite p1.
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N),
         tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS * 2,
+        NUM_MMA_GROUPS,
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
+    )
+    qk_tmem_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            qk_tiles, p_tiles, group_type=tlx.reuse_group_type.shared
+        )
     )
 
     acc_tiles = tlx.local_alloc(
@@ -1077,7 +1089,7 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                     # silu = fast_dividef(qk, 1.0 + tl.exp(-qk))
                     silu = fast_silu(qk)
                     act_qk = silu.to(tlx.dtype_of(desc_v))
-                    tlx.local_store(p_tiles[cid * 2], act_qk)
+                    tlx.local_store(p_tiles[cid], act_qk)
                     tlx.barrier_arrive(p_fulls[cid])
                     accum_cnt_qk += 1
         # mma group
@@ -1140,7 +1152,7 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                     # compute p1 @ v
                     tlx.barrier_wait(p_fulls[1], phase ^ 1)
                     tlx.async_dot(
-                        p_tiles[2],
+                        p_tiles[1],
                         v_tiles[kv_buf_id_prev],
                         acc_tiles[1],
                         use_acc=acc1,
@@ -1171,7 +1183,7 @@ def _attn_fwd_pipeline(alpha, Z, H, desc_q, desc_k, desc_v, Out, seq_offsets_q, 
                 # compute p1 @ v
                 tlx.barrier_wait(p_fulls[1], phase ^ 1)
                 tlx.async_dot(
-                    p_tiles[2],
+                    p_tiles[1],
                     v_tiles[kv_buf_id],
                     acc_tiles[1],
                     use_acc=acc1,
