@@ -160,6 +160,9 @@ def suite_listing(bench) -> str:
 
     lines = []
     for arch_name, defaults in registry.defaults.items():
+        if not defaults:
+            lines.append(f"{arch_name} default => (none)")
+            continue
         names = dict.fromkeys(component for name in defaults for component in components(name))
         selected = "+".join(defaults)
         expanded = "+".join(names)

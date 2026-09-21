@@ -30,7 +30,7 @@ SYNTHETIC: tuple[HSTUAttentionShape, ...] = (
 FOCUS_SUITES = (
     # TODO: Replace placeholders with captured sparse-length shapes.
     FocusSuite(
-        name="sm100_baseline",
+        name="sm100_1",
         op="hstu_attn",
         shapes=(
             HSTUAttentionShape(32, 1024, 4, 128, True, "bf16"),
@@ -39,23 +39,15 @@ FOCUS_SUITES = (
             HSTUAttentionShape(32, 1024, 8, 128, True, "bf16"),
             HSTUAttentionShape(32, 1024, 4, 128, True, "fp16"),
         ),
-    ),
-    # TODO: Add gfx950 shapes after validating its forward reference.
-    FocusSuite[HSTUAttentionShape](
-        name="gfx950_baseline",
-        op="hstu_attn",
-        shapes=(),
-    ),
-)
+    ), )
 
 DEFAULT_SUITES = {
-    "sm100": ("sm100_baseline", ),
-    "gfx950": ("gfx950_baseline", ),
+    "sm100": ("sm100_1", ),
+    # No production-derived gfx950 focus suite has been captured yet.
+    "gfx950": (),
 }
 FOCUS = FocusRegistry("hstu_attn", FOCUS_SUITES, DEFAULT_SUITES)
-
-SM100_FOCUS = FOCUS.shapes("sm100")
-GFX950_FOCUS = FOCUS.shapes("gfx950")
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 #: How sequence lengths are drawn. The distribution dominates ragged-attention
 #: performance, so a number taken under one is not comparable to one taken under

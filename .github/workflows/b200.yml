@@ -192,7 +192,7 @@ jobs:
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 120
+    timeout-minutes: 240
     permissions:
       id-token: write
       contents: read
@@ -230,7 +230,7 @@ jobs:
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX core tests
         id: run_core_tests
-        timeout-minutes: 30
+        timeout-minutes: 90
         run: |
           . "${SETUP_SCRIPT}"
           shopt -s nullglob
@@ -262,18 +262,33 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest python/test/unit/language/test_tlx_codegen.py -v --junitxml=/tmp/tlx-codegen.xml
+      - name: Run host-default TLX L2 perf
+        id: run_perf_tests
+        if: always() && github.event_name == 'schedule'
+        timeout-minutes: 60
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py \
+            -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
+      - name: Upload TLX perf artifacts
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: b200-tlx-perf
+          path: /tmp/tlx_benchmark/*.json
+          if-no-files-found: ignore
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_codegen_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_codegen_tests.outcome }}" != "success" || "${{ steps.run_perf_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket b200-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-codegen.xml \
-            --budget /tmp/tlx-core.xml=30 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-codegen.xml=30 \
+            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-codegen.xml /tmp/tlx-perf.xml \
+            --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-codegen.xml=30 --budget /tmp/tlx-perf.xml=60 \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "b200-tlx-test" \
             ${FAILED_FLAG}

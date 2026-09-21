@@ -7,10 +7,6 @@ import functools
 import torch
 from torch._inductor import config
 
-from ._shapes import GFX950_FOCUS
-
-PERF_SHAPES = GFX950_FOCUS
-
 
 @functools.lru_cache(maxsize=None)
 def _compiled(mode):

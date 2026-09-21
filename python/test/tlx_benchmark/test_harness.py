@@ -676,8 +676,70 @@ def test_focus_suite_can_union_other_suites():
     registry = FocusRegistry("mm", (first, second, combined), {"gfx950": ("all", )})
 
     assert registry.resolved_shapes("all") == ((1, ), (2, ), (3, ))
+    assert registry.all_shapes() == ((1, ), (2, ), (3, ))
     assert registry.shapes("gfx950") == ((1, ), (2, ), (3, ))
     assert registry.selected_suite_names("gfx950") == ("all", )
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.bmm._shapes",
+        "triton.tlx.ops.kernels.flash_attn._shapes",
+        "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes",
+        "triton.tlx.ops.kernels.hstu_attn._shapes",
+        "triton.tlx.ops.kernels.kda._shapes",
+        "triton.tlx.ops.kernels.kda._prefill_shapes",
+        "triton.tlx.ops.kernels.kda._decode_shapes",
+        "triton.tlx.ops.kernels.mm._shapes",
+    ],
+)
+def test_operator_shape_modules_expose_the_l1_union(module_name):
+    import importlib
+
+    shapes = importlib.import_module(module_name)
+    expected = tuple(dict.fromkeys((*shapes.SYNTHETIC, *shapes.FOCUS.all_shapes())))
+    assert shapes.CORRECTNESS_SHAPES == expected
+
+
+def test_operator_focus_suite_names_and_host_defaults_are_stable():
+    import importlib
+    import re
+
+    expected = {
+        "triton.tlx.ops.kernels.addmm._shapes": {
+            "gfx942": ("gfx942_1", ),
+            "gfx950": ("gfx950_1", ),
+        },
+        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.flash_attn._shapes": {
+            "sm90": ("sm90_1", ),
+            "sm100": ("sm100_1", ),
+        },
+        "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {"sm100": ("sm100_1", )},
+        "triton.tlx.ops.kernels.hstu_attn._shapes": {
+            "sm100": ("sm100_1", ),
+            "gfx950": (),
+        },
+        "triton.tlx.ops.kernels.kda._shapes": {"sm100": ("sm100_1", )},
+        "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.mm._shapes": {
+            "sm100": ("sm100_1", ),
+            "gfx950": ("gfx950_all", ),
+            "gfx942": ("gfx942_all", ),
+        },
+    }
+    pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
+    for module_name, defaults in expected.items():
+        registry = importlib.import_module(module_name).FOCUS
+        assert dict(registry.defaults) == defaults
+        assert all(pattern.fullmatch(suite.name) for suite in registry.suites)
+
+    mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
+    assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx950_2")
+    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
 def test_focus_suite_selection_rejects_unknown_names():
@@ -701,7 +763,16 @@ def test_focus_suite_op_mismatch_is_rejected_explicitly():
 # driver: the adapter contract
 # --------------------------------------------------------------------------
 
-BENCH_MODULES = ("bench_mm", "bench_flash_attn", "bench_hstu_attn", "bench_kda")
+BENCH_MODULES = (
+    "bench_addmm",
+    "bench_flash_attn",
+    "bench_flash_attn_mxfp8",
+    "bench_hstu_attn",
+    "bench_kda",
+    "bench_kda_decode",
+    "bench_kda_prefill",
+    "bench_mm",
+)
 
 
 @pytest.mark.parametrize("module_name", BENCH_MODULES)
@@ -773,6 +844,14 @@ def test_suite_listing_shows_defaults():
 
     assert driver.suite_listing(bench) == ("gfx950 default => all => common+optional\n"
                                            "gfx942 default => common")
+
+
+def test_suite_listing_shows_an_explicit_empty_default():
+    from _harness import driver
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry
+
+    bench = type("Bench", (), {"SHAPE_SUITES": FocusRegistry("fake", (), {"gfx950": ()})})
+    assert driver.suite_listing(bench) == "gfx950 default => (none)"
 
 
 def test_suite_shape_listing_shows_typed_shapes():

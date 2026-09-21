@@ -1,7 +1,7 @@
 """sm100 L1 correctness for ``tlx.ops.mm``.
 
-Runs the synthetic list plus the sm100 focus list -- the same set the perf
-suite measures.
+Runs the hardware-agnostic synthetic list plus every MM focus suite. L2 perf
+selects only the running host's configured default.
 
 A shape the op declines is reported as a skip with the reason, never as a
 pass.
@@ -23,7 +23,7 @@ import torch
 import triton
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops.kernels.mm import sm100
-from triton.tlx.ops.kernels.mm._shapes import SM100_FOCUS, SYNTHETIC
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES
 
 from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case
 
@@ -160,7 +160,7 @@ FAILED_SHAPES = {
 
 
 def _cases():
-    return [entry for entry in list(SYNTHETIC) + list(SM100_FOCUS) if tuple(entry) not in FAILED_SHAPES]
+    return [entry for entry in CORRECTNESS_SHAPES if tuple(entry) not in FAILED_SHAPES]
 
 
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _cases())

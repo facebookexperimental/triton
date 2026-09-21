@@ -3,22 +3,17 @@
 import pytest
 import torch
 from triton._internal_testing import is_blackwell
+from triton.tlx.ops.kernels.flash_attn_mxfp8._shapes import CORRECTNESS_SHAPES
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.flash_attn_mxfp8 requires sm100")
 
 ARCH = "sm100"
-SHAPES = [
-    (1, 1, 256, 128, False),
-    (1, 1, 256, 128, True),
-]
 MULTI_WAVE_SHAPE = (1, 64, 1024, 128)
 
 
 def _qkv(shape, *, requires_grad=False):
-    return [
-        (torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5).requires_grad_(requires_grad)
-        for _ in range(3)
-    ]
+    return [(torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5).requires_grad_(requires_grad)
+            for _ in range(3)]
 
 
 def _sdpa(q, k, v, causal, scale):
@@ -39,8 +34,8 @@ def _cosine(actual, expected):
     ).item()
 
 
-@pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal", SHAPES)
-def test_flash_attn_mxfp8_fwd(Z, H, N_CTX, HEAD_DIM, causal):
+@pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal,dtype_name", CORRECTNESS_SHAPES)
+def test_flash_attn_mxfp8_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn_mxfp8
 
     torch.manual_seed(20)
@@ -81,8 +76,8 @@ def test_flash_attn_mxfp8_bwd_multiple_cta_waves(causal):
         assert cosine >= 0.98, f"{label} cosine_similarity={cosine:.6f}"
 
 
-@pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal", SHAPES)
-def test_flash_attn_mxfp8_bwd(Z, H, N_CTX, HEAD_DIM, causal):
+@pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal,dtype_name", CORRECTNESS_SHAPES)
+def test_flash_attn_mxfp8_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn_mxfp8
 
     torch.manual_seed(20)

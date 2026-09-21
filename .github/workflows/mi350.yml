@@ -202,7 +202,7 @@ jobs:
       CONDA_ENV: pytorch
       UV_VENV_DIR: /workspace/uv_venvs
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 90
+    timeout-minutes: 240
     permissions:
       id-token: write
       contents: read
@@ -253,7 +253,7 @@ jobs:
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX core tests
         id: run_core_tests
-        timeout-minutes: 30
+        timeout-minutes: 90
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
@@ -283,18 +283,33 @@ jobs:
           set -eux
           . "${SETUP_SCRIPT}"
           pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
+      - name: Run host-default TLX L2 perf
+        id: run_perf_tests
+        if: always() && github.event_name == 'schedule'
+        timeout-minutes: 60
+        run: |
+          . "${SETUP_SCRIPT}"
+          pytest python/test/tlx_benchmark/test_ops_perf.py \
+            -k "not torchtlx" -v --junitxml=/tmp/tlx-perf.xml
+      - name: Upload TLX perf artifacts
+        if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi350-tlx-perf
+          path: /tmp/tlx_benchmark/*.json
+          if-no-files-found: ignore
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_perf_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml \
-            --budget /tmp/tlx-core.xml=30 --budget /tmp/tlx-correctness.xml=30 \
+            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-perf.xml \
+            --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-perf.xml=60 \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "mi350-tlx-test" \
             ${FAILED_FLAG}
@@ -305,7 +320,7 @@ jobs:
     env:
       TORCHINDUCTOR_TLX_MODE: "allow"
       TORCHTLX_ARCH: gfx950
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       id-token: write
       contents: read
@@ -361,7 +376,7 @@ jobs:
           PY
       - name: Run TorchTLX template + fusion tests
         id: run_torchtlx_tests
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
           bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml

@@ -6,7 +6,7 @@ import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops import InvalidInput, UnsupportedOp
-from triton.tlx.ops.kernels.mm._shapes import GFX950_FOCUS, SYNTHETIC, operand
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
@@ -18,7 +18,7 @@ FAILED_SHAPES = set()
 
 
 def _cases():
-    return [entry for entry in list(SYNTHETIC) + list(GFX950_FOCUS) if tuple(entry) not in FAILED_SHAPES]
+    return [entry for entry in CORRECTNESS_SHAPES if tuple(entry) not in FAILED_SHAPES]
 
 
 def _assert_strides(tensor, wanted):

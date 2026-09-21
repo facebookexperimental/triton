@@ -7,6 +7,8 @@ import torch
 import triton
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops import kda_paged_prefill, kda_recurrent_decode
+from triton.tlx.ops.kernels.kda._decode_shapes import CORRECTNESS_SHAPES as DECODE_CORRECTNESS_SHAPES
+from triton.tlx.ops.kernels.kda._prefill_shapes import CORRECTNESS_SHAPES as PREFILL_CORRECTNESS_SHAPES
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="gfx950 KDA operators require CDNA4")
 
@@ -126,6 +128,36 @@ def test_kda_paged_prefill_smoke_shapes(lengths, heads):
     _check_kda_prefill(lengths, heads=heads, scale=128**-0.5)
 
 
+@pytest.mark.parametrize("total_tokens,sequences,heads,key_dim,value_dim,dtype_name", PREFILL_CORRECTNESS_SHAPES)
+def test_kda_paged_prefill_shape_suites_run(total_tokens, sequences, heads, key_dim, value_dim, dtype_name):
+    assert dtype_name == "bf16"
+    torch.manual_seed(37)
+    shape = (1, total_tokens, heads, key_dim)
+    q = _normalized_kda_input(shape)
+    k = _normalized_kda_input(shape)
+    v = torch.randn(1, total_tokens, heads, value_dim, device=DEVICE, dtype=torch.bfloat16)
+    g = -torch.nn.functional.softplus(torch.randn(shape, device=DEVICE, dtype=torch.float32))
+    beta = torch.sigmoid(torch.randn(1, total_tokens, heads, device=DEVICE, dtype=torch.float32))
+    initial_state = torch.zeros(sequences, heads, value_dim, key_dim, device=DEVICE, dtype=torch.float32)
+    base, remainder = divmod(total_tokens, sequences)
+    lengths = [base + (index < remainder) for index in range(sequences)]
+    cu_seqlens = torch.tensor([0, *accumulate(lengths)], device=DEVICE, dtype=torch.int64)
+
+    output, final_state = kda_paged_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=1.0,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        arch=ARCH,
+    )
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(final_state).all()
+
+
 def _make_kda_decode_inputs(batch, heads, key_dim, value_dim, strided):
     q_shape = (1, batch, heads, key_dim)
     if strided:
@@ -160,6 +192,49 @@ def _make_kda_decode_inputs(batch, heads, key_dim, value_dim, strided):
     return q, k, v, g, beta
 
 
+@pytest.mark.parametrize("batch,heads,key_dim,value_dim,dtype_name", DECODE_CORRECTNESS_SHAPES)
+def test_kda_recurrent_decode_shape_suites(batch, heads, key_dim, value_dim, dtype_name):
+    assert dtype_name == "bf16"
+    torch.manual_seed(43)
+    q, k, v, g, beta = _make_kda_decode_inputs(batch, heads, key_dim, value_dim, strided=False)
+    state_pool = torch.randn(2 * batch, heads, value_dim, key_dim, device=DEVICE, dtype=torch.float32)
+    original_pool = state_pool.clone()
+    read_indices = torch.arange(batch, device=DEVICE, dtype=torch.int32)
+    write_indices = read_indices + batch
+    cu_seqlens = torch.arange(batch + 1, device=DEVICE, dtype=torch.int64)
+
+    expected = []
+    expected_pool = state_pool.clone()
+    for row in range(batch):
+        row_output, row_state = _kda_recurrent_reference(
+            q[0, row:row + 1],
+            k[0, row:row + 1],
+            v[0, row:row + 1],
+            g[0, row:row + 1],
+            beta[0, row:row + 1],
+            original_pool[row],
+            1.0,
+        )
+        expected.append(row_output[0])
+        expected_pool[batch + row] = row_state
+
+    actual = kda_recurrent_decode(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=1.0,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        arch=ARCH,
+    )
+    torch.testing.assert_close(actual.float(), torch.stack(expected).unsqueeze(0), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(state_pool, expected_pool, atol=2e-4, rtol=2e-4)
+
+
 @pytest.mark.parametrize(
     ("heads", "key_dim", "value_dim", "strided_inputs", "scale_mode"),
     [
@@ -184,11 +259,11 @@ def test_kda_recurrent_decode_indexed_state(heads, key_dim, value_dim, strided_i
     expected_output = []
     for row in range(batch):
         output, final_state = _kda_recurrent_reference(
-            q[0, row : row + 1],
-            k[0, row : row + 1],
-            v[0, row : row + 1],
-            g[0, row : row + 1],
-            beta[0, row : row + 1],
+            q[0, row:row + 1],
+            k[0, row:row + 1],
+            v[0, row:row + 1],
+            g[0, row:row + 1],
+            beta[0, row:row + 1],
             original_pool[read_indices[row].long()],
             scale,
         )
@@ -261,11 +336,11 @@ def test_kda_recurrent_decode_graph_padding_and_slot_stride():
     expected_output = []
     for row in range(active):
         row_output, final_state = _kda_recurrent_reference(
-            q[0, row : row + 1],
-            k[0, row : row + 1],
-            v[0, row : row + 1],
-            g[0, row : row + 1],
-            beta[0, row : row + 1],
+            q[0, row:row + 1],
+            k[0, row:row + 1],
+            v[0, row:row + 1],
+            g[0, row:row + 1],
+            beta[0, row:row + 1],
             original_pool[read_indices[row].long()],
             1.0,
         )

@@ -14,7 +14,7 @@ from torch._inductor.utils import fresh_cache
 from triton._internal_testing import is_blackwell
 try:
     from triton.language.extra.tlx.inductor import sm100_torch, tlx_config
-    from triton.tlx.ops.kernels.mm._shapes import SM100_FOCUS, SYNTHETIC, operand
+    from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 except ImportError:  # not the fbtriton fork
     sm100_torch = None
 
@@ -98,7 +98,7 @@ FAILED_SHAPES = {
 
 
 def _cases():
-    entries = [] if sm100_torch is None else list(SYNTHETIC) + list(SM100_FOCUS)
+    entries = [] if sm100_torch is None else CORRECTNESS_SHAPES
     return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
 
 

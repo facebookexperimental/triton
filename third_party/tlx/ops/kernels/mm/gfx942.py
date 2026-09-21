@@ -13,11 +13,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ._shapes import GFX942_FOCUS
-
-#: The shapes ``bench_mm.py`` gates on for this architecture.
-PERF_SHAPES = GFX942_FOCUS
-
 # Cache policy understood by _policy_load. Keeping the integer in the
 # kernel signature makes every selected policy a compile-time branch.
 _CACHE_DEFAULT = 0

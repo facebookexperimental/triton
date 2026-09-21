@@ -83,5 +83,16 @@ class FocusRegistry(Generic[ShapeT]):
                     result.append(shape)
         return tuple(result)
 
+    def all_shapes(self) -> tuple[ShapeT, ...]:
+        """Every focus shape, independent of architecture, without duplicates."""
+        seen: set[ShapeT] = set()
+        result: list[ShapeT] = []
+        for suite in self.suites:
+            for shape in self.resolved_shapes(suite.name):
+                if shape not in seen:
+                    seen.add(shape)
+                    result.append(shape)
+        return tuple(result)
+
     def selected_suite_names(self, arch: str, suites: Iterable[str] | None = None) -> tuple[str, ...]:
         return tuple(suite.name for suite in self._selected(arch, suites))
