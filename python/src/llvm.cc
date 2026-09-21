@@ -527,6 +527,15 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
 
 using ret = py::rv_policy;
 
+void register_types() {
+  // Pre-create lazily-registered iterator types (same calls as their
+  // __iter__ methods): concurrent first use aborts in nb_type_new.
+  llvm::Module::FunctionListType dummy_functions;
+  (void)py::make_iterator<py::rv_policy::reference>(
+      py::handle(), "iterator", dummy_functions.begin(),
+      dummy_functions.end());
+}
+
 } // namespace
 
 void init_triton_llvm(py::module_ &m) {
@@ -542,6 +551,8 @@ void init_triton_llvm(py::module_ &m) {
                 py::handle(), "iterator", s.begin(), s.end());
           },
           py::keep_alive<0, 1>());
+
+  register_types();
 
   // Module Flag behavior. See
   // https://llvm.org/doxygen/classllvm_1_1Module.html#a0a5c55e12c97b80021330fe82b642293
