@@ -46,7 +46,6 @@ case "${TORCHTLX_ARCH:-all}" in
     exit 2
     ;;
 esac
-TESTS=("${COMMON_TESTS[@]}" "${ARCH_TESTS[@]}")
 BENCH=python/test/tlx_benchmark/test_ops_perf.py
 
 PERF=0
@@ -86,4 +85,9 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 if [ "$PERF" = 1 ]; then
   exec "$PY" -m pytest -p no:cacheprovider "$BENCH" -k "$PERF_FILTER" "$@" -v
 fi
-exec "$PY" -m pytest -p no:cacheprovider "${TESTS[@]}" "$@" -v
+
+# Keep the architecture-specific GPU suite in a fresh CUDA process. Fatal
+# device errors are sticky for the lifetime of a process, so fail fast here to
+# avoid reporting every later parameter as another failure.
+"$PY" -m pytest -p no:cacheprovider "${COMMON_TESTS[@]}" "$@" -v
+exec "$PY" -m pytest -p no:cacheprovider "${ARCH_TESTS[@]}" "$@" -v -x

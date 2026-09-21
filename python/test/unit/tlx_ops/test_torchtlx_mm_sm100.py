@@ -55,6 +55,8 @@ def test_forced_mode_assesses_only_tlx_candidates(monkeypatch):
 # TODO: Re-enable these shapes when their TorchTLX failures are fixed.
 FAILED_SHAPES = {
     (73728, 256, 512, (512, 1), (256, 1), "bf16"),
+    (73728, 512, 512, (512, 1), (512, 1), "bf16"),
+    (136074, 1792, 384, (384, 1), (1792, 1), "bf16"),
     (136, 256, 128, (128, 1), (256, 1), "fp16"),
     (136, 256, 128, (128, 1), (256, 1), "bf16"),
     (810572, 512, 1536, (1536, 1), (1, 1536), "bf16"),
@@ -110,6 +112,10 @@ def test_forced_mode_matches_eager(M, N, K, a_strides, b_strides, dtype_name):
     torch._dynamo.reset()
     with tlx_config.patch(use_heuristic_config=True):
         out = sm100_torch.mm(a, b, mode="force")
+    # Surface asynchronous kernel failures in the case that launched them.
+    # A fatal CUDA error poisons the process, so the CI runner stops after the
+    # first failure instead of attributing it to every later parameter.
+    torch.cuda.synchronize()
 
     ref = torch.matmul(a, b)
     precision = REL_PRECISION[dtype]
