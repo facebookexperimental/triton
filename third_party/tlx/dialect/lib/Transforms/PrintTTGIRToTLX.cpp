@@ -281,7 +281,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.precise_sqrt", "tl.math.sqrt_rn", "IEEE-rounded square root"},
 
     // GPU operations
-    {"gpu.barrier", "gpu.barrier", "GPU barrier"},
+    // Reachable only if gpu.barrier is taken off the skip list, and
+    // tlx.workgroup_barrier is AMD-only -- gate it on isAMDTarget if so, the
+    // way the ttg.barrier handler does.
+    {"gpu.barrier", "tlx.workgroup_barrier", "Workgroup-wide barrier"},
     {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
 };
 
@@ -503,6 +506,16 @@ static const llvm::StringSet<> elementTypeCastOps = {
     "arith.extf",   "arith.truncf", "arith.sitofp",
     "arith.uitofp", "arith.fptosi", "arith.fptoui",
 };
+
+// Several TLX primitives lower to ROCDL and so are only usable on CDNA; the
+// target lives on the module as `ttg.target`, e.g. "hip:gfx950".
+static bool isAMDTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+  return target && target.getValue().starts_with("hip");
+}
 
 // Element types getElementTypeName can spell as a TLX dtype. Anything else it
 // renders as raw MLIR, which is not usable in emitted Python.
@@ -2402,6 +2415,18 @@ void printSimplifiedOp(
        << ")";
     printLocComment(op, os);
     return;
+  }
+
+  // AMD-only: create_workgroup_barrier brackets the ttg.barrier with two
+  // rocdl.sched.barrier guards, which a non-AMD target cannot lower; on AMD
+  // they constrain scheduling but not results. Local must match exactly -- a
+  // wider mask would be silently under-fenced, so it goes to the generic path.
+  if (auto barrier = dyn_cast<ttg::BarrierOp>(op)) {
+    if (isAMDTarget(op) && barrier.getAddrSpace() == ttg::AddrSpace::Local) {
+      os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
   }
 
   // Get the TLX name or use original
