@@ -322,10 +322,29 @@ def gdpa_kernel_tma_ws_blackwell(
 
     # allocate tmem for outputs of 4 dots (after partitioning)
     # qk0 = q0 dot k, qk1 = q1 dot k, acc0 = p0 dot v, acc1 = p1 dot v
-    qk0_buf = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
-    qk1_buf = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
-    p0_buf = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), dtype, 1, tlx.storage_kind.tmem, reuse=qk0_buf)
-    p1_buf = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), dtype, 1, tlx.storage_kind.tmem, reuse=qk1_buf)
+    # Each QK/P pair shares one TMEM region (disjoint lifetimes: P is
+    # produced after its QK slot is consumed). `shared` reproduces the legacy
+    # `reuse=qk*_buf` layout exactly.
+    qk0_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+    qk1_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+    qk0_buf = tlx.local_alloc(
+        (BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem, reuse=qk0_alias
+    )
+    qk1_buf = tlx.local_alloc(
+        (BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem, reuse=qk1_alias
+    )
+    p0_buf = tlx.local_alloc(
+        (BLOCK_M // 2, HEAD_DIM), dtype, 1, tlx.storage_kind.tmem, reuse=qk0_alias
+    )
+    p1_buf = tlx.local_alloc(
+        (BLOCK_M // 2, HEAD_DIM), dtype, 1, tlx.storage_kind.tmem, reuse=qk1_alias
+    )
+    qk0_alias.set_buffer_overlap(
+        tlx.reuse_group(qk0_buf, p0_buf, group_type=tlx.reuse_group_type.shared)
+    )
+    qk1_alias.set_buffer_overlap(
+        tlx.reuse_group(qk1_buf, p1_buf, group_type=tlx.reuse_group_type.shared)
+    )
     o0_buf = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
     o1_buf = tlx.local_alloc((BLOCK_M // 2, HEAD_DIM), tl.float32, 1, tlx.storage_kind.tmem)
 
