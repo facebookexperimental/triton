@@ -1277,3 +1277,133 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tmem_reuse_packed_f16_offset
+  // META-LABEL: @tmem_reuse_packed_f16_offset
+  tt.func @tmem_reuse_packed_f16_offset(%lb: i32, %ub: i32, %step: i32) {
+    %c0 = arith.constant 0 : i32
+    %zero = arith.constant dense<0.0> : tensor<128x256xf16, #blocked>
+    %one = arith.constant dense<1.0> : tensor<128x128xf16, #blocked>
+    %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
+      // The owner occupies physical columns [0, 128).
+      %owner = ttng.tmem_alloc %zero {buffer.id = 1300 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x256xf16, #blocked>) -> !ttg.memdesc<128x256xf16, #tmem, #ttng.tensor_memory, mutable>
+      %a, %ta = ttng.tmem_load %owner[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x256xf16, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x256xf16, #blocked>
+      "use"(%a) {ttg.partition = array<i32: 0>} : (tensor<128x256xf16, #blocked>) -> ()
+      // The member occupies physical columns [64, 128).
+      // Two FP16 elements occupy one physical column, so column 64 is element 128.
+      // Preserve the whole allocation's stage stride on the sliced view.
+      // CHECK: ttng.tmem_subslice %{{.*}} {offset = 128 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x256xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x256> -> !ttg.memdesc<128x128xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x256>
+      // META: ttng.tmem_subslice %{{.*}} {offset = 128 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x256xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x256> -> !ttg.memdesc<128x128xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x256>
+      %member = ttng.tmem_alloc %one {buffer.id = 1300 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+      %b, %tb = ttng.tmem_load %member[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf16, #blocked>
+      "use"(%b) {ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %i : i32
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.warp_specialize.tag = 0 : i32}
+    "use_result"(%r) : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tmem_reuse_packed_fp8_offset
+  // META-LABEL: @tmem_reuse_packed_fp8_offset
+  tt.func @tmem_reuse_packed_fp8_offset(%lb: i32, %ub: i32, %step: i32) {
+    %c0 = arith.constant 0 : i32
+    %zero = arith.constant dense<0.0> : tensor<128x512xf8E4M3FN, #blocked>
+    %one = arith.constant dense<1.0> : tensor<128x256xf8E4M3FN, #blocked>
+    %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
+      // The owner occupies physical columns [0, 128).
+      %owner = ttng.tmem_alloc %zero {buffer.id = 1300 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x512xf8E4M3FN, #blocked>) -> !ttg.memdesc<128x512xf8E4M3FN, #tmem, #ttng.tensor_memory, mutable>
+      %a, %ta = ttng.tmem_load %owner[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x512xf8E4M3FN, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x512xf8E4M3FN, #blocked>
+      "use"(%a) {ttg.partition = array<i32: 0>} : (tensor<128x512xf8E4M3FN, #blocked>) -> ()
+      // The member occupies physical columns [64, 128).
+      // Four FP8 elements occupy one physical column, so column 64 is element 256.
+      // Preserve the whole allocation's stage stride on the sliced view.
+      // CHECK: ttng.tmem_subslice %{{.*}} {offset = 256 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x512xf8E4M3FN, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x512> -> !ttg.memdesc<128x256xf8E4M3FN, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x512>
+      // META: ttng.tmem_subslice %{{.*}} {offset = 256 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x512xf8E4M3FN, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x512> -> !ttg.memdesc<128x256xf8E4M3FN, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x512>
+      %member = ttng.tmem_alloc %one {buffer.id = 1300 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 1>} : (tensor<128x256xf8E4M3FN, #blocked>) -> !ttg.memdesc<128x256xf8E4M3FN, #tmem, #ttng.tensor_memory, mutable>
+      %b, %tb = ttng.tmem_load %member[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x256xf8E4M3FN, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x256xf8E4M3FN, #blocked>
+      "use"(%b) {ttg.partition = array<i32: 1>} : (tensor<128x256xf8E4M3FN, #blocked>) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %i : i32
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.warp_specialize.tag = 0 : i32}
+    "use_result"(%r) : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tmem_reuse_f32_backing_f16_member
+  // META-LABEL: @tmem_reuse_f32_backing_f16_member
+  tt.func @tmem_reuse_f32_backing_f16_member(%lb: i32, %ub: i32, %step: i32) {
+    %c0 = arith.constant 0 : i32
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
+    %one = arith.constant dense<1.0> : tensor<128x128xf16, #blocked>
+    %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
+      // The owner occupies physical columns [0, 128).
+      %owner = ttng.tmem_alloc %zero {buffer.id = 1300 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %a, %ta = ttng.tmem_load %owner[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      "use"(%a) {ttg.partition = array<i32: 0>} : (tensor<128x128xf32, #blocked>) -> ()
+      // The member occupies physical columns [64, 128).
+      // The 128-element FP16 member occupies only 64 elements of the FP32 backing.
+      // Preserve the whole allocation's stage stride on the sliced view.
+      // CHECK: ttng.tmem_subslice %{{.*}} {offset = 64 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x128> -> !ttg.memdesc<128x64xf32, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x128>
+      // CHECK: ttg.memdesc_reinterpret %{{.*}} {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf32, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x128> -> !ttg.memdesc<128x128xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable>
+      // META: ttng.tmem_subslice %{{.*}} {offset = 64 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<128x64xf32, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x128>
+      // META: ttg.memdesc_reinterpret %{{.*}} {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf32, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<128x128xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable>
+      %member = ttng.tmem_alloc %one {buffer.id = 1300 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+      %b, %tb = ttng.tmem_load %member[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf16, #blocked>
+      "use"(%b) {ttg.partition = array<i32: 1>} : (tensor<128x128xf16, #blocked>) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %i : i32
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.warp_specialize.tag = 0 : i32}
+    "use_result"(%r) : (i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tmem_reuse_f16_stride_two_offset
+  // META-LABEL: @tmem_reuse_f16_stride_two_offset
+  tt.func @tmem_reuse_f16_stride_two_offset(%lb: i32, %ub: i32, %step: i32) {
+    %c0 = arith.constant 0 : i32
+    %zero = arith.constant dense<0.0> : tensor<128x128xf16, #blocked>
+    %one = arith.constant dense<1.0> : tensor<128x64xf16, #blocked>
+    %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
+      // The owner occupies physical columns [0, 128).
+      %owner = ttng.tmem_alloc %zero {buffer.id = 1300 : i32, buffer.offset = 0 : i32, ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+      %a, %ta = ttng.tmem_load %owner[] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf16, #blocked>
+      "use"(%a) {ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked>) -> ()
+      // The member occupies physical columns [64, 128).
+      // With colStride=2 each FP16 element occupies one physical column.
+      // Preserve the whole allocation's stage stride on the sliced view.
+      // CHECK: ttng.tmem_subslice %{{.*}} {offset = 64 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x128> -> !ttg.memdesc<128x64xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 2x128x128>
+      // META: ttng.tmem_subslice %{{.*}} {offset = 64 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<128x64xf16, #{{[^,]+}}, #ttng.tensor_memory, mutable, 1x128x128>
+      %member = ttng.tmem_alloc %one {buffer.id = 1300 : i32, buffer.offset = 64 : i32, ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable>
+      %b, %tb = ttng.tmem_load %member[] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x64xf16, #blocked>
+      "use"(%b) {ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
+      scf.yield {ttg.partition = array<i32: 0, 1>} %i : i32
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.warp_specialize.tag = 0 : i32}
+    "use_result"(%r) : (i32) -> ()
+    tt.return
+  }
+}

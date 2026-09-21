@@ -1,6 +1,7 @@
 #include "AssignSemaphoreStagePhase.h"
 #include "InsertSemas.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/BitVector.h"
 #include <map>
 
@@ -411,6 +412,101 @@ static Value emitBacking(OpBuilder &b, Location loc, const GroupDag &g,
       backing.getDefiningOp()->setAttr(name, attr);
   return backing;
 }
+struct TmemMemberSlice {
+  int32_t offset;
+  int32_t size;
+};
+
+// Buffer plans use physical 32-bit columns; tmem_subslice uses coordinates in
+// the backing's logical layout. Neither the member's element width nor its N
+// dimension determines those coordinates (e.g. packed f16 and stride-2 f16).
+static std::optional<TmemMemberSlice>
+getTmemMemberSlice(gpu::MemDescType source, const Member &member,
+                   const Member &primary) {
+  int64_t columnOffset = member.offset - primary.offset;
+  unsigned bits = source.getElementTypeBitWidth();
+  if (columnOffset < 0 || (columnOffset * 32) % bits)
+    return std::nullopt;
+
+  auto col = StringAttr::get(source.getContext(), "col");
+  auto layout = gpu::toLinearLayout(source);
+  int64_t elementOffset = columnOffset * 32 / bits;
+  if (elementOffset >= layout.getInDimSize(col))
+    return std::nullopt;
+  SmallVector<std::pair<StringAttr, int32_t>> physical;
+  for (StringAttr dim : layout.getInDimNames())
+    physical.emplace_back(dim, dim == col ? elementOffset : 0);
+  auto logical = layout.apply(physical);
+  if (llvm::any_of(ArrayRef(logical).drop_back(),
+                   [](auto coordinate) { return coordinate.second != 0; }))
+    return std::nullopt;
+  int32_t offset = logical.back().second;
+  if (nvidia_gpu::getTMemSubSliceOffset(source, offset,
+                                       source.getRank() - 1) != columnOffset)
+    return std::nullopt;
+
+  auto memberAllocation = nvidia_gpu::getTmemAllocSizes(member.type);
+  auto fits = [&](int64_t size) {
+    if (size <= 0 || offset + size > source.getShape().back())
+      return false;
+    SmallVector<int64_t> shape(source.getShape());
+    shape.back() = size;
+    Attribute encoding = source.getEncoding();
+    // Match TMEMSubSliceOp::build, including its reduced blockN encoding.
+    if (auto tmem = dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(encoding)) {
+      unsigned splitN = tmem.getCGALayout().getCTASplitNum().back();
+      if (size < splitN || size % splitN)
+        return false;
+      // These layouts split a logical N bit across physical rows. Their
+      // construction requires at least two columns per CTA.
+      if ((tmem.getCtaMode() ==
+               nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS ||
+           (tmem.getBlockM() == 64 && tmem.getTwoCTAs() &&
+            tmem.getCtaMode() !=
+                nvidia_gpu::TensorMemoryCTAMode::TwoCTA_LHS)) &&
+          std::min<int64_t>(tmem.getBlockN(), size / splitN) < 2)
+        return false;
+      encoding = nvidia_gpu::TensorMemoryEncodingAttr::get(
+          source.getContext(), tmem.getBlockM(),
+          std::min<int64_t>(tmem.getBlockN(), size), tmem.getColStride(),
+          tmem.getCGALayout(), tmem.getTwoCTAs(), tmem.getCtaMode(),
+          tmem.getFp4Padded());
+    }
+    auto slice = gpu::MemDescType::get(
+        shape, source.getElementType(), encoding, source.getMemorySpace(),
+        /*mutableMemory=*/true, source.getAllocShape());
+    if (nvidia_gpu::getTmemAllocSizes(slice).numRows < memberAllocation.numRows)
+      return false;
+
+    // A bounding column count alone can include holes from M/N tiling. Only
+    // the contiguous column prefix owned by this subview is available for
+    // reinterpreting the member. Zero bases are padding owned by the backing.
+    auto allocation = gpu::toLinearLayout(
+        gpu::dropPipeliningDim(source.getAllocShape(), encoding), encoding);
+    auto visibleShape = gpu::dropPipeliningDim(slice.getShape(), encoding);
+    uint64_t contiguousElements = 1;
+    for (const auto &basis : allocation.getBases().lookup(col)) {
+      if (llvm::any_of(llvm::zip(basis, visibleShape), [](auto coordinate) {
+            return std::get<0>(coordinate) >= std::get<1>(coordinate);
+          }))
+        break;
+      contiguousElements *= 2;
+    }
+    return llvm::divideCeil(contiguousElements * bits, uint64_t{32}) >=
+           static_cast<uint64_t>(member.extent);
+  };
+
+  // Preserve an existing wider intermediate view when it is valid; the final
+  // reinterpretation supplies the member's actual shape and element type.
+  int64_t size = member.type.getShape().back();
+  if (fits(size))
+    return TmemMemberSlice{offset, static_cast<int32_t>(size)};
+  for (size = 1; size <= source.getShape().back(); size *= 2)
+    if (fits(size))
+      return TmemMemberSlice{offset, static_cast<int32_t>(size)};
+  return std::nullopt;
+}
+
 static Value emitTmemMemberView(OpBuilder &b, Location loc, const GroupDag &g,
                                 MemberId memberId, Value buffer,
                                 const Owner &owner,
@@ -425,10 +521,11 @@ static Value emitTmemMemberView(OpBuilder &b, Location loc, const GroupDag &g,
 
   // Select the semaphore stage on the whole allocation before taking a
   // logical member's subview, so each stage keeps the physical backing stride.
+  auto slice = getTmemMemberSlice(cast<gpu::MemDescType>(buffer.getType()),
+                                 member, primary);
+  assert(slice && "TMEM member slice must be validated before emission");
   Value view = emitInto<nvidia_gpu::TMEMSubSliceOp>(
-      b, loc, owner, stageCluster, buffer,
-      static_cast<int32_t>(member.offset - primary.offset),
-      static_cast<int32_t>(target.getShape().back()),
+      b, loc, owner, stageCluster, buffer, slice->offset, slice->size,
       cast<gpu::MemDescType>(buffer.getType()).getRank() - 1);
   if (!sameViewType(view.getType(), target))
     view = emitInto<gpu::MemDescReinterpretOp>(b, loc, owner, stageCluster,
@@ -1608,6 +1705,24 @@ LogicalResult emitIR(triton::FuncOp funcOp, ArrayRef<GroupDag> groups,
                      ArrayRef<ScheduleUpdate> updates) {
   for (const GroupDag &g : groups)
     assert(g.isSealed() && "EmitIR requires sealed SYNC-DAGs");
+  // Validate all TMEM views before replacing allocations or token plumbing.
+  for (const GroupDag &g : groups) {
+    if (!g.isTmem() || !g.physicalBacking)
+      continue;
+    for (auto [index, member] : llvm::enumerate(g.pieceTable.members)) {
+      if (member.backingPrimary == index)
+        continue;
+      const Member &primary = g.pieceTable.members[member.backingPrimary];
+      auto source = genericViewType(backingType(g, primary));
+      if (member.offset == primary.offset &&
+          sameViewType(source, withMutable(member.type, true)))
+        continue;
+      if (!getTmemMemberSlice(source, member, primary))
+        return semaError(member.allocOp)
+               << "TMEM member's physical column range cannot be represented "
+                  "as a slice of its backing layout";
+    }
+  }
   OpBuilder scheduleBuilder(funcOp.getContext());
   for (auto [op, schedule] : updates)
     gpu::setStageCluster(scheduleBuilder, op, schedule);
