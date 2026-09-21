@@ -12,8 +12,9 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from triton.tlx.ops.kernels.kda._shapes import DECODE_FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.kda._shapes import FLOOR_TFLOPS, GFX950_DECODE_SYNTHETIC
+from triton.tlx.ops.kernels.kda._decode_shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.kda._decode_shapes import SYNTHETIC
+from triton.tlx.ops.kernels.kda._shapes import FLOOR_TFLOPS
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -29,7 +30,7 @@ DTYPES = {"bf16": torch.bfloat16}
 
 
 def shapes(synthetic: bool = False, suites=None) -> list:
-    return list(GFX950_DECODE_SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
 def _label(batch: int, heads: int, key_dim: int, value_dim: int, dtype: str) -> str:

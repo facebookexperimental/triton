@@ -1,4 +1,4 @@
-"""TorchTLX ``bmm`` through the gfx950 Inductor templates."""
+"""TorchTLX gfx950 MM callable for tests and benchmarks."""
 
 from __future__ import annotations
 
@@ -10,20 +10,16 @@ from torch._inductor import config
 
 @functools.lru_cache(maxsize=None)
 def _compiled(mode):
-
-    def f(a, b):
-        return torch.bmm(a, b)
+    # Keep force and reference graphs distinct: otherwise Dynamo can reuse the
+    # artifact compiled under whichever tlx_mode happened to run first.
+    def f(x, y):
+        return x @ y
 
     return torch.compile(f, dynamic=False)
 
 
-def bmm(a, b, *, mode="allow"):
-    """Run ``torch.bmm`` with the gfx950 TLX templates enabled.
-
-    ``allow`` makes TLX compete with stock Inductor choices; ``force`` retains
-    only TLX candidates. Bmm needs max-autotune enabled to enter its template
-    selection path, unlike the Blackwell ``mm`` lowering.
-    """
+def mm(a, b, *, mode="allow"):
+    """Run ``torch.mm`` with the gfx950 TLX templates enabled."""
     settings = {"triton.tlx_mode": mode, "max_autotune": True}
     if mode == "force":
         settings["max_autotune_gemm_backends"] = "TRITON"

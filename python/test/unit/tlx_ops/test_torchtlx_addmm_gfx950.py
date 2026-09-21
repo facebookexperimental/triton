@@ -8,7 +8,7 @@ from triton._internal_testing import is_hip_cdna4
 
 try:
     from triton.tlx.ops.kernels.addmm import gfx950_torch
-    from triton.tlx.ops.kernels.addmm._shapes import GFX950_FOCUS, SYNTHETIC, inputs
+    from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, inputs
 except ImportError:  # not the fbtriton fork
     gfx950_torch = None
 
@@ -45,7 +45,7 @@ FAILED_SHAPES = []
 
 
 def _cases():
-    entries = [] if gfx950_torch is None else list(SYNTHETIC) + list(GFX950_FOCUS)
+    entries = [] if gfx950_torch is None else CORRECTNESS_SHAPES
     return [entry for entry in entries if tuple(entry[:3]) not in FAILED_SHAPES]
 
 

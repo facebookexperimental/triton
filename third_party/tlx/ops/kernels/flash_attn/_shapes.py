@@ -30,7 +30,7 @@ SYNTHETIC: tuple[FlashAttentionShape, ...] = (
 
 FOCUS_SUITES = (
     FocusSuite(
-        name="sm90_baseline",
+        name="sm90_1",
         op="flash_attn",
         shapes=(
             FlashAttentionShape(4, 48, 1024, 128, False, "bf16"),
@@ -43,7 +43,7 @@ FOCUS_SUITES = (
     ),
     # TODO: Replace placeholders with captured shapes.
     FocusSuite(
-        name="sm100_baseline",
+        name="sm100_1",
         op="flash_attn",
         shapes=(
             FlashAttentionShape(4, 32, 4096, 128, False, "bf16"),
@@ -57,13 +57,11 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
-    "sm90": ("sm90_baseline", ),
-    "sm100": ("sm100_baseline", ),
+    "sm90": ("sm90_1", ),
+    "sm100": ("sm100_1", ),
 }
 FOCUS = FocusRegistry("flash_attn", FOCUS_SUITES, DEFAULT_SUITES)
-
-SM90_FOCUS = FOCUS.shapes("sm90")
-SM100_FOCUS = FOCUS.shapes("sm100")
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 
 def qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=False, device="cuda"):

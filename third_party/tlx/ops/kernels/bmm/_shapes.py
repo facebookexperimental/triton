@@ -25,8 +25,8 @@ SYNTHETIC: tuple[BMMShape, ...] = (
 )
 
 # PERF: The odd-K fallback stays synthetic-only until it is competitive.
-GFX950_FOCUS_SUITE = FocusSuite(
-    name="gfx950_baseline",
+GFX950_1 = FocusSuite(
+    name="gfx950_1",
     op="bmm",
     shapes=(
         BMMShape(8, 256, 256, 272, (256 * 272, 272, 1), (272 * 256, 256, 1), "fp16"),
@@ -36,11 +36,10 @@ GFX950_FOCUS_SUITE = FocusSuite(
     ),
 )
 
-FOCUS_SUITES = (GFX950_FOCUS_SUITE, )
-DEFAULT_SUITES = {"gfx950": ("gfx950_baseline", )}
+FOCUS_SUITES = (GFX950_1, )
+DEFAULT_SUITES = {"gfx950": ("gfx950_1", )}
 FOCUS = FocusRegistry("bmm", FOCUS_SUITES, DEFAULT_SUITES)
-
-GFX950_FOCUS = FOCUS.shapes("gfx950")
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 
 def operand(batch, rows, cols, strides, dtype, device="cuda"):
