@@ -1,0 +1,48 @@
+{
+ "schema_version": "twill-joint-solution-v1",
+ "provenance": {
+  "ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5",
+  "baseline_graph_sha256": "b556c6a72f8bae5129ad8ccc7ac1067250369789d4a9aa69afb1ebb49b7c2e1d",
+  "solver_sources_sha256": "42f28efe2e94f97c13fc4c8a7e0326aaf5fe2955d21c8a0793b24b7cf93ef237",
+  "normalization_u": 300,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 32,
+   "warp_fixed_overhead": 4,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  }
+ },
+ "attempts": [
+  {
+   "stage": "structural",
+   "result": "unsat",
+   "reason": "VARIABLELATENCY conflicts with no-cross-warp",
+   "edge": 3
+  }
+ ],
+ "wall_s": 0.0,
+ "status": "unsat",
+ "satisfiable": false
+}

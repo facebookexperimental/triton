@@ -1,0 +1,186 @@
+{
+ "schema_version": "prepared-joint-probe-v1",
+ "execution_mode": "first-window-probe",
+ "provenance": {
+  "model": "paper",
+  "ddg_sha256": "938a953dec1bc79e44c3891e2c451cbe4dcc337751db86e5e4e88c7d6eecf50c",
+  "solver_sources_sha256": "9c996b45262a0ec33fa2af162414801ce24257eb0b09c9bf723acb287e2f95cd",
+  "normalization_u": 300,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 31,
+   "warp_fixed_overhead": 0,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  },
+  "curation_source": {
+   "baseline_graph_sha256": "b556c6a72f8bae5129ad8ccc7ac1067250369789d4a9aa69afb1ebb49b7c2e1d",
+   "curator_sources_sha256": "2bef320b1288ea32a96348ecd50399b7ce2b56b561e74bfd328f90a8dcc7eac4",
+   "ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5"
+  },
+  "experiment_inputs": {
+   "allow_cross_warp": true,
+   "num_warps_override": 31,
+   "reg_budget": null
+  },
+  "preparation": {
+   "regime": "prepared",
+   "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+   "curated_ddg_sha256": "938a953dec1bc79e44c3891e2c451cbe4dcc337751db86e5e4e88c7d6eecf50c",
+   "raw_ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5",
+   "assumptions": {
+    "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+    "a2_issue_width": 128,
+    "a2_elementwise_dialects": [
+     "arith",
+     "math"
+    ],
+    "a3_async_tokens_keep_measured_cost": true,
+    "a4_tmem_functional_unit": "TMEM",
+    "b1_cluster_tolerance": [
+     11,
+     10
+    ],
+    "b2_floor_divisor": 32,
+    "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+    "b4_second_objective": "maximize sum(C') at F = F*",
+    "b5_u": 300
+   },
+   "health": {
+    "pool_size": 129,
+    "positive_entries": 112,
+    "collapsed_entries": 18,
+    "collapse_ratio": 0.1607,
+    "survivor_spread": 22.0,
+    "distinct_survivors": [
+     1,
+     2,
+     3,
+     4,
+     7,
+     10,
+     14,
+     22
+    ],
+    "objective_f": 348,
+    "first_stage_sum": 16,
+    "second_stage_sum": 272,
+    "u": 300,
+    "clusters": 16
+   },
+   "b5_u_applied": 300
+  },
+  "probe_sources_sha256": "72832d469eabe759656b1b669836c1a75917238ab255b9829e8933723b2be3ec"
+ },
+ "ii": 25,
+ "window": [
+  {
+   "L": 55,
+   "verdict": "unsat"
+  },
+  {
+   "L": 56,
+   "verdict": "unsat"
+  },
+  {
+   "L": 57,
+   "verdict": "unsat"
+  },
+  {
+   "L": 58,
+   "verdict": "unsat"
+  },
+  {
+   "L": 59,
+   "verdict": "unsat"
+  },
+  {
+   "L": 60,
+   "verdict": "unsat"
+  },
+  {
+   "L": 61,
+   "verdict": "unsat"
+  },
+  {
+   "L": 62,
+   "verdict": "unsat"
+  },
+  {
+   "L": 63,
+   "verdict": "unsat"
+  },
+  {
+   "L": 64,
+   "verdict": "unsat"
+  },
+  {
+   "L": 65,
+   "verdict": "unsat"
+  },
+  {
+   "L": 66,
+   "verdict": "unsat"
+  },
+  {
+   "L": 67,
+   "verdict": "unsat"
+  },
+  {
+   "L": 68,
+   "verdict": "unsat"
+  },
+  {
+   "L": 69,
+   "verdict": "unsat"
+  },
+  {
+   "L": 70,
+   "verdict": "unsat"
+  },
+  {
+   "L": 71,
+   "verdict": "unsat"
+  },
+  {
+   "L": 72,
+   "verdict": "unsat"
+  },
+  {
+   "L": 73,
+   "verdict": "unsat"
+  },
+  {
+   "L": 74,
+   "verdict": "unsat"
+  },
+  {
+   "L": 75,
+   "verdict": "unsat"
+  }
+ ],
+ "window_size": 21,
+ "unsat_count": 21,
+ "sat_found": false
+}
