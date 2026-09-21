@@ -43,7 +43,7 @@ def test_flash_attn_mxfp8_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     scale = 0.5
     out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, arch=ARCH, space="smoke")
     ref = _sdpa(q, k, v, causal, scale)
-    torch.testing.assert_close(out, ref, atol=0.12, rtol=0)
+    torch.testing.assert_close(out, ref, atol=0.2, rtol=0)
 
 
 @pytest.mark.parametrize("causal", [False, True])

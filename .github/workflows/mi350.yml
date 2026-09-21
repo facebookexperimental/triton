@@ -365,8 +365,16 @@ jobs:
             -r python/requirements.txt -r python/test-requirements.txt
           uv pip uninstall --python "${TORCHTLX_PYTHON}" \
             pytorch-triton pytorch-triton-rocm triton-rocm triton || true
-          uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
-            -e . --no-build-isolation
+          for attempt in 1 2 3; do
+            if uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
+              -e . --no-build-isolation; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Triton build failed; retrying so partial dependency downloads can resume"
+          done
           "${TORCHTLX_PYTHON}" - <<'PY'
           import torch
           import triton

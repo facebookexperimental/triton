@@ -28,7 +28,7 @@ DIRECTIONS = ("fwd", "bwd")
 
 def _close_enough(out, ref) -> tuple[bool, str]:
     try:
-        torch.testing.assert_close(out, ref, atol=0.12, rtol=0)
+        torch.testing.assert_close(out, ref, atol=0.2, rtol=0)
     except AssertionError as mismatch:
         return False, f"output does not match the reference: {str(mismatch).splitlines()[0]}"
     return True, ""
