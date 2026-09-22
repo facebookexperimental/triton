@@ -326,6 +326,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // CHECK-LABEL: @ld_then_tmem_shift
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.tmem_shift
+  tt.func @ld_then_tmem_shift() {
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    %1 = ttng.tmem_load %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    ttng.tmem_shift %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: @st_then_tmem_shift
+  // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.tmem_shift
+  tt.func @st_then_tmem_shift(%arg0: tensor<128x128xf32, #blocked>) {
+    %true = arith.constant true
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    ttng.tmem_store %arg0, %0, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttng.tmem_shift %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
   // Two multi-buffered views of one allocation that land on different physical
   // columns do not alias, so no barrier is needed between them.
   // CHECK-LABEL: @ld_then_st_disjoint_buffers

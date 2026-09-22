@@ -1143,6 +1143,26 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
 
 // -----
 
+#tmem_shift = #ttng.tensor_memory_encoding<blockM = 128, blockN = 8, colStride = 1, CGALayout = [[1, 0]], twoCTAs = true>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 0 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 8 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32, "ttng.two-ctas" = true} {
+  // CHECK-LABEL: @tmem_shift_2cta
+  // CHECK: tti.experimental_cluster_cta_id
+  // CHECK: arith.andi {{.*}}, %c1_i32
+  // CHECK: arith.cmpi eq
+  // CHECK: arith.constant 3 : i32
+  // CHECK: tt.call @__triton_consan_verify_write_visibility
+  // CHECK: tt.call @__triton_consan_verify_read_visibility
+  // CHECK: tt.call @__triton_consan_set_write_visibility
+  // CHECK: ttng.tmem_shift
+  tt.func public @tmem_shift_2cta() {
+    %buffer = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>
+    ttng.tmem_shift %buffer : !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory

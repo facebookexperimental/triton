@@ -71,4 +71,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %1 = ttng.tmem_subslice %0 {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem_tile, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem_half, #ttng.tensor_memory, mutable>
     tt.return
   }
+
+  // CHECK-LABEL: def tmem_shift(
+  // CHECK: tlx.tmem_shift({{[a-zA-Z_0-9]+}})
+  tt.func public @tmem_shift() attributes {noinline = false} {
+    %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem_tile, #ttng.tensor_memory, mutable>
+    ttng.tmem_shift %0 : !ttg.memdesc<128x128xf32, #tmem_tile, #ttng.tensor_memory, mutable>
+    tt.return
+  }
 }

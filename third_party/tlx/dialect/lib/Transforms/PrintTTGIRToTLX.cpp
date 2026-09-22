@@ -133,6 +133,8 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Store registers to tensor memory (Blackwell)"},
     {"ttng.tmem_copy", "tlx.tmem_copy",
      "Copy from shared memory to tensor memory (Blackwell)"},
+    {"ttng.tmem_shift", "tlx.tmem_shift",
+     "Shift tensor-memory rows down by one row (Blackwell)"},
 
     // Memory descriptor operations
     {"ttg.memdesc_subview", "tlx.local_view", "Get subview of a buffer"},

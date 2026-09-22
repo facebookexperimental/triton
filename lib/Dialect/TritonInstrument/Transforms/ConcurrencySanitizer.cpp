@@ -90,8 +90,8 @@ private:
 };
 
 bool isTensorCoreOp(Operation *op) {
-  return isa<ttng::MMAv5OpInterface, ttng::TCGen5CommitOp, ttng::TMEMCopyOp>(
-      op);
+  return isa<ttng::MMAv5OpInterface, ttng::TCGen5CommitOp, ttng::TMEMCopyOp,
+             ttng::TMEMShiftOp>(op);
 }
 
 std::optional<int> maybeGetPartitionIdx(Operation *op) {
@@ -450,7 +450,8 @@ SmallVector<uint16_t> getTensorCoreBarrierBroadcastMasks(Operation *op) {
         commitDescs.push_back(mmaOp.getA());
       commitDescs.push_back(mmaOp.getB());
     }
-  } else if (isa<ttng::TMEMCopyOp, ttng::TCGen5MMAScaledOp>(op)) {
+  } else if (isa<ttng::TMEMCopyOp, ttng::TMEMShiftOp, ttng::TCGen5MMAScaledOp>(
+                 op)) {
     // TODO: we should support descs for tc_gen5_mma_scaled.
   } else {
     llvm_unreachable("unknown tensor-core op");
@@ -640,7 +641,7 @@ Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
     return getMulticastRecipientCTAs(b, gatherOp.getResult());
   if (isa<ttng::CLCTryCancelOp>(op))
     return allCTAsMask(b);
-  if (isa<ttng::MMAv5OpInterface, ttng::TMEMCopyOp>(op))
+  if (isa<ttng::MMAv5OpInterface, ttng::TMEMCopyOp, ttng::TMEMShiftOp>(op))
     return getRecipientCTAsForBroadcastMasks(
         b, ttng::getCTABroadcastMasks(ttng::getModuleTwoCTAs(op), {}));
   return currentCTAMask(b);

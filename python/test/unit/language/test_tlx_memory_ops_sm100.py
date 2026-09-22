@@ -262,6 +262,42 @@ def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_shift(device):
+
+    @triton.jit
+    def tmem_shift_kernel(x_ptr, y_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        offsets_m = tl.arange(0, BLOCK_M)
+        offsets_n = tl.arange(0, BLOCK_N)
+        offsets = offsets_m[:, None] * BLOCK_N + offsets_n[None, :]
+        values = tl.load(x_ptr + offsets)
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        buffer = tlx.local_view(buffers, 0)
+        tlx.local_store(buffer, values)
+
+        barriers = tlx.alloc_barriers(tl.constexpr(1))
+        barrier = tlx.local_view(barriers, 0)
+        tlx.tmem_shift(buffer)
+        tlx.tcgen05_commit(barrier)
+        tlx.barrier_wait(barrier, tl.constexpr(0))
+
+        shifted = tlx.local_load(buffer)
+        tl.store(y_ptr + offsets, shifted)
+
+    block_m, block_n = 128, 16
+    x = torch.arange(block_m * block_n, dtype=torch.float32, device=device).reshape(block_m, block_n)
+    y = torch.empty_like(x)
+    kernel = tmem_shift_kernel[(1, )](x, y, BLOCK_M=block_m, BLOCK_N=block_n)
+
+    assert kernel.asm["ttgir"].count("ttng.tmem_shift") == 1
+    assert kernel.asm["ptx"].count("tcgen05.shift.cta_group::1.down") == block_n // 8
+    expected = x.clone()
+    for group_start in range(0, block_m, 32):
+        expected[group_start:group_start + 31] = x[group_start + 1:group_start + 32]
+    torch.testing.assert_close(y, expected)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("SCALE_OFFSET", [0, 8])
 def test_tmem_scale_subslice_compile(SCALE_OFFSET):
     SCALE_BLOCK_N = 16

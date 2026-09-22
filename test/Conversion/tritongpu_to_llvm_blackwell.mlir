@@ -1741,3 +1741,33 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#tmem_shift = #ttng.tensor_memory_encoding<blockM = 128, blockN = 16, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tensor_memory_shift
+  // CHECK: nvvm.elect.sync
+  // CHECK: llvm.cond_br
+  // CHECK-COUNT-2: nvvm.tcgen05.shift
+  tt.func @tensor_memory_shift(
+      %buffer: !ttg.memdesc<128x16xf32, #tmem_shift, #ttng.tensor_memory, mutable>) {
+    ttng.tmem_shift %buffer : !ttg.memdesc<128x16xf32, #tmem_shift, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem_shift = #ttng.tensor_memory_encoding<blockM = 128, blockN = 8, colStride = 1, CGALayout = [[1, 0]], twoCTAs = true>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.two-ctas" = true, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tensor_memory_shift_2cta
+  // CHECK: nvg.cluster_id
+  // CHECK: llvm.urem
+  // CHECK: nvvm.tcgen05.shift {{.*}} {group = #nvvm.cta_group<cta_2>}
+  tt.func @tensor_memory_shift_2cta(
+      %buffer: !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>) {
+    ttng.tmem_shift %buffer : !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
