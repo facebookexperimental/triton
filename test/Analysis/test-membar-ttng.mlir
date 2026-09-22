@@ -41,7 +41,7 @@ tt.func @warpgroup_wait_followed_by_barrier_expect(%acc: tensor<256xf32, #blocke
   %true = arith.constant true
   %c1 = arith.constant 1 : i32
   %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-  // CHECK: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32, warpGroupLocal}
+  // CHECK: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
   // CHECK-NEXT: arith.addi
   // CHECK-NEXT: ttng.barrier_expect
   %wait = ttng.warp_group_dot_wait %acc {pendings = 0 : i32} : tensor<256xf32, #blocked>
