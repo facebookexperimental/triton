@@ -1960,9 +1960,10 @@ struct DivFOpPattern : public OpRewritePattern<arith::DivFOp> {
   }
 };
 
-struct PreciseDivFOpPattern : public OpRewritePattern<tt::PreciseDivFOp> {
-  using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(tt::PreciseDivFOp op,
+template <typename OpTy>
+struct TritonDivFOpPattern : public OpRewritePattern<OpTy> {
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+  LogicalResult matchAndRewrite(OpTy op,
                                 PatternRewriter &rewriter) const override {
     if (!isFloatLike(op.getType()))
       return failure();
@@ -3387,12 +3388,13 @@ public:
                  BinaryFloatToIntPattern<arith::MaximumFOp, arith::MaxSIOp>,
                  BinaryFloatToIntPattern<arith::MinNumFOp, arith::MinSIOp>,
                  BinaryFloatToIntPattern<arith::MaxNumFOp, arith::MaxSIOp>,
-                 NegFOpPattern, DivFOpPattern, PreciseDivFOpPattern,
-                 RemFOpPattern, ClampFOpPattern, FmaPattern, ExpOpPattern,
-                 Exp2OpPattern, CosOpPattern, SinOpPattern, ExtFOpPattern,
-                 TruncFOpPattern, FpToFpPattern, Fp4ToFpPattern,
-                 PackedArithPattern, DotPattern, DotScaledPattern>(
-        &getContext());
+                 NegFOpPattern, DivFOpPattern,
+                 TritonDivFOpPattern<tt::PreciseDivFOp>,
+                 TritonDivFOpPattern<tt::ApproxDivFOp>, RemFOpPattern,
+                 ClampFOpPattern, FmaPattern, ExpOpPattern, Exp2OpPattern,
+                 CosOpPattern, SinOpPattern, ExtFOpPattern, TruncFOpPattern,
+                 FpToFpPattern, Fp4ToFpPattern, PackedArithPattern, DotPattern,
+                 DotScaledPattern>(&getContext());
     patterns.add<UnaryPattern<math::LogOp>>(&getContext(), UnaryOpId::Log);
     patterns.add<UnaryPattern<math::Log2Op>>(&getContext(), UnaryOpId::Log2);
     patterns.add<UnaryPattern<math::SqrtOp>>(&getContext(), UnaryOpId::Sqrt);
