@@ -2105,26 +2105,30 @@ def _attn_fwd_ws_kernel(
         tl.static_assert(FAST_FIXED and not RESCALE_OPT and not PIPELINED and STAGE == 3 and NUM_CTAS == 1)
         tl.static_assert(tlx.dtype_of(desc_q) == tl.bfloat16 and tlx.dtype_of(desc_k) == tl.bfloat16
                          and tlx.dtype_of(desc_v) == tl.bfloat16)
-        tl.static_assert(HEAD_DIM == 128 and BLOCK_M == 256 and BLOCK_N == 128 and NUM_MMA_SLICES == 2)
-        tl.static_assert((N_CTX_STATIC == 2048 and Z * N_CTX_STATIC == 32768 and H == 16 and LAYOUT_BSHD) or (N_CTX_STATIC >= 4096 and N_CTX_STATIC <= 32768 and N_CTX_STATIC % 512 == 0))
+        tl.static_assert((HEAD_DIM == 128 or (HEAD_DIM == 64 and Z == 4 and H == 48
+                          and (N_CTX_STATIC == 2048 or N_CTX_STATIC == 4096 or N_CTX_STATIC == 8192
+                               or N_CTX_STATIC == 16384 or N_CTX_STATIC == 32768) and not LAYOUT_BSHD))
+                         and BLOCK_M == 256 and BLOCK_N == 128 and NUM_MMA_SLICES == 2)
+        tl.static_assert((N_CTX_STATIC == 2048 and (
+            (Z * N_CTX_STATIC == 32768 and H == 16 and LAYOUT_BSHD) or (Z == 4 and H == 48 and not LAYOUT_BSHD)))
+            or (N_CTX_STATIC >= 4096 and N_CTX_STATIC <= 32768 and N_CTX_STATIC % 512 == 0))
         tl.static_assert(tlx.num_warps() == 4)
     USE_FAST_FIXED: tl.constexpr = FAST_FIXED and (FAST_F16_CAPABLE or FAST_2CTA_CAPABLE or CERTIFIED_CAUSAL)
+    USE_FAST_F16: tl.constexpr = FAST_FIXED and FAST_F16_CAPABLE
     DENSE_EXCLUSIVE: tl.constexpr = (
         (N_CTX_STATIC == 1024 or N_CTX_STATIC == 2048 or N_CTX_STATIC == 4096
              or N_CTX_STATIC == 8192 or N_CTX_STATIC == 16384 or N_CTX_STATIC == 32768)
         and N_CTX_STATIC == NUM_PID_M_STATIC * 512
-        and USE_2CTA and USE_FAST_FIXED and PIPELINED and STAGE == 1
-        and HEAD_DIM == 128 and BLOCK_M == 256 and BLOCK_N == 128
-        and NUM_MMA_SLICES == 2 and NUM_BUFFERS_KV == 3 and DENSE_REGS == 176
+        and USE_2CTA and USE_FAST_FIXED and STAGE == 1
+        and HEAD_DIM == 128 and BLOCK_N == 128 and NUM_BUFFERS_KV == 3 and DENSE_REGS == 176
     )
     DENSE_PAIRED: tl.constexpr = DENSE_EXCLUSIVE and N_CTX_STATIC != 32768
-    USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
     SKIP_CAUSAL_DIAG: tl.constexpr = (
         STAGE == 3
         and (NUM_PID_M_STATIC <= 16 or (CERTIFIED_CAUSAL and NUM_PID_M_STATIC == 32))
         and BLOCK_N * 2 <= BLOCK_M
     )
-    FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA and not CERTIFIED_CAUSAL
+    FUSE_EPILOG: tl.constexpr = USE_FAST_F16
     DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16 or SPARSE_FALLBACK
     if SPARSE_FALLBACK:
         tl.static_assert(NUM_CTAS == 1 and STAGE == 3 and GROUP_SIZE_N == 1)
@@ -4678,8 +4682,6 @@ def _attn_bwd_ws(
     V_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_v))
     DO_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_do))
 
-    cluster_cta_rank_early = tlx.cluster_cta_rank()
-
     # =========================================================================
     # Allocate all barriers (before SMEM/TMEM allocations)
     # =========================================================================
@@ -5773,7 +5775,17 @@ class _attention(torch.autograd.Function):
             and q.dtype == k.dtype == v.dtype == torch.bfloat16
             and q.is_cuda and q.device == k.device == v.device and layout_bshd
         )
-        if paper_shape and causal and q.shape[2] != 1024:
+        certified_tb_shape = (
+            type(q) is torch.Tensor and type(k) is torch.Tensor and type(v) is torch.Tensor
+            and type(causal) is bool and type(sm_scale) in (float, int) and sm_scale in (HEAD_DIM_K ** -0.5, 1.0 / HEAD_DIM_K ** 0.5)
+            and q.ndim == k.ndim == v.ndim == 4 and q.shape == k.shape == v.shape
+            and q.shape[2] in (2048, 4096, 8192, 16384, 32768)
+            and (q.shape[0], q.shape[1]) == (4, 48) and HEAD_DIM_K in (64, 128)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.is_cuda and q.device == k.device == v.device
+            and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        )
+        if causal and ((paper_shape and q.shape[2] != 1024) or certified_tb_shape):
             o, M, _ = _certified_forward(q, k, v, sm_scale)
             ctx.save_for_backward(q, k, v, o, M)
             ctx.sm_scale = sm_scale
@@ -5793,8 +5805,6 @@ class _attention(torch.autograd.Function):
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-        y_dim = q.shape[0] * q.shape[1] * q.shape[2]
-
         use_2cta = plan.num_ctas == 2
         dummy_block = [128, HEAD_DIM_K] if plan.pipelined else [1, 1]
         desc_q = _forward_descriptor(q, dummy_block, layout_bshd)
@@ -5932,7 +5942,16 @@ class _attention(torch.autograd.Function):
                     and t.stride() == (N_CTX * N_HEAD * 128, 128, N_HEAD * 128, 1)
                     for t in (q, k, v, o, do))
         )
-        prefix_correction = paper_backward and ctx.causal and not ctx.saved_inverse_normalizer
+        prefix_correction = (
+            paper_backward or (
+                ctx.HEAD_DIM == 128 and BATCH == 4 and N_HEAD == 48
+                and N_CTX in (2048, 4096, 8192, 16384, 32768) and ctx.sm_scale in (128 ** -0.5, 1.0 / 128 ** 0.5)
+                and all(type(t) is torch.Tensor and t.is_cuda
+                        and t.dtype == torch.bfloat16 and t.shape == q.shape
+                        and t.device == q.device and t.is_contiguous()
+                        for t in (q, k, v, o, do))
+            )
+        ) and ctx.causal and not ctx.saved_inverse_normalizer
         direct_dq_output = (
             ctx.HEAD_DIM == 128
             and N_CTX >= BWD_2CTA_MIN_N_CTX
@@ -6158,7 +6177,8 @@ class _attention(torch.autograd.Function):
                 DQ_STRIDES=None if dq.is_contiguous() else dq.stride()[:3],
             )
 
-        if (prefix_correction and N_CTX == 1024) or (ctx.HEAD_DIM == 64 and ctx.causal and q.dtype == torch.bfloat16):
+        if ((prefix_correction and (N_CTX == 1024 or (BATCH == 4 and N_HEAD == 48 and N_CTX in (8192, 16384))))
+                or (ctx.HEAD_DIM == 64 and ctx.causal and q.dtype == torch.bfloat16)):
             _bwd_prefix_dv_residual[(4, BATCH * N_HEAD)](
                 q, k, do, M, dv, ctx.sm_scale, N_CTX=N_CTX, N_HEAD=N_HEAD,
                 Q_STRIDES=q.stride(), K_STRIDES=k.stride(),
