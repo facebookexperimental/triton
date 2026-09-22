@@ -2918,6 +2918,169 @@ def _attn_fwd_ws_kernel(
 
 
 @triton.jit
+def _dq_fixed_scale(n_ctx):
+    return tl.where(n_ctx <= 8192, 2048.0, 4096.0)
+
+
+@triton.jit
+def _dq_pack_fixed_pair(values, scale, contributors, RangeBudget, budget_offsets):
+    shift = tl.inline_asm_elementwise(
+        "bfind.u32 $0, $1;", constraints="=r,r", args=[contributors - 1],
+        dtype=tl.int32, is_pure=True, pack=1,
+    ) + 1
+    limit = 32767 >> (shift + 1)
+    lo, hi = tl.split(tl.reshape(values, (values.shape[0], values.shape[1] // 2, 2)))
+    packed, amplitude = tl.inline_asm_elementwise(
+        """
+        {
+            .reg .f32 a0, a1;
+            .reg .s32 q0, q1, t1;
+            .reg .b32 b0, b1;
+            mul.rn.f32 a0, $2, $4;
+            mul.rn.f32 a1, $3, $4;
+            mov.b32 b0, a0;
+            mov.b32 b1, a1;
+            and.b32 b0, b0, 0x7fffffff;
+            and.b32 b1, b1, 0x7fffffff;
+            max.u32 $1, b0, b1;
+            cvt.rni.s32.f32 q0, a0;
+            cvt.rni.s32.f32 q1, a1;
+            shl.b32 t1, q1, 16;
+            add.u32 $0, t1, q0;
+        }
+        """,
+        constraints="=r,=r,f,f,f", args=[lo, hi, scale],
+        dtype=(tl.int32, tl.int32), is_pure=True, pack=1,
+    )
+    row_amplitude = tl.max(amplitude, 1)
+    invalid = row_amplitude >= tl.full((), 32767.5, tl.float32).to(tl.int32, bitcast=True)
+    safe_amplitude = tl.where(invalid, 0, row_amplitude).to(tl.float32, bitcast=True)
+    row_bound = tl.inline_asm_elementwise(
+        "cvt.rni.s32.f32 $0, $1;", constraints="=r,f", args=[safe_amplitude],
+        dtype=tl.int32, is_pure=True, pack=1,
+    )
+    excess = tl.where(invalid, 32768, tl.maximum(row_bound - limit, 0))
+    tl.atomic_add(RangeBudget + budget_offsets, excess, mask=excess > 0, sem="relaxed")
+    return packed
+
+@triton.jit
+def _dq_pack_bf16_pair(values):
+    bits = values.to(tl.bfloat16).to(tl.uint16, bitcast=True)
+    lo, hi = tl.split(tl.reshape(bits, (values.shape[0], values.shape[1] // 2, 2)))
+    return (lo.to(tl.uint32) | (hi.to(tl.uint32) << 16)).to(tl.int32)
+
+
+@triton.jit
+def _attn_bwd_unpack_fixed(DQ_PACKED, DQ_OUT, TOTAL: tl.constexpr,
+                           N_CTX: tl.constexpr, ROW_STRIDE: tl.constexpr,
+                           Failure, BLOCK: tl.constexpr, RangeBudget, N_HEAD: tl.constexpr):
+    if 2 * (TOTAL + BLOCK) > 2147483647:
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    elif BLOCK == 1024:
+        offsets = tl.program_id(0).to(tl.uint32) * BLOCK + tl.arange(0, BLOCK).to(tl.uint32)
+    else:
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    packed = tl.load(DQ_PACKED + offsets, offsets < TOTAL, other=0)
+    lo = (packed << 16) >> 16
+    hi = ((packed - lo) >> 16).to(tl.int16).to(tl.int32)
+    if BLOCK == 1024 or 2 * (TOTAL + BLOCK) > 2147483647:
+        row = (offsets // ROW_STRIDE % N_CTX).to(tl.int32)
+    else:
+        row = offsets // ROW_STRIDE % N_CTX
+    inv_scale = tl.div_rn(1.0, _dq_fixed_scale(N_CTX))
+    values = tl.join(lo.to(tl.float32) * inv_scale, hi.to(tl.float32) * inv_scale)
+    exact_lo = (packed & 65535).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+    exact_hi = (packed >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+    values = tl.where(row[:, None] < 256, tl.join(exact_lo, exact_hi), values)
+    converted = values.to(tl.bfloat16)
+    budget = (row // 256 + 1).to(tl.float32) * (0.5 / _dq_fixed_scale(N_CTX))
+    error = tl.abs(converted.to(tl.float32) - values) + budget[:, None]
+    contributors = row // 256 + 1
+    shift = tl.inline_asm_elementwise(
+        "bfind.u32 $0, $1;", constraints="=r,r", args=[contributors - 1],
+        dtype=tl.int32, is_pure=True, pack=1,
+    ) + 1
+    base_bound = contributors * (32767 >> (shift + 1))
+    if ROW_STRIDE == 64:
+        batch_head = offsets // (N_CTX * 64)
+    else:
+        batch_head = offsets // (N_CTX * N_HEAD * 64) * N_HEAD + offsets // 64 % N_HEAD
+    head_half = offsets % 64 // 32
+    budget_offsets = (batch_head * 2 + head_half) * N_CTX + row
+    excess = tl.load(RangeBudget + budget_offsets, offsets < TOTAL, other=0)
+    range_bad = base_bound + excess > 32767
+    bad = (row[:, None] >= 256) & (offsets[:, None] < TOTAL) & ((error > 0.01) | range_bad[:, None])
+    if tl.max(tl.max(bad.to(tl.int32), 1), 0) != 0:
+        tl.atomic_or(Failure, 1, sem="relaxed")
+    converted = tl.reshape(converted, (BLOCK * 2,))
+    if 2 * (TOTAL + BLOCK) > 2147483647:
+        out_offsets = tl.program_id(0).to(tl.int64) * BLOCK * 2 + tl.arange(0, BLOCK * 2)
+    elif BLOCK == 1024:
+        out_offsets = tl.program_id(0).to(tl.uint32) * BLOCK * 2 + tl.arange(0, BLOCK * 2).to(tl.uint32)
+    else:
+        out_offsets = tl.program_id(0) * BLOCK * 2 + tl.arange(0, BLOCK * 2)
+    tl.store(DQ_OUT + out_offsets, converted, out_offsets < TOTAL * 2)
+
+
+@triton.jit
+def _bwd_prefix_delta(Q, K, V, DO, M, Delta, scale,
+                         N_CTX: tl.constexpr, N_HEAD: tl.constexpr,
+                         Q_STRIDES: tl.constexpr, K_STRIDES: tl.constexpr,
+                         V_STRIDES: tl.constexpr, DO_STRIDES: tl.constexpr,
+                         BLOCK_M: tl.constexpr = 16, BLOCK_N: tl.constexpr = 128,
+                         HEAD_DIM: tl.constexpr = 128):
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    key = tl.arange(0, BLOCK_N)
+    dim = tl.arange(0, HEAD_DIM)
+    hz = tl.program_id(1)
+    batch = hz // N_HEAD
+    head = hz % N_HEAD
+    q = tl.load(Q + batch * Q_STRIDES[0] + head * Q_STRIDES[1] + row[:, None] * Q_STRIDES[2] + dim[None, :] * Q_STRIDES[3])
+    k = tl.load(K + batch * K_STRIDES[0] + head * K_STRIDES[1] + key[:, None] * K_STRIDES[2] + dim[None, :] * K_STRIDES[3])
+    qk = tl.dot(q, tl.trans(k))
+    m = tl.load(M + hz * N_CTX + row)
+    exponent = tl.fma(qk, scale * 1.4426950408889634, -m[:, None])
+    exponent = tl.where(key[None, :] <= row[:, None], exponent, -float('inf'))
+    p = tl.math.exp2(exponent)
+    do = tl.load(DO + batch * DO_STRIDES[0] + head * DO_STRIDES[1] + row[:, None] * DO_STRIDES[2] + dim[None, :] * DO_STRIDES[3])
+    v = tl.load(V + batch * V_STRIDES[0] + head * V_STRIDES[1] + key[:, None] * V_STRIDES[2] + dim[None, :] * V_STRIDES[3])
+    dp = tl.dot(do, tl.trans(v))
+    delta = tl.sum(p * dp, 1)
+    tl.store(Delta + hz * N_CTX + row, delta)
+
+
+
+@triton.jit
+def _bwd_prefix_dv_residual(Q, K, DO, M, DV, scale,
+                               N_CTX: tl.constexpr, N_HEAD: tl.constexpr,
+                               Q_STRIDES: tl.constexpr, K_STRIDES: tl.constexpr,
+                               DO_STRIDES: tl.constexpr, DV_STRIDES: tl.constexpr,
+                               BLOCK_K: tl.constexpr = 16, PREFIX_Q: tl.constexpr = 128,
+                               HEAD_DIM: tl.constexpr = 128):
+    key = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
+    query = tl.arange(0, PREFIX_Q)
+    dim = tl.arange(0, HEAD_DIM)
+    hz = tl.program_id(1)
+    batch = hz // N_HEAD
+    head = hz % N_HEAD
+    k = tl.load(K + batch * K_STRIDES[0] + head * K_STRIDES[1] + key[:, None] * K_STRIDES[2] + dim[None, :] * K_STRIDES[3])
+    q = tl.load(Q + batch * Q_STRIDES[0] + head * Q_STRIDES[1] + query[:, None] * Q_STRIDES[2] + dim[None, :] * Q_STRIDES[3])
+    qk = tl.dot(k, tl.trans(q))
+    m = tl.load(M + hz * N_CTX + query)
+    exponent = tl.fma(qk, scale * 1.4426950408889634, -m[None, :])
+    exponent = tl.where(key[:, None] <= query[None, :], exponent, -float('inf'))
+    p = tl.math.exp2(exponent)
+    residual = p - p.to(tl.bfloat16).to(tl.float32)
+    do = tl.load(DO + batch * DO_STRIDES[0] + head * DO_STRIDES[1] + query[:, None] * DO_STRIDES[2] + dim[None, :] * DO_STRIDES[3])
+    high = residual.to(tl.bfloat16)
+    correction = tl.dot(high, do)
+    pointer = DV + batch * DV_STRIDES[0] + head * DV_STRIDES[1] + key[:, None] * DV_STRIDES[2] + dim[None, :] * DV_STRIDES[3]
+    original = tl.load(pointer).to(tl.float32)
+    tl.store(pointer, original + correction)
+
+
+
+@triton.jit
 def _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM: tl.constexpr,
                     N_HEAD: tl.constexpr, STRIDES: tl.constexpr):
     if STRIDES is None:
@@ -2939,6 +3102,9 @@ def _attn_bwd_preprocess(O, DO,  #
                          DO_STRIDES: tl.constexpr = None,
                          SCALED_DO_STRIDES: tl.constexpr = None,
                          DQ_STRIDES: tl.constexpr = None,
+                         PACKED_DQ: tl.constexpr = False,
+                         RangeFailure=None,
+                         RangeBudget=None,
                          ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
@@ -2958,7 +3124,15 @@ def _attn_bwd_preprocess(O, DO,  #
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
-    if ZERO_DQ:
+    if PACKED_DQ:
+        packed_cols = tl.arange(0, HEAD_DIM // 2)
+        packed_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM // 2, N_HEAD, DQ_STRIDES)
+        tl.store(DQ_ACCUM + packed_rows[:, None] + packed_cols[None, :], 0)
+        budget_offsets = (off_hz * 2 + tl.arange(0, 2)[:, None]) * N_CTX + off_m[None, :]
+        tl.store(RangeBudget + budget_offsets, 0)
+        if tl.program_id(0) == 0 and off_hz == 0:
+            tl.store(RangeFailure, 0)
+    elif ZERO_DQ:
         dq_rows = _bwd_row_offset(off_hz, off_m, N_CTX, HEAD_DIM, N_HEAD, DQ_STRIDES)
         tl.store(
             DQ_ACCUM + dq_rows[:, None] + off_n[None, :],
@@ -3005,7 +3179,7 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     # dQ uses TMA reduce-add, so stale values accumulate across runs.
     # dk/dv don't need zeroing — they use use_acc=False on the first iteration.
     if (
-        not nargs.get("PERSISTENT_BWD", False)
+        (not nargs.get("PERSISTENT_BWD", False) or nargs.get("PACKED_DQ", False))
         and not nargs.get("PREPROCESS_ZEROES_DQ", False)
     ):
         nargs["desc_dq"].base.zero_()
@@ -3468,7 +3642,7 @@ def _bwd_mma_dots_2cta(
             blk_idx - 1, NUM_BUFFERS_TMEM
         )
         tlx.barrier_wait(
-            dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1
+            dq_empties[prev_tmem_buf_id], prev_tmem_phase
         )
 
     tlx.barrier_wait(k_fulls[kv_buf_id], kv_phase)
@@ -4102,6 +4276,10 @@ def _bwd_compute_inner_loop(
     P_BUF_OFFSET: tl.constexpr = 0,
     num_steps_override=0,
 ):
+    _BF16_FIXED_GAUGE: tl.constexpr = 4.055517269
+    _EXP2_BF16_BIAS: tl.constexpr = 126.0
+    _EXP2_BF16_SCALE: tl.constexpr = 128.0
+    _EXP2_MAGIC: tl.constexpr = 12582912.0
     tl.static_assert(not PRENORMALIZED_DO or STAGE != 1)
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
@@ -4116,132 +4294,110 @@ def _bwd_compute_inner_loop(
     else:
         lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE)
         num_steps = (hi - lo) // BLOCK_M1
-    for _ in range(num_steps):
-        tmem_buf_id, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
-        ds_buf_id, _ = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-
-        # Wait for QK first (from MMA, typically ready sooner), then M.
-        # D wait is deferred to right before dS computation (like FA4).
-        d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-        tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
-
-        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
-        if not PRENORMALIZED_DO:
-            m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
-            tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
-            m = tlx.local_load(sM_tiles[m_buf_id])
-        # qkT/pT are transposed: [BLOCK_N1 (keys), BLOCK_M1 (queries)]. Apply the
-        # causal mask to the logits via the R2P bitmask helper (keep query-cols
-        # m >= key-row n), then exp2 (exp2(-inf) = 0), avoiding the per-element
-        # ISETP arithmetic of `offs_m >= offs_n`.
-        if PRENORMALIZED_DO:
-            p_h = _s2_exp2_bf16(
-                qkT,
-                qk_scale * _EXP2_BF16_SCALE,
-                _EXP2_MAGIC + _EXP2_BF16_SCALE * (_EXP2_BF16_BIAS - _BF16_FIXED_GAUGE),
-            )
-            pT = p_h.to(tl.float32)
-        else:
-            if SCALE_QK_IN_KERNEL:
-                sT = _fma_f32x2(qkT, qk_scale, -m[None, :])
+    for mask_stage in tl.static_range(2 if USE_2CTA and STAGE == 1 else 1):
+        if USE_2CTA and STAGE == 1:
+            if mask_stage == 0:
+                stage_steps = min(num_steps, tl.cdiv(BLOCK_N1 * NUM_CTAS, BLOCK_M1))
             else:
-                sT = _sub_f32x2(qkT, m[None, :])
-            if STAGE == 1:
-                col_limit_left = (offs_n - curr_m)[:, None]
-                sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
-            pT = tl.math.exp2(sT)
+                stage_steps = max(num_steps - tl.cdiv(BLOCK_N1 * NUM_CTAS, BLOCK_M1), 0)
+        else:
+            stage_steps = num_steps
+        for _ in range(stage_steps):
+            tmem_buf_id, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
+            ds_buf_id, _ = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        # Store P to TMEM.
-        if PRENORMALIZED_DO and do_out_dtype == tl.bfloat16:
-            ppT = p_h
-        else:
-            ppT = pT.to(do_out_dtype)
-        # Hazard 1 (intra-task WAR): P (f16) aliases the upper half of the qk
-        # (f32) TMEM region; tcgen05 ld/st warp->chunk maps differ, so a fast
-        # warp's P store can overwrite a 32x32 chunk a slow warp has not read as
-        # qkT. Rendezvous all 8 compute warps between the read and the store.
-        tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
-        tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
-        # P aliases the QK TMEM region, so qk_empties (which frees that region for
-        # reuse) must be signaled after P is stored, not before. The
-        # local_store->TMEM lowering auto-emits tcgen05.wait::st, so p_fulls
-        # already observes the completed P store; no manual wait.
-        if USE_2CTA:
-            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
-            tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
-        else:
-            tlx.barrier_arrive(qk_empties[tmem_buf_id])
-            tlx.barrier_arrive(p_fulls[tmem_buf_id])
+            d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
+            tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
-        # --- Phase 3: Compute dS = pT * (dpT - Di). ---
-        tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
-        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
-        Di = tlx.local_load(sD_tiles[d_buf_id])
-        if not PRENORMALIZED_DO:
-            tlx.barrier_arrive(m_empties[m_buf_id])
-        tlx.barrier_arrive(d_empties[d_buf_id])
-        if PRENORMALIZED_DO and q_out_dtype == tl.bfloat16:
-            dp_delta_h = _sub_f32x2(dpT, Di[None, :]).to(tl.bfloat16)
-            dsT = _mul_bf16x2(p_h, dp_delta_h)
-        else:
-            dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
-            dsT = dsT.to(q_out_dtype)
-        # Hazard 1 (intra-task WAR): dsT (f16) aliases dp's (f32) region -- same
-        # warp->chunk mismatch as the P store above.
-        tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
-        tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
-        # dsT aliases the dP TMEM region, so dp_empties (which frees that region
-        # for reuse) must be signaled after dsT is stored, not before. The
-        # local_store->TMEM lowering auto-emits tcgen05.wait::st (+barrier), so the
-        # dsT_tmem_fulls arrive and the 2-CTA TMEM read-back below both observe the
-        # completed store; no manual wait.
-        if not REUSE_DP_FOR_DQ and not USE_2CTA:
-            tlx.barrier_arrive(dp_empties[tmem_buf_id])
-        # 2-CTA: exchange half of dS with peer via DSMEM, then
-        # overwrite ds_tiles so it contains mixed dS from both CTAs.
-        if USE_2CTA:
-            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0)
-            _, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-            # Wait for MMA Dot 5 to finish reading ds_tiles before overwriting.
-            tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
-            peer_rank = 1 - cluster_cta_rank
-            # Load own/peer M-columns from TMEM (dsT_tmem_tiles), store to SMEM.
-            if cluster_cta_rank == 0:
-                own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
-                                            [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+            qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+            if not PRENORMALIZED_DO:
+                m_buf_id, m_phase = get_bufidx_phase(blk_idx, M_STAGE)
+                tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
+                m = tlx.local_load(sM_tiles[m_buf_id])
+            if PRENORMALIZED_DO:
+                p_h = _s2_exp2_bf16(
+                    qkT,
+                    qk_scale * _EXP2_BF16_SCALE,
+                    _EXP2_MAGIC + _EXP2_BF16_SCALE * (_EXP2_BF16_BIAS - _BF16_FIXED_GAUGE),
+                )
+                pT = p_h.to(tl.float32)
             else:
-                own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
-                                           [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-            own_data = tlx.local_load(own_tmem)
-            tlx.local_store(own_smem, own_data)
-            peer_data = tlx.local_load(peer_tmem)
-            # Signal dp_empties right after TMEM reload is done —
-            # dsT_tmem is no longer needed, MMA can overwrite dp/dq TMEM.
-            tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
-            tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
-            tlx.fence("async_shared")
-            remote_dst = own_smem
-            tlx.barrier_expect_bytes(ds_peer_fulls[ds_buf_id], 2 * BLOCK_N1 * (BLOCK_M1 // NUM_CTAS))
-            tlx.async_remote_shmem_copy(
-                dst=remote_dst,
-                src=ds_xchg_tiles[ds_buf_id],
-                remote_cta_rank=peer_rank,
-                barrier=ds_peer_fulls[ds_buf_id],
-            )
-            # NOTE: ds_peer_fulls wait + ds_fulls signal moved to relay task.
-        else:
-            tlx.local_store(ds_tiles[ds_buf_id], dsT)
-            tlx.fence("async_shared")
-            tlx.barrier_arrive(ds_fulls[ds_buf_id])
-            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
+                if SCALE_QK_IN_KERNEL:
+                    sT = _fma_f32x2(qkT, qk_scale, -m[None, :])
+                else:
+                    sT = _sub_f32x2(qkT, m[None, :])
+                if STAGE == 1 and (not USE_2CTA or mask_stage == 0):
+                    col_limit_left = (offs_n - curr_m)[:, None]
+                    sT = _apply_causal_mask(sT, col_limit_left, BLOCK_M1, keep_ge=True)
+                pT = tl.math.exp2(sT)
 
-        curr_m += step_m
-        blk_idx += 1
+            if PRENORMALIZED_DO and do_out_dtype == tl.bfloat16:
+                ppT = p_h
+            else:
+                ppT = pT.to(do_out_dtype)
+            tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+            tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
+            if USE_2CTA:
+                tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
+                tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
+            else:
+                tlx.barrier_arrive(qk_empties[tmem_buf_id])
+                tlx.barrier_arrive(p_fulls[tmem_buf_id])
+
+            tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
+            dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+            tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
+            Di = tlx.local_load(sD_tiles[d_buf_id])
+            if not PRENORMALIZED_DO:
+                tlx.barrier_arrive(m_empties[m_buf_id])
+            tlx.barrier_arrive(d_empties[d_buf_id])
+            if PRENORMALIZED_DO and q_out_dtype == tl.bfloat16:
+                dp_delta_h = _sub_f32x2(dpT, Di[None, :]).to(tl.bfloat16)
+                dsT = _mul_bf16x2(p_h, dp_delta_h)
+            else:
+                dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+                dsT = dsT.to(q_out_dtype)
+            tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+            tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
+            if not REUSE_DP_FOR_DQ and not USE_2CTA:
+                tlx.barrier_arrive(dp_empties[tmem_buf_id])
+            if USE_2CTA:
+                tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0)
+                _, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+                tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
+                peer_rank = 1 - cluster_cta_rank
+                if cluster_cta_rank == 0:
+                    own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                    peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
+                                                [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                    own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                else:
+                    own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
+                                               [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                    peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                    own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                own_data = tlx.local_load(own_tmem)
+                tlx.local_store(own_smem, own_data)
+                peer_data = tlx.local_load(peer_tmem)
+                tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
+                tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
+                tlx.fence("async_shared")
+                remote_dst = own_smem
+                tlx.barrier_expect_bytes(ds_peer_fulls[ds_buf_id], 2 * BLOCK_N1 * (BLOCK_M1 // NUM_CTAS))
+                tlx.async_remote_shmem_copy(
+                    dst=remote_dst,
+                    src=ds_xchg_tiles[ds_buf_id],
+                    remote_cta_rank=peer_rank,
+                    barrier=ds_peer_fulls[ds_buf_id],
+                )
+            else:
+                tlx.local_store(ds_tiles[ds_buf_id], dsT)
+                tlx.fence("async_shared")
+                tlx.barrier_arrive(ds_fulls[ds_buf_id])
+                tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
+
+            curr_m += step_m
+            blk_idx += 1
     return curr_m, blk_idx
 
 
@@ -4253,6 +4409,8 @@ def _bwd_task_loop_init(
     BLOCK_N1: tl.constexpr,
     NUM_CTAS: tl.constexpr,
     PERSISTENT_BWD: tl.constexpr,
+    PACKED_DQ: tl.constexpr = False,
+    Failure=None,
 ):
     batch_heads = H * Z
     num_kv_pairs = tl.cdiv(N_CTX, BLOCK_N1 * NUM_CTAS)
@@ -4263,7 +4421,12 @@ def _bwd_task_loop_init(
             (tl.program_id(2) * H + tl.program_id(1)) * num_kv_pairs
             + tl.program_id(0) // NUM_CTAS
         )
-    if PERSISTENT_BWD:
+    if PERSISTENT_BWD and PACKED_DQ:
+        persistent_stride = tl.num_programs(0) // NUM_CTAS
+        num_units = batch_heads * (num_kv_pairs // 2)
+        num_outer_tasks = 2 * tl.cdiv(num_units - cluster_id, persistent_stride)
+        task_id = tl.where(cluster_id < num_units, 0, -1)
+    elif PERSISTENT_BWD:
         persistent_stride = tl.num_programs(0) // NUM_CTAS
         num_owned_heads = tl.cdiv(batch_heads - cluster_id, persistent_stride)
         num_outer_tasks = num_owned_heads * num_kv_pairs
@@ -4272,6 +4435,8 @@ def _bwd_task_loop_init(
         persistent_stride = 1
         num_outer_tasks = 1
         task_id = cluster_id
+    if Failure is not None:
+        task_id = tl.where(tl.load(Failure) != 0, task_id, -1)
     return cluster_id, persistent_stride, num_kv_pairs, num_outer_tasks, task_id
 
 
@@ -4290,12 +4455,19 @@ def _decode_bwd_kv_task(
     PERSISTENT_BWD: tl.constexpr,
     NATIVE_COORDS: tl.constexpr,
     cluster_cta_rank,
+    PACKED_DQ: tl.constexpr = False,
 ):
     if NATIVE_COORDS:
         kv_pair = tl.program_id(0) // NUM_CTAS
         head = tl.program_id(1)
         batch = tl.program_id(2)
         batch_head = batch * H + head
+    elif PERSISTENT_BWD and PACKED_DQ:
+        pairs_per_head = num_kv_pairs // 2
+        unit = cluster_id + (task_id // 2) * persistent_stride
+        batch_head = unit // pairs_per_head
+        pair = unit % pairs_per_head
+        kv_pair = tl.where(task_id % 2 == 0, pair, num_kv_pairs - 1 - pair)
     elif PERSISTENT_BWD:
         kv_pair = task_id % num_kv_pairs
         head_slot = task_id // num_kv_pairs
@@ -4316,11 +4488,46 @@ def _decode_bwd_kv_task(
 
 
 def _bwd_tuning_reset_pre_hook(nargs, reset_only=False):
-    if (
+    if nargs.get("PACKED_DQ", False):
+        nargs["desc_dq"].base.zero_()
+        nargs["RangeBudget"].zero_()
+        nargs["RangeFailure"].zero_()
+    elif (
         nargs.get("PREPROCESS_ZEROES_DQ", False)
         and not nargs.get("PERSISTENT_BWD", False)
     ):
         nargs["desc_dq"].base.zero_()
+
+
+@triton.jit
+def _cold_head_stripe_io(
+    DQ64, DQ_OUT, Failure, H, Z, N_CTX,
+    DQ64_STRIDES: tl.constexpr, WRITE_ZERO: tl.constexpr,
+):
+    if tl.load(Failure) != 0:
+        rank = tlx.cluster_cta_rank()
+        cluster_id = tl.program_id(0) // 2
+        cluster_stride = tl.num_programs(0) // 2
+        elements_per_rank = N_CTX * 64
+        lanes = tl.arange(0, 4096)
+        for batch_head in range(cluster_id, H * Z, cluster_stride):
+            batch = batch_head // H
+            head = batch_head % H
+            for offset in range(0, elements_per_rank, 4096):
+                linear = offset + lanes
+                half_row = linear // 128
+                query = (half_row // 64) * 128 + rank * 64 + half_row % 64
+                column = linear % 128
+                address = (batch.to(tl.int64) * DQ64_STRIDES[0]
+                           + head.to(tl.int64) * DQ64_STRIDES[1]
+                           + query.to(tl.int64) * DQ64_STRIDES[2]
+                           + column.to(tl.int64) * DQ64_STRIDES[3])
+                if WRITE_ZERO:
+                    tl.store(DQ64 + address, 0.0, linear < elements_per_rank)
+                else:
+                    value = tl.load(DQ64 + address, linear < elements_per_rank, other=0)
+                    tl.store(DQ_OUT + address, value.to(tl.bfloat16), linear < elements_per_rank)
+
 
 
 @triton.autotune(
@@ -4373,7 +4580,30 @@ def _attn_bwd_ws(
     PERSISTENT_BWD: tl.constexpr = False,
     PRENORMALIZED_DO: tl.constexpr = False,
     PREPROCESS_ZEROES_DQ: tl.constexpr = False,
+    PACKED_DQ: tl.constexpr = False,
+    RangeFailure=None,
+    PACKED_N_CTX: tl.constexpr = 0,
+    RangeBudget=None,
+    Failure=None,
+    DQ64=None,
+    DQ64_STRIDES: tl.constexpr = None,
+    DQ_OUT=None,
 ):
+    _RCP_LN2: tl.constexpr = 1.4426950408889634
+    if Failure is not None:
+        tl.static_assert(not PACKED_DQ)
+        tl.static_assert(DQ_OUT is not None and DQ_OUT.dtype.element_ty == tl.bfloat16)
+        tl.static_assert(PERSISTENT_BWD and STAGE == 3 and SCALE_QK_IN_KERNEL
+                         and not PRENORMALIZED_DO and not USE_WARP_BARRIER
+                         and BLOCK_M1 == 128 and BLOCK_N1 == 128 and EPILOGUE_SUBTILE == 8
+                         and DQ_STAGE_COUNT == 2 and NUM_BUFFERS_KV == 1 and NUM_BUFFERS_Q == 1
+                         and NUM_BUFFERS_DS == 1 and NUM_BUFFERS_TMEM == 1
+                         and tlx.dtype_of(desc_q) == tl.bfloat16 and DQ64 is not None
+                         and DQ64.dtype.element_ty == tl.float64 and DQ64_STRIDES is not None)
+    if PACKED_DQ:
+        tl.static_assert(PACKED_N_CTX >= 256 and PACKED_N_CTX <= 16384 and PACKED_N_CTX % 256 == 0)
+        tl.static_assert(not PERSISTENT_BWD or PACKED_N_CTX % 512 == 0)
+        N_CTX = PACKED_N_CTX
     # Runtime error if NUM_BUFFERS_DO != 1
     tl.static_assert(NUM_BUFFERS_DO == 1)
 
@@ -4385,6 +4615,18 @@ def _attn_bwd_ws(
     REUSE_DP_FOR_DQ: tl.constexpr = (BLOCK_M1 == 128) and (HEAD_DIM == 128) and (NUM_CTAS == 1)
 
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
+    tl.static_assert(
+        not PACKED_DQ or (
+            STAGE == 3 and SCALE_QK_IN_KERNEL
+            and tlx.dtype_of(desc_q) == tl.bfloat16
+            and (not PERSISTENT_BWD or (not USE_WARP_BARRIER and NUM_BUFFERS_KV == 1
+                 and NUM_BUFFERS_Q == 1 and NUM_BUFFERS_DS == 1 and NUM_BUFFERS_TMEM == 1))
+            and tlx.dtype_of(desc_dq) == tl.int32 and EPILOGUE_SUBTILE == 8
+            and BLOCK_M1 == 128 and BLOCK_N1 == 128 and DQ_STAGE_COUNT == 2
+            and RangeFailure is not None and RangeBudget is not None
+        ),
+        "packed dQ requires the guarded causal BF16 direct two-CTA configuration",
+    )
     tl.static_assert(
         not SCALE_QK_IN_KERNEL or (USE_2CTA and HEAD_DIM == 128),
         "direct dQ requires NUM_CTAS=2 and HEAD_DIM=128",
@@ -4451,7 +4693,7 @@ def _attn_bwd_ws(
         dq_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=4)
     else:
         dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
-    if DIRECT_DQ_OUTPUT:
+    if DIRECT_DQ_OUTPUT and Failure is None:
         dq_stage_fulls = tlx.alloc_warp_barrier(
             num_barriers=DQ_STAGE_COUNT, num_warps=4
         )
@@ -4511,11 +4753,11 @@ def _attn_bwd_ws(
 
     DQ_STORE_M: tl.constexpr = BLOCK_M1 // NUM_CTAS
     DQ_SLICE_N: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-    if USE_2CTA:
+    if USE_2CTA and Failure is None:
         DQ_STORE_STAGES: tl.constexpr = 1 if EPILOGUE_SUBTILE == 4 else 2
         DQ_BUFFER_STAGES: tl.constexpr = DQ_STAGE_COUNT if DIRECT_DQ_OUTPUT else DQ_STORE_STAGES
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), DQ_BUFFER_STAGES)
-    else:
+    elif Failure is None:
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
@@ -4678,22 +4920,26 @@ def _attn_bwd_ws(
     # `less_reg_mma`: the MMA task issues many dots over the same SMEM
     # operands, so a CSE-d operand descriptor stays live across all of them and
     # spills. Give each MMA its own address computation instead.
+    if Failure is not None:
+        _cold_head_stripe_io(DQ64, DQ_OUT, Failure, H, Z, N_CTX, DQ64_STRIDES, True)
+
     with tlx.async_tasks(exclusive=not DIRECT_DQ_OUTPUT, less_reg_mma=True):
         # compute
         with tlx.async_task("default"):
             (cluster_id, persistent_stride, num_kv_pairs,
              num_outer_tasks, task_id) = _bwd_task_loop_init(
-                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD)
+                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD, PACKED_DQ, Failure)
             task_iter = 0
+            phase_base = 0
             while task_id != -1:
                 (kv_pair, start_n, head, batch, off_chz, start_m,
                  num_steps, start_block_n) = _decode_bwd_kv_task(
                      task_id, cluster_id, persistent_stride,
                      num_kv_pairs, H, N_CTX, BLOCK_M1, BLOCK_N1,
                      NUM_CTAS, STAGE, PERSISTENT_BWD, NATIVE_COORDS,
-                     cluster_cta_rank)
+                     cluster_cta_rank, PACKED_DQ)
                 tile_count = task_iter
-                blk_idx = task_iter * num_steps
+                blk_idx = phase_base
                 curr_m = start_m
                 step_m = BLOCK_M1
                 do_out_dtype = tlx.dtype_of(desc_do)
@@ -4895,6 +5141,7 @@ def _attn_bwd_ws(
                 else:
                     tlx.barrier_arrive(k_empties[kv_buf_id])
                     tlx.barrier_arrive(dk_empties[kv_buf_id])
+                phase_base += num_steps
                 task_iter += 1
                 task_id = tl.where(task_iter < num_outer_tasks, task_iter, -1)
 
@@ -4902,32 +5149,66 @@ def _attn_bwd_ws(
         with tlx.async_task(num_warps=4, registers=88):
             (cluster_id, persistent_stride, num_kv_pairs,
              num_outer_tasks, task_id) = _bwd_task_loop_init(
-                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD)
+                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD, PACKED_DQ, Failure)
             task_iter = 0
+            phase_base = 0
             while task_id != -1:
                 (kv_pair, start_n, head, batch, off_chz, start_m,
                  num_steps, start_block_n) = _decode_bwd_kv_task(
                      task_id, cluster_id, persistent_stride,
                      num_kv_pairs, H, N_CTX, BLOCK_M1, BLOCK_N1,
                      NUM_CTAS, STAGE, PERSISTENT_BWD, NATIVE_COORDS,
-                     cluster_cta_rank)
+                     cluster_cta_rank, PACKED_DQ)
                 tile_count = task_iter
-                blk_idx = task_iter * num_steps
+                blk_idx = phase_base
                 curr_m = start_m
                 step_m = BLOCK_M1
                 for _ in range(num_steps):
                     tmem_buf_id, tmem_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                    if USE_2CTA:
+                    if Failure is not None:
+                        rows = tl.arange(0, 128)
+                        columns = tl.arange(0, 16)
+                        query_rows = curr_m + cluster_cta_rank * 64 + rows % 64
+                        dq_base = (batch.to(tl.int64) * DQ64_STRIDES[0]
+                                   + head.to(tl.int64) * DQ64_STRIDES[1]
+                                   + query_rows.to(tl.int64) * DQ64_STRIDES[2])
+                        for slice_id in tl.static_range(4):
+                            dq_slice = tlx.local_slice(
+                                dq_phys[tmem_buf_id + DQ_BUF_IDX],
+                                [0, slice_id * 16],
+                                [128, 16],
+                            )
+                            dq = tlx.local_load(dq_slice)
+                            dq = _mul_f32x2(dq, sm_scale)
+                            dq_columns = slice_id * 16 + columns[None, :] + (rows[:, None] // 64) * 64
+                            dq_offsets = dq_base[:, None] + dq_columns.to(tl.int64) * DQ64_STRIDES[3]
+                            tl.atomic_add(DQ64 + dq_offsets, dq.to(tl.float64), sem="relaxed")
+                        tlx.named_barrier_wait(DQ_READ_DONE_BAR, NUM_REDUCE_THREADS)
+                        tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
+
+                    elif USE_2CTA:
                         dq_m_offset = cluster_cta_rank * DQ_STORE_M
-                        DQ_PACK_ITERS: tl.constexpr = (HEAD_DIM // NUM_CTAS) // DQ_SLICE_N
+                        DQ_PACK_ITERS: tl.constexpr = (HEAD_DIM // NUM_CTAS) // (DQ_SLICE_N * (2 if PACKED_DQ else 1))
                         if DIRECT_DQ_OUTPUT:
                             dq_full = tlx.local_load(dq_phys[tmem_buf_id + DQ_BUF_IDX])
                             tlx.named_barrier_wait(DQ_READ_DONE_BAR, NUM_REDUCE_THREADS)
                             tlx.barrier_arrive(
                                 dq_empties[tmem_buf_id], 1, remote_cta_rank=0
                             )
+                            if PACKED_DQ:
+                                if curr_m < 256:
+                                    dq_packed = _dq_pack_bf16_pair(_mul_f32x2(dq_full, sm_scale))
+                                else:
+                                    budget_rows = tl.arange(0, BLOCK_M1)
+                                    budget_offsets = (2 * off_chz + (budget_rows // DQ_STORE_M) * N_CTX
+                                                      + curr_m + dq_m_offset + budget_rows % DQ_STORE_M)
+                                    dq_packed = _dq_pack_fixed_pair(
+                                        dq_full, sm_scale * _dq_fixed_scale(N_CTX), curr_m // 256 + 1,
+                                        RangeBudget, budget_offsets,
+                                    )
+                                dq_full = dq_packed
                             dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
                             for slice_id in tl.static_range(DQ_PACK_ITERS):
                                 dq_stage_count = blk_idx * DQ_PACK_ITERS + slice_id
@@ -4941,7 +5222,7 @@ def _attn_bwd_ws(
                                 dq_smem = dq_store_buf[dq_stage_buf_id]
                                 tlx.local_store(
                                     dq_smem,
-                                    (dq_slices[slice_id] * sm_scale).to(
+                                    (dq_slices[slice_id] if PACKED_DQ else dq_slices[slice_id] * sm_scale).to(
                                         tlx.dtype_of(desc_dq)
                                     ),
                                 )
@@ -5014,31 +5295,34 @@ def _attn_bwd_ws(
                     curr_m += step_m
                     blk_idx += 1
 
-                tlx.async_descriptor_store_wait(0)
+                if Failure is None:
+                    tlx.async_descriptor_store_wait(0)
+                phase_base += num_steps
                 task_iter += 1
                 task_id = tl.where(task_iter < num_outer_tasks, task_iter, -1)
 
-        if USE_2CTA and DIRECT_DQ_OUTPUT:
+        if USE_2CTA and DIRECT_DQ_OUTPUT and Failure is None:
             with tlx.async_task(num_warps=1, registers=88):
                 (cluster_id, persistent_stride, num_kv_pairs,
                  num_outer_tasks, task_id) = _bwd_task_loop_init(
-                     H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD)
+                     H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD, PACKED_DQ, Failure)
                 task_iter = 0
+                phase_base = 0
                 while task_id != -1:
                     (kv_pair, start_n, head, batch, off_chz, start_m,
                      num_steps, start_block_n) = _decode_bwd_kv_task(
                          task_id, cluster_id, persistent_stride,
                          num_kv_pairs, H, N_CTX, BLOCK_M1, BLOCK_N1,
                          NUM_CTAS, STAGE, PERSISTENT_BWD, NATIVE_COORDS,
-                         cluster_cta_rank)
+                         cluster_cta_rank, PACKED_DQ)
                     tile_count = task_iter
                     curr_m = start_m
                     dq_m_offset = cluster_cta_rank * DQ_STORE_M
                     DQ_PACK_ITERS: tl.constexpr = (
-                        HEAD_DIM // NUM_CTAS // DQ_SLICE_N
+                        HEAD_DIM // NUM_CTAS // (DQ_SLICE_N * (2 if PACKED_DQ else 1))
                     )
                     for blk_local_idx in range(num_steps):
-                        blk_idx = task_iter * num_steps + blk_local_idx
+                        blk_idx = phase_base + blk_local_idx
                         for slice_id in tl.static_range(DQ_PACK_ITERS):
                             dq_stage_count = blk_idx * DQ_PACK_ITERS + slice_id
                             dq_stage_buf_id, dq_stage_phase = get_bufidx_phase(
@@ -5054,7 +5338,7 @@ def _attn_bwd_ws(
                                 dq_stage_fulls[dq_stage_buf_id], dq_stage_phase
                             )
                             dq_smem = dq_store_buf[dq_stage_buf_id]
-                            if PERSISTENT_BWD and kv_pair == 0:
+                            if (PERSISTENT_BWD and not PACKED_DQ and kv_pair == 0) or (PACKED_DQ and curr_m < 256):
                                 tlx.async_descriptor_store(
                                     desc_dq,
                                     dq_smem,
@@ -5083,23 +5367,25 @@ def _attn_bwd_ws(
                     tlx.async_descriptor_store_wait(0)
                     for final_stage_id in tl.static_range(DQ_STAGE_COUNT):
                         tlx.barrier_arrive(dq_stage_empties[final_stage_id])
+                    phase_base += num_steps
                     task_iter += 1
                     task_id = tl.where(task_iter < num_outer_tasks, task_iter, -1)
 
         with tlx.async_task(num_warps=1, registers=88):
             (cluster_id, persistent_stride, num_kv_pairs,
              num_outer_tasks, task_id) = _bwd_task_loop_init(
-                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD)
+                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD, PACKED_DQ, Failure)
             task_iter = 0
+            phase_base = 0
             while task_id != -1:
                 (kv_pair, start_n, head, batch, off_chz, start_m,
                  num_steps, start_block_n) = _decode_bwd_kv_task(
                      task_id, cluster_id, persistent_stride,
                      num_kv_pairs, H, N_CTX, BLOCK_M1, BLOCK_N1,
                      NUM_CTAS, STAGE, PERSISTENT_BWD, NATIVE_COORDS,
-                     cluster_cta_rank)
+                     cluster_cta_rank, PACKED_DQ)
                 tile_count = task_iter
-                blk_idx = task_iter * num_steps
+                blk_idx = phase_base
                 if is_leader:
                     kv_buf_id, kv_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
                     if USE_2CTA:
@@ -5203,23 +5489,25 @@ def _attn_bwd_ws(
                             BLOCK_N1=BLOCK_N1,
                         )
                     tile_count += 1
+                phase_base += num_steps
                 task_iter += 1
                 task_id = tl.where(task_iter < num_outer_tasks, task_iter, -1)
 
         with tlx.async_task(num_warps=1, registers=88):
             (cluster_id, persistent_stride, num_kv_pairs,
              num_outer_tasks, task_id) = _bwd_task_loop_init(
-                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD)
+                 H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD, PACKED_DQ, Failure)
             task_iter = 0
+            phase_base = 0
             while task_id != -1:
                 (kv_pair, start_n, head, batch, off_chz, start_m,
                  num_steps, start_block_n) = _decode_bwd_kv_task(
                      task_id, cluster_id, persistent_stride,
                      num_kv_pairs, H, N_CTX, BLOCK_M1, BLOCK_N1,
                      NUM_CTAS, STAGE, PERSISTENT_BWD, NATIVE_COORDS,
-                     cluster_cta_rank)
+                     cluster_cta_rank, PACKED_DQ)
                 tile_count = task_iter
-                blk_idx = task_iter * num_steps
+                blk_idx = phase_base
                 if USE_2CTA:
                     blk_idx = _bwd_load_2cta(
                         blk_idx=blk_idx,
@@ -5337,6 +5625,7 @@ def _attn_bwd_ws(
                         cluster_cta_rank=cluster_cta_rank,
                         is_leader=is_leader,
                     )
+                phase_base += num_steps
                 task_iter += 1
                 task_id = tl.where(task_iter < num_outer_tasks, task_iter, -1)
 
@@ -5346,24 +5635,30 @@ def _attn_bwd_ws(
             with tlx.async_task(num_warps=1, registers=40):
                 (cluster_id, persistent_stride, num_kv_pairs,
                  num_outer_tasks, task_id) = _bwd_task_loop_init(
-                     H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD)
+                     H, Z, N_CTX, BLOCK_N1, NUM_CTAS, PERSISTENT_BWD, PACKED_DQ, Failure)
                 task_iter = 0
+                phase_base = 0
                 while task_id != -1:
                     (kv_pair, start_n, head, batch, off_chz, start_m,
                      num_steps, start_block_n) = _decode_bwd_kv_task(
                          task_id, cluster_id, persistent_stride,
                          num_kv_pairs, H, N_CTX, BLOCK_M1, BLOCK_N1,
                          NUM_CTAS, STAGE, PERSISTENT_BWD, NATIVE_COORDS,
-                         cluster_cta_rank)
+                         cluster_cta_rank, PACKED_DQ)
                     tile_count = task_iter
                     for blk_local_idx_relay in range(num_steps):
-                        blk_idx_relay = task_iter * num_steps + blk_local_idx_relay
+                        blk_idx_relay = phase_base + blk_local_idx_relay
                         ds_buf_id_relay, ds_phase_relay = get_bufidx_phase(blk_idx_relay, NUM_BUFFERS_DS)
                         tlx.barrier_wait(ds_peer_fulls[ds_buf_id_relay], ds_phase_relay)
                         tlx.fence("async_shared")
                         tlx.barrier_arrive(ds_fulls[ds_buf_id_relay], 1, remote_cta_rank=0)
+                    phase_base += num_steps
                     task_iter += 1
                     task_id = tl.where(task_iter < num_outer_tasks, task_iter, -1)
+
+
+    if Failure is not None:
+        _cold_head_stripe_io(DQ64, DQ_OUT, Failure, H, Z, N_CTX, DQ64_STRIDES, False)
 
         # TODO: empty task to absorb warps — needs num_warps bump in configs
         # EMPTY_WARPS: tl.constexpr = 1 if USE_2CTA else 2
@@ -5595,6 +5890,15 @@ class _attention(torch.autograd.Function):
                    for tensor in (q, k, v, o, do))
         assert ctx.HEAD_DIM in (64, 128), "backward requires head dimension 64 or 128"
         BATCH, N_HEAD, N_CTX = q.shape[:3]
+        paper_backward = (
+            ctx.HEAD_DIM == 128 and N_HEAD == 16 and q.is_cuda
+            and N_CTX in (1024, 2048, 4096, 8192, 16384, 32768)
+            and BATCH * N_CTX == 32768 and ctx.sm_scale in (128 ** -0.5, 1.0 / 128 ** 0.5)
+            and all(type(t) is torch.Tensor and t.dtype == torch.bfloat16 and t.shape == q.shape
+                    and t.stride() == (N_CTX * N_HEAD * 128, 128, N_HEAD * 128, 1)
+                    for t in (q, k, v, o, do))
+        )
+        prefix_correction = paper_backward and ctx.causal and not ctx.saved_inverse_normalizer
         direct_dq_output = (
             ctx.HEAD_DIM == 128
             and N_CTX >= BWD_2CTA_MIN_N_CTX
@@ -5605,7 +5909,12 @@ class _attention(torch.autograd.Function):
             and q.dtype == torch.bfloat16
             and not ctx.causal
         )
-        if direct_dq_output:
+        packed_dq_output = direct_dq_output and ctx.causal and q.dtype == torch.bfloat16 and N_CTX <= 16384 and BATCH * N_HEAD * N_CTX >= 131072
+        range_failure = torch.empty((1,), device=q.device, dtype=torch.int32) if packed_dq_output else None
+        range_budget = torch.empty((BATCH, N_HEAD, 2, N_CTX), device=q.device, dtype=torch.int32) if packed_dq_output else None
+        if packed_dq_output:
+            dq = torch.empty_like(q)
+        elif direct_dq_output:
             if bf16_dq_output:
                 dq = torch.empty_like(q, dtype=torch.bfloat16)
             else:
@@ -5615,7 +5924,13 @@ class _attention(torch.autograd.Function):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         _HALF_HD = ctx.HEAD_DIM // 2
-        if direct_dq_output:
+        if packed_dq_output:
+            if q.is_contiguous():
+                dq_accum = torch.empty((BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM // 2), device=q.device, dtype=torch.int32)
+            else:
+                dq_accum = torch.empty((BATCH, N_CTX, N_HEAD, ctx.HEAD_DIM // 2), device=q.device,
+                                       dtype=torch.int32).transpose(1, 2)
+        elif direct_dq_output:
             dq_accum = dq
         else:
             dq_accum = torch.empty([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
@@ -5631,17 +5946,20 @@ class _attention(torch.autograd.Function):
             and not ctx.causal
             and dense_policy is not None
             and dense_policy[0]
-        )
+        ) or (packed_dq_output and N_CTX % 512 == 0)
         scale_do_by_inv_l = ctx.saved_inverse_normalizer
         assert not scale_do_by_inv_l or bf16_dq_output
         do_scaled = torch.empty_like(do) if scale_do_by_inv_l else do
-        preprocess_zeroes_dq = scale_do_by_inv_l and not persistent_bwd
+        preprocess_zeroes_dq = (scale_do_by_inv_l and not persistent_bwd) or packed_dq_output
         _attn_bwd_preprocess[pre_grid](
             o, do,  #
             M, do_scaled, delta, dq_accum,  #
             N_CTX,  #
             SCALE_DO_BY_INV_L=scale_do_by_inv_l,
             ZERO_DQ=preprocess_zeroes_dq,
+            PACKED_DQ=packed_dq_output,
+            RangeFailure=range_failure,
+            RangeBudget=range_budget,
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
             N_HEAD=N_HEAD,
             O_STRIDES=None if o.is_contiguous() else o.stride()[:3],
@@ -5649,6 +5967,16 @@ class _attention(torch.autograd.Function):
             SCALED_DO_STRIDES=None if do_scaled.is_contiguous() else do_scaled.stride()[:3],
             DQ_STRIDES=None if dq_accum.is_contiguous() else dq_accum.stride()[:3],
         )
+
+        if prefix_correction:
+            prefix_block = 64 if N_CTX == 1024 else 16
+            _bwd_prefix_delta[(128 // prefix_block, BATCH * N_HEAD)](
+                q, k, v, do, M, delta, ctx.sm_scale,
+                N_CTX=N_CTX, N_HEAD=N_HEAD,
+                Q_STRIDES=q.stride(), K_STRIDES=k.stride(),
+                V_STRIDES=v.stride(), DO_STRIDES=do.stride(),
+                BLOCK_M=prefix_block, BLOCK_N=128, HEAD_DIM=ctx.HEAD_DIM, num_warps=4,
+            )
 
         dummy_block = [1, 1, 1, 1]
         HEAD_DIM = ctx.HEAD_DIM
@@ -5678,11 +6006,12 @@ class _attention(torch.autograd.Function):
             block_shape=dummy_block,
         )
         if direct_dq_output:
-            packed_shape = [BATCH, N_HEAD, 2, N_CTX, _HALF_HD]
+            dq_half_hd = _HALF_HD // 2 if packed_dq_output else _HALF_HD
+            packed_shape = [BATCH, N_HEAD, 2, N_CTX, dq_half_hd]
             packed_strides = [
                 dq_accum.stride(0),
                 dq_accum.stride(1),
-                _HALF_HD,
+                dq_half_hd,
                 dq_accum.stride(2),
                 1,
             ]
@@ -5738,6 +6067,9 @@ class _attention(torch.autograd.Function):
             n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
             num_ctas = meta.get("NUM_CTAS", 1)
             n_tiles = triton.cdiv(n_tiles, num_ctas) * num_ctas
+            if persistent_bwd and packed_dq_output:
+                pair_units = BATCH * N_HEAD * (n_tiles // (2 * num_ctas))
+                return (num_ctas * min(pair_units, max(1, sm_count // num_ctas)), )
             if persistent_bwd and num_ctas == 2:
                 return (min(n_tiles * N_HEAD * BATCH, persistent_cta_cap), )
             if num_ctas == 2:
@@ -5745,23 +6077,40 @@ class _attention(torch.autograd.Function):
             return (n_tiles, N_HEAD, BATCH)
 
         stage = 3 if ctx.causal else 1
-        _attn_bwd_ws[grid_bwd](
-            desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
-            desc_m, desc_delta,  #
-            M, delta,  #
-            N_HEAD, BATCH,  #
-            N_CTX,  #
-            desc_kt, desc_qt, desc_dot,  #
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM,  #
-            STAGE=stage,  #
+        bwd_args = (
+            desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,
+            desc_m, desc_delta, M, delta, N_HEAD, BATCH, N_CTX, desc_kt, desc_qt, desc_dot,
+        )
+        bwd_kwargs = dict(
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            HEAD_DIM=ctx.HEAD_DIM,
+            STAGE=stage,
             SCALE_QK_IN_KERNEL=direct_dq_output,
             PERSISTENT_BWD=persistent_bwd,
             PRENORMALIZED_DO=scale_do_by_inv_l,
             PREPROCESS_ZEROES_DQ=preprocess_zeroes_dq,
+            PACKED_DQ=packed_dq_output,
+            RangeFailure=range_failure,
+            PACKED_N_CTX=N_CTX if packed_dq_output else 0,
+            RangeBudget=range_budget,
         )
+        _attn_bwd_ws[grid_bwd](*bwd_args, **bwd_kwargs)
 
-        if not direct_dq_output:
+        if packed_dq_output:
+            unpack_block = 1024 if prefix_correction and N_CTX in (8192, 16384) else 512
+            _attn_bwd_unpack_fixed[(triton.cdiv(dq_accum.numel(), unpack_block),)](
+                dq_accum, dq, dq_accum.numel(), N_CTX, dq_accum.stride(2), range_failure, BLOCK=unpack_block,
+                RangeBudget=range_budget, N_HEAD=N_HEAD,
+            )
+            fallback_dq = torch.empty_like(q, dtype=torch.float64)
+            cold_kwargs = dict(
+                bwd_kwargs, PERSISTENT_BWD=True, PREPROCESS_ZEROES_DQ=True,
+                PACKED_DQ=False, RangeFailure=None, PACKED_N_CTX=0, RangeBudget=None,
+                Failure=range_failure, DQ64=fallback_dq, DQ64_STRIDES=fallback_dq.stride(), DQ_OUT=dq,
+            )
+            cold_grid = (2 * min(BATCH * N_HEAD, max(1, sm_count // 2)), 1, 1)
+            _attn_bwd_ws[cold_grid](*bwd_args, **cold_kwargs)
+        elif not direct_dq_output:
             _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
             post_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
             _attn_bwd_dq_postprocess[post_grid](
@@ -5771,6 +6120,14 @@ class _attention(torch.autograd.Function):
                 BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
                 N_HEAD=N_HEAD,
                 DQ_STRIDES=None if dq.is_contiguous() else dq.stride()[:3],
+            )
+
+        if prefix_correction and N_CTX == 1024:
+            _bwd_prefix_dv_residual[(4, BATCH * N_HEAD)](
+                q, k, do, M, dv, ctx.sm_scale, N_CTX=N_CTX, N_HEAD=N_HEAD,
+                Q_STRIDES=q.stride(), K_STRIDES=k.stride(),
+                DO_STRIDES=do.stride(), DV_STRIDES=dv.stride(),
+                BLOCK_K=32, PREFIX_Q=128, HEAD_DIM=ctx.HEAD_DIM, num_warps=4,
             )
 
         return dq, dk, dv, None, None
@@ -5837,3 +6194,4 @@ def attention(q, k, v, sm_scale, causal, config=None):
         **config,
     )
     return o
+
