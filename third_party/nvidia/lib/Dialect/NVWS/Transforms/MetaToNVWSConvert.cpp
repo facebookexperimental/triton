@@ -135,6 +135,25 @@ static LogicalResult promoteMetaWarpSpecializeRoots(FuncOp func) {
           "MetaToNVWSConvert found multiple Meta warp-specialize loops for "
           "one promoted root");
 
+    // The planner resolves SMEM policy from the scheduled loop outward.
+    // Preserve the closest override that the new root would no longer see,
+    // including overrides inherited from an intermediate enclosing loop.
+    for (StringRef name : {"tt.smem_alloc_algo", "tt.smem_circular_reuse"}) {
+      for (scf::ForOp loop = scheduled; loop != root;
+           loop = loop->getParentOfType<scf::ForOp>()) {
+        Attribute attr;
+        if (name == "tt.smem_alloc_algo")
+          attr = loop->getAttrOfType<IntegerAttr>(name);
+        else
+          attr = loop->getAttrOfType<BoolAttr>(name);
+        if (attr) {
+          root->setAttr(name, attr);
+          loop->removeAttr(name);
+          break;
+        }
+      }
+    }
+
     const StringRef rootAttrs[] = {kWarpSpecializeAttrName,
                                    kWarpSpecializeTagAttrName,
                                    kPartitionStagesAttrName,
