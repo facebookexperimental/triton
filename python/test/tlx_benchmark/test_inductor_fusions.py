@@ -14,7 +14,7 @@ from inductor_fusions.compat import (  # noqa: E402
     CompatibilityError, require_include_fallback,
 )
 from inductor_fusions.measure import (  # noqa: E402
-    PairedSample, abba_orders, measure_pairs, summarize_pairs,
+    PairedSample, summarize_pairs,
 )
 
 
@@ -33,39 +33,6 @@ def test_catalog_has_stable_architecture_boundaries_and_enabled_mi350_cases():
 def test_authoritative_mi350_problems_are_visible_without_allocating_inputs():
     problems = {case.name: case.problem for case in cases_for_arch("gfx950")}
     assert problems == {"gfx950_01_double_layernorm": "M=1024 N=6144 dtype=fp16"}
-
-
-def test_abba_order_is_balanced_and_requires_enough_pairs():
-    assert abba_orders(4) == ("AB", "BA", "AB", "BA")
-    assert abba_orders(10) == ("AB", "BA") * 5
-    with pytest.raises(ValueError, match="even sample count"):
-        abba_orders(3)
-
-
-def test_measure_pairs_preserves_pairing_when_order_reverses():
-    calls = []
-
-    def before():
-        return "before"
-
-    def after():
-        return "after"
-
-    values = iter((10.0, 5.0, 5.5, 11.0, 12.0, 6.0, 6.5, 13.0))
-
-    def measure(fn):
-        calls.append(fn())
-        return next(values)
-
-    samples = measure_pairs(before, after, samples=4, measure_once=measure)
-    assert calls == ["before", "after", "after", "before"] * 2
-    assert [(sample.before_us, sample.after_us) for sample in samples] == [
-        (10.0, 5.0),
-        (11.0, 5.5),
-        (12.0, 6.0),
-        (13.0, 6.5),
-    ]
-    assert all(sample.speedup == 2.0 for sample in samples)
 
 
 def test_summary_uses_median_of_paired_speedups_and_marks_noise():

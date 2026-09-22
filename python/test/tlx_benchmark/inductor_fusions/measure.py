@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import statistics
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 MAX_PAIRED_SPEEDUP_SPREAD = 0.05
 
@@ -36,29 +36,6 @@ class PairedSummary:
             "status": "noisy" if self.noisy else "stable",
             "samples": [dataclasses.asdict(sample) | {"speedup": sample.speedup} for sample in self.samples],
         }
-
-
-def abba_orders(samples: int) -> tuple[str, ...]:
-    if samples < 4 or samples % 2:
-        raise ValueError("paired measurement requires an even sample count of at least 4")
-    return tuple("AB" if index % 2 == 0 else "BA" for index in range(samples))
-
-
-def measure_pairs(
-    before: Callable[[], object],
-    after: Callable[[], object],
-    *,
-    samples: int,
-    measure_once: Callable[[Callable[[], object]], float],
-) -> tuple[PairedSample, ...]:
-    measured = []
-    for order in abba_orders(samples):
-        first, second = (before, after) if order == "AB" else (after, before)
-        first_us = measure_once(first)
-        second_us = measure_once(second)
-        before_us, after_us = (first_us, second_us) if order == "AB" else (second_us, first_us)
-        measured.append(PairedSample(before_us, after_us, order))
-    return tuple(measured)
 
 
 def relative_interdecile_range(values: Sequence[float]) -> float:
