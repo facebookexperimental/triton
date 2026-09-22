@@ -324,3 +324,17 @@ def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, SPLIT_K):
     ref = torch.matmul(a, b)
     precision = REL_PRECISION[dtype]
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_rejects_unsupported_backward():
+    from triton.tlx.ops import UnsupportedBackward
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = torch.randn((16, 16), device="cuda", dtype=torch.float16, requires_grad=True)
+    b = torch.randn((16, 16), device="cuda", dtype=torch.float16)
+    with pytest.raises(UnsupportedBackward, match="tlx.ops.mm does not support backward on sm100"):
+        tlx_mm(a, b)
+
+    with torch.no_grad():
+        out = tlx_mm(a, b)
+    assert not out.requires_grad

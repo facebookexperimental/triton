@@ -12,6 +12,10 @@ class UnsupportedOp(RuntimeError):
     """No catalog entry for this op on the current target."""
 
 
+class UnsupportedBackward(UnsupportedOp):
+    """The selected op implementation has no autograd support."""
+
+
 class InvalidInput(ValueError):
     """An entry exists but cannot handle these inputs."""
 
@@ -25,6 +29,7 @@ class OpSpec:
     dtypes: frozenset = frozenset()  # bare torch names, so the table needs no torch
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
+    supports_backward: bool = False
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -123,6 +128,7 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma"}),
+        supports_backward=True,
     ),
     OpSpec(
         op="flash_attn",
@@ -132,6 +138,7 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
     ),
     OpSpec(
         op="flash_attn_mxfp8",
@@ -141,6 +148,7 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
     ),
     OpSpec(
         op="hstu_attn_dev",
@@ -151,6 +159,7 @@ CATALOG: tuple[OpSpec, ...] = (
         # Causal-only, non-causal is not supported yet
         accepts=lambda d: bool(d.get("causal", True)),
         requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
     ),
     OpSpec(
         op="hstu_attn_dev",
@@ -167,6 +176,7 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
     ),
     OpSpec(
         op="kda_paged_prefill",
@@ -278,3 +288,15 @@ def check_inputs(spec: OpSpec, dtype=None, **dims) -> None:
             raise InvalidInput(f"{spec} does not support {name}; supported: {sorted(spec.dtypes)}")
     if spec.accepts is not None and not spec.accepts(dims):
         raise InvalidInput(f"{spec} does not support these inputs: {dims}")
+
+
+def check_backward(spec: OpSpec, *inputs) -> None:
+    """Fail before launch when autograd is requested but unavailable."""
+    if spec.supports_backward or not any(getattr(tensor, "requires_grad", False) for tensor in inputs):
+        return
+
+    import torch
+
+    if torch.is_grad_enabled():
+        raise UnsupportedBackward(f"tlx.ops.{spec.op} does not support backward on {spec.arch}; "
+                                  "use tensors with requires_grad=False or call it under torch.no_grad()")
