@@ -2095,6 +2095,7 @@ def _attn_fwd_ws_kernel(
                                       and not USE_2CTA)
     FAST_2CTA_CAPABLE: tl.constexpr = (
         USE_2CTA
+        and PIPELINED
         and tlx.dtype_of(desc_v) == tl.bfloat16
         and NUM_MMA_SLICES == 2
         and not RESCALE_OPT
@@ -2115,7 +2116,6 @@ def _attn_fwd_ws_kernel(
         and USE_2CTA and USE_FAST_FIXED and PIPELINED and STAGE == 1
         and HEAD_DIM == 128 and BLOCK_M == 256 and BLOCK_N == 128
         and NUM_MMA_SLICES == 2 and NUM_BUFFERS_KV == 3 and DENSE_REGS == 176
-        and H == 16 and LAYOUT_BSHD and Z * N_CTX_STATIC == 32768
     )
     DENSE_PAIRED: tl.constexpr = DENSE_EXCLUSIVE and N_CTX_STATIC != 32768
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
@@ -2873,7 +2873,16 @@ def _attn_fwd_ws_kernel(
                     qo_offset_y, _, offset_x = _forward_descriptor_offsets(
                         qo_offset_y, 0, off_hz, H, N_CTX, HEAD_DIM, LAYOUT_BSHD)
                     _, phase = get_bufidx_phase(tile_count, 1)
-                    if USE_FAST_FIXED and NUM_GROUPS_PER_CTA == 2:
+                    if NUM_PID_M_STATIC == 1 and NUM_CTAS == 1:
+                        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+                            tlx.barrier_wait(o_fulls[cid], phase)
+                            if cid * BLOCK_M_SPLIT < N_CTX:
+                                tlx.async_descriptor_store(
+                                    desc_o, o_tiles[cid], [qo_offset_y + cid * BLOCK_M_SPLIT, offset_x],
+                                    eviction_policy="evict_first")
+                            tlx.async_descriptor_store_wait(0)
+                            tlx.barrier_arrive(o_empties[cid])
+                    elif USE_FAST_FIXED and NUM_GROUPS_PER_CTA == 2:
                         for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                             group_id = cid * NUM_CTAS + cluster_cta_rank
                             tlx.barrier_wait(o_fulls[cid], phase)
@@ -5766,7 +5775,10 @@ class _attention(torch.autograd.Function):
 
         o = torch.empty_like(q)
         extra_kern_args = {}
-        if paper_shape and not causal:
+        if (not causal and plan.pipelined and HEAD_DIM_K == 128
+                and q.dtype == k.dtype == v.dtype == torch.bfloat16
+                and q.is_cuda and q.device == k.device == v.device
+                and q.shape[2] in (1024, 2048, 4096, 8192, 16384, 32768)):
             extra_kern_args["N_CTX_STATIC"] = q.shape[2]
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
@@ -6207,4 +6219,3 @@ def attention(q, k, v, sm_scale, causal, config=None):
         **config,
     )
     return o
-
