@@ -1609,3 +1609,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Both of these keep their only meaningful operand in an attribute, so the
+// generic operand-only path emitted them as raw MLIR with the axis and the
+// scheduling mask thrown away.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def amd_thread_id_and_sched_barrier(
+  // CHECK: tlx.thread_id(0)
+  // CHECK: tlx.amd_sched_barrier(0)
+  tt.func public @amd_thread_id_and_sched_barrier(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %tid = gpu.thread_id x
+    rocdl.sched.barrier none
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Parsed IR carries the mask as a SchedGroupMask enum attribute, not an
+  // integer, so anything but `none` reaches the string path and is flagged.
+  // CHECK-LABEL: def amd_sched_barrier_other_mask(
+  // CHECK-NOT: tlx.amd_sched_barrier(
+  tt.func public @amd_sched_barrier_other_mask(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    rocdl.sched.barrier mfma_wmma
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
