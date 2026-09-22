@@ -12,7 +12,7 @@
    - `eviction_policy`: L2 cache eviction policy (`""`, `"evict_first"`, `"evict_last"`)
    - `multicast_targets`: Optional list of multicast targets for cluster-wide loads
 
-- `tlx.async_descriptor_gather(desc, result, x_offsets, y_offset, barrier, pred=None, multicast=False)` **[sm90+]**
+- `tlx.async_descriptor_gather(desc, result, x_offsets, y_offset, barrier, pred=None, multicast=False)` **[sm100+]**
 
    Gather independently selected rows from a 2D global tensor into consecutive rows of a shared-memory buffer. The operation is asynchronous and signals `barrier` after the full TMA transaction completes.
 
@@ -25,7 +25,7 @@
    - `pred`: Optional scalar predicate guarding the operation
    - `multicast`: Whether to multicast into a cluster-broadcast shared layout
 
-   `NUM_ROWS` must be at least 8 and a multiple of 4. TMA gather supports element types up to 32 bits, and the descriptor block must contain at least `32 / element_bit_width * 8` columns. The `x_offsets` register layout must provide groups of four contiguous tensor elements to each issuing thread and broadcast each group across its warp. The row-index values themselves are independent: they do not need to be consecutive, aligned, or multiples of 4.
+   `NUM_ROWS` must be at least 8 and a multiple of 4. TMA gather supports element types up to 32 bits, and the descriptor block must contain at least `32 / element_bit_width * 8` columns. The `x_offsets` register layout must provide eight contiguous tensor elements to each issuing thread, arranged as two groups of four, and broadcast them across its warp. The row-index values themselves are independent: they do not need to be consecutive, aligned, or multiples of 4.
 
    Conceptually, one `gather4` message consumes four arbitrary row offsets and writes four row tiles into consecutive SMEM rows:
 
@@ -57,8 +57,9 @@
    barriers = tlx.alloc_barriers(1)
    barrier = tlx.local_view(barriers, 0)
 
-   # Four consecutive offsets are owned by each issuing thread and broadcast
-   # across its warp. This layout assumes four warps and NUM_ROWS == 32.
+   # Each warp owns 8 consecutive offsets, broadcast across all its lanes.
+   # Each gather4 instruction consumes 4 offsets, so each warp issues 2.
+   # This layout assumes 4 warps and NUM_ROWS == 32.
    offset_layout: tl.constexpr = tlx.layout(
        shape=((32, 4), (8,)),
        stride=((0, 8), (1,)),

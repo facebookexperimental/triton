@@ -33,8 +33,8 @@ def test_descriptor_gather(offset_dtype, device):
         bars = tlx.alloc_barriers(tl.constexpr(1))
         bar = tlx.local_view(bars, 0)
 
-        # Each warp owns contiguous groups of four row offsets, broadcast to all
-        # of its lanes as required by TMA gather4.
+        # Each warp owns eight consecutive offsets, broadcast across all its lanes.
+        # Each gather4 instruction consumes four offsets, so each warp issues two.
         offset_layout: tl.constexpr = tlx.layout(
             shape=((32, 4), (8, )),
             stride=((0, 8), (1, )),
@@ -43,7 +43,8 @@ def test_descriptor_gather(offset_dtype, device):
         x_offsets = tl.load(offsets_ptr + offset_ids)
 
         tlx.barrier_expect_bytes(bar, BLOCK_M * BLOCK_N * 2)
-        tlx.async_descriptor_gather(desc, buffer, x_offsets, 0, bar)
+        # A non-broadcast destination must disable the multicast request.
+        tlx.async_descriptor_gather(desc, buffer, x_offsets, 0, bar, multicast=True)
         tlx.barrier_wait(bar, phase=0)
 
         rows = tl.arange(0, BLOCK_M)
@@ -61,6 +62,7 @@ def test_descriptor_gather(offset_dtype, device):
     kernel = descriptor_gather_kernel[(1, )](x, x_offsets, y, M, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4)
 
     assert kernel.asm["ttgir"].count("ttng.async_tma_gather") == 1
+    assert "multicast" not in kernel.asm["ttgir"]
     gather4_count = BLOCK_M * BLOCK_N * x.element_size() // (4 * 4 * 128)
     assert kernel.asm["ptx"].count("cp.async.bulk.tensor.2d.tile::gather4") == gather4_count
     torch.testing.assert_close(y, x[x_offsets.long()])

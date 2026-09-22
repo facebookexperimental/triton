@@ -1466,8 +1466,13 @@ def async_descriptor_gather(
     """
     assert isinstance(desc, tl.tensor_descriptor_base), "desc must be a tensor descriptor"
     arch = _semantic.builder.options.arch
-    if isinstance(arch, str) and arch.startswith("gfx"):
-        raise NotImplementedError(f"tlx.async_descriptor_gather is NV-only; got AMD arch '{arch}'")
+    try:
+        capability = int(cuda_parse_arch(arch))
+    except (TypeError, ValueError):
+        raise NotImplementedError(
+            f"tlx.async_descriptor_gather is only available on Blackwell; got arch {arch!r}") from None
+    if capability < 100:
+        raise NotImplementedError(f"tlx.async_descriptor_gather is only available on Blackwell; got arch {arch!r}")
 
     assert isinstance(result, tlx.buffered_tensor) and result.type.storage == tlx.storage_kind.smem, (
         "result must be a buffered tensor in SMEM")
