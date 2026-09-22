@@ -8,7 +8,7 @@ from triton._internal_testing import is_hip_cdna4
 
 try:
     from triton.language.extra.tlx.inductor import gfx950_torch, tlx_config
-    from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
+    from triton.tlx.ops.kernels.mm._shapes import FOCUS, SYNTHETIC, operand
 except ImportError:  # not the fbtriton fork
     gfx950_torch = None
 
@@ -65,8 +65,10 @@ FAILED_SHAPES = {
 
 
 def _cases():
-    entries = [] if gfx950_torch is None else CORRECTNESS_SHAPES
-    return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
+    entries = [] if gfx950_torch is None else (*SYNTHETIC, *FOCUS.shapes("gfx950"))
+    return [
+        entry for entry in dict.fromkeys(entries) if tuple(entry) not in FAILED_SHAPES
+    ]
 
 
 @pytest.mark.parametrize("M,N,K,a_strides,b_strides,dtype_name", _cases())
