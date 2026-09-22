@@ -1939,11 +1939,12 @@ def _attn_fwd_ws(
     COMPACT_CLC: tl.constexpr = False,
     GLOBAL_LPT: tl.constexpr = False,
     LAYOUT_BSHD: tl.constexpr = False,
+    N_CTX_STATIC: tl.constexpr = 0,
 ):
     _attn_fwd_ws_kernel(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N, STAGE,
                         NUM_BUFFERS_Q, NUM_BUFFERS_KV, NUM_BUFFERS_QK, NUM_MMA_GROUPS, NUM_MMA_SLICES, GROUP_SIZE_N,
                         RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS, PIPELINED, POLICY, DENSE_REGS, FAST_FIXED,
-                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC, GLOBAL_LPT, LAYOUT_BSHD=LAYOUT_BSHD)
+                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC, GLOBAL_LPT, LAYOUT_BSHD=LAYOUT_BSHD, N_CTX_STATIC=N_CTX_STATIC)
 
 
 @triton.jit
@@ -2010,6 +2011,15 @@ def _attn_fwd_ws_kernel(
         tl.static_assert((N_CTX_STATIC == 2048 and Z * N_CTX_STATIC == 32768 and H == 16 and LAYOUT_BSHD) or (N_CTX_STATIC >= 4096 and N_CTX_STATIC <= 32768 and N_CTX_STATIC % 512 == 0))
         tl.static_assert(tlx.num_warps() == 4)
     USE_FAST_FIXED: tl.constexpr = FAST_FIXED and (FAST_F16_CAPABLE or FAST_2CTA_CAPABLE or CERTIFIED_CAUSAL)
+    DENSE_EXCLUSIVE: tl.constexpr = (
+        (N_CTX_STATIC == 1024 or N_CTX_STATIC == 2048 or N_CTX_STATIC == 4096
+             or N_CTX_STATIC == 8192 or N_CTX_STATIC == 16384 or N_CTX_STATIC == 32768)
+        and N_CTX_STATIC == NUM_PID_M_STATIC * 512
+        and USE_2CTA and USE_FAST_FIXED and PIPELINED and STAGE == 1
+        and HEAD_DIM == 128 and BLOCK_M == 256 and BLOCK_N == 128
+        and NUM_MMA_SLICES == 2 and NUM_BUFFERS_KV == 3 and DENSE_REGS == 176
+        and H == 16 and LAYOUT_BSHD and Z * N_CTX_STATIC == 32768
+    )
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
     SKIP_CAUSAL_DIAG: tl.constexpr = (
         STAGE == 3
@@ -2045,6 +2055,8 @@ def _attn_fwd_ws_kernel(
     HEAD_DIM_KV: tl.constexpr = HEAD_DIM // NUM_CTAS
     # Effective M-block: 2-CTA covers BLOCK_M * NUM_CTAS total Q rows per work tile.
     EFFECTIVE_BLOCK_M: tl.constexpr = BLOCK_M * NUM_CTAS
+    if DENSE_EXCLUSIVE:
+        N_CTX = NUM_PID_M_STATIC * EFFECTIVE_BLOCK_M
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
@@ -2192,13 +2204,12 @@ def _attn_fwd_ws_kernel(
     # In 2-CTA mode, cross-CTA barrier_arrive (to the leader's mbarriers) requires
     # the mbarrier.init to be visible cluster-wide before any remote arrive.
     # Must be AFTER all barrier allocations (including CLC context barriers).
+    if DENSE_EXCLUSIVE or CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+        ws_done = tlx.alloc_barriers(num_barriers=1, arrive_count=3 + (1 if CERTIFIED_CAUSAL else NUM_GROUPS_PER_CTA))
     if USE_2CTA:
         tlx.fence_mbarrier_init_cluster()
 
-    if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
-        ws_done = tlx.alloc_barriers(num_barriers=1, arrive_count=3 + (1 if CERTIFIED_CAUSAL else NUM_GROUPS_PER_CTA))
-
-    with tlx.async_tasks(exclusive=CERTIFIED_CAUSAL or SPARSE_FALLBACK):
+    with tlx.async_tasks(exclusive=CERTIFIED_CAUSAL or SPARSE_FALLBACK or DENSE_EXCLUSIVE):
         # correction group
         with tlx.async_task("default"):
             accum_cnt = 0
@@ -2323,7 +2334,7 @@ def _attn_fwd_ws_kernel(
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
-            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK or DENSE_EXCLUSIVE:
                 tlx.barrier_wait(ws_done[0], 0)
 
         # softmax groups
@@ -2470,7 +2481,7 @@ def _attn_fwd_ws_kernel(
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
-            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK or DENSE_EXCLUSIVE:
                 tlx.barrier_arrive(ws_done[0])
 
         # mma group
@@ -2579,7 +2590,7 @@ def _attn_fwd_ws_kernel(
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
-            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK or DENSE_EXCLUSIVE:
                 tlx.barrier_arrive(ws_done[0])
 
         if USE_2CTA and USE_FAST_FIXED:
@@ -2622,6 +2633,8 @@ def _attn_fwd_ws_kernel(
                     tlx.named_barrier_wait(15, 64)
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+                if DENSE_EXCLUSIVE:
+                    tlx.barrier_arrive(ws_done[0])
 
         # Q/K/V loader role; output publication remains in the epilog task.
         with tlx.async_task(num_warps=1, registers=24):
@@ -2727,7 +2740,7 @@ def _attn_fwd_ws_kernel(
                         tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
-            if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+            if CERTIFIED_CAUSAL or SPARSE_FALLBACK or DENSE_EXCLUSIVE:
                 tlx.barrier_arrive(ws_done[0])
 
         # epilog group
@@ -2795,7 +2808,7 @@ def _attn_fwd_ws_kernel(
                             tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                         clc_phase_consumer ^= 1
 
-                if CERTIFIED_CAUSAL or SPARSE_FALLBACK:
+                if CERTIFIED_CAUSAL or SPARSE_FALLBACK or DENSE_EXCLUSIVE:
                     tlx.barrier_arrive(ws_done[0])
 
 
@@ -5341,6 +5354,8 @@ class _attention(torch.autograd.Function):
 
         o = torch.empty_like(q)
         extra_kern_args = {}
+        if paper_shape and not causal:
+            extra_kern_args["N_CTX_STATIC"] = q.shape[2]
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
