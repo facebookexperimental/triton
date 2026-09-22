@@ -605,10 +605,9 @@ def _amd_numa_node(index: int) -> Optional[int]:
 
 class Governor(contextlib.AbstractContextManager):
 
-    def __init__(self, device: Optional[Device], enable: bool = True, govern_device: bool = True):
+    def __init__(self, device: Optional[Device], enable: bool = True):
         self.device = device
         self.enable = enable
-        self.govern_device = govern_device
         self.applied: list[str] = []
         self.skipped: list[str] = []
         self._restore: list[list[str]] = []
@@ -680,13 +679,10 @@ class Governor(contextlib.AbstractContextManager):
         if not self.enable or self.device is None:
             self.skipped.append("all governing (disabled or no GPU)")
             return self
-        if self.govern_device:
-            if self.device.vendor == NVIDIA:
-                self._govern_nvidia(self.device)
-            else:
-                self._govern_amd(self.device)
+        if self.device.vendor == NVIDIA:
+            self._govern_nvidia(self.device)
         else:
-            self.skipped.append("GPU clock/power governing (disabled)")
+            self._govern_amd(self.device)
         self._bind_numa(self.device)
         return self
 
