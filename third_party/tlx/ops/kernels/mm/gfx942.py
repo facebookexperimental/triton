@@ -20,10 +20,6 @@ _CACHE_CA_EVICT_LAST = 2
 _CACHE_CA_EVICT_FIRST = 3
 _CACHE_EVICT_LAST = 5
 
-# Repack row-major operands whose leading stride prevents vectorized loads.
-_STRIDE_ALIGN = 16
-_ALIGN_ROWS = True
-
 # Keep the steady-state K loop unmasked and handle an uneven final tile once.
 _PEEL_K_TAIL = True
 
@@ -359,6 +355,8 @@ def _launch_config(a, b, bias, bias_strides, out, selected):
 
 
 def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1, split_m_128_32=False):
+    # This overlaps register-staged global loads; it is not an explicit
+    # two-buffer LDS allocation.
     meta = {
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
@@ -429,17 +427,6 @@ def _tuned(space, shape=None):
     return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS", "PEEL_K_TAIL"])(matmul_kernel_gfx942)
 
 
-def _align_rows(t):
-    """Repack a row-major operand whose leading stride defeats vectorized loads."""
-    if t.stride(1) != 1 or t.stride(0) % _STRIDE_ALIGN == 0:
-        return t
-    rows, cols = t.shape
-    padded_cols = triton.cdiv(cols, _STRIDE_ALIGN) * _STRIDE_ALIGN
-    padded = torch.empty((rows, padded_cols), device=t.device, dtype=t.dtype)
-    padded[:, :cols] = t
-    return padded[:, :cols]
-
-
 def _validate_operands(a, b, out):
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Expected A[M, K] and B[K, N], got {tuple(a.shape)} and {tuple(b.shape)}")
@@ -479,9 +466,6 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     if selected is not None:
         _launch_config(a, b, bias, bias_strides, out, selected)
         return out
-
-    if _ALIGN_ROWS:
-        a, b = _align_rows(a), _align_rows(b)
 
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )  # noqa: E731
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
