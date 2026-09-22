@@ -1076,6 +1076,8 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
+        if knobs.nvidia.promote_mbarrier_to_named_barrier:
+            nvidia.passes.ttnvgpuir.add_promote_mbarrier_to_named_barrier(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         if knobs.nvidia.enable_unify_ws_barrier_locations:

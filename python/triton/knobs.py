@@ -642,6 +642,7 @@ class nvidia_knobs(base_knobs):
     # it (knobs.nvidia.scope()) instead of leaking global env state.
     modulo_strict_error: env_bool = env_bool("TRITON_MODULO_STRICT_ERROR")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
+    promote_mbarrier_to_named_barrier: env_bool = env_bool("TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     # Default ON; opt out with TRITON_USE_C_DISPATCHER=0.
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)

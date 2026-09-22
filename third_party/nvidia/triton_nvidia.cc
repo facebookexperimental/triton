@@ -231,6 +231,9 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
                      ttng::createTritonNvidiaGPUUnifyWSBarrierLocationsPass);
   ADD_PASS_WRAPPER_0("add_prune_unused_barriers",
                      ttng::createTritonNvidiaGPUPruneUnusedBarriersPass);
+  ADD_PASS_WRAPPER_0(
+      "add_promote_mbarrier_to_named_barrier",
+      ttng::createTritonNvidiaGPUPromoteMBarrierToNamedBarrierPass);
   ADD_PASS_WRAPPER_0("add_clc_split", ttng::createTritonNvidiaGPUCLCSplitPass);
   ADD_PASS_WRAPPER_0("add_clc_hoist", ttng::createTritonNvidiaGPUCLCHoistPass);
   ADD_PASS_WRAPPER_0("add_clc_materialize",
