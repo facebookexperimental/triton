@@ -40,6 +40,7 @@ specialize_arg(PyObject *backend, PyObject *arg, bool is_const,
 
 static bool init_called = false;
 
+#ifndef Py_LIMITED_API
 static bool is_python_finalizing() {
 #if PY_VERSION_HEX >= 0x030D0000
   return Py_IsFinalizing() != 0;
@@ -47,6 +48,7 @@ static bool is_python_finalizing() {
   return _Py_IsFinalizing() != 0;
 #endif
 }
+#endif
 
 // --- dispatch/cache stats (opt-in via TRITON_CACHE_STATS=1) ------------------
 // Counts hit vs fallback per dispatch path, per kernel, so owners can find
@@ -68,7 +70,7 @@ static std::unordered_map<std::string,
 static void cache_stats_record(PyObject *name_obj, const char *event) {
   // Caller must guard with `if (g_cache_stats)`.
   const char *name = (name_obj && PyUnicode_Check(name_obj))
-                         ? PyUnicode_AsUTF8(name_obj)
+                         ? PyUnicode_AsUTF8AndSize(name_obj, nullptr)
                          : nullptr;
   std::lock_guard<std::mutex> lk(g_cache_stats_mu);
   g_cache_stats_map[name ? name : "<unknown>"][event]++;
@@ -744,6 +746,16 @@ PyObject *specialize_impl(PyObject *self, PyObject *const *args,
 // CPython's free-threaded mode (PEP 703 / nogil) is ever adopted, a lock or
 // atomic operations must be added here.
 
+#ifdef Py_LIMITED_API
+PyObject *native_fast_dispatch(PyObject *, PyObject *const *, Py_ssize_t) {
+  Py_RETURN_NONE;
+}
+
+PyObject *native_fast_dispatch_insert(PyObject *, PyObject *const *,
+                                      Py_ssize_t) {
+  Py_RETURN_NONE;
+}
+#else
 static constexpr int FC_MAX_ARGS = 64;
 
 enum ArgTypeCode : uint8_t {
@@ -2811,6 +2823,7 @@ PyObject *native_autotune_proxy_set_grid(PyObject *self_unused,
   }
   Py_RETURN_NONE;
 }
+#endif
 
 bool visit_make_tensordesc_args(PyObject *arg, PyObject *sig,
                                 PyObject *relevant_paths,
@@ -2973,6 +2986,7 @@ static PyMethodDef module_methods[] = {
      nullptr},
     {"native_fast_dispatch_insert", (PyCFunction)native_fast_dispatch_insert,
      METH_FASTCALL, nullptr},
+#ifndef Py_LIMITED_API
     {"native_create_jit_proxy", (PyCFunction)native_create_jit_proxy,
      METH_FASTCALL, nullptr},
     {"native_create_autotune_proxy", (PyCFunction)native_create_autotune_proxy,
@@ -2981,6 +2995,7 @@ static PyMethodDef module_methods[] = {
      METH_FASTCALL, nullptr},
     {"native_autotune_proxy_set_grid",
      (PyCFunction)native_autotune_proxy_set_grid, METH_FASTCALL, nullptr},
+#endif
     {"native_dump_cache_stats", (PyCFunction)native_dump_cache_stats,
      METH_NOARGS,
      "Return {kernel: {event: count}} of C dispatch hit/fallback stats "
@@ -3007,6 +3022,7 @@ static PyMethodDef module_methods[] = {
 } // anonymous namespace
 
 void init_native_specialize(nanobind::module_ &m) {
+#ifndef Py_LIMITED_API
   // Initialize JITCacheProxy type
   _init_jit_cache_proxy_type();
   if (PyType_Ready(&JITCacheProxyType) < 0)
@@ -3015,6 +3031,7 @@ void init_native_specialize(nanobind::module_ &m) {
   _init_autotune_cache_proxy_type();
   if (PyType_Ready(&AutotuneCacheProxyType) < 0)
     return;
+#endif
   // add functions to module
   PyModule_AddFunctions(m.ptr(), module_methods);
 }
