@@ -557,6 +557,19 @@ def test_governor_can_be_disabled():
     assert g.applied == []
 
 
+def test_governor_can_leave_gpu_settings_untouched_but_bind_numa(monkeypatch):
+    from _harness.denoise import AMD, Device, Governor
+
+    device = Device(AMD, 0, "MI350X")
+    governor = Governor(device, govern_device=False)
+    monkeypatch.setattr(governor, "_govern_amd", lambda _: pytest.fail("unexpected AMD governing"))
+    monkeypatch.setattr(governor, "_bind_numa", lambda _: governor.applied.append("NUMA"))
+    with governor:
+        pass
+    assert governor.applied == ["NUMA"]
+    assert governor.skipped == ["GPU clock/power governing (disabled)"]
+
+
 # --------------------------------------------------------------------------
 # direction: the one op-specific axis that is a Case field
 # --------------------------------------------------------------------------
