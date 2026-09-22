@@ -343,6 +343,36 @@ class TestLocalBufferRetention(TestCase):
             },
         )
 
+    def test_hopper_plans_offer_block_and_budget_choices(self):
+        i, r = sympy.symbols("i r", integer=True)
+        accesses = tuple(
+            MemoryDep(f"workspace_{index}", 6144 * i + r, (i, r), (128, 6144))
+            for index in range(4)
+        )
+        producer = self._scheduler_node(
+            "producer", is_reduction=True, rnumel=6144, writes=accesses
+        )
+        consumer = self._scheduler_node(
+            "consumer",
+            is_reduction=True,
+            rnumel=6144,
+            reads=accesses,
+            writes=accesses,
+        )
+        graph = self._graph_mock()
+        graph.get_dtype.return_value = torch.float16
+        graph.get_numel.return_value = 128 * 6144
+
+        with V.set_graph_handler(graph), self._on_hopper(), config.patch(
+            {"triton.tlx_mode": "allow"}
+        ):
+            plans = LocalBufferRetention.plans_for(
+                [producer, DisableReduction, EnableReduction, consumer]
+            )
+
+        self.assertEqual([plan.reduction_block for plan in plans], [8192, 4096])
+        self.assertEqual([len(plan.buffers) for plan in plans], [2, 4])
+
     def test_rejects_unproven_buffer_multiple(self):
         i, r = sympy.symbols("i r", integer=True)
         dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
