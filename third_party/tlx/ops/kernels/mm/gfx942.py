@@ -475,7 +475,7 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    selected = tuned_config(a, b)
+    selected = tuned_config(a, b) if space == "heuristic" else None
     if selected is not None:
         _launch_config(a, b, bias, bias_strides, out, selected)
         return out

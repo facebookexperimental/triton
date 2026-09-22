@@ -30,6 +30,30 @@ def test_gfx942_wide_heuristic_config():
     assert config.num_stages == 2
 
 
+def test_full_space_does_not_use_tuned_config(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: (819200, 1024, 192))
+    monkeypatch.setattr(gfx942, "_align_rows", lambda tensor: tensor)
+
+    def fail_tuned_config(*args):
+        pytest.fail("space='full' must not use the frozen heuristic config")
+
+    monkeypatch.setattr(gfx942, "tuned_config", fail_tuned_config)
+
+    class FullSpaceReached(Exception):
+        pass
+
+    def full_space(space, shape):
+        assert space == "full"
+        assert shape is None
+        raise FullSpaceReached
+
+    monkeypatch.setattr(gfx942, "_tuned", full_space)
+    with pytest.raises(FullSpaceReached):
+        gfx942._gemm(object(), object(), out=object(), space="full")
+
+
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", shapes())
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
