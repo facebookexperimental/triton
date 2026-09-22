@@ -1188,11 +1188,9 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
     cgaLayout =
         ttg::CGAEncodingAttr::get(ctx, LinearLayout(bases, outDimNames));
   }
-  for (int i = 0; i < rank; ++i) {
-    auto dim = cgaLayout.getCTAOrder()[i];
-    msgToOffset *= LinearLayout::identity1D(cgaLayout.getCTASplitNum()[dim],
-                                            kBlock, outDimNames[dim]);
-  }
+  // Zero block bases represent broadcast CTAs but still contribute to the
+  // block input domain required by later layout composition.
+  msgToOffset *= cgaLayout.getLinearLayout();
   return msgToOffset;
 }
 
