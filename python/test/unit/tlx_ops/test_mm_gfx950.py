@@ -43,7 +43,7 @@ def test_mm(m, n, k, a_strides, b_strides, dtype_name):
     torch.cuda.synchronize()
     started = time.perf_counter()
     try:
-        out = tlx_mm(a, b, arch="gfx950", space="heuristic")
+        out = tlx_mm(a, b, space="heuristic")
     except (InvalidInput, UnsupportedOp) as declined:
         pytest.skip(f"gfx950 does not support this shape: {declined}")
     torch.cuda.synchronize()
@@ -75,7 +75,7 @@ def test_mm_register_fallback(m, n, k, dtype):
     a = torch.randn((m, k), device="cuda", dtype=dtype)
     b = torch.randn((n, k), device="cuda", dtype=dtype).T
 
-    out = tlx_mm(a, b, arch="gfx950", space="heuristic")
+    out = tlx_mm(a, b, space="heuristic")
     expected = torch.matmul(a, b)
     torch.testing.assert_close(
         out,
@@ -91,7 +91,7 @@ def test_mm_rejects_invalid_rank():
     a = torch.randn((16, ), device="cuda", dtype=torch.float16)
     b = torch.randn((16, 16), device="cuda", dtype=torch.float16)
     with pytest.raises(InvalidInput, match="rank-2"):
-        tlx_mm(a, b, arch="gfx950")
+        tlx_mm(a, b)
 
 
 def test_mm_rejects_mismatched_reduction_dimensions():
@@ -100,7 +100,7 @@ def test_mm_rejects_mismatched_reduction_dimensions():
     a = torch.randn((8, 16), device="cuda", dtype=torch.float16)
     b = torch.randn((17, 8), device="cuda", dtype=torch.float16)
     with pytest.raises(InvalidInput, match="reduction dimensions"):
-        tlx_mm(a, b, arch="gfx950")
+        tlx_mm(a, b)
 
 
 def test_mm_rejects_mismatched_dtype():
@@ -109,7 +109,7 @@ def test_mm_rejects_mismatched_dtype():
     a = torch.randn((8, 16), device="cuda", dtype=torch.float16)
     b = torch.randn((16, 8), device="cuda", dtype=torch.float32)
     with pytest.raises(InvalidInput, match="same dtype and device"):
-        tlx_mm(a, b, arch="gfx950")
+        tlx_mm(a, b)
 
 
 def test_mm_rejects_mismatched_device():
@@ -118,7 +118,7 @@ def test_mm_rejects_mismatched_device():
     a = torch.randn((8, 16), device="cuda", dtype=torch.float16)
     b = torch.randn((16, 8), device="cpu", dtype=torch.float16)
     with pytest.raises(InvalidInput, match="same dtype and device"):
-        tlx_mm(a, b, arch="gfx950")
+        tlx_mm(a, b)
 
 
 def test_mm_rejects_invalid_space():

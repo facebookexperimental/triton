@@ -307,7 +307,7 @@ def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, SPLIT_K):
     with _pinned_config({"SPLIT_K": SPLIT_K, "NUM_CTAS": NUM_CTAS}):
         torch.cuda.synchronize()
         started = time.perf_counter()
-        out = tlx_mm(a, b, arch=ARCH, space="heuristic")
+        out = tlx_mm(a, b, space="heuristic")
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
 

@@ -7,7 +7,6 @@ from triton.tlx.ops.kernels.flash_attn_mxfp8._shapes import CORRECTNESS_SHAPES
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.flash_attn_mxfp8 requires sm100")
 
-ARCH = "sm100"
 MULTI_WAVE_SHAPE = (1, 64, 1024, 128)
 
 
@@ -41,7 +40,7 @@ def test_flash_attn_mxfp8_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     torch.manual_seed(20)
     q, k, v = _qkv((Z, H, N_CTX, HEAD_DIM))
     scale = 0.5
-    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, arch=ARCH, space="smoke")
+    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
     ref = _sdpa(q, k, v, causal, scale)
     torch.testing.assert_close(out, ref, atol=0.2, rtol=0)
 
@@ -53,7 +52,7 @@ def test_flash_attn_mxfp8_fwd_multiple_cta_waves(causal):
     torch.manual_seed(20)
     q, k, v = _qkv(MULTI_WAVE_SHAPE)
     scale = 0.5
-    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, arch=ARCH, space="smoke")
+    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
     ref = _sdpa(q, k, v, causal, scale)
     torch.testing.assert_close(out, ref, atol=0.15, rtol=0)
 
@@ -68,7 +67,7 @@ def test_flash_attn_mxfp8_bwd_multiple_cta_waves(causal):
     scale = 0.5
     do = torch.randn_like(q)
 
-    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, arch=ARCH, space="smoke").backward(do)
+    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal, scale).backward(do)
 
     for label, actual, expected in (("dq", q.grad, rq.grad), ("dk", k.grad, rk.grad), ("dv", v.grad, rv.grad)):
@@ -86,7 +85,7 @@ def test_flash_attn_mxfp8_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     scale = 0.5
     do = torch.randn_like(q)
 
-    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, arch=ARCH, space="smoke").backward(do)
+    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal, scale).backward(do)
 
     for label, actual, expected in (("dq", q.grad, rq.grad), ("dk", k.grad, rk.grad), ("dv", v.grad, rv.grad)):
@@ -107,7 +106,7 @@ def test_flash_attn_mxfp8_rejects_unsupported_inputs(shape, dtype, match):
 
     q, k, v = [torch.randn(shape, device="cuda", dtype=dtype) for _ in range(3)]
     with pytest.raises(InvalidInput, match=match):
-        flash_attn_mxfp8(q, k, v, arch=ARCH, space="smoke")
+        flash_attn_mxfp8(q, k, v, space="smoke")
 
 
 def test_flash_attn_mxfp8_rejects_mismatched_shapes():
@@ -117,7 +116,7 @@ def test_flash_attn_mxfp8_rejects_mismatched_shapes():
     k = torch.randn((1, 1, 128, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     with pytest.raises(InvalidInput, match="identical shapes"):
-        flash_attn_mxfp8(q, k, v, arch=ARCH, space="smoke")
+        flash_attn_mxfp8(q, k, v, space="smoke")
 
 
 def test_flash_attn_mxfp8_rejects_unknown_space():
@@ -125,4 +124,4 @@ def test_flash_attn_mxfp8_rejects_unknown_space():
 
     q, k, v = _qkv((1, 1, 256, 128))
     with pytest.raises(InvalidInput, match="does not provide space"):
-        flash_attn_mxfp8(q, k, v, arch=ARCH, space="heuristic")
+        flash_attn_mxfp8(q, k, v, space="heuristic")
