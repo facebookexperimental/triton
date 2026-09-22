@@ -10,6 +10,63 @@ from typing import Optional
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("offset_dtype", [torch.int16, torch.int32])
+def test_descriptor_gather(offset_dtype, device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_gather_kernel(input_ptr, offsets_ptr, output_ptr, M, N, BLOCK_M: tl.constexpr,
+                                 BLOCK_N: tl.constexpr):
+        desc = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[1, BLOCK_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        bars = tlx.alloc_barriers(tl.constexpr(1))
+        bar = tlx.local_view(bars, 0)
+
+        # Each warp owns contiguous groups of four row offsets, broadcast to all
+        # of its lanes as required by TMA gather4.
+        offset_layout: tl.constexpr = tlx.layout(
+            shape=((32, 4), (8, )),
+            stride=((0, 8), (1, )),
+        )
+        offset_ids = tlx.require_layout(tl.arange(0, BLOCK_M), offset_layout)
+        x_offsets = tl.load(offsets_ptr + offset_ids)
+
+        tlx.barrier_expect_bytes(bar, BLOCK_M * BLOCK_N * 2)
+        tlx.async_descriptor_gather(desc, buffer, x_offsets, 0, bar)
+        tlx.barrier_wait(bar, phase=0)
+
+        rows = tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_N)
+        output_offsets = rows[:, None] * BLOCK_N + cols[None, :]
+        tl.store(output_ptr + output_offsets, tlx.local_load(buffer))
+
+    triton.set_allocator(alloc_fn)
+    M, N = 256, 128
+    BLOCK_M, BLOCK_N = 32, 128
+    x = torch.arange(M * N, dtype=torch.float16, device=device).reshape(M, N)
+    x_offsets = ((torch.arange(BLOCK_M, dtype=torch.int32, device=device) * 37 + 3) % M).to(offset_dtype)
+    y = torch.empty((BLOCK_M, BLOCK_N), dtype=x.dtype, device=device)
+
+    kernel = descriptor_gather_kernel[(1, )](x, x_offsets, y, M, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4)
+
+    assert kernel.asm["ttgir"].count("ttng.async_tma_gather") == 1
+    gather4_count = BLOCK_M * BLOCK_N * x.element_size() // (4 * 4 * 128)
+    assert kernel.asm["ptx"].count("cp.async.bulk.tensor.2d.tile::gather4") == gather4_count
+    torch.testing.assert_close(y, x[x_offsets.long()])
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("store_reduce", ["add", "min", "max"])
 def test_descriptor_store_reduce(store_reduce, device):
     """Test that TMA stores with atomic reduction generate correct IR and produce correct results."""

@@ -12,6 +12,74 @@
    - `eviction_policy`: L2 cache eviction policy (`""`, `"evict_first"`, `"evict_last"`)
    - `multicast_targets`: Optional list of multicast targets for cluster-wide loads
 
+- `tlx.async_descriptor_gather(desc, result, x_offsets, y_offset, barrier, pred=None, multicast=False)` **[sm90+]**
+
+   Gather independently selected rows from a 2D global tensor into consecutive rows of a shared-memory buffer. The operation is asynchronous and signals `barrier` after the full TMA transaction completes.
+
+   **Parameters:**
+   - `desc`: A 2D tensor descriptor whose block shape is `[1, BLOCK_N]`
+   - `result`: Mutable SMEM buffer with shape `[NUM_ROWS, BLOCK_N]` and the same element type as `desc`
+   - `x_offsets`: 1D `int16` or `int32` tensor containing one global row index per result row
+   - `y_offset`: Scalar column offset shared by all gathered rows
+   - `barrier`: mbarrier that tracks transaction completion; register the expected byte count before issuing the gather
+   - `pred`: Optional scalar predicate guarding the operation
+   - `multicast`: Whether to multicast into a cluster-broadcast shared layout
+
+   `NUM_ROWS` must be at least 8 and a multiple of 4. TMA gather supports element types up to 32 bits, and the descriptor block must contain at least `32 / element_bit_width * 8` columns. The `x_offsets` register layout must provide groups of four contiguous tensor elements to each issuing thread and broadcast each group across its warp. The row-index values themselves are independent: they do not need to be consecutive, aligned, or multiples of 4.
+
+   Conceptually, one `gather4` message consumes four arbitrary row offsets and writes four row tiles into consecutive SMEM rows:
+
+   ```text
+   x_offsets = [3, 17, 42, 5]
+
+   Global:                         SMEM:
+   row r0, column tile ---------> result row 0
+   row r1, column tile ---------> result row 1
+   row r2, column tile ---------> result row 2
+   row r3, column tile ---------> result row 3
+   ```
+
+   A row tile is the portion covered by one TMA message. When `BLOCK_N` is wider than one message, the compiler emits multiple `gather4` instructions for the same four-row group, one per column tile.
+
+   **Example:**
+   ```python
+   NUM_ROWS: tl.constexpr = 32
+   BLOCK_N: tl.constexpr = 128
+
+   desc = tl.make_tensor_descriptor(
+       input_ptr,
+       shape=[M, N],
+       strides=[N, 1],
+       block_shape=[1, BLOCK_N],
+   )
+   buffers = tlx.local_alloc((NUM_ROWS, BLOCK_N), tl.float16, 1)
+   result = tlx.local_view(buffers, 0)
+   barriers = tlx.alloc_barriers(1)
+   barrier = tlx.local_view(barriers, 0)
+
+   # Four consecutive offsets are owned by each issuing thread and broadcast
+   # across its warp. This layout assumes four warps and NUM_ROWS == 32.
+   offset_layout: tl.constexpr = tlx.layout(
+       shape=((32, 4), (8,)),
+       stride=((0, 8), (1,)),
+   )
+   offset_ids = tlx.require_layout(tl.arange(0, NUM_ROWS), offset_layout)
+   x_offsets = tl.load(row_indices_ptr + offset_ids)
+
+   tlx.barrier_expect_bytes(
+       barrier,
+       NUM_ROWS * BLOCK_N * tlx.size_of(tl.float16),
+   )
+   tlx.async_descriptor_gather(
+       desc,
+       result,
+       x_offsets,
+       y_offset=0,
+       barrier=barrier,
+   )
+   tlx.barrier_wait(barrier, phase=0)
+   ```
+
 - `tlx.async_descriptor_prefetch_tensor(memdesc, [offsets], pred, eviction_policy)` **[sm90+]**
 
    Hint hardware to load a chunk of data from global memory into a L2 cache to prepare for upcoming `async_descriptor_load` operations.

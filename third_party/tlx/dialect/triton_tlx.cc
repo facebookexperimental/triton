@@ -1391,6 +1391,13 @@ void init_triton_tlx_ir(py::module_ &m) {
                  /*offsets=*/std::vector<Value>{}, mbarrier, result, pred,
                  multicast, cacheModifier, evictionPolicy, isVolatile, twoCta);
            })
+      .def("create_async_TMA_gather",
+           [](TritonOpBuilder &self, Value desc, Value xOffsets, Value yOffset,
+              Value mbarrier, Value result, Value pred,
+              bool multicast) -> void {
+             self.create<ttng::AsyncTMAGatherOp>(
+                 desc, xOffsets, yOffset, mbarrier, result, pred, multicast);
+           })
       .def("create_async_TMA_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value pred, EvictionPolicy evictionPolicy) -> void {
