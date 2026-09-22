@@ -66,9 +66,7 @@ FAILED_SHAPES = {
 
 def _cases():
     entries = [] if gfx950_torch is None else (*SYNTHETIC, *FOCUS.shapes("gfx950"))
-    return [
-        entry for entry in dict.fromkeys(entries) if tuple(entry) not in FAILED_SHAPES
-    ]
+    return [entry for entry in dict.fromkeys(entries) if tuple(entry) not in FAILED_SHAPES]
 
 
 @pytest.mark.parametrize("M,N,K,a_strides,b_strides,dtype_name", _cases())
