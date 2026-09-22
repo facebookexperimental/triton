@@ -101,29 +101,36 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   }
 
   // Meta schedules the inner loop but specializes the enclosing task-bearing
-  // loop nest. The converter promotes only the WS-root metadata; the inner
-  // loop keeps its authored pipeline schedule. The file's second RUN verifies
-  // that repeating conversion preserves this shape.
+  // loop nest. The converter promotes the WS-root metadata and its effective
+  // SMEM policy, overriding the outer policy; the inner loop keeps its pipeline
+  // schedule. The file's second RUN verifies that repeating conversion preserves
+  // both the promoted policy and the circular buffer plan.
   // CHECK-LABEL: tt.func @promote_nested_meta_ws_root
   tt.func @promote_nested_meta_ws_root(
       %lb: i32, %ub: i32, %step: i32) {
+    // CHECK: %[[A:.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 70 : i32, buffer.start = 0 : i32}
+    %a = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 70 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[B:.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 70 : i32, buffer.start = 1 : i32}
+    %b = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 70 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // CHECK: scf.for
     scf.for %outer = %lb to %ub step %step : i32 {
       "test.outer.before"() {async_task_id = array<i32: 1>} : () -> ()
       // CHECK: scf.for
       scf.for %inner = %lb to %ub step %step : i32 {
-        "test.inner"() {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : () -> ()
+        "test.inner"(%a, %b) {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : (!ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>) -> ()
         scf.yield {async_task_id = array<i32: 0, 1>}
       // CHECK: } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, ttg.partition = array<i32: 0, 1>}
       } {async_task_id = array<i32: 0, 1>, tt.num_stages = 2 : i32,
          tt.scheduled_max_stage = 1 : i32, tt.warp_specialize,
+         tt.smem_alloc_algo = 0 : i32, tt.smem_circular_reuse = true,
          ttg.partition.stages = [0 : i32, 1 : i32],
          ttg.partition.types = ["default", "gemm"],
          ttg.warp_specialize.tag = 11 : i32}
       "test.outer.after"() {async_task_id = array<i32: 0>} : () -> ()
       scf.yield {async_task_id = array<i32: 0, 1>}
-    // CHECK: } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.partition.types = ["default", "gemm"], ttg.warp_specialize.tag = 11 : i32}
-    } {async_task_id = array<i32: 0, 1>}
+    // CHECK: } {tt.smem_alloc_algo = 0 : i32, tt.smem_circular_reuse = true, tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.stages = [0 : i32, 1 : i32], ttg.partition.types = ["default", "gemm"], ttg.warp_specialize.tag = 11 : i32}
+    } {async_task_id = array<i32: 0, 1>, tt.smem_alloc_algo = 1 : i32,
+       tt.smem_circular_reuse = false}
     tt.return
   }
 }
