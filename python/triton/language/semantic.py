@@ -1949,8 +1949,8 @@ class TritonSemantic(Generic[TensorTy]):
     #                               Associative Scan
     # ===----------------------------------------------------------------------===
 
-    def associative_scan(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
-                         reverse: bool) -> Tuple[TensorTy, ...]:
+    def associative_scan(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn, reverse: bool,
+                         reduction_ordering=None) -> Tuple[TensorTy, ...]:
         shape = inputs[0].type.shape
         rank = len(shape)
 
@@ -1962,7 +1962,8 @@ class TritonSemantic(Generic[TensorTy]):
         for t in inputs:
             assert t.type.shape == shape, "all scan inputs must have the same shape"
 
-        scan_op = self.builder.create_scan([t.handle for t in inputs], axis, reverse)
+        ordering = reduction_ordering.name if reduction_ordering is not None else ""
+        scan_op = self.builder.create_scan([t.handle for t in inputs], axis, reverse, ordering)
         region_builder_fn(scan_op)
         assert scan_op.verify()
 
