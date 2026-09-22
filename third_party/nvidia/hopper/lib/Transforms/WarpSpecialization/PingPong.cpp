@@ -1,8 +1,8 @@
 //===----------------------------------------------------------------------===//
 // PingPong Barrier Insertion Pass
 //
-// Enforce pingpong around expensive ops (warp_group_dot, math.exp)
-// across warp partitions by inserting named barriers.
+// Enforce pingpong around expensive ops (warp_group_dot, math.exp,
+// tanh.approx inline asm) across warp partitions by inserting named barriers.
 //
 // Two passes:
 //   1. doPingPongPrep: Preprocess to group expensive ops that
@@ -20,7 +20,8 @@
 //
 // Critical op types:
 //   - NonReorderable (warp_group_dot): has memory effects, boundary is the op
-//   - PureArithmetic (math.exp): boundary extends to next memory op
+//   - PureArithmetic (math.exp, tanh.approx inline asm): boundary extends to
+//     next memory op
 //===----------------------------------------------------------------------===//
 
 #include "Utility.h"
@@ -49,6 +50,72 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 namespace { // anonymous namespace
+/// SFU-backed math ops. On NVPTX, exp2 lowers directly to ex2.approx;
+/// sin/cos/tanh lower to their .approx forms when approximations are allowed
+/// (else MUFU-seeded libdevice); sqrt/rsqrt lower through rsqrt.approx (plus
+/// refinement unless approximations are allowed). Deliberately excludes log2
+/// (libdevice does not use lg2.approx; the approx lowering is disabled by
+/// default) and erf (no approx path).
+static bool isSFUMathOp(Operation *op) {
+  return isa<math::ExpOp, math::Exp2Op, math::SinOp, math::CosOp,
+             math::TanhOp, math::SqrtOp, math::RsqrtOp>(op);
+}
+
+/// SFU-backed inline asm: pure elementwise asm blocks invoking PTX
+/// instructions that execute on the special-function unit. Per the PTX ISA
+/// (floating-point §9.7.3 and half-precision §9.7.4 instructions), the
+/// single-precision transcendental/reciprocal approximations -- sin, cos,
+/// ex2, lg2, tanh, rcp, rsqrt, sqrt and div .approx -- lower to SFU/MUFU
+/// hardware at a fraction of FFMA throughput. Deliberately excludes the
+/// correctly-rounded/full-range spellings (div.full, .rn), which lower
+/// differently. Matches the asm template text since the op carries no finer
+/// opcode.
+///
+/// The template must also be straight-line register arithmetic of the kind
+/// TLX kernels emit (e.g. tanh.approx, f32x2 fma/mul blocks): any barrier,
+/// synchronization, memory, control-flow or collective operation in the
+/// template disqualifies the whole op, since the ping-pong region must not
+/// wrap such effects. Tokens are matched as instruction prefixes (e.g.
+/// "bar." covers bar.sync/bar.warp.sync/bar.cluster.*) rather than
+/// enumerating every PTX variant. Matching is intentionally conservative and
+/// may reject on comments; conversely, unlisted spellings may slip through,
+/// so prefer prefix tokens when extending this list.
+static bool isSFUInlineAsmOp(Operation *op) {
+  auto asmOp = dyn_cast<tt::ElementwiseInlineAsmOp>(op);
+  if (!asmOp || !asmOp.getPure())
+    return false;
+  StringRef asmStr = asmOp.getAsmString();
+  static constexpr StringRef kSFUApproxMnemonics[] = {
+      "sin.approx", "cos.approx", "ex2.approx",   "lg2.approx",
+      "tanh.approx", "rcp.approx", "rsqrt.approx", "sqrt.approx",
+      "div.approx"};
+  bool hasSFU = llvm::any_of(kSFUApproxMnemonics, [&](StringRef mnemonic) {
+    return asmStr.contains(mnemonic);
+  });
+  if (!hasSFU)
+    return false;
+  static constexpr StringRef kUnsafeSubstrings[] = {
+      // Barriers and synchronization.
+      "bar.", "barrier", "mbarrier",
+      // Memory ordering.
+      "fence", "membar",
+      // Memory access.
+      "ld.", "st.", "cp.", "atom.", "red.", "prefetch",
+      // Control flow ("bra " matches branches, not identifiers like bravo).
+      "bra ", "bra\t", "bra.", "call", "ret;", "exit", "trap",
+      // Async / collective operations.
+      "wgmma", "tcgen05", "shfl", "vote",
+  };
+  return !llvm::any_of(kUnsafeSubstrings, [&](StringRef substr) {
+    return asmStr.contains(substr);
+  });
+}
+
+/// Any op that exercises the SFU on NVIDIA GPUs.
+static bool isSFUOp(Operation *op) {
+  return isSFUMathOp(op) || isSFUInlineAsmOp(op);
+}
+
 /// Manages expensive operations for critical region identification and
 /// assigns unique barrier IDs to each operation type.
 class CriticalRegionManager {
@@ -83,10 +150,10 @@ public:
       }
       break;
     case 100: // Blackwell
-      // On Blackwell, exp/exp2 uses SFU which can be expensive for multi-dim
-      // tensors Blackwell increases performance for GEMM which is no longer a
+      // On Blackwell, SFU-backed ops are expensive for multi-dim tensors.
+      // Blackwell increases performance for GEMM which is no longer a
       // bottleneck
-      if (isa<math::ExpOp, math::Exp2Op>(op)) {
+      if (isSFUOp(op)) {
         LDBG("Encounter a " << op->getName() << " op on Blackwell.");
         Type resultType = op->getResult(0).getType();
         if (auto tensorTy = dyn_cast<RankedTensorType>(resultType))

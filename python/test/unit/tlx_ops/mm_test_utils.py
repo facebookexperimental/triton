@@ -5,7 +5,7 @@ import time
 import pytest
 import torch
 from triton.tlx.ops import InvalidInput, UnsupportedOp
-from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, operand
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 
 torch.manual_seed(0)
 
@@ -13,8 +13,8 @@ MAX_SECONDS_PER_CASE = 60
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 
 
-def shapes(focus_shapes):
-    return list(SYNTHETIC) + list(focus_shapes)
+def shapes():
+    return list(CORRECTNESS_SHAPES)
 
 
 def _assert_strides(tensor, wanted):

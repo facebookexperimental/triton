@@ -12,9 +12,6 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._shapes import SM90_FOCUS
-
-PERF_SHAPES = SM90_FOCUS
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 

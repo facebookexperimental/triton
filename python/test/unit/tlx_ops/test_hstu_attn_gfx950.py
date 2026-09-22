@@ -2,6 +2,7 @@
 import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
+from triton.tlx.ops.kernels.hstu_attn._shapes import CORRECTNESS_SHAPES, inputs
 
 GFX950_ARCH = "gfx950"
 
@@ -9,6 +10,24 @@ GFX950_SHAPES = [
     (2, 128, 2, 128, 128),
     (4, 256, 4, 128, 128),
 ]
+
+DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("Z,MAX_SEQ_LEN,H,HEAD_DIM,causal,dtype_name", CORRECTNESS_SHAPES)
+def test_hstu_attn_common_shapes_gfx950(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype_name):
+    from triton.tlx.ops import hstu_attn_dev as tlx_hstu_attn
+    from triton.tlx.ops.kernels.hstu_attn._reference import triton_hstu_mha
+
+    dtype = DTYPES[dtype_name]
+    q, k, v, offsets, attn_scale = inputs(Z, MAX_SEQ_LEN, H, HEAD_DIM, dtype)
+    alpha = 1.0 / HEAD_DIM
+    actual = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, attn_scale, alpha=alpha, causal=causal, arch=GFX950_ARCH,
+                           space="smoke")
+    expected = triton_hstu_mha(MAX_SEQ_LEN, alpha, q, k, v, offsets, attn_scale)
+    precision = 1e-3 if dtype == torch.float16 else 8e-3
+    torch.testing.assert_close(actual, expected, atol=precision * expected.abs().max().item(), rtol=precision)
 
 
 def _gfx950_inputs(batch_size, max_seq_len, H, attn_dim, hidden_dim, dtype):

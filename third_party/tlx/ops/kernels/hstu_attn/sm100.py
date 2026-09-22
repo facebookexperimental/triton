@@ -50,11 +50,6 @@ from ._reference import (
     forward_valid_mask,
     target_common_preprocess,
 )
-from ._shapes import SM100_FOCUS
-
-#: The shapes `bench_hstu_attn.py` gates on for this arch.
-PERF_SHAPES = SM100_FOCUS
-
 try:
     # @manual=//triton:triton
     from triton.tools.tensor_descriptor import TensorDescriptor

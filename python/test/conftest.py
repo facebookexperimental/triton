@@ -41,6 +41,9 @@ def pytest_addoption(parser):
 
 @pytest.fixture
 def device(request):
+    # --device is unpassable under buck; cpu backend implies cpu tensors.
+    if os.environ.get("TRITON_DEFAULT_BACKEND") == "cpu":
+        return "cpu"
     return request.config.getoption("--device")
 
 
@@ -131,7 +134,10 @@ def pytest_collection_modifyitems(config, items):
             kept.append(item)
         else:
             deselected.append(item)
-    if saw_test_core:
+    # Under buck/testpilot (FB_TRITON_TESTING=1), shards collect only a
+    # subset of tests, so the strict coverage check below is skipped there.
+    # The allowlist filtering above still applies everywhere.
+    if saw_test_core and os.environ.get("FB_TRITON_TESTING") != "1":
         missing = sorted(set(allowlisted) - seen)
         if missing:
             raise ValueError(f"CPU allowlist entries matched no collected test in test_core.py: {missing}")

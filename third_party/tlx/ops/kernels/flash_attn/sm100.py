@@ -9,9 +9,6 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._shapes import SM100_FOCUS
-
-PERF_SHAPES = SM100_FOCUS
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 

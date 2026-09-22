@@ -24,22 +24,35 @@ SYNTHETIC: tuple[AddMMShape, ...] = (
 )
 
 # PERF: The odd-K fallback stays synthetic-only until it is competitive.
-GFX950_FOCUS_SUITE = FocusSuite(
-    name="gfx950_baseline",
-    op="addmm",
-    shapes=(
-        AddMMShape(4096, 192, 2048, (2048, 1), (1, 2048), "fp16"),
-        AddMMShape(4096, 192, 2048, (2048, 1), (1, 2048), "bf16"),
-        AddMMShape(1024, 1024, 864, (864, 1), (1, 864), "fp16"),
-        AddMMShape(64000, 256, 256, (256, 1), (1, 256), "fp16"),
+FOCUS_SUITES = (
+    FocusSuite(
+        name="gfx942_1",
+        op="addmm",
+        shapes=(
+            AddMMShape(819200, 1024, 192, (192, 1), (1, 192), "bf16"),
+            AddMMShape(4096, 1894, 242432, (242432, 1), (1, 242432), "bf16"),
+            AddMMShape(1024, 6144, 20480, (20480, 1), (1, 20480), "bf16"),
+            AddMMShape(61440, 2048, 5120, (5120, 1), (1, 5120), "bf16"),
+        ),
+    ),
+    FocusSuite(
+        name="gfx950_1",
+        op="addmm",
+        shapes=(
+            AddMMShape(4096, 192, 2048, (2048, 1), (1, 2048), "fp16"),
+            AddMMShape(4096, 192, 2048, (2048, 1), (1, 2048), "bf16"),
+            AddMMShape(1024, 1024, 864, (864, 1), (1, 864), "fp16"),
+            AddMMShape(64000, 256, 256, (256, 1), (1, 256), "fp16"),
+        ),
     ),
 )
 
-FOCUS_SUITES = (GFX950_FOCUS_SUITE, )
-DEFAULT_SUITES = {"gfx950": ("gfx950_baseline", )}
+DEFAULT_SUITES = {
+    "gfx942": ("gfx942_1", ),
+    "gfx950": ("gfx950_1", ),
+}
 FOCUS = FocusRegistry("addmm", FOCUS_SUITES, DEFAULT_SUITES)
-
-GFX950_FOCUS = FOCUS.shapes("gfx950")
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 
 def inputs(entry, dtype, device="cuda"):

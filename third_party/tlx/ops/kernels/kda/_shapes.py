@@ -13,28 +13,11 @@ class KDAShape(NamedTuple):
     dtype: str
 
 
-class KDAPrefillShape(NamedTuple):
-    total_tokens: int
-    sequences: int
-    heads: int
-    key_dim: int
-    value_dim: int
-    dtype: str
-
-
-class KDADecodeShape(NamedTuple):
-    batch: int
-    heads: int
-    key_dim: int
-    value_dim: int
-    dtype: str
-
-
 SYNTHETIC: tuple[KDAShape, ...] = (KDAShape(2, 64, 2, 128, "bf16"), )
 
 # TODO: Replace placeholders with captured shapes.
-SM100_FOCUS_SUITE = FocusSuite(
-    name="sm100_baseline",
+SM100_1 = FocusSuite(
+    name="sm100_1",
     op="kimi_delta_attention",
     shapes=(
         KDAShape(4, 4096, 8, 128, "bf16"),
@@ -43,46 +26,10 @@ SM100_FOCUS_SUITE = FocusSuite(
         KDAShape(8, 2048, 8, 128, "bf16"),
     ),
 )
-FOCUS_SUITES = (SM100_FOCUS_SUITE, )
-
-GFX950_PREFILL_SYNTHETIC: tuple[KDAPrefillShape, ...] = (KDAPrefillShape(64, 1, 4, 128, 128, "bf16"), )
-
-GFX950_PREFILL_FOCUS_SUITE = FocusSuite(
-    name="gfx950_prefill_baseline",
-    op="kda_paged_prefill",
-    shapes=(
-        KDAPrefillShape(4096, 1, 4, 128, 128, "bf16"),
-        KDAPrefillShape(4096, 4, 4, 128, 128, "bf16"),
-        KDAPrefillShape(131072, 1, 4, 128, 128, "bf16"),
-        KDAPrefillShape(131072, 8, 4, 128, 128, "bf16"),
-        KDAPrefillShape(4096, 1, 12, 128, 128, "bf16"),
-        KDAPrefillShape(4096, 4, 12, 128, 128, "bf16"),
-        KDAPrefillShape(131072, 1, 12, 128, 128, "bf16"),
-        KDAPrefillShape(131072, 8, 12, 128, 128, "bf16"),
-    ),
-)
-PREFILL_FOCUS_SUITES = (GFX950_PREFILL_FOCUS_SUITE, )
-
-GFX950_DECODE_SYNTHETIC: tuple[KDADecodeShape, ...] = (KDADecodeShape(1, 4, 128, 128, "bf16"), )
-
-GFX950_DECODE_FOCUS_SUITE = FocusSuite(
-    name="gfx950_decode_baseline",
-    op="kda_recurrent_decode",
-    shapes=tuple(KDADecodeShape(batch, heads, 128, 128, "bf16") for heads in (4, 12) for batch in (1, 2, 4, 8, 16, 32)),
-)
-DECODE_FOCUS_SUITES = (GFX950_DECODE_FOCUS_SUITE, )
-
-DEFAULT_SUITES = {"sm100": ("sm100_baseline", )}
-PREFILL_DEFAULT_SUITES = {"gfx950": ("gfx950_prefill_baseline", )}
-DECODE_DEFAULT_SUITES = {"gfx950": ("gfx950_decode_baseline", )}
-
+FOCUS_SUITES = (SM100_1, )
+DEFAULT_SUITES = {"sm100": ("sm100_1", )}
 FOCUS = FocusRegistry("kimi_delta_attention", FOCUS_SUITES, DEFAULT_SUITES)
-PREFILL_FOCUS = FocusRegistry("kda_paged_prefill", PREFILL_FOCUS_SUITES, PREFILL_DEFAULT_SUITES)
-DECODE_FOCUS = FocusRegistry("kda_recurrent_decode", DECODE_FOCUS_SUITES, DECODE_DEFAULT_SUITES)
-
-SM100_FOCUS = FOCUS.shapes("sm100")
-GFX950_PREFILL_FOCUS = PREFILL_FOCUS.shapes("gfx950")
-GFX950_DECODE_FOCUS = DECODE_FOCUS.shapes("gfx950")
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 CHUNK = 64
 

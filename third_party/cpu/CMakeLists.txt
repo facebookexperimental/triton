@@ -111,7 +111,7 @@ FetchContent_Declare(
   GIT_TAG 93f04d869471ce4d007abaebb8c6a7bc62749f61
 )
 FetchContent_MakeAvailable(sleef)
-if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+if(TARGET sleef AND CMAKE_LIBRARY_OUTPUT_DIRECTORY)
   # Place SLEEF next to libtriton in Python builds.
   set_target_properties(sleef PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
 endif()

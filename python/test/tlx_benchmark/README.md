@@ -12,7 +12,8 @@ One shot command with extreme simplicity
 python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `hstu_attn`, `kda`, `kda_prefill`, `kda_decode`.
+`flash_attn`, `flash_attn_mxfp8`, `hstu_attn`, `kda`, `kda_prefill`,
+`kda_decode`.
 
 ```
 options:
@@ -23,7 +24,7 @@ options:
                         else measures a path users do not take
   --head N              only the first N cases PER DIRECTION, for a quick look; on an op with a
                         backward, --head 10 is 10 fwd and 10 bwd
-  --synthetic           run the correctness shapes instead of this arch's focus list; they are
+  --synthetic           run the hardware-agnostic synthetic shapes instead of this arch's focus list; they are
                         mostly too small to time, so this is for looking, not for gating
   --suite SUITE         run one focus suite; repeat to combine suites (default: this
                         architecture's configured set)
@@ -54,6 +55,7 @@ options:
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
+| `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
@@ -69,7 +71,7 @@ a `smoke` space no user takes.
 The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
 They force the TLX template (`tlx_mode="force"`) and race it against the same
 compile with TLX off, so `speedup > 1` is exactly "TLX would have won the
-autotune under `tlx_mode="allow"`". `mm_torchtlx` covers Blackwell;
+autotune under `tlx_mode="allow"`". `mm_torchtlx` covers Blackwell and MI350X;
 `addmm_torchtlx` and `bmm_torchtlx` cover MI350X. They need `torch >= 2.14` for
 `config.triton.tlx_mode`. A shape where Inductor emits no TLX kernel at all is
 an error row, not a quiet 1.00x.
@@ -177,20 +179,23 @@ Latency is not reported: it is `flop_count / TFLOP/s`, both in the artifact.
 
 ## shapes
 
-1. Synthetic (general): L1 only.
-2. Focus suites: L2 shape groups for one operator.
+1. Synthetic (general): hardware-agnostic shapes included in L1.
+2. Focus suites: production-derived shape groups. L1 covers their union; L2
+   selects only the running host's default group.
 
 By default, an L2 run uses the suites in the op's `DEFAULT_SUITES` entry for
 the selected GPU. `--suite NAME` overrides the default; repeat it to combine
 suites. Suites are hardware-agnostic but belong to exactly one op. Selected
 suite names are recorded in the JSON artifact. `--synthetic` selects the L1
-list instead and cannot be combined with `--suite`.
+list instead and cannot be combined with `--suite`. An empty architecture
+default records that no production-derived L2 suite is available yet; pytest
+reports that operator as skipped rather than substituting synthetic shapes.
 
 List an op's suites without selecting a GPU or starting a benchmark:
 
 ```bash
 python python/test/tlx_benchmark/bench_mm.py --list-suites
-python python/test/tlx_benchmark/bench_mm.py --list-suite gfx942_baseline
+python python/test/tlx_benchmark/bench_mm.py --list-suite gfx942_all
 ```
 
 Each entry carries its own strides and dtype, so there is no dtype
@@ -198,16 +203,24 @@ cross-product. Strides, not a row/col flag: a leading stride wider than the row
 is a padded slice, and 0 is a broadcast.
 
 Shape definitions live in `tlx/ops/kernels/<op>/_shapes.py`: a typed shape,
-`SYNTHETIC`, `FOCUS_SUITES`, `DEFAULT_SUITES`, and `FOCUS`. Arch modules retain
-flattened `PERF_SHAPES` aliases.
+`SYNTHETIC`, `FOCUS_SUITES`, `DEFAULT_SUITES`, `FOCUS`, and the deduplicated
+`CORRECTNESS_SHAPES` union used by L1. Architecture implementation modules do
+not own or re-export benchmark shapes. A package containing several public
+operators uses one shape module per operator, as KDA does with
+`_shapes.py`, `_prefill_shapes.py`, and `_decode_shapes.py`.
+
+Leaf focus suites use `<arch>_<request-index>` names such as `gfx950_1`. When
+an architecture selects multiple captured requests, its default is an
+`<arch>_all` suite that includes those leaves. A suite may be selected by more
+than one architecture; the architecture in its name records its origin, not an
+execution restriction.
 
 ## Adding an op
 
 Write `tlx/ops/kernels/<op>/_shapes.py` with a typed shape, `SYNTHETIC`, one or
 more `FocusSuite` values, a `DEFAULT_SUITES` mapping, a `FOCUS` registry,
-`inputs()`, `flops()`, and `label()`. Re-export flattened `PERF_SHAPES` from each
-arch module, then add a `bench_<op>.py` with the adapter names and one line of
-wiring:
+`CORRECTNESS_SHAPES`, `inputs()`, `flops()`, and `label()`. Then add a
+`bench_<op>.py` with the adapter names and one line of wiring:
 
 ```python
 OP = "<op>"                    # catalog op name

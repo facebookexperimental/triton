@@ -14,7 +14,6 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 from ..._catalog import InvalidInput
-from ._shapes import GFX950_FOCUS
 
 # Register-resident path.
 
@@ -3042,7 +3041,6 @@ def _launch_persistent(a, b, out=None, specialization=None):
 
 __all__ = ["mm", "matmul", "supports"]
 
-PERF_SHAPES = GFX950_FOCUS
 
 
 # The initial implementation deliberately exposes only measured plans. A
