@@ -13,7 +13,6 @@ from triton.tlx.ops.kernels.kda._prefill_shapes import CORRECTNESS_SHAPES as PRE
 pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="gfx950 KDA operators require CDNA4")
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-ARCH = "gfx950"
 
 
 def _kda_recurrent_reference(q, k, v, g, beta, state, scale):
@@ -88,7 +87,6 @@ def _check_kda_prefill(lengths, heads, scale, cu_on_cpu=False):
         scale=scale,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
     torch.testing.assert_close(
         actual_output[0].float(),
@@ -152,7 +150,6 @@ def test_kda_paged_prefill_shape_suites_run(total_tokens, sequences, heads, key_
         scale=1.0,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
     assert torch.isfinite(output).all()
     assert torch.isfinite(final_state).all()
@@ -229,7 +226,6 @@ def test_kda_recurrent_decode_shape_suites(batch, heads, key_dim, value_dim, dty
         read_indices=read_indices,
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
     torch.testing.assert_close(actual.float(), torch.stack(expected).unsqueeze(0), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(state_pool, expected_pool, atol=2e-4, rtol=2e-4)
@@ -281,7 +277,6 @@ def test_kda_recurrent_decode_indexed_state(heads, key_dim, value_dim, strided_i
         read_indices=read_indices,
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
 
     torch.testing.assert_close(actual_output.float(), expected_output, atol=2e-2, rtol=2e-2)
@@ -312,7 +307,6 @@ def test_kda_recurrent_decode_graph_padding_and_slot_stride():
         read_indices=read_indices,
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -327,7 +321,6 @@ def test_kda_recurrent_decode_graph_padding_and_slot_stride():
             read_indices=read_indices,
             write_indices=write_indices,
             cu_seqlens=cu_seqlens,
-            arch=ARCH,
         )
     graph.replay()
     torch.cuda.synchronize()
@@ -398,7 +391,6 @@ def test_kda_recurrent_decode_invalid_indices(scale, invalid_index):
         read_indices=reads,
         write_indices=writes,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
     torch.testing.assert_close(
         actual.float(),
@@ -441,7 +433,6 @@ def test_kda_recurrent_decode_cpu_metadata_and_malformed_rows():
         read_indices=reads,
         write_indices=writes,
         cu_seqlens=cu_seqlens,
-        arch=ARCH,
     )
 
     torch.testing.assert_close(actual[:, 0], torch.zeros_like(actual[:, 0]))
