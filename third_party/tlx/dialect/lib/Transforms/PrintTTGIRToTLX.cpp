@@ -2563,6 +2563,75 @@ void printSimplifiedOp(
     }
   }
 
+  // tt.atomic_rmw selects its operation with an enum attribute; each maps to a
+  // distinct tl.atomic_* builtin.
+  if (opName == "tt.atomic_rmw" && op->getNumOperands() >= 2) {
+    // TT_AtomicRMWAttr is an I32EnumAttr, so the attribute carries the case's
+    // integer value rather than its mnemonic.
+    Attribute kindAttr = op->getAttr("atomic_rmw_op");
+    int64_t kind = -1;
+    if (auto intAttr = dyn_cast_or_null<IntegerAttr>(kindAttr)) {
+      kind = intAttr.getInt();
+    } else if (kindAttr) {
+      std::string text;
+      llvm::raw_string_ostream textOs(text);
+      kindAttr.print(textOs);
+      textOs.flush();
+      StringRef t(text);
+      kind = t.contains("fadd")   ? 5
+             : t.contains("add")  ? 4
+             : t.contains("exch") ? 10
+             : t.contains("umax") ? 8
+             : t.contains("umin") ? 9
+             : t.contains("max")  ? 6
+             : t.contains("min")  ? 7
+             : t.contains("xor")  ? 3
+             : t.contains("and")  ? 1
+             : t.contains("or")   ? 2
+                                  : -1;
+    }
+    StringRef fn;
+    switch (kind) {
+    case 1:
+      fn = "tl.atomic_and";
+      break;
+    case 2:
+      fn = "tl.atomic_or";
+      break;
+    case 3:
+      fn = "tl.atomic_xor";
+      break;
+    case 4:
+    case 5:
+      fn = "tl.atomic_add";
+      break;
+    case 6:
+    case 8:
+      fn = "tl.atomic_max";
+      break;
+    case 7:
+    case 9:
+      fn = "tl.atomic_min";
+      break;
+    case 10:
+      fn = "tl.atomic_xchg";
+      break;
+    default:
+      break;
+    }
+    if (!fn.empty()) {
+      if (op->getNumResults() == 1)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << fn << "(" << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", " << getValueName(op->getOperand(1), argSubstitutionMap);
+      if (op->getNumOperands() > 2)
+        os << ", mask=" << getValueName(op->getOperand(2), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;

@@ -1638,3 +1638,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// tt.atomic_rmw picks its operation from an I32Enum attribute, which the
+// generic path drops; each case has its own tl.atomic_* builtin.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def atomic_rmw_kinds(
+  // CHECK-DAG: tl.atomic_add(arg0, {{.*}}, mask=True)
+  // CHECK-DAG: tl.atomic_max(arg0, {{.*}}, mask=True)
+  tt.func public @atomic_rmw_kinds(%p: !tt.ptr<f32>) attributes {noinline = false} {
+    %v = arith.constant 1.000000e+00 : f32
+    %t = arith.constant true
+    %a = tt.atomic_rmw fadd, acq_rel, gpu, %p, %v, %t : (!tt.ptr<f32>, f32, i1) -> f32
+    %b = tt.atomic_rmw max, acq_rel, gpu, %p, %v, %t : (!tt.ptr<f32>, f32, i1) -> f32
+    tt.return
+  }
+
+  // The remaining enum cases, so a mis-numbered entry in the ladder is caught
+  // rather than silently spelling one atomic as another.
+  // CHECK-LABEL: def atomic_rmw_remaining_kinds(
+  // CHECK-DAG: tl.atomic_min(arg0,
+  // CHECK-DAG: tl.atomic_xchg(arg0,
+  // CHECK-DAG: tl.atomic_and(arg0,
+  // CHECK-DAG: tl.atomic_or(arg0,
+  // CHECK-DAG: tl.atomic_xor(arg0,
+  tt.func public @atomic_rmw_remaining_kinds(%p: !tt.ptr<i32>) attributes {noinline = false} {
+    %v = arith.constant 1 : i32
+    %t = arith.constant true
+    %a = tt.atomic_rmw min, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %b = tt.atomic_rmw exch, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %c = tt.atomic_rmw and, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %d = tt.atomic_rmw or, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %e = tt.atomic_rmw xor, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+
+  // The last three enum values. Integer add(4) sits next to fadd(5), and
+  // umax(8)/umin(9) next to max(6)/min(7), so an off-by-one in the ladder
+  // would otherwise be spelled as the neighbouring atomic.
+  // CHECK-LABEL: def atomic_rmw_unsigned_and_int_add(
+  // CHECK-DAG: tl.atomic_add(arg0,
+  // CHECK-DAG: tl.atomic_max(arg0,
+  // CHECK-DAG: tl.atomic_min(arg0,
+  tt.func public @atomic_rmw_unsigned_and_int_add(%p: !tt.ptr<i32>) attributes {noinline = false} {
+    %v = arith.constant 1 : i32
+    %t = arith.constant true
+    %a = tt.atomic_rmw add, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %b = tt.atomic_rmw umax, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %c = tt.atomic_rmw umin, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+}
