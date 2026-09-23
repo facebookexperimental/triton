@@ -180,6 +180,17 @@ std::optional<UseInfo> getUseInfo(Operation *op) {
     info.shape = expandToRank(shape, rank);
     return info;
   }
+  if (auto gather = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+    info.descriptor = cast<TypedValue<TensorDescType>>(gather.getDesc());
+    info.desiredSharedEncoding = gather.getResult().getType().getEncoding();
+    assert(isTMACompatibleEncoding(info.desiredSharedEncoding) &&
+           "expecting TMA compatible encoding");
+    info.cgaLayout = ttg::getCGALayout(info.desiredSharedEncoding);
+    auto shape = gather.getResult().getType().getShape();
+    auto rank = gather.getDesc().getType().getBlockType().getRank();
+    info.shape = expandToRank(shape, rank);
+    return info;
+  }
   if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
     info.descriptor = cast<TypedValue<TensorDescType>>(store.getDesc());
     auto encoding = store.getSrc().getType().getEncoding();

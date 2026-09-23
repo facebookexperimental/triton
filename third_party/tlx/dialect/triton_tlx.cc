@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/PluginUtils.h"
@@ -1391,6 +1392,15 @@ void init_triton_tlx_ir(py::module_ &m) {
                  /*offsets=*/std::vector<Value>{}, mbarrier, result, pred,
                  multicast, cacheModifier, evictionPolicy, isVolatile, twoCta);
            })
+      .def(
+          "create_async_TMA_gather",
+          [](TritonOpBuilder &self, Value desc, Value xOffsets, Value yOffset,
+             Value mbarrier, Value result, Value pred, bool multicast) -> void {
+            multicast &=
+                ttng::hasCGABroadcast(cast<ttg::MemDescType>(result.getType()));
+            self.create<ttng::AsyncTMAGatherOp>(
+                desc, xOffsets, yOffset, mbarrier, result, pred, multicast);
+          })
       .def("create_async_TMA_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value pred, EvictionPolicy evictionPolicy) -> void {

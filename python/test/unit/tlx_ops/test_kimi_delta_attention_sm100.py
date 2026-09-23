@@ -9,8 +9,6 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.kimi_delta_a
 
 torch.manual_seed(0)
 
-ARCH = "sm100"
-
 REL_PRECISION = {torch.bfloat16: 8e-3}
 
 
@@ -20,7 +18,7 @@ def test_kimi_delta_attention_focus_shapes_run(B, T, H, HEAD_DIM, dtype_name):
 
     dtype = {"bf16": torch.bfloat16}[dtype_name]
     q, k, v, g, beta, cu_seqlens = shape_inputs(B, T, H, HEAD_DIM, dtype)
-    out, aux = tlx_kda(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, arch=ARCH)
+    out, aux = tlx_kda(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens)
     assert aux is None
     assert torch.isfinite(out).all()
 
@@ -93,7 +91,7 @@ def test_kimi_delta_attention_fwd(dtype):
     from triton.tlx.ops import kimi_delta_attention as tlx_kda
 
     q, k, v, g, beta, cu_seqlens = _inputs(dtype)
-    out, aux = tlx_kda(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, arch=ARCH)
+    out, aux = tlx_kda(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens)
 
     assert aux is None
     ref = _reference(q, k, v, g, beta, cu_seqlens, scale=1.0).to(out.dtype)
@@ -111,7 +109,7 @@ def test_kimi_delta_attention_bwd(dtype):
     rbeta = beta.detach().clone().requires_grad_()
     do = torch.randn_like(q)
 
-    out, aux = tlx_kda(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, arch=ARCH)
+    out, aux = tlx_kda(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens)
     ref = _reference(rq, rk, rv, rg, rbeta, cu_seqlens, scale=1.0)
     out.backward(do)
     ref.backward(do.float())

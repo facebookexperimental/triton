@@ -7,7 +7,6 @@ from triton.tlx.ops.kernels.flash_attn._shapes import CORRECTNESS_SHAPES, SYNTHE
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="requires an sm90 GPU")
 
-ARCH = "sm90"
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 FWD_SHAPES = tuple(dict.fromkeys((*CORRECTNESS_SHAPES, *(shape._replace(dtype="bf16") for shape in SYNTHETIC))))
 
@@ -42,7 +41,7 @@ def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     scale = None if causal else 0.7
     if HEAD_DIM != 128:
         with pytest.raises(InvalidInput, match="does not support"):
-            flash_attn(q, k, v, causal=causal, sm_scale=scale, arch=ARCH, space="smoke")
+            flash_attn(q, k, v, causal=causal, sm_scale=scale, space="smoke")
         return
     out = flash_attn(
         q,
@@ -50,7 +49,6 @@ def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
         v,
         causal=causal,
         sm_scale=scale,
-        arch=ARCH,
         space="smoke",
     )
     ref = _sdpa(q, k, v, causal, scale=scale)
@@ -70,9 +68,9 @@ def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
 
     if HEAD_DIM != 128:
         with pytest.raises(InvalidInput, match="does not support"):
-            flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke")
+            flash_attn(q, k, v, causal=causal, space="smoke")
         return
-    flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke").backward(do)
+    flash_attn(q, k, v, causal=causal, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal).backward(do)
 
     for got, expected in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
@@ -85,4 +83,4 @@ def test_flash_attn_rejects_d64():
 
     q, k, v = _qkv(1, 1, 128, 64, torch.float16)
     with pytest.raises(InvalidInput, match="does not support"):
-        flash_attn(q, k, v, arch=ARCH, space="smoke")
+        flash_attn(q, k, v, space="smoke")

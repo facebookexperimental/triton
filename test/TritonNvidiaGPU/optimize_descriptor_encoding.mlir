@@ -314,3 +314,28 @@ tt.func public @scale_descriptor_arg_from_shared_linear_use(%arg0: !tt.tensordes
   tt.return
 }
 }
+
+// -----
+
+#offset_parent = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
+#offsets = #ttg.slice<{dim = 0, parent = #offset_parent}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-LABEL: @async_tma_gather
+// CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<1x128xf16, #shared>
+// CHECK: ttng.async_tma_gather {{.*}} : !tt.tensordesc<1x128xf16, #shared>
+tt.func public @async_tma_gather(%arg0: !tt.ptr<f16>, %arg1: i32, %arg2: tensor<32xi32, #offsets>) {
+  %c1_i64 = arith.constant 1 : i64
+  %stride = arith.extsi %arg1 : i32 to i64
+  %desc = tt.make_tensor_descriptor %arg0, [%arg1, %arg1], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1x128xf16>
+  %result = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+  %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  %c0_i32 = arith.constant 0 : i32
+  %true = arith.constant true
+  ttng.async_tma_gather %desc[%arg2, %c0_i32] %result, %bar, %true : !tt.tensordesc<1x128xf16>, tensor<32xi32, #offsets>, i32, !ttg.memdesc<1xi64, #barrier, #smem, mutable>, !ttg.memdesc<32x128xf16, #shared, #smem, mutable>, i1
+  tt.return
+}
+}

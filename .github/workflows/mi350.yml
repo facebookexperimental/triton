@@ -315,7 +315,8 @@ jobs:
             ${FAILED_FLAG}
 
   mi350-torchtlx-test:
-    if: github.repository_owner == 'facebookexperimental'
+    # Temporarily disabled because the TorchTLX environment is brittle.
+    if: ${{ false }}
     runs-on: linux-fb-triton-mi350-1
     env:
       TORCHINDUCTOR_TLX_MODE: "allow"

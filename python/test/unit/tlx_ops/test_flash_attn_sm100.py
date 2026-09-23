@@ -17,8 +17,6 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.flash_attn i
 
 torch.manual_seed(0)
 
-ARCH = "sm100"
-
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 FWD_SHAPES = tuple(dict.fromkeys((*CORRECTNESS_SHAPES, *(shape._replace(dtype="bf16") for shape in SYNTHETIC))))
@@ -45,7 +43,7 @@ def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
 
     dtype = DTYPES[dtype_name]
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype)
-    out = tlx_flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke")
+    out = tlx_flash_attn(q, k, v, causal=causal, space="smoke")
     _assert_close(out, _sdpa(q, k, v, causal), dtype)
 
 
@@ -59,7 +57,7 @@ def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
     do = torch.randn_like(q)
 
-    tlx_flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke").backward(do)
+    tlx_flash_attn(q, k, v, causal=causal, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal).backward(do)
 
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
@@ -74,7 +72,7 @@ def test_flash_attn_bwd_bf16_accuracy(Z, H, N_CTX, HEAD_DIM):
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
     do = torch.randn_like(q)
 
-    tlx_flash_attn(q, k, v, causal=False, arch=ARCH, space="smoke").backward(do)
+    tlx_flash_attn(q, k, v, causal=False, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal=False).backward(do)
 
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):

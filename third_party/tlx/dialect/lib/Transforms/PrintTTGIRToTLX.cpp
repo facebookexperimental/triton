@@ -160,6 +160,8 @@ static const TTGIRToTLXMapping opMappings[] = {
     // TMA operations
     {"ttng.async_tma_copy_global_to_local", "tlx.async_descriptor_load",
      "TMA load from global to shared memory"},
+    {"ttng.async_tma_gather", "tlx.async_descriptor_gather",
+     "TMA gather from global to shared memory"},
     {"ttng.async_tma_copy_local_to_global", "tlx.async_descriptor_store",
      "TMA store from shared to global memory"},
     {"ttng.tma_store_wait", "tlx.async_descriptor_store_wait",
@@ -1976,6 +1978,32 @@ void printSimplifiedOp(
     }
     if (pred && !isConstantTrue(pred))
       os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_tma_gather: reorder args for Python API
+  // TTGIR operands: desc, x_offsets, y_offset, barrier, result, pred
+  // Python API: async_descriptor_gather(desc, result, x_offsets, y_offset,
+  //                                     barrier)
+  if (opName == "ttng.async_tma_gather") {
+    Value desc = op->getOperand(0);
+    Value xOffsets = op->getOperand(1);
+    Value yOffset = op->getOperand(2);
+    Value barrier = op->getOperand(3);
+    Value result = op->getOperand(4);
+    Value pred = op->getOperand(5);
+    os << "tlx.async_descriptor_gather("
+       << getValueName(desc, argSubstitutionMap) << ", "
+       << getValueName(result, argSubstitutionMap) << ", "
+       << getValueName(xOffsets, argSubstitutionMap) << ", "
+       << getValueName(yOffset, argSubstitutionMap) << ", "
+       << getValueName(barrier, argSubstitutionMap);
+    if (!isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    if (op->hasAttr("multicast"))
+      os << ", multicast=True";
     os << ")";
     printLocComment(op, os);
     return;

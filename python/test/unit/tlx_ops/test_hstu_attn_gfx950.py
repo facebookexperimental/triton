@@ -4,8 +4,6 @@ import torch
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops.kernels.hstu_attn._shapes import CORRECTNESS_SHAPES, inputs
 
-GFX950_ARCH = "gfx950"
-
 GFX950_SHAPES = [
     (2, 128, 2, 128, 128),
     (4, 256, 4, 128, 128),
@@ -23,8 +21,7 @@ def test_hstu_attn_common_shapes_gfx950(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dty
     dtype = DTYPES[dtype_name]
     q, k, v, offsets, attn_scale = inputs(Z, MAX_SEQ_LEN, H, HEAD_DIM, dtype)
     alpha = 1.0 / HEAD_DIM
-    actual = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, attn_scale, alpha=alpha, causal=causal, arch=GFX950_ARCH,
-                           space="smoke")
+    actual = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, attn_scale, alpha=alpha, causal=causal, space="smoke")
     expected = triton_hstu_mha(MAX_SEQ_LEN, alpha, q, k, v, offsets, attn_scale)
     precision = 1e-3 if dtype == torch.float16 else 8e-3
     torch.testing.assert_close(actual, expected, atol=precision * expected.abs().max().item(), rtol=precision)
@@ -54,7 +51,7 @@ def test_hstu_attn_gfx950(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM):
     q, k, v, offsets, num_targets = _gfx950_inputs(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM, dtype)
 
     out = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, None, alpha=alpha, causal=True, num_targets=num_targets,
-                        arch=GFX950_ARCH, space="smoke")
+                        space="smoke")
     ref = torch_hstu_attn_ref(
         MAX_SEQ_LEN,
         alpha,

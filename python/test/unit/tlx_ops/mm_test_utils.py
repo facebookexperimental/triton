@@ -38,7 +38,7 @@ def run_mm_case(arch, M, N, K, a_strides, b_strides, dtype_name):
     torch.cuda.synchronize()
     started = time.perf_counter()
     try:
-        out = tlx_mm(a, b, arch=arch, space="heuristic")
+        out = tlx_mm(a, b, space="heuristic")
     except (InvalidInput, UnsupportedOp) as declined:
         pytest.skip(f"{arch} declines this shape: {declined}")
     torch.cuda.synchronize()

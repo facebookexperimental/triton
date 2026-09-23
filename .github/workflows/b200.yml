@@ -294,7 +294,8 @@ jobs:
             ${FAILED_FLAG}
 
   b200-torchtlx-test:
-    if: github.repository_owner == 'facebookexperimental'
+    # Temporarily disabled because the TorchTLX environment is brittle.
+    if: ${{ false }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
