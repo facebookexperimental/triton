@@ -8,6 +8,8 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include <deque>
 
+namespace ttng = mlir::triton::nvidia_gpu;
+
 namespace mlir {
 
 /// Given a value produced by memdesc_index, possibly wrapped in transparent
