@@ -86,6 +86,7 @@ from .mma_ops import (
     release_layout,
     tcgen05_commit,
 )
+from .packed_arith import add4, fma4, mul4, sub4
 from .types import (
     async_token,
     buffered_tensor,
@@ -140,6 +141,11 @@ __all__ = [
     # async_tasks
     "async_tasks",
     "async_task",
+    # packed arithmetic
+    "add4",
+    "sub4",
+    "mul4",
+    "fma4",
     # types
     "layout_encoding",
     "shared_layout_encoding",
