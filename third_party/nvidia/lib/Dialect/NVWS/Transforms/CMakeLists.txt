@@ -1,10 +1,15 @@
 add_triton_library(NVWSTransforms
+  BufferGroups.cpp
   AssignSemaphoreStagePhase.cpp
   OptimizeSemaphore.cpp
   LowerSemaphore.cpp
   LowerAref.cpp
   LowerWarpGroup.cpp
   InsertAref.cpp
+  InsertSemas.cpp
+  InsertSemasAccessDag.cpp
+  InsertSemasEmitIR.cpp
+  InsertSemasSyncDag.cpp
   Utilities.cpp
   AssignStagePhase.cpp
   InsertTmemAref.cpp
