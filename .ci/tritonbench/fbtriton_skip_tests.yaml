@@ -75,7 +75,7 @@ rms_norm:
 gemm:
   backends: tlx_matmul_gfx950
   disabled_devices:
-    - mi350
+    - hip
   disabled_channels:
     - meta-triton
 launch_latency:
