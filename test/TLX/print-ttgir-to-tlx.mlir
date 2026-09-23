@@ -1550,3 +1550,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Elementwise ops that already have an exact TLX spelling. The NaN-quieting
+// arith.maximumf/minimumf were missing alongside their maxnumf/minnumf peers.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // Ordered rather than DAG-matched. The closing paren right after the third
+  // operand is what proves propagateNan = none emitted no argument, and
+  // ordering gives the negative check below a defined start -- after a DAG
+  // group it would constrain only the text following whichever of those
+  // matched last.
+  // CHECK-LABEL: def elementwise_min_max_clamp(
+  // CHECK: = tl.maximum({{.*}}, propagate_nan=tl.PropagateNan.ALL)
+  // CHECK: = tl.minimum({{.*}}, propagate_nan=tl.PropagateNan.ALL)
+  // CHECK: = tl.clamp({{[a-z0-9_]+}}, {{[a-z0-9_]+}}, {{[a-z0-9_]+}})
+  // CHECK-NOT: UNSUPPORTED
+  tt.func public @elementwise_min_max_clamp(%x: tensor<256xf32, #blocked>, %lo: tensor<256xf32, #blocked>, %hi: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %a = arith.maximumf %x, %lo : tensor<256xf32, #blocked>
+    %b = arith.minimumf %x, %hi : tensor<256xf32, #blocked>
+    %c = tt.clampf %x, %lo, %hi, propagateNan = none : tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // The other side of the enum. Read through ClampFOp's typed accessor, so a
+  // change in the attribute's printed spelling cannot silently drop it and
+  // leave the clamp NaN-quieting.
+  // CHECK-LABEL: def clamp_propagate_nan_all(
+  // CHECK: = tl.clamp({{.*}}, propagate_nan=tl.PropagateNan.ALL)
+  tt.func public @clamp_propagate_nan_all(%x: tensor<256xf32, #blocked>, %lo: tensor<256xf32, #blocked>, %hi: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %c = tt.clampf %x, %lo, %hi, propagateNan = all : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
