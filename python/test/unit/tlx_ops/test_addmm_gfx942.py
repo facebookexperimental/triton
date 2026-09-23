@@ -2,15 +2,9 @@ import pytest
 import torch
 
 from triton._internal_testing import is_hip_cdna3
-from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, FOCUS, inputs
-from triton.tlx.ops.kernels.mm.gfx942 import TUNED_CONFIGS
+from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, inputs
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="tlx.ops.addmm requires gfx942")
-
-
-def test_focus_suite_covers_addmm_tuned_configs():
-    focus_shapes = {(shape.m, shape.n, shape.k) for shape in FOCUS.resolved_shapes("gfx942_1")}
-    assert focus_shapes == set(TUNED_CONFIGS) - {(2048, 25408, 10240)}
 
 
 @pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", CORRECTNESS_SHAPES)

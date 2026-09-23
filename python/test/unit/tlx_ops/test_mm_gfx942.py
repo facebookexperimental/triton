@@ -32,27 +32,23 @@ def test_gfx942_wide_heuristic_config():
     assert config.num_stages == 2
 
 
-def test_full_space_does_not_use_tuned_config(monkeypatch):
+@pytest.mark.parametrize("space, expected_shape", [("heuristic", (819200, 1024, 192)), ("full", None)])
+def test_space_reaches_requested_autotuner(monkeypatch, space, expected_shape):
     from triton.tlx.ops.kernels.mm import gfx942
 
     monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: (819200, 1024, 192))
 
-    def fail_tuned_config(*args):
-        pytest.fail("space='full' must not use the frozen heuristic config")
-
-    monkeypatch.setattr(gfx942, "tuned_config", fail_tuned_config)
-
-    class FullSpaceReached(Exception):
+    class AutotunerReached(Exception):
         pass
 
-    def full_space(space, shape):
-        assert space == "full"
-        assert shape is None
-        raise FullSpaceReached
+    def tuned(requested_space, shape):
+        assert requested_space == space
+        assert shape == expected_shape
+        raise AutotunerReached
 
-    monkeypatch.setattr(gfx942, "_tuned", full_space)
-    with pytest.raises(FullSpaceReached):
-        gfx942._gemm(object(), object(), out=object(), space="full")
+    monkeypatch.setattr(gfx942, "_tuned", tuned)
+    with pytest.raises(AutotunerReached):
+        gfx942._gemm(object(), object(), out=object(), space=space)
 
 
 def test_unaligned_row_base_vectorizes():
@@ -69,8 +65,6 @@ def test_unaligned_row_base_vectorizes():
         "GROUP_M": 4,
         "NUM_XCDS": 8,
         "XCD_CHUNK": 8,
-        "A_POLICY": gfx942._CACHE_DEFAULT,
-        "B_POLICY": gfx942._CACHE_DEFAULT,
     }
     grid = (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
     compiled = gfx942.matmul_kernel_gfx942[grid](

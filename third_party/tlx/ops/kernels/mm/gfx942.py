@@ -1,9 +1,7 @@
 """Shared MI300X (gfx942/CDNA3) GEMM implementation for ``mm`` and ``addmm``.
 
-One direct-load kernel serves both fundamental operations. Five BF16
-row-major-A/column-major-B shapes have frozen configurations; other supported
-shapes and layouts use the same kernel through a compact heuristic or autotune
-space.
+One direct-load kernel serves both operations through a compact heuristic or
+full autotune space.
 """
 
 import functools
@@ -13,29 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-# Cache policy understood by _policy_load. Keeping the integer in the
-# kernel signature makes every selected policy a compile-time branch.
-_CACHE_DEFAULT = 0
-_CACHE_CA_EVICT_LAST = 2
-_CACHE_CA_EVICT_FIRST = 3
-_CACHE_EVICT_LAST = 5
-
 # Keep the steady-state K loop unmasked and handle an uneven final tile once.
 _PEEL_K_TAIL = True
-
-
-@triton.jit
-def _policy_load(ptrs, mask, even_k: tl.constexpr, policy: tl.constexpr):
-    if policy == 2:
-        return tl.load(ptrs, cache_modifier=".ca", eviction_policy="evict_last") if even_k else tl.load(
-            ptrs, mask=mask, other=0.0, cache_modifier=".ca", eviction_policy="evict_last")
-    if policy == 3:
-        return tl.load(ptrs, cache_modifier=".ca", eviction_policy="evict_first") if even_k else tl.load(
-            ptrs, mask=mask, other=0.0, cache_modifier=".ca", eviction_policy="evict_first")
-    if policy == 5:
-        return tl.load(ptrs, eviction_policy="evict_last") if even_k else tl.load(ptrs, mask=mask, other=0.0,
-                                                                                  eviction_policy="evict_last")
-    return tl.load(ptrs) if even_k else tl.load(ptrs, mask=mask, other=0.0)
 
 
 @triton.jit
@@ -62,8 +39,6 @@ def matmul_kernel_gfx942(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
     ADD_BIAS: tl.constexpr,
-    A_POLICY: tl.constexpr,
-    B_POLICY: tl.constexpr,
     PEEL_K_TAIL: tl.constexpr,
     SPLIT_M_128_32: tl.constexpr = False,
 ):
@@ -108,9 +83,9 @@ def matmul_kernel_gfx942(
             b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
             a0_ptrs = a_ptr + offs_m0[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
             a1_ptrs = a_ptr + offs_m1[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            b = _policy_load(b_ptrs, offs_k[:, None] < K - k, True, B_POLICY)
-            a0 = _policy_load(a0_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
-            a1 = _policy_load(a1_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
+            b = tl.load(b_ptrs)
+            a0 = tl.load(a0_ptrs)
+            a1 = tl.load(a1_ptrs)
             acc0 = tl.dot(a0, b, acc0, allow_tf32=False, out_dtype=tl.float32)
             acc1 = tl.dot(a1, b, acc1, allow_tf32=False, out_dtype=tl.float32)
 
@@ -151,23 +126,23 @@ def matmul_kernel_gfx942(
             for k in range(0, k_main, BLOCK_K):
                 a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
                 b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-                a = _policy_load(a_ptrs, offs_k[None, :] < K - k, True, A_POLICY)
-                b = _policy_load(b_ptrs, offs_k[:, None] < K - k, True, B_POLICY)
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs)
                 acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
             if not even_k:
                 a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
                 b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
                 tail = offs_k < K - k_main
-                a = _policy_load(a_ptrs, tail[None, :], False, A_POLICY)
-                b = _policy_load(b_ptrs, tail[:, None], False, B_POLICY)
+                a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
+                b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
                 acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
         else:
             for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
                 k = k_idx * BLOCK_K
                 a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
                 b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-                a = _policy_load(a_ptrs, offs_k[None, :] < K - k, even_k, A_POLICY)
-                b = _policy_load(b_ptrs, offs_k[:, None] < K - k, even_k, B_POLICY)
+                a = tl.load(a_ptrs) if even_k else tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
+                b = tl.load(b_ptrs) if even_k else tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
                 acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
 
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
@@ -185,175 +160,6 @@ def matmul_kernel_gfx942(
         tl.store(c_ptr + idx_m * stride_cm + idx_n * stride_cn, acc, mask=mask)
 
 
-# Public, reviewable record of the five selected configurations. The keys are
-# (M, N, K) for A[M, K] @ B[K, N]. Backend flags are separated from kernel
-# meta-parameters by ``_launch_config`` so they are never forwarded as kernel
-# arguments.
-TUNED_CONFIGS = {
-    (819200, 1024, 192): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 32,
-        "GROUP_M": 32,
-        "NUM_XCDS": 8,
-        "XCD_CHUNK": 4,
-        "A_POLICY": _CACHE_CA_EVICT_FIRST,
-        "B_POLICY": _CACHE_DEFAULT,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 0,
-        "kpack": 2,
-        "num_warps": 4,
-        "num_stages": 2,
-        "LLVM_SCHED_STRATEGY": "max-memory-clause",
-    },
-    (4096, 1894, 242432): {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "BLOCK_K": 256,
-        "GROUP_M": 32,
-        "NUM_XCDS": 8,
-        "XCD_CHUNK": 8,
-        "A_POLICY": _CACHE_EVICT_LAST,
-        "B_POLICY": _CACHE_DEFAULT,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 0,
-        "kpack": 1,
-        "num_warps": 8,
-        "num_stages": 2,
-        "DISABLE_AGPR": True,
-        "REVERSE_LOCAL_ASSIGNMENT": True,
-        "SINK_INSTS_TO_AVOID_SPILLS": True,
-        "REGCLASS_PRIORITY": False,
-        "DISABLE_HIGH_RP_RESCHEDULE": False,
-    },
-    (1024, 6144, 20480): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "GROUP_M": 2,
-        "NUM_XCDS": 8,
-        "XCD_CHUNK": 8,
-        "A_POLICY": _CACHE_DEFAULT,
-        "B_POLICY": _CACHE_EVICT_LAST,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 0,
-        "kpack": 1,
-        "num_warps": 4,
-        "num_stages": 2,
-        "ENABLE_SCHED_BARRIER": True,
-        "SINK_INSTS_TO_AVOID_SPILLS": True,
-    },
-    (2048, 25408, 10240): {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
-        "BLOCK_K": 64,
-        "GROUP_M": 8,
-        "NUM_XCDS": 8,
-        "XCD_CHUNK": 16,
-        "A_POLICY": _CACHE_CA_EVICT_LAST,
-        "B_POLICY": _CACHE_DEFAULT,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 1,
-        "kpack": 1,
-        "num_warps": 8,
-        "num_stages": 2,
-        "ENABLE_SCHED_BARRIER": True,
-        "DISABLE_AGPR": True,
-        "REGCLASS_PRIORITY": True,
-        "LLVM_SCHED_STRATEGY": "iterative-ilp",
-    },
-    (61440, 2048, 5120): {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
-        "BLOCK_K": 64,
-        "GROUP_M": 4,
-        "NUM_XCDS": 8,
-        "XCD_CHUNK": 16,
-        "A_POLICY": _CACHE_EVICT_LAST,
-        "B_POLICY": _CACHE_DEFAULT,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 1,
-        "kpack": 1,
-        "num_warps": 8,
-        "num_stages": 2,
-        "ENABLE_SCHED_BARRIER": True,
-        "DISABLE_AGPR": True,
-    },
-}
-
-_BACKEND_OPTIONS = {
-    "ENABLE_SCHED_BARRIER": "enable_sched_group_barrier_scheduler",
-    "REVERSE_LOCAL_ASSIGNMENT": "reverse_local_assignment",
-    "SINK_INSTS_TO_AVOID_SPILLS": "sink_insts_to_avoid_spills",
-    "REGCLASS_PRIORITY": "regclass_priority_trumps_globalness",
-    "DISABLE_HIGH_RP_RESCHEDULE": "disable_unclustered_high_rp_reschedule",
-}
-
-
-def tuned_config(a: torch.Tensor, b: torch.Tensor):
-    """Return an exact-shape fast path, or ``None`` for the generic path.
-
-    The configurations were measured with contiguous ``A[M, K]`` storage and
-    a transposed contiguous ``B[K, N]`` view. Keeping the layout guard here
-    prevents a shape match from silently applying a layout-specific choice to
-    a different memory-access pattern.
-    """
-    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
-        return None
-    if a.dtype != torch.bfloat16 or b.dtype != a.dtype:
-        return None
-    if not a.is_contiguous() or b.stride() != (1, b.shape[0]):
-        return None
-    return TUNED_CONFIGS.get((a.shape[0], b.shape[1], a.shape[1]))
-
-
-def _launch_config(a, b, bias, bias_strides, out, selected):
-    """Launch one frozen configuration into a validated output tensor."""
-    meta = dict(selected)
-
-    backend = {}
-    llvm_attrs = []
-    if meta.pop("DISABLE_AGPR", False):
-        llvm_attrs.append(("amdgpu-agpr-alloc", "0,0"))
-    sched_strategy = meta.pop("LLVM_SCHED_STRATEGY", "")
-    if sched_strategy:
-        llvm_attrs.append(("amdgpu-sched-strategy", sched_strategy))
-    if llvm_attrs:
-        backend["llvm_fn_attrs"] = tuple(llvm_attrs)
-    for key, option in _BACKEND_OPTIONS.items():
-        if key in meta:
-            backend[option] = meta.pop(key)
-
-    m, k = a.shape
-    n = b.shape[1]
-    bias_ptr = bias if bias is not None else out
-    args = (
-        a,
-        b,
-        bias_ptr,
-        out,
-        m,
-        n,
-        k,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        bias_strides[0],
-        bias_strides[1],
-        out.stride(0),
-        out.stride(1),
-    )
-    grid = (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]), )
-    matmul_kernel_gfx942[grid](
-        *args,
-        ADD_BIAS=bias is not None,
-        PEEL_K_TAIL=_PEEL_K_TAIL,
-        **meta,
-        **backend,
-    )
-
-
 def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kpack=1, split_m_128_32=False):
     # This overlaps register-staged global loads; it is not an explicit
     # two-buffer LDS allocation.
@@ -364,8 +170,6 @@ def _config(block_m, block_n, block_k, group_m, num_warps, *, waves_per_eu=0, kp
         "GROUP_M": group_m,
         "NUM_XCDS": 8,
         "XCD_CHUNK": 8,
-        "A_POLICY": _CACHE_DEFAULT,
-        "B_POLICY": _CACHE_DEFAULT,
         "waves_per_eu": waves_per_eu,
         "kpack": kpack,
     }
@@ -461,11 +265,6 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
-
-    selected = tuned_config(a, b) if space == "heuristic" else None
-    if selected is not None:
-        _launch_config(a, b, bias, bias_strides, out, selected)
-        return out
 
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )  # noqa: E731
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
