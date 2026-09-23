@@ -54,6 +54,27 @@
 <p>Loads the buffer from local or tensor memory. <code>layout</code> pins a requested register layout. On AMD, the rematerialization options start fresh address coordinate live ranges either per load or for a named group of nearby loads; the two options are mutually exclusive.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_store(buffer, distributed_tensor)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Store a distributed tensor into a buffer in local memory or tensor memory.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.tmem_shift(buffer)</code> <strong>[sm100]</strong></div></div>
+<p>Shift a mutable tensor-memory buffer in place with Blackwell <code>tcgen05.shift.down</code> instructions. Within each 32-row TMEM group, rows 0 through 30 receive the previous contents of the following row; row 31 is unchanged.</p>
+<p>The instruction completes asynchronously. Call <code>tlx.tcgen05_commit</code> with an mbarrier after the shift, then wait on that barrier before loading or otherwise consuming the buffer. The buffer must be a mutable rank-2 TMEM allocation using the standard tensor-memory encoding. It must occupy exactly 128 physical TMEM rows, and its physical column count must be a multiple of 8. The compiler emits one shift instruction per 32-byte column segment.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>buffer</code>: Mutable rank-2 tensor-memory buffer to shift in place</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">    buffers = tlx.local_alloc(
+        (128, 16),
+        tl.float32,
+        num=1,
+        storage=tlx.storage_kind.tmem,
+    )
+    buffer = tlx.local_view(buffers, 0)
+    barriers = tlx.alloc_barriers(1)
+    barrier = tlx.local_view(barriers, 0)
+
+    tlx.local_store(buffer, values)
+    tlx.tmem_shift(buffer)
+    tlx.tcgen05_commit(barrier)
+    tlx.barrier_wait(barrier, phase=0)
+    shifted = tlx.local_load(buffer)</code></pre>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)</code> <strong>[sm90+, gfx942+?]</strong></div></div>
 <p>Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from <code>src</code> at positions specified by <code>indices</code> along the given <code>axis</code>.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_scatter(dst, src, indices, axis, optional_token)</code> <strong>[sm90+, gfx942+?]</strong></div></div>
