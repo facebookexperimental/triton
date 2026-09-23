@@ -53,6 +53,14 @@ def test_space_reaches_requested_autotuner(monkeypatch, space):
         gfx942._gemm(object(), object(), out=object(), space=space)
 
 
+def test_full_space_includes_shape_specific_incumbent():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    configs = gfx942._candidate_configs((2048, 10240, 25408))
+    assert len(configs) == len(gfx942.CONFIGS()) + 1
+    assert any(config.kwargs.get("SPLIT_M_128_32") for config in configs)
+
+
 def test_unaligned_row_base_vectorizes():
     from triton.tlx.ops.kernels.mm import gfx942
 
