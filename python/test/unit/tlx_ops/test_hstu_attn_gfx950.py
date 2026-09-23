@@ -1,4 +1,9 @@
-"""tlx.ops.hstu_attn correctness -- gfx950."""
+"""gfx950 HSTU correctness.
+
+The first section covers the public ``tlx.ops.hstu_attn_dev`` forward path.
+Backward coverage below exercises the standalone tutorial implementation; it
+does not imply that the public gfx950 backend supports autograd.
+"""
 from pathlib import Path
 import pytest
 import torch
@@ -69,6 +74,8 @@ def test_hstu_attn_gfx950(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM):
     torch.testing.assert_close(out * MAX_SEQ_LEN, ref * MAX_SEQ_LEN, atol=1e-3, rtol=0)
 
 
+# Standalone tutorial backward coverage. Keep the test names explicit so a
+# green tlx_ops suite cannot be mistaken for public gfx950 backward support.
 def _load_gfx950_hstu_tutorial():
     """Load the standalone gfx950 HSTU forward/backward implementation."""
     import sys
@@ -89,7 +96,7 @@ def _load_gfx950_hstu_benchmark():
     return benchmark
 
 
-def test_hstu_attn_gfx950_fixture_launch_coverage(tmp_path):
+def test_hstu_tutorial_gfx950_fixture_launch_coverage(tmp_path):
     benchmark = _load_gfx950_hstu_benchmark()
 
     # Issue #2005 intentionally has a length one row beyond N, but every
@@ -119,7 +126,7 @@ def test_hstu_attn_gfx950_fixture_launch_coverage(tmp_path):
         benchmark._make_input_fixture_workload(fixture_path)
 
 
-def test_hstu_attn_gfx950_sequence_xcd_padding_budget():
+def test_hstu_tutorial_gfx950_sequence_xcd_padding_budget():
     hstu = _load_gfx950_hstu_tutorial()
 
     assert hstu._gfx950_fa_schedule_launch_sequences(7, 8) == (7, False)
@@ -188,7 +195,7 @@ def _assert_per_sequence_close(name, got, expected, offsets, tolerance=8e-3, tai
         ),
     ],
 )
-def test_hstu_attn_gfx950_backward_target_causal(bwd_variant, sequence_xcd_case):
+def test_hstu_tutorial_gfx950_backward_target_causal(bwd_variant, sequence_xcd_case):
     """Cover ragged tails and padded/unpadded XCD sequence scheduling."""
     hstu = _load_gfx950_hstu_tutorial()
     torch.manual_seed(7)
@@ -258,7 +265,7 @@ def test_hstu_attn_gfx950_backward_target_causal(bwd_variant, sequence_xcd_case)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_hstu_attn_gfx950_backward_ticket_2005_layout():
+def test_hstu_tutorial_gfx950_backward_ticket_2005_layout():
     """Cover the interleaved QKV layout and N/length boundary from issue #2005."""
     hstu = _load_gfx950_hstu_tutorial()
     device = torch.device("cuda")
@@ -347,7 +354,7 @@ def test_hstu_attn_gfx950_backward_ticket_2005_layout():
         ),
     ],
 )
-def test_hstu_attn_gfx950_backward_reuses_poisoned_outputs(bwd_options):
+def test_hstu_tutorial_gfx950_backward_reuses_poisoned_outputs(bwd_options):
     """Repeated launches must clear aliased or separate dQ accumulation state."""
     hstu = _load_gfx950_hstu_tutorial()
     torch.manual_seed(11)
@@ -435,7 +442,7 @@ def test_hstu_attn_gfx950_backward_reuses_poisoned_outputs(bwd_options):
         ),
     ],
 )
-def test_hstu_attn_gfx950_backward_graph_replay_resets_dq(bwd_options):
+def test_hstu_tutorial_gfx950_backward_graph_replay_resets_dq(bwd_options):
     """Captured backward launches must reset dQ accumulation on every replay."""
     hstu = _load_gfx950_hstu_tutorial()
     torch.manual_seed(13)
