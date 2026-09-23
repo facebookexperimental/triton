@@ -33,34 +33,6 @@
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
 
-- `tlx.tmem_shift(buffer)` **[sm100]**
-
-    Shift a mutable tensor-memory buffer in place with Blackwell `tcgen05.shift.down` instructions. Within each 32-row TMEM group, rows 0 through 30 receive the previous contents of the following row; row 31 is unchanged.
-
-    The instruction completes asynchronously. Call `tlx.tcgen05_commit` with an mbarrier after the shift, then wait on that barrier before loading or otherwise consuming the buffer. The buffer must be a mutable rank-2 TMEM allocation using the standard tensor-memory encoding. It must occupy exactly 128 physical TMEM rows, and its physical column count must be a multiple of 8. The compiler emits one shift instruction per 32-byte column segment.
-
-    **Parameters:**
-    - `buffer`: Mutable rank-2 tensor-memory buffer to shift in place
-
-    **Example:**
-    ```python
-    buffers = tlx.local_alloc(
-        (128, 16),
-        tl.float32,
-        num=1,
-        storage=tlx.storage_kind.tmem,
-    )
-    buffer = tlx.local_view(buffers, 0)
-    barriers = tlx.alloc_barriers(1)
-    barrier = tlx.local_view(barriers, 0)
-
-    tlx.local_store(buffer, values)
-    tlx.tmem_shift(buffer)
-    tlx.tcgen05_commit(barrier)
-    tlx.barrier_wait(barrier, phase=0)
-    shifted = tlx.local_load(buffer)
-    ```
-
 - `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[sm90+, gfx942+?]**
 
     Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.
