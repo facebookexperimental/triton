@@ -137,26 +137,26 @@
 
 ## Rubin packed x4 arithmetic
 
-> `tlx.add4`, `tlx.sub4`, `tlx.mul4`, and `tlx.fma4` require **[sm107+]**.
+> `tlx.packed_add4`, `tlx.packed_sub4`, `tlx.packed_mul4`, and `tlx.packed_fma4` require **[sm107+]**.
 
 These operations apply one Rubin packed-arithmetic instruction to four low-precision lanes at a time. Operands must be block tensors containing FP8 E4M3/E5M2 values or packed FP4 E2M1 values represented as `tl.int8`.
 
 | API | Operation and result |
 |-----|----------------------|
-| `tlx.add4(lhs, rhs, dtype=None)` | Add `lhs` to the FP8 `rhs`; the result has the type and shape of `rhs` |
-| `tlx.sub4(lhs, rhs, dtype=None)` | Subtract the FP8 `rhs` from `lhs`; the result has the type and shape of `rhs` |
-| `tlx.mul4(lhs, rhs, dtype=None)` | Multiply FP8 or packed-FP4 inputs and produce an FP8 result |
-| `tlx.fma4(lhs, rhs, acc, dtype=None)` | Multiply FP8 or packed-FP4 inputs and add the FP8 accumulator; the result has the type and shape of `acc` |
+| `tlx.packed_add4(lhs, rhs, dtype=None)` | Add `lhs` to the FP8 `rhs`; the result has the type and shape of `rhs` |
+| `tlx.packed_sub4(lhs, rhs, dtype=None)` | Subtract the FP8 `rhs` from `lhs`; the result has the type and shape of `rhs` |
+| `tlx.packed_mul4(lhs, rhs, dtype=None)` | Multiply FP8 or packed-FP4 inputs and produce an FP8 result |
+| `tlx.packed_fma4(lhs, rhs, acc, dtype=None)` | Multiply FP8 or packed-FP4 inputs and add the FP8 accumulator; the result has the type and shape of `acc` |
 
-`dtype` may be omitted when an FP8 result-typed operand, such as `rhs` or `acc`, determines it. Multiplying two packed-FP4 operands requires an explicit FP8 result `dtype`. For mixed FP4/FP8 operations, the packed-FP4 tensor has exactly one dimension at half the corresponding FP8 extent. For an all-FP4 `mul4`, packing is inferred along the final dimension and the logical result doubles that dimension.
+`dtype` may be omitted when an FP8 result-typed operand, such as `rhs` or `acc`, determines it. Multiplying two packed-FP4 operands requires an explicit FP8 result `dtype`. For mixed FP4/FP8 operations, the packed-FP4 tensor has exactly one dimension at half the corresponding FP8 extent. For an all-FP4 `packed_mul4`, packing is inferred along the final dimension and the logical result doubles that dimension.
 
 ```python
 # fp4_values contains two packed E2M1 values per int8 element.
-mixed = tlx.mul4(fp4_values, fp8_values, dtype=tl.float8e4nv)
-acc = tlx.fma4(fp4_values, fp8_values, fp8_acc)
+mixed = tlx.packed_mul4(fp4_values, fp8_values, dtype=tl.float8e4nv)
+acc = tlx.packed_fma4(fp4_values, fp8_values, fp8_acc)
 
 # An all-FP4 multiply needs an explicit FP8 result type.
-product = tlx.mul4(fp4_lhs, fp4_rhs, dtype=tl.float8e5)
+product = tlx.packed_mul4(fp4_lhs, fp4_rhs, dtype=tl.float8e5)
 ```
 
 The frontend lowers these APIs to `ttng.packed_arith`; the SM107 backend then emits the corresponding `add`, `sub`, `mul`, or `fma` x4 PTX instruction.

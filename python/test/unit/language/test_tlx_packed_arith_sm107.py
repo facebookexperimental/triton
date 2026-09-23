@@ -29,13 +29,13 @@ def _packed_fp8_kernel(a_ptr, b_ptr, c_ptr, output_ptr, OP: tl.constexpr, DTYPE:
     b = tlx.require_layout(tl.load(b_ptr + offsets), RESULT_LAYOUT)
     c = tlx.require_layout(tl.load(c_ptr + offsets), RESULT_LAYOUT)
     if OP == "add":
-        result = tlx.add4(a, b, dtype=DTYPE)
+        result = tlx.packed_add4(a, b, dtype=DTYPE)
     elif OP == "sub":
-        result = tlx.sub4(a, b, dtype=DTYPE)
+        result = tlx.packed_sub4(a, b, dtype=DTYPE)
     elif OP == "mul":
-        result = tlx.mul4(a, b, dtype=DTYPE)
+        result = tlx.packed_mul4(a, b, dtype=DTYPE)
     else:
-        result = tlx.fma4(a, b, c, dtype=DTYPE)
+        result = tlx.packed_fma4(a, b, c, dtype=DTYPE)
     tl.store(output_ptr + offsets, result)
 
 
@@ -48,15 +48,15 @@ def _packed_fp4_kernel(fp4_a_ptr, fp4_b_ptr, fp8_ptr, output_ptr, OP: tl.constex
     fp4_b = tlx.require_layout(tl.load(fp4_b_ptr + packed_offsets), FP4_LAYOUT)
     fp8 = tlx.require_layout(tl.load(fp8_ptr + offsets), RESULT_LAYOUT)
     if OP == "add":
-        result = tlx.add4(fp4_a, fp8, dtype=DTYPE)
+        result = tlx.packed_add4(fp4_a, fp8, dtype=DTYPE)
     elif OP == "sub":
-        result = tlx.sub4(fp4_a, fp8, dtype=DTYPE)
+        result = tlx.packed_sub4(fp4_a, fp8, dtype=DTYPE)
     elif OP == "mul":
-        result = tlx.mul4(fp4_a, fp8, dtype=DTYPE)
+        result = tlx.packed_mul4(fp4_a, fp8, dtype=DTYPE)
     elif OP == "fma":
-        result = tlx.fma4(fp4_a, fp8, fp8, dtype=DTYPE)
+        result = tlx.packed_fma4(fp4_a, fp8, fp8, dtype=DTYPE)
     else:
-        result = tlx.mul4(fp4_a, fp4_b, dtype=DTYPE)
+        result = tlx.packed_mul4(fp4_a, fp4_b, dtype=DTYPE)
     tl.store(output_ptr + offsets, result)
 
 
@@ -65,7 +65,7 @@ def _packed_fp4_missing_dtype_kernel(fp4_a_ptr, fp4_b_ptr, FP4_LAYOUT: tl.conste
     packed_offsets = tlx.require_layout(tl.arange(0, 256), FP4_LAYOUT)
     fp4_a = tlx.require_layout(tl.load(fp4_a_ptr + packed_offsets), FP4_LAYOUT)
     fp4_b = tlx.require_layout(tl.load(fp4_b_ptr + packed_offsets), FP4_LAYOUT)
-    tlx.mul4(fp4_a, fp4_b)
+    tlx.packed_mul4(fp4_a, fp4_b)
 
 
 def _compile_to_ptx(kernel, signature, constexprs, capability=107):

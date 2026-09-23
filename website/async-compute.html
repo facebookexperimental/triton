@@ -145,16 +145,16 @@
     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
     tl.store(C_ptrs, acc)</code></pre>
 <h2 id="rubin-packed-x4-arithmetic">Rubin packed x4 arithmetic</h2>
-<blockquote><p><code>tlx.add4</code>, <code>tlx.sub4</code>, <code>tlx.mul4</code>, and <code>tlx.fma4</code> require <strong>[sm107+]</strong>.</p></blockquote>
+<blockquote><p><code>tlx.packed_add4</code>, <code>tlx.packed_sub4</code>, <code>tlx.packed_mul4</code>, and <code>tlx.packed_fma4</code> require <strong>[sm107+]</strong>.</p></blockquote>
 <p>These operations apply one Rubin packed-arithmetic instruction to four low-precision lanes at a time. Operands must be block tensors containing FP8 E4M3/E5M2 values or packed FP4 E2M1 values represented as <code>tl.int8</code>.</p>
-<table><thead><tr><th>API</th><th>Operation and result</th></tr></thead><tbody><tr><td><code>tlx.add4(lhs, rhs, dtype=None)</code></td><td>Add <code>lhs</code> to the FP8 <code>rhs</code>; the result has the type and shape of <code>rhs</code></td></tr><tr><td><code>tlx.sub4(lhs, rhs, dtype=None)</code></td><td>Subtract the FP8 <code>rhs</code> from <code>lhs</code>; the result has the type and shape of <code>rhs</code></td></tr><tr><td><code>tlx.mul4(lhs, rhs, dtype=None)</code></td><td>Multiply FP8 or packed-FP4 inputs and produce an FP8 result</td></tr><tr><td><code>tlx.fma4(lhs, rhs, acc, dtype=None)</code></td><td>Multiply FP8 or packed-FP4 inputs and add the FP8 accumulator; the result has the type and shape of <code>acc</code></td></tr></tbody></table>
-<p><code>dtype</code> may be omitted when an FP8 result-typed operand, such as <code>rhs</code> or <code>acc</code>, determines it. Multiplying two packed-FP4 operands requires an explicit FP8 result <code>dtype</code>. For mixed FP4/FP8 operations, the packed-FP4 tensor has exactly one dimension at half the corresponding FP8 extent. For an all-FP4 <code>mul4</code>, packing is inferred along the final dimension and the logical result doubles that dimension.</p>
+<table><thead><tr><th>API</th><th>Operation and result</th></tr></thead><tbody><tr><td><code>tlx.packed_add4(lhs, rhs, dtype=None)</code></td><td>Add <code>lhs</code> to the FP8 <code>rhs</code>; the result has the type and shape of <code>rhs</code></td></tr><tr><td><code>tlx.packed_sub4(lhs, rhs, dtype=None)</code></td><td>Subtract the FP8 <code>rhs</code> from <code>lhs</code>; the result has the type and shape of <code>rhs</code></td></tr><tr><td><code>tlx.packed_mul4(lhs, rhs, dtype=None)</code></td><td>Multiply FP8 or packed-FP4 inputs and produce an FP8 result</td></tr><tr><td><code>tlx.packed_fma4(lhs, rhs, acc, dtype=None)</code></td><td>Multiply FP8 or packed-FP4 inputs and add the FP8 accumulator; the result has the type and shape of <code>acc</code></td></tr></tbody></table>
+<p><code>dtype</code> may be omitted when an FP8 result-typed operand, such as <code>rhs</code> or <code>acc</code>, determines it. Multiplying two packed-FP4 operands requires an explicit FP8 result <code>dtype</code>. For mixed FP4/FP8 operations, the packed-FP4 tensor has exactly one dimension at half the corresponding FP8 extent. For an all-FP4 <code>packed_mul4</code>, packing is inferred along the final dimension and the logical result doubles that dimension.</p>
 <pre><code class="language-python"># fp4_values contains two packed E2M1 values per int8 element.
-mixed = tlx.mul4(fp4_values, fp8_values, dtype=tl.float8e4nv)
-acc = tlx.fma4(fp4_values, fp8_values, fp8_acc)
+mixed = tlx.packed_mul4(fp4_values, fp8_values, dtype=tl.float8e4nv)
+acc = tlx.packed_fma4(fp4_values, fp8_values, fp8_acc)
 
 # An all-FP4 multiply needs an explicit FP8 result type.
-product = tlx.mul4(fp4_lhs, fp4_rhs, dtype=tl.float8e5)</code></pre>
+product = tlx.packed_mul4(fp4_lhs, fp4_rhs, dtype=tl.float8e5)</code></pre>
 <p>The frontend lowers these APIs to <code>ttng.packed_arith</code>; the SM107 backend then emits the corresponding <code>add</code>, <code>sub</code>, <code>mul</code>, or <code>fma</code> x4 PTX instruction.</p>
 <h2 id="explicit-mfma-scheduling">Explicit MFMA scheduling</h2>
 <blockquote><p><code>amd_scheduled_mfma</code> and <code>amd_mfma_commit</code> support <strong>[gfx942, gfx950]</strong> native BF16/F16 MFMA layouts. The register-class constraint operations are AMD-only and currently verified on <strong>[gfx950]</strong>.</p></blockquote>
