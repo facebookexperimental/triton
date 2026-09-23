@@ -1188,11 +1188,7 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
     cgaLayout =
         ttg::CGAEncodingAttr::get(ctx, LinearLayout(bases, outDimNames));
   }
-  for (int i = 0; i < rank; ++i) {
-    auto dim = cgaLayout.getCTAOrder()[i];
-    msgToOffset *= LinearLayout::identity1D(cgaLayout.getCTASplitNum()[dim],
-                                            kBlock, outDimNames[dim]);
-  }
+  msgToOffset *= cgaLayout.getLinearLayout();
   return msgToOffset;
 }
 
@@ -1280,6 +1276,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto ctx = op.getContext();
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
+    auto kOffset = str_attr("offset");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     // We multicast if the flag is on and the block layout has broadcasting
@@ -1333,9 +1330,20 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
       auto sharedAddress = applyLinearLayout(
           loc, rewriter, msgToShared, {{kMsg, copyIdxVal}, {kBlock, ctaId}});
-      auto [shMemPtr, targetCTA] = materializeLocalAddrs(
-          loc, dstTy, dstMemObj, llvmElemTy,
-          {{sharedAddress[0].second, sharedAddress[1].second}}, rewriter)[0];
+      Value shMemOffset;
+      Value layoutBlock;
+      for (auto [name, value] : sharedAddress) {
+        if (name == kOffset)
+          shMemOffset = value;
+        else if (name == kBlock)
+          layoutBlock = value;
+      }
+      if (!shMemOffset || !layoutBlock)
+        return op.emitError(
+            "expected TMA shared layout to produce offset and block");
+      auto [shMemPtr, targetCTA] =
+          materializeLocalAddrs(loc, dstTy, dstMemObj, llvmElemTy,
+                                {{shMemOffset, layoutBlock}}, rewriter)[0];
       if (affineBlockMask) {
         shMemPtr = NVVM::MapaOp::create(rewriter, loc,
                                         ptr_ty(rewriter.getContext(), 7),
