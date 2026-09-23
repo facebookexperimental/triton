@@ -153,4 +153,4 @@ print("TorchTLX registry -> compatible")
 PY
 
 log "ready"
-log "$PY python/test/tlx_benchmark/run_torchtlx_fusions.py --list"
+log "$PY python/test/torchtlx_benchmark/run_torchtlx_fusions.py --list"
