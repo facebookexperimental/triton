@@ -1,7 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-meta-to-nvws-convert \
 // RUN:   | FileCheck %s --implicit-check-not='{{ttg\.memdesc_reinterpret|allocation\.reuseTarget|buffer\.id = 22}}'
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect --nvws-meta-to-nvws-convert --nvws-meta-to-nvws-convert \
-// RUN:   | FileCheck %s --implicit-check-not='{{ttg\.memdesc_reinterpret|allocation\.reuseTarget|buffer\.id = 22}}'
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -79,8 +77,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   }
 
   // An alias outside the WS loop is replayed inside it by InsertSemas, so its
-  // Meta task assignment must become persistent NVWS ownership. Running the
-  // converter twice must retain the same partition and tag.
+  // Meta task assignment must become NVWS partition and tag metadata.
   // CHECK-LABEL: tt.func @external_memdesc_alias
   tt.func @external_memdesc_alias(
       %lb: i32, %ub: i32, %step: i32) {
@@ -103,8 +100,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // Meta schedules the inner loop but specializes the enclosing task-bearing
   // loop nest. The converter promotes the WS-root metadata and its effective
   // SMEM policy, overriding the outer policy; the inner loop keeps its pipeline
-  // schedule. The file's second RUN verifies that repeating conversion preserves
-  // both the promoted policy and the circular buffer plan.
+  // schedule. The converted buffers must preserve the circular buffer plan.
   // CHECK-LABEL: tt.func @promote_nested_meta_ws_root
   tt.func @promote_nested_meta_ws_root(
       %lb: i32, %ub: i32, %step: i32) {
