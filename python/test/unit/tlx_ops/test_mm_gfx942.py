@@ -7,6 +7,8 @@ A shape the op declines is reported as a skip with the reason, never as a
 pass.
 """
 
+import types
+
 import pytest
 import torch
 import triton
@@ -32,8 +34,8 @@ def test_gfx942_wide_heuristic_config():
     assert config.num_stages == 2
 
 
-@pytest.mark.parametrize("space, expected_shape", [("heuristic", (819200, 1024, 192)), ("full", None)])
-def test_space_reaches_requested_autotuner(monkeypatch, space, expected_shape):
+@pytest.mark.parametrize("space", ["heuristic", "origami", "full"])
+def test_space_reaches_requested_autotuner(monkeypatch, space):
     from triton.tlx.ops.kernels.mm import gfx942
 
     monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: (819200, 1024, 192))
@@ -43,12 +45,20 @@ def test_space_reaches_requested_autotuner(monkeypatch, space, expected_shape):
 
     def tuned(requested_space, shape):
         assert requested_space == space
-        assert shape == expected_shape
+        assert shape == (819200, 1024, 192)
         raise AutotunerReached
 
     monkeypatch.setattr(gfx942, "_tuned", tuned)
     with pytest.raises(AutotunerReached):
         gfx942._gemm(object(), object(), out=object(), space=space)
+
+
+def test_full_space_includes_shape_specific_incumbent():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    configs = gfx942._candidate_configs((2048, 10240, 25408))
+    assert len(configs) == len(gfx942.CONFIGS()) + 1
+    assert any(config.kwargs.get("SPLIT_M_128_32") for config in configs)
 
 
 def test_unaligned_row_base_vectorizes():
@@ -94,6 +104,113 @@ def test_unaligned_row_base_vectorizes():
     a_loads = [line for line in compiled.asm["ttgir"].splitlines() if "amdg.buffer_load %a_ptr[" in line]
     assert any("contiguity = 8" in line for line in a_loads), "expected wide unaligned A load"
     assert "buffer_load_dwordx4" in compiled.asm["amdgcn"], "expected 16-byte VMEM load"
+
+
+def test_gfx942_origami_ranking_preserves_tlx_configs():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    class Struct:
+        pass
+
+    class Dim3:
+
+        def __init__(self, m, n, k):
+            self.m, self.n, self.k = m, n, k
+
+    seen = {}
+
+    def rank_configs(problem, hardware, configs):
+        seen["problem"] = problem
+        seen["hardware"] = hardware
+        seen["configs"] = configs
+        return [types.SimpleNamespace(config=config) for config in reversed(configs)]
+
+    fake_origami = types.SimpleNamespace(
+        config_t=Struct,
+        dim3_t=Dim3,
+        get_hardware_for_device=lambda index: ("gfx942", index),
+        problem_t=Struct,
+        rank_configs=rank_configs,
+        string_to_datatype=lambda name: name,
+        transpose_t=types.SimpleNamespace(N="N", T="T"),
+    )
+    a = types.SimpleNamespace(
+        device=types.SimpleNamespace(index=3),
+        dtype=torch.float16,
+        shape=(32, 64),
+        stride=lambda: (64, 1),
+    )
+    b = types.SimpleNamespace(
+        dtype=torch.float16,
+        shape=(64, 48),
+        stride=lambda: (1, 64),
+    )
+    configs = [
+        gfx942._config(64, 64, 64, 4, 4),
+        gfx942._config(64, 64, 64, 8, 4),
+        gfx942._config(128, 128, 32, 8, 4, waves_per_eu=2),
+    ]
+    selected = gfx942._rank_configs_with_origami(
+        fake_origami,
+        configs,
+        {"a_ptr": a, "b_ptr": b, "M": 32, "N": 48, "K": 64},
+        top_k=2,
+    )
+
+    assert selected == [configs[2], configs[0], configs[1]]
+    assert [config.occupancy for config in seen["configs"]] == [1, 2]
+    assert all((config.mi.m, config.mi.n, config.mi.k) == (16, 16, 16) for config in seen["configs"])
+    assert seen["problem"].a_transpose == "N"
+    assert seen["problem"].b_transpose == "T"
+    assert seen["hardware"] == ("gfx942", 3)
+
+
+def test_gfx942_origami_missing_package_fails(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    def missing_origami(name):
+        raise ImportError("missing dependency")
+
+    monkeypatch.setattr(gfx942.importlib, "import_module", missing_origami)
+    with pytest.raises(RuntimeError, match="Could not import rocm-origami") as exc:
+        gfx942._load_origami()
+    assert isinstance(exc.value.__cause__, ImportError)
+
+
+def test_gfx942_origami_keeps_heuristic_incumbent(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (2048, 10240, 25408)
+    configs = gfx942._candidate_configs(shape)
+    monkeypatch.setattr(gfx942, "_load_origami", lambda: object())
+    monkeypatch.setattr(gfx942, "_rank_configs_with_origami", lambda *args: [configs[0]])
+
+    selected = gfx942._origami_prune_configs(
+        configs,
+        {"M": shape[0], "N": shape[1], "K": shape[2]},
+    )
+
+    assert selected[0] is configs[0]
+    assert selected[-1].kwargs["SPLIT_M_128_32"]
+
+
+def test_gfx942_origami_space_wiring():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    tuner = gfx942._tuned("origami", (128, 128, 128))
+    assert len(tuner.configs) == len(gfx942.CONFIGS())
+    assert tuner.early_config_prune is gfx942._origami_prune_configs
+    assert {"stride_am", "stride_ak", "stride_bk", "stride_bn"} <= set(tuner.keys)
+
+
+def test_gfx942_full_and_origami_share_candidate_universe():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (2048, 10240, 25408)
+    full = gfx942._tuned("full", shape)
+    origami = gfx942._tuned("origami", shape)
+    assert full.configs == origami.configs
+    assert any(config.kwargs.get("SPLIT_M_128_32") for config in full.configs)
 
 
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", shapes())

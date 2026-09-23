@@ -19,7 +19,7 @@ python python/test/tlx_benchmark/bench_{op}.py
 options:
   -h, --help            show this help message and exit
   --device DEVICE       GPU index, or 'auto' (default) for the least-used one
-  --space {heuristic,full,smoke}
+  --space {heuristic,origami,full,smoke}
                         autotune search space; the default is each op's own, and measuring anything
                         else measures a path users do not take
   --head N              only the first N cases PER DIRECTION, for a quick look; on an op with a
@@ -67,6 +67,13 @@ selection and expose `heuristic` as the suite's comparable default label. The
 remaining direct providers autotune a full space on their first call, which is
 minutes rather than seconds; they raise `cap_s` accordingly rather than measure
 a `smoke` space no user takes.
+
+On gfx942, `mm` also accepts the experimental `origami` space. When the optional
+`rocm-origami` package is available, it ranks the curated ROCm direct-load
+candidate pool and Triton benchmarks the top sixteen analytical groups' original
+configs plus the existing heuristic incumbent. An explicit request fails when
+Origami is missing or incompatible. The `full` and `origami` spaces use the
+same candidate universe, including any shape-specific incumbent.
 
 The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
 They force the TLX template (`tlx_mode="force"`) and race it against the same

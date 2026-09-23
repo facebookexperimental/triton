@@ -398,7 +398,7 @@ def main(bench, argv=None) -> int:
     parser = argparse.ArgumentParser(description=bench.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
     parser.add_argument(
-        "--space", choices=("heuristic", "full", "smoke"), default=None,
+        "--space", choices=("heuristic", "origami", "full", "smoke"), default=None,
         help=f"autotune search space (default {resolve_space(bench, None)}); the default is what this op "
         "uses by default, and measuring anything else measures a path users do not take")
     parser.add_argument("--head", type=int, default=None, metavar="N",

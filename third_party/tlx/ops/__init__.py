@@ -28,6 +28,12 @@ second. On implementations that provide it, pass `space="full"` explicitly to
 buy back the tuned configs, which are worth up to ~4x on small shapes. The
 gfx950 implementation currently provides only `"heuristic"`.
 
+The gfx942 `mm`/`addmm` implementation additionally provides an experimental
+`"origami"` space. It uses the optional `rocm-origami` package to rank the
+curated macro-tile/occupancy groups, then empirically tunes the top sixteen groups'
+original TLX configs plus the existing heuristic incumbent. An explicit
+`space="origami"` request fails if Origami is absent or incompatible.
+
 Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly

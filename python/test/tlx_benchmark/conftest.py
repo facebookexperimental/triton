@@ -1,7 +1,7 @@
 def pytest_addoption(parser):
     group = parser.getgroup("tlx-benchmark")
     group.addoption(
-        "--space", choices=("heuristic", "full", "smoke"), default=None,
+        "--space", choices=("heuristic", "origami", "full", "smoke"), default=None,
         help="autotune search space; the default is each op's own (mm: heuristic, everything "
         "else: full), and measuring anything else measures a path users do not take")
     group.addoption("--head", type=int, default=None, metavar="N",
