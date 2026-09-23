@@ -95,6 +95,116 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A while forwards condition arguments to its results even on zero iterations.
+// The before/after regions deliberately use different types and value orders.
+// A nested execute_region also exercises the generic region-branch mapping.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHAIN: #mma = #ttg.amd_mfma<{{.*}}warpsPerCTA = [4, 1]
+// CHAIN-LABEL: @chain_through_while
+// CHAIN: tt.dot {{.*}} -> tensor<128x128xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<128x128xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @chain_through_while(
+      %a: tensor<128x128xf16, #dotOp0>, %b: tensor<128x128xf16, #dotOp1>,
+      %limit: i32) -> tensor<128x128xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
+    %i0 = arith.constant 0 : i32
+    %i1 = arith.constant 1 : i32
+    %first = tt.dot %a, %b, %zero : tensor<128x128xf16, #dotOp0> * tensor<128x128xf16, #dotOp1> -> tensor<128x128xf32, #blocked>
+    %r:2 = scf.while (%i = %i0, %acc = %first) : (i32, tensor<128x128xf32, #blocked>) -> (tensor<128x128xf16, #dotOp0>, i32) {
+      %p = scf.execute_region -> tensor<128x128xf16, #dotOp0> {
+        %half = arith.truncf %acc : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
+        %converted = ttg.convert_layout %half : tensor<128x128xf16, #blocked> -> tensor<128x128xf16, #dotOp0>
+        scf.yield %converted : tensor<128x128xf16, #dotOp0>
+      }
+      %cond = arith.cmpi slt, %i, %limit : i32
+      scf.condition(%cond) %p, %i : tensor<128x128xf16, #dotOp0>, i32
+    } do {
+    ^bb0(%p: tensor<128x128xf16, #dotOp0>, %i: i32):
+      %next_i = arith.addi %i, %i1 : i32
+      %half = ttg.convert_layout %p : tensor<128x128xf16, #dotOp0> -> tensor<128x128xf16, #blocked>
+      %acc = arith.extf %half : tensor<128x128xf16, #blocked> to tensor<128x128xf32, #blocked>
+      scf.yield %next_i, %acc : i32, tensor<128x128xf32, #blocked>
+    }
+    %last = tt.dot %r#0, %b, %zero : tensor<128x128xf16, #dotOp0> * tensor<128x128xf16, #dotOp1> -> tensor<128x128xf32, #blocked>
+    tt.return %last : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// The operand dependency exists only through the while back-edge. Visit the
+// tail before the head so its layout also exercises the backward traversal.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHAIN: #mma = #ttg.amd_mfma<{{.*}}warpsPerCTA = [4, 1]
+// CHAIN-LABEL: @chain_through_while_backedge
+// CHAIN: tt.dot {{.*}} -> tensor<128x128xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<128x128xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @chain_through_while_backedge(
+      %a: tensor<128x128xf16, #dotOp0>, %b: tensor<128x128xf16, #dotOp1>,
+      %limit: i32) -> tensor<128x128xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<128x128xf32, #blocked>
+    %i0 = arith.constant 0 : i32
+    %i1 = arith.constant 1 : i32
+    %r:3 = scf.while (%i = %i0, %p = %a, %acc = %zero) : (i32, tensor<128x128xf16, #dotOp0>, tensor<128x128xf32, #blocked>) -> (i32, tensor<128x128xf16, #dotOp0>, tensor<128x128xf32, #blocked>) {
+      %cond = arith.cmpi slt, %i, %limit : i32
+      scf.condition(%cond) %i, %p, %acc : i32, tensor<128x128xf16, #dotOp0>, tensor<128x128xf32, #blocked>
+    } do {
+    ^bb0(%i: i32, %p: tensor<128x128xf16, #dotOp0>, %acc: tensor<128x128xf32, #blocked>):
+      %tail = tt.dot %p, %b, %acc : tensor<128x128xf16, #dotOp0> * tensor<128x128xf16, #dotOp1> -> tensor<128x128xf32, #blocked>
+      %head = tt.dot %a, %b, %zero : tensor<128x128xf16, #dotOp0> * tensor<128x128xf16, #dotOp1> -> tensor<128x128xf32, #blocked>
+      %half = arith.truncf %head : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
+      %next_p = ttg.convert_layout %half : tensor<128x128xf16, #blocked> -> tensor<128x128xf16, #dotOp0>
+      %next_i = arith.addi %i, %i1 : i32
+      scf.yield %next_i, %next_p, %tail : i32, tensor<128x128xf16, #dotOp0>, tensor<128x128xf32, #blocked>
+    }
+    tt.return %r#2 : tensor<128x128xf32, #blocked>
+  }
+}
+
+// -----
+
+// Reordered condition arguments must not make the accumulator a dependency of
+// the independent A/B results, including through subsequent loop iterations.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#dotOp0 = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dotOp1 = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHAIN: #mma = #ttg.amd_mfma<{{.*}}warpsPerCTA = [2, 2]
+// CHAIN-LABEL: @independent_while_results
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+// CHAIN: tt.dot {{.*}} -> tensor<256x256xf32, #mma>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @independent_while_results(
+      %a: tensor<256x32xf16, #dotOp0>, %b: tensor<32x256xf16, #dotOp1>,
+      %limit: i32) -> tensor<256x256xf32, #blocked> {
+    %zero = arith.constant dense<0.0> : tensor<256x256xf32, #blocked>
+    %i0 = arith.constant 0 : i32
+    %i1 = arith.constant 1 : i32
+    %first = tt.dot %a, %b, %zero : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    %r:4 = scf.while (%i = %i0, %acc = %first, %a_iter = %a, %b_iter = %b) : (i32, tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>) -> (tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>, tensor<256x256xf32, #blocked>, i32) {
+      %cond = arith.cmpi slt, %i, %limit : i32
+      scf.condition(%cond) %a_iter, %b_iter, %acc, %i : tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>, tensor<256x256xf32, #blocked>, i32
+    } do {
+    ^bb0(%a_iter: tensor<256x32xf16, #dotOp0>, %b_iter: tensor<32x256xf16, #dotOp1>, %acc: tensor<256x256xf32, #blocked>, %i: i32):
+      %next = tt.dot %a_iter, %b_iter, %acc : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+      %next_a = arith.addf %a_iter, %a : tensor<256x32xf16, #dotOp0>
+      %next_b = arith.addf %b_iter, %b : tensor<32x256xf16, #dotOp1>
+      %next_i = arith.addi %i, %i1 : i32
+      scf.yield %next_i, %next, %next_a, %next_b : i32, tensor<256x256xf32, #blocked>, tensor<256x32xf16, #dotOp0>, tensor<32x256xf16, #dotOp1>
+    }
+    %last = tt.dot %r#0, %r#1, %r#2 : tensor<256x32xf16, #dotOp0> * tensor<32x256xf16, #dotOp1> -> tensor<256x256xf32, #blocked>
+    tt.return %last : tensor<256x256xf32, #blocked>
+  }
+}
+
+// -----
+
 // Check the warpsPerCTA parameter of #mma layout of the two dot's.
 // The 1st dot always has warpsPerCTA = [4, 1].
 // The warpsPerCTA for the 2nd dot depends on mfma instruction size and BLOCK_M size.

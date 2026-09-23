@@ -4,8 +4,8 @@
 #include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -916,6 +916,7 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
   // independent A/B tiles does not make those tiles depend on the accumulator.
   SmallVector<Value> worklist{dotOp.getD()};
   DenseSet<Value> visited;
+  DenseMap<Operation *, RegionBranchSuccessorMapping> successorMaps;
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     if (!visited.insert(value).second)
@@ -927,27 +928,21 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
             value == (opIdx == 0 ? nextDot.getA() : nextDot.getB()))
           return true;
       }
-      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
-        if (auto iterArg = forOp.getTiedLoopRegionIterArg(&use)) {
-          worklist.push_back(iterArg);
-          // The initial value is also the result when the loop is skipped.
-          worklist.push_back(forOp.getTiedLoopResult(&use));
-        }
+      auto branch = dyn_cast<RegionBranchOpInterface>(user);
+      if (!branch && isa<RegionBranchTerminatorOpInterface>(user))
+        branch =
+            dyn_cast_if_present<RegionBranchOpInterface>(user->getParentOp());
+      if (branch) {
+        // The interface maps only forwarded operands, excluding conditions
+        // and other control dependencies. Cache all entry/exit/back-edge maps.
+        auto [it, inserted] = successorMaps.try_emplace(branch.getOperation());
+        if (inserted)
+          branch.getSuccessorOperandInputMapping(it->second);
+        auto successors = it->second.find(&use);
+        if (successors != it->second.end())
+          llvm::append_range(worklist, successors->second);
         continue;
       }
-      if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
-        Operation *parent = yieldOp->getParentOp();
-        unsigned index = use.getOperandNumber();
-        if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
-          worklist.push_back(forOp.getRegionIterArg(index));
-          worklist.push_back(forOp.getResult(index));
-        } else if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
-          worklist.push_back(ifOp.getResult(index));
-        }
-        continue;
-      }
-      // Do not turn control dependencies on other region operations into
-      // dependencies on every result (in particular, an scf.if condition).
       if (user->getNumRegions() == 0)
         llvm::append_range(worklist, user->getResults());
     }
@@ -958,34 +953,29 @@ bool isChainDotHead(tt::DotOpInterface dotOp, unsigned opIdx) {
 bool isChainDotTail(tt::DotOpInterface dotOp) {
   SmallVector<Value> worklist{dotOp.getA()};
   DenseSet<Value> visited;
+  DenseMap<Operation *, RegionBranchInverseSuccessorMapping> predecessorMaps;
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     if (!visited.insert(value).second)
       continue;
-    if (auto arg = dyn_cast<BlockArgument>(value)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())) {
-        if (OpOperand *init = forOp.getTiedLoopInit(arg)) {
-          worklist.push_back(init->get());
-          worklist.push_back(forOp.getTiedLoopYieldedValue(arg)->get());
-        }
-      }
-      continue;
-    }
-    auto result = cast<OpResult>(value);
-    Operation *def = result.getOwner();
-    if (isa<tt::DotOpInterface>(def) && def != dotOp)
+    Operation *def = value.getDefiningOp();
+    if (isa_and_nonnull<tt::DotOpInterface>(def) && def != dotOp)
       return true;
-    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
-      worklist.push_back(forOp.getTiedLoopRegionIterArg(result));
+    Operation *owner =
+        def ? def : cast<BlockArgument>(value).getOwner()->getParentOp();
+    if (auto branch = dyn_cast_if_present<RegionBranchOpInterface>(owner)) {
+      // Map this particular result or block argument back to its sources;
+      // region inputs and outputs need not have matching types or positions.
+      auto [it, inserted] = predecessorMaps.try_emplace(branch.getOperation());
+      if (inserted)
+        branch.getSuccessorInputOperandMapping(it->second);
+      auto predecessors = it->second.find(value);
+      if (predecessors != it->second.end())
+        for (OpOperand *operand : predecessors->second)
+          worklist.push_back(operand->get());
       continue;
     }
-    if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
-      unsigned index = result.getResultNumber();
-      worklist.push_back(ifOp.thenYield().getOperand(index));
-      worklist.push_back(ifOp.elseYield().getOperand(index));
-      continue;
-    }
-    if (def->getNumRegions() == 0)
+    if (def && def->getNumRegions() == 0)
       llvm::append_range(worklist, def->getOperands());
   }
   return false;
