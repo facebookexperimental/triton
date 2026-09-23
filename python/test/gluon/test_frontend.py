@@ -280,7 +280,10 @@ def test_nvmma_layout_rank_mangling():
     module = run_parser(nvmma_layout_rank_kernel, target=HOPPER_TARGET)
     module_text = module.str_nodebug()
 
-    assert module_text.count("tt.func private @test_frontend.allocate_with_nvmma_layout") == 2
+    specializations = re.findall(
+        r'tt\.func private @"(test_frontend\.allocate_with_nvmma_layout[^"]*)"', module_text)
+    assert len(specializations) == 2
+    assert len(set(specializations)) == 2
     assert "!ttg.memdesc<16x16xf16" in module_text
     assert "!ttg.memdesc<2x16x16xf16" in module_text
 
