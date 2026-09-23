@@ -71,6 +71,13 @@ rms_norm:
   disabled_devices:
     - hip
 # ============ TODO: errors in CI ============
+# TLX matmul does not support backward on gfx950.
+gemm:
+  backends: tlx_matmul_gfx950
+  disabled_devices:
+    - mi350
+  disabled_channels:
+    - meta-triton
 launch_latency:
   backends: nop_triton_kernel_autotuned,nop_triton_kernel_autotuned_nocache
   disabled_devices:
