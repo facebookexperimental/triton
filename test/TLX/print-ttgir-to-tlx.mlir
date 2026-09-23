@@ -1585,3 +1585,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// amdg.extract_slice keeps its offsets in an attribute and its shape in the
+// result type, both of which the generic operand-only path drops.
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [32, 32, 8], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def amd_extract_slice(
+  // CHECK: tlx.extract_slice(arg0, [128, 32], [0, 0])
+  tt.func public @amd_extract_slice(%x: tensor<256x64xf16, #mma>) attributes {noinline = false} {
+    %s = amdg.extract_slice %x [0, 0] : tensor<256x64xf16, #mma> to tensor<128x32xf16, #mma>
+    tt.return
+  }
+
+  // Distinct non-zero offsets: all-zero offsets would not catch the shape
+  // being emitted in the offset list, or the two lists being swapped.
+  // CHECK-LABEL: def amd_extract_slice_offsets(
+  // CHECK: tlx.extract_slice(arg0, [128, 32], [128, 0])
+  tt.func public @amd_extract_slice_offsets(%x: tensor<256x64xf16, #mma>) attributes {noinline = false} {
+    %s = amdg.extract_slice %x [128, 0] : tensor<256x64xf16, #mma> to tensor<128x32xf16, #mma>
+    tt.return
+  }
+}

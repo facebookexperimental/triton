@@ -2483,6 +2483,39 @@ void printSimplifiedOp(
     return;
   }
 
+  // amdg.extract_slice takes its offsets as an attribute and gets its shape
+  // from the result type; tlx.extract_slice wants both spelled out.
+  if (opName == "amdg.extract_slice" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1) {
+    auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    auto srcTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto offsets = op->getAttrOfType<DenseI64ArrayAttr>("static_offsets");
+    // tlx.extract_slice takes the shape and the offsets as equal-length lists;
+    // emitting mismatched ranks would be silently wrong, so leave a disagreeing
+    // op to the generic path, which flags it. A dynamic dimension is the same
+    // hazard: getDimSize would hand back ShapedType::kDynamic and that negative
+    // sentinel would be emitted as the shape. The encodings have to agree too:
+    // only the shape and offsets are emitted, and create_amd_extract_slice
+    // rebuilds the result type from the source encoding, so a result that was
+    // laid out differently would come back silently relaid out. The verifier
+    // pins lane and warp bases but not the register bases, so they can differ.
+    if (resTy && srcTy && resTy.hasStaticShape() &&
+        resTy.getEncoding() == srcTy.getEncoding() && offsets &&
+        offsets.size() == resTy.getRank()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tlx.extract_slice("
+         << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+      for (unsigned i = 0; i < resTy.getRank(); ++i)
+        os << (i ? ", " : "") << resTy.getDimSize(i);
+      os << "], [";
+      for (unsigned i = 0; i < offsets.size(); ++i)
+        os << (i ? ", " : "") << offsets[i];
+      os << "])";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
