@@ -230,9 +230,9 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"arith.constant", "const", "Constant value"},
     {"arith.select", "tl.where", "Select operation"},
     {"arith.maxf", "tl.maximum", "Float max"},
-    {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
+    {"arith.maxnumf", "tl.maximum", "Float max (NaN-quieting)"},
     {"arith.minf", "tl.minimum", "Float min"},
-    {"arith.minnumf", "tl.minimum", "Float min (NaN-propagating)"},
+    {"arith.minnumf", "tl.minimum", "Float min (NaN-quieting)"},
     // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
     // they are not used here. Use tl.minimum/maximum similar to float above.
     {"arith.maxsi", "tl.maximum", "Signed integer max"},
@@ -2452,6 +2452,65 @@ void printSimplifiedOp(
   if (auto barrier = dyn_cast<ttg::BarrierOp>(op)) {
     if (isAMDTarget(op) && barrier.getAddrSpace() == ttg::AddrSpace::Local) {
       os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tl.maximum/minimum/clamp default to propagate_nan=NONE, which is the
+  // NaN-quieting behaviour of maxnumf/minnumf. maximumf/minimumf propagate
+  // NaN instead, and tt.clampf carries the choice in an attribute, so all
+  // three have to say so explicitly or the round trip changes NaN semantics.
+  if ((opName == "arith.maximumf" || opName == "arith.minimumf") &&
+      op->getNumOperands() == 2 && op->getNumResults() == 1) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+       << (opName == "arith.maximumf" ? "tl.maximum(" : "tl.minimum(")
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap)
+       << ", propagate_nan=tl.PropagateNan.ALL)";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = tl.clamp(";
+    for (unsigned i = 0; i < 3; ++i)
+      os << (i ? ", " : "") << getValueName(op->getOperand(i), argSubstitutionMap);
+    if (clamp.getPropagateNan() == tt::PropagateNan::ALL)
+      os << ", propagate_nan=tl.PropagateNan.ALL";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // amdg.extract_slice takes its offsets as an attribute and gets its shape
+  // from the result type; tlx.extract_slice wants both spelled out.
+  if (opName == "amdg.extract_slice" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1) {
+    auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    auto srcTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto offsets = op->getAttrOfType<DenseI64ArrayAttr>("static_offsets");
+    // tlx.extract_slice takes the shape and the offsets as equal-length lists;
+    // emitting mismatched ranks would be silently wrong, so leave a disagreeing
+    // op to the generic path, which flags it. A dynamic dimension is the same
+    // hazard: getDimSize would hand back ShapedType::kDynamic and that negative
+    // sentinel would be emitted as the shape. The encodings have to agree too:
+    // only the shape and offsets are emitted, and create_amd_extract_slice
+    // rebuilds the result type from the source encoding, so a result that was
+    // laid out differently would come back silently relaid out. The verifier
+    // pins lane and warp bases but not the register bases, so they can differ.
+    if (resTy && srcTy && resTy.hasStaticShape() &&
+        resTy.getEncoding() == srcTy.getEncoding() && offsets &&
+        offsets.size() == resTy.getRank()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tlx.extract_slice("
+         << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+      for (unsigned i = 0; i < resTy.getRank(); ++i)
+        os << (i ? ", " : "") << resTy.getDimSize(i);
+      os << "], [";
+      for (unsigned i = 0; i < offsets.size(); ++i)
+        os << (i ? ", " : "") << offsets[i];
+      os << "])";
       printLocComment(op, os);
       return;
     }
