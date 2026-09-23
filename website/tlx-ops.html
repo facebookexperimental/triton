@@ -52,8 +52,8 @@
 <h2 id="interface">Interface</h2>
 <pre><code class="language-python">from triton.tlx.ops import mm as tlx_mm
 
-out = tlx_mm(a, b, arch=&quot;sm100&quot;)</code></pre>
-<p><code>sm100</code> rather than <code>blackwell</code>, to align with the PTX convention.</p>
+out = tlx_mm(a, b)</code></pre>
+<p><code>tlx.ops</code> infers the architecture from the input tensors and dispatches to the matching registered implementation.</p>
 <h2 id="structure">Structure</h2>
 <pre><code>third_party/tlx/
     ops/                    -&gt; (symlink) python/triton/tlx/ops
