@@ -11,10 +11,6 @@ import torch
 import triton
 import triton.language as tl
 
-# Keep the steady-state K loop unmasked and handle an uneven final tile once.
-_PEEL_K_TAIL = True
-
-
 @triton.jit
 def matmul_kernel_gfx942(
     a_ptr,
@@ -39,7 +35,6 @@ def matmul_kernel_gfx942(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
     ADD_BIAS: tl.constexpr,
-    PEEL_K_TAIL: tl.constexpr,
     SPLIT_M_128_32: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
@@ -121,29 +116,20 @@ def matmul_kernel_gfx942(
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
         even_k = K % BLOCK_K == 0
-        if PEEL_K_TAIL:
-            k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
-            for k in range(0, k_main, BLOCK_K):
-                a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-                b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs)
-                acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
-            if not even_k:
-                a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
-                b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-                tail = offs_k < K - k_main
-                a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
-                b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
-                acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
-        else:
-            for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
-                k = k_idx * BLOCK_K
-                a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-                b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-                a = tl.load(a_ptrs) if even_k else tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-                b = tl.load(b_ptrs) if even_k else tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
-                acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
+        for k in range(0, k_main, BLOCK_K):
+            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        if not even_k:
+            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
+            b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            tail = offs_k < K - k_main
+            a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
+            b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
+            acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
 
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
         cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
@@ -228,7 +214,7 @@ def _tuned(space, shape=None):
         configs = heuristic_config(*shape)
     else:
         configs = {"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space]()
-    return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS", "PEEL_K_TAIL"])(matmul_kernel_gfx942)
+    return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS"])(matmul_kernel_gfx942)
 
 
 def _validate_operands(a, b, out):
@@ -286,7 +272,6 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         out.stride(0),
         out.stride(1),
         ADD_BIAS=bias is not None,
-        PEEL_K_TAIL=_PEEL_K_TAIL,
         matrix_instr_nonkdim=16,
     )
     return out

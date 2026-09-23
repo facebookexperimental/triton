@@ -84,7 +84,6 @@ def test_unaligned_row_base_vectorizes():
         out.stride(0),
         out.stride(1),
         ADD_BIAS=False,
-        PEEL_K_TAIL=True,
         matrix_instr_nonkdim=16,
         num_warps=4,
         num_stages=2,
