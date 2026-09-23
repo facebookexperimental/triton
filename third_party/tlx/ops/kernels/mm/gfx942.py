@@ -6,20 +6,17 @@ full autotune space.
 
 import functools
 import importlib
-import logging
 
 import torch
 
 import triton
 import triton.language as tl
 
-log = logging.getLogger(__name__)
-
 # Origami only models the macro tile, matrix instruction, and occupancy. Keep
 # enough analytical groups for Triton's empirical tuner to resolve TLX-specific
 # variants that Origami cannot see. This is intentionally opt-in through
 # ``space="origami"``; the production heuristic is unchanged.
-_ORIGAMI_TOP_K = 8
+_ORIGAMI_TOP_K = 16
 _ORIGAMI_UNSUPPORTED_ROCM_MAJOR = 10
 
 
@@ -261,13 +258,13 @@ def _load_origami():
     if hip_version is not None:
         try:
             if int(hip_version.split(".", 1)[0]) >= _ORIGAMI_UNSUPPORTED_ROCM_MAJOR:
-                return None
-        except ValueError:
-            return None
+                raise RuntimeError(f"rocm-origami does not support ROCm {hip_version}")
+        except ValueError as exc:
+            raise RuntimeError(f"Could not parse ROCm version {hip_version!r}") from exc
     try:
         module = importlib.import_module("origami")
-    except (ImportError, OSError):
-        return None
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("Could not import rocm-origami") from exc
     required = (
         "config_t",
         "dim3_t",
@@ -277,7 +274,10 @@ def _load_origami():
         "string_to_datatype",
         "transpose_t",
     )
-    return module if all(hasattr(module, name) for name in required) else None
+    missing = [name for name in required if not hasattr(module, name)]
+    if missing:
+        raise RuntimeError(f"rocm-origami is missing required APIs: {', '.join(missing)}")
+    return module
 
 
 def _origami_transpose(origami, tensor):
@@ -367,21 +367,25 @@ def _rank_configs_with_origami(origami, configs, named_args, top_k=_ORIGAMI_TOP_
 
 
 def _origami_prune_configs(configs, named_args, **kwargs):
-    """Select an empirical top-K, falling back to today's one-config heuristic."""
+    """Select an empirical top-K plus the existing heuristic incumbent."""
     del kwargs
     origami = _load_origami()
-    if origami is not None:
-        try:
-            return _rank_configs_with_origami(origami, configs, named_args)
-        except Exception as exc:
-            log.warning("Origami GFX942 MM selection failed; using the existing heuristic: %s", exc)
+    if origami is None:
+        raise RuntimeError("space='origami' requires a compatible rocm-origami installation")
+    try:
+        selected = _rank_configs_with_origami(origami, configs, named_args)
+    except Exception as exc:
+        raise RuntimeError("Origami gfx942 MM selection failed") from exc
+
     M, N, K = (int(named_args[name]) for name in ("M", "N", "K"))
-    fallback = heuristic_config(M, N, K)[0]
+    incumbent = heuristic_config(M, N, K)[0]
     for config in configs:
-        if (config.kwargs == fallback.kwargs and config.num_warps == fallback.num_warps
-                and config.num_stages == fallback.num_stages):
-            return [config]
-    raise RuntimeError("Origami fallback config is missing from its autotune space")
+        if (config.kwargs == incumbent.kwargs and config.num_warps == incumbent.num_warps
+                and config.num_stages == incumbent.num_stages):
+            if all(candidate is not config for candidate in selected):
+                selected.append(config)
+            return selected
+    raise RuntimeError("Origami incumbent config is missing from its autotune space")
 
 
 def heuristic_config(M, N, K):

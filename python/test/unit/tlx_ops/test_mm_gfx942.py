@@ -157,19 +157,33 @@ def test_gfx942_origami_ranking_preserves_tlx_configs():
     assert seen["hardware"] == ("gfx942", 3)
 
 
-def test_gfx942_origami_missing_package_falls_back(monkeypatch):
+def test_gfx942_origami_missing_package_fails(monkeypatch):
     from triton.tlx.ops.kernels.mm import gfx942
 
-    monkeypatch.setattr(gfx942, "_load_origami", lambda: None)
-    tuner = gfx942._tuned("origami", (2048, 10240, 25408))
-    configs = gfx942._origami_prune_configs(
-        tuner.configs,
-        {"M": 2048, "N": 10240, "K": 25408},
+    def missing_origami(name):
+        raise ImportError("missing dependency")
+
+    monkeypatch.setattr(gfx942.importlib, "import_module", missing_origami)
+    with pytest.raises(RuntimeError, match="Could not import rocm-origami") as exc:
+        gfx942._load_origami()
+    assert isinstance(exc.value.__cause__, ImportError)
+
+
+def test_gfx942_origami_keeps_heuristic_incumbent(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (2048, 10240, 25408)
+    configs = gfx942._candidate_configs(shape)
+    monkeypatch.setattr(gfx942, "_load_origami", lambda: object())
+    monkeypatch.setattr(gfx942, "_rank_configs_with_origami", lambda *args: [configs[0]])
+
+    selected = gfx942._origami_prune_configs(
+        configs,
+        {"M": shape[0], "N": shape[1], "K": shape[2]},
     )
-    assert len(configs) == 1
-    assert configs[0].kwargs["BLOCK_M"] == 160
-    assert configs[0].kwargs["BLOCK_N"] == 512
-    assert configs[0].kwargs["BLOCK_K"] == 32
+
+    assert selected[0] is configs[0]
+    assert selected[-1].kwargs["SPLIT_M_128_32"]
 
 
 def test_gfx942_origami_space_wiring():

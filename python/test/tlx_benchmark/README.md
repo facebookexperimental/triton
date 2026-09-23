@@ -70,10 +70,10 @@ a `smoke` space no user takes.
 
 On gfx942, `mm` also accepts the experimental `origami` space. When the optional
 `rocm-origami` package is available, it ranks the curated ROCm direct-load
-candidate pool and Triton benchmarks the top eight analytical groups' original
-configs. Missing or incompatible Origami installations fall back to the
-existing one-config heuristic. The `full` and `origami` spaces use the same
-candidate universe, including any shape-specific incumbent.
+candidate pool and Triton benchmarks the top sixteen analytical groups' original
+configs plus the existing heuristic incumbent. An explicit request fails when
+Origami is missing or incompatible. The `full` and `origami` spaces use the
+same candidate universe, including any shape-specific incumbent.
 
 The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
 They force the TLX template (`tlx_mode="force"`) and race it against the same
