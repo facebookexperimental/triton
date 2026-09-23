@@ -290,6 +290,8 @@ bool containsLocalBarrier(Operation *op) {
     return true;
   if (isa<triton::nvidia_gpu::ClusterWaitOp>(op))
     return true;
+  if (isa<ttng::BarrierExpectOp>(op))
+    return true;
   if (auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op))
     return !arrive.getPerThread();
   if (isa<triton::gpu::WarpSpecializePartitionsOp>(op))
