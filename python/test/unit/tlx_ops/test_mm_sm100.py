@@ -6,8 +6,8 @@ selects only the running host's configured default.
 A shape the op declines is reported as a skip with the reason, never as a
 pass.
 
-TODO: cover the config variants dropped with the tutorial copy of this kernel --
-USE_WARP_BARRIER and NUM_CTAS=2. Only the heuristic-selected config runs today.
+TODO: cover the USE_WARP_BARRIER config variant dropped with the tutorial copy
+of this kernel. Only the heuristic-selected config runs today.
 
 The split-K tests include white-box workspace-layout coverage because the
 public API cannot pin ``SPLIT_K``/``NUM_CTAS``. A split's region must cover the
@@ -17,13 +17,14 @@ split's partials.
 
 import contextlib
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 import triton
 from triton._internal_testing import is_blackwell
 from triton.tlx.ops.kernels.mm import sm100
-from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 
 from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case
 
@@ -31,146 +32,8 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires sm100")
 
 ARCH = "sm100"
 
-# TODO: Re-enable these shapes when their direct TLX accuracy failures are fixed.
-FAILED_SHAPES = {
-    (589824, 2048, 512, (512, 1), (2048, 1), "bf16"),
-    (442368, 2048, 512, (512, 1), (2048, 1), "bf16"),
-    (589824, 1056, 800, (800, 1), (1056, 1), "bf16"),
-    (2433024, 256, 256, (256, 1), (1, 256), "bf16"),
-    (589824, 512, 2048, (2048, 1), (1, 2048), "bf16"),
-    (12800, 1024, 2304, (1, 12800), (1024, 1), "bf16"),
-    (442368, 512, 2048, (2048, 1), (1, 2048), "bf16"),
-    (2701258, 384, 384, (384, 1), (1, 384), "bf16"),
-    (2617290, 384, 384, (384, 1), (1, 384), "bf16"),
-    (2536160, 384, 384, (384, 1), (1, 384), "bf16"),
-    (442368, 512, 192, (192, 1), (512, 1), "bf16"),
-    (2433024, 256, 256, (256, 1), (256, 1), "bf16"),
-    (2701258, 384, 384, (384, 1), (384, 1), "bf16"),
-    (2617290, 384, 384, (384, 1), (384, 1), "bf16"),
-    (2536160, 384, 384, (384, 1), (384, 1), "bf16"),
-    (4126464, 256, 256, (256, 1), (1, 256), "bf16"),
-    (12800, 1024, 1152, (1, 12800), (1024, 1), "bf16"),
-    (2701258, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (2617290, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (2536160, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (294912, 3584, 800, (800, 1), (3584, 1), "bf16"),
-    (49152, 512, 1152, (1, 49152), (512, 1), "bf16"),
-    (589824, 256, 128, (128, 1), (1, 128), "bf16"),
-    (33792, 1024, 2304, (1, 33792), (1024, 1), "bf16"),
-    (589824, 512, 192, (192, 1), (512, 1), "bf16"),
-    (33792, 2048, 2304, (1, 33792), (2048, 1), "bf16"),
-    (67584, 1024, 2304, (1, 67584), (1024, 1), "bf16"),
-    (294912, 2816, 768, (768, 1), (2816, 1), "bf16"),
-    (1253376, 256, 256, (256, 1), (1, 256), "bf16"),
-    (317200, 4096, 512, (512, 1), (4096, 1), "bf16"),
-    (589824, 544, 512, (512, 1), (544, 1), "bf16"),
-    (65536, 512, 1152, (1, 65536), (512, 1), "bf16"),
-    (147456, 448, 192, (192, 1), (448, 1), "bf16"),
-    (4126464, 256, 256, (256, 1), (256, 1), "bf16"),
-    (838100, 512, 1536, (1536, 1), (1, 1536), "bf16"),
-    (810572, 512, 1536, (1536, 1), (1, 1536), "bf16"),
-    (838100, 512, 512, (512, 1), (512, 1), "bf16"),
-    (776648, 512, 1536, (1536, 1), (1, 1536), "bf16"),
-    (810572, 512, 512, (512, 1), (512, 1), "bf16"),
-    (294912, 1056, 256, (256, 1), (1056, 1), "bf16"),
-    (776648, 512, 512, (512, 1), (512, 1), "bf16"),
-    (294912, 512, 192, (192, 1), (512, 1), "bf16"),
-    (294912, 544, 768, (768, 1), (544, 1), "bf16"),
-    (294912, 512, 512, (512, 1), (512, 1), "bf16"),
-    (626688, 256, 256, (256, 1), (1, 256), "bf16"),
-    (351004, 4096, 512, (512, 1), (4096, 1), "bf16"),
-    (294912, 256, 128, (128, 1), (1, 128), "bf16"),
-    (1216512, 256, 256, (256, 1), (1, 256), "bf16"),
-    (294912, 544, 512, (512, 1), (544, 1), "bf16"),
-    (338640, 4096, 512, (512, 1), (4096, 1), "bf16"),
-    (1253376, 256, 256, (256, 1), (256, 1), "bf16"),
-    (229248, 1024, 1152, (1, 229248), (1024, 1), "bf16"),
-    (114624, 2048, 1152, (1, 114624), (2048, 1), "bf16"),
-    (1216512, 256, 256, (256, 1), (256, 1), "bf16"),
-    (294912, 384, 512, (512, 1), (384, 1), "bf16"),
-    (114624, 1024, 1152, (1, 114624), (1024, 1), "bf16"),
-    (838100, 512, 512, (512, 1), (1, 512), "bf16"),
-    (810572, 512, 512, (512, 1), (1, 512), "bf16"),
-    (451885, 512, 1536, (1536, 1), (1, 1536), "bf16"),
-    (776648, 512, 512, (512, 1), (1, 512), "bf16"),
-    (451885, 512, 512, (512, 1), (512, 1), "bf16"),
-    (397716, 512, 1536, (1536, 1), (1, 1536), "bf16"),
-    (705178, 1536, 384, (384, 1), (1536, 1), "bf16"),
-    (397716, 512, 512, (512, 1), (512, 1), "bf16"),
-    (17408, 1024, 2304, (1, 17408), (1024, 1), "bf16"),
-    (34816, 1024, 2304, (1, 34816), (1024, 1), "bf16"),
-    (2701258, 384, 128, (128, 1), (384, 1), "bf16"),
-    (626688, 256, 256, (256, 1), (256, 1), "bf16"),
-    (308743, 512, 1536, (1536, 1), (1, 1536), "bf16"),
-    (32768, 512, 1152, (1, 32768), (512, 1), "bf16"),
-    (67584, 1024, 1152, (1, 67584), (1024, 1), "bf16"),
-    (2617290, 384, 128, (128, 1), (384, 1), "bf16"),
-    (308743, 512, 512, (512, 1), (512, 1), "bf16"),
-    (73728, 384, 512, (512, 1), (384, 1), "bf16"),
-    (503599, 1536, 384, (384, 1), (1536, 1), "bf16"),
-    (294912, 368, 768, (768, 1), (368, 1), "bf16"),
-    (451885, 512, 512, (512, 1), (1, 512), "bf16"),
-    (2536160, 384, 128, (128, 1), (384, 1), "bf16"),
-    (386937, 1792, 384, (384, 1), (1792, 1), "bf16"),
-    (17408, 1024, 1152, (1, 17408), (1024, 1), "bf16"),
-    (397716, 512, 512, (512, 1), (1, 512), "bf16"),
-    (386515, 1536, 384, (384, 1), (1536, 1), "bf16"),
-    (34816, 1024, 1152, (1, 34816), (1024, 1), "bf16"),
-    (32768, 1024, 1152, (1, 32768), (1024, 1), "bf16"),
-    (313230, 1792, 384, (384, 1), (1792, 1), "bf16"),
-    (308743, 512, 512, (512, 1), (1, 512), "bf16"),
-    (294912, 512, 256, (256, 1), (512, 1), "bf16"),
-    (222929, 1792, 512, (512, 1), (1792, 1), "bf16"),
-    (198339, 1792, 512, (512, 1), (1792, 1), "bf16"),
-    (73728, 512, 512, (512, 1), (512, 1), "bf16"),
-    (776648, 512, 128, (128, 1), (512, 1), "bf16"),
-    (838100, 512, 128, (128, 1), (512, 1), "bf16"),
-    (810572, 512, 128, (128, 1), (512, 1), "bf16"),
-    (119998, 384, 384, (384, 1), (384, 1), "bf16"),
-    (132755, 1792, 512, (512, 1), (1792, 1), "bf16"),
-    (15044, 1024, 1152, (1, 15072), (1024, 1), "bf16"),
-    (119998, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (23552, 1024, 1152, (1, 23552), (1024, 1), "bf16"),
-    (107766, 2304, 384, (384, 1), (2304, 1), "bf16"),
-    (136074, 1792, 384, (384, 1), (1792, 1), "bf16"),
-    (83117, 384, 384, (384, 1), (384, 1), "bf16"),
-    (384, 384, 19459, (1, 384), (384, 1), "bf16"),
-    (211269, 1024, 384, (384, 1), (1024, 1), "bf16"),
-    (198462, 1024, 384, (384, 1), (1024, 1), "bf16"),
-    (83117, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (75315, 2560, 384, (384, 1), (2560, 1), "bf16"),
-    (65217, 2304, 384, (384, 1), (2304, 1), "bf16"),
-    (66611, 384, 384, (384, 1), (384, 1), "bf16"),
-    (77557, 2304, 384, (384, 1), (2304, 1), "bf16"),
-    (115451, 256, 256, (256, 1), (256, 1), "bf16"),
-    (117014, 256, 256, (256, 1), (256, 1), "bf16"),
-    (119998, 384, 384, (384, 1), (1, 384), "bf16"),
-    (114658, 256, 256, (256, 1), (256, 1), "bf16"),
-    (451885, 512, 128, (128, 1), (512, 1), "bf16"),
-    (15044, 512, 1152, (1, 15072), (512, 1), "bf16"),
-    (48136, 3328, 384, (384, 1), (3328, 1), "bf16"),
-    (308743, 512, 128, (128, 1), (512, 1), "bf16"),
-    (397716, 512, 128, (128, 1), (512, 1), "bf16"),
-    (47224, 3328, 384, (384, 1), (3328, 1), "bf16"),
-    (61104, 2560, 384, (384, 1), (2560, 1), "bf16"),
-    (57151, 2560, 384, (384, 1), (2560, 1), "bf16"),
-    (66611, 384, 1152, (1152, 1), (1, 1152), "bf16"),
-    (1000000, 512, 512, (512, 1), (512, 1), "bf16"),
-    # Shared gfx942_1/gfx950_1 production-request shapes.
-    (819200, 1024, 192, (192, 1), (1, 192), "bf16"),
-    (61440, 2048, 5120, (5120, 1), (1, 5120), "bf16"),
-    (61440, 5120, 2048, (2048, 1), (5120, 1), "fp16"),
-    (2252800, 256, 256, (256, 1), (256, 1), "fp16"),
-    (61440, 3840, 4096, (4096, 1), (3840, 1), "fp16"),
-    (61440, 5120, 7744, (7744, 1), (5120, 1), "fp16"),
-}
 
-
-def _cases():
-    return [entry for entry in CORRECTNESS_SHAPES if tuple(entry) not in FAILED_SHAPES]
-
-
-@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _cases())
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", CORRECTNESS_SHAPES)
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
 
@@ -257,6 +120,70 @@ def test_heuristic_configs_have_a_sound_workspace(M, N, K):
         assert rows >= written, f"heuristic config for {M}x{N}x{K} on {num_sms} SMs has an aliasing workspace: {cfg}"
 
 
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (64512, 128, 512),
+        (1000000, 512, 512),
+        (3159809, 384, 384),
+    ],
+)
+def test_tall_m_heuristic_cluster_fits_one_group(M, N, K):
+    cfg = sm100.get_heuristic_config(M, N, K, num_sms=148)
+    assert cfg["NUM_CTAS"] == 2
+    assert cfg["GROUP_SIZE_M"] % cfg["NUM_CTAS"] == 0
+    assert cfg["GROUP_SIZE_M"] >= cfg["NUM_CTAS"]
+
+
+@pytest.mark.parametrize("M, N", [(1, 1), (1280, 1280), (128, 10000)])
+def test_group_size_fits_padded_cluster_grid(M, N):
+    block_m = 256
+    num_ctas = 2
+    group_size = sm100._select_group_size_m(M, N, block_m, num_ctas)
+    padded_tiles = sm100._padded_num_pid_m(M, block_m, num_ctas)
+    assert num_ctas <= group_size <= padded_tiles
+    assert group_size % num_ctas == 0
+
+
+def test_split_k_workspace_uses_fp32_partials():
+    c = torch.empty((384, 384), device="cuda", dtype=torch.bfloat16)
+    workspace_desc = SimpleNamespace(base=c, shape=list(c.shape), block_shape=[1, 1])
+    nargs = {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "NUM_MMA_GROUPS": 2,
+        "NUM_CTAS": 1,
+        "SPLIT_K": 4,
+        "M": 384,
+        "N": 384,
+        "a_desc": SimpleNamespace(block_shape=[1, 1]),
+        "b_desc": SimpleNamespace(block_shape=[1, 1]),
+        "c_desc": SimpleNamespace(base=c, block_shape=[1, 1]),
+        "workspace_desc": workspace_desc,
+    }
+    sm100.matmul_tma_set_block_size_hook(nargs)
+    assert workspace_desc.base.dtype == torch.float32
+    assert workspace_desc.shape == [4 * 384, 384]
+
+
+def test_preprocess_prunes_oversized_fp32_epilogue():
+    config = triton.Config({
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 8,
+        "NUM_SMEM_BUFFERS": 3,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 2,
+        "NUM_CTAS": 1,
+        "SPLIT_K": 4,
+        "INTERLEAVE_EPILOGUE": 0,
+    })
+    assert sm100.preprocess_configs([config], {"M": 128, "N": 256, "K": 4096}) == []
+
+
 @contextlib.contextmanager
 def _pinned_config(overrides):
     """Force ``space="heuristic"`` to compile exactly one config."""
@@ -286,23 +213,26 @@ def _pinned_config(overrides):
 
 GPU_SHAPES = [
     # M % BLOCK_SIZE_M != 0 -- the reported bug (BLOCK_SIZE_M=256 -> 24 rows over).
-    (1000, 1000, 1024, 1),
+    (1000, 1000, 1024, 1, torch.float16),
     # Whole region overhangs: one tile of 128 rows holds only 64 real rows.
-    (64, 4096, 4096, 1),
+    (64, 4096, 4096, 1, torch.float16),
+    # Long-K bf16 case needs fp32 partials before the split reduction.
+    (384, 384, 19459, 1, torch.bfloat16),
 ]
 
 SPLIT_KS_GPU = [1, 4]
 
 
 @pytest.mark.parametrize("SPLIT_K", SPLIT_KS_GPU)
-@pytest.mark.parametrize("M, N, K, NUM_CTAS", GPU_SHAPES)
-def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, SPLIT_K):
+@pytest.mark.parametrize("M, N, K, NUM_CTAS, dtype", GPU_SHAPES)
+def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, dtype, SPLIT_K):
     """Splitting the reduction must not change the result."""
     from triton.tlx.ops import mm as tlx_mm
 
-    dtype = torch.float16
-    a = torch.randn((M, K), device="cuda", dtype=dtype)
-    b = torch.randn((K, N), device="cuda", dtype=dtype)
+    # A row-major descriptor would have row stride K, which is not necessarily
+    # 16-byte aligned (for example K=19459). Use layouts accepted by SM100 TMA.
+    a = operand(M, K, (1, M), dtype)
+    b = operand(K, N, (N, 1), dtype)
 
     with _pinned_config({"SPLIT_K": SPLIT_K, "NUM_CTAS": NUM_CTAS}):
         torch.cuda.synchronize()

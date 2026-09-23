@@ -83,7 +83,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -103,7 +103,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -119,7 +119,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -232,11 +232,15 @@ def get_heuristic_config(M, N, K, num_sms=148):
         (64, 64, 64, 1, 6, 2, 1, 1),  # Smallest tiles
     ]
 
-    def estimate_smem(bm, bn, bk, num_ctas, num_smem_buffers, num_mma_groups, epilogue_subtile):
+    def estimate_smem(bm, bn, bk, num_ctas, num_smem_buffers, num_mma_groups, epilogue_subtile, split_k=1):
         """Estimate shared memory usage for a config."""
         smem_a = bm * bk * 2 * num_smem_buffers
         smem_b = bk * (bn // num_ctas) * 2 * num_smem_buffers
-        smem_epilog = bm * (bn // epilogue_subtile) * 2
+        epilogue_elem_bytes = 4 if split_k > 1 else 2
+        num_epilogue_buffers = max(num_mma_groups, 2)
+        block_m_split = bm // num_mma_groups
+        smem_epilog = (block_m_split * (bn // epilogue_subtile) * epilogue_elem_bytes *
+                       num_epilogue_buffers)
         smem_barriers = num_smem_buffers * num_mma_groups * 8 * (2 if num_ctas == 2 else 1)
         return smem_a + smem_b + smem_epilog + smem_barriers
 
@@ -307,6 +311,21 @@ def get_heuristic_config(M, N, K, num_sms=148):
                         score, total_ctas, waves, split_k = sk_score, sk_ctas, sk_waves, sk
                     break  # Use the first valid split-K
 
+        if split_k > 1:
+            smem = estimate_smem(
+                bm,
+                bn,
+                bk,
+                num_ctas,
+                num_smem_buffers,
+                num_mma_groups,
+                epilogue_subtile,
+                split_k,
+            )
+            if smem > MAX_SMEM:
+                split_k = 1
+                score, total_ctas, waves = compute_wave_score(bm, bn, num_ctas)
+
         # Selection criteria:
         # 1. Prefer lower wave inefficiency score
         # 2. With same score, prefer fewer waves (less overhead)
@@ -324,7 +343,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -339,7 +358,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m):
+def _select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
@@ -353,17 +372,21 @@ def _select_group_size_m(M, N, block_m):
     - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
     """
     num_m_tiles = (M + block_m - 1) // block_m
+    # The scheduler pads M tiles to whole clusters, so this is the effective
+    # grid size that GROUP_SIZE_M must not exceed.
+    num_m_tiles = (num_m_tiles + num_ctas - 1) // num_ctas * num_ctas
     ratio = M / max(N, 1)
 
     if ratio > 10:
-        # M >> N: sweep M, reuse B
-        return 1
+        # M >> N: sweep M, reuse B. A cluster must stay inside one group.
+        group_size = 1
     elif ratio < 0.1:
         # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
+        group_size = min(64, num_m_tiles)
     else:
         # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
+        group_size = min(8, num_m_tiles)
+    return max(num_ctas, math.ceil(group_size / num_ctas) * num_ctas)
 
 
 def get_cuda_autotune_config():
@@ -438,7 +461,9 @@ def matmul_tma_set_block_size_hook(nargs):
         M = nargs["M"]
         N = nargs["N"]
         rows = SPLIT_K * _workspace_rows_per_split(M, BLOCK_M, NUM_CTAS)
-        workspace = torch.empty((rows, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
+        # Keep split partials in fp32 and cast only after reduction. Rounding
+        # every partial to the output dtype amplifies cancellation error.
+        workspace = torch.empty((rows, N), device=nargs["c_desc"].base.device, dtype=torch.float32)
         nargs["workspace_desc"].base = workspace
         nargs["workspace_desc"].shape = list(workspace.shape)
     else:
@@ -533,7 +558,11 @@ def preprocess_configs(configs, named_args, **kwargs):
         smem_a = BLOCK_M * BLOCK_K * 2 * NUM_SMEM_BUFFERS
         smem_b_size = BLOCK_N // NUM_CTAS
         smem_b = BLOCK_K * smem_b_size * 2 * NUM_SMEM_BUFFERS
-        smem_epilog = BLOCK_M * (BLOCK_N // EPILOGUE_SUBTILE) * 2
+        epilogue_elem_bytes = 4 if SPLIT_K > 1 else 2
+        num_epilogue_buffers = max(NUM_MMA_GROUPS, 2)
+        block_m_split = BLOCK_M // NUM_MMA_GROUPS
+        smem_epilog = (block_m_split * (BLOCK_N // EPILOGUE_SUBTILE) * epilogue_elem_bytes *
+                       num_epilogue_buffers)
         smem_barriers = NUM_SMEM_BUFFERS * NUM_MMA_GROUPS * MBARRIER_SIZE
         if NUM_CTAS == 2:
             smem_barriers += NUM_SMEM_BUFFERS * NUM_MMA_GROUPS * MBARRIER_SIZE
@@ -884,7 +913,7 @@ def reduce_post_hook(nargs, exception=None):
             SPLIT_K=split_k,
             BLOCK_SIZE_M=32,
             BLOCK_SIZE_N=32,
-            OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[workspace.dtype],
+            OUTPUT_DTYPE=TORCH_DTYPE_TO_TRITON[c.dtype],
         )
 
 
@@ -943,12 +972,13 @@ def matmul_kernel_tma_ws_blackwell(
         tlx.storage_kind.tmem,
     )
 
-    # Allocate SMEM buffers for epilogue TMA store (at least 2 for multi-buffering)
+    # Allocate SMEM buffers for epilogue TMA store (at least 2 for multi-buffering).
+    # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
     NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
     slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
     c_smem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, slice_size),
-        tlx.dtype_of(c_desc),
+        tlx.dtype_of(workspace_desc),
         NUM_EPILOGUE_SMEM_BUFFERS,
     )
 
