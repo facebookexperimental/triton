@@ -327,6 +327,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   }
 
   // CHECK-LABEL: @ld_then_tmem_shift
+  // The pass inserts an actual CTA rendezvous. TMEM load lowering separately
+  // emits tcgen05.wait::ld before the barrier.
   // CHECK: ttng.tmem_load
   // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.tmem_shift
@@ -339,6 +341,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   }
 
   // CHECK-LABEL: @st_then_tmem_shift
+  // The pass inserts an actual CTA rendezvous. TMEM store lowering separately
+  // emits tcgen05.wait::st before the barrier.
   // CHECK: ttng.tmem_store
   // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.tmem_shift

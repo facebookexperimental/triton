@@ -290,7 +290,13 @@ def test_tmem_shift(device):
     kernel = tmem_shift_kernel[(1, )](x, y, BLOCK_M=block_m, BLOCK_N=block_n)
 
     assert kernel.asm["ttgir"].count("ttng.tmem_shift") == 1
-    assert kernel.asm["ptx"].count("tcgen05.shift.cta_group::1.down") == block_n // 8
+    ptx = kernel.asm["ptx"]
+    shift_pos = ptx.find("tcgen05.shift.cta_group::1.down")
+    store_wait_pos = ptx.find("tcgen05.wait::st.sync.aligned")
+    assert ptx.count("tcgen05.shift.cta_group::1.down") == block_n // 8
+    assert 0 <= store_wait_pos < shift_pos
+    assert "bar.sync" in ptx[store_wait_pos:shift_pos]
+
     expected = x.clone()
     for group_start in range(0, block_m, 32):
         expected[group_start:group_start + 31] = x[group_start + 1:group_start + 32]
