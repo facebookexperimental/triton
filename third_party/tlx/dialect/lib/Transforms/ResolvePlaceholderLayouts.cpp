@@ -79,6 +79,8 @@ static UserLayoutAttr getUserLayoutFromType(Type type) {
 static bool containsNoVerifyLayout(Type type);
 static bool containsUserLayout(Type type);
 static bool containsUserLayout(Attribute attr);
+static LogicalResult
+repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes);
 
 static bool containsNoVerifyLayout(Attribute attr) {
   if (!attr)
@@ -332,6 +334,13 @@ static LogicalResult unwrapSharedUserLayouts(ModuleOp moduleOp) {
 /// signatures, and nested encoding attributes consistent in one verifier-safe
 /// step; derived wrapper propagation does not create additional anchors.
 static LogicalResult unwrapRegisterUserLayouts(ModuleOp moduleOp) {
+  SmallVector<::mlir::triton::ReshapeOp> wrappedReshapes;
+  moduleOp.walk([&](::mlir::triton::ReshapeOp reshape) {
+    if (containsUserLayout(reshape.getSrc().getType()) ||
+        containsUserLayout(reshape.getType()))
+      wrappedReshapes.push_back(reshape);
+  });
+
   mlir::AttrTypeReplacer replacer;
   replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
     return getEffectiveEncoding(wrapper);
@@ -346,6 +355,9 @@ static LogicalResult unwrapRegisterUserLayouts(ModuleOp moduleOp) {
           arg.setType(replacer.replace(arg.getType()));
   });
   realignDenseConstantTypes(moduleOp);
+
+  if (failed(repairUnwrappedReshapes(wrappedReshapes)))
+    return failure();
 
   bool residual = false;
   moduleOp.walk([&](Operation *op) {
@@ -492,8 +504,8 @@ static Attribute deepUnwrapTlxWrappers(Attribute attr) {
 // keeps the reshape's previously inferred destination stable. Once wrappers
 // are removed below, the concrete reshape must satisfy Triton's normal layout
 // inference again. Preserve the destination expected by existing consumers
-// with an explicit layout conversion. The conversion may exchange data across
-// threads when downstream layout optimization selected a different ownership.
+// with a require-layout boundary. Early resolution leaves that boundary for
+// RLC to place safely; late finalization lowers it to an explicit conversion.
 static LogicalResult
 repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
   for (auto reshape : reshapes) {
@@ -526,9 +538,9 @@ repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
     reshape.getResult().setType(inferredDstTy);
     OpBuilder builder(reshape);
     builder.setInsertionPointAfter(reshape);
-    auto convert = ttg::ConvertLayoutOp::create(builder, reshape.getLoc(),
+    auto require = ttg::RequireLayoutOp::create(builder, reshape.getLoc(),
                                                 oldDstTy, reshape.getResult());
-    reshape.getResult().replaceAllUsesExcept(convert.getResult(), convert);
+    reshape.getResult().replaceAllUsesExcept(require.getResult(), require);
   }
   return success();
 }
