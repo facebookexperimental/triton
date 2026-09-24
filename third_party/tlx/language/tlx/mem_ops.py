@@ -1075,27 +1075,33 @@ def local_load(
         output = _semantic.builder.create_release_layout(load_handle, relaxed=True)
         return tl.tensor(output, block_type)
     else:
+        is_hip = _semantic.builder.options.backend_name == "hip"
+        synced_via_async_wait = (token is not None or relaxed) and is_hip
+        rematerialize_coordinates = rematerialize_coordinates and is_hip
+        rematerialize_coordinates_group = rematerialize_coordinates_group if is_hip else None
         if layout is not None:
             # Pin the load result to the requested register layout, wrapped as a
             # user layout so remove-layout-conversions anchors it (won't rewrite
             # it to a "preferred" layout). Unlike require_layout, this survives
             # even when the only consumer is layout-flexible.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
-            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None,
-                                                         layoutEncoding=enc)
-        else:
-            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
-        result = tl.tensor(output, block_type)
-        if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
-        if rematerialize_coordinates and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("tlx.rematerialize_coordinates", _semantic.builder.get_unit_attr())
-        if rematerialize_coordinates_group is not None and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr(
-                "tlx.rematerialize_coordinates_group",
-                _semantic.builder.get_int32_attr(rematerialize_coordinates_group),
+            output = _semantic.builder.create_local_load(
+                src.handle,
+                token.handle if token else None,
+                layoutEncoding=enc,
+                syncedViaAsyncWait=synced_via_async_wait,
+                rematerializeCoordinates=rematerialize_coordinates,
+                rematerializeCoordinatesGroup=rematerialize_coordinates_group,
             )
-        return result
+        else:
+            output = _semantic.builder.create_local_load(
+                src.handle,
+                token.handle if token else None,
+                syncedViaAsyncWait=synced_via_async_wait,
+                rematerializeCoordinates=rematerialize_coordinates,
+                rematerializeCoordinatesGroup=rematerialize_coordinates_group,
+            )
+        return tl.tensor(output, block_type)
 
 
 @tl.builtin
