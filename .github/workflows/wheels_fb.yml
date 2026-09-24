@@ -23,6 +23,11 @@ on:
       # Optional ABI-matrix overrides; default to the full fork matrix.
       pythons:  { type: string, required: false, default: '["cp310","cp311","cp312","cp313","cp314"]' }
       arches:   { type: string, required: false, default: '["x86_64","aarch64"]' }
+      max_jobs:
+        description: "Maximum number of parallel compilation jobs"
+        type: number
+        required: false
+        default: 4
       upload_s3:
         description: "Upload wheels to S3 instead of GitHub artifacts (caller must grant id-token: write)"
         type: boolean
@@ -87,6 +92,8 @@ jobs:
           python-version: '3.11'
 
       - name: Build wheel via cibuildwheel
+        env:
+          MAX_JOBS: ${{ inputs.max_jobs || 4 }}
         run: |
           python3 -m pip install --upgrade cibuildwheel
 
@@ -96,7 +103,7 @@ jobs:
           # the wheel size roughly in half (the static LLVM/MLIR blob is the
           # bulk of it).
           export CIBW_ENVIRONMENT="\
-            MAX_JOBS=4 \
+            MAX_JOBS=${MAX_JOBS} \
             TRITON_BUILD_WITH_CLANG_LLD=1 \
             TRITON_WHEEL_NAME=fbtriton \
             LDFLAGS=-Wl,--strip-all"
