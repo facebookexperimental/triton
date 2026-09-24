@@ -163,13 +163,13 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 )
 
 
-def append_tlx(templates, op_name="mm"):
+def append_tlx(templates, op_name, kernel_inputs):
     # Import registry to trigger heuristic registration via decorators
     from . import registry  # noqa: F401
 
     if is_rocm():
         return _append_tlx_amd(templates, op_name)
-    return _append_tlx_nvidia(templates, op_name)
+    return _append_tlx_nvidia(templates, op_name, kernel_inputs)
 
 
 def _append_tlx_amd(templates, op_name):
@@ -221,10 +221,21 @@ def _append_tlx_amd(templates, op_name):
     return templates
 
 
-def _append_tlx_nvidia(templates, op_name):
+def _append_tlx_nvidia(templates, op_name, kernel_inputs):
     # This helper runs for every NVIDIA target, but only plain mm is eligible
     # for its Blackwell-specific TLX template. Other operations keep their choices.
     if op_name != "mm":
+        return templates
+    # Same gate tuned_mm applies to its own TMA templates, and not optional
+    # here: TMATemplateConfigMixin derives A_ROW_MAJOR/B_ROW_MAJOR eagerly and
+    # *raises* on an operand host-side TMA cannot describe, so the candidate
+    # cannot decline itself later. Any size-1 dim is such an operand -- a
+    # [M, 1] grad and its transpose both carry stride [1, 1], leaving no dim
+    # uniquely stride-1.
+    from torch._inductor.utils import can_use_tma
+
+    mat1, mat2 = kernel_inputs.mat1mat2()
+    if not can_use_tma(mat1, mat2, add_guards=True):
         return templates
     templates.append(blackwell_gemm_ws_template)
     return templates

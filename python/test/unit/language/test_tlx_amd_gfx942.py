@@ -204,3 +204,62 @@ def test_amd_scheduled_mfma_large_persistent_correct_gfx942(dtype):
         matrix_instr_nonkdim=16,
     )
     torch.testing.assert_close(actual, 2 * (a.float() @ b.float()), atol=4e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+@pytest.mark.parametrize("offset", [1, 2, 3, 7])
+def test_plain_unaligned_vector_load_correctness_gfx942(offset):
+
+    @triton.jit
+    def kernel(x_ptr, y_ptr, OFFSET: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        values = tl.load(x_ptr + OFFSET + offsets)
+        tl.store(y_ptr + offsets, values)
+
+    block_size = 2048
+    x = torch.arange(block_size + 8, device="cuda", dtype=torch.float16)
+    actual = torch.empty(block_size, device="cuda", dtype=torch.float16)
+    compiled = kernel[(1, )](
+        x,
+        actual,
+        OFFSET=offset,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    torch.testing.assert_close(actual, x[offset:offset + block_size], atol=0.0, rtol=0.0)
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+@pytest.mark.parametrize("offset", [1, 2, 3, 7])
+def test_masked_unaligned_vector_load_correctness_gfx942(offset):
+
+    @triton.jit
+    def kernel(
+        x_ptr,
+        y_ptr,
+        OFFSET: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        VALID_SIZE: tl.constexpr,
+    ):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < VALID_SIZE
+        values = tl.load(x_ptr + OFFSET + offsets, mask=mask, other=0)
+        tl.store(y_ptr + offsets, values)
+
+    block_size = 2048
+    valid_size = block_size - 8
+    x = torch.arange(block_size + 1, device="cuda", dtype=torch.float16)
+    actual = torch.empty(block_size, device="cuda", dtype=torch.float16)
+    compiled = kernel[(1, )](
+        x,
+        actual,
+        OFFSET=offset,
+        BLOCK_SIZE=block_size,
+        VALID_SIZE=valid_size,
+        num_warps=4,
+    )
+    expected = torch.zeros_like(actual)
+    expected[:valid_size] = x[offset:offset + valid_size]
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]

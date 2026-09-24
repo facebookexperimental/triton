@@ -1369,10 +1369,11 @@ bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch) {
   if (!load || load.getIsVolatile())
     return false;
 
-  // Keep this restricted to gfx950 so future targets must opt in through an
-  // explicit capability update. Ignore target feature suffixes when matching
-  // the processor name.
-  return targetArch.split(':').first == "gfx950";
+  // Keep this restricted to hardware validated below so future targets must
+  // opt in through an explicit capability update. Ignore target feature
+  // suffixes when matching the processor name.
+  StringRef processor = targetArch.split(':').first;
+  return processor == "gfx942" || processor == "gfx950";
 }
 
 static inline ttg::SwizzledSharedEncodingAttr
@@ -1941,7 +1942,8 @@ void replaceUsesAndPropagateType(
       auto operands = llvm::to_vector(wait.getOperands());
       operands[operand->getOperandNumber()] = val;
       auto newWait = ttng::WarpGroupDotWaitOp::create(
-          builder, wait.getLoc(), operands, wait.getPendings());
+          builder, wait.getLoc(), operands, wait.getPendingsAttr(),
+          wait.getWarpGroupLocalAttr());
       wait.replaceAllUsesWith(newWait.getResults());
       wait.erase();
     } else {

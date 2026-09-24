@@ -69,7 +69,7 @@ CATALOG: tuple[OpSpec, ...] = (
         op="addmm",
         arch="gfx942",
         variant="fused_gemm",
-        impl="triton.tlx.ops.kernels.mm.gfx942:addmm",
+        impl="triton.tlx.ops.kernels.addmm.gfx942:addmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),

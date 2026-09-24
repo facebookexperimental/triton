@@ -41,6 +41,13 @@ def has_tlx() -> bool:
         return False
 
 
+def _mm_kernel_inputs_stub() -> mock.Mock:
+    """MMKernelInputs stand-in for append_tlx's TMA-compatibility gate."""
+    kernel_inputs = mock.Mock()
+    kernel_inputs.mat1mat2.return_value = (mock.sentinel.mat1, mock.sentinel.mat2)
+    return kernel_inputs
+
+
 # Arch gates. All of these go through the one shared target model, so adding
 # MI300X/MI450X coverage is a change to the arch classes rather than to every
 # gate in the suite. With no GPU visible current_target() resolves to no arch
@@ -531,7 +538,7 @@ class TestTLXTemplates(TestCase):
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
 
-        def _only_warppipe(templates, op_name="mm"):
+        def _only_warppipe(templates, op_name, kernel_inputs):
             uids = {getattr(template, "uid", None) for template in templates}
             if op_name == "addmm" and mm_template.uid in uids:
                 template = _tlx_mm.gfx950_addmm_warppipe_template
@@ -590,15 +597,48 @@ class TestTLXTemplates(TestCase):
 
         existing_template = object()
         scaled_mm_templates = [existing_template]
-        with mock.patch.object(_tlx_mm, "is_rocm", return_value=False):
+        kernel_inputs = _mm_kernel_inputs_stub()
+        with (
+                mock.patch.object(_tlx_mm, "is_rocm", return_value=False),
+                mock.patch(
+                    "torch._inductor.utils.can_use_tma",
+                    return_value=True,
+                ) as can_use_tma,
+        ):
             scaled_mm_result = _tlx_mm.append_tlx(
-                scaled_mm_templates, op_name="scaled_mm"
+                scaled_mm_templates, "scaled_mm", kernel_inputs
             )
-            mm_result = _tlx_mm.append_tlx([], op_name="mm")
+            mm_result = _tlx_mm.append_tlx([], "mm", kernel_inputs)
 
         self.assertIs(scaled_mm_result, scaled_mm_templates)
         self.assertEqual(scaled_mm_templates, [existing_template])
         self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
+        # scaled_mm bails before the gate; mm consults it with both operands.
+        can_use_tma.assert_called_once_with(
+            mock.sentinel.mat1, mock.sentinel.mat2, add_guards=True
+        )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_nvidia_skips_mm_when_tma_cannot_describe_operands(self):
+        """The config mixin raises on such operands instead of declining them.
+
+        TMATemplateConfigMixin derives A_ROW_MAJOR/B_ROW_MAJOR eagerly and
+        asserts when no dim is uniquely stride-1 -- which is every operand with
+        a size-1 dim, e.g. the [M, 1] grad of an N=1 GEMM. Proposing the
+        template is therefore what decides whether that assertion can fire.
+        """
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        with (
+                mock.patch.object(_tlx_mm, "is_rocm", return_value=False),
+                mock.patch(
+                    "torch._inductor.utils.can_use_tma",
+                    return_value=False,
+                ),
+        ):
+            templates = _tlx_mm.append_tlx([], "mm", _mm_kernel_inputs_stub())
+
+        self.assertEqual(templates, [])
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
@@ -606,9 +646,10 @@ class TestTLXTemplates(TestCase):
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
 
         templates = [mm_template]
+        kernel_inputs = _mm_kernel_inputs_stub()
         with mock.patch.object(_tlx_mm, "is_rocm", return_value=True):
-            self.assertIs(_tlx_mm.append_tlx(templates, "mm"), templates)
-            self.assertIs(_tlx_mm.append_tlx(templates, "mm"), templates)
+            self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
+            self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
 
         expected_uids = {
             _tlx_mm.gfx950_mm_interwave_template.uid,
@@ -1169,7 +1210,7 @@ class TestTLXTemplates(TestCase):
         def addmm(bias, a, b):
             return torch.addmm(bias, a, b)
 
-        def _only_interwave(templates, op_name="mm"):
+        def _only_interwave(templates, op_name, kernel_inputs):
             from torch._inductor.kernel.mm import mm_template
 
             uids = {getattr(t, "uid", None) for t in templates}
@@ -1226,7 +1267,7 @@ class TestTLXTemplates(TestCase):
         def addmm(bias, a, b):
             return torch.addmm(bias, a.flatten(0, 1), b)
 
-        def _add_interwave(templates, op_name="mm"):
+        def _add_interwave(templates, op_name, kernel_inputs):
             from torch._inductor.kernel.mm import mm_template
 
             uids = {getattr(t, "uid", None) for t in templates}
@@ -1619,7 +1660,7 @@ class TestTLXTemplates(TestCase):
         def bmm(a, b):
             return torch.bmm(a, b)
 
-        def _only_shared_a(templates, op_name="mm"):
+        def _only_shared_a(templates, op_name, kernel_inputs):
             from torch._inductor.kernel.bmm import bmm_template
 
             uids = {getattr(template, "uid", None) for template in templates}
@@ -1666,7 +1707,7 @@ class TestTLXTemplates(TestCase):
         def bmm_bias(a, b, bias):
             return torch.bmm(a, b) + bias
 
-        def _only_shared_a(templates, op_name="mm"):
+        def _only_shared_a(templates, op_name, kernel_inputs):
             if op_name == "bmm":
                 templates[:] = [_tlx_mm.amd_bmm_shared_a_template]
             return templates
@@ -1768,7 +1809,7 @@ class TestTLXTemplates(TestCase):
         def addmm(bias, a, w):
             return torch.addmm(bias, a, w.t())
 
-        def _only_persistent(templates, op_name="mm"):
+        def _only_persistent(templates, op_name, kernel_inputs):
             # Offer only the persistent template (drop the per-tile warp-pipe) so force
             # mode is guaranteed to select and compile the persistent kernel.
             from torch._inductor.kernel.mm import mm_template
@@ -1823,7 +1864,7 @@ class TestTLXTemplates(TestCase):
         def addmm(bias, a, w):
             return torch.addmm(bias, a, w.t())
 
-        def _only_persistent(templates, op_name="mm"):
+        def _only_persistent(templates, op_name, kernel_inputs):
             from torch._inductor.kernel.mm import mm_template
 
             uids = {getattr(t, "uid", None) for t in templates}
