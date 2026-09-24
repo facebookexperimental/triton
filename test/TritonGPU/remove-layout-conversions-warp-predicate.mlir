@@ -270,6 +270,53 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
 
 // -----
 
+#cross_warp_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#cross_warp_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
+#cross_warp_src_pinned = #tlx.no_verify_layout<#tlx.user_layout<#cross_warp_src>>
+#cross_warp_dst_pinned = #tlx.no_verify_layout<#tlx.user_layout<#cross_warp_dst>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // FINAL-LABEL: tt.func @wave_uniform_hoists_deferred_shared_memory_release
+  // FINAL-SAME: %[[PRED:.*]]: i1, %[[NATIVE:.*]]: tensor<64x64xf32, #[[$SRC:.*]]>, %[[PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$DST:.*]]>
+  tt.func @wave_uniform_hoists_deferred_shared_memory_release(
+      %predicate: i1, %native: tensor<64x64xf32, #cross_warp_src_pinned>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL: %[[CONVERTED:.*]] = ttg.convert_layout %[[NATIVE]] : tensor<64x64xf32, #[[$SRC]]> -> tensor<64x64xf32, #[[$DST]]>
+    // FINAL: ttg.warp_predicate %[[PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.release_layout
+    ttg.warp_predicate %predicate () {
+      %released = ttg.release_layout %native : tensor<64x64xf32, #cross_warp_src_pinned> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[PTRS]], %[[CONVERTED]]
+      tt.store %ptrs, %released : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @wave_uniform_hoists_deferred_shared_memory_require
+  // FINAL-SAME: %[[REQ_PRED:.*]]: i1, %[[REQ_SRC:.*]]: tensor<64x64xf32, #[[$REQ_SRC_LAYOUT:.*]]>, %[[REQ_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$REQ_DST_LAYOUT:.*]]>
+  tt.func @wave_uniform_hoists_deferred_shared_memory_require(
+      %predicate: i1, %src: tensor<64x64xf32, #cross_warp_src_pinned>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL: %[[REQUIRED:.*]] = ttg.convert_layout %[[REQ_SRC]] : tensor<64x64xf32, #[[$REQ_SRC_LAYOUT]]> -> tensor<64x64xf32, #[[$REQ_DST_LAYOUT]]>
+    // FINAL: ttg.warp_predicate %[[REQ_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.require_layout
+    ttg.warp_predicate %predicate () {
+      %required = ttg.require_layout %src : tensor<64x64xf32, #cross_warp_src_pinned> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[REQ_PTRS]], %[[REQUIRED]]
+      tt.store %ptrs, %required : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+}
+
+// -----
+
 #nested_uniform_blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #nested_uniform_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
 #nested_uniform_mma_row = #ttg.slice<{dim = 1, parent = #nested_uniform_mma}>
@@ -413,6 +460,25 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
       tt.store %ptrs, %reshaped : tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>
       ttg.predicate_yield
     } : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @wave_uniform_reshape_repair_stays_outside
+  // FINAL-SAME: %[[UNIFORM_RESHAPE_PRED:.*]]: i1, %[[UNIFORM_RESHAPE_SRC:.*]]: tensor<128x128xf32, #{{.*}}>, %[[UNIFORM_RESHAPE_PTRS:.*]]: tensor<128x2x64x!tt.ptr<f32>, #[[$RESHAPE_DST]]>
+  tt.func @wave_uniform_reshape_repair_stays_outside(
+      %predicate: i1, %src: tensor<128x128xf32, #reshape_src>,
+      %ptrs: tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>) {
+    // FINAL: %[[UNIFORM_COMPATIBLE_SRC:.*]] = ttg.convert_layout %[[UNIFORM_RESHAPE_SRC]]
+    // FINAL: ttg.warp_predicate %[[UNIFORM_RESHAPE_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    ttg.warp_predicate %predicate () {
+      // FINAL: %[[UNIFORM_RESHAPED:.*]] = tt.reshape %[[UNIFORM_COMPATIBLE_SRC]] : {{.*}} -> tensor<128x2x64xf32, #[[$RESHAPE_DST]]>
+      %reshaped = tt.reshape %src : tensor<128x128xf32, #reshape_src> -> tensor<128x2x64xf32, #reshape_wrapped_dst>
+      // FINAL: tt.store %[[UNIFORM_RESHAPE_PTRS]], %[[UNIFORM_RESHAPED]]
+      tt.store %ptrs, %reshaped : tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
     // FINAL: tt.return
     tt.return
   }
