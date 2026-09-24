@@ -1149,7 +1149,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK: %[[BEFORE_DESC:.*]] = tt.make_tensor_descriptor %{{.*}}
       // CHECK: tt.descriptor_store %[[BEFORE_DESC]]
       %before_c0 = arith.constant 0 : i32
-      %before_desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f32>, <128x128xf32, #shared_while_store>
+      %before_desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<128x128xf32, #shared_while_store>
       tt.descriptor_store %before_desc[%before_c0, %before_c0], %src : !tt.tensordesc<128x128xf32, #shared_while_store>, tensor<128x128xf32, #blocked_while_store>
       %continue = arith.cmpi sgt, %unused, %before_c0 : i32
       // CHECK: scf.condition({{.*}}) {{%.*}}, [[BEFORE_COUNTER]] : i1, i32
@@ -1166,7 +1166,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK-NEXT: [[COUNTER_INC:%.*]] = arith.addi [[AFTER_COUNTER]], {{.*}} : i32
       // CHECK-NEXT: [[COUNTER_WRAP:%.*]] = arith.cmpi sge, [[COUNTER_INC]], {{.*}} : i32
       // CHECK-NEXT: [[NEXT_COUNTER:%.*]] = arith.select [[COUNTER_WRAP]], [[ZERO]], [[COUNTER_INC]] : i32
-      %desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f32>, <128x128xf32, #shared_while_store>
+      %desc = tt.make_tensor_descriptor %base, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<128x128xf32, #shared_while_store>
       // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32, read_only}
       // CHECK-NEXT: ttg.local_store {{.*}}, %[[ALLOC]]
       // CHECK-NEXT: ttng.fence_async_shared
