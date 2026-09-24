@@ -37,23 +37,39 @@ def _async_amd_desc_load_fused_kernel(
     M: tl.constexpr,
     N: tl.constexpr,
     MULTICAST_MASKS: tl.constexpr = None,
+    SHARED_LAYOUT: tl.constexpr = None,
+    MASK_SHIFT_BITS: tl.constexpr = 0,
 ):
     a_desc = tl.make_tensor_descriptor(a_ptr, [M, N], [N, 1], [M, N])
     b_desc = tl.make_tensor_descriptor(b_ptr, [M, N], [N, 1], [M, N])
-    a_buf = tlx.local_alloc((M, N), tl.float16, 1)
-    b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    if SHARED_LAYOUT is None:
+        a_buf = tlx.local_alloc((M, N), tl.float16, 1)
+        b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    else:
+        a_buf = tlx.local_alloc((M, N), tl.float16, 1, layout=SHARED_LAYOUT)
+        b_buf = tlx.local_alloc((M, N), tl.float16, 1, layout=SHARED_LAYOUT)
     a_smem = tlx.local_view(a_buf, 0)
     b_smem = tlx.local_view(b_buf, 0)
     a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
     b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
-    token = tlx.async_amd_descriptor_load_fused([
-        (a_desc, a_smem, 0b0011),
-        (b_desc, b_smem, 0b1100),
-    ], multicast_masks=MULTICAST_MASKS)
+    if SHARED_LAYOUT is not None:
+        tlx.cluster_barrier()
+    if MASK_SHIFT_BITS and MULTICAST_MASKS is not None:
+        shift = tlx.cluster_cta_rank() & MASK_SHIFT_BITS
+        token = tlx.async_amd_descriptor_load_fused([(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
+                                                    multicast_masks=(MULTICAST_MASKS[0] << shift,
+                                                                     MULTICAST_MASKS[1] << shift))
+    else:
+        token = tlx.async_amd_descriptor_load_fused([(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
+                                                    multicast_masks=MULTICAST_MASKS)
     tlx.async_amd_descriptor_wait(tokens=[token])
+    if SHARED_LAYOUT is not None:
+        tlx.cluster_barrier()
     result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
     offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
     tl.store(output_ptr + offsets, result)
+    if SHARED_LAYOUT is not None:
+        tlx.cluster_barrier()
 
 
 @triton.jit
@@ -558,6 +574,7 @@ test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch = _gfx1250_grouped.test_groupe
 test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm_xcd_remap_gfx1250
 
 
+@pytest.mark.parametrize("independent_ctas", [False, True])
 @pytest.mark.parametrize("cluster_size,masks,message", [
     (4, (-1, 3), "outside the cluster"),
     (4, (16, 3), "outside the cluster"),
@@ -565,16 +582,66 @@ test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm
     (4, (1.5, 3), "scalar integers"),
     (8, (63, 3), "at most 5 recipients"),
 ])
-def test_tdm_fused_multicast_invalid_masks(cluster_size, masks, message):
+def test_tdm_fused_multicast_invalid_masks(cluster_size, masks, message, independent_ctas):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
     from triton.compiler.errors import CompilationError
     source = ASTSource(_async_amd_desc_load_fused_kernel,
                        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr":
                                   "*fp16"}, constexprs={"M": 64, "N": 64, "MULTICAST_MASKS": masks})
+    options = dict(ctas_per_cga=(cluster_size, 1, 1)) if independent_ctas else dict(num_ctas=cluster_size)
     with pytest.raises(CompilationError, match=message):
-        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4,
-                                                                                    ctas_per_cga=(cluster_size, 1, 1)))
+        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, **options))
+
+
+def _tdm_fused_distributed_constants(num_ctas, split_m, mask_mode):
+    replicas = num_ctas // split_m
+    shared = tlx.swizzled_shared_layout_encoding(
+        vectorSize=1,
+        perPhase=1,
+        maxPhase=1,
+        order=[1, 0],
+        numCTAs=num_ctas,
+        numCTAsPerCGA=[split_m, replicas],
+        numCTASplit=[split_m, 1],
+        numCTAOrder=[1, 0],
+    )
+    # Adjacent CTAs share a row partition, matching the default register layout
+    # without requiring cross-CTA shared loads. Explicit masks
+    # enable multicast for A and disable it for B despite B's replicated layout.
+    mask = (1 << replicas) - 1
+    masks = None if mask_mode == "inferred" else (mask, 0) if mask_mode == "explicit" else (0, 0)
+    return dict(M=64, N=64, SHARED_LAYOUT=shared, MULTICAST_MASKS=masks, MASK_SHIFT_BITS=num_ctas - replicas)
+
+
+@pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
+@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "disabled"])
+def test_tdm_fused_multicast_distributed_compiles(num_ctas, split_m, mask_mode):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_async_amd_desc_load_fused_kernel,
+                       signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr":
+                                  "*fp16"}, constexprs=_tdm_fused_distributed_constants(num_ctas, split_m, mask_mode))
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, num_ctas=num_ctas))
+    assert compiled.metadata.num_ctas == num_ctas
+    assert (" multicast " in compiled.asm["ttgir"]) == (mask_mode != "inferred")
+    assert compiled.asm["amdgcn"].count("tensor_load_to_lds") == 1
+    if split_m > 1:
+        assert "CGALayout = [[0, 0], [1, 0]]" in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
+@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "disabled"])
+def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, mask_mode):
+    a = torch.randn((64, 64), dtype=torch.float16, device=device)
+    b = torch.randn_like(a)
+    output = torch.empty_like(a)
+    constants = _tdm_fused_distributed_constants(num_ctas, split_m, mask_mode)
+    _async_amd_desc_load_fused_kernel[(1, )](a, b, output, **constants, num_ctas=num_ctas)
+    torch.testing.assert_close(output, a + b, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])

@@ -1116,8 +1116,8 @@ def AsyncTDMFusedCopyGlobalToLocalOp
     disjoint. All members share one cache modifier.
 
     Optional `multicast_masks` specify one scalar i32 recipient bitmask per
-    member for clusters of independent CTA programs (ttg.num-ctas = 1).
-    Bit n names CTA n in the cluster; zero disables multicast for that member.
+    member, overriding layout-derived multicast. Bit n names CTA n in the
+    physical cluster; zero disables multicast for that member.
     Each mask may select at most five recipients on gfx1250. Dynamic masks
     must satisfy the same range and recipient-count restrictions as constants.
     The caller must ensure every recipient issues the same source request to

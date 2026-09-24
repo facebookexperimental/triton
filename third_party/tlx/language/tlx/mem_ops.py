@@ -1718,7 +1718,8 @@ def async_amd_descriptor_load_fused(
     cache modifier.
 
     ``multicast_masks`` optionally supplies a scalar integer recipient mask
-    for each member in a ``ctas_per_cga`` cluster of independent programs.
+    for each member in the physical cluster, configured by ``num_ctas`` or
+    ``ctas_per_cga``. Explicit masks override layout-derived multicast.
     Bit n selects CTA n; zero disables multicast for that member. Each mask
     must select at most five recipients on gfx1250, including when its value
     is computed at runtime. Each recipient must issue the same source request
@@ -1764,9 +1765,7 @@ def async_amd_descriptor_load_fused(
         if len(multicast_masks) != len(members):
             raise ValueError("fused TDM requires one multicast mask per member")
         options = _semantic.builder.options
-        if options.num_ctas != 1:
-            raise ValueError("explicit multicast masks require num_ctas=1 and ctas_per_cga")
-        cluster_size = (options.ctas_per_cga or (1, 1, 1))[0]
+        cluster_size = (options.ctas_per_cga or (options.num_ctas, 1, 1))[0]
         for mask in multicast_masks:
             mask = tl._unwrap_if_constexpr(mask)
             if isinstance(mask, int) and not 0 <= mask < (1 << cluster_size):

@@ -28,6 +28,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 4 : i32, "ttg
 
 // -----
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1], [0, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // TTG-LABEL: tdm_fused_distributed_explicit_multicast
+  // LLVM-LABEL: tdm_fused_distributed_explicit_multicast
+  // FOLD-LABEL: tdm_fused_distributed_explicit_multicast
+  tt.func public @tdm_fused_distributed_explicit_multicast(
+      %a: !tt.tensordesc<64x64xf16, #shared>,
+      %b: !tt.tensordesc<64x64xf16, #shared>,
+      %da: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>,
+      %mask_a: i32, %mask_b: i32) {
+    // Explicit masks replace the inferred {0,2}/{1,3} recipient groups while
+    // the layout still determines the per-CTA column partition.
+    // TTG: amdg.async_tdm_fused_copy_global_to_local
+    // TTG-SAME: multicast %{{.*}}, %{{.*}}
+    // LLVM: rocdl.cluster.workgroup.id.x
+    // LLVM: llvm.or %{{.*}}, %arg4 : i32
+    // LLVM: llvm.or %{{.*}}, %arg5 : i32
+    // LLVM: "llvm.amdgcn.tensor.load.to.lds"
+    // LLVM-NOT: "llvm.amdgcn.tensor.load.to.lds"
+    // FOLD: rocdl.cluster.workgroup.id.x
+    // FOLD: llvm.getelementptr
+    // FOLD: "llvm.amdgcn.tensor.load.to.lds"
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db multicast %mask_a, %mask_b {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {

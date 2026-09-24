@@ -1445,11 +1445,6 @@ LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
   if (!getMulticastMasks().empty()) {
     if (getMulticastMasks().size() != numMembers)
       return emitOpError("requires one multicast mask per member");
-    auto mod = getOperation()->getParentOfType<ModuleOp>();
-    if (auto numCTAs = mod->getAttrOfType<IntegerAttr>(gpu::AttrNumCTAsName);
-        numCTAs && numCTAs.getInt() != 1)
-      return emitOpError("explicit multicast masks require independent CTA "
-                         "programs (ttg.num-ctas = 1)");
     int64_t clusterSize = gpu::lookupPhysicalNumCTAs(getOperation());
     if (clusterSize < 1 || clusterSize > 16)
       return emitOpError("multicast requires a cluster of at most 16 CTAs");
