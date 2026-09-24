@@ -563,6 +563,10 @@ def _launch_local_split_u(a, b, out, plan):
     return out
 
 
+def _full_config_key(a, b):
+    return (a.device, a.dtype, tuple(a.shape), tuple(b.shape), tuple(a.stride()), tuple(b.stride()))
+
+
 def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     M, N, K = _validate_operands(a, b, out)
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
@@ -581,6 +585,18 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
 
     shape = (M, N, K) if space in ("heuristic", "full") else None
     kernel = _tuned(space, shape, space == "full" and enable_local_split_u)
+    fast_configs = None
+    fast_key = None
+    if space == "full" and enable_local_split_u:
+        fast_configs = getattr(kernel, "_tlx_fast_configs", None)
+        if fast_configs is None:
+            fast_configs = kernel._tlx_fast_configs = {}
+        fast_key = _full_config_key(a, b)
+        cached = fast_configs.get(fast_key)
+        if cached is not None and cached[1] and cached[0].kwargs.get("USE_LOCAL_SPLIT_U", False):
+            plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
+            return _launch_local_split_u(a, b, out, plan)
+
     bias_ptr = bias if bias is not None else out
     kernel[grid](
         a,
@@ -601,6 +617,11 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         ADD_BIAS=bias is not None,
         matrix_instr_nonkdim=16,
     )
+    if fast_configs is not None:
+        # Keep one cached Autotuner launch so runtime instrumentation can
+        # observe the winner before the short kernel takes its fast path.
+        previous = fast_configs.get(fast_key)
+        fast_configs[fast_key] = (kernel.best_config, previous is not None)
     return out
 
 
