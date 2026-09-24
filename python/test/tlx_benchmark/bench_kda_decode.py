@@ -88,7 +88,6 @@ def prepare(case: Case, space: str) -> Prepared:
         read_indices=read_indices,
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
-        arch=driver.arch(),
     )
     return Prepared(
         tlx_fn=tlx_fn,
