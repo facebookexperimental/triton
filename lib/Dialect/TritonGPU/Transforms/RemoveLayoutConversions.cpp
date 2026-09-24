@@ -1203,12 +1203,10 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         return *selected;
       }
 
-      // Finalization also repairs reshapes whose deferred TLX wrapper hid a
-      // source/result inference mismatch. Force the inverse source encoding now
-      // so that repair does not create a conversion under restricted EXEC.
-      if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer);
-          reshape && (hasDeferredTlxEncoding(reshape.getSrc().getType()) ||
-                      hasDeferredTlxEncoding(reshape.getType()))) {
+      // A deferred wrapper or its early-resolved require boundary can expose a
+      // reshape inference mismatch. Force the inverse source encoding now so
+      // that repair does not create a conversion under restricted EXEC.
+      if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
         Attribute operandEncoding = inferSrcEncoding(reshape, *selected);
         if (!operandEncoding ||
             failed(forceSlice(reshape.getSrc(), operandEncoding,
@@ -1395,16 +1393,24 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       return WalkResult::advance();
     });
 
-    // Wrapper removal can similarly expose a reshape inference mismatch and
-    // repair it with a post-RLC convert_layout. Resolve every wrapped reshape
-    // while conversions can still be placed outside restricted EXEC.
+    // Wrapper removal can expose a reshape inference mismatch and repair it
+    // with a require-layout boundary. Resolve both the deferred wrapper form
+    // and its early-resolved reshape -> require form while conversions can
+    // still be placed outside restricted EXEC.
     predicateOp.getRegion().walk([&](ReshapeOp reshapeOp) {
       if (conflict)
         return WalkResult::interrupt();
-      if (!hasDeferredTlxEncoding(reshapeOp.getSrc().getType()) &&
-          !hasDeferredTlxEncoding(reshapeOp.getType()))
+      bool hasDeferredEncoding =
+          hasDeferredTlxEncoding(reshapeOp.getSrc().getType()) ||
+          hasDeferredTlxEncoding(reshapeOp.getType());
+      RequireLayoutOp repairBoundary;
+      if (reshapeOp.getResult().hasOneUse())
+        repairBoundary = dyn_cast<RequireLayoutOp>(
+            *reshapeOp.getResult().getUsers().begin());
+      if (!hasDeferredEncoding && !repairBoundary)
         return WalkResult::advance();
-      auto resultType = cast<RankedTensorType>(reshapeOp.getType());
+      auto resultType = cast<RankedTensorType>(
+          repairBoundary ? repairBoundary.getType() : reshapeOp.getType());
       Attribute encoding = getEffectiveLayoutEncoding(resultType.getEncoding());
       if (auto forced =
               forcedWarpPredicateEncodings.find(reshapeOp.getResult());
