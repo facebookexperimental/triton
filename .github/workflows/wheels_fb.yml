@@ -39,7 +39,6 @@ jobs:
     name: Build wheel ${{ matrix.python }} ${{ matrix.arch }}
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
     timeout-minutes: 90
-    environment: ${{ inputs.upload_s3 && 'docker-s3-upload' || '' }}
 
     strategy:
       # Don't cancel sibling builds when one fails — we want to see which
