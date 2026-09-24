@@ -90,9 +90,10 @@ public:
   bool needsAsyncProxyFenceTracking(ModuleOp module) const override {
     bool needed = false;
     module.walk([&](Operation *op) {
-      needed |= isa<ttng::TMALoadLikeOpInterface, ttng::CLCTryCancelOp,
-                    ttng::WarpGroupDotOp, ttng::MMAv5OpInterface,
-                    ttng::TMEMCopyOp, ttng::TMAStoreLikeOpInterface>(op);
+      needed |=
+          isa<ttng::TMALoadLikeOpInterface, ttng::CLCTryCancelOp,
+              ttng::WarpGroupDotOp, ttng::MMAv5OpInterface, ttng::TMEMCopyOp,
+              ttng::TMEMShiftOp, ttng::TMAStoreLikeOpInterface>(op);
     });
     return needed;
   }
@@ -127,10 +128,10 @@ public:
                                    arith::ConstantIntOp::create(b, 0, 32));
     }
 
-    // In 2CTA tcgen05 and tmem_copy, only the even CTA in each (i, i^1) pair
+    // In 2CTA tcgen05 operations, only the even CTA in each (i, i^1) pair
     // issues the op.
     if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::TCGen5CommitOp,
-            ttng::TMEMCopyOp>(op) &&
+            ttng::TMEMCopyOp, ttng::TMEMShiftOp>(op) &&
         ttng::getModuleTwoCTAs(op))
       mask = 0x1;
     if (!mask)
@@ -183,6 +184,15 @@ public:
           MemEffectsOpInfo::Effects::Proxy::Async);
       info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
                                         copyOp.getDst(), "Dst");
+    }
+    if (auto shiftOp = dyn_cast<ttng::TMEMShiftOp>(op)) {
+      info.emplace();
+      info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
+      info->operandEffects.emplace_back(
+          MemEffectsOpInfo::Effects::Read, shiftOp.getBuffer(), "Buffer",
+          MemEffectsOpInfo::Effects::Proxy::Async);
+      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
+                                        shiftOp.getBuffer(), "Buffer");
     }
     if (auto mmav5Op = dyn_cast<ttng::MMAv5OpInterface>(op)) {
       info.emplace();

@@ -69,6 +69,7 @@ from .mem_ops import (
     storage_alias_spec,
     subslice,
     tmem_copy,
+    tmem_shift,
     update_tensor_descriptor,
 )
 from .mma_ops import (
@@ -199,6 +200,7 @@ __all__ = [
     "dump_layout",
     "local_load",
     "local_store",
+    "tmem_shift",
     "local_gather",
     "local_scatter",
     "local_trans",

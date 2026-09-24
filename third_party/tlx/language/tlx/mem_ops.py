@@ -1274,6 +1274,28 @@ def tmem_copy(
 
 
 @tl.builtin
+def tmem_shift(buffer: tlx.buffered_tensor, _semantic=None) -> None:
+    """Shift every row of a tensor-memory buffer down by one row.
+
+    The operation is asynchronous and maps to one ``tcgen05.shift.down``
+    instruction per 32-byte row segment. Within each 32-row TMEM group, rows
+    0 through 30 receive the previous contents of the following row and row 31
+    is unchanged.
+
+    Call :func:`tcgen05_commit` with an mbarrier and wait on that barrier before
+    consuming the shifted buffer.
+
+    Args:
+        buffer: Mutable rank-2 tensor-memory buffer to shift in place.
+    """
+    assert isinstance(buffer, tlx.buffered_tensor), "buffer must be a buffered tensor"
+    assert buffer.type.storage == tlx.storage_kind.tmem, "buffer must be in tensor memory"
+    assert len(buffer.type.shape) == 2, "buffer must be rank 2"
+    _assert_blackwell_for_tmem(_semantic.builder.options.arch)
+    _semantic.builder.create_tmem_shift(buffer.handle)
+
+
+@tl.builtin
 def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic=None) -> tlx.buffered_tensor:
     """
     Permutes the dimensions of a tensor.

@@ -1078,6 +1078,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#tmem_shift = #ttng.tensor_memory_encoding<blockM = 128, blockN = 16, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func public @tmem_shift_requires_mutable(
+      %buffer: !ttg.memdesc<128x16xf32, #tmem_shift, #ttng.tensor_memory>) {
+    // expected-error @below {{buffer must be mutable}}
+    ttng.tmem_shift %buffer : !ttg.memdesc<128x16xf32, #tmem_shift, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem_shift = #ttng.tensor_memory_encoding<blockM = 64, blockN = 16, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func public @tmem_shift_requires_128_rows(
+      %buffer: !ttg.memdesc<64x16xf32, #tmem_shift, #ttng.tensor_memory, mutable>) {
+    // expected-error @below {{buffer must occupy 128 physical TMEM rows, but got 64}}
+    ttng.tmem_shift %buffer : !ttg.memdesc<64x16xf32, #tmem_shift, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem_shift = #ttng.tensor_memory_encoding<blockM = 128, blockN = 8, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func public @tmem_shift_requires_32_byte_segments(
+      %buffer: !ttg.memdesc<128x8xf16, #tmem_shift, #ttng.tensor_memory, mutable>) {
+    // expected-error @below {{buffer physical column count must be a multiple of 8, but got 4}}
+    ttng.tmem_shift %buffer : !ttg.memdesc<128x8xf16, #tmem_shift, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
 #nvmma_no_broadcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>

@@ -398,6 +398,10 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value src, Value dst) {
              self.create<ttng::TMEMCopyOp>(src, dst);
            })
+      .def("create_tmem_shift",
+           [](TritonOpBuilder &self, Value buffer) {
+             self.create<ttng::TMEMShiftOp>(buffer);
+           })
       .def("create_remote_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues,
               Value remoteCTARank) -> void {
