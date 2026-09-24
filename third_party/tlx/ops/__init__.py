@@ -103,6 +103,8 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
 
     `sm_scale` defaults to `HEAD_DIM ** -0.5`.
     """
+    if space not in ("full", "smoke"):
+        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space!r}")
     fn, spec = impl_for("flash_attn", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)

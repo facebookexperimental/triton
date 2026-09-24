@@ -774,6 +774,21 @@ class TestDenseFABackwardSupportGfx950(unittest.TestCase):
                     "sm_scale must be a finite number",
                 )
 
+    def test_support_gate_rejects_missing_backward_state(self):
+        args = self._aligned_support_args()
+        for index, expected in (
+            (3, "o must match q shape and device"),
+            (4, "do must match q shape and device"),
+            (5, "lse must be FP32 B,H,N on the same device"),
+        ):
+            missing = list(args)
+            missing[index] = None
+            with self.subTest(index=index):
+                self.assertEqual(
+                    amd_fa_bwd.fa_backward_support_error(*missing, 0.125, False),
+                    expected,
+                )
+
     def test_d256_scratch_producer_covers_consumer(self):
         shape = (32, 1, 2600, 256)
         q = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)

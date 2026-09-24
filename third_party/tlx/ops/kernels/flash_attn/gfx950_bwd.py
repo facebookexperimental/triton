@@ -4555,8 +4555,7 @@ def _run_bwd_d256(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, poison_
     )
 
 
-def fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
-    """Return why ``fa_backward`` cannot run, or ``None`` when supported."""
+def _fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
     if q.ndim != 4 or k.ndim != 4:
         return "q and k must be rank-4 B,H,N,D tensors"
     if q.device.type != "cuda":
@@ -4576,7 +4575,11 @@ def fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
         return (f"supported MHA shapes are {supported}; supported GQA shapes "
                 f"satisfy {_GQA_SHAPE_CONSTRAINT}; {_D64_SHAPE_CONSTRAINT}; "
                 f"got q={tuple(q.shape)}, k={tuple(k.shape)}")
-    q_tensors = {"q": q, "o": o, "do": do}
+    q_tensors = {"q": q}
+    if o is not None:
+        q_tensors["o"] = o
+    if do is not None:
+        q_tensors["do"] = do
     for name, tensor in q_tensors.items():
         if tensor.device != q.device or tensor.shape != q.shape:
             return f"{name} must match q shape and device"
@@ -4592,10 +4595,11 @@ def fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
             return f"{name} must be bfloat16"
         if not tensor.is_contiguous():
             return f"{name} must be contiguous B,H,N,D"
-    if lse.device != q.device or lse.shape != q.shape[:-1] or lse.dtype is not torch.float32:
-        return "lse must be FP32 B,H,N on the same device"
-    if not lse.is_contiguous():
-        return "lse must be contiguous B,H,N"
+    if lse is not None:
+        if lse.device != q.device or lse.shape != q.shape[:-1] or lse.dtype is not torch.float32:
+            return "lse must be FP32 B,H,N on the same device"
+        if not lse.is_contiguous():
+            return "lse must be contiguous B,H,N"
     try:
         arch = torch.cuda.get_device_properties(q.device).gcnArchName
     except (AssertionError, AttributeError, RuntimeError) as error:
@@ -4614,6 +4618,22 @@ def fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
         if causal and q.shape[2] > k.shape[2]:
             return "D64 bottom-right causal attention requires SQ <= SKV"
     return None
+
+
+def fa_backward_input_support_error(q, k, v, sm_scale, causal):
+    """Return why Q/K/V cannot use ``fa_backward``, without allocating state."""
+    return _fa_backward_support_error(q, k, v, None, None, None, sm_scale, causal)
+
+
+def fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
+    """Return why ``fa_backward`` cannot run, or ``None`` when supported."""
+    if o is None:
+        return "o must match q shape and device"
+    if do is None:
+        return "do must match q shape and device"
+    if lse is None:
+        return "lse must be FP32 B,H,N on the same device"
+    return _fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal)
 
 
 def _validate_inputs(q, k, v, o, do, lse, sm_scale, causal):

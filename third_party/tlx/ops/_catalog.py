@@ -141,6 +141,16 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=True,
     ),
     OpSpec(
+        op="flash_attn",
+        arch="gfx950",
+        variant="rotated_cluster_pipeline",
+        impl="triton.tlx.ops.kernels.flash_attn.gfx950:flash_attn",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset(),
+        supports_backward=True,
+    ),
+    OpSpec(
         op="flash_attn_mxfp8",
         arch="sm100",
         variant="ws_pipelined_persistent_mxfp8",

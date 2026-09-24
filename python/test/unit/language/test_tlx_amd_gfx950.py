@@ -14,7 +14,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 import traceback
 from triton._internal_testing import is_hip_cdna4
-from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _cluster_causal_query_tile as _amd_fa_cluster_causal_query_tile,
     _cluster_direct_workgroup_window as _amd_fa_cluster_direct_workgroup_window,
     attention as _amd_fa_cluster_attention,
