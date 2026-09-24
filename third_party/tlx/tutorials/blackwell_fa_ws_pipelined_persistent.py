@@ -4672,8 +4672,6 @@ def _attn_bwd_ws(
     )
     DIRECT_DQ_OUTPUT: tl.constexpr = SCALE_QK_IN_KERNEL and USE_2CTA and HEAD_DIM == 128
     NATIVE_COORDS: tl.constexpr = USE_2CTA and not PERSISTENT_BWD
-    DQ_READ_DONE_BAR: tl.constexpr = 12
-    NUM_REDUCE_THREADS: tl.constexpr = 4 * 32
     qk_scale = sm_scale * _RCP_LN2
 
     # Compute bytes per element for each tensor type
@@ -5218,7 +5216,6 @@ def _attn_bwd_ws(
                             dq_columns = slice_id * 16 + columns[None, :] + (rows[:, None] // 64) * 64
                             dq_offsets = dq_base[:, None] + dq_columns.to(tl.int64) * DQ64_STRIDES[3]
                             tl.atomic_add(DQ64 + dq_offsets, dq.to(tl.float64), sem="relaxed")
-                        tlx.named_barrier_wait(DQ_READ_DONE_BAR, NUM_REDUCE_THREADS)
                         tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
 
                     elif USE_2CTA:
@@ -5226,7 +5223,6 @@ def _attn_bwd_ws(
                         DQ_PACK_ITERS: tl.constexpr = (HEAD_DIM // NUM_CTAS) // (DQ_SLICE_N * (2 if PACKED_DQ else 1))
                         if DIRECT_DQ_OUTPUT:
                             dq_full = tlx.local_load(dq_phys[tmem_buf_id + DQ_BUF_IDX])
-                            tlx.named_barrier_wait(DQ_READ_DONE_BAR, NUM_REDUCE_THREADS)
                             tlx.barrier_arrive(
                                 dq_empties[tmem_buf_id], 1, remote_cta_rank=0
                             )
