@@ -3272,8 +3272,7 @@ struct TritonGPUInferLayoutInterface
     auto mmaBEncoding =
         dyn_cast_or_null<NvidiaMmaEncodingAttr>(bEncoding.getParent());
     auto dotOp = cast<DotOpInterface>(op);
-    auto resEnc = unwrapTlxWrappers(
-        cast<RankedTensorType>(dotOp.getD().getType()).getEncoding());
+    auto resEnc = cast<RankedTensorType>(dotOp.getD().getType()).getEncoding();
     auto mmaResEncoding = dyn_cast<NvidiaMmaEncodingAttr>(resEnc);
     if (mmaAEncoding || mmaBEncoding || mmaResEncoding) {
       // Check that they are all set and have the same version.
@@ -3906,8 +3905,8 @@ struct TritonGPUVerifyTensorLayoutInterface
       return true;
     return isa<triton::MakeRangeOp, triton::SplatOp, triton::BroadcastOp,
                triton::LoadOp, triton::StoreOp, triton::JoinOp, triton::SplitOp,
-               triton::AssertOp,
-               triton::gpu::ConvertLayoutOp, triton::gpu::Fp4ToFpOp,
+               triton::AssertOp, triton::gpu::ConvertLayoutOp,
+               triton::gpu::RequireLayoutOp, triton::gpu::Fp4ToFpOp,
                triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op);
   }
 
