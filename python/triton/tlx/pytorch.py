@@ -20,6 +20,12 @@ PROVIDER_NAME = "TLX_GFX950_BWD"
 _D64_ROUTE = "d64"
 _D128_ROUTE = "d128"
 _D256_ROUTE = "d256"
+_D128_SPLIT_ENTRY = "split"
+_D128_COMBINED_ENTRY = "combined"
+# (entry, block_m, block_n, num_warps, pipelined, rectangular, exact)
+_D128_NONCAUSAL_SPLIT_CONFIG = (_D128_SPLIT_ENTRY, 32, 64, 4, True, True, False)
+_D128_CAUSAL_SPLIT_CONFIG = (_D128_SPLIT_ENTRY, 32, 32, 2, False, False, False)
+_D128_EXACT_CONFIG = (_D128_COMBINED_ENTRY, 16, 256, 4, False, False, True)
 _REQUIRED_BASE_ALIGNMENT_BYTES = 16
 # Exact (Q shape, K/V shape, causal) signatures measured through the activated
 # provider on MI350X. Each entry records the measured route configuration so
@@ -29,6 +35,10 @@ _PERFORMANCE_VALIDATED_SIGNATURES = {
     ((1, 16, 4096, 64), (1, 16, 4096, 64), False): (_D64_ROUTE, "noncausal_fused_n256"),
     ((1, 24, 4096, 64), (1, 24, 4096, 64), True): (_D64_ROUTE, "causal_scheduled_mha"),
     ((4, 48, 1024, 64), (4, 6, 1024, 64), True): (_D64_ROUTE, "causal_scheduled_gqa8"),
+    ((16, 27, 200, 128), (16, 27, 200, 128), False):
+    (_D128_ROUTE, frozenset({_D128_NONCAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
+    ((16, 27, 200, 128), (16, 27, 200, 128), True):
+    (_D128_ROUTE, frozenset({_D128_CAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
     ((16, 64, 1024, 128), (16, 8, 1024, 128), False): (_D128_ROUTE, None),
     ((16, 64, 2048, 128), (16, 8, 2048, 128), False): (_D128_ROUTE, None),
     ((16, 64, 4096, 128), (16, 8, 4096, 128), False): (_D128_ROUTE, None),
@@ -44,6 +54,24 @@ class _TLXFlashAttentionHandle:
     def remove(self) -> None:
         # torch.library.Library deregisters its implementations on destruction.
         self.library = None
+
+
+def _d128_dispatch_config(dispatch):
+    if dispatch.entry is gfx950_bwd._attn_bwd_dkdv_d128_split_kernel:
+        entry = _D128_SPLIT_ENTRY
+    elif dispatch.entry is gfx950_bwd._attn_bwd_dkdv_dq_d128_combined_kernel:
+        entry = _D128_COMBINED_ENTRY
+    else:
+        return None
+    return (
+        entry,
+        dispatch.block_m,
+        dispatch.block_n,
+        dispatch.num_warps,
+        dispatch.pipelined,
+        dispatch.rectangular,
+        dispatch.exact,
+    )
 
 
 def _native_fallback(
@@ -100,7 +128,20 @@ def _is_performance_validated(query, key, value, out, grad_out, logsumexp, scale
 
     route_kind, expected_config = route
     if route_kind == _D128_ROUTE:
-        return not any(gfx950_bwd._d128_regalloc_options().values())
+        if any(gfx950_bwd._d128_regalloc_options().values()):
+            return False
+        # D128 GQA has one fixed launch topology. Short MHA can select the
+        # measured split fallback or the measured exact opt-in, but not the
+        # unmeasured persistent experiments behind neighboring environment
+        # flags.
+        if expected_config is None:
+            return True
+        try:
+            dispatch = gfx950_bwd._select_d128_dispatch(tuple(query.shape), is_causal)
+            selected_config = _d128_dispatch_config(dispatch)
+        except (AssertionError, AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+        return selected_config in expected_config
     if route_kind == _D256_ROUTE:
         dispatch = gfx950_bwd._select_d256_dispatch(is_causal)
         return (dispatch.num_warps, dispatch.staged, dispatch.pipelined) == expected_config
