@@ -121,8 +121,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
   // CHECK: arith.xori {{.*}} : tensor<{{.*}}xi64
   // CHECK-NEXT: %[[MISSING_PROXY_BITS:.*]] = arith.andi {{.*}} : tensor<{{.*}}xi64
   // CHECK-NEXT: %[[HAS_MISSING_PROXY_BITS:.*]] = arith.cmpi ne, %[[MISSING_PROXY_BITS]], {{.*}} : tensor<{{.*}}xi64
-  // CHECK-NEXT: %[[MISSING_PROXY_PREDICATES:.*]] = tt.reshape %[[HAS_MISSING_PROXY_BITS]]{{.*}} -> tensor<{{.*}}xi1
-  // CHECK: "tt.reduce"(%[[MISSING_PROXY_PREDICATES]])
+  // CHECK-NEXT: "tt.reduce"(%[[HAS_MISSING_PROXY_BITS]])
   // CHECK: arith.ori {{.*}} : i1
   // CHECK-LABEL: @proxy_fence_state_transitions
   tt.func public @proxy_fence_state_transitions(%out: !tt.tensordesc<32x32xf32, #proxy_shared>) {
