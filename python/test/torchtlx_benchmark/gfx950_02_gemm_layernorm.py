@@ -5,6 +5,10 @@ import torch.nn.functional as F
 
 NAME = "gfx950_02_gemm_layernorm"
 CANDIDATE_NAME = "gemm_layernorm"
+CANDIDATE_CODE_MARKER_GROUPS = (
+    ("a16w16_8wave", "_register_kernel_impl"),
+    ("tlx_gfx950_apply_norm", "tlx_gfx950_addmm_norm_row_reduce"),
+)
 _COMMON_CONFIG: dict[str, object] = {
     "force_disable_caches": True,
     "max_autotune": True,
