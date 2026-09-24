@@ -28,6 +28,11 @@ flash_attention:
   disabled_devices:
     - hip
 # Device specific tests
+gemm:
+  # gfx950 TLX matmul does not support backward.
+  backends: tlx_matmul_gfx950
+  disabled_devices:
+    - hip
 blackwell_attentions_mxfp8:
   devices:
     - b200

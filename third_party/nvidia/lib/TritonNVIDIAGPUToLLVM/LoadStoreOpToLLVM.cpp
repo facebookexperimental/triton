@@ -1188,11 +1188,7 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
     cgaLayout =
         ttg::CGAEncodingAttr::get(ctx, LinearLayout(bases, outDimNames));
   }
-  for (int i = 0; i < rank; ++i) {
-    auto dim = cgaLayout.getCTAOrder()[i];
-    msgToOffset *= LinearLayout::identity1D(cgaLayout.getCTASplitNum()[dim],
-                                            kBlock, outDimNames[dim]);
-  }
+  msgToOffset *= cgaLayout.getLinearLayout();
   return msgToOffset;
 }
 
@@ -1252,7 +1248,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
         typeConverter->convertType(barrierTy.getElementType()), rewriter);
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getResult(), llvmElemTy, rewriter);
-    Value dstBase = dstMemObj.getShmemAffineBase(loc, rewriter, dstTy);
+    uint64_t affineBlockMask =
+        LLVM::SharedMemoryObject::getMaskSpanOffsetsAndBlocks(dstTy).second;
 
     auto voidTy = void_ty(op->getContext());
     auto id = getThreadId(rewriter, loc);
@@ -1272,12 +1269,14 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
     auto smemLayout = ttg::toLinearLayout(smemTy);
-    auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
+    auto msgToShared =
+        invertAndComposeBlockLocal(smemLayout, msgToPackedOffset);
     auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, smemTy);
 
     auto ctx = op.getContext();
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
+    auto kOffset = str_attr("offset");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     // We multicast if the flag is on and the block layout has broadcasting
@@ -1312,6 +1311,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           getCGALayout(barrierTy.getEncoding()) == oneCTACGALayout;
       ctaGroup = oneCTABarrier ? "cta_group::1." : "cta_group::2.";
     }
+    if (affineBlockMask)
+      ctaGroup = "cta_group::2.";
 
     // The bounding box inner dimension must be less than or equal to the
     // swizzle size.
@@ -1326,32 +1327,52 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       Value boxPred =
           b.and_(pred, b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
-      Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
       Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
-      Value shMemOffset =
-          applyLinearLayout(loc, rewriter, msgToShared,
-                            {{kMsg, copyIdxVal}, {kBlock, ctaId}})[0]
-              .second;
-      Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
+      auto sharedAddress = applyLinearLayout(
+          loc, rewriter, msgToShared, {{kMsg, copyIdxVal}, {kBlock, ctaId}});
+      Value shMemOffset;
+      Value layoutBlock;
+      for (auto [name, value] : sharedAddress) {
+        if (name == kOffset)
+          shMemOffset = value;
+        else if (name == kBlock)
+          layoutBlock = value;
+      }
+      if (!shMemOffset || !layoutBlock)
+        return op.emitError(
+            "expected TMA shared layout to produce offset and block");
+      auto [shMemPtr, targetCTA] =
+          materializeLocalAddrs(loc, dstTy, dstMemObj, llvmElemTy,
+                                {{shMemOffset, layoutBlock}}, rewriter)[0];
+      if (affineBlockMask) {
+        shMemPtr = NVVM::MapaOp::create(rewriter, loc,
+                                        ptr_ty(rewriter.getContext(), 7),
+                                        shMemPtr, targetCTA);
+      }
       SmallVector<PTXBuilder::Operand *> operands = {
           ptxBuilderTMA.newOperand(boxPred, "b"),
           ptxBuilderTMA.newOperand(shMemPtr, "r"),
           ptxBuilderTMA.newOperand(adaptor.getDesc(), "l")};
       // The destination SMEM scope is cluster-level whenever the copy involves
-      // the cluster -- a cluster barrier (#9510), multicast, or a 2-CTA group;
-      // otherwise it is CTA-local. The barrier component keys on the barrier
-      // layout (not the SMEM layout), matching #9510.
+      // the cluster -- a cluster barrier (#9510), multicast, a 2-CTA group, or
+      // a subview whose affine block component targets another CTA. Otherwise
+      // it is CTA-local. The barrier component keys on the barrier layout (not
+      // the SMEM layout), matching #9510.
       auto multicastMask = op.getMulticastTargets();
       // The current Hopper toolchain emits PTX < 8.6, where shared::cta TMA
       // loads are not accepted. Conservatively use cluster scope on Hopper;
       // keep CTA scope on Blackwell.
       bool clusterScope = computeCapability < 100 || crossCTABarrier ||
                           multicast || multicastMask != nullptr ||
-                          op.getTwoCta();
+                          op.getTwoCta() || affineBlockMask;
       std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
-                            "d.shared::" + (clusterScope ? "cluster" : "cta") +
-                            ".global.mbarrier::complete_tx::bytes";
-      if (op.getTwoCta())
+                            "d.";
+      if (affineBlockMask)
+        tmaInst += ctaGroup;
+      tmaInst += "shared::" + std::string(clusterScope ? "cluster" : "cta") +
+                 ".global" + (isIm2Col ? ".im2col" : "") +
+                 ".mbarrier::complete_tx::bytes";
+      if (op.getTwoCta() && !affineBlockMask)
         tmaInst += ".cta_group::2";
       if (multicastMask != nullptr)
         tmaInst += ".multicast::cluster";
@@ -1729,11 +1750,10 @@ static LinearLayout getUnswizzledLayout(triton::gpu::MemDescType type) {
     assert(isa<ttg::SwizzledSharedEncodingAttr>(type.getEncoding()));
     return ttg::toLinearLayout(type);
   }
-  assert(type.getShape() == type.getAllocShape().take_back(type.getRank()));
   // TMA gather/scatter only supports tiled mode
   return ttg::nvmmaSharedToLinearLayout(
-      type.getShape(), cast<NVMMASharedEncodingAttr>(type.getEncoding()),
-      ttg::TMAMode::Tiled, /*disableSwizzle=*/true);
+      ttg::dropPipeliningDim(type.getAllocShape(), type.getEncoding()),
+      mmaEncoding, ttg::TMAMode::Tiled, /*disableSwizzle=*/true);
 }
 
 // This function is shared between the TMA gather and scatter lowerings. It
@@ -1774,11 +1794,7 @@ static LogicalResult iterateGatherScatterIndices(
           "x offsets are not grouped by 4 contiguous elements");
   }
 
-  // TMA expects the memdesc shape to match the alloc shape.
   triton::gpu::MemDescType smemType = smem.getType();
-  ArrayRef<int64_t> allocShape = smemType.getAllocShape();
-  if (allocShape.size() < 2 || smemType.getShape() != allocShape.take_back(2))
-    return op->emitError("memdesc shape must match alloc shape");
   // `NVMMASharedEncodingAttr` means the core matrix tiles are placed next to
   // each other in shared memory, which lines up with how `gather4` loads data.
   auto enc = dyn_cast<NVMMASharedEncodingAttr>(smemType.getEncoding());
@@ -1787,10 +1803,10 @@ static LogicalResult iterateGatherScatterIndices(
   if (enc.getFp4Padded())
     yOffsetValue = b.mul(yOffsetValue, b.i32_val(2));
   Type llvmElemTy = typeConverter.convertType(smemType.getElementType());
-  Type elemPtrTy = ptr_ty(ctx, /*addrspace=*/3);
   auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, smemObjValue,
                                                        llvmElemTy, rewriter);
-  Value smemBase = smemObj.getShmemAffineBase(loc, rewriter, smemType);
+  bool crossCTA =
+      LLVM::SharedMemoryObject::getMaskSpanOffsetsAndBlocks(smemType).second;
 
   unsigned threadsPerWarp = xCoordsLayout.getInDimSize(kLane);
 
@@ -1819,7 +1835,8 @@ static LogicalResult iterateGatherScatterIndices(
   // swizzle tile size, e.g. [4, 32] vs. [8, 32], then, for example, the address
   // of the 0th element of row 4 will not be at the start of the segment.
   LinearLayout sharedLayout = getUnswizzledLayout(smemType);
-  LinearLayout msgToShared = msgLayout.invertAndCompose(sharedLayout);
+  LinearLayout msgToShared =
+      invertAndComposeBlockLocal(sharedLayout, msgLayout);
 
   // If there are too few rows, warps will have redundant data.
   auto freeVars = xCoordsLayout.getFreeVariableMasks();
@@ -1858,10 +1875,13 @@ static LogicalResult iterateGatherScatterIndices(
                                        {kMsg, msgIdVal}});
       assert(result.size() == 2 && result.front().first == "offset" &&
              result.back().first == "block");
-      Value shMemOffset = result.front().second;
-      // Because we checked that the memdesc's allocshape and shape match, we
-      // can ignore the strides and directly index into the shmem object.
-      Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, smemBase, shMemOffset);
+      auto [shMemPtr, targetCTA] = materializeLocalAddrs(
+          loc, smemType, smemObj, llvmElemTy,
+          {{result.front().second, result.back().second}}, rewriter)[0];
+      if (crossCTA) {
+        shMemPtr = NVVM::MapaOp::create(rewriter, loc, ptr_ty(ctx, 7), shMemPtr,
+                                        targetCTA);
+      }
       Value yOffset = b.add(yOffsetValue, b.i32_val(msgId * msgSize));
 
       callback(pred, shMemPtr, yOffset, ArrayRef(xOffsets).slice(regId, 4));
@@ -1914,6 +1934,9 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
     barrierPtr =
         LLVM::NVIDIA::getLeaderAddress(loc, rewriter, barrierPtr, barrierTy);
   }
+  bool crossCTA = LLVM::SharedMemoryObject::getMaskSpanOffsetsAndBlocks(
+                      op.getResult().getType())
+                      .second;
 
   std::string ctaGroup;
   if (getModuleTwoCTAs(op)) {
@@ -1923,6 +1946,8 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
         getCGALayout(barrierTy.getEncoding()) == oneCTACGALayout;
     ctaGroup = oneCTABarrier ? ".cta_group::1" : ".cta_group::2";
   }
+  if (crossCTA)
+    ctaGroup = ".cta_group::2";
 
   // Callback to generate the gather4 instruction.
   auto callback = [&](Value pred, Value shMemPtr, Value yOffset,
@@ -1930,7 +1955,9 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
     std::string tmaInst = "@$0 cp.async.bulk.tensor.2d.tile::gather4";
     tmaInst += ctaGroup;
     tmaInst += ".shared::";
-    bool clusterScope = multicast || (crossCTABarrier && !getModuleTwoCTAs(op));
+    bool clusterScope =
+        multicast || crossCTA ||
+        (crossCTABarrier && !getModuleTwoCTAs(op));
     tmaInst += clusterScope ? "cluster" : "cta";
     tmaInst += ".global.mbarrier::complete_tx::bytes";
     if (multicast)
