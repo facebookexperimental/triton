@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions | FileCheck %s
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions -tritongpu-remove-layout-conversions | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions -tlx-finalize-user-layouts | FileCheck %s --check-prefix=FINAL
 
 #blocked_acc = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked_row = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
@@ -264,5 +265,155 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
     // CHECK: } {wave_uniform} :
     // CHECK: tt.return %[[RESULT]]
     tt.return %result : tensor<128xf32, #uniform_blocked_pinned>
+  }
+}
+
+// -----
+
+#nested_uniform_blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#nested_uniform_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#nested_uniform_mma_row = #ttg.slice<{dim = 1, parent = #nested_uniform_mma}>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @nested_wave_uniform_inherits_restricted_exec
+  // CHECK-SAME: %[[OUTER_PRED:.*]]: i1, %[[INNER_PRED:.*]]: i1, %[[INIT:.*]]: tensor<128xf32, #[[$NESTED_BLOCKED:.*]]>, %[[NATIVE:.*]]: tensor<128xf32, #[[$NESTED_NATIVE:.*]]>, %[[PTR:.*]]: !tt.ptr<i32>
+  tt.func @nested_wave_uniform_inherits_restricted_exec(
+      %outer_predicate: i1, %inner_predicate: i1,
+      %init: tensor<128xf32, #nested_uniform_blocked>,
+      %native: tensor<128xf32, #nested_uniform_mma_row>, %ptr: !tt.ptr<i32>) {
+    // CHECK: %[[FORCED_INIT:.*]] = ttg.convert_layout %[[INIT]] : tensor<128xf32, #[[$NESTED_BLOCKED]]> -> tensor<128xf32, #[[$NESTED_NATIVE]]>
+    %pid = tt.get_program_id x : i32
+    // CHECK: ttg.warp_predicate %[[OUTER_PRED]]() {
+    // CHECK-NOT: ttg.convert_layout
+    ttg.warp_predicate %outer_predicate () {
+      %inner_init = arith.addf %init, %init : tensor<128xf32, #nested_uniform_blocked>
+      // CHECK: %[[INNER:.*]] = ttg.warp_predicate %[[INNER_PRED]](%{{.*}}) {
+      // CHECK-NOT: ttg.convert_layout
+      %inner = ttg.warp_predicate %inner_predicate (%inner_init) {
+        %restored = ttg.convert_layout %native : tensor<128xf32, #nested_uniform_mma_row> -> tensor<128xf32, #nested_uniform_blocked>
+        tt.store %ptr, %pid : !tt.ptr<i32>
+        // CHECK: ttg.predicate_yield %[[NATIVE]] : tensor<128xf32, #[[$NESTED_NATIVE]]>
+        ttg.predicate_yield %restored : tensor<128xf32, #nested_uniform_blocked>
+      } {wave_uniform} : (i1, tensor<128xf32, #nested_uniform_blocked>) -> tensor<128xf32, #nested_uniform_blocked>
+      // CHECK: } {wave_uniform} : (i1, tensor<128xf32, #[[$NESTED_NATIVE]]>) -> tensor<128xf32, #[[$NESTED_NATIVE]]>
+      // CHECK-NOT: ttg.convert_layout
+      ttg.predicate_yield
+    } : (i1) -> ()
+    // CHECK: tt.return
+    tt.return
+  }
+}
+
+// -----
+
+#release_blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#release_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#release_mma_row = #ttg.slice<{dim = 1, parent = #release_mma}>
+#release_native = #tlx.user_layout<#release_mma_row>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // FINAL-LABEL: tt.func @strict_release_finalizes_outside_restricted_exec
+  // FINAL-SAME: %[[PRED:.*]]: i1, %[[INIT:.*]]: tensor<128xf32, #[[$RELEASE_BLOCKED:.*]]>, %[[NATIVE:.*]]: tensor<128xf32, #{{.*}}>
+  tt.func @strict_release_finalizes_outside_restricted_exec(
+      %predicate: i1, %init: tensor<128xf32, #release_blocked>,
+      %native: tensor<128xf32, #release_native>)
+      -> tensor<128xf32, #release_blocked> {
+    // FINAL: %[[CONVERTED_INIT:.*]] = ttg.convert_layout %[[INIT]] : tensor<128xf32, #[[$RELEASE_BLOCKED]]> -> tensor<128xf32, #[[$RELEASE_NATIVE:.*]]>
+    // FINAL: %[[RESULT:.*]] = ttg.warp_predicate %[[PRED]](%[[CONVERTED_INIT]]) {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.release_layout
+    %result = ttg.warp_predicate %predicate (%init) {
+      %released = ttg.release_layout %native : tensor<128xf32, #release_native> -> tensor<128xf32, #release_blocked>
+      // FINAL: ttg.predicate_yield %[[NATIVE]] : tensor<128xf32, #[[$RELEASE_NATIVE]]>
+      ttg.predicate_yield %released : tensor<128xf32, #release_blocked>
+    } : (i1, tensor<128xf32, #release_blocked>) -> tensor<128xf32, #release_blocked>
+    // FINAL: %[[RESTORED:.*]] = ttg.convert_layout %[[RESULT]] : tensor<128xf32, #[[$RELEASE_NATIVE]]> -> tensor<128xf32, #[[$RELEASE_BLOCKED]]>
+    // FINAL: tt.return %[[RESTORED]]
+    tt.return %result : tensor<128xf32, #release_blocked>
+  }
+
+  // FINAL-LABEL: tt.func @strict_release_without_carried_result
+  // FINAL-SAME: %[[SIDE_PRED:.*]]: i1, %[[SIDE_NATIVE:.*]]: tensor<128xf32, #{{.*}}>, %[[PTRS:.*]]: tensor<128x!tt.ptr<f32>, #[[$RELEASE_BLOCKED]]>
+  tt.func @strict_release_without_carried_result(
+      %predicate: i1, %native: tensor<128xf32, #release_native>,
+      %ptrs: tensor<128x!tt.ptr<f32>, #release_blocked>) {
+    // FINAL: %[[RELEASED:.*]] = ttg.convert_layout %[[SIDE_NATIVE]] : tensor<128xf32, #{{.*}}> -> tensor<128xf32, #[[$RELEASE_BLOCKED]]>
+    // FINAL: ttg.warp_predicate %[[SIDE_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.release_layout
+    ttg.warp_predicate %predicate () {
+      %released = ttg.release_layout %native : tensor<128xf32, #release_native> -> tensor<128xf32, #release_blocked>
+      // FINAL: tt.store %[[PTRS]], %[[RELEASED]]
+      tt.store %ptrs, %released : tensor<128x!tt.ptr<f32>, #release_blocked>
+      ttg.predicate_yield
+    } : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @strict_release_tensor_predicate_without_carried_result
+  // FINAL-SAME: %[[TENSOR_PRED:.*]]: tensor<128xi1, #[[$RELEASE_BLOCKED]]>, %[[TENSOR_NATIVE:.*]]: tensor<128xf32, #{{.*}}>, %[[TENSOR_PTRS:.*]]: tensor<128x!tt.ptr<f32>, #[[$RELEASE_BLOCKED]]>
+  tt.func @strict_release_tensor_predicate_without_carried_result(
+      %predicate: tensor<128xi1, #release_blocked>,
+      %native: tensor<128xf32, #release_native>,
+      %ptrs: tensor<128x!tt.ptr<f32>, #release_blocked>) {
+    // FINAL: %[[TENSOR_RELEASED:.*]] = ttg.convert_layout %[[TENSOR_NATIVE]] : tensor<128xf32, #{{.*}}> -> tensor<128xf32, #[[$RELEASE_BLOCKED]]>
+    // FINAL: ttg.warp_predicate %[[TENSOR_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.release_layout
+    ttg.warp_predicate %predicate () {
+      %released = ttg.release_layout %native : tensor<128xf32, #release_native> -> tensor<128xf32, #release_blocked>
+      // FINAL: tt.store %[[TENSOR_PTRS]], %[[TENSOR_RELEASED]]
+      tt.store %ptrs, %released : tensor<128x!tt.ptr<f32>, #release_blocked>
+      ttg.predicate_yield
+    } : (tensor<128xi1, #release_blocked>) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @require_finalizes_outside_restricted_exec
+  // FINAL-SAME: %[[REQUIRE_PRED:.*]]: i1, %[[REQUIRE_SRC:.*]]: tensor<128xf32, #[[$RELEASE_BLOCKED]]>, %[[REQUIRE_PTRS:.*]]: tensor<128x!tt.ptr<f32>, #{{.*}}>
+  tt.func @require_finalizes_outside_restricted_exec(
+      %predicate: i1, %src: tensor<128xf32, #release_blocked>,
+      %ptrs: tensor<128x!tt.ptr<f32>, #release_native>) {
+    // FINAL: %[[REQUIRED:.*]] = ttg.convert_layout %[[REQUIRE_SRC]]
+    // FINAL: ttg.warp_predicate %[[REQUIRE_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.require_layout
+    ttg.warp_predicate %predicate () {
+      %required = ttg.require_layout %src : tensor<128xf32, #release_blocked> -> tensor<128xf32, #release_native>
+      // FINAL: tt.store %[[REQUIRE_PTRS]], %[[REQUIRED]]
+      tt.store %ptrs, %required : tensor<128x!tt.ptr<f32>, #release_native>
+      ttg.predicate_yield
+    } : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+}
+
+// -----
+
+#reshape_src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 64]], warp = [[32, 0], [64, 0], [16, 0]], block = []}>
+#reshape_dst = #ttg.blocked<{sizePerThread = [1, 1, 2], threadsPerWarp = [1, 32, 1], warpsPerCTA = [4, 2, 1], order = [2, 1, 0]}>
+#reshape_wrapped_dst = #tlx.no_verify_layout<#tlx.user_layout<#reshape_dst>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 32 : i32} {
+  // FINAL-LABEL: tt.func @reshape_repair_stays_outside_restricted_exec
+  // FINAL-SAME: %[[RESHAPE_PRED:.*]]: i1, %[[RESHAPE_SRC:.*]]: tensor<128x128xf32, #{{.*}}>, %[[RESHAPE_PTRS:.*]]: tensor<128x2x64x!tt.ptr<f32>, #[[$RESHAPE_DST:.*]]>
+  tt.func @reshape_repair_stays_outside_restricted_exec(
+      %predicate: i1, %src: tensor<128x128xf32, #reshape_src>,
+      %ptrs: tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>) {
+    // FINAL: %[[COMPATIBLE_SRC:.*]] = ttg.convert_layout %[[RESHAPE_SRC]]
+    // FINAL: ttg.warp_predicate %[[RESHAPE_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    ttg.warp_predicate %predicate () {
+      // FINAL: %[[RESHAPED:.*]] = tt.reshape %[[COMPATIBLE_SRC]] : {{.*}} -> tensor<128x2x64xf32, #[[$RESHAPE_DST]]>
+      %reshaped = tt.reshape %src : tensor<128x128xf32, #reshape_src> -> tensor<128x2x64xf32, #reshape_wrapped_dst>
+      // FINAL: tt.store %[[RESHAPE_PTRS]], %[[RESHAPED]]
+      tt.store %ptrs, %reshaped : tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>
+      ttg.predicate_yield
+    } : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
   }
 }
