@@ -57,9 +57,8 @@ static NoVerifyLayoutAttr getNoVerifyLayoutFromType(Type type) {
 }
 
 /// Extract a user-layout wrapper on a *shared* (MemDescType) value, if present.
-/// Register (RankedTensorType) user layouts are intentionally left wrapped
-/// here: they must survive as anchors through remove-layout-conversions and are
-/// unwrapped later by tlx-finalize-user-layouts.
+/// Register pins are retired separately after their provenance has moved to
+/// explicit require-layout SSA boundaries.
 static UserLayoutAttr getUserLayoutFromType(Type type) {
   if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
     return dyn_cast_or_null<UserLayoutAttr>(memDescType.getEncoding());
@@ -68,6 +67,8 @@ static UserLayoutAttr getUserLayoutFromType(Type type) {
 }
 
 static bool containsNoVerifyLayout(Type type);
+static bool containsUserLayout(Type type);
+static bool containsUserLayout(Attribute attr);
 
 static bool containsNoVerifyLayout(Attribute attr) {
   if (!attr)
@@ -242,8 +243,9 @@ static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
   // wrapper
   // (#tlx.user_layout<#tlx.no_verify_layout<L>> -> #tlx.user_layout<L>). The
   // no-verify marker only defers tensor verification through inlining; once
-  // inlining is done it is no longer needed. A user-layout marker is preserved
-  // (it is retired later by tlx-finalize-user-layouts).
+  // inlining is done it is no longer needed. User-layout markers are preserved
+  // for the next step, which retires them after pin provenance is on explicit
+  // SSA boundaries.
   mlir::AttrTypeReplacer replacer;
   replacer.addReplacement([](NoVerifyLayoutAttr wrapper) -> Attribute {
     return wrapper.getLayout();
@@ -267,13 +269,20 @@ static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
         op->emitError("unresolved TLX no-verify layout after placeholder "
                       "layout resolution");
       }
+    for (NamedAttribute attr : op->getAttrs())
+      if (containsNoVerifyLayout(attr.getValue())) {
+        residual = true;
+        op->emitError("unresolved TLX no-verify layout in operation attribute "
+                      "after placeholder layout resolution");
+        break;
+      }
   });
   return failure(residual);
 }
 
 /// Unwrap every user-pinned layout (#tlx.user_layout<...>) back
 /// to the concrete shared layout the user requested, and verify none remain.
-static LogicalResult unwrapUserLayouts(ModuleOp moduleOp) {
+static LogicalResult unwrapSharedUserLayouts(ModuleOp moduleOp) {
   DenseMap<Value, Attribute> valuesToUnwrap;
   collectValuesWithEncodings(
       moduleOp,
@@ -307,11 +316,64 @@ static LogicalResult unwrapUserLayouts(ModuleOp moduleOp) {
   return failure(foundResidual);
 }
 
+/// Retire register user-layout wrappers after TLX propagation has transferred
+/// true pin provenance to require-layout SSA boundaries. Applying the type
+/// replacement module-wide keeps operation results, region arguments, function
+/// signatures, and nested encoding attributes consistent in one verifier-safe
+/// step; derived wrapper propagation does not create additional anchors.
+static LogicalResult unwrapRegisterUserLayouts(ModuleOp moduleOp) {
+  mlir::AttrTypeReplacer replacer;
+  replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
+    return getEffectiveEncoding(wrapper);
+  });
+
+  moduleOp->walk([&](Operation *op) {
+    replacer.replaceElementsIn(op, /*replaceAttrs=*/true, /*replaceLocs=*/false,
+                               /*replaceTypes=*/true);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          arg.setType(replacer.replace(arg.getType()));
+  });
+  realignDenseConstantTypes(moduleOp);
+
+  bool residual = false;
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes()) {
+      if (!containsUserLayout(type))
+        continue;
+      residual = true;
+      op->emitError("unresolved TLX register user layout after early pin "
+                    "lowering");
+    }
+    for (NamedAttribute attr : op->getAttrs())
+      if (containsUserLayout(attr.getValue())) {
+        residual = true;
+        op->emitError("unresolved TLX user layout in operation attribute "
+                      "after early pin lowering");
+        break;
+      }
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments()) {
+          if (!containsUserLayout(arg.getType()))
+            continue;
+          residual = true;
+          op->emitError("unresolved TLX register user layout on block "
+                        "argument after early pin lowering");
+        }
+  });
+  return failure(residual);
+}
+
 LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
   if (failed(unwrapNoVerifyLayouts(moduleOp)))
     return failure();
 
-  if (failed(unwrapUserLayouts(moduleOp)))
+  if (failed(unwrapSharedUserLayouts(moduleOp)))
+    return failure();
+
+  if (failed(unwrapRegisterUserLayouts(moduleOp)))
     return failure();
 
   // Collect all values that have dummy layouts
@@ -389,10 +451,9 @@ static bool containsUserLayout(Type type) {
   return found;
 }
 
-/// Unwrap user-pinned register layouts (#tlx.user_layout on a RankedTensorType)
-/// back to the concrete wrapped layout, and verify none remain. These are kept
-/// wrapped through the layout-optimization passes (they anchor via
-/// PinnedEncodingTrait) and retired here.
+/// Defensively unwrap any user-pinned register layouts that reach late
+/// finalization. The early resolver normally retires these after transferring
+/// provenance to explicit SSA boundaries.
 ///
 /// Uses an AttrTypeReplacer so the wrapper is stripped *everywhere* it appears,
 /// including nested inside other encodings (e.g. a reduce's

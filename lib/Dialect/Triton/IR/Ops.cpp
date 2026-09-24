@@ -262,9 +262,6 @@ DotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
       encodingContainsTlxNoVerifyLayout(bEnc) ||
       encodingContainsTlxNoVerifyLayout(retEnc))
     return success();
-  aEnc = unwrapTlxWrappers(aEnc);
-  bEnc = unwrapTlxWrappers(bEnc);
-  retEnc = unwrapTlxWrappers(retEnc);
   if (aEnc && bEnc && retEnc) {
     Dialect &dialect = retEnc.getDialect();
     auto interface = cast<DialectInferLayoutInterface>(&dialect);
@@ -296,9 +293,6 @@ LogicalResult DotOp::verify() {
       encodingContainsTlxNoVerifyLayout(bEncoding) ||
       encodingContainsTlxNoVerifyLayout(retEnc))
     return success();
-  aEncoding = unwrapTlxWrappers(aEncoding);
-  bEncoding = unwrapTlxWrappers(bEncoding);
-  retEnc = unwrapTlxWrappers(retEnc);
   if (!aEncoding && !bEncoding)
     return success();
   // Verify that the encodings are valid.

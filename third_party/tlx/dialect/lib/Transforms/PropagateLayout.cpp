@@ -42,6 +42,9 @@ public:
       return failure();
     auto resultType = cast<RankedTensorType>(requireLayoutOp.getType());
     if (containsPinnedEncoding(resultType.getEncoding())) {
+      // Keep the temporary wrapper until placeholder resolution can retire it
+      // from the whole SSA graph atomically. The first-class TTG operation is
+      // the durable boundary once tensor types become physical.
       auto boundary = ttg::RequireLayoutOp::create(
           rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
           requireLayoutOp.getSrc());
@@ -713,12 +716,13 @@ static void updateTensorRegionBranchTypes(triton::FuncOp funcOp,
 // encoding on a MemDescType (results and block arguments) with its wrapped
 // concrete layout L. Runs after the dataflow rewrite has refused to retag these
 // buffers, so the user's choice has been honored and the marker is no longer
-// needed. Done here (not only in tlx-resolve-placeholder-layouts) because the
-// AMD pipeline does not run that pass, but always runs this one.
+// needed. Retire shared metadata immediately after its dataflow completes;
+// register metadata remains until the following resolver can rewrite the whole
+// SSA graph atomically.
 //
-// Register (RankedTensorType) user layouts are intentionally left wrapped: they
-// must survive as anchors through remove-layout-conversions and the other
-// layout passes, and are unwrapped later by tlx-finalize-user-layouts.
+// Register (RankedTensorType) wrappers remain only until the following
+// tlx-resolve-placeholder-layouts pass can retire them atomically. Explicit
+// ttg.require_layout operations remain as the durable repeated-RLC boundaries.
 static void unwrapUserLayoutEncodings(Operation *root) {
   auto rewrite = [](Value v) {
     if (auto md = dyn_cast<ttg::MemDescType>(v.getType())) {

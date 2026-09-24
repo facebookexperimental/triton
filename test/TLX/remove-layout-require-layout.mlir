@@ -94,24 +94,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
-// After placeholder resolution, require_layout retains user_layout as an
-// identity anchor. Re-running RLC must keep both the boundary and its pin
-// provenance while propagating the effective physical MMA layout downstream.
+// After placeholder resolution, require_layout itself is the physical pin
+// boundary. Re-running RLC must preserve that SSA operation and its exact MMA
+// result layout without relying on discardable attributes.
 
 #pin_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
-#pin_user = #tlx.user_layout<#pin_mma>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   // CHECK-LABEL: tt.func @require_layout_user_candidate_is_idempotent
   tt.func @require_layout_user_candidate_is_idempotent(
-      %src: tensor<32x32xf32, #pin_mma>) -> tensor<32x32xf32, #pin_user> {
-    // CHECK: %[[PIN_TO_USER:.*]] = ttg.convert_layout %{{.*}} : tensor<32x32xf32, #{{.*}}> -> tensor<32x32xf32, #[[$PIN_USER:.*]]>
-    // CHECK: %[[PIN_REQ:.*]] = ttg.require_layout %[[PIN_TO_USER]] : tensor<32x32xf32, #[[$PIN_USER]]> -> tensor<32x32xf32, #[[$PIN_USER]]>
-    %req = ttg.require_layout %src : tensor<32x32xf32, #pin_mma> -> tensor<32x32xf32, #pin_user>
-    // CHECK: %[[PIN_NEXT:.*]] = arith.addf %[[PIN_REQ]], %[[PIN_REQ]] : tensor<32x32xf32, #[[$PIN_USER]]>
-    %next = arith.addf %req, %req : tensor<32x32xf32, #pin_user>
+      %src: tensor<32x32xf32, #pin_mma>) -> tensor<32x32xf32, #pin_mma> {
+    // CHECK: %[[PIN_REQ:.*]] = ttg.require_layout %arg0 : tensor<32x32xf32, #[[$PIN_MMA:.*]]> -> tensor<32x32xf32, #[[$PIN_MMA]]>
+    %req = ttg.require_layout %src : tensor<32x32xf32, #pin_mma> -> tensor<32x32xf32, #pin_mma>
+    // CHECK: %[[PIN_NEXT:.*]] = arith.addf %[[PIN_REQ]], %[[PIN_REQ]] : tensor<32x32xf32, #[[$PIN_MMA]]>
+    %next = arith.addf %req, %req : tensor<32x32xf32, #pin_mma>
     // CHECK-NEXT: tt.return %[[PIN_NEXT]]
-    tt.return %next : tensor<32x32xf32, #pin_user>
+    tt.return %next : tensor<32x32xf32, #pin_mma>
   }
 }
 
