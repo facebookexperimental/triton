@@ -3402,11 +3402,80 @@ def _dispatch_plan(m, n, k, dtype, element_size):
 
 
 def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
-    """Return the production plan selected for one problem shape."""
-    # Layouts outside the direct-to-LDS contract use the generic strided register kernel.
-    if a_strides[1] != 1 or b_strides[0] != 1:
+    """Return one production plan selected from measured gfx950 families."""
+
+    def register(block_m, block_n, block_k, group_m, num_xcds, waves_per_eu, num_warps, num_stages):
+        return "register", {
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "GROUP_M": group_m,
+            "NUM_XCDS": num_xcds,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": waves_per_eu,
+            "kpack": 1,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
+    # Only genuinely strided operands retain the generic register fallback; either dense B orientation is eligible below.
+    if a_strides[1] != 1 or (b_strides[0] != 1 and b_strides[1] != 1):
         return "register", _register_plan_for_shape(m, n, k) or _intermediate_register_config(m, n, k)
-    return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Sub-1024 row problems retain their measured LDS, persistent, and LocalSplitU algorithm choices.
+    if m < 1024:
+        return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Small output grids and shallow medium-M reductions retain their measured incumbent algorithms.
+    if m < 4096 and (m * n <= 4 * 1024 * 1024 or n <= 512 or k <= 512):
+        return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Extremely reduction-heavy matrices retain the incumbent split-K plan.
+    if k >= 64 * n:
+        return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Short reductions favor the measured 128x256 K32 wave-limited family.
+    if k <= 256:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
+
+    # Narrow outputs favor the measured 256x256 two-stage family despite the N tail.
+    if n <= 256:
+        return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Extreme N-major shapes favor the wide-N K32 family.
+    if n >= 8 * k:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
+
+    # Large-M throughput shapes favor the measured 256x256 two-stage family.
+    if m >= 16384:
+        return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Low-M N-major shapes amortize best with the larger square tile.
+    if n >= 2 * k and m <= 1024:
+        return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Low-M broad K-major shapes favor the measured XCD-swizzled square family.
+    if m <= 1024 and k >= 2 * n and n >= 4096:
+        return register(128, 128, 64, 8, 8, 0, 4, 2)
+
+    # Remaining N-major shapes favor the XCD-swizzled 128x128 family.
+    if n >= 2 * k:
+        return register(128, 128, 64, 16, 8, 0, 4, 2)
+
+    # Broad K-major outputs favor the non-swizzled 128x128 family.
+    if k >= 2 * n and n >= 4096:
+        return register(128, 128, 64, 16, 1, 0, 4, 2)
+
+    # Narrower K-major outputs favor the XCD-swizzled 128x128 family with shorter grouping.
+    if k >= 2 * n:
+        return register(128, 128, 64, 8, 8, 0, 4, 2)
+
+    # Balanced shapes with at least 4096 rows favor the wide-N K32 family.
+    if m >= 4096:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
+
+    # Remaining balanced shapes use the measured XCD-swizzled square family.
+    return register(128, 128, 64, 8, 8, 0, 4, 2)
 
 
 def _dispatch_for(a, b):
