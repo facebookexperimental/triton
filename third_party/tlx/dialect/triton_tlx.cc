@@ -349,13 +349,32 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_local_load",
           [](TritonOpBuilder &self, Value subView,
              std::optional<Value> asyncToken,
-             std::optional<Attribute> layoutEncoding) -> mlir::Value {
+             std::optional<Attribute> layoutEncoding, bool syncedViaAsyncWait,
+             bool rematerializeCoordinates,
+             std::optional<int32_t> rematerializeCoordinatesGroup)
+              -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
+            auto createLoad = [&](RankedTensorType resultType) {
+              auto load = self.create<ttg::LocalLoadOp>(
+                  resultType, subView, asyncToken.value_or(Value()));
+              if (syncedViaAsyncWait)
+                load->setAttr("ttg.amdg.syncedViaAsyncWait",
+                              self.getBuilder().getBoolAttr(true));
+              if (rematerializeCoordinates)
+                load->setAttr("tlx.rematerialize_coordinates",
+                              self.getBuilder().getUnitAttr());
+              if (rematerializeCoordinatesGroup)
+                load->setAttr(
+                    "tlx.rematerialize_coordinates_group",
+                    self.getBuilder().getI32IntegerAttr(
+                        *rematerializeCoordinatesGroup));
+              return load;
+            };
+
             if (!layoutEncoding.has_value()) {
               auto resultType = RankedTensorType::get(
                   subViewType.getShape(), subViewType.getElementType());
-              return self.create<ttg::LocalLoadOp>(
-                  resultType, subView, asyncToken.value_or(Value()));
+              return createLoad(resultType).getResult();
             }
 
             Attribute physicalEncoding =
@@ -363,13 +382,15 @@ void init_triton_tlx_ir(py::module_ &m) {
             auto rawType = RankedTensorType::get(
                 subViewType.getShape(), subViewType.getElementType(),
                 tlx::wrapNoVerifyLayout(physicalEncoding));
-            Value load = self.create<ttg::LocalLoadOp>(
-                rawType, subView, asyncToken.value_or(Value()));
-            return createPinnedProducerLayoutBoundary(self, load,
-                                                        physicalEncoding);
+            auto load = createLoad(rawType);
+            return createPinnedProducerLayoutBoundary(
+                self, load.getResult(), physicalEncoding);
           },
           py::arg("subView"), py::arg("asyncToken").none(),
-          py::arg("layoutEncoding") = std::nullopt)
+          py::arg("layoutEncoding") = std::nullopt,
+          py::arg("syncedViaAsyncWait") = false,
+          py::arg("rematerializeCoordinates") = false,
+          py::arg("rematerializeCoordinatesGroup") = std::nullopt)
       .def("create_local_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);

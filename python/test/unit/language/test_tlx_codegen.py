@@ -2859,7 +2859,15 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
         )
     else:
         assert dummy_clamps[0] == "%c0_i32"
-    assert ttgir.count("tlx.rematerialize_coordinates_group = 21 : i32") == (9 if causal else 0)
+    group_marker = "tlx.rematerialize_coordinates_group = 21 : i32"
+    expected_group_count = 9 if causal else 0
+    assert ttgir.count(group_marker) == expected_group_count
+    grouped_local_loads = re.findall(
+        rf"^\s*%.* = ttg\.local_load .*{re.escape(group_marker)}",
+        ttgir,
+        re.MULTILINE,
+    )
+    assert len(grouped_local_loads) == expected_group_count
     assert "amdgcn" in compiled.asm
 
 
