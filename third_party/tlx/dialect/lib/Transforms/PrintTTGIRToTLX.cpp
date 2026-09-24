@@ -2567,6 +2567,50 @@ void printSimplifiedOp(
     }
   }
 
+  // tt.atomic_rmw selects its operation with an enum attribute; each maps to a
+  // distinct tl.atomic_* builtin. The switch is exhaustive on purpose: a new
+  // RMWOp then fails the build rather than silently losing which atomic it was.
+  if (auto rmw = dyn_cast<tt::AtomicRMWOp>(op)) {
+    StringRef fn;
+    switch (rmw.getAtomicRmwOp()) {
+    case tt::RMWOp::AND:
+      fn = "tl.atomic_and";
+      break;
+    case tt::RMWOp::OR:
+      fn = "tl.atomic_or";
+      break;
+    case tt::RMWOp::XOR:
+      fn = "tl.atomic_xor";
+      break;
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      fn = "tl.atomic_add";
+      break;
+    case tt::RMWOp::MAX:
+    case tt::RMWOp::UMAX:
+      fn = "tl.atomic_max";
+      break;
+    case tt::RMWOp::MIN:
+    case tt::RMWOp::UMIN:
+      fn = "tl.atomic_min";
+      break;
+    case tt::RMWOp::XCHG:
+      fn = "tl.atomic_xchg";
+      break;
+    }
+    if (!fn.empty()) {
+      if (op->getNumResults() == 1)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << fn << "(" << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", " << getValueName(op->getOperand(1), argSubstitutionMap);
+      if (op->getNumOperands() > 2)
+        os << ", mask=" << getValueName(op->getOperand(2), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
