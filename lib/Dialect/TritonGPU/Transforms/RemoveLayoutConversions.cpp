@@ -49,6 +49,12 @@ static bool isPinnedConvertLayout(ConvertLayoutOp op) {
   return hasPinnedEncoding(op.getType());
 }
 
+static bool isCoordinateRematerializationBoundary(ConvertLayoutOp op) {
+  return op.getSrc().getType() == op.getType() &&
+         (op->hasAttr("tlx.rematerialize_coordinates") ||
+          op->hasAttr("tlx.rematerialize_coordinates_group"));
+}
+
 // A layout conversion requested at the source level can acquire a short
 // elementwise/conversion suffix when pinned layouts are materialized.  Layout
 // propagation may then eliminate the marked conversion and retain a later
@@ -2141,6 +2147,12 @@ bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
 
 bool LayoutRematerialization::backwardRematerialization(
     ConvertLayoutOp convertOp, bool disableRematSplitting) {
+  // Identity conversions with coordinate-rematerialization metadata are
+  // semantic backend boundaries. In particular, a block-argument source has
+  // no producer for rewriteSlice to clone or map.
+  if (isCoordinateRematerializationBoundary(convertOp))
+    return false;
+
   RankedTensorType targetType = convertOp.getType();
   if (isa<DotOperandEncodingAttr>(targetType.getEncoding())) {
     // DotOperand is hoisted by hoistDotOperand for pipelining purposes.

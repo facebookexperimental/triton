@@ -3906,8 +3906,9 @@ struct TritonGPUVerifyTensorLayoutInterface
     return isa<triton::MakeRangeOp, triton::SplatOp, triton::BroadcastOp,
                triton::LoadOp, triton::StoreOp, triton::JoinOp, triton::SplitOp,
                triton::AssertOp, triton::gpu::ConvertLayoutOp,
-               triton::gpu::RequireLayoutOp, triton::gpu::Fp4ToFpOp,
-               triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op);
+               triton::gpu::RequireLayoutOp, triton::gpu::ReleaseLayoutOp,
+               triton::gpu::Fp4ToFpOp, triton::gpu::LocalLoadOp,
+               triton::gpu::LocalStoreOp>(op);
   }
 
   LogicalResult verifyTensorLayout(
