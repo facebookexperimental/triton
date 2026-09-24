@@ -1,4 +1,5 @@
 // RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-finalize-user-layouts %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-finalize-user-layouts --canonicalize %s | FileCheck %s --check-prefix=CANON
 
 // A user-pinned layout (#tlx.user_layout<...>) is honored by layout propagation:
 // the value is never retagged, and the wrapper is unwrapped back to the concrete
@@ -129,5 +130,30 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
     // CHECK: tt.return %arg0
     %released = ttg.release_layout %src : tensor<128x64xf16, #identity> -> tensor<128x64xf16, #identity>
     tt.return %released : tensor<128x64xf16, #identity>
+  }
+}
+
+// -----
+
+// Coordinate-rematerialization groups are semantic metadata on a pinned
+// boundary. Propagation and finalization must preserve the group even when
+// unwrapping makes the eventual conversion an identity.
+
+#group_physical = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#group_user = #tlx.user_layout<#group_physical>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @preserve_rematerialization_group
+  // CANON-LABEL: @preserve_rematerialization_group
+  tt.func @preserve_rematerialization_group(
+      %src: tensor<128x64xf16, #group_physical>)
+      -> tensor<128x64xf16, #group_user> {
+    // CHECK-NOT: ttg.require_layout
+    // CHECK: %[[REMAT:.*]] = ttg.convert_layout %arg0 {tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #{{.*}}>
+    // CANON: %[[REMAT:.*]] = ttg.convert_layout %arg0 {tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #{{.*}}>
+    %required = tlx.require_layout %src {tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #group_physical> -> tensor<128x64xf16, #group_user>
+    // CHECK: tt.return %[[REMAT]]
+    // CANON: tt.return %[[REMAT]]
+    tt.return %required : tensor<128x64xf16, #group_user>
   }
 }

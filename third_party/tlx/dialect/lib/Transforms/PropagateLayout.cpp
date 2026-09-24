@@ -31,6 +31,20 @@ namespace tlx {
 #define GEN_PASS_DEF_TLXPROPAGATELAYOUT
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
+static bool hasCoordinateRematerializationAttrs(Operation *op) {
+  return op->hasAttr("tlx.rematerialize_coordinates") ||
+         op->hasAttr("tlx.rematerialize_coordinates_group");
+}
+
+static void copyCoordinateRematerializationAttrs(Operation *source,
+                                                 Operation *target) {
+  if (Attribute attr = source->getAttr("tlx.rematerialize_coordinates"))
+    target->setAttr("tlx.rematerialize_coordinates", attr);
+  if (Attribute attr =
+          source->getAttr("tlx.rematerialize_coordinates_group"))
+    target->setAttr("tlx.rematerialize_coordinates_group", attr);
+}
+
 class RequireLayoutPattern : public mlir::OpRewritePattern<RequireLayoutOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -48,16 +62,14 @@ public:
       auto boundary = ttg::RequireLayoutOp::create(
           rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
           requireLayoutOp.getSrc());
-      if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
-        boundary->setAttr("tlx.rematerialize_coordinates",
-                          rewriter.getUnitAttr());
+      copyCoordinateRematerializationAttrs(requireLayoutOp, boundary);
       rewriter.replaceOp(requireLayoutOp, boundary);
       return success();
     }
-    bool rematerializeCoordinates =
-        requireLayoutOp->hasAttr("tlx.rematerialize_coordinates");
+    bool hasRematerializationMetadata =
+        hasCoordinateRematerializationAttrs(requireLayoutOp);
     if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType() &&
-        !rematerializeCoordinates) {
+        !hasRematerializationMetadata) {
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
@@ -65,8 +77,8 @@ public:
     auto convert = ttg::ConvertLayoutOp::create(
         rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
         requireLayoutOp.getSrc());
-    if (rematerializeCoordinates)
-      convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
+    if (hasRematerializationMetadata)
+      copyCoordinateRematerializationAttrs(requireLayoutOp, convert);
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
   }
