@@ -6,6 +6,7 @@ register-resident, and direct-to-LDS execution paths in this module.
 
 import os
 from functools import lru_cache
+from types import MappingProxyType
 from typing import NamedTuple
 
 import torch
@@ -22,31 +23,40 @@ _BLOCK_K = 64
 _NUM_CU = 256
 _MIN_KTILES_PER_SPLIT = 16
 
+def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds,
+                         num_warps, num_stages):
+    return MappingProxyType({
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "GROUP_M": group_m,
+        "NUM_XCDS": num_xcds,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    })
+
+
+_SMALL_SQUARE_REGISTER_CONFIG = _fixed_register_plan(
+    32, 16, 256, 4, 1, 2, 2
+)
+_MT64X64_BK256_REGISTER_CONFIG = _fixed_register_plan(
+    64, 64, 256, 4, 8, 8, 2
+)
+
 _TUNED_SHAPE_CONFIGS = {
-    (2041, 2041, 2048): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 128,
-        "GROUP_M": 16,
-        "NUM_XCDS": 8,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 0,
-        "kpack": 1,
-        "num_warps": 8,
-        "num_stages": 2,
-    },
-    (2048, 256, 1024): {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "GROUP_M": 16,
-        "NUM_XCDS": 1,
-        "matrix_instr_nonkdim": 16,
-        "waves_per_eu": 0,
-        "kpack": 1,
-        "num_warps": 4,
-        "num_stages": 2,
-    },
+    (2048, 256, 1024): _MT64X64_BK256_REGISTER_CONFIG,
+    (2041, 2041, 2048): _fixed_register_plan(
+        128, 128, 128, 16, 8, 8, 2
+    ),
+}
+
+_FP16_TUNED_SHAPE_CONFIGS = {
+    (256, 257, 4096): _SMALL_SQUARE_REGISTER_CONFIG,
+    (257, 257, 4096): _SMALL_SQUARE_REGISTER_CONFIG,
+    (272, 3072, 4608): _MT64X64_BK256_REGISTER_CONFIG,
 }
 
 
@@ -252,15 +262,18 @@ def _intermediate_register_config(m, n, k):
     }
 
 
-def _register_plan_for_shape(m, n, k):
+def _register_plan_for_shape(m, n, k, dtype=None):
     """Return the bounded register plan selected by the gfx950 geometry."""
-    tuned = _TUNED_SHAPE_CONFIGS.get((m, n, k))
+    shape = (m, n, k)
+    tuned = _TUNED_SHAPE_CONFIGS.get(shape)
+    if dtype == torch.float16:
+        tuned = _FP16_TUNED_SHAPE_CONFIGS.get(shape, tuned)
     if tuned is not None:
         return tuned
 
     config = _register_config_for(m, n, k)
     if config is not None:
-        return config
+        return MappingProxyType(config)
 
     block_m = _default_lds_block_m(m, n, k)
     padded_m = triton.cdiv(m, block_m) * block_m
@@ -268,7 +281,7 @@ def _register_plan_for_shape(m, n, k):
     has_high_m_padding = 4 * m < 3 * padded_m
     if not is_intermediate_m or (block_m == _BLOCK_M and not has_high_m_padding):
         return None
-    return _intermediate_register_config(m, n, k)
+    return MappingProxyType(_intermediate_register_config(m, n, k))
 
 
 # Direct-to-LDS and Stream-K paths.
@@ -1691,12 +1704,12 @@ def _strong_lds_plan(M, N, K):
 
 
 @lru_cache(maxsize=None)
-def _matmul_plan(M, N, K):
+def _matmul_plan(M, N, K, dtype):
     """Cache the pure shape-based dispatch decision used by ``matmul``."""
     strong_lds_plan = _strong_lds_plan(M, N, K)
     if strong_lds_plan is not None:
         return "lds", strong_lds_plan
-    register_config = _register_plan_for_shape(M, N, K)
+    register_config = _register_plan_for_shape(M, N, K, dtype)
     if register_config is not None:
         return "register", register_config
     return "lds", _lds_plan_for_shape(M, N, K)
@@ -1853,7 +1866,7 @@ def _lds_matmul(a, b, SPLIT_K=None):
     if SPLIT_K is None:
         M, K = a.shape
         N = b.shape[1]
-        path, config = _matmul_plan(M, N, K)
+        path, config = _matmul_plan(M, N, K, a.dtype)
         if path == "register":
             return _launch_register(a, b, config=config)
         block_m, block_n, split_k = config
@@ -3328,7 +3341,7 @@ def _register_plan_for(a, b):
     m, n, k = problem
     if min(m, n, k) <= 0:
         return None
-    return _register_plan_for_shape(m, n, k)
+    return _register_plan_for_shape(m, n, k, a.dtype)
 
 
 def _lds_plan_for(a, b):
@@ -3369,7 +3382,7 @@ def _dispatch_plan(m, n, k, dtype, element_size):
     strong_lds_plan = _strong_lds_plan(m, n, k)
     if strong_lds_plan is not None:
         return "lds", strong_lds_plan
-    register_plan = _register_plan_for_shape(m, n, k)
+    register_plan = _register_plan_for_shape(m, n, k, dtype)
     if register_plan is not None:
         return "register", register_plan
     if min(m, n) <= 0 or k < 128 or k * element_size % 16 != 0:
