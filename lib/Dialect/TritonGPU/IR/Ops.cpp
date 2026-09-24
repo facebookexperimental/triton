@@ -1,6 +1,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/DebugStringHelper.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -1892,39 +1893,49 @@ LogicalResult WarpPredicateOp::verify() {
            << unsupportedRegion->getName();
   }
 
-  if (!waveUniform) {
-    getRegion().walk([&](Operation *nested) {
-      if (crossLaneOp)
-        return WalkResult::interrupt();
-      if (nested != getOperation() && isa<WarpPredicateOp>(nested))
-        return WalkResult::skip();
-      if (isa<triton::DotOp>(nested)) {
-        crossLaneOp = nested;
-        return WalkResult::interrupt();
-      }
-      if (auto convert = dyn_cast<ConvertLayoutOp>(nested);
-          convert && !isConvertTrivial(convert)) {
-        Region *sourceRegion = convert.getSrc().getParentRegion();
-        bool captured = sourceRegion != &getRegion() &&
-                        !getRegion().isAncestor(sourceRegion);
-        bool boundary = convert->hasOneUse() &&
-                        llvm::any_of(yield.getValues(), [&](Value value) {
-                          return value == convert;
-                        });
-        // Layout propagation moves captured conversions before EXEC is
-        // restricted and yielded conversions after reconvergence. Only an
-        // internal shuffle truly executes under the predicate.
-        if (!captured && !boundary) {
-          crossLaneOp = nested;
-          return WalkResult::interrupt();
-        }
-      }
-      return WalkResult::advance();
-    });
+  bool requiresSharedMemory = false;
+  getRegion().walk([&](Operation *nested) {
     if (crossLaneOp)
-      return emitOpError("cross-lane operation ")
-             << crossLaneOp->getName()
-             << " requires a wave-uniform predicate";
+      return WalkResult::interrupt();
+    if (nested != getOperation() && isa<WarpPredicateOp>(nested))
+      return WalkResult::skip();
+    if (!waveUniform && isa<triton::DotOp>(nested)) {
+      crossLaneOp = nested;
+      return WalkResult::interrupt();
+    }
+    auto convert = dyn_cast<ConvertLayoutOp>(nested);
+    if (!convert || isConvertTrivial(convert))
+      return WalkResult::advance();
+
+    auto srcType = cast<RankedTensorType>(convert.getSrc().getType());
+    auto dstType = cast<RankedTensorType>(convert.getType());
+    ModuleOp module = getOperation()->getParentOfType<ModuleOp>();
+    bool multiWarpCta = !module || maybeLookupNumWarps(module).value_or(2) > 1;
+    requiresSharedMemory =
+        multiWarpCta && cvtNeedsSharedMemory(srcType, dstType);
+    if (waveUniform && !requiresSharedMemory)
+      return WalkResult::advance();
+
+    Region *sourceRegion = convert.getSrc().getParentRegion();
+    bool captured =
+        sourceRegion != &getRegion() && !getRegion().isAncestor(sourceRegion);
+    bool boundary = convert->hasOneUse() &&
+                    llvm::is_contained(yield.getValues(), convert.getResult());
+    // Layout propagation moves captured conversions before EXEC is restricted
+    // and yielded conversions after reconvergence. Only an internal transfer
+    // truly executes under the predicate.
+    if (!captured && !boundary) {
+      crossLaneOp = nested;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (crossLaneOp) {
+    if (waveUniform && requiresSharedMemory)
+      return emitOpError("layout conversion requiring shared memory is not "
+                         "supported under a wave-uniform predicate");
+    return emitOpError("cross-lane operation ")
+           << crossLaneOp->getName() << " requires a wave-uniform predicate";
   }
 
   WalkResult barrier = getRegion().walk([&](Operation *nested) {

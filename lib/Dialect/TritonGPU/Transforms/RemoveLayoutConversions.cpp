@@ -133,6 +133,18 @@ static Attribute getEffectiveLayoutEncoding(Attribute encoding) {
   return triton::unwrapTlxWrappers(encoding);
 }
 
+static bool conversionNeedsSharedMemory(RankedTensorType srcType,
+                                        RankedTensorType dstType) {
+  Attribute srcEncoding = getEffectiveLayoutEncoding(srcType.getEncoding());
+  Attribute dstEncoding = getEffectiveLayoutEncoding(dstType.getEncoding());
+  if (!srcEncoding || !dstEncoding ||
+      !isa<DistributedEncodingTrait>(srcEncoding) ||
+      !isa<DistributedEncodingTrait>(dstEncoding))
+    return false;
+  return cvtNeedsSharedMemory(srcType.cloneWithEncoding(srcEncoding),
+                              dstType.cloneWithEncoding(dstEncoding));
+}
+
 static bool hasSameEffectiveLayout(Attribute lhs, Attribute rhs) {
   return getEffectiveLayoutEncoding(lhs) == getEffectiveLayoutEncoding(rhs);
 }
@@ -950,10 +962,50 @@ projectToPredicateEncoding(RankedTensorType valueType,
 // externally required result layouts after reconvergence.
 LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
   WalkResult walkResult = funcOp.walk([&](WarpPredicateOp predicateOp) {
-    // A wave-uniform predicate is cross-lane safe only if no enclosing
-    // non-wave-uniform predicate has already masked lanes from EXEC.
-    if (isEffectivelyWaveUniform(predicateOp))
+    bool effectivelyWaveUniform = isEffectivelyWaveUniform(predicateOp);
+    ModuleOp module = predicateOp->getParentOfType<ModuleOp>();
+    if (effectivelyWaveUniform && module && lookupNumWarps(module) == 1)
       return WalkResult::advance();
+    if (effectivelyWaveUniform) {
+      // Wave-uniform EXEC makes warp shuffles safe, but waves may still take
+      // different paths. Resolve boundaries that need CTA-wide shared-memory
+      // communication instead of leaving a barrier under the predicate.
+      bool needsIsland = false;
+      predicateOp.getRegion().walk<WalkOrder::PreOrder>([&](Operation *nested) {
+        if (nested != predicateOp.getOperation() &&
+            isa<WarpPredicateOp>(nested))
+          return WalkResult::skip();
+        if (auto convert = dyn_cast<ConvertLayoutOp>(nested)) {
+          auto srcType = cast<RankedTensorType>(convert.getSrc().getType());
+          auto dstType = cast<RankedTensorType>(convert.getType());
+          needsIsland |= conversionNeedsSharedMemory(srcType, dstType);
+        } else if (auto require = dyn_cast<RequireLayoutOp>(nested)) {
+          auto srcType = cast<RankedTensorType>(require.getSrc().getType());
+          auto dstType = cast<RankedTensorType>(require.getType());
+          needsIsland |= conversionNeedsSharedMemory(srcType, dstType);
+        } else if (auto release = dyn_cast<ReleaseLayoutOp>(nested)) {
+          auto srcType = cast<RankedTensorType>(release.getSrc().getType());
+          auto dstType = cast<RankedTensorType>(release.getType());
+          needsIsland |= conversionNeedsSharedMemory(srcType, dstType);
+        } else if (auto reshape = dyn_cast<ReshapeOp>(nested);
+                   reshape &&
+                   (hasDeferredTlxEncoding(reshape.getSrc().getType()) ||
+                    hasDeferredTlxEncoding(reshape.getType()))) {
+          auto srcType = cast<RankedTensorType>(reshape.getSrc().getType());
+          auto dstType = cast<RankedTensorType>(reshape.getType());
+          Attribute srcEncoding =
+              getEffectiveLayoutEncoding(srcType.getEncoding());
+          Attribute inferred = inferDstEncoding(reshape, srcEncoding);
+          if (inferred) {
+            auto inferredType = dstType.cloneWithEncoding(inferred);
+            needsIsland |= conversionNeedsSharedMemory(inferredType, dstType);
+          }
+        }
+        return needsIsland ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (!needsIsland)
+        return WalkResult::advance();
+    }
 
     auto yieldOp = dyn_cast<PredicateYieldOp>(
         predicateOp.getRegion().front().getTerminator());
