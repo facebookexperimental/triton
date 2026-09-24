@@ -2516,6 +2516,57 @@ void printSimplifiedOp(
     }
   }
 
+  // gpu.thread_id carries its axis in a `dimension` enum attribute rather than
+  // an operand, so the generic path would drop it.
+  if (opName == "gpu.thread_id" && op->getNumResults() == 1) {
+    if (Attribute dimAttr = op->getAttr("dimension")) {
+      std::string dim;
+      llvm::raw_string_ostream dimOs(dim);
+      dimAttr.print(dimOs);
+      dimOs.flush();
+      // The enum prints as `#gpu<dim y>`. Match the final token exactly rather
+      // than searching the whole string, where an incidental 'y' or 'z' would
+      // pick the wrong axis. An unrecognised or absent dimension falls through
+      // to the generic path, which flags it, rather than defaulting to x.
+      StringRef token = StringRef(dim).rtrim(" >");
+      size_t cut = token.find_last_of(" <");
+      if (cut != StringRef::npos)
+        token = token.drop_front(cut + 1);
+      int axis = token == "x" ? 0 : token == "y" ? 1 : token == "z" ? 2 : -1;
+      if (axis >= 0) {
+        os << getValueName(op->getResult(0), argSubstitutionMap)
+           << " = tlx.thread_id(" << axis << ")";
+        printLocComment(op, os);
+        return;
+      }
+    }
+  }
+
+  // Parsed IR carries the mask as a SchedGroupMask attribute, so only `none`
+  // is named and other masks are flagged rather than guessed at. A plain
+  // IntegerAttr mask shares tlx.amd_sched_barrier's encoding and rides through.
+  if (opName == "rocdl.sched.barrier") {
+    if (auto m = op->getAttrOfType<IntegerAttr>("mask")) {
+      os << "tlx.amd_sched_barrier(" << m.getInt() << ")";
+      printLocComment(op, os);
+      return;
+    }
+    std::string mask;
+    llvm::raw_string_ostream maskOs(mask);
+    if (Attribute a = op->getAttr("mask"))
+      a.print(maskOs);
+    maskOs.flush();
+    // Anchored on the closing bracket, not a substring search: the attribute
+    // prints as `#rocdl<sched_group_mask none>`, and `none` has to be the whole
+    // payload. A bare contains() would also accept a combined mask that merely
+    // mentions it, and `non_mem_non_sideeffect` sits one character away.
+    if (StringRef(mask).ends_with("sched_group_mask none>")) {
+      os << "tlx.amd_sched_barrier(0)";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
