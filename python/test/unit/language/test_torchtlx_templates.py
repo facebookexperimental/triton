@@ -167,6 +167,9 @@ class TestLocalBufferRetention(TestCase):
     ):
         snode = object.__new__(SchedulerNode)
         snode.node = object.__new__(ir.ComputedBuffer)
+        snode.node.data = (
+            object.__new__(ir.Reduction) if is_reduction else mock.Mock()
+        )
         snode.node.get_reduction_type = mock.Mock(return_value=reduction_type if is_reduction else None)
         snode.group = (torch.device("cuda"), (1024, rnumel if is_reduction else 1))
         snode.is_reduction = mock.Mock(return_value=is_reduction)
@@ -278,10 +281,14 @@ class TestLocalBufferRetention(TestCase):
         dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
         access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
         first_reduction = self._scheduler_node("first_reduction", is_reduction=True, reduction_type="sum")
-        producer = self._scheduler_node("producer", is_reduction=True, writes=(access, ))
-        consumer = self._scheduler_node("consumer", is_reduction=True, reads=(access, ), writes=(access, ))
+        second_reduction = self._scheduler_node(
+            "second_reduction", is_reduction=True, reduction_type="sum"
+        )
+        producer = self._scheduler_node("producer", writes=(access, ))
+        consumer = self._scheduler_node("consumer", reads=(access, ), writes=(access, ))
         node_schedule = [
             first_reduction,  # phase 0
+            second_reduction,
             DisableReduction, EnableReduction, producer,  # phase 2: stores `workspace`
             DisableReduction, EnableReduction, consumer,  # phase 4: loads `workspace`
         ]
@@ -321,11 +328,10 @@ class TestLocalBufferRetention(TestCase):
     def test_hopper_plan_omits_amd_backend_options(self):
         i, r = sympy.symbols("i r", integer=True)
         access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
-        producer = self._scheduler_node(
-            "producer", is_reduction=True, writes=(access,)
-        )
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True)
+        producer = self._scheduler_node("producer", writes=(access,))
         consumer = self._scheduler_node(
-            "consumer", is_reduction=True, reads=(access,), writes=(access,)
+            "consumer", reads=(access,), writes=(access,)
         )
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float16
@@ -335,7 +341,13 @@ class TestLocalBufferRetention(TestCase):
             {"triton.tlx_mode": "allow"}
         ):
             plan = LocalBufferRetention.plan_for(
-                [producer, DisableReduction, EnableReduction, consumer]
+                [
+                    first_reduction,
+                    producer,
+                    DisableReduction,
+                    EnableReduction,
+                    consumer,
+                ]
             )
 
         self.assertIsNotNone(plan)
@@ -356,16 +368,11 @@ class TestLocalBufferRetention(TestCase):
             MemoryDep(f"workspace_{index}", 6144 * i + r, (i, r), (128, 6144))
             for index in range(4)
         )
-        producer = self._scheduler_node(
-            "producer", is_reduction=True, rnumel=6144, writes=accesses
+        first_reduction = self._scheduler_node(
+            "first_reduction", is_reduction=True, rnumel=6144
         )
-        consumer = self._scheduler_node(
-            "consumer",
-            is_reduction=True,
-            rnumel=6144,
-            reads=accesses,
-            writes=accesses,
-        )
+        producer = self._scheduler_node("producer", writes=accesses)
+        consumer = self._scheduler_node("consumer", reads=accesses, writes=accesses)
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float16
         graph.get_numel.return_value = 128 * 6144
@@ -374,7 +381,13 @@ class TestLocalBufferRetention(TestCase):
             {"triton.tlx_mode": "allow"}
         ):
             plans = LocalBufferRetention.plans_for(
-                [producer, DisableReduction, EnableReduction, consumer]
+                [
+                    first_reduction,
+                    producer,
+                    DisableReduction,
+                    EnableReduction,
+                    consumer,
+                ]
             )
 
         self.assertEqual([plan.reduction_block for plan in plans], [8192, 4096])
@@ -384,15 +397,22 @@ class TestLocalBufferRetention(TestCase):
         i, r = sympy.symbols("i r", integer=True)
         dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
         access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
-        producer = self._scheduler_node("producer", is_reduction=True, writes=(access, ))
-        consumer = self._scheduler_node("consumer", is_reduction=True, reads=(access, ), writes=(access, ))
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True)
+        producer = self._scheduler_node("producer", writes=(access, ))
+        consumer = self._scheduler_node("consumer", reads=(access, ), writes=(access, ))
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float16
         graph.get_numel.return_value = dynamic_rows * 4096 + 1
 
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for([producer, DisableReduction, EnableReduction, consumer])
+                plan = LocalBufferRetention.plan_for([
+                    first_reduction,
+                    producer,
+                    DisableReduction,
+                    EnableReduction,
+                    consumer,
+                ])
 
         self.assertIsNone(plan)
 
@@ -402,9 +422,10 @@ class TestLocalBufferRetention(TestCase):
         # reading memory the kernel never writes.
         i, r = sympy.symbols("i r", integer=True)
         access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
-        producer = self._scheduler_node("producer", is_reduction=True, writes=(access, ))
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True)
+        producer = self._scheduler_node("producer", writes=(access, ))
         pointwise_reader = self._scheduler_node("pointwise_reader", reads=(access, ))
-        consumer = self._scheduler_node("consumer", is_reduction=True, reads=(access, ), writes=(access, ))
+        consumer = self._scheduler_node("consumer", reads=(access, ), writes=(access, ))
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float16
         graph.get_numel.return_value = 128 * 4096
@@ -412,6 +433,7 @@ class TestLocalBufferRetention(TestCase):
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
                 plan = LocalBufferRetention.plan_for([
+                    first_reduction,
                     producer,
                     DisableReduction,
                     pointwise_reader,
@@ -426,9 +448,10 @@ class TestLocalBufferRetention(TestCase):
         # so the reader must observe the rewrite rather than the retained value.
         i, r = sympy.symbols("i r", integer=True)
         access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
-        producer = self._scheduler_node("producer", is_reduction=True, writes=(access, ))
-        rewriter = self._scheduler_node("rewriter", is_reduction=True, writes=(access, ))
-        reader = self._scheduler_node("reader", is_reduction=True, reads=(access, ))
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True)
+        producer = self._scheduler_node("producer", writes=(access, ))
+        rewriter = self._scheduler_node("rewriter", writes=(access, ))
+        reader = self._scheduler_node("reader", reads=(access, ))
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float16
         graph.get_numel.return_value = 128 * 4096
@@ -436,6 +459,7 @@ class TestLocalBufferRetention(TestCase):
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
                 plan = LocalBufferRetention.plan_for([
+                    first_reduction,
                     producer,
                     DisableReduction,
                     EnableReduction,
@@ -449,11 +473,12 @@ class TestLocalBufferRetention(TestCase):
         i, r = sympy.symbols("i r", integer=True)
         dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
         access = MemoryDep("workspace", 16384 * i + r, (i, r), (128, 16384))
-        producer = self._scheduler_node("producer", is_reduction=True, rnumel=16384, writes=(access, ))
+        first_reduction = self._scheduler_node(
+            "first_reduction", is_reduction=True, rnumel=16384
+        )
+        producer = self._scheduler_node("producer", writes=(access, ))
         consumer = self._scheduler_node(
             "consumer",
-            is_reduction=True,
-            rnumel=16384,
             reads=(access, ),
             writes=(access, ),
         )
@@ -463,7 +488,13 @@ class TestLocalBufferRetention(TestCase):
 
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for([producer, DisableReduction, EnableReduction, consumer])
+                plan = LocalBufferRetention.plan_for([
+                    first_reduction,
+                    producer,
+                    DisableReduction,
+                    EnableReduction,
+                    consumer,
+                ])
 
         self.assertIsNone(plan)
 
@@ -471,10 +502,10 @@ class TestLocalBufferRetention(TestCase):
         i, r = sympy.symbols("i r", integer=True)
         store = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
         transposed_load = MemoryDep("workspace", i + 128 * r, (i, r), (128, 4096))
-        producer = self._scheduler_node("producer", is_reduction=True, writes=(store, ))
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True)
+        producer = self._scheduler_node("producer", writes=(store, ))
         consumer = self._scheduler_node(
             "consumer",
-            is_reduction=True,
             reads=(transposed_load, ),
             writes=(store, ),
         )
@@ -484,9 +515,56 @@ class TestLocalBufferRetention(TestCase):
 
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for([producer, DisableReduction, EnableReduction, consumer])
+                plan = LocalBufferRetention.plan_for([
+                    first_reduction,
+                    producer,
+                    DisableReduction,
+                    EnableReduction,
+                    consumer,
+                ])
 
         self.assertIsNone(plan)
+
+    def test_rejects_reduction_output(self):
+        i, r = sympy.symbols("i r", integer=True)
+        reduction_output_access = MemoryDep(
+            "reduction_output", 4096 * i + r, (i, r), (128, 4096)
+        )
+        workspace_access = MemoryDep(
+            "workspace", 4096 * i + r, (i, r), (128, 4096)
+        )
+        reduction = self._scheduler_node(
+            "reduction", is_reduction=True, writes=(reduction_output_access,)
+        )
+        producer = self._scheduler_node("producer", writes=(workspace_access,))
+        consumer = self._scheduler_node(
+            "consumer", reads=(reduction_output_access, workspace_access)
+        )
+        graph = self._graph_mock()
+        graph.get_dtype.return_value = torch.float32
+        graph.get_numel.return_value = 128 * 4096
+        graph.scheduler.can_buffer_be_removed_through_fusion.return_value = True
+
+        with V.set_graph_handler(graph), self._on_gfx950(), config.patch(
+            {"triton.tlx_mode": "allow"}
+        ):
+            plan = LocalBufferRetention.plan_for(
+                [
+                    reduction,
+                    DisableReduction,
+                    EnableReduction,
+                    producer,
+                    DisableReduction,
+                    EnableReduction,
+                    consumer,
+                ]
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            [spec.name for spec in plan.buffers],
+            ["workspace"],
+        )
 
     @unittest.skipIf(
         not (is_gfx950() or is_hopper()),
