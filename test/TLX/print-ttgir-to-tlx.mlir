@@ -1693,3 +1693,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Region-carrying reductions. The reduce combiner detector knew maxf/maxnumf
+// but not the NaN-quieting maximumf, and had no min case at all, so those fell
+// back to a bare tl.reduce missing its combine_fn. tt.scan had no mapping.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def reduce_and_scan_combiners(
+  // CHECK-DAG: tl.max(
+  // CHECK-DAG: tl.min(
+  // CHECK-DAG: tl.cumsum(arg0, axis=0)
+  // CHECK-NOT: tl.reduce(
+  tt.func public @reduce_and_scan_combiners(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %hi = "tt.reduce"(%x) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %m = arith.maximumf %a, %b : f32
+      tt.reduce.return %m : f32
+    }) : (tensor<256xf32, #blocked>) -> f32
+    %lo = "tt.reduce"(%x) <{axis = 0 : i32}> ({
+    ^bb0(%c: f32, %d: f32):
+      %n = arith.minimumf %c, %d : f32
+      tt.reduce.return %n : f32
+    }) : (tensor<256xf32, #blocked>) -> f32
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%e: f32, %f: f32):
+      %g = arith.addf %e, %f : f32
+      tt.scan.return %g : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Only the combiner's top-level ops name the kind. An arith.addf buried in
+  // an scf.if is not a cumulative sum, and a recursive walk would call it one.
+  // CHECK-LABEL: def scan_nested_add_is_not_cumsum(
+  // CHECK-NOT: tl.cumsum(
+  tt.func public @scan_nested_add_is_not_cumsum(%x: tensor<256xf32, #blocked>, %c: i1) attributes {noinline = false} {
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%e: f32, %f: f32):
+      %g = scf.if %c -> f32 {
+        %n = arith.addf %e, %f : f32
+        scf.yield %n : f32
+      } else {
+        scf.yield %e : f32
+      }
+      tt.scan.return %g : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
