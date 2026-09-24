@@ -19,5 +19,5 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       pythons: '["cp312"]'
       arches: '["x86_64"]'
-      max_jobs: 32
+      max_jobs: 16
       upload_s3: true
