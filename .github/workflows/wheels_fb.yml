@@ -1,9 +1,9 @@
 name: Wheels (fbtriton)
 # Builds fbtriton manylinux wheels (x86_64 + aarch64) for each supported
 # CPython ABI on GitHub-hosted runners. Smoke-tests each wheel by importing it
-# inside the per-ABI venv that cibuildwheel creates. No publish step — wheel
-# artifacts are uploaded for download via 'gh run download'. Reused by
-# publish_fbtriton.yml via `workflow_call`.
+# inside the per-ABI venv that cibuildwheel creates. Wheel artifacts are
+# uploaded to GitHub by default, or to S3 when upload_s3 is enabled. Reused by
+# build.yml and publish_fbtriton.yml via `workflow_call`.
 #
 # This is the Meta-fork-only build. The upstream `wheels.yml` is left
 # untouched so it stays trivially mergeable from triton-lang/triton.
@@ -23,17 +23,23 @@ on:
       # Optional ABI-matrix overrides; default to the full fork matrix.
       pythons:  { type: string, required: false, default: '["cp310","cp311","cp312","cp313","cp314"]' }
       arches:   { type: string, required: false, default: '["x86_64","aarch64"]' }
+      upload_s3:
+        description: "Upload wheels to S3 instead of GitHub artifacts (caller must grant id-token: write)"
+        type: boolean
+        required: false
+        default: false
   pull_request:
     paths:
       - .github/workflows/wheels_fb.yml
 
-permissions: read-all
+# Inherit caller permissions: S3 callers grant contents: read and id-token: write.
 
 jobs:
   build:
     name: Build wheel ${{ matrix.python }} ${{ matrix.arch }}
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
     timeout-minutes: 90
+    environment: ${{ inputs.upload_s3 && 'docker-s3-upload' || '' }}
 
     strategy:
       # Don't cancel sibling builds when one fails — we want to see which
@@ -118,8 +124,49 @@ jobs:
 
           python3 -m cibuildwheel . --output-dir wheelhouse
 
-      - uses: actions/upload-artifact@v6
+      - name: Upload wheel to GitHub
+        if: ${{ !inputs.upload_s3 }}
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.python }}-manylinux_2_28_${{ matrix.arch }}
           path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+      - name: Prepare S3 artifact
+        if: ${{ inputs.upload_s3 }}
+        id: wheel
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(wheelhouse/*.whl)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one Triton wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          wheel_name=$(basename "${wheels[0]}")
+          commit_sha=$(git rev-parse HEAD)
+          artifact_name="${wheel_name}-${commit_sha}"
+          # An explicit S3 prefix overrides the action's name input. Preserve
+          # the artifact name as a directory, including for clean release versions.
+          mkdir -p "s3-artifacts/${artifact_name}"
+          mv "${wheels[0]}" "s3-artifacts/${artifact_name}/"
+          echo "name=${artifact_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate with AWS
+        if: ${{ inputs.upload_s3 }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_upload-benchmark-results
+          role-duration-seconds: 18000
+          aws-region: us-east-1
+
+      - name: Upload wheel to S3
+        if: ${{ inputs.upload_s3 }}
+        uses: pytorch/test-infra/.github/actions/upload-artifact-s3@main
+        with:
+          name: ${{ steps.wheel.outputs.name }}
+          path: s3-artifacts/*/*.whl
+          s3-bucket: tritonci-artifacts
+          s3-prefix: build-artifacts
+          overwrite: "true"
           if-no-files-found: error
