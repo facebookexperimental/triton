@@ -59,8 +59,7 @@ def prepare(case: Case, space: str) -> Prepared:
     dtype = getattr(torch, case.dtype)
     q, k, v = qkv(batch, heads, context, head_dim, dtype, requires_grad=backward)
 
-    tlx_fwd = lambda: flash_attn_mxfp8(  # noqa: E731
-        q, k, v, causal=causal, sm_scale=0.5, arch=driver.arch(), space=space)
+    tlx_fwd = lambda: flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=0.5, space=space)  # noqa: E731
     ref_fwd = lambda: F.scaled_dot_product_attention(  # noqa: E731
         q, k, v, is_causal=causal, scale=0.5)
 

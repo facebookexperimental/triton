@@ -53,7 +53,7 @@ def prepare(case: Case, space: str) -> Prepared:
     tlx_out = torch.empty((M, N), device="cuda", dtype=dtype)
     ref_out = torch.empty_like(tlx_out)
 
-    tlx_fn = lambda: tlx_addmm(bias, a, b, out=tlx_out, arch=driver.arch(), space=space)  # noqa: E731
+    tlx_fn = lambda: tlx_addmm(bias, a, b, out=tlx_out, space=space)  # noqa: E731
     ref_fn = lambda: torch.addmm(bias, a, b, out=ref_out)  # noqa: E731
     return Prepared(
         tlx_fn=tlx_fn,

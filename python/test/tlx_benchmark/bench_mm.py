@@ -53,7 +53,7 @@ def prepare(case: Case, space: str) -> Prepared:
     dtype = getattr(torch, case.dtype)
     a, b = operand(M, K, a_strides, dtype), operand(K, N, b_strides, dtype)
 
-    tlx_fn = lambda: tlx_mm(a, b, arch=driver.arch(), space=space)  # noqa: E731
+    tlx_fn = lambda: tlx_mm(a, b, space=space)  # noqa: E731
     ref_fn = lambda: torch.matmul(a, b)  # noqa: E731
     return Prepared(
         tlx_fn=tlx_fn,

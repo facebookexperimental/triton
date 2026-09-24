@@ -74,8 +74,8 @@ class Prepared:
 
 
 #: The GPU this run is about. Everything downstream -- which focus suites are
-#: selected, which `arch=` the op is pinned to, which device's clocks are
-#: captured, what the artifact is named -- has to agree with it.
+#: selected, which architecture is recorded in each case, which device's
+#: clocks are captured, what the artifact is named -- has to agree with it.
 #:
 #: Set once by `select`, from `main`'s `--device`. Absent that (the pytest
 #: entry point, which does no selection) it falls back to the first device,
@@ -383,9 +383,9 @@ def main(bench, argv=None) -> int:
     # and it has to happen before the first CUDA call because the visibility
     # variable is read once at context creation.
     device = select_device(args.device)
-    # Pin it before anything reads `arch()`: the shape import, the `arch=` the
-    # op is dispatched on, the denoise capture and the artifact name all come
-    # from this one object.
+    # Pin it before anything reads `arch()`: the shape import, case metadata,
+    # denoise capture and artifact name all come from this one object. Public
+    # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
         os.environ[device.visibility_env] = str(device.index)
