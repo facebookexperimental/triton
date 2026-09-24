@@ -284,6 +284,18 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
             tensor.data_ptr.return_value = 0
         return tensors
 
+    @staticmethod
+    def _d64_dispatch(q_shape, k_shape, causal):
+        return amd_fa_bwd._select_d64_dispatch(
+            q_shape,
+            k_shape,
+            causal,
+            arch="gfx950",
+            cu_count=256,
+            sm_scale=0.125,
+            bases_aligned_16=True,
+        )
+
     def test_import_registers_without_activation(self):
         import torch.nn.attention as attention
 
@@ -466,36 +478,89 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
     def test_only_measured_signatures_are_selected(self):
         from triton.tlx import pytorch as provider
 
-        tensors = self._performance_tensors((1, 16, 4096, 64), (1, 2, 4096, 64))
+        q_shape = (1, 16, 4096, 64)
+        k_shape = (1, 2, 4096, 64)
+        tensors = self._performance_tensors(q_shape, k_shape)
         with mock.patch.object(
                 provider.gfx950_bwd,
                 "_select_d64_dispatch_for_device",
-                return_value=mock.Mock(family="noncausal_fused_n256"),
+                return_value=self._d64_dispatch(q_shape, k_shape, False),
         ):
             self.assertTrue(provider._is_performance_validated(*tensors, 0.125, False))
             self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
 
-        # This maps to the same noncausal fused family, but its checked-in CK
-        # benchmark loses. Family-wide routing would incorrectly select TLX.
+        # A family match is not enough: every shape needs its own provider-path
+        # measurement and exact dispatch fingerprint.
         tensors = self._performance_tensors((2, 32, 16384, 64), (2, 4, 16384, 64))
         self.assertFalse(provider._is_performance_validated(*tensors, 0.125, False))
 
-    def test_d64_signature_requires_measured_dispatch_family(self):
+    def test_d64_signature_requires_measured_dispatch_config(self):
         from triton.tlx import pytorch as provider
 
-        tensors = self._performance_tensors((4, 48, 1024, 64), (4, 6, 1024, 64))
+        q_shape = (4, 48, 1024, 64)
+        k_shape = (4, 6, 1024, 64)
+        tensors = self._performance_tensors(q_shape, k_shape)
+        measured = self._d64_dispatch(q_shape, k_shape, True)
         with mock.patch.object(
                 provider.gfx950_bwd,
                 "_select_d64_dispatch_for_device",
-                return_value=mock.Mock(family="causal_scheduled_gqa8"),
+                return_value=measured,
         ):
             self.assertTrue(provider._is_performance_validated(*tensors, 0.125, True))
+
+        mutations = (
+            {"family": "causal_m192"},
+            {"owner_rows": measured.owner_rows * 2},
+            {"key_rows": measured.key_rows * 2},
+            {"kv_splits": measured.kv_splits * 2},
+            {"selected_causal": not measured.selected_causal},
+            {"stat_mode": measured.stat_mode + 1},
+            {"dq_logical_n": measured.dq_logical_n * 2},
+            {"dq_use_xcd": not measured.dq_use_xcd},
+            {"dq_launches": ()},
+            {"gqa_grid_mode": None},
+            {"cyclic_query_split": not measured.cyclic_query_split},
+            {"dkdv_lifetime": None},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+        launch = measured.dq_launches[0]
+        launch_mutations = (
+            {"launch_tiles": launch.launch_tiles + 1},
+            {"skip_owner_tail": not launch.skip_owner_tail},
+            {"owner_pid_base": launch.owner_pid_base + 1},
+            {"launch_q_tiles": launch.launch_q_tiles + 1},
+            {"owner_fragments": launch.owner_fragments + 1},
+            {"grid_owner_m": launch.grid_owner_m + 1},
+        )
+        for mutation in launch_mutations:
+            with self.subTest(launch_mutation=mutation), mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=replace(measured, dq_launches=(replace(launch, **mutation), )),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+        with (
+                mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=measured,
+                ),
+                mock.patch.object(provider.gfx950_bwd, "_d64_q3_register_class", return_value=None),
+        ):
+            self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+
         with mock.patch.object(
                 provider.gfx950_bwd,
                 "_select_d64_dispatch_for_device",
-                return_value=mock.Mock(family="causal_m192"),
+                return_value=object(),
         ):
-            self.assertFalse(provider._is_performance_validated(*tensors, -0.125, True))
+            self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
 
     def test_short_d128_selects_only_measured_dispatches(self):
         from triton.tlx import pytorch as provider
@@ -521,6 +586,19 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
                 with self.subTest(causal=causal, route=option), mock.patch.dict(
                         os.environ,
                         route_options | {option: "1"},
+                ):
+                    self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+            for option in (
+                    amd_fa_bwd._D128_SINK_INSTS_ENV,
+                    amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+                    amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+            ):
+                with self.subTest(causal=causal, route="exact", regalloc=option), mock.patch.dict(
+                        os.environ,
+                        route_options | {
+                            amd_fa_bwd._D128_EXACT_ENABLE_ENV: "1",
+                            option: "1",
+                        },
                 ):
                     self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
 
@@ -571,6 +649,36 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
             with self.subTest(option=option), mock.patch.dict(os.environ, {option: "1"}, clear=True):
                 self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
 
+    def test_interleaved_d128_requires_measured_dispatch_config(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            measured = amd_fa_bwd._select_d128_interleaved_dispatch()
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+        mutations = (
+            {"main_entry": object()},
+            {"block_m": measured.block_m * 2},
+            {"block_n": measured.block_n // 2},
+            {"num_warps": measured.num_warps // 2},
+            {"num_stages": measured.num_stages + 1},
+            {"matrix_instr_nonkdim": measured.matrix_instr_nonkdim * 2},
+            {"convert_entry": object()},
+            {"convert_block_m": measured.convert_block_m // 2},
+            {"convert_num_warps": measured.convert_num_warps // 2},
+            {"sink_insts_to_avoid_spills": not measured.sink_insts_to_avoid_spills},
+            {"regclass_priority_trumps_globalness": not measured.regclass_priority_trumps_globalness},
+            {"reverse_local_assignment": not measured.reverse_local_assignment},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    amd_fa_bwd,
+                    "_select_d128_interleaved_dispatch",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
     def test_d256_forced_staged_route_is_not_selected(self):
         from triton.tlx import pytorch as provider
 
@@ -578,6 +686,21 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TLX_FA_BWD_FORCE_STAGED": "1"}, clear=True):
             self.assertTrue(provider._is_performance_validated(*tensors, 256**-0.5, False))
             self.assertFalse(provider._is_performance_validated(*tensors, 256**-0.5, True))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            measured = amd_fa_bwd._select_d256_dispatch(False)
+        mutations = (
+            {"entry": object()},
+            {"num_warps": measured.num_warps * 2},
+            {"staged": not measured.staged},
+            {"pipelined": not measured.pipelined},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    amd_fa_bwd,
+                    "_select_d256_dispatch",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 256**-0.5, False))
 
 
 @unittest.skipUnless(is_hip_cdna4(), "Requires gfx950 hardware")
@@ -748,14 +871,16 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
         )
 
     def test_sdpa_autograd_routes_d128_gqa_to_tlx(self):
-        self._assert_sdpa_autograd_routes_to_tlx(
-            (16, 64, 1024, 128),
-            (16, 8, 1024, 128),
-            causal=False,
-            enable_gqa=True,
-            seed=3640,
-            max_relative_l2=1e-2,
-        )
+        for sequence_length in (1024, 2048, 4096):
+            with self.subTest(sequence_length=sequence_length):
+                self._assert_sdpa_autograd_routes_to_tlx(
+                    (16, 64, sequence_length, 128),
+                    (16, 8, sequence_length, 128),
+                    causal=False,
+                    enable_gqa=True,
+                    seed=3640 + sequence_length,
+                    max_relative_l2=1e-2,
+                )
 
     def test_sdpa_autograd_routes_short_d128_to_tlx(self):
         route_options = {

@@ -3773,6 +3773,38 @@ def _run_bwd_d128(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _D128InterleavedDispatch:
+    main_entry: object
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    matrix_instr_nonkdim: int
+    convert_entry: object
+    convert_block_m: int
+    convert_num_warps: int
+    sink_insts_to_avoid_spills: bool = False
+    regclass_priority_trumps_globalness: bool = False
+    reverse_local_assignment: bool = False
+
+
+def _select_d128_interleaved_dispatch():
+    regalloc = _d128_regalloc_options()
+    return _D128InterleavedDispatch(
+        main_entry=_attn_bwd_dkdv_dq_d128_gqa_kernel,
+        block_m=16,
+        block_n=256,
+        num_warps=4,
+        num_stages=1,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        convert_entry=_attn_bwd_dq_native_convert_kernel,
+        convert_block_m=128,
+        convert_num_warps=4,
+        **regalloc,
+    )
+
+
 def _run_bwd_d128_gqa(
     q,
     k,
@@ -3790,7 +3822,8 @@ def _run_bwd_d128_gqa(
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
     assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
-    _attn_bwd_dkdv_dq_d128_gqa_kernel[(hk, triton.cdiv(n_ctx, 256), batch)](
+    dispatch = _select_d128_interleaved_dispatch()
+    dispatch.main_entry[(hk, triton.cdiv(n_ctx, dispatch.block_n), batch)](
         q,
         k,
         v,
@@ -3806,29 +3839,29 @@ def _run_bwd_d128_gqa(
         HK=hk,
         N=n_ctx,
         D=head_dim,
-        BLOCK_M=16,
-        BLOCK_N=256,
-        num_warps=4,
-        num_stages=1,
-        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        BLOCK_M=dispatch.block_m,
+        BLOCK_N=dispatch.block_n,
+        num_warps=dispatch.num_warps,
+        num_stages=dispatch.num_stages,
+        matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim,
         # The source bridge directly emits fragmented persistent current-dK
         # and transient delayed-dQ MFMAs. The chains read different alternating
         # dS stages, so they are independent and can be interleaved. No TTGIR
         # dot preset is needed because the bridge contains scheduled fragments
         # rather than a pair of ordinary tt.dot operations.
         # Register-allocation experiments remain independent explicit opt-ins.
-        reverse_local_assignment=(os.environ.get(_D128_REVERSE_LOCAL_ENV, "0") == "1"),
-        sink_insts_to_avoid_spills=(os.environ.get(_D128_SINK_INSTS_ENV, "0") == "1"),
-        regclass_priority_trumps_globalness=(os.environ.get(_D128_REGCLASS_PRIORITY_ENV, "") == "1"),
+        reverse_local_assignment=dispatch.reverse_local_assignment,
+        sink_insts_to_avoid_spills=dispatch.sink_insts_to_avoid_spills,
+        regclass_priority_trumps_globalness=dispatch.regclass_priority_trumps_globalness,
     )
-    _attn_bwd_dq_native_convert_kernel[(triton.cdiv(n_ctx, 128), batch * hq)](
+    dispatch.convert_entry[(triton.cdiv(n_ctx, dispatch.convert_block_m), batch * hq)](
         dq_acc,
         dq,
         N=n_ctx,
         D=head_dim,
-        BLOCK_M=128,
-        num_warps=4,
-        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        BLOCK_M=dispatch.convert_block_m,
+        num_warps=dispatch.convert_num_warps,
+        matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim,
     )
 
 
@@ -4785,6 +4818,12 @@ class _D64Dispatch:
     gqa_grid_mode: str | None = None
     cyclic_query_split: bool = False
     dkdv_lifetime: str | None = None
+
+
+def _d64_q3_register_class(dispatch):
+    if dispatch.family == "causal_scheduled_gqa8":
+        return "agpr"
+    return None
 
 
 _D64_NONCAUSAL_FAMILIES = frozenset({"noncausal_direct_n256", "noncausal_fused_n256"})
@@ -9231,6 +9270,7 @@ def _launch_bwd_d64_causal_dq(
             OWNER_FRAGMENTS=launch.owner_fragments,
             GRID_OWNER_M=launch.grid_owner_m,
             KV_PIPELINE_STAGES=_D64_DQ_KV_STAGES,
+            Q3_REGISTER_CLASS=_d64_q3_register_class(dispatch),
             num_warps=4,
             matrix_instr_nonkdim=_matrix_instr_nonkdim(),
         )
