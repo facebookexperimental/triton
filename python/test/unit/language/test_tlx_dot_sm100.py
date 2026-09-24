@@ -1436,26 +1436,19 @@ def test_tmem_buffer_scales_two_entries(device):
     torch.testing.assert_close(c1, ref_c1, atol=atol, rtol=0)
 
 
+@pytest.mark.parametrize(("scale_format", "vec_size"), [("mxfp4", 32), ("nvfp4", 16)])
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_async_dot_scaled_mxfp4(device):
-    """
-    Test D = (A * A_scale) * (B * B_scale) with mxfp4 (e2m1) format for both A and B.
+def test_async_dot_scaled_fp4(device, scale_format, vec_size):
+    """Test direct TLX scaled MMA with MXFP4 and NVFP4 scale formats.
 
-    For mxfp4 format:
-    - Two fp4 (e2m1) elements are packed into a single uint8
-    - A has logical shape (M, K), packed along K to get physical shape (M, K//2)
-    - B is stored in transposed layout (N, K), packed along K to get (N, K//2)
-    - B is transposed in SMEM before being passed to MMA to get (K//2, N)
-
-    Scale layout uses 5D TMA descriptor [1, rep_m, rep_k, 2, 256] with uint8 elements,
-    matching cuBLAS block scaling layout.
+    Both formats pack two E2M1 values into each uint8 along K. MXFP4 uses
+    E8M0 scales over blocks of 32 values, while NVFP4 uses E4M3FN scales
+    over blocks of 16 values.
     """
     from triton.tools.mxfp import MXFP4Tensor
 
-    VEC_SIZE = 32  # mxfp4 uses 32 elements per scale factor
-
     @triton.jit
-    def tcgen5_dot_scaled_mxfp4_kernel(
+    def tcgen5_dot_scaled_fp4_kernel(
         a_desc,
         a_scale_desc,
         b_desc,
@@ -1464,24 +1457,29 @@ def test_async_dot_scaled_mxfp4(device):
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        VEC_SIZE: tl.constexpr,
     ):
         # Scale tile dimensions for 5D TMA (per cuBLAS block scaling layout)
         REP_M: tl.constexpr = triton.cdiv(BLOCK_M, 128)
         REP_N: tl.constexpr = triton.cdiv(BLOCK_N, 128)
-        REP_K: tl.constexpr = triton.cdiv(BLOCK_K, 128)
+        SCALE_REP_K: tl.constexpr = triton.cdiv(BLOCK_K, VEC_SIZE * 4)
 
         # Allocate SMEM buffers
         # A: (M, K//2) - packed along K
         # B: (N, K//2) - stored in transposed layout, packed along K
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K // 2), tl.uint8, tl.constexpr(1))
         b_tile = tlx.local_alloc((BLOCK_N, BLOCK_K // 2), tl.uint8, tl.constexpr(1))
-        # 5D scale buffers: [1, REP_M/N, REP_K, 2, 256] for cuBLAS block scaling layout
-        a_scale_tile = tlx.local_alloc((1, REP_M, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
-        b_scale_tile = tlx.local_alloc((1, REP_N, REP_K, 2, 256), tl.uint8, tl.constexpr(1))
+        # 5D scale buffers: [1, REP_M/N, SCALE_REP_K, 2, 256]
+        a_scale_tile = tlx.local_alloc(
+            (1, REP_M, SCALE_REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1)
+        )
+        b_scale_tile = tlx.local_alloc(
+            (1, REP_N, SCALE_REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1)
+        )
 
         load_bar = tlx.alloc_barriers(tl.constexpr(1))
         DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K // 2 + BLOCK_N * BLOCK_K // 2
-        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * REP_K * 2 * 256
+        SCALE_BYTES: tl.constexpr = (REP_M + REP_N) * SCALE_REP_K * 2 * 256
         tlx.barrier_expect_bytes(load_bar[0], DATA_BYTES + SCALE_BYTES)
         tlx.async_descriptor_load(a_desc, a_tile[0], [0, 0], load_bar)
         tlx.async_descriptor_load(b_desc, b_tile[0], [0, 0], load_bar)
@@ -1505,8 +1503,7 @@ def test_async_dot_scaled_mxfp4(device):
     M, N, K = (128, 128, 128)
     BLOCK_M, BLOCK_N, BLOCK_K = (M, N, K)
 
-    # Create mxfp4 tensors and pack them
-    # A has logical shape (M, K), packed along K to get physical shape (M, K//2)
+    # Create E2M1 tensors and pack them along K.
 
     A = torch.full((M, K), 2, dtype=torch.float32, device=device)
     B = torch.full((N, K), 2, dtype=torch.float32, device=device)
@@ -1517,33 +1514,45 @@ def test_async_dot_scaled_mxfp4(device):
 
     a_ref = AMXFP4.to(torch.float32)
 
-    # B is stored in transposed layout (N, K), packed along K to get (N, K//2)
-    # This matches the hardware expectation for mxfp4
+    # B is stored in transposed layout (N, K), then transposed in SMEM for MMA.
     b_ref = BMXFP4.to(torch.float32).T  # Transpose for reference matmul -> (K, N)
 
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    # TMA descriptors for packed mxfp4 data
+    # TMA descriptors for packed E2M1 data
     a_desc = TensorDescriptor.from_tensor(APACKED, [BLOCK_M, BLOCK_K // 2])
     b_desc = TensorDescriptor.from_tensor(BPACKED, [BLOCK_N, BLOCK_K // 2])  # B stored as (N, K//2)
     c_desc = TensorDescriptor.from_tensor(c, block_shape=[BLOCK_M, BLOCK_N])
 
-    # Create E8M0 scale tensors using 5D TMA layout: [1, rep_m, rep_k, 2, 256]
-    # This matches cuBLAS block scaling layout used by tcgen5_mma_scaled
-    a_scale = torch.randint(127, 128, (M, K // VEC_SIZE), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(127, 128, (N, K // VEC_SIZE), dtype=torch.uint8, device=device)
+    a_scale_indices = torch.arange(M * K // vec_size, device=device).reshape(M, K // vec_size)
+    b_scale_indices = torch.arange(N * K // vec_size, device=device).reshape(N, K // vec_size)
+    if scale_format == "mxfp4":
+        a_scale = (126 + a_scale_indices % 3).to(torch.uint8)
+        b_scale = (126 + (2 * b_scale_indices + 1) % 3).to(torch.uint8)
+    else:
+        a_scale = (0.5 + (a_scale_indices % 5).to(torch.float32) / 8).to(torch.float8_e4m3fn)
+        b_scale = (0.625 + ((3 * b_scale_indices) % 5).to(torch.float32) / 8).to(torch.float8_e4m3fn)
 
-    # Swizzle to 5D cuBLAS block scaling layout for TMA: [1, rep_m, rep_k, 2, 256]
-    a_scale_5d = swizzle_scale_to_5d(a_scale.reshape(1, M, K // VEC_SIZE), M // 128, K // VEC_SIZE // 4)
-    b_scale_5d = swizzle_scale_to_5d(b_scale.reshape(1, N, K // VEC_SIZE), N // 128, K // VEC_SIZE // 4)
+    # Swizzle the underlying bytes, then restore the semantic scale dtype so
+    # lowering can distinguish E8M0 MXFP4 from E4M3FN NVFP4.
+    def swizzle_scale(scale, rows):
+        scale_5d = swizzle_scale_to_5d(
+            scale.view(torch.uint8).reshape(1, rows, K // vec_size),
+            rows // 128,
+            K // vec_size // 4,
+        )
+        return scale_5d.view(scale.dtype)
 
-    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
-    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128]
+    a_scale_5d = swizzle_scale(a_scale, M)
+    b_scale_5d = swizzle_scale(b_scale, N)
+
+    a_scale_block_shape = [1, BLOCK_M // 128, BLOCK_K // vec_size // 4, 2, 2 * 128]
+    b_scale_block_shape = [1, BLOCK_N // 128, BLOCK_K // vec_size // 4, 2, 2 * 128]
     a_scale_desc = TensorDescriptor.from_tensor(a_scale_5d, block_shape=a_scale_block_shape)
     b_scale_desc = TensorDescriptor.from_tensor(b_scale_5d, block_shape=b_scale_block_shape)
 
-    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N}
-    kernel = tcgen5_dot_scaled_mxfp4_kernel[(1, 1)](
+    kern_kwargs = {"BLOCK_M": BLOCK_M, "BLOCK_K": BLOCK_K, "BLOCK_N": BLOCK_N, "VEC_SIZE": vec_size}
+    kernel = tcgen5_dot_scaled_fp4_kernel[(1, 1)](
         a_desc,
         a_scale_desc,
         b_desc,
@@ -1556,6 +1565,13 @@ def test_async_dot_scaled_mxfp4(device):
     assert ttgir.count("ttng.async_tma_copy_global_to_local") == 4
     assert ttgir.count("ttng.tc_gen5_mma_scaled") == 1
 
+    ptx = kernel.asm["ptx"]
+    expected_ptx_kinds = {
+        "mxfp4": ("kind::mxf4.block_scale.block32", "kind::mxf4.block_scale.scale_vec::2X"),
+        "nvfp4": ("kind::mxf4nvf4.block_scale.block16", "kind::mxf4nvf4.block_scale.scale_vec::4X"),
+    }
+    assert any(kind in ptx for kind in expected_ptx_kinds[scale_format])
+
     # Converts E8M0 format scale values to float32 by bit-shifting the exponent bits
     # into the correct position for IEEE 754 float32 representation
     def fp8e8m0_to_float32(scale):
@@ -1565,14 +1581,17 @@ def test_async_dot_scaled_mxfp4(device):
         scale = scale.view(torch.float32)
         return scale
 
-    # Compute reference (use original 2D scales, not swizzled 5D)
-    a_scale_f32 = fp8e8m0_to_float32(a_scale)
-    b_scale_f32 = fp8e8m0_to_float32(b_scale)
-    # Repeat each scale value VEC_SIZE times along dim 1
-    a_scale_f32 = a_scale_f32.repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
-    b_scale_f32 = b_scale_f32.repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+    # Compute reference using the original 2D scales, not the swizzled 5D tensors.
+    if scale_format == "mxfp4":
+        a_scale_f32 = fp8e8m0_to_float32(a_scale)
+        b_scale_f32 = fp8e8m0_to_float32(b_scale)
+    else:
+        a_scale_f32 = a_scale.to(torch.float32)
+        b_scale_f32 = b_scale.to(torch.float32)
+    a_scale_f32 = a_scale_f32.repeat_interleave(vec_size, dim=1)[:M, :K]
+    b_scale_f32 = b_scale_f32.repeat_interleave(vec_size, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a_ref * a_scale_f32, b_ref * b_scale_f32).to(torch.float16)
-    atol = 1e-2 * math.sqrt(K / 32)
+    atol = 1e-2 * math.sqrt(K / vec_size)
     torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
 
 
