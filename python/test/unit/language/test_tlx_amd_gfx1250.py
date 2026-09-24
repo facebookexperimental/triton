@@ -652,6 +652,33 @@ def _amd_independent_cluster_ids(output):
     tl.store(output + pid, pid * 16 + rank)
 
 
+@pytest.mark.parametrize("arch,cluster_size", [
+    ("gfx1250", None),
+    ("gfx1250", 1),
+    ("gfx1250", 2),
+    ("gfx1250", 4),
+    ("gfx950", None),
+    ("gfx950", 1),
+])
+def test_amd_cluster_barrier_compiles(arch, cluster_size):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    options = dict(num_warps=4)
+    if cluster_size is not None:
+        options["ctas_per_cga"] = (cluster_size, 1, 1)
+    source = ASTSource(_amd_independent_cluster_ids, signature={"output": "*i32"})
+    compiled = triton.compile(source, target=GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64), options=options)
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.barrier local" in ttgir
+    assert "amdg.cluster_barrier_arrive" in ttgir
+    assert "amdg.cluster_barrier_wait" in ttgir
+    assert "s_barrier" in compiled.asm["amdgcn"]
+    multi_cta = cluster_size is not None and cluster_size > 1
+    assert ("s_barrier_signal -3" in compiled.asm["amdgcn"]) == multi_cta
+    assert ("s_barrier_wait -3" in compiled.asm["amdgcn"]) == multi_cta
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 def test_amd_independent_cluster_launch_grid_and_cache():
     output = torch.empty((8, ), device="cuda", dtype=torch.int32)

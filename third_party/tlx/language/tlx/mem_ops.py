@@ -1723,7 +1723,8 @@ def async_amd_descriptor_load_fused(
     must select at most five recipients on gfx1250, including when its value
     is computed at runtime. Each recipient must issue the same source request
     to the same LDS offset.
-    Synchronize the cluster before overwriting a slot read by another CTA.
+    The caller must synchronize accesses to destination shared memory across
+    recipient CTAs.
     Omit the masks to infer multicast from distributed tensor layouts.
     """
     arch = _semantic.builder.options.arch

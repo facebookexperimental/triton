@@ -1433,18 +1433,6 @@ LogicalResult AsyncCopyLocalToGlobalOp::verify() {
   return success();
 }
 
-static int64_t getNumCTAsInCluster(Operation *op) {
-  auto mod = op->getParentOfType<ModuleOp>();
-  int64_t clusterSize = 1;
-  for (StringRef attr :
-       {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"})
-    if (auto dim = mod->getAttrOfType<IntegerAttr>(attr))
-      clusterSize *= dim.getInt();
-  if (auto numCTAs = mod->getAttrOfType<IntegerAttr>(gpu::AttrNumCTAsName))
-    clusterSize = std::max(clusterSize, numCTAs.getInt());
-  return clusterSize;
-}
-
 LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
   size_t numMembers = getDescs().size();
   if (numMembers < 2 || numMembers > 4)
@@ -1462,7 +1450,7 @@ LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
         numCTAs && numCTAs.getInt() != 1)
       return emitOpError("explicit multicast masks require independent CTA "
                          "programs (ttg.num-ctas = 1)");
-    int64_t clusterSize = getNumCTAsInCluster(getOperation());
+    int64_t clusterSize = gpu::lookupPhysicalNumCTAs(getOperation());
     if (clusterSize < 1 || clusterSize > 16)
       return emitOpError("multicast requires a cluster of at most 16 CTAs");
     for (Value mask : getMulticastMasks()) {
@@ -1834,24 +1822,6 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
 
   inferredReturnTypes.push_back(tensorTy);
 
-  return success();
-}
-
-// -- ClusterBarrierSignalOp --
-LogicalResult ClusterBarrierArriveOp::verify() {
-  int64_t numCTAs = getNumCTAsInCluster(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError(
-        "requires ttg.num-ctas > 1 or independent CTA cluster dimensions");
-  return success();
-}
-
-// -- ClusterBarrierWaitOp --
-LogicalResult ClusterBarrierWaitOp::verify() {
-  int64_t numCTAs = getNumCTAsInCluster(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError(
-        "requires ttg.num-ctas > 1 or independent CTA cluster dimensions");
   return success();
 }
 

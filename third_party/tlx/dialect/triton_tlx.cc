@@ -1551,7 +1551,7 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
              // bracketed by SchedBarrier(0) guards so the scheduler cannot
-             // hoist ops across the ping-pong cluster border.
+             // hoist operations across the barrier.
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
              self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);

@@ -1121,7 +1121,8 @@ def AsyncTDMFusedCopyGlobalToLocalOp
     Each mask may select at most five recipients on gfx1250. Dynamic masks
     must satisfy the same range and recipient-count restrictions as constants.
     The caller must ensure every recipient issues the same source request to
-    the same LDS offset and synchronize the cluster before reusing input LDS.
+    the same LDS offset and synchronize accesses to destination shared memory
+    across recipient CTAs.
     When omitted, multicast is inferred from the descriptor's CGA layout.
   }];
 
@@ -1558,17 +1559,17 @@ def AsyncCopyMbarrierArriveOp
 }
 
 //===----------------------------------------------------------------------===//
-// ClusterBarrierSignalOp
+// ClusterBarrierArriveOp
 //===----------------------------------------------------------------------===//
 
 def ClusterBarrierArriveOp : TT_AMDGPU_Op<"cluster_barrier_arrive"> {
   let summary = "Arrive at a cluster barrier";
   let description = [{
-    Signals that the cluster has arrived at a barrier, used to synchronizing CTAs within a cluster.
+    Signals that the current CTA has arrived at a barrier used to synchronize
+    CTAs within a cluster. This operation is a no-op for a single-CTA cluster.
 
     See ClusterBarrierWaitOp for how to wait on the arrived cluster barrier.
   }];
-  let hasVerifier = 1;
   let assemblyFormat = "attr-dict";
 }
 
@@ -1582,8 +1583,8 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
     Waits for all CTAs of the same cluster to have arrived at a cluster barrier.
     Arrive and wait operations must come in pairs. Waiting before arriving or arriving
     more than once without a corresponding wait will result in undefined behavior.
+    This operation is a no-op for a single-CTA cluster.
   }];
-  let hasVerifier = 1;
   let assemblyFormat = "attr-dict";
 }
 
