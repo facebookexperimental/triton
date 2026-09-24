@@ -1004,10 +1004,12 @@ public:
             oldScaleAType.getElementType(), oldScaleBType.getElementType());
     Attribute scaleAEncoding =
         triton::nvidia_gpu::TensorMemoryScalesEncodingAttr::get(
-            context, CGALayout, aScaleBlockRepOrder);
+            context, CGALayout, aScaleBlockRepOrder,
+            triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
     Attribute scaleBEncoding =
         triton::nvidia_gpu::TensorMemoryScalesEncodingAttr::get(
-            context, CGALayout, bScaleBlockRepOrder);
+            context, CGALayout, bScaleBlockRepOrder,
+            triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
     Value scaleA =
         tryCreateTmemCopyCompatibleScaleOperand(dotOp.getAScale(), rewriter);
     if (!scaleA) {

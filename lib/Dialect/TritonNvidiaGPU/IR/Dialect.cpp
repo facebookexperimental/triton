@@ -471,9 +471,14 @@ LogicalResult TensorMemoryEncodingAttr::verify(
 
 LogicalResult TensorMemoryScalesEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError,
-    gpu::CGAEncodingAttr cgaLayout, TensorMemoryScalesBlockRepOrder) {
+    gpu::CGAEncodingAttr cgaLayout, TensorMemoryScalesBlockRepOrder,
+    TensorMemoryCTAMode ctaMode) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
+  }
+  if (ctaMode != TensorMemoryCTAMode::DEFAULT &&
+      ctaMode != TensorMemoryCTAMode::TwoCTA_RHS) {
+    return emitError() << "scale layout only supports default or twocta_rhs CTA mode";
   }
   return success();
 }
