@@ -497,11 +497,51 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
         ):
             self.assertFalse(provider._is_performance_validated(*tensors, -0.125, True))
 
-    def test_short_d128_is_not_selected_on_backward_only_gain(self):
+    def test_short_d128_selects_only_measured_dispatches(self):
         from triton.tlx import pytorch as provider
 
         tensors = self._performance_tensors((16, 27, 200, 128), (16, 27, 200, 128))
-        self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+        route_options = {
+            amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+            amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+        }
+        for causal in (False, True):
+            with self.subTest(causal=causal, route="split"), mock.patch.dict(os.environ, route_options):
+                self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+            with self.subTest(causal=causal, route="exact"), mock.patch.dict(
+                    os.environ,
+                    route_options | {amd_fa_bwd._D128_EXACT_ENABLE_ENV: "1"},
+            ):
+                self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+            for option in (amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV, amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV):
+                with self.subTest(causal=causal, route=option), mock.patch.dict(
+                        os.environ,
+                        route_options | {option: "1"},
+                ):
+                    self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+
+        with mock.patch.dict(os.environ, route_options):
+            measured = amd_fa_bwd._select_d128_dispatch((16, 27, 200, 128), False)
+        mutations = (
+            {"entry": object()},
+            {"block_m": measured.block_m * 2},
+            {"block_n": measured.block_n // 2},
+            {"num_warps": measured.num_warps // 2},
+            {"pipelined": not measured.pipelined},
+            {"rectangular": not measured.rectangular},
+            {"exact": not measured.exact},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    amd_fa_bwd,
+                    "_select_d128_dispatch",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
 
     def test_every_tensor_base_must_be_aligned(self):
         from triton.tlx import pytorch as provider
@@ -716,6 +756,27 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
             seed=3640,
             max_relative_l2=1e-2,
         )
+
+    def test_sdpa_autograd_routes_short_d128_to_tlx(self):
+        route_options = {
+            amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+            amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+        }
+        for exact in (False, True):
+            options = route_options | {amd_fa_bwd._D128_EXACT_ENABLE_ENV: str(int(exact))}
+            for causal in (False, True):
+                with self.subTest(exact=exact, causal=causal), mock.patch.dict(os.environ, options):
+                    self._assert_sdpa_autograd_routes_to_tlx(
+                        (16, 27, 200, 128),
+                        (16, 27, 200, 128),
+                        causal=causal,
+                        seed=3650 + 2 * int(exact) + int(causal),
+                        max_relative_l2=1e-2,
+                    )
 
     def test_sdpa_autograd_routes_d256_to_tlx(self):
         for causal in (False, True):

@@ -23,9 +23,11 @@ CUDA kernel captured at activation. Use
 `torch.nn.attention.restore_flash_attention_impl()` to remove the override.
 The automatic set is an exact allow-list of D64, D128, and D256 signatures that
 won through the activated provider on MI350X; unmeasured shapes and known
-losing members of the same kernel families fall back. The supported short D128
-`(16, 27, 200, 128)` kernel remains internal and is not selected here because
-its backward-only gain does not cover end-to-end dispatcher overhead.
+losing members of the same kernel families fall back. For short D128
+`(16, 27, 200, 128)`, the default split route improves forward plus backward by
+1.15x non-causal and 1.35x causal. The exact-D128 opt-in improves it by 1.34x
+and 1.39x, respectively. Both measured routes are eligible; unmeasured
+persistent experiments and register-allocation overrides fall back.
 
 ## Adaptive FlashAttention
 
