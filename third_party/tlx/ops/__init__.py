@@ -142,8 +142,7 @@ def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, cau
     `1 / HEAD_DIM`.
 
     Causal-only: `causal=False` raises `InvalidInput`. The argument is kept so
-    the intent is stated at the call site rather than assumed. Backward support
-    depends on the selected architecture.
+    the intent is stated at the call site rather than assumed.
     """
     fn, spec = impl_for("hstu_attn_dev", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], causal=causal)

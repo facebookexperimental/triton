@@ -1,9 +1,4 @@
-"""gfx950 HSTU correctness.
-
-The first section covers the public ``tlx.ops.hstu_attn_dev`` forward path.
-Backward coverage below exercises the standalone tutorial implementation; it
-does not imply that the public gfx950 backend supports autograd.
-"""
+"""gfx950 ``tlx.ops.hstu_attn_dev`` forward and backward correctness."""
 from pathlib import Path
 import pytest
 import torch
@@ -49,7 +44,7 @@ def _gfx950_inputs(batch_size, max_seq_len, H, attn_dim, hidden_dim, dtype):
 @pytest.mark.parametrize("batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM", GFX950_SHAPES)
 def test_hstu_attn_gfx950(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM):
     from triton.tlx.ops import hstu_attn_dev as tlx_hstu_attn
-    from triton.tlx.ops.kernels.hstu_attn.gfx950 import torch_hstu_attention as torch_hstu_attn_ref
+    from triton.tlx.ops.kernels.hstu_attn._reference import triton_hstu_mha
 
     torch.cuda.empty_cache()
     dtype = torch.bfloat16
@@ -58,45 +53,41 @@ def test_hstu_attn_gfx950(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM):
 
     out = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, None, alpha=alpha, causal=True, num_targets=num_targets,
                         space="smoke")
-    ref = torch_hstu_attn_ref(
+    ref_attn_scale = torch.tensor(1.0 / MAX_SEQ_LEN, device=q.device, dtype=torch.float32)
+    ref = triton_hstu_mha(
         MAX_SEQ_LEN,
         alpha,
         q,
         k,
         v,
         offsets,
-        causal=True,
-        dropout_pr=0.0,
-        training=False,
+        ref_attn_scale,
         num_targets=num_targets,
     )
 
     torch.testing.assert_close(out * MAX_SEQ_LEN, ref * MAX_SEQ_LEN, atol=1e-3, rtol=0)
 
 
-# Standalone tutorial backward coverage. Keep the test names explicit so a
-# green tlx_ops suite cannot be mistaken for public gfx950 backward support.
-def _load_gfx950_hstu_tutorial():
-    """Load the standalone gfx950 HSTU forward/backward implementation."""
+def _load_gfx950_hstu_impl():
+    """Load the production implementation for low-level schedule coverage."""
+    from triton.tlx.ops.kernels.hstu_attn import gfx950
+
+    return gfx950
+
+
+def _load_gfx950_hstu_benchmark():
+    """Load the benchmark helpers without requiring a GPU workload."""
     import sys
 
     kernel_dir = str(Path(__file__).resolve().parents[4] / "third_party" / "tlx" / "tutorials" / "hstu_self_attn")
     if kernel_dir not in sys.path:
         sys.path.insert(0, kernel_dir)
-    import tlx_gfx950_ragged_hstu_attention as hstu
-
-    return hstu
-
-
-def _load_gfx950_hstu_benchmark():
-    """Load the benchmark helpers without requiring a GPU workload."""
-    _load_gfx950_hstu_tutorial()
     import bench_gfx950_bwd as benchmark
 
     return benchmark
 
 
-def test_hstu_tutorial_gfx950_fixture_launch_coverage(tmp_path):
+def test_hstu_gfx950_fixture_launch_coverage(tmp_path):
     benchmark = _load_gfx950_hstu_benchmark()
 
     # Issue #2005 intentionally has a length one row beyond N, but every
@@ -126,8 +117,8 @@ def test_hstu_tutorial_gfx950_fixture_launch_coverage(tmp_path):
         benchmark._make_input_fixture_workload(fixture_path)
 
 
-def test_hstu_tutorial_gfx950_sequence_xcd_padding_budget():
-    hstu = _load_gfx950_hstu_tutorial()
+def test_hstu_gfx950_sequence_xcd_padding_budget():
+    hstu = _load_gfx950_hstu_impl()
 
     assert hstu._gfx950_fa_schedule_launch_sequences(7, 8) == (7, False)
     assert hstu._gfx950_fa_schedule_launch_sequences(9, 8) == (9, False)
@@ -176,12 +167,12 @@ def _assert_per_sequence_close(name, got, expected, offsets, tolerance=8e-3, tai
 @pytest.mark.parametrize(
     "bwd_variant,sequence_xcd_case",
     [
-        pytest.param("default", "padded", id="default"),
+        pytest.param("tlx.ops-general", "padded", id="tlx-ops-general"),
         pytest.param("kv_parallel_fa_schedule", "padded", id="fa-schedule"),
         pytest.param(
-            "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t",
+            "tlx.ops-production",
             "padded",
-            id="fa-schedule-production",
+            id="tlx-ops-production",
         ),
         pytest.param(
             "kv_parallel_fa_schedule_bn256_direct_qdo_g2l",
@@ -195,9 +186,9 @@ def _assert_per_sequence_close(name, got, expected, offsets, tolerance=8e-3, tai
         ),
     ],
 )
-def test_hstu_tutorial_gfx950_backward_target_causal(bwd_variant, sequence_xcd_case):
+def test_hstu_gfx950_backward_target_causal(bwd_variant, sequence_xcd_case):
     """Cover ragged tails and padded/unpadded XCD sequence scheduling."""
-    hstu = _load_gfx950_hstu_tutorial()
+    hstu = _load_gfx950_hstu_impl()
     torch.manual_seed(7)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -241,16 +232,33 @@ def test_hstu_tutorial_gfx950_backward_target_causal(bwd_variant, sequence_xcd_c
         max_seq_len,
         alpha,
     )
-    out = hstu.tlx_gfx950_hstu_mha(
-        max_seq_len,
-        alpha,
-        q,
-        k,
-        v,
-        offsets,
-        num_targets=num_targets,
-        bwd_variant=bwd_variant,
-    )
+    if bwd_variant.startswith("tlx.ops-"):
+        from triton.tlx.ops import hstu_attn_dev
+
+        attn_scale = (torch.tensor(1.0 / max_seq_len, device=device, dtype=torch.float32)
+                      if bwd_variant == "tlx.ops-general" else None)
+        out = hstu_attn_dev(
+            q,
+            k,
+            v,
+            offsets,
+            max_seq_len,
+            attn_scale,
+            alpha=alpha,
+            num_targets=num_targets,
+            space="smoke",
+        )
+    else:
+        out = hstu.tlx_gfx950_hstu_mha(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            offsets,
+            num_targets=num_targets,
+            bwd_variant=bwd_variant,
+        )
     out.backward(dout)
     ref.backward(dout.float())
 
@@ -265,9 +273,9 @@ def test_hstu_tutorial_gfx950_backward_target_causal(bwd_variant, sequence_xcd_c
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_hstu_tutorial_gfx950_backward_ticket_2005_layout():
+def test_hstu_gfx950_backward_ticket_2005_layout():
     """Cover the interleaved QKV layout and N/length boundary from issue #2005."""
-    hstu = _load_gfx950_hstu_tutorial()
+    hstu = _load_gfx950_hstu_impl()
     device = torch.device("cuda")
     dtype = torch.bfloat16
     max_seq_len, heads, head_dim = 996, 4, 128
@@ -354,9 +362,9 @@ def test_hstu_tutorial_gfx950_backward_ticket_2005_layout():
         ),
     ],
 )
-def test_hstu_tutorial_gfx950_backward_reuses_poisoned_outputs(bwd_options):
+def test_hstu_gfx950_backward_reuses_poisoned_outputs(bwd_options):
     """Repeated launches must clear aliased or separate dQ accumulation state."""
-    hstu = _load_gfx950_hstu_tutorial()
+    hstu = _load_gfx950_hstu_impl()
     torch.manual_seed(11)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -442,9 +450,9 @@ def test_hstu_tutorial_gfx950_backward_reuses_poisoned_outputs(bwd_options):
         ),
     ],
 )
-def test_hstu_tutorial_gfx950_backward_graph_replay_resets_dq(bwd_options):
+def test_hstu_gfx950_backward_graph_replay_resets_dq(bwd_options):
     """Captured backward launches must reset dQ accumulation on every replay."""
-    hstu = _load_gfx950_hstu_tutorial()
+    hstu = _load_gfx950_hstu_impl()
     torch.manual_seed(13)
     device = torch.device("cuda")
     dtype = torch.bfloat16
