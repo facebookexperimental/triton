@@ -536,14 +536,7 @@ def grouped_gemm_tdm_kernel(
     if LIMIT_DOT_LIFETIME:
         # CDNA5 SCHED_MODE[2] lets this single-wave-per-SIMD schedule queue
         # WMMAs while independent scalar and memory instructions execute.
-        tl.inline_asm_elementwise(
-            "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1; s_mov_b32 $0, 0;",
-            constraints="=s",
-            args=[],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     DIRECT_LOAD_OFFSETS: tl.constexpr = OPTIMIZE_CROSS_TILE and L2_PREFETCH_DISTANCE == 0
     K_BLOCKS_PER_LOOP: tl.constexpr = 1 if CROSS_GROUP_PREFETCH else NUM_BUFFERS
     NUM_SUBTILES: tl.constexpr = 4

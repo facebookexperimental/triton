@@ -574,6 +574,56 @@ test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch = _gfx1250_grouped.test_groupe
 test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm_xcd_remap_gfx1250
 
 
+@triton.jit
+def _amd_wave_sched_mode_kernel(VALUE: tl.constexpr, OFFSET: tl.constexpr, WIDTH: tl.constexpr):
+    tlx.amd_set_wave_sched_mode(VALUE, offset=OFFSET, width=WIDTH)
+
+
+@pytest.mark.parametrize("value,offset,width", [(1, 2, 1), (0, 2, 1), (2, 0, 2)])
+def test_amd_wave_sched_mode_compiles(value, offset, width):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=value, OFFSET=offset,
+                                                                                  WIDTH=width))
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32))
+    hwreg = 26 | offset << 6 | (width - 1) << 11
+    # A result-free intrinsic must survive optimization even in an empty kernel.
+    assert f"call void @llvm.amdgcn.s.setreg(i32 {hwreg}, i32 {value})" in compiled.asm["llir"]
+    assert "asm sideeffect" not in compiled.asm["llir"]
+    instruction = f"s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, {offset}, {width}), {value}"
+    assert instruction in compiled.asm["amdgcn"]
+    assert "s_mov_b32" not in compiled.asm["amdgcn"]
+
+
+@pytest.mark.parametrize("value,offset,width,message", [
+    (-1, 2, 1, "value must fit"),
+    (2, 2, 1, "value must fit"),
+    (1, -1, 1, "field must fit"),
+    (1, 32, 1, "field must fit"),
+    (0, 2, 0, "field must fit"),
+    (1, 31, 2, "field must fit"),
+    (1.0, 2, 1, "constexpr integers"),
+])
+def test_amd_wave_sched_mode_invalid_field(value, offset, width, message):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=value, OFFSET=offset,
+                                                                                  WIDTH=width))
+    with pytest.raises(triton.CompilationError, match=message):
+        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32))
+
+
+def test_amd_wave_sched_mode_unsupported_target():
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=1, OFFSET=2, WIDTH=1))
+    with pytest.raises(triton.CompilationError, match="requires an AMD gfx12 target"):
+        triton.compile(source, target=GPUTarget("hip", "gfx942", 64))
+
+
 @pytest.mark.parametrize("independent_ctas", [False, True])
 @pytest.mark.parametrize("cluster_size,masks,message", [
     (4, (-1, 3), "outside the cluster"),
@@ -665,6 +715,7 @@ def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size):
                               options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1)))
     assert compiled.metadata.num_ctas == 1
     assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+    assert "call void @llvm.amdgcn.s.setreg(i32 154, i32 1)" in compiled.asm["llir"]
     assert f'"amdgpu-cluster-dims"="{cluster_size},1,1"' in compiled.asm["llir"]
     assert compiled.metadata.global_scratch_size == 0
     assert compiled.metadata.shared <= 320 * 1024
