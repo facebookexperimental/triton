@@ -1014,6 +1014,18 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         return WalkResult::advance();
     }
 
+    auto isInsideRestrictedExec = [](Value value) {
+      Operation *scope = value.getDefiningOp();
+      scope =
+          scope ? scope->getParentOp() : value.getParentBlock()->getParentOp();
+      for (Operation *op = scope; op; op = op->getParentOp()) {
+        if (auto predicate = dyn_cast<WarpPredicateOp>(op);
+            predicate && !predicate.getWaveUniform().value_or(false))
+          return true;
+      }
+      return false;
+    };
+
     bool conflict = false;
     std::function<LogicalResult(Value, Attribute)> forceSlice =
         [&](Value value, Attribute encoding) -> LogicalResult {
@@ -1022,13 +1034,14 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         return success();
       encoding = getEffectiveLayoutEncoding(encoding);
 
-      // Captures are island inputs.  Do not retag their producers: rewriting
-      // will materialize the requested encoding before entering restricted
-      // EXEC, where cross-lane communication remains safe.
+      // Captures outside restricted EXEC are island inputs: rewriting can
+      // materialize their encoding before entering the region. A predicate
+      // produced inside an enclosing non-wave-uniform island cannot be
+      // converted there, so force its transparent producer slice instead.
       Region *valueRegion = value.getParentRegion();
       bool captured = valueRegion != &predicateOp.getRegion() &&
                       !predicateOp.getRegion().isAncestor(valueRegion);
-      if (captured)
+      if (captured && !isInsideRestrictedExec(value))
         return success();
 
       if (auto it = forcedWarpPredicateEncodings.find(value);
@@ -1040,6 +1053,7 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         return failure();
       if (hasSameEffectiveLayout(valueType.getEncoding(), encoding)) {
         forcedWarpPredicateEncodings[value] = encoding;
+        layouts[value].insertEncoding(encoding);
         return success();
       }
 
@@ -1055,6 +1069,7 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         return failure();
 
       forcedWarpPredicateEncodings[value] = encoding;
+      layouts[value].insertEncoding(encoding);
       if (!transparent)
         return success();
 
@@ -1068,6 +1083,10 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       return success();
     };
 
+    if (predicateEncoding &&
+        failed(forceSlice(predicateOp.getPredicate(), *predicateEncoding)))
+      conflict = true;
+
     for (auto [index, result, yielded, bodyRoot] :
          llvm::enumerate(predicateOp.getResults(), yieldOp.getValues(),
                          bodyRoots)) {
@@ -1076,8 +1095,6 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         continue;
 
       Attribute bodyEncoding = bodyEncodings[index];
-      if (predicateType && resultType.getRank() == predicateType.getRank())
-        bodyEncoding = *predicateEncoding;
       if (predicateType) {
         // Different register order is harmless because EXEC masks lanes, not
         // individual registers.  Any lane, warp, or block ownership mismatch

@@ -67,3 +67,71 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
     tt.return %result : tensor<128x128xf32, #predicate_only_mma>
   }
 }
+
+// -----
+
+#register_order_old = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#register_order_a = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+#register_order_b = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+#register_order_a_pinned = #tlx.no_verify_layout<#tlx.user_layout<#register_order_a>>
+#register_order_b_pinned = #tlx.no_verify_layout<#tlx.user_layout<#register_order_b>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$REGISTER_ORDER_A:.*]] = #ttg.linear<{register = {{\[\[}}1], [2{{\]\]}}
+  // CHECK-DAG: #[[$REGISTER_ORDER_B:.*]] = #ttg.linear<{register = {{\[\[}}2], [1{{\]\]}}
+  // CHECK-LABEL: tt.func @preserve_pinned_carried_register_order
+  tt.func @preserve_pinned_carried_register_order(
+      %predicate: tensor<256xi1, #register_order_old>,
+      %lhs: tensor<256xf32, #register_order_old>,
+      %rhs: tensor<256xf32, #register_order_old>)
+      -> (tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>) {
+    // CHECK: %[[RESULT:.*]]:2 = ttg.warp_predicate {{.*}} {
+    %result:2 = ttg.warp_predicate %predicate (%lhs, %rhs) {
+      %lhs_native = ttg.convert_layout %lhs : tensor<256xf32, #register_order_old> -> tensor<256xf32, #register_order_a_pinned>
+      %lhs_next = arith.addf %lhs_native, %lhs_native : tensor<256xf32, #register_order_a_pinned>
+      %lhs_old = ttg.convert_layout %lhs_next : tensor<256xf32, #register_order_a_pinned> -> tensor<256xf32, #register_order_old>
+      %rhs_native = ttg.convert_layout %rhs : tensor<256xf32, #register_order_old> -> tensor<256xf32, #register_order_b_pinned>
+      %rhs_next = arith.addf %rhs_native, %rhs_native : tensor<256xf32, #register_order_b_pinned>
+      %rhs_old = ttg.convert_layout %rhs_next : tensor<256xf32, #register_order_b_pinned> -> tensor<256xf32, #register_order_old>
+      // CHECK: ttg.predicate_yield %{{.*}}, %{{.*}} : tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>
+      ttg.predicate_yield %lhs_old, %rhs_old : tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>
+    } : (tensor<256xi1, #register_order_old>, tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>) -> (tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>)
+    // CHECK: } : (tensor<256xi1, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>) -> (tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>)
+    tt.return %result#0, %result#1 : tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>
+  }
+}
+
+// -----
+
+#nested_old = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#nested_inner = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+#nested_inner_pinned = #tlx.no_verify_layout<#tlx.user_layout<#nested_inner>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$NESTED_INNER:.*]] = #ttg.linear<{register = {{\[\[}}1], [2{{\]\]}}
+  // CHECK-LABEL: tt.func @avoid_nested_predicate_conversion
+  // CHECK-SAME: %[[OUTER_PRED_ARG:.*]]: tensor<256xi1, #{{.*}}>, %[[INNER_PRED_ARG:.*]]: tensor<256xi1, #{{.*}}>, %[[VALUE_ARG:.*]]: tensor<256xf32, #{{.*}}>, %[[PTRS_ARG:.*]]: tensor<256x!tt.ptr<f32>, #{{.*}}>
+  tt.func @avoid_nested_predicate_conversion(
+      %outer_predicate: tensor<256xi1, #nested_old>,
+      %inner_predicate: tensor<256xi1, #nested_old>,
+      %value: tensor<256xf32, #nested_inner_pinned>,
+      %ptrs: tensor<256x!tt.ptr<f32>, #nested_inner_pinned>) {
+    // CHECK-DAG: %[[OUTER_PRED_INPUT:.*]] = ttg.convert_layout %[[OUTER_PRED_ARG]] : tensor<256xi1, #{{.*}}> -> tensor<256xi1, #[[$NESTED_INNER]]>
+    // CHECK-DAG: %[[INNER_PRED_INPUT:.*]] = ttg.convert_layout %[[INNER_PRED_ARG]] : tensor<256xi1, #{{.*}}> -> tensor<256xi1, #[[$NESTED_INNER]]>
+    // CHECK: ttg.warp_predicate %[[OUTER_PRED_ARG]]() {
+    ttg.warp_predicate %outer_predicate () {
+      // CHECK: %[[INNER_PRED:.*]] = arith.ori %[[INNER_PRED_INPUT]], %[[OUTER_PRED_INPUT]] : tensor<256xi1, #[[$NESTED_INNER]]>
+      // CHECK-NOT: ttg.convert_layout %[[INNER_PRED]]
+      // CHECK-NEXT: %[[INNER:.*]] = ttg.warp_predicate %[[INNER_PRED]]
+      %inner_pred = arith.ori %inner_predicate, %outer_predicate : tensor<256xi1, #nested_old>
+      %inner = ttg.warp_predicate %inner_pred (%value) {
+        %inner_next = arith.addf %value, %value : tensor<256xf32, #nested_inner_pinned>
+        ttg.predicate_yield %inner_next : tensor<256xf32, #nested_inner_pinned>
+      } : (tensor<256xi1, #nested_old>, tensor<256xf32, #nested_inner_pinned>) -> tensor<256xf32, #nested_inner_pinned>
+      tt.store %ptrs, %inner : tensor<256x!tt.ptr<f32>, #nested_inner_pinned>
+      ttg.predicate_yield
+    } : (tensor<256xi1, #nested_old>) -> ()
+    // CHECK: tt.return
+    tt.return
+  }
+}
