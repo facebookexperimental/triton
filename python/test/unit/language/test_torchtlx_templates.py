@@ -42,7 +42,7 @@ def has_tlx() -> bool:
 
 
 def _mm_kernel_inputs_stub() -> mock.Mock:
-    """MMKernelInputs stand-in for append_tlx's TMA-compatibility gate."""
+    """MMKernelInputs stand-in for append_tlx tests."""
     kernel_inputs = mock.Mock()
     kernel_inputs.mat1mat2.return_value = (mock.sentinel.mat1, mock.sentinel.mat2)
     return kernel_inputs
@@ -670,53 +670,55 @@ class TestTLXTemplates(TestCase):
             base_get_configs.assert_called_once()
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
-    def test_tlx_nvidia_only_appends_blackwell_template_to_mm(self):
+    def test_tlx_blackwell_template_is_arch_gated(self):
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
 
         existing_template = object()
+        h100_templates = [existing_template]
         scaled_mm_templates = [existing_template]
         kernel_inputs = _mm_kernel_inputs_stub()
-        with (
-                mock.patch.object(_tlx_mm, "is_rocm", return_value=False),
-                mock.patch(
-                    "torch._inductor.utils.can_use_tma",
-                    return_value=True,
-                ) as can_use_tma,
-        ):
+        with mock.patch.object(
+            _tlx_mm, "is_rocm", return_value=False
+        ), mock.patch.object(_tlx_mm, "current_target") as target:
+            target.return_value.is_blackwell = False
+            h100_result = _tlx_mm.append_tlx(
+                h100_templates, "mm", kernel_inputs
+            )
+
+            target.return_value.is_blackwell = True
             scaled_mm_result = _tlx_mm.append_tlx(
                 scaled_mm_templates, "scaled_mm", kernel_inputs
             )
             mm_result = _tlx_mm.append_tlx([], "mm", kernel_inputs)
 
+        self.assertIs(h100_result, h100_templates)
+        self.assertEqual(h100_templates, [existing_template])
         self.assertIs(scaled_mm_result, scaled_mm_templates)
         self.assertEqual(scaled_mm_templates, [existing_template])
         self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
-        # scaled_mm bails before the gate; mm consults it with both operands.
-        can_use_tma.assert_called_once_with(
-            mock.sentinel.mat1, mock.sentinel.mat2, add_guards=True
-        )
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
-    def test_tlx_nvidia_skips_mm_when_tma_cannot_describe_operands(self):
-        """The config mixin raises on such operands instead of declining them.
+    def test_tlx_matmul_ws_rejects_ambiguous_tma_layout(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
 
-        TMATemplateConfigMixin derives A_ROW_MAJOR/B_ROW_MAJOR eagerly and
-        asserts when no dim is uniquely stride-1 -- which is every operand with
-        a size-1 dim, e.g. the [M, 1] grad of an N=1 GEMM. Proposing the
-        template is therefore what decides whether that assertion can fire.
-        """
-        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        class _KernelInputs:
+            _mat1_idx = 0
+            _mat2_idx = 1
 
+            def strides_hinted(self):
+                return ((1, 1), (32, 1))
+
+        graph = mock.Mock()
+        graph.sizevars.statically_known_equals.side_effect = (
+            lambda lhs, rhs: lhs == rhs
+        )
+        heuristic = object.__new__(_tlx_registry.BlackwellGemmWSConfigHeuristic)
         with (
-                mock.patch.object(_tlx_mm, "is_rocm", return_value=False),
-                mock.patch(
-                    "torch._inductor.utils.can_use_tma",
-                    return_value=False,
-                ),
+            V.set_graph_handler(graph),
+            mock.patch.object(_tlx_registry, "MMKernelInputs", _KernelInputs),
+            config.patch({"triton.tlx_mode": "force"}),
         ):
-            templates = _tlx_mm.append_tlx([], "mm", _mm_kernel_inputs_stub())
-
-        self.assertEqual(templates, [])
+            self.assertFalse(heuristic.should_run(_KernelInputs()))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
