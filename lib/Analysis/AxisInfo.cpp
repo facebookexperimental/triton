@@ -134,6 +134,20 @@ protected:
   }
 };
 
+static AxisInfo
+getPassthroughAxisInfo(Operation *op,
+                       ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) {
+  if (operands.empty()) {
+    if (op->getNumResults() == 0)
+      return AxisInfo();
+    return AxisInfo::getPessimisticValueState(op->getResult(0));
+  }
+  auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (tensorType && tensorType.getRank() != operands[0]->getValue().getRank())
+    return AxisInfo::getPessimisticValueState(op->getResult(0));
+  return operands[0]->getValue();
+}
+
 template <typename OpTy>
 class CastOpAxisInfoVisitor final : public AxisInfoVisitorImpl<OpTy> {
 public:
@@ -142,15 +156,20 @@ public:
   AxisInfo
   getAxisInfo(OpTy op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
-    if (operands.empty()) {
-      if (op->getNumResults() == 0)
-        return AxisInfo();
-      return AxisInfo::getPessimisticValueState(op->getResult(0));
-    }
-    auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-    if (tensorType && tensorType.getRank() != operands[0]->getValue().getRank())
-      return AxisInfo::getPessimisticValueState(op->getResult(0));
-    return operands[0]->getValue();
+    return getPassthroughAxisInfo(op, operands);
+  }
+};
+
+class AxisInfoPassthroughVisitor final : public AxisInfoVisitor {
+public:
+  AxisInfo
+  getAxisInfo(Operation *op,
+              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    return getPassthroughAxisInfo(op, operands);
+  }
+
+  bool match(Operation *op) override {
+    return op->hasTrait<mlir::OpTrait::AxisInfoPassthroughTrait>();
   }
 };
 
@@ -1190,12 +1209,11 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
   // in the process of a PartialConversion, where UnrealizedConversionCast
   // may exist
   visitors.append<UnrealizedConversionCastOpAxisInfoVisitor>();
+  visitors.append<AxisInfoPassthroughVisitor>();
   visitors.append<CastOpAxisInfoVisitor<arith::ExtSIOp>,
                   CastOpAxisInfoVisitor<arith::ExtUIOp>,
                   CastOpAxisInfoVisitor<arith::TruncIOp>,
                   CastOpAxisInfoVisitor<triton::gpu::ConvertLayoutOp>,
-                  CastOpAxisInfoVisitor<triton::gpu::RequireLayoutOp>,
-                  CastOpAxisInfoVisitor<triton::gpu::ReleaseLayoutOp>,
                   CastOpAxisInfoVisitor<triton::BitcastOp>,
                   CastOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();
   visitors.append<MakeRangeOpAxisInfoVisitor>();
