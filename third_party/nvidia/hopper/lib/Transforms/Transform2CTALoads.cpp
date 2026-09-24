@@ -126,6 +126,7 @@ struct BLoadTrace {
   ttg::LocalAllocOp localAlloc;
   ttg::MemDescTransOp memDescTrans;
   tt::TransOp trans;
+  arith::TruncFOp trunc;
   unsigned splitDim = 1;
 };
 
@@ -177,6 +178,17 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
   while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
     tensor = cvt.getSrc();
 
+  // A producer-fused B operand can load FP32 through TMA and explicitly round
+  // it to BF16 before the dot.  Preserve that rounding, but move it after the
+  // per-CTA descriptor split so each CTA converts and stages only its N half.
+  arith::TruncFOp trunc;
+  if (auto truncOp = tensor.getDefiningOp<arith::TruncFOp>()) {
+    trunc = truncOp;
+    tensor = trunc.getIn();
+    while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
+      tensor = cvt.getSrc();
+  }
+
   tt::TransOp trans;
   if (auto transOp = tensor.getDefiningOp<tt::TransOp>()) {
     trans = transOp;
@@ -194,7 +206,7 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
   if (!descLoad)
     return failure();
 
-  return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, splitDim};
+  return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, trunc, splitDim};
 }
 
 struct Transform2CTALoads
@@ -454,6 +466,7 @@ struct Transform2CTALoads
     auto localAlloc = trace->localAlloc;
     auto memDescTrans = trace->memDescTrans;
     auto trans = trace->trans;
+    auto trunc = trace->trunc;
     unsigned splitDim = trace->splitDim;
 
     // Use the descriptor's original type. Host-side TMA descriptor arguments
@@ -508,6 +521,15 @@ struct Transform2CTALoads
       // and creates the CuTensorMap with the correct half-width box_dim.
       // This follows the same pattern as Data Partitioning (WSDataPartition).
       auto descVal = descLoad.getDesc();
+      // Retyping a shared host descriptor would also change unrelated loads.
+      // Reject the newly supported truncated path instead of producing an
+      // invalid mixed-width descriptor use.
+      if (trunc && !descVal.hasOneUse()) {
+        mma->emitError(
+            "2-CTA truncated B requires an unshared host descriptor");
+        signalPassFailure();
+        return failure();
+      }
       descVal.setType(newDescType);
       newDesc = descVal;
       // Update the function signature to match.
@@ -563,14 +585,27 @@ struct Transform2CTALoads
       allocSrc = tt::TransOp::create(builder, trans.getLoc(), allocSrc,
                                      trans.getOrder());
     }
+    if (trunc) {
+      builder.setInsertionPoint(localAlloc);
+      auto srcType = cast<RankedTensorType>(allocSrc.getType());
+      auto oldResultType = cast<RankedTensorType>(trunc.getOut().getType());
+      auto truncType = RankedTensorType::get(srcType.getShape(),
+                                             oldResultType.getElementType(),
+                                             srcType.getEncoding());
+      auto newTrunc = arith::TruncFOp::create(
+          builder, trunc.getLoc(), truncType, allocSrc,
+          trunc.getRoundingmodeAttr(), trunc.getFastmathAttr());
+      allocSrc = newTrunc;
+    }
 
     auto origMemDescType = cast<ttg::MemDescType>(localAlloc.getType());
     auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
     auto newMemDescEncoding = shrinkSwizzleForShape(
         origMemDescType.getEncoding(), allocSrcType.getShape());
     auto newMemDescType = ttg::MemDescType::get(
-        allocSrcType.getShape(), elemType, newMemDescEncoding,
-        origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
+        allocSrcType.getShape(), allocSrcType.getElementType(),
+        newMemDescEncoding, origMemDescType.getMemorySpace(),
+        origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
     auto newLocalAlloc = ttg::LocalAllocOp::create(builder, localAlloc.getLoc(),
@@ -591,7 +626,11 @@ struct Transform2CTALoads
       localAlloc.erase();
     }
 
-    // Clean up old transpose if no other users.
+    // Erase the replaced producer chain downstream-to-upstream. Otherwise a
+    // dead truncation can keep the old transpose and descriptor load alive.
+    if (trunc && trunc.getResult().use_empty())
+      trunc.erase();
+
     if (trans && trans.getResult().use_empty())
       trans.erase();
 
