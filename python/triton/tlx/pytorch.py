@@ -120,6 +120,66 @@ _D64_CAUSAL_GQA8_M192_CONFIG = _d64_causal_config(
     dkdv_lifetime="direct_d64",
     q3_register_class="agpr",
 )
+_D64_CAUSAL_MHA_M256_XCD_64_CONFIG = _d64_causal_config(
+    "causal_scheduled_mha",
+    256,
+    64,
+    0,
+    True,
+    64,
+    4,
+)
+_D64_CAUSAL_MHA_M256_XCD_65_CONFIG = _d64_causal_config(
+    "causal_scheduled_mha",
+    256,
+    64,
+    0,
+    True,
+    65,
+    4,
+)
+_D64_CAUSAL_MHA_M256_LINEAR_64_CONFIG = _d64_causal_config(
+    "causal_scheduled_mha",
+    256,
+    64,
+    0,
+    False,
+    64,
+    4,
+)
+_D64_CAUSAL_MHA_M256_LINEAR_128_CONFIG = _d64_causal_config(
+    "causal_scheduled_mha",
+    256,
+    64,
+    0,
+    False,
+    128,
+    4,
+)
+_D64_CAUSAL_GQA8_M256_16_CONFIG = _d64_causal_config(
+    "causal_scheduled_gqa8",
+    256,
+    128,
+    1,
+    True,
+    16,
+    4,
+    gqa_grid_mode="xcd",
+    dkdv_lifetime="direct_d64",
+    q3_register_class="agpr",
+)
+_D64_CAUSAL_GQA8_M256_64_CONFIG = _d64_causal_config(
+    "causal_scheduled_gqa8",
+    256,
+    128,
+    1,
+    True,
+    64,
+    4,
+    gqa_grid_mode="xcd",
+    dkdv_lifetime="direct_d64",
+    q3_register_class="agpr",
+)
 # Exact (Q shape, K/V shape, causal) signatures measured through the activated
 # provider on MI350X. Each entry records the dispatcher-selected tuning
 # configuration so runtime experiments cannot silently select an unmeasured
@@ -129,6 +189,19 @@ _PERFORMANCE_VALIDATED_SIGNATURES = {
     ((1, 16, 4096, 64), (1, 16, 4096, 64), False): (_D64_ROUTE, _D64_NONCAUSAL_MHA_CONFIG),
     ((1, 24, 4096, 64), (1, 24, 4096, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M192_CONFIG),
     ((4, 48, 1024, 64), (4, 6, 1024, 64), True): (_D64_ROUTE, _D64_CAUSAL_GQA8_M192_CONFIG),
+    ((2, 32, 16384, 64), (2, 32, 16384, 64), False): (_D64_ROUTE, _D64_NONCAUSAL_MHA_CONFIG),
+    ((2, 32, 16384, 64), (2, 4, 16384, 64), False): (_D64_ROUTE, _D64_NONCAUSAL_GQA8_CONFIG),
+    ((2, 32, 16384, 64), (2, 32, 16384, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M256_XCD_64_CONFIG),
+    ((2, 32, 16384, 64), (2, 4, 16384, 64), True): (_D64_ROUTE, _D64_CAUSAL_GQA8_M256_64_CONFIG),
+    ((4, 48, 4096, 64), (4, 6, 4096, 64), True): (_D64_ROUTE, _D64_CAUSAL_GQA8_M256_16_CONFIG),
+    ((4, 48, 4096, 64), (4, 6, 8192, 64), True): (_D64_ROUTE, _D64_CAUSAL_GQA8_M256_16_CONFIG),
+    ((4, 48, 4096, 64), (4, 6, 12288, 64), True): (_D64_ROUTE, _D64_CAUSAL_GQA8_M256_16_CONFIG),
+    ((4, 48, 4096, 64), (4, 6, 16384, 64), True): (_D64_ROUTE, _D64_CAUSAL_GQA8_M256_16_CONFIG),
+    ((1, 8, 16384, 64), (1, 8, 16384, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M256_XCD_64_CONFIG),
+    ((1, 8, 16640, 64), (1, 8, 16640, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M256_XCD_65_CONFIG),
+    ((1, 4, 32768, 64), (1, 4, 32768, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M256_LINEAR_128_CONFIG),
+    ((3, 3, 16384, 64), (3, 3, 16384, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M256_LINEAR_64_CONFIG),
+    ((2, 8, 16384, 64), (2, 8, 16384, 64), True): (_D64_ROUTE, _D64_CAUSAL_MHA_M256_XCD_64_CONFIG),
     ((16, 27, 200, 128), (16, 27, 200, 128), False):
     (_D128_SHORT_ROUTE, frozenset({_D128_NONCAUSAL_SPLIT_CONFIG, _D128_EXACT_CONFIG})),
     ((16, 27, 200, 128), (16, 27, 200, 128), True):
@@ -136,6 +209,9 @@ _PERFORMANCE_VALIDATED_SIGNATURES = {
     ((16, 64, 1024, 128), (16, 8, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
     ((16, 64, 2048, 128), (16, 8, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
     ((16, 64, 4096, 128), (16, 8, 4096, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
+    ((16, 16, 1024, 128), (16, 16, 1024, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
+    ((16, 16, 2048, 128), (16, 16, 2048, 128), False): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
+    ((16, 64, 1024, 128), (16, 8, 1024, 128), True): (_D128_INTERLEAVED_ROUTE, _D128_INTERLEAVED_CONFIG),
     ((32, 1, 2600, 256), (32, 1, 2600, 256), False): (_D256_ROUTE, _D256_NONCAUSAL_CONFIG),
     ((32, 1, 2600, 256), (32, 1, 2600, 256), True): (_D256_ROUTE, _D256_CAUSAL_CONFIG),
 }

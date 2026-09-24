@@ -491,8 +491,55 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
 
         # A family match is not enough: every shape needs its own provider-path
         # measurement and exact dispatch fingerprint.
-        tensors = self._performance_tensors((2, 32, 16384, 64), (2, 4, 16384, 64))
+        tensors = self._performance_tensors((2, 32, 8192, 64), (2, 4, 8192, 64))
         self.assertFalse(provider._is_performance_validated(*tensors, 0.125, False))
+
+        losing_d128 = (
+            ((16, 16, 4096, 128), (16, 16, 4096, 128), False),
+            ((16, 64, 2048, 128), (16, 8, 2048, 128), True),
+        )
+        for q_shape, k_shape, causal in losing_d128:
+            with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal):
+                tensors = self._performance_tensors(q_shape, k_shape)
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+
+    def test_expanded_measured_signatures_select_exact_dispatches(self):
+        from triton.tlx import pytorch as provider
+
+        d64_cases = (
+            ((2, 32, 16384, 64), (2, 32, 16384, 64), False),
+            ((2, 32, 16384, 64), (2, 4, 16384, 64), False),
+            ((2, 32, 16384, 64), (2, 32, 16384, 64), True),
+            ((2, 32, 16384, 64), (2, 4, 16384, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 4096, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 8192, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 12288, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 16384, 64), True),
+            ((1, 8, 16384, 64), (1, 8, 16384, 64), True),
+            ((1, 8, 16640, 64), (1, 8, 16640, 64), True),
+            ((1, 4, 32768, 64), (1, 4, 32768, 64), True),
+            ((3, 3, 16384, 64), (3, 3, 16384, 64), True),
+            ((2, 8, 16384, 64), (2, 8, 16384, 64), True),
+        )
+        for q_shape, k_shape, causal in d64_cases:
+            tensors = self._performance_tensors(q_shape, k_shape)
+            with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal), mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=self._d64_dispatch(q_shape, k_shape, causal),
+            ):
+                self.assertTrue(provider._is_performance_validated(*tensors, 0.125, causal))
+
+        d128_cases = (
+            ((16, 16, 1024, 128), (16, 16, 1024, 128), False),
+            ((16, 16, 2048, 128), (16, 16, 2048, 128), False),
+            ((16, 64, 1024, 128), (16, 8, 1024, 128), True),
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for q_shape, k_shape, causal in d128_cases:
+                with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal):
+                    tensors = self._performance_tensors(q_shape, k_shape)
+                    self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, causal))
 
     def test_d64_signature_requires_measured_dispatch_config(self):
         from triton.tlx import pytorch as provider
@@ -782,7 +829,7 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
                 attention.activate_flash_attention_impl(previous)
 
     @staticmethod
-    def _run_sdpa_grads(query, key, value, grad_out, *, causal, enable_gqa):
+    def _run_sdpa_grads(query, key, value, grad_out, *, causal, enable_gqa, attention_mask=None):
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
         q, k, v = (tensor.detach().requires_grad_(True) for tensor in (query, key, value))
@@ -791,6 +838,7 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
                 q,
                 k,
                 v,
+                attn_mask=attention_mask,
                 is_causal=causal,
                 enable_gqa=enable_gqa,
             )
@@ -803,6 +851,7 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
         *,
         causal,
         enable_gqa=False,
+        attention_mask=None,
         seed,
         max_relative_l2,
     ):
@@ -812,13 +861,29 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
         value = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
         grad_out = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
 
-        expected = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        expected = self._run_sdpa_grads(
+            query,
+            key,
+            value,
+            grad_out,
+            causal=causal,
+            enable_gqa=enable_gqa,
+            attention_mask=attention_mask,
+        )
         with self._activated(), mock.patch.object(
                 amd_fa_bwd,
                 "fa_backward",
                 wraps=amd_fa_bwd.fa_backward,
         ) as tlx_backward:
-            actual = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+            actual = self._run_sdpa_grads(
+                query,
+                key,
+                value,
+                grad_out,
+                causal=causal,
+                enable_gqa=enable_gqa,
+                attention_mask=attention_mask,
+            )
         tlx_backward.assert_called_once()
         self.assertTrue(all(tensor.is_contiguous() for tensor in tlx_backward.call_args.args[:6]))
         for result, reference in zip(actual, expected, strict=True):
@@ -870,6 +935,28 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
             max_relative_l2=5e-3,
         )
 
+    def test_sdpa_autograd_routes_expanded_d64_mha_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (3, 3, 16384, 64),
+            (3, 3, 16384, 64),
+            causal=True,
+            seed=3670,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_expanded_rectangular_d64_gqa_to_tlx(self):
+        from torch.nn.attention.bias import causal_lower_right
+
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (4, 48, 4096, 64),
+            (4, 6, 8192, 64),
+            causal=False,
+            enable_gqa=True,
+            attention_mask=causal_lower_right(4096, 8192),
+            seed=3671,
+            max_relative_l2=5e-3,
+        )
+
     def test_sdpa_autograd_routes_d128_gqa_to_tlx(self):
         for sequence_length in (1024, 2048, 4096):
             with self.subTest(sequence_length=sequence_length):
@@ -879,6 +966,25 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
                     causal=False,
                     enable_gqa=True,
                     seed=3640 + sequence_length,
+                    max_relative_l2=1e-2,
+                )
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (16, 64, 1024, 128),
+            (16, 8, 1024, 128),
+            causal=True,
+            enable_gqa=True,
+            seed=3672,
+            max_relative_l2=1e-2,
+        )
+
+    def test_sdpa_autograd_routes_expanded_d128_mha_to_tlx(self):
+        for sequence_length in (1024, 2048):
+            with self.subTest(sequence_length=sequence_length):
+                self._assert_sdpa_autograd_routes_to_tlx(
+                    (16, 16, sequence_length, 128),
+                    (16, 16, sequence_length, 128),
+                    causal=False,
+                    seed=3673 + sequence_length,
                     max_relative_l2=1e-2,
                 )
 

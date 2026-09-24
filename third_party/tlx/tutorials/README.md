@@ -28,6 +28,14 @@ losing members of the same kernel families fall back. For short D128
 1.15x non-causal and 1.35x causal. The exact-D128 opt-in improves it by 1.34x
 and 1.39x, respectively. Both measured routes are eligible; unmeasured
 persistent experiments and register-allocation overrides fall back.
+The measured expansion also enables 13 dense D64 signatures from the long
+MHA/GQA and rectangular-GQA kernels, with forward-plus-backward speedups of
+1.10x--1.59x over PyTorch's CK/AITER path, plus three interleaved D128
+signatures: non-causal MHA at N=1024/2048 (1.12x/1.07x) and causal GQA8 at
+N=1024 (1.05x). Neighboring D128 shapes that did not clear the performance
+gate remain on the native provider. For causal rectangular attention, use
+PyTorch's `causal_lower_right(SQ, SKV)` bias; plain `is_causal=True` rejects
+unequal sequence lengths before reaching FlashAttention.
 
 ## Adaptive FlashAttention
 
