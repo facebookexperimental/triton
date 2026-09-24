@@ -30,12 +30,12 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import amdgc_hazard_repair
 from triton.backends.amd import compiler as amd_compiler
-from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
+from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
-from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _validate_cluster_inputs as _validate_amd_fa_cluster_inputs,
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
 )
