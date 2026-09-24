@@ -1,5 +1,43 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_multicast_missing_member(%a: !tt.tensordesc<64x64xf16>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, %mask: i32) {
+    // expected-error @+1 {{requires one multicast mask per member}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_multicast_outside_cluster(%a: !tt.tensordesc<64x64xf16>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
+    %mask = arith.constant 16 : i32
+    // expected-error @+1 {{multicast mask names a CTA outside the cluster}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask, %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 8 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_multicast_too_many_recipients(%a: !tt.tensordesc<64x64xf16>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
+    %mask = arith.constant 63 : i32
+    // expected-error @+1 {{multicast masks support at most 5 recipients}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask, %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Matching padding alone does not make a transposed view TDM-compatible.
 #desc_layout = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 #view_layout = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>

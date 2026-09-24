@@ -1409,7 +1409,9 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
         member.padInterval = padded.getIntervals()[0];
         member.padAmount = padded.getPaddings()[0];
       }
-      if (targetInfo.supportsMultiCTALaunch())
+      if (!adaptor.getMulticastMasks().empty())
+        member.multicastMask = adaptor.getMulticastMasks()[i];
+      else if (targetInfo.supportsMultiCTALaunch())
         member.multicastMask = LLVM::AMD::emitCtaMulticastMask(
             rewriter, loc, ctaId, member.sharedLayout);
 

@@ -940,6 +940,16 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
              self.create<triton::nvidia_gpu::ClusterWaitOp>();
            })
+      .def("create_amd_cluster_barrier",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::ClusterBarrierArriveOp>();
+             self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
+      .def("create_amd_cluster_cta_rank",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<ROCDL::ClusterWorkgroupIdXOp>(
+                 self.getBuilder().getI32Type());
+           })
       .def("create_fence_mbarrier_init_cluster",
            [](TritonOpBuilder &self) -> void {
              self.create<ttng::FenceMBarrierInitReleaseClusterOp>();
@@ -1089,14 +1099,16 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_async_tdm_fused_copy_global_to_local",
           [](TritonOpBuilder &self, std::vector<Value> descs,
              std::vector<Value> dests, std::vector<int32_t> warpUsedHints,
-             tt::CacheModifier cacheModifier) -> mlir::Value {
+             tt::CacheModifier cacheModifier,
+             std::vector<Value> multicastMasks) -> mlir::Value {
             auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
             auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
             return self.create<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
-                tokenType, descs, dests, hints, cacheModifier);
+                tokenType, descs, dests, multicastMasks, hints, cacheModifier);
           },
           py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
-          py::arg("cacheModifier") = tt::CacheModifier::NONE)
+          py::arg("cacheModifier") = tt::CacheModifier::NONE,
+          py::arg("multicastMasks") = std::vector<Value>{})
       .def(
           "create_async_tdm_copy_local_to_global",
           [](TritonOpBuilder &self, Value desc, Value src,

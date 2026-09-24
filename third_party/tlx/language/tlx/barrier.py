@@ -20,7 +20,20 @@ def _make_mbarrier_layout_handle(_semantic):
 
 @tl.builtin
 def cluster_barrier(_semantic=None):
-    _semantic.builder.create_cluster_barrier()
+    """Synchronize all threads in all CTAs of the cluster.
+
+    On AMD, rendezvous within each workgroup before signaling the cluster so
+    remote TDM input refills cannot overtake another wave's local LDS reads.
+    All participating CTAs must execute the same sequence of barriers.
+    """
+    if _semantic.builder.options.backend_name == "hip":
+        options = _semantic.builder.options
+        cluster_size = (options.ctas_per_cga or (options.num_ctas, 1, 1))[0]
+        _semantic.builder.create_workgroup_barrier()
+        if cluster_size > 1:
+            _semantic.builder.create_amd_cluster_barrier()
+    else:
+        _semantic.builder.create_cluster_barrier()
 
 
 @tl.builtin

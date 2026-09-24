@@ -9,8 +9,6 @@ its correctness and compile tests, and a regular-shape benchmark sweep.
   kernel, tests, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with process isolation and CSV
   output.
-- `grouped_gemm_experiments.py`: opt-in cluster multicast and WMMA operand
-  reuse transformations for hardware experiments.
 
 ## Data Layout
 
@@ -196,10 +194,10 @@ kernel and configuration.
 
 The sweep defaults to `256x256x128`, depth 2, and the within-group hybrid with
 cross-tile prefetch and TDM output stores enabled for every shape. It uses
-`--cluster-size 4 --cluster-sync refill` with multicast enabled and operand
-reuse disabled. XCD remapping defaults to `chunked`.
+four-workgroup input multicast, with cluster synchronization before input
+refills. XCD remapping defaults to `chunked`.
 
-Use `--cluster-size 1` to disable clustering. Combine it with
+Use `--cluster-size 1` for ordinary workgroups. Combine it with
 `--no-cross-tile-prefetch` to compare the alias-C schedule, `--xcd-remap none`
 to disable remapping, or `--auto-config` to let the kernel's general cost
 model select the configuration, including whether to use cross-tile prefetch.
@@ -224,55 +222,50 @@ python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
   --case 1,4096,4096,4096
 ```
 
-## Cluster and Operand Reuse Options
+## Cluster multicast
 
-Cluster multicast and WMMA operand-cache reuse are available for hardware
-comparison. The benchmark sweep defaults to four-workgroup multicast with
-refill-only synchronization. Operand reuse remains opt-in and disabled by
-default.
+`--cluster-size 2` shares B within a workgroup pair. `--cluster-size 4`
+shares A and B across a logical two-by-two output region. Each recipient
+issues the matching TDM request, allowing hardware to multicast the inputs.
+`--no-cluster-multicast` keeps the cluster synchronization but loads each
+workgroup's inputs independently, providing a comparison control.
 
-`--cluster-size 2` shares B within each workgroup pair. `--cluster-size 4`
-shares A and B across a logical two-by-two output region. Use
-`--no-cluster-multicast` with either size for a synchronization-only control.
-`--cluster-sync all` uses conservative cluster rendezvous at all handoffs;
-`--cluster-sync refill` limits them to handoffs preceding input refills,
-retaining local synchronization for data readiness and output staging.
-`--num-programs` continues to count physical workgroups.
+The kernel expresses recipient masks on `tlx.async_amd_descriptor_load_fused`
+and uses `tlx.cluster_barrier()` before refilling an input slot. The barrier
+first synchronizes local waves, then arrives and waits at the AMD cluster
+barrier so a remote refill cannot overwrite data another workgroup still reads.
+The masks and barriers lower through the compiler's AMD TDM and synchronization
+operations. Compilation uses the ordinary JIT cache and launch path.
+Each input mask selects two recipients, within gfx1250's limit of five.
 
-Cluster experiments require the square hybrid defaults: `256x256x128`, depth
-two, `group_m=4`, cross-tile prefetch enabled, dedicated C staging and L2
-prefetch disabled, and chunked remapping with eight logical XCDs and chunk
-size two. Groups must have equal, nonzero M divisible by 1024; N must be
-divisible by 512. The program count must be divisible by 16 and divide each
-group's output tile count. Set `--num-programs` explicitly when the device CU
-count does not satisfy those conditions. Automatic configuration selection
-is unsupported for this experiment.
+The launch uses `ctas_per_cga=(cluster_size, 1, 1)`, with one independent
+program per workgroup and one-CTA tensor layouts. The grid and `num_programs`
+count physical workgroups; the HIP launcher handles conversion to cluster
+counts and checks grid divisibility.
 
-`--operand-reuse` sets WMMA reuse hints only when consecutive instructions
-use the same physical source registers and the preceding result does not
-overwrite them. It can be used independently or together with multicast.
-Use `--benchmark-mode graph` for timing comparisons to reduce host launch
-overhead from the experimental compilation hook.
+Clustering requires `256x256x128`, depth two, `group_m=4`, cross-tile prefetch
+enabled, dedicated C staging and L2 prefetch disabled, and chunked remapping
+with eight logical XCDs and chunk size two. Groups must have equal positive
+M divisible by 1024, and N must be divisible by 512. The program count must
+be divisible by 16 and divide each group's output tile count. These conditions
+keep cluster members on the same loop and group boundaries. Set `--num-programs`
+explicitly when the device CU count does not satisfy them. Automatic
+configuration selection is unsupported with clustering.
 
 ```bash
-# Four-workgroup multicast with reduced synchronization.
+# Four-workgroup multicast.
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
-  --cluster-size 4 --cluster-sync refill --benchmark-mode graph --check
+  --cluster-size 4 --benchmark-mode graph --check
 
-# The matching synchronization-only control.
+# Matching synchronization-only control.
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
-  --cluster-size 4 --cluster-sync refill --no-cluster-multicast --benchmark-mode graph --check
+  --cluster-size 4 --no-cluster-multicast --benchmark-mode graph --check
 
-# Operand reuse on the ordinary workgroup schedule.
+# Ordinary workgroups using the same hybrid pipeline.
 python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
-  --cluster-size 1 --operand-reuse --benchmark-mode graph --check
+  --cluster-size 1 --benchmark-mode graph --check
 ```
 
-The standalone script and Python wrapper expose the same options with
-underscores, such as `--cluster_size` and `operand_reuse=True`.
-Their defaults remain `cluster_size=1`, `cluster_sync="all"`, and
-`operand_reuse=False` to support the general ragged-group path.
-These experiments use a scoped, cache-keyed compilation hook for this kernel.
-The cluster prototype edits LLVM IR and rejects unrecognized code generation;
-operand reuse is applied after register allocation. Tensor layouts, tensor
-APIs, and the ordinary compiler schedule remain unchanged.
+The Python wrapper and standalone script expose `cluster_size` and
+`cluster_multicast`, using underscores in CLI flags. They default to
+`cluster_size=1` for the general ragged-group path.

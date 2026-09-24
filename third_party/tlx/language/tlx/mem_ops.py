@@ -1706,6 +1706,7 @@ def async_amd_descriptor_load(
 def async_amd_descriptor_load_fused(
     members,
     cache_modifier: str = "",
+    multicast_masks=None,
     _semantic=None,
 ) -> tlx.async_token:
     """Emit one fused AMD TDM load for two to four members.
@@ -1715,6 +1716,15 @@ def async_amd_descriptor_load_fused(
     :func:`update_tensor_descriptor` before this operation when needed. Member
     hints must be legal, pairwise-disjoint bitmasks. All members share one
     cache modifier.
+
+    ``multicast_masks`` optionally supplies a scalar integer recipient mask
+    for each member in a ``ctas_per_cga`` cluster of independent programs.
+    Bit n selects CTA n; zero disables multicast for that member. Each mask
+    must select at most five recipients on gfx1250, including when its value
+    is computed at runtime. Each recipient must issue the same source request
+    to the same LDS offset.
+    Synchronize the cluster before overwriting a slot read by another CTA.
+    Omit the masks to infer multicast from distributed tensor layouts.
     """
     arch = _semantic.builder.options.arch
     assert is_amd_tdm_target(arch), (
@@ -1747,12 +1757,33 @@ def async_amd_descriptor_load_fused(
         dest_handles.append(dest.handle)
         warp_used_hints.append(int(warp_used_hint))
 
+    mask_handles = []
+    multicast_masks = tl._unwrap_if_constexpr(multicast_masks)
+    if multicast_masks is not None:
+        if len(multicast_masks) != len(members):
+            raise ValueError("fused TDM requires one multicast mask per member")
+        options = _semantic.builder.options
+        if options.num_ctas != 1:
+            raise ValueError("explicit multicast masks require num_ctas=1 and ctas_per_cga")
+        cluster_size = (options.ctas_per_cga or (1, 1, 1))[0]
+        for mask in multicast_masks:
+            mask = tl._unwrap_if_constexpr(mask)
+            if isinstance(mask, int) and not 0 <= mask < (1 << cluster_size):
+                raise ValueError("multicast mask names a CTA outside the cluster")
+            if isinstance(mask, int) and mask.bit_count() > 5:
+                raise ValueError("multicast masks support at most 5 recipients")
+            mask = _semantic.to_tensor(mask)
+            if mask.type.is_block() or not mask.dtype.is_int():
+                raise TypeError("multicast masks must be scalar integers")
+            mask_handles.append(_semantic.cast(mask, tl.int32).handle)
+
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     token_handle = _semantic.builder.create_async_tdm_fused_copy_global_to_local(
         desc_handles,
         dest_handles,
         warp_used_hints,
         cache,
+        mask_handles,
     )
     return tlx.async_token(token_handle)
 

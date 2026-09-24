@@ -36,6 +36,7 @@ def _async_amd_desc_load_fused_kernel(
     output_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
+    MULTICAST_MASKS: tl.constexpr = None,
 ):
     a_desc = tl.make_tensor_descriptor(a_ptr, [M, N], [N, 1], [M, N])
     b_desc = tl.make_tensor_descriptor(b_ptr, [M, N], [N, 1], [M, N])
@@ -48,7 +49,7 @@ def _async_amd_desc_load_fused_kernel(
     token = tlx.async_amd_descriptor_load_fused([
         (a_desc, a_smem, 0b0011),
         (b_desc, b_smem, 0b1100),
-    ])
+    ], multicast_masks=MULTICAST_MASKS)
     tlx.async_amd_descriptor_wait(tokens=[token])
     result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
     offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
@@ -557,91 +558,65 @@ test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch = _gfx1250_grouped.test_groupe
 test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm_xcd_remap_gfx1250
 
 
-@pytest.mark.parametrize("cluster_size,cluster_sync", [(1, "all"), (2, "all"), (4, "all"), (4, "refill")])
-@pytest.mark.parametrize("group_size", [1, 2])
-def test_grouped_gemm_experiments_codegen(cluster_size, cluster_sync, group_size):
-    import re
-    from triton import knobs
+@pytest.mark.parametrize("cluster_size,masks,message", [
+    (4, (-1, 3), "outside the cluster"),
+    (4, (16, 3), "outside the cluster"),
+    (4, (3, ), "one multicast mask per member"),
+    (4, (1.5, 3), "scalar integers"),
+    (8, (63, 3), "at most 5 recipients"),
+])
+def test_tdm_fused_multicast_invalid_masks(cluster_size, masks, message):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
-    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import experimental_codegen
-
-    src = ASTSource(
-        _gfx1250_grouped.grouped_gemm_tdm_kernel,
-        signature=_gfx1250_grouped._grouped_gemm_tdm_compile_signature(),
-        constexprs=dict(NUM_PROGRAMS=32, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
-                        L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2,
-                        NUM_XCDS=8, XCD_CHUNK=2, K=1024, group_size=group_size),
-        attrs=_gfx1250_grouped._grouped_gemm_tdm_compile_attrs(),
-    )
-    target = GPUTarget("hip", "gfx1250", 32)
-    options = dict(num_warps=4, waves_per_eu=1)
-    original_hook = knobs.runtime.add_stages_inspection_hook
-    with experimental_codegen(cluster_size=cluster_size, cluster_sync=cluster_sync):
-        control = triton.compile(src, target=target, options=options)
-    with experimental_codegen(cluster_size=cluster_size, cluster_sync=cluster_sync, operand_reuse=True):
-        reused = triton.compile(src, target=target, options=options)
-    assert knobs.runtime.add_stages_inspection_hook is original_hook
-    assert reused.metadata.num_ctas == control.metadata.num_ctas == cluster_size
-    assert '"amdgpu-cluster-dims"="' + str(cluster_size) + ',1,1"' in reused.asm["llir"]
-    assert reused.metadata.global_scratch_size == 0
-    assert reused.metadata.shared <= 320 * 1024
-    assert reused.asm["ttgir"] == control.asm["ttgir"]
-    assert "matrix_a_reuse" in reused.asm["amdgcn"] or "matrix_b_reuse" in reused.asm["amdgcn"]
-    assert re.sub(r" matrix_[ab]_reuse", "", reused.asm["amdgcn"]) == control.asm["amdgcn"]
-    if cluster_size > 1:
-        assert "call void @llvm.amdgcn.s.cluster.barrier()" in reused.asm["llir"]
-        assert "%cluster_desc_" in reused.asm["llir"]
-    else:
-        assert "call void @llvm.amdgcn.s.cluster.barrier()" not in reused.asm["llir"]
-    # Switching back must recover the ordinary cached kernel and launch size.
-    default = triton.compile(src, target=target, options=options)
-    assert default.metadata.num_ctas == 1
-    assert default.asm["ttgir"] == control.asm["ttgir"]
-    assert "matrix_a_reuse" not in default.asm["amdgcn"]
-    assert "matrix_b_reuse" not in default.asm["amdgcn"]
+    from triton.compiler.errors import CompilationError
+    source = ASTSource(_async_amd_desc_load_fused_kernel,
+                       signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr":
+                                  "*fp16"}, constexprs={"M": 64, "N": 64, "MULTICAST_MASKS": masks})
+    with pytest.raises(CompilationError, match=message):
+        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4,
+                                                                                    ctas_per_cga=(cluster_size, 1, 1)))
 
 
-def test_grouped_gemm_operand_reuse_register_hazards():
-    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import _reuse_adjacent_wmma
-
-    lines = [
-        "v_wmma_f32_16x16x32_f16 v[0:7], v[16:23], v[24:31], v[0:7]",
-        "v_wmma_f32_16x16x32_f16 v[8:15], v[16:23], v[24:31], v[8:15]",
-        "s_set_vgpr_msb 1",
-        "v_wmma_f32_16x16x32_f16 v[16:23], v[16:23], v[24:31], v[16:23]",
-        "v_wmma_f32_16x16x32_f16 v[0:7], v[16:23], v[24:31], v[0:7]",
-        "next_block:",
-        "v_wmma_f32_16x16x32_f16 v[8:15], v[16:23], v[24:31], v[8:15]",
-    ]
-    output = _reuse_adjacent_wmma("\n".join(lines) + "\n").splitlines()
-    assert output[1] == lines[1] + " matrix_a_reuse matrix_b_reuse"
-    assert output[4] == lines[4] + " matrix_b_reuse"
-    for index in (0, 2, 3, 5, 6):
-        assert output[index] == lines[index]
-    # Equal encoded register numbers in different physical banks do not
-    # overlap; debug directives do not break instruction adjacency.
-    banked = (
-        "v_wmma_f32_16x16x32_f16 v[16:23] /*v[272:279]*/, v[16:23] /*v[528:535]*/, v[24:31], v[16:23] /*v[272:279]*/\n"
-        ".loc 1 1 1\n"
-        "v_wmma_f32_16x16x32_f16 v[0:7] /*v[256:263]*/, v[16:23] /*v[528:535]*/, v[24:31], v[0:7] /*v[256:263]*/\n")
-    assert _reuse_adjacent_wmma(banked).endswith(" matrix_a_reuse matrix_b_reuse\n")
-
-
-def test_grouped_gemm_experiments_restore_cache_on_error():
-    from types import SimpleNamespace
+@pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
     from triton import knobs
-    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import experimental_codegen
 
-    jit_kernel = SimpleNamespace(c_cache=True)
-    previous_hook = knobs.runtime.add_stages_inspection_hook
-    with pytest.raises(RuntimeError, match="compile failure"):
-        with experimental_codegen(operand_reuse=True, jit_kernel=jit_kernel):
-            assert jit_kernel.c_cache is False
-            assert knobs.runtime.add_stages_inspection_hook is not previous_hook
-            raise RuntimeError("compile failure")
-    assert jit_kernel.c_cache is True
-    assert knobs.runtime.add_stages_inspection_hook is previous_hook
+    constants = dict(NUM_PROGRAMS=16, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
+                     L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2, NUM_XCDS=8,
+                     XCD_CHUNK=2, K=512, group_size=group_size, CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast)
+    source = ASTSource(
+        _gfx1250_grouped.grouped_gemm_tdm_kernel, signature={
+            k: v
+            for k, v in _gfx1250_grouped._grouped_gemm_tdm_compile_signature().items()
+            if k not in constants
+        }, constexprs=constants, attrs=_gfx1250_grouped._grouped_gemm_tdm_compile_attrs())
+    assert knobs.runtime.add_stages_inspection_hook is None
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1)))
+    assert compiled.metadata.num_ctas == 1
+    assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+    assert f'"amdgpu-cluster-dims"="{cluster_size},1,1"' in compiled.asm["llir"]
+    assert compiled.metadata.global_scratch_size == 0
+    assert compiled.metadata.shared <= 320 * 1024
+    assert ("amdg.cluster_barrier_arrive" in compiled.asm["ttgir"]) == (cluster_size > 1)
+    assert ("amdg.cluster_barrier_wait" in compiled.asm["ttgir"]) == (cluster_size > 1)
+    assert (" multicast " in compiled.asm["ttgir"]) == (multicast and cluster_size > 1)
+
+
+@pytest.mark.parametrize("dims,num_ctas,arch", [
+    ((3, 1, 1), 1, "gfx1250"),
+    ((4, 2, 1), 1, "gfx1250"),
+    ((4, 1), 1, "gfx1250"),
+    ((4, 1, 1), 2, "gfx1250"),
+    ((4, 1, 1), 1, "gfx950"),
+])
+def test_amd_independent_cluster_invalid_options(dims, num_ctas, arch):
+    from triton.backends.amd.compiler import HIPOptions
+    with pytest.raises(ValueError, match="ctas_per_cga"):
+        HIPOptions(arch=arch, num_ctas=num_ctas, ctas_per_cga=dims)
 
 
 @pytest.mark.parametrize("m_list,n,num_programs,valid", [
@@ -653,14 +628,14 @@ def test_grouped_gemm_experiments_restore_cache_on_error():
     ([4096, 4096], 4096, 24, False),
     ([4096, 4096], 4096, 48, False),
 ])
-def test_grouped_gemm_cluster_config_validation(m_list, n, num_programs, valid):
-    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import validate_cluster_config
+def test_grouped_gemm_multicast_config_validation(m_list, n, num_programs, valid):
 
     def validate():
-        validate_cluster_config(m_list, n, num_programs, block_m=256, block_n=256, block_k=128, group_m=4,
-                                tdm_pipeline_depth=2, l2_prefetch_distance=0, c_staging_mode=0,
-                                cross_tile_prefetch=True, auto_config=False, xcd_remap_mode="chunked", num_xcds=8,
-                                xcd_chunk=2)
+        _gfx1250_grouped._validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=256, block_n=256,
+                                                               block_k=128, group_m=4, tdm_pipeline_depth=2,
+                                                               l2_prefetch_distance=0, c_staging_mode=0,
+                                                               cross_tile_prefetch=True, auto_config=False,
+                                                               xcd_remap_mode="chunked", num_xcds=8, xcd_chunk=2)
 
     if valid:
         validate()
@@ -669,46 +644,41 @@ def test_grouped_gemm_cluster_config_validation(m_list, n, num_programs, valid):
             validate()
 
 
+@triton.jit
+def _amd_independent_cluster_ids(output):
+    pid = tl.program_id(0)
+    rank = tlx.cluster_cta_rank()
+    tlx.cluster_barrier()
+    tl.store(output + pid, pid * 16 + rank)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+def test_amd_independent_cluster_launch_grid_and_cache():
+    output = torch.empty((8, ), device="cuda", dtype=torch.int32)
+    pid = torch.arange(8, dtype=torch.int32)
+    # Switching cluster shapes with one JIT signature must retain physical
+    # program IDs and must not reuse a cached launch with the wrong cluster.
+    for size in (1, 4, 2, 1):
+        _amd_independent_cluster_ids[(8, )](output, ctas_per_cga=(size, 1, 1))
+        torch.testing.assert_close(output.cpu(), pid * 16 + pid % size)
+    with pytest.raises(ValueError, match="grid X must be divisible"):
+        _amd_independent_cluster_ids[(3, )](output, ctas_per_cga=(4, 1, 1))
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
 @pytest.mark.parametrize("group_size", [1, 2])
-@pytest.mark.parametrize("cluster_size,cluster_multicast,cluster_sync,operand_reuse", [
-    (1, True, "all", False),
-    (1, True, "all", True),
-    (2, False, "all", False),
-    (2, True, "all", False),
-    (4, True, "all", False),
-    (4, False, "refill", False),
-    (4, True, "refill", True),
-])
-def test_grouped_gemm_experiments_correctness(cluster_size, cluster_multicast, cluster_sync, operand_reuse, group_size):
-    # Exercise priming and multiple persistent tiles, with a group transition
-    # when present. Distinct operands catch sharing the wrong tile or group.
-    m_list, n, k = [2048] * group_size, 1024, 512
-    device = triton.runtime.driver.active.get_active_torch_device()
-    a, b, offsets, groups = _gfx1250_grouped._make_packed_ragged_m(m_list, n, k, device)
-    original_c_cache = _gfx1250_grouped.grouped_gemm_tdm_kernel.c_cache
-    out = _gfx1250_grouped.grouped_gemm_tdm(
-        a,
-        b,
-        offsets,
-        block_m=256,
-        block_n=256,
-        num_programs=16,
-        cross_tile_prefetch=True,
-        xcd_remap_mode="chunked",
-        cluster_size=cluster_size,
-        cluster_multicast=cluster_multicast,
-        cluster_sync=cluster_sync,
-        operand_reuse=operand_reuse,
-    )
-    start = 0
-    for group, m in enumerate(m_list):
-        torch.testing.assert_close(out[start:start + m], groups[group] @ b[group].T, atol=1e-2, rtol=1e-2)
-        start += m
-    assert _gfx1250_grouped.grouped_gemm_tdm_kernel.c_cache is original_c_cache
-    if cluster_size == 4 and operand_reuse:
-        # Launch defaults again with the same signature. A leaked cluster
-        # entry in the native launch cache would use the wrong physical grid.
-        ordinary = _gfx1250_grouped.grouped_gemm_tdm(a, b, offsets, block_m=256, block_n=256, num_programs=16,
-                                                     cross_tile_prefetch=True, xcd_remap_mode="chunked")
-        torch.testing.assert_close(ordinary, out, atol=0, rtol=0)
+def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size):
+    # Distinct CPU inputs detect sharing the wrong tile; two persistent tiles
+    # per program exercise ring reuse, and G=2 also exercises a group boundary.
+    torch.manual_seed(123)
+    m, n, k = 2048, 1024, 512
+    a = torch.randn((group_size * m, k), dtype=torch.float16)
+    b = torch.randn((group_size, n, k), dtype=torch.float16)
+    offsets = torch.arange(group_size + 1, dtype=torch.int32) * m
+    out = _gfx1250_grouped.grouped_gemm_tdm(a.cuda(), b.cuda(), offsets.cuda(), block_m=256, block_n=256,
+                                            num_programs=16, cross_tile_prefetch=True, xcd_remap_mode="chunked",
+                                            cluster_size=cluster_size, cluster_multicast=multicast).cpu()
+    for group in range(group_size):
+        expected = (a[group * m:(group + 1) * m].float() @ b[group].float().T).half()
+        torch.testing.assert_close(out[group * m:(group + 1) * m], expected, atol=1e-2, rtol=1e-2)

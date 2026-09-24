@@ -294,6 +294,22 @@ def _tdm_load_subtile(
 
 
 @triton.jit
+def _tdm_load_fused(a_desc, b_desc, a_view, b_view, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr):
+    if CLUSTER_SIZE > 1:
+        # Every wave must finish reading a slot before any workgroup can
+        # refill that slot through multicast into a neighbor's LDS.
+        tlx.cluster_barrier()
+    if CLUSTER_SIZE > 1 and CLUSTER_MULTICAST:
+        rank = tlx.cluster_cta_rank()
+        a_mask = 0 if CLUSTER_SIZE == 2 else 5 << (rank & 1)
+        b_mask = 3 if CLUSTER_SIZE == 2 else 3 << (rank & 2)
+        masks = [a_mask, b_mask]
+    else:
+        masks = None
+    tlx.async_amd_descriptor_load_fused([(a_desc, a_view, 3), (b_desc, b_view, 12)], multicast_masks=masks)
+
+
+@triton.jit
 def _tdm_issue_loads(
     a_desc,
     b_desc,
@@ -305,14 +321,15 @@ def _tdm_issue_loads(
     pred,
     BLOCK_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr = 1,
+    CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     slot = producer % NUM_BUFFERS
-    tlx.async_amd_descriptor_load_fused([
-        (tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False,
-                                      pred=pred), a_buf[slot], 3),
-        (tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False,
-                                      pred=pred), b_buf[slot], 12),
-    ])
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False,
+                                          pred=pred)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False,
+                                          pred=pred)
+    _tdm_load_fused(a_desc, b_desc, a_buf[slot], b_buf[slot], CLUSTER_SIZE, CLUSTER_MULTICAST)
     return producer + 1
 
 
@@ -327,14 +344,13 @@ def _tdm_issue_loads_unpredicated(
     off_n,
     BLOCK_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr = 1,
+    CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     slot = producer % NUM_BUFFERS
-    tlx.async_amd_descriptor_load_fused([
-        (tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K],
-                                      clamp_bounds=False), a_buf[slot], 3),
-        (tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K],
-                                      clamp_bounds=False), b_buf[slot], 12),
-    ])
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False)
+    _tdm_load_fused(a_desc, b_desc, a_buf[slot], b_buf[slot], CLUSTER_SIZE, CLUSTER_MULTICAST)
     return producer + 1
 
 
@@ -494,6 +510,8 @@ def grouped_gemm_tdm_kernel(
     XCD_REMAP_MODE: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr = 1,
+    CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     """Packed ragged-M grouped GEMM using gfx1250 TDM descriptor loads/stores.
 
@@ -510,6 +528,8 @@ def grouped_gemm_tdm_kernel(
     # Limit operand lifetimes and K-loop scope to keep it free of scratch spills.
     OPTIMIZE_CROSS_TILE: tl.constexpr = CROSS_TILE_PREFETCH and BLOCK_M == 256 and BLOCK_N == 256
     HYBRID_TILE_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and C_STAGING_MODE == 0
+    tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4, "cluster size must be 1, 2, or 4")
+    tl.static_assert(CLUSTER_SIZE == 1 or HYBRID_TILE_PREFETCH, "clustering requires the square within-group hybrid")
     CROSS_GROUP_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and not HYBRID_TILE_PREFETCH
     OPTIMIZE_ALIAS_C: tl.constexpr = C_STAGING_MODE == 0 and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 2
     LIMIT_DOT_LIFETIME: tl.constexpr = OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
@@ -639,6 +659,8 @@ def grouped_gemm_tdm_kernel(
                     first_off_n,
                     BLOCK_K,
                     NUM_BUFFERS,
+                    CLUSTER_SIZE,
+                    CLUSTER_MULTICAST,
                 )
                 # Fold the tile position into each fused load to shorten
                 # descriptor lifetimes. L2 prefetch retains the positioned path.
@@ -659,6 +681,8 @@ def grouped_gemm_tdm_kernel(
                     first_load_n,
                     BLOCK_K,
                     NUM_BUFFERS,
+                    CLUSTER_SIZE,
+                    CLUSTER_MULTICAST,
                 )
                 tlx.async_amd_descriptor_wait(NUM_BUFFERS - 1)
 
@@ -698,6 +722,8 @@ def grouped_gemm_tdm_kernel(
                         0,
                         BLOCK_K,
                         NUM_BUFFERS,
+                        CLUSTER_SIZE,
+                        CLUSTER_MULTICAST,
                     )
                 # With dedicated C staging, the previous C store is older than
                 # these input groups. This count-based wait retires that store
@@ -748,6 +774,8 @@ def grouped_gemm_tdm_kernel(
                             load_off_n,
                             BLOCK_K,
                             NUM_BUFFERS,
+                            CLUSTER_SIZE,
+                            CLUSTER_MULTICAST,
                         )
                         acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, i + 1, NUM_BUFFERS,
                                                                    BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
@@ -838,6 +866,8 @@ def grouped_gemm_tdm_kernel(
                         has_next,
                         BLOCK_K,
                         NUM_BUFFERS,
+                        CLUSTER_SIZE,
+                        CLUSTER_MULTICAST,
                     )
                     acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer_j + 1, NUM_BUFFERS,
                                                                BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
@@ -860,6 +890,8 @@ def grouped_gemm_tdm_kernel(
                         pred,
                         BLOCK_K,
                         NUM_BUFFERS,
+                        CLUSTER_SIZE,
+                        CLUSTER_MULTICAST,
                     )
                     # Issue first so the next producer group can overlap the
                     # final WMMA, then wait until the older consumer group is
@@ -933,6 +965,24 @@ def grouped_gemm_tdm_kernel(
     # tlx.async_amd_descriptor_wait(0)
 
 
+def _validate_grouped_gemm_cluster_config(m_list, n, num_programs, *, block_m, block_n, block_k, group_m,
+                                          tdm_pipeline_depth, l2_prefetch_distance, c_staging_mode, cross_tile_prefetch,
+                                          auto_config, xcd_remap_mode, num_xcds, xcd_chunk):
+    """Require identical cluster control flow and the tested operand-sharing map."""
+    if (block_m, block_n, block_k, group_m, tdm_pipeline_depth, l2_prefetch_distance,
+            c_staging_mode) != (256, 256, 128, 4, 2, 0, 0) or not cross_tile_prefetch or auto_config:
+        raise ValueError("clustering requires the 256x256x128 depth-2 hybrid, group_m=4, "
+                         "no L2 prefetch, and auto_config=False")
+    if (xcd_remap_mode, num_xcds, xcd_chunk) != ("chunked", 8, 2):
+        raise ValueError("clustering requires chunked XCD remapping with num_xcds=8 and xcd_chunk=2")
+    if not m_list or min(m_list) <= 0 or len(set(m_list)) != 1 or m_list[0] % (4 * block_m) or n % (2 * block_n):
+        raise ValueError("clustering requires equal nonempty groups, M divisible by 1024, and N divisible by 512")
+    tiles_per_group = (m_list[0] // block_m) * (n // block_n)
+    if num_programs % 16 or tiles_per_group % num_programs:
+        raise ValueError("clustering requires num_programs divisible by 16 and each group's tile count "
+                         "divisible by num_programs; set num_programs explicitly if necessary")
+
+
 def grouped_gemm_tdm(
     a_packed: torch.Tensor,
     b_t: torch.Tensor,
@@ -956,8 +1006,6 @@ def grouped_gemm_tdm(
     xcd_chunk: int = 2,
     cluster_size: int = 1,
     cluster_multicast: bool = True,
-    cluster_sync: str = "all",
-    operand_reuse: bool = False,
 ) -> torch.Tensor:
     """Compute packed ragged-M grouped GEMM with gfx1250 TDM.
 
@@ -975,12 +1023,10 @@ def grouped_gemm_tdm(
     groups; smaller tiles use dedicated LDS for C within each group.
     ``auto_config`` scores the validated tile seeds using saturated rate, CU
     utilization, and padding efficiency.
-    ``cluster_size=2|4`` enables an experimental cluster launch for aligned,
-    equal-sized groups using the square hybrid. ``cluster_multicast=False``
-    retains cluster synchronization as a comparison control. ``cluster_sync``
-    selects all handoffs or only input-refill handoffs. ``operand_reuse``
-    enables conservative WMMA operand-cache hints. Both experiments are off
-    by default and use a scoped, cache-keyed code-generation hook.
+    ``cluster_size=2|4`` groups independent workgroups for TDM multicast.
+    Pairs share B; four workgroups share A and B across a two-by-two tile
+    region. ``cluster_multicast=False`` keeps the same cluster synchronization
+    while each workgroup loads its own inputs.
     """
     assert a_packed.dtype == torch.float16 and b_t.dtype == torch.float16
     assert a_packed.device == b_t.device == group_offsets.device
@@ -989,8 +1035,8 @@ def grouped_gemm_tdm(
     assert group_offsets.dtype == torch.int32
     assert xcd_remap_mode in _XCD_REMAP_MODES
     assert num_xcds >= 1 and xcd_chunk >= 1
-    if cluster_size not in (1, 2, 4) or cluster_sync not in ("all", "refill"):
-        raise ValueError("cluster_size must be 1, 2, or 4; cluster_sync must be all or refill")
+    if cluster_size not in (1, 2, 4):
+        raise ValueError("cluster_size must be 1, 2, or 4")
 
     group_size, n, k = b_t.shape
     total_m, a_k = a_packed.shape
@@ -1042,27 +1088,12 @@ def grouped_gemm_tdm(
         num_programs = _active_num_cus(a_packed.device)
     num_programs = max(1, min(int(num_programs), total_tiles))
 
-    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import (
-        experimental_codegen, validate_cluster_config)
-
     if cluster_size > 1:
-        validate_cluster_config(
-            m_list,
-            n,
-            num_programs,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            group_m=group_m,
-            tdm_pipeline_depth=tdm_pipeline_depth,
-            l2_prefetch_distance=l2_prefetch_distance,
-            c_staging_mode=c_staging_mode,
-            cross_tile_prefetch=cross_tile_prefetch,
-            auto_config=auto_config,
-            xcd_remap_mode=xcd_remap_mode,
-            num_xcds=num_xcds,
-            xcd_chunk=xcd_chunk,
-        )
+        _validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n,
+                                              block_k=block_k, group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                              l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                              cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                              xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
 
     # The group count is known from B's shape. Specializing the square
     # cross-tile schedule removes unused boundary-refill state for small groups.
@@ -1070,7 +1101,7 @@ def grouped_gemm_tdm(
                          if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
 
     def run_kernel():
-        return grouped_gemm_tdm_kernel[(num_programs // cluster_size, )](
+        return grouped_gemm_tdm_kernel[(num_programs, )](
             a_packed,
             b_t,
             c_packed,
@@ -1094,20 +1125,21 @@ def grouped_gemm_tdm(
             XCD_REMAP_MODE=_XCD_REMAP_MODES[xcd_remap_mode],
             NUM_XCDS=num_xcds,
             XCD_CHUNK=xcd_chunk,
+            CLUSTER_SIZE=cluster_size,
+            CLUSTER_MULTICAST=cluster_multicast,
             num_warps=4,
             waves_per_eu=1,
+            ctas_per_cga=(cluster_size, 1, 1),
         )
 
-    with experimental_codegen(cluster_size, cluster_multicast, cluster_sync, operand_reuse,
-                              jit_kernel=grouped_gemm_tdm_kernel):
-        if benchmark == "graph":
-            ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
-            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
-        elif benchmark == "eager":
-            ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
-            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
-        else:
-            run_kernel()
+    if benchmark == "graph":
+        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
+        print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+    elif benchmark == "eager":
+        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
+        print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+    else:
+        run_kernel()
     return c_packed
 
 
@@ -1186,6 +1218,8 @@ def test_grouped_gemm_tdm_compiles_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH):
         constexprs={
             "NUM_PROGRAMS": 8,
             "BLOCK_M": BLOCK_SIZE,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
             "BLOCK_N": BLOCK_SIZE,
             "BLOCK_K": 128,
             "GROUP_M": 4,
@@ -1225,6 +1259,8 @@ def test_grouped_gemm_tdm_asymmetric_alias_compiles_gfx1250():
         constexprs={
             "NUM_PROGRAMS": 8,
             "BLOCK_M": 128,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
             "BLOCK_N": 256,
             "BLOCK_K": 128,
             "GROUP_M": 4,
@@ -1259,6 +1295,8 @@ def test_grouped_gemm_tdm_asymmetric_dedicated_c_compiles_gfx1250(BLOCK_M, BLOCK
         constexprs={
             "NUM_PROGRAMS": 4,
             "BLOCK_M": BLOCK_M,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
             "BLOCK_N": BLOCK_N,
             "BLOCK_K": 128,
             "GROUP_M": 4,
@@ -1297,6 +1335,8 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
         constexprs={
             "NUM_PROGRAMS": 32,
             "BLOCK_M": BLOCK_M,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
             "BLOCK_N": 256,
             "BLOCK_K": 128,
             "GROUP_M": 4,
@@ -1517,13 +1557,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)
     parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4), default=1,
-                        help="experimental workgroup cluster size (default: 1, disabled)")
+                        help="workgroups per multicast cluster (default: 1)")
     parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
-    parser.add_argument("--cluster_sync", choices=("all", "refill"), default="all",
-                        help="cluster rendezvous at all handoffs or only before input refills")
-    parser.add_argument("--operand_reuse", action=argparse.BooleanOptionalAction, default=False,
-                        help="experimental WMMA operand-cache reuse hints")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
@@ -1572,8 +1608,6 @@ if __name__ == "__main__":
         xcd_chunk=args.xcd_chunk,
         cluster_size=args.cluster_size,
         cluster_multicast=args.cluster_multicast,
-        cluster_sync=args.cluster_sync,
-        operand_reuse=args.operand_reuse,
         benchmark=benchmark,
         benchmark_num_iters=args.benchmark_num_iters,
     )
