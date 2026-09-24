@@ -32,23 +32,66 @@ def test_gfx942_wide_heuristic_config():
     assert config.num_stages == 2
 
 
-@pytest.mark.parametrize("space, expected_shape", [("heuristic", (819200, 1024, 192)), ("full", None)])
-def test_space_reaches_requested_autotuner(monkeypatch, space, expected_shape):
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_space_reaches_requested_autotuner(monkeypatch, space):
     from triton.tlx.ops.kernels.mm import gfx942
 
     monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: (819200, 1024, 192))
+    monkeypatch.setattr(gfx942, "_precheck_local_split_u", lambda *args: False)
 
     class AutotunerReached(Exception):
         pass
 
-    def tuned(requested_space, shape):
+    def tuned(requested_space, shape, enable_local_split_u):
         assert requested_space == space
-        assert shape == expected_shape
+        assert shape == (819200, 1024, 192)
+        assert not enable_local_split_u
         raise AutotunerReached
 
     monkeypatch.setattr(gfx942, "_tuned", tuned)
     with pytest.raises(AutotunerReached):
         gfx942._gemm(object(), object(), out=object(), space=space)
+
+
+def test_full_space_includes_shape_specific_incumbent():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    configs = gfx942._candidate_configs((2048, 10240, 25408))
+    assert len(configs) == len(gfx942.CONFIGS()) + 1
+    assert any(config.kwargs.get("SPLIT_M_128_32") for config in configs)
+
+
+@pytest.mark.parametrize("shape", [(7, 8192, 2048), (7, 2048, 4096)])
+def test_full_space_adds_local_split_u_candidate(shape):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    direct_configs = gfx942._candidate_configs(shape)
+    configs = gfx942._candidate_configs(shape, enable_local_split_u=True)
+    local_configs = [config for config in configs if config.kwargs.get("USE_LOCAL_SPLIT_U")]
+
+    assert len(configs) == len(direct_configs) + 1
+    assert len(local_configs) == 1
+    plan = gfx942._MEASURED_LOCAL_SPLIT_U_PLANS[shape]
+    assert local_configs[0].kwargs["BLOCK_M"] == plan.tile_m
+    assert local_configs[0].kwargs["BLOCK_N"] == plan.tile_n
+    assert local_configs[0].kwargs["BLOCK_K"] == plan.wave_k
+    assert local_configs[0].num_warps == plan.local_split_u
+
+
+def test_heuristic_space_launches_local_split_u_directly(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (7, 8192, 2048)
+    out = object()
+    monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: shape)
+    monkeypatch.setattr(gfx942, "_precheck_local_split_u", lambda *args: True)
+
+    def launch(a, b, out, plan):
+        assert plan == gfx942._MEASURED_LOCAL_SPLIT_U_PLANS[shape]
+        return out
+
+    monkeypatch.setattr(gfx942, "_launch_local_split_u", launch)
+    assert gfx942._gemm(object(), object(), out=out, space="heuristic") is out
 
 
 def test_unaligned_row_base_vectorizes():
