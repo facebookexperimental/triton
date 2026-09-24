@@ -326,8 +326,7 @@ struct CanonicalizeConvertFromConvert
     // Convert to the same layout is redundant unless it carries a backend
     // request that must follow the conversion surviving layout propagation.
     if (op->getResultTypes() == op->getOperandTypes()) {
-      if (op->hasAttr("tlx.rematerialize_coordinates") ||
-          op->hasAttr("tlx.rematerialize_coordinates_group"))
+      if (op->hasAttr("tlx.rematerialize_coordinates"))
         return failure();
       rewriter.replaceOp(op, op->getOperands());
       return success();
@@ -379,10 +378,20 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(local_load) -> local_load.
     if (auto sharedLoad = dyn_cast<LocalLoadOp>(arg)) {
-      // Shared_load can load to any layout so we can always fold convert into
-      // it.
+      bool outerRematerializesCoordinates =
+          op->hasAttr("tlx.rematerialize_coordinates");
+      bool loadHasRematerializationGroup =
+          sharedLoad->hasAttr("tlx.rematerialize_coordinates_group");
+      // A group names the concrete local-load operation whose coordinates are
+      // shared. Keep a separate outer boolean boundary instead of merging it
+      // into a grouped load.
+      if (loadHasRematerializationGroup && outerRematerializesCoordinates)
+        return failure();
+
+      // Shared_load can load to any layout so we can fold the conversion into
+      // it when doing so keeps the load-owned metadata semantics intact.
       // We insert at the point of the original op as there could be ops with
-      // memory side-effects between the LocalLoad op and the ConvertLayout op
+      // memory side-effects between the LocalLoad op and the ConvertLayout op.
       rewriter.setInsertionPoint(arg);
       auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
           op, op->getResult(0).getType(), sharedLoad.getSrc(),
@@ -392,6 +401,9 @@ struct CanonicalizeConvertFromConvert
       // load conservatively wait for unrelated async LDS writes.
       for (auto attr : sharedLoad->getDiscardableAttrs())
         replacement->setDiscardableAttr(attr.getName(), attr.getValue());
+      if (outerRematerializesCoordinates)
+        replacement->setAttr("tlx.rematerialize_coordinates",
+                             rewriter.getUnitAttr());
 
       return success();
     }

@@ -104,7 +104,7 @@ tt.func @test_canonicalize_convert_histogram(%arg0: tensor<256xi32, #blocked1>, 
 
 // CHECK-LABEL: @test_canonicalize_convert_local_load
 // CHECK-NOT:   ttg.barrier local
-// CHECK: %[[V:.+]] = ttg.local_load {{.*}} token %arg0
+// CHECK: %[[V:.+]] = ttg.local_load {{.*}} token %arg0 {tlx.rematerialize_coordinates, ttg.amdg.syncedViaAsyncWait = true}
 // CHECK-NEXT:  ttg.barrier local
 // CHECK-NEXT: tt.return %[[V]]
 
@@ -115,9 +115,9 @@ tt.func @test_canonicalize_convert_histogram(%arg0: tensor<256xi32, #blocked1>, 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.compute-capability" = 80} {
 tt.func @test_canonicalize_convert_local_load(%arg0: !ttg.async.token) -> tensor<256xi32, #blocked1> {
     %0 = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
-    %1 = ttg.local_load %0 token %arg0: !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %1 = ttg.local_load %0 token %arg0 {ttg.amdg.syncedViaAsyncWait = true}: !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
     ttg.barrier local
-    %2 = ttg.convert_layout %1 : tensor<256xi32, #blocked> -> tensor<256xi32, #blocked1>
+    %2 = ttg.convert_layout %1 {tlx.rematerialize_coordinates} : tensor<256xi32, #blocked> -> tensor<256xi32, #blocked1>
     tt.return %2 : tensor<256xi32, #blocked1>
 }
 }  // end module
@@ -377,4 +377,83 @@ tt.func @fold_subslice_chain() {
   // CHECK: ttg.local_store %{{.*}}, %[[SUBSLICE]]
   ttg.local_store %dummy_value, %subslice2 : tensor<8x16xf8E5M2> -> !ttg.memdesc<8x16xf8E5M2, #shared, #smem, mutable, 32x64>
   tt.return
+}
+
+// -----
+
+// A rematerialization group names a concrete local_load. Folding a plain
+// convert into that load must preserve both the group and other load metadata.
+// CHECK-LABEL: @test_canonicalize_grouped_local_load
+// CHECK-NOT: ttg.convert_layout
+// CHECK: %[[GROUPED:.*]] = ttg.local_load %{{.*}} {tlx.rematerialize_coordinates_group = 7 : i32, ttg.amdg.syncedViaAsyncWait = true}
+// CHECK: tt.return %[[GROUPED]]
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.compute-capability" = 80} {
+  tt.func @test_canonicalize_grouped_local_load() -> tensor<256xi32, #blocked1> {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 7 : i32, ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %2 = ttg.convert_layout %1 : tensor<256xi32, #blocked> -> tensor<256xi32, #blocked1>
+    tt.return %2 : tensor<256xi32, #blocked1>
+  }
+}
+
+// -----
+
+// A boolean rematerialization request outside a grouped load remains a
+// separate conversion so the group continues to identify the original load.
+// CHECK-LABEL: @test_canonicalize_grouped_local_load_outer_boolean
+// CHECK: %[[GROUPED:.*]] = ttg.local_load %{{.*}} {tlx.rematerialize_coordinates_group = 7 : i32}
+// CHECK-NEXT: %[[REMAT:.*]] = ttg.convert_layout %[[GROUPED]] {tlx.rematerialize_coordinates}
+// CHECK: tt.return %[[REMAT]]
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.compute-capability" = 80} {
+  tt.func @test_canonicalize_grouped_local_load_outer_boolean() -> tensor<256xi32, #blocked1> {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %2 = ttg.convert_layout %1 {tlx.rematerialize_coordinates} : tensor<256xi32, #blocked> -> tensor<256xi32, #blocked1>
+    tt.return %2 : tensor<256xi32, #blocked1>
+  }
+}
+
+// -----
+
+// Group metadata is invalid on a conversion and does not keep an identity
+// conversion alive. The boolean form remains a semantic backend boundary.
+// CHECK-LABEL: @test_canonicalize_identity_rematerialization_metadata
+// CHECK-NOT: tlx.rematerialize_coordinates_group
+// CHECK: %[[BOOLEAN:.*]] = ttg.convert_layout %arg0 {tlx.rematerialize_coordinates}
+// CHECK: tt.return %arg0, %[[BOOLEAN]]
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.compute-capability" = 80} {
+  tt.func @test_canonicalize_identity_rematerialization_metadata(
+      %src: tensor<256xi32, #blocked>) -> (tensor<256xi32, #blocked>, tensor<256xi32, #blocked>) {
+    %group = ttg.convert_layout %src {tlx.rematerialize_coordinates_group = 7 : i32} : tensor<256xi32, #blocked> -> tensor<256xi32, #blocked>
+    %boolean = ttg.convert_layout %src {tlx.rematerialize_coordinates} : tensor<256xi32, #blocked> -> tensor<256xi32, #blocked>
+    tt.return %group, %boolean : tensor<256xi32, #blocked>, tensor<256xi32, #blocked>
+  }
+}
+
+// -----
+
+// Folding nested conversions ORs the boolean request from both boundaries.
+// CHECK-LABEL: @test_canonicalize_nested_convert_boolean
+// CHECK: %[[REMAT:.*]] = ttg.convert_layout %arg0 {tlx.rematerialize_coordinates}
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.return %[[REMAT]]
+#blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.compute-capability" = 80} {
+  tt.func @test_canonicalize_nested_convert_boolean(
+      %src: tensor<256xi32, #blocked0>) -> tensor<256xi32, #blocked2> {
+    %inner = ttg.convert_layout %src {tlx.rematerialize_coordinates} : tensor<256xi32, #blocked0> -> tensor<256xi32, #blocked1>
+    %outer = ttg.convert_layout %inner : tensor<256xi32, #blocked1> -> tensor<256xi32, #blocked2>
+    tt.return %outer : tensor<256xi32, #blocked2>
+  }
 }
