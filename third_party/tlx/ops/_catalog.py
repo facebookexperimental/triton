@@ -126,7 +126,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws_pipelined_pingpong",
         impl="triton.tlx.ops.kernels.flash_attn.sm90:flash_attn",
         dtypes=_FP16,
-        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
         supports_backward=True,
     ),
