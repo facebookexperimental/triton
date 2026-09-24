@@ -1,6 +1,6 @@
 """BF16 Flash-Attention backward kernel families for AMD gfx950.
 
-The public ``fa_backward`` wrapper supports dense contiguous BF16 D64 tensors
+The internal ``fa_backward`` wrapper supports dense contiguous BF16 D64 tensors
 with matching positive batches, Hkv dividing Hq, SQ/SKV at least 256 and
 aligned to 64, SQ no larger than 8,388,544, and SKV no larger than 16,777,152.
 Bottom-right causal D64 additionally requires SQ no larger than SKV. It also
@@ -9,7 +9,7 @@ and the causal/non-causal HipKittens GQA contract: positive B/Hq/Hkv, Hkv dividi
 Hq, N a positive multiple of 256, and D=128. ``GQA_BENCHMARK_SHAPES`` records
 the published performance series; it is not an allow-list. Other
 configurations are not part of this submission's public contract yet. Focused
-D64 tests live in ``python/test/unit/language/test_tlx_amd_fa_bwd.py``.
+tests live in ``python/test/unit/language/test_tlx_amd_fa_bwd_gfx950.py``.
 
 Each launch topology has one stable JIT entry.  Constexpr schedule kwargs pick
 the tuned split, persistent, staged, peeled, or hoisted implementation behind
@@ -28,12 +28,10 @@ import dataclasses
 import math
 import os
 
-import pytest
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_hip_cdna4
 
 # Public equal-head correctness contract for this submission. The kernels
 # have broader D128 and D256 families internally, but these are the two MHA
@@ -70,132 +68,6 @@ def _is_supported_gqa_shape(shape):
 # register pressure for the D-sliced kernels and prevents the accumulator from
 # using AGPRs on gfx950.
 _CDNA4_MATRIX_INSTR_NONKDIM = 16
-
-
-@dataclasses.dataclass(frozen=True)
-class ReferenceCase:
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    o: torch.Tensor
-    do: torch.Tensor
-    lse: torch.Tensor
-    sm_scale: float
-    causal: bool
-    grads: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-
-    @property
-    def kernel_args(self):
-        return (self.q, self.k, self.v, self.o, self.do, self.lse, self.sm_scale, self.causal)
-
-
-def make_reference_case(shape, causal, seed=0):
-    """Build forward state and FP32 autograd gradients one head at a time."""
-    batch, heads, n_ctx, head_dim = shape
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(seed)
-    q = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
-    do = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
-    o = torch.empty_like(q)
-    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
-    dq = torch.empty(shape, device="cuda", dtype=torch.float32)
-    dk = torch.empty_like(dq)
-    dv = torch.empty_like(dq)
-    sm_scale = head_dim**-0.5
-    causal_mask = None
-    if causal:
-        causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1)
-
-    for batch_idx in range(batch):
-        for head_idx in range(heads):
-            q_ref = q[batch_idx, head_idx].float().requires_grad_(True)
-            k_ref = k[batch_idx, head_idx].float().requires_grad_(True)
-            v_ref = v[batch_idx, head_idx].float().requires_grad_(True)
-            scores = torch.matmul(q_ref, k_ref.transpose(0, 1)) * sm_scale
-            if causal_mask is not None:
-                scores = scores.masked_fill(causal_mask, float("-inf"))
-            lse_ref = torch.logsumexp(scores, dim=-1)
-            probs = torch.softmax(scores, dim=-1)
-            o_ref = torch.matmul(probs, v_ref)
-            grads = torch.autograd.grad(o_ref, (q_ref, k_ref, v_ref), do[batch_idx, head_idx].float())
-            with torch.no_grad():
-                o[batch_idx, head_idx].copy_(o_ref)
-                lse[batch_idx, head_idx].copy_(lse_ref)
-                dq[batch_idx, head_idx].copy_(grads[0])
-                dk[batch_idx, head_idx].copy_(grads[1])
-                dv[batch_idx, head_idx].copy_(grads[2])
-
-    return ReferenceCase(q, k, v, o, do, lse, sm_scale, causal, (dq, dk, dv))
-
-
-def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), causal=False, seed=0, sm_scale=None):
-    """Build a small supported GQA reference case."""
-    assert _is_supported_gqa_shape(shape)
-    batch, hq, hk, n_ctx, head_dim = shape
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(seed)
-    q = torch.randn(
-        (batch, hq, n_ctx, head_dim),
-        generator=generator,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    k = torch.randn(
-        (batch, hk, n_ctx, head_dim),
-        generator=generator,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    v = torch.randn(
-        (batch, hk, n_ctx, head_dim),
-        generator=generator,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    do = torch.randn(
-        q.shape,
-        generator=generator,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    o = torch.empty_like(q)
-    lse = torch.empty(q.shape[:-1], device="cuda", dtype=torch.float32)
-    dq = torch.empty_like(q, dtype=torch.float32)
-    dk = torch.zeros_like(k, dtype=torch.float32)
-    dv = torch.zeros_like(v, dtype=torch.float32)
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-    causal_mask = None
-    if causal:
-        causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1)
-    group_size = hq // hk
-
-    for batch_idx in range(batch):
-        for query_head in range(hq):
-            kv_head = query_head // group_size
-            q_ref = q[batch_idx, query_head].float().requires_grad_(True)
-            k_ref = k[batch_idx, kv_head].float().requires_grad_(True)
-            v_ref = v[batch_idx, kv_head].float().requires_grad_(True)
-            scores = torch.matmul(q_ref, k_ref.transpose(0, 1)) * sm_scale
-            if causal_mask is not None:
-                scores = scores.masked_fill(causal_mask, float("-inf"))
-            lse_ref = torch.logsumexp(scores, dim=-1)
-            o_ref = torch.matmul(torch.softmax(scores, dim=-1), v_ref)
-            grads = torch.autograd.grad(
-                o_ref,
-                (q_ref, k_ref, v_ref),
-                do[batch_idx, query_head].float(),
-            )
-            with torch.no_grad():
-                o[batch_idx, query_head].copy_(o_ref)
-                lse[batch_idx, query_head].copy_(lse_ref)
-                dq[batch_idx, query_head].copy_(grads[0])
-                dk[batch_idx, kv_head].add_(grads[1])
-                dv[batch_idx, kv_head].add_(grads[2])
-
-    return ReferenceCase(q, k, v, o, do, lse, sm_scale, causal, (dq, dk, dv))
 
 
 @triton.jit
@@ -4650,9 +4522,12 @@ def _run_bwd_d256(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, poison_
     )
 
 
-def _validate_inputs(q, k, v, o, do, lse):
+def fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal):
+    """Return why ``fa_backward`` cannot run, or ``None`` when supported."""
     if q.ndim != 4 or k.ndim != 4:
-        raise ValueError("q and k must be rank-4 B,H,N,D tensors")
+        return "q and k must be rank-4 B,H,N,D tensors"
+    if q.device.type != "cuda":
+        return "q must be a CUDA tensor"
     batch, hq, n_ctx, head_dim = q.shape
     k_batch, hk, k_ctx, k_dim = k.shape
     mha_shape = (tuple(q.shape) in SUPPORTED_SHAPES and tuple(k.shape) == tuple(q.shape))
@@ -4665,41 +4540,59 @@ def _validate_inputs(q, k, v, o, do, lse):
     d64_shape = _is_supported_d64_shape(tuple(q.shape), tuple(k.shape))
     if not (mha_shape or gqa_shape or d64_shape):
         supported = sorted(SUPPORTED_SHAPES)
-        raise ValueError(f"supported MHA shapes are {supported}; supported GQA shapes "
-                         f"satisfy {_GQA_SHAPE_CONSTRAINT}; {_D64_SHAPE_CONSTRAINT}; "
-                         f"got q={tuple(q.shape)}, "
-                         f"k={tuple(k.shape)}")
+        return (f"supported MHA shapes are {supported}; supported GQA shapes "
+                f"satisfy {_GQA_SHAPE_CONSTRAINT}; {_D64_SHAPE_CONSTRAINT}; "
+                f"got q={tuple(q.shape)}, k={tuple(k.shape)}")
     q_tensors = {"q": q, "o": o, "do": do}
     for name, tensor in q_tensors.items():
         if tensor.device != q.device or tensor.shape != q.shape:
-            raise ValueError(f"{name} must match q shape and device")
+            return f"{name} must match q shape and device"
         if tensor.dtype is not torch.bfloat16:
-            raise ValueError(f"{name} must be bfloat16")
+            return f"{name} must be bfloat16"
         if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous B,H,N,D")
+            return f"{name} must be contiguous B,H,N,D"
     kv_tensors = {"k": k, "v": v}
     for name, tensor in kv_tensors.items():
         if tensor.device != q.device or tensor.shape != k.shape:
-            raise ValueError(f"{name} must match k shape and q device")
+            return f"{name} must match k shape and q device"
         if tensor.dtype is not torch.bfloat16:
-            raise ValueError(f"{name} must be bfloat16")
+            return f"{name} must be bfloat16"
         if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous B,H,N,D")
+            return f"{name} must be contiguous B,H,N,D"
     if lse.device != q.device or lse.shape != q.shape[:-1] or lse.dtype is not torch.float32:
-        raise ValueError("lse must be FP32 B,H,N on the same device")
+        return "lse must be FP32 B,H,N on the same device"
     if not lse.is_contiguous():
-        raise ValueError("lse must be contiguous B,H,N")
-    arch = torch.cuda.get_device_properties(q.device).gcnArchName
+        return "lse must be contiguous B,H,N"
+    try:
+        arch = torch.cuda.get_device_properties(q.device).gcnArchName
+    except (AssertionError, AttributeError, RuntimeError) as error:
+        return f"unable to query AMD GPU architecture: {error}"
     if not arch.startswith("gfx950"):
-        raise ValueError(f"gfx950 is required, got {arch}")
+        return f"gfx950 is required, got {arch}"
+    try:
+        scale = float(sm_scale)
+    except (TypeError, ValueError, OverflowError):
+        return "sm_scale must be a finite number"
+    if not math.isfinite(scale):
+        return "sm_scale must be a finite number"
+    if d64_shape:
+        if scale == 0.0:
+            return "D64 sm_scale must be finite and nonzero"
+        if causal and q.shape[2] > k.shape[2]:
+            return "D64 bottom-right causal attention requires SQ <= SKV"
+    return None
+
+
+def _validate_inputs(q, k, v, o, do, lse, sm_scale, causal):
+    error = fa_backward_support_error(q, k, v, o, do, lse, sm_scale, causal)
+    if error is not None:
+        raise ValueError(error)
 
 
 def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
-    _validate_inputs(q, k, v, o, do, lse)
+    _validate_inputs(q, k, v, o, do, lse, sm_scale, causal)
     if _is_supported_d64_shape(tuple(q.shape), tuple(k.shape)):
         sm_scale = _validate_d64_sm_scale(sm_scale)
-        if causal and q.shape[2] > k.shape[2]:
-            raise ValueError("D64 bottom-right causal attention requires SQ <= SKV")
         dispatch = _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal)
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
@@ -4767,464 +4660,6 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
         _run_bwd_d256(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal)
         return dq, dk, dv
     raise NotImplementedError("TLX Flash-Attention backward kernels are not implemented yet")
-
-
-@pytest.mark.parametrize("shape", sorted(SUPPORTED_SHAPES))
-def test_fa_backward_rejects_fp16(shape):
-    q = torch.empty(shape, device="cuda", dtype=torch.float16)
-    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="bfloat16"):
-        fa_backward(q, q, q, q, q, lse, 0.5, False)
-
-
-def test_fa_backward_rejects_unsupported_shape():
-    shape = (1, 1, 128, 128)
-    q = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="supported MHA shapes"):
-        fa_backward(q, q, q, q, q, lse, 0.5, False)
-
-
-def test_fa_backward_rejects_noncontiguous_lse():
-    batch, heads, n_ctx, head_dim = (16, 27, 200, 128)
-    q = torch.empty((batch, heads, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty((batch, heads, 2 * n_ctx), device="cuda", dtype=torch.float32)[..., ::2]
-    assert lse.shape == (batch, heads, n_ctx)
-    assert not lse.is_contiguous()
-    with pytest.raises(ValueError, match="contiguous"):
-        fa_backward(q, q, q, q, q, lse, 0.5, False)
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_make_reference_case(causal):
-    case = make_reference_case((1, 1, 8, 4), causal, seed=17)
-    assert case.q.shape == (1, 1, 8, 4)
-    assert case.o.dtype is torch.bfloat16
-    assert case.lse.dtype is torch.float32
-    assert len(case.grads) == 3
-    for grad in case.grads:
-        assert grad.shape == case.q.shape
-        assert torch.isfinite(grad).all()
-    assert case.kernel_args == (
-        case.q,
-        case.k,
-        case.v,
-        case.o,
-        case.do,
-        case.lse,
-        case.sm_scale,
-        causal,
-    )
-
-
-@pytest.mark.parametrize("shape", sorted(SUPPORTED_SHAPES))
-def test_bwd_preprocess(shape):
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(0)
-    o = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
-    do = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
-    actual = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
-    _run_bwd_preprocess(o, do, actual)
-    expected = (o.float() * do.float()).sum(-1)
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
-
-
-def _snr_db(actual, expected):
-    signal = torch.linalg.vector_norm(expected.float())
-    noise = torch.linalg.vector_norm(actual.float() - expected.float())
-    return 20.0 * torch.log10(signal / noise).item()
-
-
-def test_d128_dispatch_uses_one_entry_per_launch_topology(monkeypatch):
-    """Schedule kwargs select implementations behind stable topology entries."""
-    monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-
-    full = _select_d128_dispatch((16, 27, 200, 128), False)
-    causal = _select_d128_dispatch((16, 27, 200, 128), True)
-    assert full.entry is causal.entry is _attn_bwd_dkdv_d128_split_kernel
-    assert (full.pipelined, full.rectangular, full.block_m, full.block_n) == (True, True, 32, 64)
-    assert (causal.pipelined, causal.rectangular, causal.block_m, causal.block_n) == (False, False, 32, 32)
-
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "1")
-    exact = _select_d128_dispatch((16, 27, 200, 128), False)
-    assert exact.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
-    assert exact.exact and not exact.pipelined
-
-
-def test_gqa_benchmark_shapes_match_hk_series():
-    assert GQA_BENCHMARK_SHAPES == {
-        (16, 64, 8, 1024, 128),
-        (16, 64, 8, 2048, 128),
-        (16, 64, 8, 4096, 128),
-        (16, 64, 8, 8192, 128),
-        (15, 64, 8, 16384, 128),
-    }
-
-
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (1, 1, 1, 256, 128),
-        (2, 6, 3, 512, 128),
-        (1, 6, 2, 768, 128),
-        (1, 12, 3, 1024, 128),
-        (16, 64, 8, 4096, 128),
-        (1, 520, 8, 16384, 128),
-    ],
-)
-def test_gqa_supported_shape_constraint(shape):
-    assert _is_supported_gqa_shape(shape)
-
-
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (0, 8, 1, 256, 128),
-        (1, 0, 1, 256, 128),
-        (1, 8, 0, 256, 128),
-        (1, 27, 8, 256, 128),
-        (1, 8, 1, 128, 128),
-        (1, 8, 1, 200, 128),
-        (1, 8, 1, 384, 128),
-        (1, 8, 1, 256, 256),
-    ],
-)
-def test_gqa_unsupported_shape_constraint(shape):
-    assert not _is_supported_gqa_shape(shape)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize(
-    "shape",
-    [
-        pytest.param((1, 1, 1, 256, 128), id="group1"),
-        pytest.param((1, 1, 1, 512, 128), id="group1-two-kv-tiles"),
-        pytest.param((1, 2, 1, 256, 128), id="group2"),
-        pytest.param((2, 3, 1, 256, 128), id="group3-batch2"),
-        pytest.param((1, 4, 1, 256, 128), id="group4"),
-        pytest.param((1, 8, 1, 512, 128), id="group8-two-kv-tiles"),
-        pytest.param((2, 2, 2, 512, 128), id="mha-hkv2-batch2"),
-        pytest.param((1, 4, 2, 256, 128), id="group2-hkv2"),
-        pytest.param((2, 6, 3, 512, 128), id="group2-hkv3-batch2"),
-    ],
-)
-def test_gqa_supported_shapes_end_to_end_gfx950(shape, causal):
-    case = _make_gqa_smoke_case(shape, causal=causal, seed=17)
-    actual_grads = fa_backward(*case.kernel_args)
-    assert len(actual_grads) == len(case.grads) == 3
-    for actual, expected in zip(actual_grads, case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_gqa_causal_zero_scale_gfx950():
-    case = _make_gqa_smoke_case((1, 2, 1, 256, 128), causal=True, seed=17, sm_scale=0.0)
-    actual_grads = fa_backward(*case.kernel_args)
-    assert len(actual_grads) == len(case.grads) == 3
-    for actual, expected in zip(actual_grads, case.grads):
-        assert torch.isfinite(actual).all()
-        if torch.count_nonzero(expected).item() == 0:
-            assert torch.count_nonzero(actual).item() == 0
-        else:
-            assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_gqa_causal_negative_scale_gfx950():
-    case = _make_gqa_smoke_case((1, 2, 1, 256, 128), causal=True, seed=17, sm_scale=-0.125)
-    actual_grads = fa_backward(*case.kernel_args)
-    assert len(actual_grads) == len(case.grads) == 3
-    for actual, expected in zip(actual_grads, case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize(
-    ("q_shape", "k_shape"),
-    [
-        pytest.param((1, 6, 256, 128), (1, 4, 256, 128), id="nondivisible-heads"),
-        pytest.param((1, 8, 384, 128), (1, 1, 384, 128), id="nonmultiple-sequence"),
-    ],
-)
-def test_fa_backward_rejects_unsupported_gqa_signature(q_shape, k_shape, causal):
-    q = torch.empty(q_shape, device="cuda", dtype=torch.bfloat16)
-    k = torch.empty(k_shape, device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty(q_shape[:-1], device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="supported GQA shapes"):
-        fa_backward(q, k, k, q, q, lse, 0.5, causal)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize(
-    "shape",
-    [
-        pytest.param((1, 1, 1, 256, 128), id="group1"),
-        pytest.param((1, 1, 1, 512, 128), id="group1-two-kv-tiles"),
-        pytest.param((1, 64, 8, 4096, 128), id="group8"),
-    ],
-)
-def test_gqa_main_kernel_is_spill_free_gfx950(shape, causal, monkeypatch):
-    batch, hq, hk, n_ctx, head_dim = shape
-    q = torch.zeros((batch, hq, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.zeros((batch, hk, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
-    lse = torch.zeros((batch, hq, n_ctx), device="cuda", dtype=torch.float32)
-    delta = torch.zeros_like(lse)
-    dq_acc = torch.zeros_like(q)
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(k)
-
-    monkeypatch.delenv(_D128_REVERSE_LOCAL_ENV, raising=False)
-    monkeypatch.delenv(_D128_SINK_INSTS_ENV, raising=False)
-    monkeypatch.delenv(_D128_REGCLASS_PRIORITY_ENV, raising=False)
-    _attn_bwd_dkdv_dq_d128_gqa_kernel.device_caches.clear()
-    _run_bwd_d128_gqa(
-        q,
-        k,
-        k,
-        q,
-        lse,
-        delta,
-        dq_acc,
-        dq,
-        dk,
-        dv,
-        head_dim**-0.5,
-        causal,
-    )
-    device = torch.cuda.current_device()
-    compiled = tuple(_attn_bwd_dkdv_dq_d128_gqa_kernel.device_caches[device][0].values())
-    assert len(compiled) == 1
-    assert compiled[0].n_spills == 0
-    ttir = compiled[0].asm["ttir"]
-    amdgcn = compiled[0].asm["amdgcn"]
-    assert "scratch_load" not in amdgcn
-    assert "scratch_store" not in amdgcn
-    expected_mask_regions = 2 if causal else 0
-    assert ttir.count("amdg.rematerialized_range 0 to 256 identity 32") == expected_mask_regions
-    assert ttir.count("amdg.rematerialized_range 0 to 16 identity 33") == expected_mask_regions
-    if causal:
-        llir = compiled[0].asm["llir"]
-        for mask in ("0x1fff01ff", "0x3fff03ff", "0x7fff07ff", "0xffff0fff"):
-            assert mask not in amdgcn
-        assert "~{vcc},~{scc}" not in llir
-
-
-def test_d256_dispatch_uses_one_configured_producer_entry(monkeypatch):
-    monkeypatch.delenv("TLX_FA_BWD_FORCE_STAGED", raising=False)
-    full = _select_d256_dispatch(False)
-    causal = _select_d256_dispatch(True)
-    assert full.entry is causal.entry is _attn_bwd_dkdv_d256_producer_kernel
-    assert (full.staged, full.pipelined, full.num_warps) == (False, True, 4)
-    assert (causal.staged, causal.pipelined, causal.num_warps) == (False, False, 4)
-
-    monkeypatch.setenv("TLX_FA_BWD_FORCE_STAGED", "1")
-    staged = _select_d256_dispatch(True)
-    assert staged.entry is _attn_bwd_dkdv_d256_producer_kernel
-    assert (staged.staged, staged.pipelined, staged.num_warps) == (True, False, 2)
-
-
-def test_d128_short_causal_uses_gluon_matching_tile_config():
-    """Short D128 mirrors Gluon's causal and full-attention tile schedules."""
-    assert _select_d128_dkdv_config((16, 27, 200, 128), True) == (32, 32, 2)
-    assert _select_d128_dkdv_config((16, 27, 200, 128), False) == (32, 64, 4)
-    assert _select_d128_dkdv_config((16, 27, 260, 128), True) == (64, 64, 4)
-
-
-def test_d128_persistent_short_is_exact_experiment_shape():
-    assert _d128_persistent_short_supported((16, 27, 200, 128), False)
-    assert _d128_persistent_short_supported((16, 27, 200, 128), True)
-    assert not _d128_persistent_short_supported((1, 1, 128, 128), False)
-    assert not _d128_persistent_short_supported((1, 1, 256, 128), False)
-    assert not _d128_persistent_short_supported((1, 1, 260, 128), False)
-    assert not _d128_persistent_short_supported((32, 1, 2600, 256), False)
-    assert not _d128_persistent_short_supported((1, 1, 200, 64), False)
-
-
-def test_d128_legacy_disable_flags_are_ignored(monkeypatch):
-    """Legacy disable knobs must not override the explicit exact opt-in."""
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    monkeypatch.setenv("TLX_FA_BWD_DISABLE_PERSISTENT_D128", "1")
-    monkeypatch.setenv("TLX_FA_BWD_DISABLE_EXACT_D128", "1")
-    dispatch = _select_d128_dispatch((16, 27, 200, 128), False)
-    assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
-    assert dispatch.exact
-
-
-def test_d128_exact_layout_dispatch_is_narrow_and_opt_in(monkeypatch):
-    """The exact MFMA/LDS port is opt-in and narrow to the validated target."""
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    for causal in (False, True):
-        dispatch = _select_d128_dispatch((16, 27, 200, 128), causal)
-        assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
-        assert dispatch.exact
-    assert _select_d128_dispatch((16, 27, 201, 128), False).entry is _attn_bwd_dkdv_d128_split_kernel
-    assert not _select_d128_dispatch((32, 1, 2600, 256), False).exact
-
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
-    assert _select_d128_dispatch((16, 27, 200, 128), False).entry is _attn_bwd_dkdv_d128_split_kernel
-
-
-def test_d128_persistent_short_dispatches_combined_when_opted_in(monkeypatch):
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
-    monkeypatch.setenv(_D128_PERSISTENT_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    dispatch = _select_d128_dispatch((16, 27, 200, 128), False)
-    assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
-    assert not dispatch.exact and not dispatch.pipelined
-    assert dispatch.num_warps == 8
-
-
-def test_d128_persistent_pipeline_dispatches_only_when_opted_in(monkeypatch):
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
-    monkeypatch.setenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    dispatch = _select_d128_dispatch((16, 27, 200, 128), False)
-    assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
-    assert not dispatch.exact and dispatch.pipelined
-    assert dispatch.num_warps == 4
-
-
-def test_d128_persistent_short_keeps_non_target_shapes_on_split(monkeypatch):
-    monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
-    monkeypatch.setenv(_D128_PERSISTENT_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    assert _select_d128_dispatch((1, 1, 128, 128), False).entry is _attn_bwd_dkdv_d128_split_kernel
-    assert _select_d128_dispatch((1, 1, 256, 128), True).entry is _attn_bwd_dkdv_d128_split_kernel
-
-
-def test_shape_specific_launch_configs():
-    assert _d128_num_warps(False) == 2
-    assert _d128_num_warps(True) == 4
-    assert _matrix_instr_nonkdim() == 16
-
-
-def test_d128_regalloc_options_are_independent_opt_ins(monkeypatch):
-    for name in (_D128_SINK_INSTS_ENV, _D128_REGCLASS_PRIORITY_ENV, _D128_REVERSE_LOCAL_ENV):
-        monkeypatch.delenv(name, raising=False)
-    assert _d128_regalloc_options() == {
-        "sink_insts_to_avoid_spills": False,
-        "regclass_priority_trumps_globalness": False,
-        "reverse_local_assignment": False,
-    }
-
-    monkeypatch.setenv(_D128_SINK_INSTS_ENV, "1")
-    monkeypatch.setenv(_D128_REGCLASS_PRIORITY_ENV, "1")
-    assert _d128_regalloc_options() == {
-        "sink_insts_to_avoid_spills": True,
-        "regclass_priority_trumps_globalness": True,
-        "reverse_local_assignment": False,
-    }
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_fa_backward_b16_h27_n200_d128(causal, monkeypatch):
-    monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    case = make_reference_case((16, 27, 200, 128), causal)
-    dq, dk, dv = fa_backward(*case.kernel_args)
-    for actual, expected in zip((dq, dk, dv), case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-def test_fa_backward_b16_h27_n200_d128_causal_repeated(monkeypatch):
-    """Repeat the causal BM32 tail to catch stale or non-finite LDS rows."""
-    monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    case = make_reference_case((16, 27, 200, 128), True)
-    for _ in range(5):
-        dq, dk, dv = fa_backward(*case.kernel_args)
-        for actual, expected in zip((dq, dk, dv), case.grads):
-            assert torch.isfinite(actual).all()
-            assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_fa_backward_b16_h27_n200_d128_persistent_opt_in(causal, monkeypatch):
-    # Keep the fused port exercised without allowing its experimental status to
-    # change the production/default correctness test above.
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
-    monkeypatch.setenv(_D128_PERSISTENT_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    case = make_reference_case((16, 27, 200, 128), causal)
-    dq, dk, dv = fa_backward(*case.kernel_args)
-    for actual, expected in zip((dq, dk, dv), case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_fa_backward_b16_h27_n200_d128_persistent_pipeline_opt_in(causal, monkeypatch):
-    # The async Q/dO ring has separate ownership and wait-group ordering from
-    # the older combined experiment, so keep a BF16 runtime check for both
-    # masks in addition to the selector-only coverage.
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
-    monkeypatch.setenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    case = make_reference_case((16, 27, 200, 128), causal)
-    dq, dk, dv = fa_backward(*case.kernel_args)
-    for actual, expected in zip((dq, dk, dv), case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_fa_backward_b16_h27_n200_d128_exact_layout(causal, monkeypatch):
-    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "1")
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    case = make_reference_case((16, 27, 200, 128), causal)
-    dq, dk, dv = fa_backward(*case.kernel_args)
-    for actual, expected in zip((dq, dk, dv), case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_fa_backward_b32_h1_n2600_d256(causal):
-    case = make_reference_case((32, 1, 2600, 256), causal)
-    dq, dk, dv = fa_backward(*case.kernel_args)
-    for actual, expected in zip((dq, dk, dv), case.grads):
-        assert torch.isfinite(actual).all()
-        assert _snr_db(actual, expected) >= 40.0
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_d256_scratch_producer_covers_consumer(causal):
-    case = make_reference_case((32, 1, 2600, 256), causal)
-    dq = torch.empty_like(case.q)
-    dk = torch.empty_like(case.k)
-    dv = torch.empty_like(case.v)
-    delta = torch.empty(case.q.shape[:-1], device=case.q.device, dtype=torch.float32)
-    _run_bwd_preprocess(case.o, case.do, delta)
-    _run_bwd_d256(
-        case.q,
-        case.k,
-        case.v,
-        case.do,
-        case.lse,
-        delta,
-        dq,
-        dk,
-        dv,
-        case.sm_scale,
-        causal,
-        poison_scratch=True,
-    )
-    assert torch.isfinite(dq).all()
 
 
 _D64_VALIDATION_SHAPES = {

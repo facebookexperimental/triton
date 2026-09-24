@@ -1,5 +1,32 @@
 # AMD attention tutorials
 
+## PyTorch dense FlashAttention backward
+
+The packaged gfx950 BF16 backward kernels live in
+[`../ops/kernels/flash_attn/gfx950_bwd.py`](../ops/kernels/flash_attn/gfx950_bwd.py).
+Current PyTorch releases can opt into them through the FlashAttention provider
+registry:
+
+```python
+import triton.tlx.pytorch
+from torch.nn.attention import activate_flash_attention_impl
+
+activate_flash_attention_impl("TLX_GFX950_BWD")
+```
+
+Activation is process-global and replaces only
+`aten::_scaled_dot_product_flash_attention_backward`; PyTorch continues to run
+the forward kernel. The provider selects TLX only for correctness- and
+performance-validated dense BF16 gfx950 routes. Dropout, deterministic mode,
+unsupported layouts/shapes, and routes without a measured advantage call the
+CUDA kernel captured at activation. Use
+`torch.nn.attention.restore_flash_attention_impl()` to remove the override.
+The automatic set is an exact allow-list of D64, D128, and D256 signatures that
+won through the activated provider on MI350X; unmeasured shapes and known
+losing members of the same kernel families fall back. The supported short D128
+`(16, 27, 200, 128)` kernel remains internal and is not selected here because
+its backward-only gain does not cover end-to-end dispatcher overhead.
+
 ## Adaptive FlashAttention
 
 [`amd_fa_adaptive.py`](amd_fa_adaptive.py) implements adaptive and
