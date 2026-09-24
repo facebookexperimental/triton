@@ -1195,6 +1195,7 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   CastOpAxisInfoVisitor<arith::TruncIOp>,
                   CastOpAxisInfoVisitor<triton::gpu::ConvertLayoutOp>,
                   CastOpAxisInfoVisitor<triton::gpu::RequireLayoutOp>,
+                  CastOpAxisInfoVisitor<triton::gpu::ReleaseLayoutOp>,
                   CastOpAxisInfoVisitor<triton::BitcastOp>,
                   CastOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();
   visitors.append<MakeRangeOpAxisInfoVisitor>();
