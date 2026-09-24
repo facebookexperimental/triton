@@ -4,7 +4,7 @@ from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
 
-from ..hw.target import is_rocm
+from ..hw.target import current_target, is_rocm
 
 # TLX kernel .jinja templates ship alongside this module (packaged as buck
 # resources of the triton beta python library), so load them from here rather
@@ -169,7 +169,9 @@ def append_tlx(templates, op_name, kernel_inputs):
 
     if is_rocm():
         return _append_tlx_amd(templates, op_name)
-    return _append_tlx_nvidia(templates, op_name, kernel_inputs)
+    if current_target().is_blackwell:
+        return _append_tlx_blackwell(templates, op_name)
+    return templates
 
 
 def _append_tlx_amd(templates, op_name):
@@ -221,21 +223,8 @@ def _append_tlx_amd(templates, op_name):
     return templates
 
 
-def _append_tlx_nvidia(templates, op_name, kernel_inputs):
-    # This helper runs for every NVIDIA target, but only plain mm is eligible
-    # for its Blackwell-specific TLX template. Other operations keep their choices.
+def _append_tlx_blackwell(templates, op_name):
     if op_name != "mm":
-        return templates
-    # Same gate tuned_mm applies to its own TMA templates, and not optional
-    # here: TMATemplateConfigMixin derives A_ROW_MAJOR/B_ROW_MAJOR eagerly and
-    # *raises* on an operand host-side TMA cannot describe, so the candidate
-    # cannot decline itself later. Any size-1 dim is such an operand -- a
-    # [M, 1] grad and its transpose both carry stride [1, 1], leaving no dim
-    # uniquely stride-1.
-    from torch._inductor.utils import can_use_tma
-
-    mat1, mat2 = kernel_inputs.mat1mat2()
-    if not can_use_tma(mat1, mat2, add_guards=True):
         return templates
     templates.append(blackwell_gemm_ws_template)
     return templates

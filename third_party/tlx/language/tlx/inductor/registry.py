@@ -22,7 +22,6 @@ import contextlib
 import dataclasses
 import logging
 import os
-from collections.abc import Sequence
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -39,7 +38,7 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_num_sms
+from torch._inductor.utils import get_num_sms, tma_inner_dim
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -922,10 +921,14 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
     @staticmethod
     def _row_major_kwargs(kernel_inputs: KernelInputs) -> dict[str, bool]:
         """A_ROW_MAJOR/B_ROW_MAJOR, spelled exactly as TMATemplateConfigMixin does."""
-        mat1, mat2 = kernel_inputs.mat1mat2()
+        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
+        strides = kernel_inputs.strides_hinted()
+        mat1_inner_dim = tma_inner_dim(strides[kernel_inputs._mat1_idx])
+        mat2_inner_dim = tma_inner_dim(strides[kernel_inputs._mat2_idx])
+        assert mat1_inner_dim is not None and mat2_inner_dim is not None
         return {
-            "A_ROW_MAJOR": not mat1.layout.is_transposed(),
-            "B_ROW_MAJOR": not mat2.layout.is_transposed(),
+            "A_ROW_MAJOR": mat1_inner_dim == 1,
+            "B_ROW_MAJOR": mat2_inner_dim == 1,
         }
 
     @staticmethod
@@ -934,13 +937,9 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             return False
 
         strides = kernel_inputs.strides_hinted()
-
-        def is_dense_2d(s: Sequence[int]) -> bool:
-            return s[-1] == 1 or s[-2] == 1
-
-        return not (
-            is_dense_2d(strides[kernel_inputs._mat1_idx])
-            and is_dense_2d(strides[kernel_inputs._mat2_idx])
+        return any(
+            tma_inner_dim(strides[idx]) is None
+            for idx in (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
         )
 
     def _get_template_configs_impl(
