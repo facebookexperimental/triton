@@ -235,3 +235,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#uniform_blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#uniform_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#uniform_mma_row = #ttg.slice<{dim = 1, parent = #uniform_mma}>
+#uniform_blocked_pinned = #tlx.no_verify_layout<#tlx.user_layout<#uniform_blocked>>
+#uniform_mma_pinned = #tlx.no_verify_layout<#tlx.user_layout<#uniform_mma_row>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @wave_uniform_allows_cross_lane_conversion
+  // CHECK-SAME: %[[PRED:.*]]: i1, %[[INIT:.*]]: tensor<128xf32, #{{.*}}>
+  tt.func @wave_uniform_allows_cross_lane_conversion(
+      %predicate: i1, %init: tensor<128xf32, #uniform_blocked_pinned>)
+      -> tensor<128xf32, #uniform_blocked_pinned> {
+    // CHECK: %[[RESULT:.*]] = ttg.warp_predicate %[[PRED]](%[[INIT]]) {
+    // CHECK: %[[NATIVE:.*]] = ttg.convert_layout %[[INIT]] : tensor<128xf32, #{{.*}}> -> tensor<128xf32, #{{.*}}>
+    // CHECK: %[[NEXT:.*]] = arith.addf %[[NATIVE]], %[[NATIVE]]
+    // CHECK: %[[RESTORED:.*]] = ttg.convert_layout %[[NEXT]] : tensor<128xf32, #{{.*}}> -> tensor<128xf32, #{{.*}}>
+    // CHECK: ttg.predicate_yield %[[RESTORED]]
+    %result = ttg.warp_predicate %predicate (%init) {
+      %native = ttg.convert_layout %init : tensor<128xf32, #uniform_blocked_pinned> -> tensor<128xf32, #uniform_mma_pinned>
+      %next = arith.addf %native, %native : tensor<128xf32, #uniform_mma_pinned>
+      %restored = ttg.convert_layout %next : tensor<128xf32, #uniform_mma_pinned> -> tensor<128xf32, #uniform_blocked_pinned>
+      ttg.predicate_yield %restored : tensor<128xf32, #uniform_blocked_pinned>
+    } {wave_uniform} : (i1, tensor<128xf32, #uniform_blocked_pinned>) -> tensor<128xf32, #uniform_blocked_pinned>
+    // CHECK: } {wave_uniform} :
+    // CHECK: tt.return %[[RESULT]]
+    tt.return %result : tensor<128xf32, #uniform_blocked_pinned>
+  }
+}
