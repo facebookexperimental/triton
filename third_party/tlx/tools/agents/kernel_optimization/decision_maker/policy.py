@@ -329,6 +329,27 @@ def _full_space_parity_score(
     return gate_progress, minimum, aggregate
 
 
+def is_acceptable_winner(
+    candidate: PerformanceSummary,
+    baseline: PerformanceSummary,
+    budget: OptimizationBudget,
+    cases: tuple[InputCase, ...],
+    target: KernelTarget | None,
+) -> bool:
+    """Accept a strict winner or a measurable progressive parity improvement."""
+    if is_promotable(candidate, budget, cases, target):
+        return True
+    if (
+        target is None
+        or not _is_full_space_parity_policy(target)
+        or not target.evaluation_policy.get("progressive")
+    ):
+        return False
+    candidate_score = _full_space_parity_score(candidate, cases, target)
+    baseline_score = _full_space_parity_score(baseline, cases, target)
+    return candidate_score is not None and baseline_score is not None and candidate_score > baseline_score
+
+
 def _promotion_failure_diagnostics(
     summary: PerformanceSummary,
     budget: OptimizationBudget,

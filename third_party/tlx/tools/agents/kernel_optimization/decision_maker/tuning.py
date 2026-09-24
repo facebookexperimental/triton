@@ -26,7 +26,7 @@ from ..policy_source import frozen_source_digest
 from .benchmark_environment import canonical_arch
 from .harness import SubprocessHarness
 from .orchestrator import KernelOptimizer
-from .policy import is_promotable
+from .policy import is_acceptable_winner
 from .vcs import commit_winner, prepare_auto_commit
 
 MIN_REASONABLE_FULL_CONFIGS = 16
@@ -117,12 +117,7 @@ def run_tuning(
         repository_root=repository,
     )
     heuristic_result = KernelOptimizer(provider).optimize(heuristic_request)
-    passed = is_promotable(
-        heuristic_result.final,
-        heuristic_budget,
-        cases,
-        heuristic_target,
-    )
+    passed = heuristic_result.success
     final_source = heuristic_result.best_kernel
     output_dir.joinpath("best_kernel.py").write_text(final_source)
     summary = _parity_summary(heuristic_result.final, cases)
@@ -152,20 +147,24 @@ def run_tuning(
                 heuristic_budget.benchmark_repetitions,
                 profile=False,
             )
-            if not is_promotable(
-                    performance,
-                    heuristic_budget,
-                    cases,
-                    heuristic_target,
+            if not is_acceptable_winner(
+                performance,
+                heuristic_result.baseline,
+                heuristic_budget,
+                cases,
+                heuristic_target,
             ):
-                raise RuntimeError("merged heuristic policy failed parity validation")
+                raise RuntimeError(
+                    "merged heuristic policy neither met parity targets nor improved the baseline"
+                )
 
         commit_result = commit_winner(
             snapshot,
             final_source,
             commit_message or f"Tune {arch} {op} heuristic policy",
-            (f"TLX agent measured suite {suite} and required at least 98% weighted "
-             "full-space parity with no stable case below 95%."),
+            (f"TLX agent measured suite {suite} and selected a decision tree that "
+             "improved full-space parity over the incumbent; the absolute target is "
+             "98% weighted parity with no stable case below 95%."),
             validate_committed_source=validate,
         )
 

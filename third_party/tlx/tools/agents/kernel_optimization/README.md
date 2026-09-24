@@ -26,8 +26,9 @@ Production `tlx.ops` tuning treats the existing full search space as a fixed
 oracle and edits only `heuristic_config`. The Decision Maker requires one
 heuristic config, at least 98% weighted geometric-mean parity with full, and at
 least 95% parity on every stable production shape. Intermediate decision trees
-that improve the parity objective become the parent for the next round without
-being committed; only a tree that passes all parity gates can reach VCS.
+that improve the parity objective become the parent for the next round. If the
+run ends before reaching the absolute targets, a revalidated tree that still
+improves the incumbent is retained and may reach VCS instead of being discarded.
 
 The Decision Maker establishes the authoritative baseline and supplies normalized evidence
 to the Optimizer.

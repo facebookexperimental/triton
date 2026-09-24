@@ -31,6 +31,7 @@ from ..contracts import (
 from .policy import (
     ABLATION_KINDS,
     evaluated_decision,
+    is_acceptable_winner,
     is_correct_and_stable as _is_correct_and_stable,
     is_near_threshold as _is_near_threshold,
     is_promotable,
@@ -536,8 +537,12 @@ class DecisionMaker:
 
         if best_experiment_id != "baseline" and (
             final_profiler_diagnostics
-            or not is_promotable(
-                final_profile, request.budget, request.cases, request.target
+            or not is_acceptable_winner(
+                final_profile,
+                baseline,
+                request.budget,
+                request.cases,
+                request.target,
             )
         ):
             if final_profiler_diagnostics:

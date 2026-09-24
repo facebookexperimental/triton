@@ -1751,7 +1751,7 @@ class KernelOptimizerTest(unittest.TestCase):
             performance(0.80),
             performance(0.90),
             performance(0.99),
-            performance(0.99),
+            performance(0.97),
         ]
         with (
             tempfile.TemporaryDirectory() as directory,
