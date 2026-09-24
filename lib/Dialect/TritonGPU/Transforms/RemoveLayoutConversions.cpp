@@ -1026,13 +1026,46 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       return false;
     };
 
+    auto layoutsAreEquivalent = [](RankedTensorType type, Attribute lhs,
+                                   Attribute rhs, bool ignoreRegisterOrder) {
+      auto withEncoding = [&](Attribute encoding) {
+        return type.cloneWithEncoding(getEffectiveLayoutEncoding(encoding));
+      };
+      LinearLayout lhsLayout = toLinearLayout(withEncoding(lhs));
+      LinearLayout rhsLayout = toLinearLayout(withEncoding(rhs));
+      return ignoreRegisterOrder
+                 ? isLayoutEquivalentIgnoringRegisterOrder(lhsLayout, rhsLayout)
+                 : lhsLayout == rhsLayout;
+    };
+
+    auto recordForcedEncoding =
+        [&](Value value, Attribute requested, bool ignoreRegisterOrder,
+            bool preferRequested = false) -> FailureOr<Attribute> {
+      auto type = cast<RankedTensorType>(value.getType());
+      requested = getEffectiveLayoutEncoding(requested);
+      if (auto forced = forcedWarpPredicateEncodings.find(value);
+          forced != forcedWarpPredicateEncodings.end()) {
+        if (!layoutsAreEquivalent(type, forced->second, requested,
+                                  ignoreRegisterOrder))
+          return failure();
+        Attribute selected = preferRequested ? requested : forced->second;
+        forced->second = selected;
+        layouts[value].insertEncoding(selected);
+        return selected;
+      }
+      forcedWarpPredicateEncodings[value] = requested;
+      layouts[value].insertEncoding(requested);
+      return requested;
+    };
+
     bool conflict = false;
-    std::function<LogicalResult(Value, Attribute)> forceSlice =
-        [&](Value value, Attribute encoding) -> LogicalResult {
+    std::function<FailureOr<Attribute>(Value, Attribute, bool)> forceSlice =
+        [&](Value value, Attribute requested,
+            bool ignoreRegisterOrder) -> FailureOr<Attribute> {
       auto valueType = dyn_cast<RankedTensorType>(value.getType());
       if (!valueType)
-        return success();
-      encoding = getEffectiveLayoutEncoding(encoding);
+        return requested;
+      requested = getEffectiveLayoutEncoding(requested);
 
       // Captures outside restricted EXEC are island inputs: rewriting can
       // materialize their encoding before entering the region. A predicate
@@ -1042,63 +1075,170 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       bool captured = valueRegion != &predicateOp.getRegion() &&
                       !predicateOp.getRegion().isAncestor(valueRegion);
       if (captured && !isInsideRestrictedExec(value))
-        return success();
+        return requested;
 
-      if (auto it = forcedWarpPredicateEncodings.find(value);
-          it != forcedWarpPredicateEncodings.end())
-        return hasSameEffectiveLayout(it->second, encoding) ? success()
-                                                            : failure();
-      if (containsPinnedEncoding(valueType.getEncoding()) &&
-          !hasSameEffectiveLayout(valueType.getEncoding(), encoding))
-        return failure();
-      if (hasSameEffectiveLayout(valueType.getEncoding(), encoding)) {
-        forcedWarpPredicateEncodings[value] = encoding;
-        layouts[value].insertEncoding(encoding);
-        return success();
+      Attribute current = getEffectiveLayoutEncoding(valueType.getEncoding());
+      Operation *producer = value.getDefiningOp();
+      if (producer && producer->hasAttr("tlx.preserve_layout")) {
+        if (!layoutsAreEquivalent(valueType, current, requested,
+                                  /*ignoreRegisterOrder=*/false))
+          return failure();
+        return recordForcedEncoding(value, current,
+                                    /*ignoreRegisterOrder=*/false,
+                                    /*preferRequested=*/true);
       }
 
+      Attribute candidate = requested;
+      if (ignoreRegisterOrder &&
+          layoutsAreEquivalent(valueType, current, requested,
+                               /*ignoreRegisterOrder=*/true))
+        candidate = current;
+      bool pinned = containsPinnedEncoding(valueType.getEncoding());
+      if (pinned) {
+        if (!layoutsAreEquivalent(valueType, current, requested,
+                                  ignoreRegisterOrder))
+          return failure();
+        candidate = current;
+      }
+
+      FailureOr<Attribute> selected =
+          recordForcedEncoding(value, candidate, ignoreRegisterOrder,
+                               /*preferRequested=*/pinned);
+      if (failed(selected))
+        return failure();
+      if (layoutsAreEquivalent(valueType, current, *selected,
+                               /*ignoreRegisterOrder=*/false))
+        return *selected;
+
       // Only recurse through operations whose layout can be changed without
-      // changing ownership-sensitive semantics.  Structural and shape-changing
+      // changing ownership-sensitive semantics. Structural and shape-changing
       // operations stop the slice unless they already have the selected layout.
-      Operation *producer = value.getDefiningOp();
+      auto convert = dyn_cast_or_null<ConvertLayoutOp>(producer);
       bool transparent =
           producer && (producer->hasTrait<OpTrait::Elementwise>() ||
-                       isa<ConvertLayoutOp>(producer));
-      if (producer && !transparent &&
-          !hasSameEffectiveLayout(valueType.getEncoding(), encoding))
+                       (convert && !isPinnedConvertLayout(convert)));
+      if (producer && !transparent)
         return failure();
-
-      forcedWarpPredicateEncodings[value] = encoding;
-      layouts[value].insertEncoding(encoding);
       if (!transparent)
-        return success();
+        return *selected;
 
-      Attribute operandEncoding = inferSrcEncoding(producer, encoding);
+      Attribute operandEncoding =
+          convert ? *selected : inferSrcEncoding(producer, *selected);
       if (!operandEncoding)
         return failure();
-      for (Value operand : producer->getOperands())
-        if (isa<RankedTensorType>(operand.getType()) &&
-            failed(forceSlice(operand, operandEncoding)))
+      for (Value operand : producer->getOperands()) {
+        if (!isa<RankedTensorType>(operand.getType()))
+          continue;
+        if (failed(forceSlice(operand, operandEncoding, ignoreRegisterOrder)))
           return failure();
+      }
+      return *selected;
+    };
+
+    if (predicateEncoding) {
+      FailureOr<Attribute> selectedPredicate =
+          forceSlice(predicateOp.getPredicate(), *predicateEncoding,
+                     /*ignoreRegisterOrder=*/true);
+      if (failed(selectedPredicate))
+        conflict = true;
+      else
+        predicateEncoding = *selectedPredicate;
+    }
+
+    auto synchronizeBoundaryEncoding =
+        [&](Value value, Attribute requested) -> LogicalResult {
+      auto type = cast<RankedTensorType>(value.getType());
+      requested = getEffectiveLayoutEncoding(requested);
+      if (auto forced = forcedWarpPredicateEncodings.find(value);
+          forced != forcedWarpPredicateEncodings.end() &&
+          !layoutsAreEquivalent(type, forced->second, requested,
+                                /*ignoreRegisterOrder=*/false))
+        return failure();
+      forcedWarpPredicateEncodings[value] = requested;
+      layouts[value].insertEncoding(requested);
       return success();
     };
 
-    if (predicateEncoding &&
-        failed(forceSlice(predicateOp.getPredicate(), *predicateEncoding)))
-      conflict = true;
-
-    for (auto [index, result, yielded, bodyRoot] :
-         llvm::enumerate(predicateOp.getResults(), yieldOp.getValues(),
-                         bodyRoots)) {
+    for (auto [index, result, yielded, bodyRoot] : llvm::enumerate(
+             predicateOp.getResults(), yieldOp.getValues(), bodyRoots)) {
       auto resultType = dyn_cast<RankedTensorType>(result.getType());
       if (!resultType || !bodyEncodings[index])
         continue;
 
-      Attribute bodyEncoding = bodyEncodings[index];
+      Attribute bodyEncoding = getEffectiveLayoutEncoding(bodyEncodings[index]);
+      Value init = predicateOp.getInits()[index];
+      bool forceInit = isInsideRestrictedExec(init);
+      SmallVector<Value, 4> carrierValues = {result, yielded, bodyRoot};
+      if (forceInit)
+        carrierValues.push_back(init);
+
+      // Select a single spelling before updating any member. Hard anchors win,
+      // followed by an encoding already selected by a nested island.
+      bool selectedHardAnchor = false;
+      for (Value value : carrierValues) {
+        auto type = cast<RankedTensorType>(value.getType());
+        Operation *producer = value.getDefiningOp();
+        bool hardAnchor =
+            containsPinnedEncoding(type.getEncoding()) ||
+            (producer && producer->hasAttr("tlx.preserve_layout"));
+        if (!hardAnchor)
+          continue;
+        Attribute current = getEffectiveLayoutEncoding(type.getEncoding());
+        if (!layoutsAreEquivalent(type, current, bodyEncoding,
+                                  /*ignoreRegisterOrder=*/false)) {
+          conflict = true;
+          break;
+        }
+        if (!selectedHardAnchor) {
+          bodyEncoding = current;
+          selectedHardAnchor = true;
+        }
+      }
+      if (conflict)
+        break;
+
+      bool selectedExisting = false;
+      for (Value value : carrierValues) {
+        auto forced = forcedWarpPredicateEncodings.find(value);
+        if (forced == forcedWarpPredicateEncodings.end())
+          continue;
+        auto type = cast<RankedTensorType>(value.getType());
+        if (!layoutsAreEquivalent(type, forced->second, bodyEncoding,
+                                  /*ignoreRegisterOrder=*/false)) {
+          conflict = true;
+          break;
+        }
+        if (!selectedHardAnchor && !selectedExisting) {
+          bodyEncoding = forced->second;
+          selectedExisting = true;
+        }
+      }
+      if (conflict)
+        break;
+
+      if (failed(synchronizeBoundaryEncoding(result, bodyEncoding)) ||
+          failed(synchronizeBoundaryEncoding(yielded, bodyEncoding))) {
+        conflict = true;
+        break;
+      }
+      if (forcedWarpPredicateEncodings.count(bodyRoot) &&
+          failed(synchronizeBoundaryEncoding(bodyRoot, bodyEncoding))) {
+        conflict = true;
+        break;
+      }
+      if (failed(forceSlice(bodyRoot, bodyEncoding,
+                            /*ignoreRegisterOrder=*/false)) ||
+          (forceInit && failed(forceSlice(init, bodyEncoding,
+                                          /*ignoreRegisterOrder=*/false)))) {
+        conflict = true;
+        break;
+      }
+
       if (predicateType) {
         // Different register order is harmless because EXEC masks lanes, not
-        // individual registers.  Any lane, warp, or block ownership mismatch
-        // would make one shared tensor predicate invalid for this carried group.
+        // individual registers. Any lane, warp, or block ownership mismatch
+        // would make one shared tensor predicate invalid for this carried
+        // group.
         auto nativeType = resultType.cloneWithEncoding(bodyEncoding);
         FailureOr<Attribute> projected =
             projectToPredicateEncoding(nativeType, predicateType);
@@ -1109,39 +1249,14 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         auto selectedType = RankedTensorType::get(
             predicateType.getShape(), predicateType.getElementType(),
             *predicateEncoding);
-        auto candidateType = RankedTensorType::get(
-            predicateType.getShape(), predicateType.getElementType(),
-            *projected);
+        auto candidateType =
+            RankedTensorType::get(predicateType.getShape(),
+                                  predicateType.getElementType(), *projected);
         if (!isLayoutEquivalentIgnoringRegisterOrder(
                 toLinearLayout(selectedType), toLinearLayout(candidateType))) {
           conflict = true;
           break;
         }
-      }
-
-      // Boundary values participate in the island as one atomic choice.  Keep
-      // compatible pin provenance so repeated RLC rediscovers the same hard
-      // anchor, and reject a pin that requires different physical ownership.
-      auto forceBoundary = [&](Value value) {
-        auto type = cast<RankedTensorType>(value.getType());
-        if (auto forced = forcedWarpPredicateEncodings.find(value);
-            forced != forcedWarpPredicateEncodings.end())
-          return hasSameEffectiveLayout(forced->second, bodyEncoding)
-                     ? success()
-                     : failure();
-        if (containsPinnedEncoding(type.getEncoding())) {
-          if (!hasSameEffectiveLayout(type.getEncoding(), bodyEncoding))
-            return failure();
-          forcedWarpPredicateEncodings[value] = type.getEncoding();
-        } else {
-          forcedWarpPredicateEncodings[value] = bodyEncoding;
-        }
-        return success();
-      };
-      if (failed(forceBoundary(result)) || failed(forceBoundary(yielded)) ||
-          failed(forceSlice(bodyRoot, bodyEncoding))) {
-        conflict = true;
-        break;
       }
     }
 
@@ -1162,6 +1277,12 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
 }
 
 void LayoutPropagation::resolveConflicts() {
+  for (auto [value, encoding] : forcedWarpPredicateEncodings) {
+    (void)encoding;
+    assert(layouts.count(value) &&
+           "forced warp-predicate value must be in the layout lattice");
+  }
+
   std::unique_ptr<ModuleAxisInfoAnalysis> axisInfoAnalysis;
   std::optional<size_t> smemFootprint;
   // Snapshot: the loop below collapses each entry to a single encoding.
