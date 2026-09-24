@@ -930,6 +930,11 @@ projectToPredicateEncoding(RankedTensorType valueType,
 // externally required result layouts after reconvergence.
 LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
   WalkResult walkResult = funcOp.walk([&](WarpPredicateOp predicateOp) {
+    // Wave-uniform predicates permit warp-local cross-lane operations because
+    // every participating wave executes with all lanes active.
+    if (predicateOp.getWaveUniform().value_or(false))
+      return WalkResult::advance();
+
     auto yieldOp = dyn_cast<PredicateYieldOp>(
         predicateOp.getRegion().front().getTerminator());
     if (!yieldOp)
