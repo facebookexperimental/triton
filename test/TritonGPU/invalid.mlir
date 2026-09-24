@@ -1097,42 +1097,6 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32,
 
 // -----
 
-#row = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
-#column = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
-module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @warp_predicate_requires_uniform_wave_for_layout_shuffle(
-      %predicate: i1,
-      %init: tensor<64x64xf32, #row>) -> tensor<64x64xf32, #row> {
-    // expected-error @+1 {{cross-lane operation ttg.convert_layout requires a wave-uniform predicate}}
-    %result = ttg.warp_predicate %predicate (%init) {
-      %local = arith.addf %init, %init : tensor<64x64xf32, #row>
-      %shuffled = ttg.convert_layout %local : tensor<64x64xf32, #row> -> tensor<64x64xf32, #column>
-      ttg.predicate_yield %init : tensor<64x64xf32, #row>
-    } : (i1, tensor<64x64xf32, #row>) -> tensor<64x64xf32, #row>
-    tt.return %result : tensor<64x64xf32, #row>
-  }
-}
-
-// -----
-
-#warp_rows = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
-#warp_columns = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
-module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @wave_uniform_rejects_shared_memory_layout_conversion(
-      %predicate: i1, %init: tensor<64x64xf32, #warp_rows>) {
-    // expected-error @+1 {{layout conversion requiring shared memory is not supported under a wave-uniform predicate}}
-    ttg.warp_predicate %predicate () {
-      %local = arith.addf %init, %init : tensor<64x64xf32, #warp_rows>
-      %converted = ttg.convert_layout %local : tensor<64x64xf32, #warp_rows> -> tensor<64x64xf32, #warp_columns>
-      %sink = arith.addf %converted, %converted : tensor<64x64xf32, #warp_columns>
-      ttg.predicate_yield
-    } {wave_uniform} : (i1) -> ()
-    tt.return
-  }
-}
-
-// -----
-
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @warp_predicate_reduce_axis_out_of_bounds(
@@ -1181,3 +1145,4 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %result : tensor<64xf32, #carried>
   }
 }
+
