@@ -54,6 +54,7 @@ def benchmark(
         "samples_us": [artifact["latency_us"] * scale] * repetitions,
         "warmup_count": 2,
         "cache_policy": "warm",
+        "metrics": dict(case["parameters"].get("benchmark_metrics", {})),
     }
 
 

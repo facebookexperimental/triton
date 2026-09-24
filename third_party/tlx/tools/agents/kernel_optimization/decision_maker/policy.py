@@ -93,6 +93,7 @@ def evaluated_decision(
     *,
     best_speedup: float,
     profiler_diagnostics: str = "",
+    target: KernelTarget | None = None,
 ) -> Decision:
     """Return the authoritative action for a completed experiment."""
 
@@ -112,7 +113,7 @@ def evaluated_decision(
         )
     if (
         not profiler_diagnostics
-        and is_promotable(performance, budget, cases)
+        and is_promotable(performance, budget, cases, target)
         and performance.aggregate_speedup > best_speedup
     ):
         return Decision(
@@ -210,6 +211,7 @@ def is_promotable(
     summary: PerformanceSummary,
     budget: OptimizationBudget,
     cases: tuple[InputCase, ...] | None = None,
+    target: KernelTarget | None = None,
 ) -> bool:
     case_by_id = {case.case_id: case for case in cases or ()}
     if summary.aggregate_speedup < budget.min_speedup:
@@ -226,7 +228,54 @@ def is_promotable(
             or evaluation.timing.coefficient_of_variation > budget.max_cv
         ):
             return False
-    return True
+    return _passes_evaluation_policy(summary, tuple(cases or ()), target)
+
+
+def _passes_evaluation_policy(
+    summary: PerformanceSummary,
+    cases: tuple[InputCase, ...],
+    target: KernelTarget | None,
+) -> bool:
+    policy = dict(target.evaluation_policy) if target is not None else {}
+    minimum_full_configs = policy.get("minimum_full_config_count")
+    if minimum_full_configs is not None:
+        counts = [
+            int(evaluation.verification.metrics.get("full_config_count", 0))
+            for evaluation in summary.cases
+            if evaluation.verification.passed
+        ]
+        if not counts or max(counts) < int(minimum_full_configs):
+            return False
+    if policy.get("kind") != "full_space_parity":
+        return True
+
+    per_case_min = float(policy.get("per_case_min", 0.95))
+    aggregate_min = float(policy.get("aggregate_min", 0.98))
+    max_configs = int(policy.get("max_heuristic_configs", 1))
+    weights = {case.case_id: case.weight for case in cases}
+    weighted_logs = 0.0
+    total_weight = 0.0
+    for evaluation in summary.cases:
+        metrics = evaluation.verification.metrics
+        parity = metrics.get("full_space_parity")
+        config_count = metrics.get("heuristic_config_count")
+        stable = bool(metrics.get("parity_stable", True))
+        if config_count is None or int(config_count) > max_configs:
+            return False
+        if parity is None:
+            return False
+        parity = float(parity)
+        if not math.isfinite(parity) or parity <= 0:
+            return False
+        if stable and parity < per_case_min:
+            return False
+        if stable:
+            weight = float(weights.get(evaluation.case_id, 1.0))
+            weighted_logs += weight * math.log(parity)
+            total_weight += weight
+    if total_weight == 0:
+        return False
+    return math.exp(weighted_logs / total_weight) >= aggregate_min
 
 
 def is_correct_and_stable(

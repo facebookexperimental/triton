@@ -293,6 +293,11 @@ class DecisionMaker:
                         performance = replace(performance, aggregate_speedup=speedup)
                         if (
                             not is_ablation
+                            and not bool(
+                                request.target.evaluation_policy.get(
+                                    "profile_complete_per_measurement", False
+                                )
+                            )
                             and _is_correct_and_stable(
                                 performance,
                                 request.budget,
@@ -341,6 +346,7 @@ class DecisionMaker:
                             request.cases,
                             best_speedup=best_performance.aggregate_speedup,
                             profiler_diagnostics=profiler_diagnostics,
+                            target=request.target,
                         )
                         status = {
                             DecisionStatus.PROMOTE: "promoted",
@@ -523,7 +529,9 @@ class DecisionMaker:
 
         if best_experiment_id != "baseline" and (
             final_profiler_diagnostics
-            or not is_promotable(final_profile, request.budget, request.cases)
+            or not is_promotable(
+                final_profile, request.budget, request.cases, request.target
+            )
         ):
             if final_profiler_diagnostics:
                 diagnostics.append(f"final: rejected: {final_profiler_diagnostics}")

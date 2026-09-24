@@ -5,18 +5,22 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from ..decision_maker import cli as cli_module
 from ..decision_maker import orchestrator as optimizer_module
+from ..decision_maker import tuning as tuning_module
 from ..decision_maker.artifacts import load_prior_run_evidence
 from ..decision_maker.cli import (
     _commit_body,
     _parse_args,
     _result_exit_code,
     _resolve_harness_paths,
+    _resolve_task,
+    _run_task,
     _validate_host_matches_target,
 )
 from ..decision_maker.harness import StandaloneHarness, SubprocessHarness
@@ -49,6 +53,12 @@ from ..decision_maker.policy import (
     weighted_geometric_speedup,
 )
 from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
+from ..decision_maker.tuning import (
+    _parity_summary,
+    _tuning_symbols,
+    infer_kernel_path,
+    production_cases,
+)
 from ..decision_maker.profiling import ProfileRequest
 from ..optimizer.agent import (
     CandidateContext,
@@ -65,6 +75,7 @@ from ..optimizer.source import (
     validate_kernel_source,
     validate_replacement_source,
 )
+from ..policy_source import frozen_source_digest, validate_branch_comments
 
 # Derive from the registry module, not from this test file: under Buck the
 # link-tree sources are symlinks, and the registry resolves them.
@@ -831,6 +842,131 @@ class ScoringTest(unittest.TestCase):
     def test_source_digest_stable(self) -> None:
         self.assertEqual(source_digest("VALUE = 1\n"), source_digest("VALUE = 1\n  \n"))
 
+    def test_full_space_parity_policy_enforces_gates(self) -> None:
+        cases = (InputCase("a", {}, weight=3.0), InputCase("b", {}))
+        target = KernelTarget(
+            "hip",
+            "gfx942",
+            evaluation_policy={
+                "kind": "full_space_parity",
+                "aggregate_min": 0.98,
+                "per_case_min": 0.95,
+                "max_heuristic_configs": 1,
+            },
+        )
+
+        def summary(a_parity: float, b_parity: float) -> PerformanceSummary:
+            return PerformanceSummary(
+                cases=tuple(
+                    CaseEvaluation(
+                        case_id=case_id,
+                        verification=VerificationResult(
+                            True,
+                            metrics={
+                                "full_space_parity": parity,
+                                "heuristic_config_count": 1,
+                                "parity_stable": True,
+                            },
+                        ),
+                        timing=TimingSamples((1.0, 1.0, 1.0)),
+                    )
+                    for case_id, parity in (("a", a_parity), ("b", b_parity))
+                ),
+                aggregate_speedup=1.01,
+            )
+
+        self.assertTrue(
+            is_promotable(summary(0.99, 0.96), OptimizationBudget(), cases, target)
+        )
+        self.assertFalse(
+            is_promotable(summary(0.99, 0.94), OptimizationBudget(), cases, target)
+        )
+        self.assertFalse(
+            is_promotable(summary(0.97, 0.97), OptimizationBudget(), cases, target)
+        )
+        too_many = replace(
+            summary(0.99, 0.96),
+            cases=tuple(
+                replace(
+                    evaluation,
+                    verification=replace(
+                        evaluation.verification,
+                        metrics={
+                            **evaluation.verification.metrics,
+                            "heuristic_config_count": 2,
+                        },
+                    ),
+                )
+                for evaluation in summary(0.99, 0.96).cases
+            ),
+        )
+        self.assertFalse(is_promotable(too_many, OptimizationBudget(), cases, target))
+        compact = _parity_summary(summary(0.99, 0.96), cases)
+        self.assertEqual(compact["stable_shape_count"], 2)
+        self.assertEqual(compact["maximum_heuristic_config_count"], 1)
+
+    def test_tuning_rejects_an_unreasonably_small_full_space(self) -> None:
+        summary = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(
+                        True, metrics={"full_config_count": 8}
+                    ),
+                    timing=TimingSamples((1.0, 1.0, 1.0)),
+                ),
+            ),
+            aggregate_speedup=1.1,
+        )
+        target = KernelTarget(
+            "hip",
+            "gfx942",
+            evaluation_policy={"minimum_full_config_count": 16},
+        )
+        self.assertFalse(is_promotable(summary, OptimizationBudget(), target=target))
+        expanded = replace(
+            summary,
+            cases=(
+                replace(
+                    summary.cases[0],
+                    verification=VerificationResult(
+                        True, metrics={"full_config_count": 16}
+                    ),
+                ),
+            ),
+        )
+        self.assertTrue(is_promotable(expanded, OptimizationBudget(), target=target))
+
+    def test_policy_source_scope_and_branch_comments(self) -> None:
+        baseline = "def _configs():\n    return [1]\n\ndef heuristic_config():\n    return 1\n"
+        candidate = (
+            "def _configs():\n    configs = [1, 2]\n    return configs\n\n"
+            "def heuristic_config():\n    return 1\n"
+        )
+        self.assertEqual(
+            frozen_source_digest(baseline, ("_configs",)),
+            frozen_source_digest(candidate, ("_configs",)),
+        )
+        self.assertNotEqual(
+            frozen_source_digest(baseline, ("heuristic_config",)),
+            frozen_source_digest(candidate, ("heuristic_config",)),
+        )
+        valid, _ = validate_branch_comments(
+            "def heuristic_config(m):\n"
+            "    # Small M needs a narrow tile.\n"
+            "    if m < 16:\n"
+            "        return 1\n"
+            "    return 2\n",
+            "heuristic_config",
+        )
+        self.assertTrue(valid)
+        valid, diagnostic = validate_branch_comments(
+            "def heuristic_config(m):\n    if m < 16:\n        return 1\n    return 2\n",
+            "heuristic_config",
+        )
+        self.assertFalse(valid)
+        self.assertIn("needs an explanatory comment", diagnostic)
+
 
 class PriorRunEvidenceTest(unittest.TestCase):
     def test_loads_sources_and_sanitized_evidence_without_mutation(self) -> None:
@@ -948,6 +1084,105 @@ class CliTest(unittest.TestCase):
             ]
         )
         self.assertTrue(args.diagnostic_proton_intra_kernel)
+
+    def test_tuning_cli_needs_only_op_arch_and_suite(self) -> None:
+        args = _parse_args(
+            ["--op", "mm", "--arch", "gfx942", "--suite", "gfx942_all"]
+        )
+        self.assertIsNone(args.task)
+        self.assertIsNone(args.output_dir)
+        self.assertEqual(args.device, "auto")
+        self.assertTrue(args.govern)
+        self.assertEqual(_resolve_task(args), "tuning")
+
+    def test_old_objective_name_warns_and_maps_to_tuning(self) -> None:
+        args = _parse_args(["--objective", "heuristic-policy"])
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            task = _resolve_task(args)
+        self.assertEqual(task, "tuning")
+        self.assertIn("deprecated", stderr.getvalue())
+
+    def test_authoring_passes_its_winner_to_tuning_epilogue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "out").mkdir()
+            cases = root / "cases.json"
+            cases.write_text('[{"case_id": "a"}]')
+            target = root / "target.json"
+            target.write_text('{"backend": "fake", "architecture": "gfx942"}')
+            result = KernelOptimizationResult(
+                success=True,
+                best_kernel="AUTHORED = True\n",
+                baseline=_performance(("a", 100.0)),
+                final=_performance(("a", 80.0)),
+                experiments=(),
+                artifacts_dir=root / "out",
+                stopping_reason="budget_exhausted",
+            )
+            args = _parse_args(
+                [
+                    "--task",
+                    "authoring",
+                    "--op",
+                    "mm",
+                    "--arch",
+                    "gfx942",
+                    "--suite",
+                    "gfx942_all",
+                    "--output-dir",
+                    str(root / "out"),
+                    "--harness",
+                    str(Path(__file__)),
+                    "--cases",
+                    str(cases),
+                    "--target",
+                    str(target),
+                    "--provider",
+                    "mock",
+                    "--no-commit-winner",
+                ]
+            )
+            optimizer = Mock()
+            optimizer.optimize.return_value = result
+            tuning_result = {"task": "tuning", "summary": {"success": True}}
+            with (
+                patch.object(
+                    cli_module,
+                    "_resolve_harness_paths",
+                    return_value=(Path(__file__), cases, target),
+                ),
+                patch.object(cli_module, "KernelOptimizer", return_value=optimizer),
+                patch.object(
+                    tuning_module,
+                    "run_tuning",
+                    return_value=(0, tuning_result),
+                ) as run_tuning,
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = _run_task(args, environment_ready=True)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                run_tuning.call_args.kwargs["initial_source"], "AUTHORED = True\n"
+            )
+            self.assertEqual(
+                run_tuning.call_args.kwargs["output_dir"], root / "out" / "tuning"
+            )
+            self.assertTrue((root / "out" / "task_result.json").is_file())
+
+    def test_tuning_device_selection_prefers_matching_arch_then_memory(self) -> None:
+        from types import SimpleNamespace
+
+        from ..decision_maker.benchmark_environment import _select_device
+
+        devices = [
+            SimpleNamespace(index=0, arch="gfx950", memory_used_mib=1),
+            SimpleNamespace(index=1, arch="gfx942", memory_used_mib=10),
+            SimpleNamespace(index=2, arch="gfx942", memory_used_mib=5),
+        ]
+        self.assertEqual(_select_device(devices, "auto", "gfx942").index, 2)
+        self.assertEqual(_select_device(devices, "0", "gfx942").index, 0)
 
 
 class HarnessTest(unittest.TestCase):
@@ -1229,6 +1464,66 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(first.source, "LATENCY_US = 80\nCORRECT = True\n")
         self.assertEqual(second.source, "LATENCY_US = 60\nCORRECT = True\n")
+
+    def test_infers_mm_kernel_and_production_suite(self) -> None:
+        from ..decision_maker.tuning_harnesses import mm as mm_harness
+
+        repository = Path(__file__).resolve().parents[6]
+        gfx942 = infer_kernel_path(repository, "mm", "gfx942")
+        self.assertEqual(gfx942.name, "gfx942.py")
+        self.assertEqual(infer_kernel_path(repository, "mm", "B200").name, "sm100.py")
+        self.assertEqual(len(production_cases("mm", "gfx942_all")), 27)
+        self.assertEqual(
+            _tuning_symbols(gfx942.read_text()), ("_configs", "heuristic_config")
+        )
+        sm100 = infer_kernel_path(repository, "mm", "sm100")
+        self.assertEqual(
+            _tuning_symbols(sm100.read_text()),
+            ("get_cuda_autotune_config", "heuristic_config"),
+        )
+        for arch, kernel in (("gfx942", gfx942), ("sm100", sm100)):
+            result = mm_harness.build(kernel.read_text(), {"architecture": arch})
+            self.assertTrue(result["success"], result.get("diagnostics"))
+            result["artifact"]["directory"].cleanup()
+
+    def test_mm_tuning_harness_routes_through_public_op(self) -> None:
+        from types import SimpleNamespace
+
+        import torch
+
+        from ..decision_maker.tuning_harnesses.mm import _install_candidate
+
+        marker = object()
+        candidate = SimpleNamespace(mm=lambda a, b, *, space: (marker, space))
+        a = torch.empty((8, 8), dtype=torch.float16)
+        b = torch.empty((8, 8), dtype=torch.float16)
+        for arch in ("gfx942", "sm100"):
+            with self.subTest(arch=arch):
+                op = _install_candidate(candidate, arch)
+                self.assertEqual(op(a, b, space="full"), (marker, "full"))
+
+    def test_benchmark_metrics_are_attached_to_verification(self) -> None:
+        harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
+        case = InputCase(
+            "a", {"benchmark_metrics": {"full_space_parity": 0.99}}
+        )
+        for harness in (
+            StandaloneHarness(harness_path),
+            SubprocessHarness(harness_path, 30.0),
+        ):
+            with self.subTest(harness=type(harness).__name__):
+                performance = harness.evaluate(
+                    "LATENCY_US = 50\nCORRECT = True\n",
+                    (case,),
+                    KernelTarget("fake", "fake"),
+                    benchmark_repetitions=2,
+                )
+                self.assertEqual(
+                    performance.cases[0].verification.metrics[
+                        "full_space_parity"
+                    ],
+                    0.99,
+                )
 
 
 class CommitBodyTest(unittest.TestCase):
@@ -2396,6 +2691,42 @@ class KernelOptimizerTest(unittest.TestCase):
                 )
                 # Optimizer should complete without error even with oversized profile.
                 self.assertIsNotNone(result)
+
+    def test_complete_measurement_profile_skips_near_threshold_rerun(self) -> None:
+        provider = FixedCandidateProvider(
+            [
+                CandidateProposal(
+                    "LATENCY_US = 100\nCORRECT = True\nTAG = 1\n", "same"
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=_write_policy_harness(Path(tmp)),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget(
+                        "fake",
+                        "fake",
+                        evaluation_policy={
+                            "profile_complete_per_measurement": True
+                        },
+                    ),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(tmp) / "out",
+                )
+            )
+        candidate_request = result.experiments[1].performance.cases[0].profile[
+            "request"
+        ]
+        self.assertEqual(candidate_request["level"], "summary")
+        self.assertEqual(candidate_request["reason"], "candidate")
 
 
 def _write_policy_harness(directory: Path) -> Path:
