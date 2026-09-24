@@ -440,6 +440,14 @@ _REGISTER_CONFIGS += [
     )
 ]
 
+
+def _configs():
+    """Return the full register-kernel autotune space."""
+    return list(_REGISTER_CONFIGS)
+
+
+CONFIGS = _configs
+
 # Coalesced SIMD register layout for the [HALF_M, HALF_N] = [128, 128] fp16 quadrant
 # store (num_warps=8, warp_size=64): each thread holds 8 contiguous N elements ->
 # 128-bit buffer_store_dwordx4. Applied to the epilogue store via tlx.require_layout
@@ -492,7 +500,7 @@ _A_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((8, 1024, 6
 _B_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((1024, 16, 1), (128, 8)))
 
 _register_kernel = triton.autotune(
-    configs=_REGISTER_CONFIGS,
+    configs=CONFIGS(),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_register_configs},
 )(_register_kernel_impl)
@@ -3393,6 +3401,11 @@ def _dispatch_plan(m, n, k, dtype, element_size):
     return "lds", (block_m, block_n, split_k)
 
 
+def heuristic_config(m, n, k, dtype, element_size):
+    """Return the production plan selected for one problem shape."""
+    return _dispatch_plan(m, n, k, dtype, element_size)
+
+
 def _dispatch_for(a, b):
     problem = _problem_for(a, b)
     if problem is None:
@@ -3457,14 +3470,17 @@ def matmul(a, b, out=None):
 
 def mm(a, b, *, space="heuristic"):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
-    if space != "heuristic":
-        raise InvalidInput("gfx950 mm currently supports space='heuristic' only")
+    if space not in ("full", "heuristic"):
+        raise InvalidInput(f"unknown gfx950 mm search space: {space}")
     if not a.is_cuda or a.stride(1) != 1 or b.stride(0) != 1:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     m, k = a.shape
     _, n = b.shape
-    dispatch = _dispatch_plan(
+    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    if space == "full":
+        return _launch_register(a, b, out=out)
+    dispatch = heuristic_config(
         m,
         n,
         k,
@@ -3474,7 +3490,6 @@ def mm(a, b, *, space="heuristic"):
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch

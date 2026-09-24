@@ -319,15 +319,27 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
 def _tuning_symbols(source: str) -> tuple[str, str]:
     tree = ast.parse(source)
     functions = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    search_symbol = next(
-        (name for name in ("_configs", "get_cuda_autotune_config", "get_autotune_config") if name in functions),
-        None,
-    )
+    search_symbol = _factory_symbol(tree, "CONFIGS", functions)
     if search_symbol is None:
-        raise SystemExit("tuning requires a function that constructs the full search space")
+        raise SystemExit("tuning requires a module-level CONFIGS factory")
     if "heuristic_config" not in functions:
         raise SystemExit("tuning requires heuristic_config() and space='heuristic' support")
     return search_symbol, "heuristic_config"
+
+
+def _factory_symbol(tree: ast.Module, exported_name: str, functions: set[str]) -> str | None:
+    """Return the editable symbol behind a module-level factory export."""
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target, )
+        if not any(isinstance(target, ast.Name) and target.id == exported_name for target in targets):
+            continue
+        value = node.value
+        if isinstance(value, ast.Name) and value.id in functions:
+            return value.id
+        return exported_name
+    return None
 
 
 def _case_id(parameters: dict[str, Any]) -> str:

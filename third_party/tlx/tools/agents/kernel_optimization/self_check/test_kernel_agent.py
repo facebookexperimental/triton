@@ -1481,7 +1481,11 @@ class HarnessTest(unittest.TestCase):
             _tuning_symbols(sm100.read_text()),
             ("get_cuda_autotune_config", "heuristic_config"),
         )
-        for arch, kernel in (("gfx942", gfx942), ("sm100", sm100)):
+        gfx950 = infer_kernel_path(repository, "mm", "gfx950")
+        self.assertEqual(
+            _tuning_symbols(gfx950.read_text()), ("_configs", "heuristic_config")
+        )
+        for arch, kernel in (("gfx942", gfx942), ("gfx950", gfx950), ("sm100", sm100)):
             result = mm_harness.build(kernel.read_text(), {"architecture": arch})
             self.assertTrue(result["success"], result.get("diagnostics"))
             result["artifact"]["directory"].cleanup()
@@ -1497,7 +1501,7 @@ class HarnessTest(unittest.TestCase):
         candidate = SimpleNamespace(mm=lambda a, b, *, space: (marker, space))
         a = torch.empty((8, 8), dtype=torch.float16)
         b = torch.empty((8, 8), dtype=torch.float16)
-        for arch in ("gfx942", "sm100"):
+        for arch in ("gfx942", "gfx950", "sm100"):
             with self.subTest(arch=arch):
                 op = _install_candidate(candidate, arch)
                 self.assertEqual(op(a, b, space="full"), (marker, "full"))
