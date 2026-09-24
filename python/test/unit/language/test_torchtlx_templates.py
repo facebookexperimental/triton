@@ -585,20 +585,52 @@ class TestTLXTemplates(TestCase):
             base_get_configs.assert_called_once()
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
-    def test_tlx_nvidia_only_appends_blackwell_template_to_mm(self):
+    def test_tlx_blackwell_template_is_arch_gated(self):
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
 
         existing_template = object()
+        h100_templates = [existing_template]
         scaled_mm_templates = [existing_template]
-        with mock.patch.object(_tlx_mm, "is_rocm", return_value=False):
+        with mock.patch.object(
+            _tlx_mm, "is_rocm", return_value=False
+        ), mock.patch.object(_tlx_mm, "current_target") as target:
+            target.return_value.is_blackwell = False
+            h100_result = _tlx_mm.append_tlx(h100_templates, op_name="mm")
+
+            target.return_value.is_blackwell = True
             scaled_mm_result = _tlx_mm.append_tlx(
                 scaled_mm_templates, op_name="scaled_mm"
             )
             mm_result = _tlx_mm.append_tlx([], op_name="mm")
 
+        self.assertIs(h100_result, h100_templates)
+        self.assertEqual(h100_templates, [existing_template])
         self.assertIs(scaled_mm_result, scaled_mm_templates)
         self.assertEqual(scaled_mm_templates, [existing_template])
         self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_rejects_ambiguous_tma_layout(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        class _KernelInputs:
+            _mat1_idx = 0
+            _mat2_idx = 1
+
+            def strides_hinted(self):
+                return ((1, 1), (32, 1))
+
+        graph = mock.Mock()
+        graph.sizevars.statically_known_equals.side_effect = (
+            lambda lhs, rhs: lhs == rhs
+        )
+        heuristic = object.__new__(_tlx_registry.BlackwellGemmWSConfigHeuristic)
+        with (
+            V.set_graph_handler(graph),
+            mock.patch.object(_tlx_registry, "MMKernelInputs", _KernelInputs),
+            config.patch({"triton.tlx_mode": "force"}),
+        ):
+            self.assertFalse(heuristic.should_run(_KernelInputs()))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
