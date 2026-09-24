@@ -345,6 +345,7 @@ class DecisionMaker:
                             request.budget,
                             request.cases,
                             best_speedup=best_performance.aggregate_speedup,
+                            best_performance=best_performance,
                             profiler_diagnostics=profiler_diagnostics,
                             target=request.target,
                         )
@@ -409,6 +410,12 @@ class DecisionMaker:
                         if (
                             decision.status is DecisionStatus.PROMOTE
                             and promotion_committer is not None
+                            and is_promotable(
+                                performance,
+                                request.budget,
+                                request.cases,
+                                request.target,
+                            )
                         ):
                             commit_result = promotion_committer.commit_promotion(
                                 experiment,

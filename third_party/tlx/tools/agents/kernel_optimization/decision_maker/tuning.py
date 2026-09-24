@@ -74,74 +74,21 @@ def run_tuning(
     harness_path = Path(__file__).with_name("tuning_harnesses") / f"{op}.py"
     if not harness_path.is_file():
         raise SystemExit(f"tuning does not yet support tlx.ops.{op}")
-    search_symbol, heuristic_symbol = _tuning_symbols(original_source)
+    _, heuristic_symbol = _tuning_symbols(original_source)
     target = _tuning_target(op, arch)
     _validate_device_arch(target, arch)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    search_target = _phase_target(
-        target,
-        phase="search_space",
-        source=original_source,
-        editable_symbols=(search_symbol, ),
-        guidance=(f"Phase 1/2: improve only {search_symbol}. Preserve every incumbent, kernel, "
-                  "dispatch rule, and heuristic_config. Use the measured per-shape top "
-                  "configs to add a compact, hardware-valid candidate set; do not author "
-                  f"the decision tree yet. If the incumbent full space has fewer than {MIN_REASONABLE_FULL_CONFIGS} "
-                  "configurations, expand it to a reasonable, diverse set before pruning."),
-        evaluation_policy={
-            "profile_complete_per_measurement": True,
-            "minimum_full_config_count": MIN_REASONABLE_FULL_CONFIGS,
-        },
-    )
-    search_budget = replace(
-        budget,
-        max_rounds=search_rounds,
-        min_speedup=max(1.0, budget.min_speedup),
-    )
-    search_request = KernelOptimizationRequest(
-        kernel_source=original_source,
-        harness_path=harness_path,
-        cases=cases,
-        target=search_target,
-        budget=search_budget,
-        output_dir=output_dir / "search_space",
-        kernel_path=kernel_path,
-        repository_root=repository,
-    )
-    search_result = KernelOptimizer(provider).optimize(search_request)
-    search_source = search_result.best_kernel
-    full_config_count = _maximum_full_config_count(search_result.final)
-    if full_config_count < MIN_REASONABLE_FULL_CONFIGS:
-        output_dir.joinpath("best_kernel.py").write_text(search_source)
-        summary = {
-            "success": False,
-            "task": "tuning",
-            "phase": "search_space",
-            "op": op,
-            "arch": target.architecture,
-            "suite": suite,
-            "full_config_count": full_config_count,
-            "minimum_full_config_count": MIN_REASONABLE_FULL_CONFIGS,
-            "diagnostics": "full search space remains unreasonably small",
-        }
-        result = {
-            **summary,
-            "summary": summary,
-            "search_space": to_json_value(search_result),
-            "heuristic": None,
-            "commit": None,
-        }
-        output_dir.joinpath("summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-        output_dir.joinpath("result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-        return 2, result
+    # Kept in the API for CLI compatibility. Tuning treats the existing full
+    # space as its fixed oracle and edits only the dispatch decision tree.
+    del search_rounds
 
     heuristic_target = _phase_target(
         target,
         phase="heuristic",
-        source=search_source,
+        source=original_source,
         editable_symbols=(heuristic_symbol, ),
-        guidance=("Phase 2/2: freeze the kernel and full search space. Author only "
+        guidance=("Author only "
                   f"{heuristic_symbol} as a compact decision tree. Optimize measured regret "
                   "against full-space winners, return exactly one config, use general "
                   "dimension/layout predicates, and put one explanatory sentence directly "
@@ -154,11 +101,13 @@ def run_tuning(
             "max_heuristic_configs": 1,
             "stable_cv_max": 0.03,
             "profile_complete_per_measurement": True,
+            "minimum_full_config_count": MIN_REASONABLE_FULL_CONFIGS,
+            "progressive": True,
         },
     )
     heuristic_budget = replace(budget, max_rounds=heuristic_rounds, min_speedup=1.0)
     heuristic_request = KernelOptimizationRequest(
-        kernel_source=search_source,
+        kernel_source=original_source,
         harness_path=harness_path,
         cases=cases,
         target=heuristic_target,
@@ -214,7 +163,7 @@ def run_tuning(
         commit_result = commit_winner(
             snapshot,
             final_source,
-            commit_message or f"Tune {arch} {op} search space and heuristic policy",
+            commit_message or f"Tune {arch} {op} heuristic policy",
             (f"TLX agent measured suite {suite} and required at least 98% weighted "
              "full-space parity with no stable case below 95%."),
             validate_committed_source=validate,
@@ -228,7 +177,7 @@ def run_tuning(
         "suite": suite,
         "kernel": str(kernel_path),
         "summary": summary,
-        "search_space": to_json_value(search_result),
+        "search_space": None,
         "heuristic": to_json_value(heuristic_result),
         "commit": to_json_value(commit_result) if commit_result is not None else None,
     }

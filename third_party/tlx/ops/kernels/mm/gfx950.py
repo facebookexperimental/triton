@@ -3401,8 +3401,11 @@ def _dispatch_plan(m, n, k, dtype, element_size):
     return "lds", (block_m, block_n, split_k)
 
 
-def heuristic_config(m, n, k, dtype, element_size):
+def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
     """Return the production plan selected for one problem shape."""
+    # Layouts outside the direct-to-LDS contract use the generic strided register kernel.
+    if a_strides[1] != 1 or b_strides[0] != 1:
+        return "register", _register_plan_for_shape(m, n, k) or _intermediate_register_config(m, n, k)
     return _dispatch_plan(m, n, k, dtype, element_size)
 
 
@@ -3472,7 +3475,7 @@ def mm(a, b, *, space="heuristic"):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
     if space not in ("full", "heuristic"):
         raise InvalidInput(f"unknown gfx950 mm search space: {space}")
-    if not a.is_cuda or a.stride(1) != 1 or b.stride(0) != 1:
+    if not a.is_cuda or any(stride <= 0 for stride in (*a.stride(), *b.stride())):
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     m, k = a.shape
@@ -3486,6 +3489,8 @@ def mm(a, b, *, space="heuristic"):
         k,
         a.dtype,
         a.element_size(),
+        a.stride(),
+        b.stride(),
     )
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "

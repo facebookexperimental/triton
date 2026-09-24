@@ -905,6 +905,153 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(compact["stable_shape_count"], 2)
         self.assertEqual(compact["maximum_heuristic_config_count"], 1)
 
+        noisy_unstable = replace(
+            summary(0.99, 0.96),
+            aggregate_speedup=0.5,
+            cases=(
+                summary(0.99, 0.96).cases[0],
+                replace(
+                    summary(0.99, 0.96).cases[1],
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_space_parity": 0.5,
+                            "heuristic_config_count": 1,
+                            "parity_stable": False,
+                        },
+                    ),
+                    timing=TimingSamples((1.0, 10.0, 1.0)),
+                ),
+            ),
+        )
+        self.assertTrue(
+            is_promotable(
+                noisy_unstable,
+                OptimizationBudget(max_cv=0.1),
+                cases,
+                target,
+            )
+        )
+
+    def test_full_space_parity_can_adopt_an_intermediate_tree(self) -> None:
+        cases = (InputCase("a", {}), )
+        target = KernelTarget(
+            "hip",
+            "gfx950",
+            evaluation_policy={
+                "kind": "full_space_parity",
+                "aggregate_min": 0.98,
+                "per_case_min": 0.95,
+                "max_heuristic_configs": 1,
+                "progressive": True,
+            },
+        )
+
+        def summary(parity: float) -> PerformanceSummary:
+            return PerformanceSummary(
+                cases=(
+                    CaseEvaluation(
+                        case_id="a",
+                        verification=VerificationResult(
+                            True,
+                            metrics={
+                                "full_space_parity": parity,
+                                "heuristic_config_count": 1,
+                                "parity_stable": True,
+                            },
+                        ),
+                        timing=TimingSamples((1.0, 1.0, 1.0)),
+                    ),
+                ),
+            )
+
+        decision = evaluated_decision(
+            CandidateProposal(source="VALUE = 2\n"),
+            summary(0.90),
+            OptimizationBudget(),
+            cases,
+            best_speedup=1.0,
+            best_performance=summary(0.80),
+            target=target,
+        )
+        self.assertEqual(decision.status, DecisionStatus.PROMOTE)
+        self.assertIn("continue refinement", decision.rationale)
+
+    def test_tuning_edits_only_the_heuristic(self) -> None:
+        source = (
+            "def _configs():\n"
+            "    return list(range(16))\n\n"
+            "CONFIGS = _configs\n\n"
+            "def heuristic_config():\n"
+            "    return 1\n"
+        )
+        candidate = source.replace("return 1\n", "return 2\n")
+        cases = (InputCase("a", {}), )
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_config_count": 16,
+                            "full_space_parity": 1.0,
+                            "heuristic_config_count": 1,
+                            "parity_stable": True,
+                        },
+                    ),
+                    timing=TimingSamples((1.0, 1.0, 1.0)),
+                ),
+            ),
+        )
+        optimization_result = KernelOptimizationResult(
+            success=True,
+            best_kernel=candidate,
+            baseline=performance,
+            final=performance,
+            experiments=(),
+            artifacts_dir=Path("heuristic"),
+            stopping_reason="round_budget_exhausted",
+            winner_experiment_id="r001-c000",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "third_party/tlx/ops/kernels/mm/gfx950.py"
+            kernel.parent.mkdir(parents=True)
+            kernel.write_text(source)
+            optimizer = Mock()
+            optimizer.optimize.return_value = optimization_result
+            with (
+                patch.object(tuning_module, "production_cases", return_value=cases),
+                patch.object(tuning_module, "_validate_device_arch"),
+                patch.object(tuning_module, "KernelOptimizer", return_value=optimizer),
+            ):
+                exit_code, result = tuning_module.run_tuning(
+                    repository=root,
+                    op="mm",
+                    arch="gfx950",
+                    suite="suite",
+                    output_dir=root / "out",
+                    provider=Mock(),
+                    budget=OptimizationBudget(),
+                    search_rounds=99,
+                    heuristic_rounds=3,
+                    commit=False,
+                    commit_message=None,
+                    vcs="git",
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIsNone(result["search_space"])
+            optimizer.optimize.assert_called_once()
+            request = optimizer.optimize.call_args.args[0]
+            self.assertEqual(request.kernel_source, source)
+            self.assertEqual(
+                request.target.environment["TLX_AGENT_EDITABLE_SYMBOLS"],
+                "heuristic_config",
+            )
+            self.assertEqual((root / "out/best_kernel.py").read_text(), candidate)
+
     def test_tuning_rejects_an_unreasonably_small_full_space(self) -> None:
         summary = PerformanceSummary(
             cases=(
@@ -1562,6 +1709,85 @@ class CommitBodyTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+
+    def test_parity_tuning_refines_from_best_intermediate_tree(self) -> None:
+        def performance(parity: float) -> PerformanceSummary:
+            return PerformanceSummary(
+                cases=(
+                    CaseEvaluation(
+                        case_id="a",
+                        verification=VerificationResult(
+                            True,
+                            metrics={
+                                "full_config_count": 16,
+                                "full_space_parity": parity,
+                                "heuristic_config_count": 1,
+                                "parity_stable": True,
+                            },
+                        ),
+                        timing=TimingSamples((1.0, 1.0, 1.0)),
+                    ),
+                ),
+            )
+
+        baseline_source = "TREE = 0\n"
+        intermediate_source = "TREE = 1\n"
+        winner_source = "TREE = 2\n"
+        contexts: list[CandidateContext] = []
+        proposals = [
+            CandidateProposal(intermediate_source, "improve the tree"),
+            CandidateProposal(winner_source, "finish the tree"),
+        ]
+
+        class RecordingProvider:
+
+            def propose(self, request, context):
+                del request
+                contexts.append(context)
+                return proposals.pop(0)
+
+        harness = Mock()
+        harness.evaluate.side_effect = [
+            performance(0.80),
+            performance(0.90),
+            performance(0.99),
+            performance(0.99),
+        ]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(optimizer_module, "SubprocessHarness", return_value=harness),
+        ):
+            result = KernelOptimizer(RecordingProvider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(directory) / "unused_harness.py",
+                    cases=(InputCase("a", {}), ),
+                    target=KernelTarget(
+                        "hip",
+                        "gfx950",
+                        evaluation_policy={
+                            "kind": "full_space_parity",
+                            "aggregate_min": 0.98,
+                            "per_case_min": 0.95,
+                            "max_heuristic_configs": 1,
+                            "minimum_full_config_count": 16,
+                            "profile_complete_per_measurement": True,
+                            "progressive": True,
+                        },
+                    ),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory) / "out",
+                ))
+
+        self.assertEqual(contexts[1].current_source, intermediate_source)
+        self.assertIn("continue refinement", result.experiments[1].decision.rationale)
+        self.assertTrue(result.success)
+        self.assertEqual(result.best_kernel, winner_source)
+
     def test_ablation_records_signal_without_promoting_or_committing(self) -> None:
         class RejectCommitter:
             def commit_promotion(self, experiment, source, baseline, performance):

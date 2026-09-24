@@ -102,6 +102,24 @@ def test_mm_small_square_register_plan(m):
     )
 
 
+def test_mm_register_fallback_for_row_major_b(monkeypatch):
+    from triton.tlx.ops.kernels.mm.gfx950 import mm
+
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 32), device="cuda", dtype=torch.float16)
+    expected = torch.empty((64, 32), device="cuda", dtype=torch.float16)
+
+    def launch_register_plan(actual_a, actual_b, *, config, out, _validated):
+        assert actual_a is a
+        assert actual_b is b
+        assert config == _gfx950._intermediate_register_config(64, 32, 128)
+        assert _validated
+        return expected
+
+    monkeypatch.setattr(_gfx950, "_launch_register_plan", launch_register_plan)
+    assert mm(a, b, space="heuristic") is expected
+
+
 def test_mm_rejects_invalid_rank():
     from triton.tlx.ops import mm as tlx_mm
 

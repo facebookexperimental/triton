@@ -22,11 +22,12 @@ The loop is:
 build -> verify -> benchmark -> profile -> propose source mutation -> repeat
 ```
 
-Production `tlx.ops` tuning is a two-phase specialization
-of that same loop. The first phase edits only the full search-space constructor;
-the second freezes that oracle and edits only `heuristic_config`. The Decision
-Maker requires one heuristic config, at least 98% weighted geometric-mean parity
-with full, and at least 95% parity on every stable production shape.
+Production `tlx.ops` tuning treats the existing full search space as a fixed
+oracle and edits only `heuristic_config`. The Decision Maker requires one
+heuristic config, at least 98% weighted geometric-mean parity with full, and at
+least 95% parity on every stable production shape. Intermediate decision trees
+that improve the parity objective become the parent for the next round without
+being committed; only a tree that passes all parity gates can reach VCS.
 
 The Decision Maker establishes the authoritative baseline and supplies normalized evidence
 to the Optimizer.
@@ -137,15 +138,13 @@ candidate implementations through `tlx.ops.mm`, while the selected device
 chooses the architecture implementation. An implementation is ready for this
 task when it exposes `space="full"`, `space="heuristic"`, a full-space factory,
 and `heuristic_config`. The tuning task requires at least 16 candidates in the
-full space; when the incumbent is smaller, its first phase asks the agent to
-expand it before deriving the heuristic.
+fixed full space; a smaller oracle is rejected rather than mutated.
 
-The output contains separate `search_space/` and `heuristic/` agent runs plus a
-top-level `best_kernel.py`, compact `summary.json`, and complete `result.json`.
-Search-space candidates may change only the implementation's detected
-full-space factory; heuristic candidates may change only `heuristic_config`.
-Each heuristic branch must carry a one-sentence explanation. Use
-`--search-rounds` and `--heuristic-rounds` to budget the phases independently.
+The output contains a `heuristic/` agent run plus a top-level `best_kernel.py`,
+compact `summary.json`, and complete `result.json`. Candidates may change only
+`heuristic_config`, and each branch must carry a one-sentence explanation. Use
+`--heuristic-rounds` to budget the search. `--search-rounds` remains accepted as
+a deprecated no-op for command-line compatibility.
 
 `tuning` is also available as the epilogue of `authoring`. Supplying the
 production operation and suite makes the successful authored source—not merely

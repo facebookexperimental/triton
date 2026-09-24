@@ -68,7 +68,12 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--op", default=None, help="tlx.ops name for an inferred production kernel")
     parser.add_argument("--suite", default=None, help="production shape suite for tuning")
-    parser.add_argument("--search-rounds", type=int, default=2)
+    parser.add_argument(
+        "--search-rounds",
+        type=int,
+        default=2,
+        help="deprecated compatibility option; tuning keeps the full space fixed",
+    )
     parser.add_argument("--heuristic-rounds", type=int, default=5)
     parser.add_argument(
         "--reference-kernel",
