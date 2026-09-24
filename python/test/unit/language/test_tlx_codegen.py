@@ -40,8 +40,9 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
 )
 import math
-from triton.language.extra.tlx.tutorials import amd_fa_bwd, amd_fa_varlen_bwd
-from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
+from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _D64DQLaunch,
     _D64Dispatch,
     _D64_GQA_SIGNED,
@@ -2122,7 +2123,7 @@ def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
     ],
 )
 def test_d64_buffer_span_boundaries_guard_dispatch(sq, skv, supported):
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 
     assert amd_fa_bwd._AMD_BUFFER_MAX_ADDRESSABLE_BYTES == (1 << 31) - 1
     assert amd_fa_bwd._D64_MAX_QUERY_SEQUENCE == 8_388_544
@@ -2220,7 +2221,7 @@ def test_d64_buffer_span_boundaries_guard_dispatch(sq, skv, supported):
     ],
 )
 def test_d64_dispatch_validation_rejects_invalid_contracts(q_shape, k_shape, causal, dispatch_kwargs, message):
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 
     assert hasattr(amd_fa_bwd,
                    "_validate_d64_dispatch"), ("D64 dispatch validation must not depend on removable Python asserts")
@@ -2231,7 +2232,7 @@ def test_d64_dispatch_validation_rejects_invalid_contracts(q_shape, k_shape, cau
 
 
 def test_d64_dispatch_validation_rejects_incomplete_dq_launch_plan():
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 
     q_shape = (4, 48, 4096, 64)
     k_shape = (4, 6, 4096, 64)
@@ -2287,7 +2288,7 @@ def test_d64_dispatch_validation_rejects_incomplete_dq_launch_plan():
     ],
 )
 def test_d64_dispatch_validation_rejects_incompatible_selected_modes(q_shape, k_shape, changes, message):
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 
     dispatch = amd_fa_bwd._select_d64_dispatch(
         q_shape,
@@ -2367,7 +2368,7 @@ def test_d64_dispatch_validation_rejects_incompatible_selected_modes(q_shape, k_
     ],
 )
 def test_d64_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal, family):
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 
     dispatch = amd_fa_bwd._select_d64_dispatch(
         q_shape,
@@ -2789,7 +2790,7 @@ def test_buffer_atomic_rejects_unsupported_i16_gfx950():
 
 
 def test_pinned_buffer_load_layout_survives_optimization_gfx950():
-    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
         _attn_bwd_dq_native_convert_kernel, )
 
     compiled = compile_for_gfx950(
@@ -2808,7 +2809,7 @@ def test_pinned_buffer_load_layout_survives_optimization_gfx950():
 
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
-    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
         _attn_bwd_dkdv_dq_d128_gqa_kernel, )
 
     # At N=16384 and D=128, 512 BF16 heads exactly fill the signed 32-bit
@@ -2861,7 +2862,7 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
 
 
 def test_gqa_oversized_head_rebases_native_conversion_gfx950():
-    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
         _attn_bwd_dq_native_convert_kernel, )
 
     compiled = compile_for_gfx950(

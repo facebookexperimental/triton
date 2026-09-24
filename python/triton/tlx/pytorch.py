@@ -1,0 +1,273 @@
+"""Opt-in PyTorch dispatcher integration for TLX FlashAttention kernels.
+
+Importing this module registers the ``TLX_GFX950_BWD`` provider with
+``torch.nn.attention``. It does not activate the provider. Activation replaces
+only dense FlashAttention backward; PyTorch continues to own forward and every
+unsupported backward call is sent to the CUDA kernel captured at activation.
+"""
+
+from __future__ import annotations
+
+import functools
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+PROVIDER_NAME = "TLX_GFX950_BWD"
+_D64_ROUTE = "d64"
+_D128_ROUTE = "d128"
+_D256_ROUTE = "d256"
+_REQUIRED_BASE_ALIGNMENT_BYTES = 16
+# Exact (Q shape, K/V shape, causal) signatures measured through the activated
+# provider on MI350X. Each entry records the measured route configuration so
+# experimental tuning overrides cannot silently select an unmeasured route.
+_PERFORMANCE_VALIDATED_SIGNATURES = {
+    ((1, 16, 4096, 64), (1, 2, 4096, 64), False): (_D64_ROUTE, "noncausal_fused_n256"),
+    ((1, 16, 4096, 64), (1, 16, 4096, 64), False): (_D64_ROUTE, "noncausal_fused_n256"),
+    ((1, 24, 4096, 64), (1, 24, 4096, 64), True): (_D64_ROUTE, "causal_scheduled_mha"),
+    ((4, 48, 1024, 64), (4, 6, 1024, 64), True): (_D64_ROUTE, "causal_scheduled_gqa8"),
+    ((16, 64, 1024, 128), (16, 8, 1024, 128), False): (_D128_ROUTE, None),
+    ((16, 64, 2048, 128), (16, 8, 2048, 128), False): (_D128_ROUTE, None),
+    ((16, 64, 4096, 128), (16, 8, 4096, 128), False): (_D128_ROUTE, None),
+    ((32, 1, 2600, 256), (32, 1, 2600, 256), False): (_D256_ROUTE, (4, False, True)),
+    ((32, 1, 2600, 256), (32, 1, 2600, 256), True): (_D256_ROUTE, (4, False, False)),
+}
+
+
+@dataclass
+class _TLXFlashAttentionHandle:
+    library: torch.library.Library | None
+
+    def remove(self) -> None:
+        # torch.library.Library deregisters its implementations on destruction.
+        self.library = None
+
+
+def _native_fallback(
+    native_kernel,
+    dispatch_keys,
+    grad_out,
+    query,
+    key,
+    value,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    philox_seed,
+    philox_offset,
+    *,
+    scale,
+):
+    return native_kernel.call_boxed(
+        dispatch_keys,
+        grad_out,
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        cum_seq_q,
+        cum_seq_k,
+        max_q,
+        max_k,
+        dropout_p,
+        is_causal,
+        philox_seed,
+        philox_offset,
+        scale=scale,
+    )
+
+
+def _is_performance_validated(query, key, value, out, grad_out, logsumexp, scale, is_causal):
+    signature = (tuple(query.shape), tuple(key.shape), bool(is_causal))
+    route = _PERFORMANCE_VALIDATED_SIGNATURES.get(signature)
+    if route is None:
+        return False
+    try:
+        if any(tensor.data_ptr() % _REQUIRED_BASE_ALIGNMENT_BYTES
+               for tensor in (query, key, value, out, grad_out, logsumexp)):
+            return False
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
+    route_kind, expected_config = route
+    if route_kind == _D128_ROUTE:
+        return not any(gfx950_bwd._d128_regalloc_options().values())
+    if route_kind == _D256_ROUTE:
+        dispatch = gfx950_bwd._select_d256_dispatch(is_causal)
+        return (dispatch.num_warps, dispatch.staged, dispatch.pipelined) == expected_config
+
+    if route_kind != _D64_ROUTE:
+        return False
+    try:
+        dispatch = gfx950_bwd._select_d64_dispatch_for_device(
+            query,
+            key,
+            value,
+            out,
+            grad_out,
+            logsumexp,
+            scale,
+            is_causal,
+        )
+    except (AssertionError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    return dispatch.family == expected_config
+
+
+def _tlx_support_error(
+    grad_out,
+    query,
+    key,
+    value,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    *,
+    scale,
+):
+    if dropout_p != 0.0:
+        return "dropout_p must be zero"
+    if cum_seq_q is not None or cum_seq_k is not None:
+        return "only dense attention is supported"
+    if query.layout is not torch.strided:
+        return "query must use strided layout"
+    if torch.are_deterministic_algorithms_enabled():
+        return "deterministic algorithms are enabled"
+    if query.ndim != 4 or key.ndim != 4:
+        return "query and key must be rank-4 BHSD tensors"
+    if query.shape[-1] <= 0:
+        return "query head dimension must be positive"
+    if max_q != query.shape[2] or max_k != key.shape[2]:
+        return "max_q and max_k must match the dense sequence lengths"
+
+    resolved_scale = query.shape[-1]**-0.5 if scale is None else scale
+    error = gfx950_bwd.fa_backward_support_error(
+        query,
+        key,
+        value,
+        out,
+        grad_out,
+        logsumexp,
+        resolved_scale,
+        is_causal,
+    )
+    if error is not None:
+        return error
+    if not _is_performance_validated(query, key, value, out, grad_out, logsumexp, resolved_scale, is_causal):
+        return "shape is supported but not performance-validated for dispatcher use"
+    return None
+
+
+def _tlx_scaled_dot_product_flash_attention_backward(
+    native_kernel,
+    dispatch_keys,
+    grad_out,
+    query,
+    key,
+    value,
+    out,
+    logsumexp,
+    cum_seq_q,
+    cum_seq_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    philox_seed,
+    philox_offset,
+    *,
+    scale=None,
+):
+    error = _tlx_support_error(
+        grad_out,
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        cum_seq_q,
+        cum_seq_k,
+        max_q,
+        max_k,
+        dropout_p,
+        is_causal,
+        scale=scale,
+    )
+    if error is not None:
+        return _native_fallback(
+            native_kernel,
+            dispatch_keys,
+            grad_out,
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            cum_seq_q,
+            cum_seq_k,
+            max_q,
+            max_k,
+            dropout_p,
+            is_causal,
+            philox_seed,
+            philox_offset,
+            scale=scale,
+        )
+
+    resolved_scale = query.shape[-1]**-0.5 if scale is None else scale
+    return gfx950_bwd.fa_backward(
+        query,
+        key,
+        value,
+        out,
+        grad_out,
+        logsumexp,
+        resolved_scale,
+        is_causal,
+    )
+
+
+def register_tlx_gfx950_flash_attention_backward() -> _TLXFlashAttentionHandle:
+    """Install the conditional gfx950 dense-backward dispatcher override."""
+    get_kernel = getattr(torch.library, "get_kernel", None)
+    if get_kernel is None:
+        raise RuntimeError("TLX FlashAttention integration requires torch.library.get_kernel")
+
+    op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+    native_kernel: Any = get_kernel(op, "CUDA")
+    library = torch.library.Library("aten", "IMPL", "CUDA")
+    library.impl(
+        "_scaled_dot_product_flash_attention_backward",
+        functools.partial(_tlx_scaled_dot_product_flash_attention_backward, native_kernel),
+        "CUDA",
+        with_keyset=True,
+    )
+    return _TLXFlashAttentionHandle(library)
+
+
+try:
+    from torch.nn.attention import register_flash_attention_impl
+except ImportError as error:
+    raise ImportError(
+        "TLX FlashAttention integration requires torch.nn.attention.register_flash_attention_impl") from error
+
+register_flash_attention_impl(
+    PROVIDER_NAME,
+    register_fn=register_tlx_gfx950_flash_attention_backward,
+)
+
+__all__ = ["PROVIDER_NAME", "register_tlx_gfx950_flash_attention_backward"]

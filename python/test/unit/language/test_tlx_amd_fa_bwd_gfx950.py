@@ -1,18 +1,57 @@
 """TLX AMD tests -- CDNA4 (gfx950)."""
 
-from dataclasses import replace
+import contextlib
+from dataclasses import dataclass, replace
+import importlib
 import inspect
+import os
 import re
+import unittest
+from unittest import mock
 
 import pytest
 import torch
-from triton.language.extra.tlx.tutorials import amd_fa_bwd, amd_fa_varlen_bwd
-from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
-    ReferenceCase,
+from triton._internal_testing import is_hip_cdna4
+from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
+from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _select_d64_dispatch,
     fa_backward,
-    is_hip_cdna4,
 )
+
+
+def flash_attention_registry_available() -> bool:
+    """True when torch exposes the public conditional-provider APIs."""
+    try:
+        import torch.nn.attention as attention
+
+        return all(
+            hasattr(attention, name) for name in (
+                "activate_flash_attention_impl",
+                "current_flash_attention_impl",
+                "list_flash_attention_impls",
+                "register_flash_attention_impl",
+                "restore_flash_attention_impl",
+            )) and hasattr(torch.library, "get_kernel")
+    except ImportError:
+        return False
+
+
+@dataclass(frozen=True)
+class ReferenceCase:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    o: torch.Tensor
+    do: torch.Tensor
+    lse: torch.Tensor
+    sm_scale: float
+    causal: bool
+    grads: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+    @property
+    def kernel_args(self):
+        return (self.q, self.k, self.v, self.o, self.do, self.lse, self.sm_scale, self.causal)
 
 
 def _make_d64_aten_case(shape, *, causal, seed):
@@ -191,6 +230,559 @@ def _make_varlen_d128_reference_case(
         expected_dk.to(torch.bfloat16),
         expected_dv.to(torch.bfloat16),
     )
+
+
+@unittest.skipUnless(
+    flash_attention_registry_available(),
+    "Need the public PyTorch FlashAttention provider registry",
+)
+class TestTLXFlashAttentionProvider(unittest.TestCase):
+
+    class _NativeKernel:
+
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def call_boxed(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self.result
+
+    @staticmethod
+    def _wrapper_args(shape=(1, 1, 2, 4)):
+        query = torch.randn(shape)
+        key = torch.randn(shape)
+        value = torch.randn(shape)
+        out_storage = torch.randn((*shape[:-1], 2 * shape[-1]))
+        grad_storage = torch.randn_like(out_storage)
+        lse_storage = torch.randn((*shape[:-1], 2))
+        out = out_storage[..., ::2]
+        grad_out = grad_storage[..., ::2]
+        logsumexp = lse_storage[..., 0]
+        return (
+            grad_out,
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            None,
+            None,
+            shape[2],
+            shape[2],
+            0.0,
+            False,
+            torch.tensor(0, dtype=torch.int64),
+            torch.tensor(0, dtype=torch.int64),
+        )
+
+    @staticmethod
+    def _performance_tensors(q_shape, k_shape):
+        tensors = [mock.Mock(shape=q_shape) for _ in range(6)]
+        tensors[1].shape = k_shape
+        for tensor in tensors:
+            tensor.data_ptr.return_value = 0
+        return tensors
+
+    def test_import_registers_without_activation(self):
+        import torch.nn.attention as attention
+
+        active = attention.current_flash_attention_impl()
+        provider = importlib.import_module("triton.tlx.pytorch")
+        with mock.patch.object(
+                attention,
+                "register_flash_attention_impl",
+                wraps=attention.register_flash_attention_impl,
+        ) as register:
+            provider = importlib.reload(provider)
+
+        register.assert_called_once_with(
+            provider.PROVIDER_NAME,
+            register_fn=provider.register_tlx_gfx950_flash_attention_backward,
+        )
+        self.assertIn(provider.PROVIDER_NAME, attention.list_flash_attention_impls())
+        self.assertEqual(attention.current_flash_attention_impl(), active)
+
+    def test_tlx_route_maps_arguments_without_hidden_copies(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args()
+        expected = tuple(torch.empty(0) for _ in range(3))
+        native = self._NativeKernel(result=None)
+        with (
+                mock.patch.object(provider, "_tlx_support_error", return_value=None),
+                mock.patch.object(provider.gfx950_bwd, "fa_backward", return_value=expected) as tlx_backward,
+        ):
+            actual = provider._tlx_scaled_dot_product_flash_attention_backward(
+                native,
+                object(),
+                *args,
+                scale=None,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(native.calls, [])
+        tlx_backward.assert_called_once()
+        call = tlx_backward.call_args.args
+        self.assertIs(call[0], args[1])
+        self.assertIs(call[1], args[2])
+        self.assertIs(call[2], args[3])
+        self.assertIs(call[3], args[4])
+        self.assertIs(call[4], args[0])
+        self.assertIs(call[5], args[5])
+        self.assertEqual(call[6], args[1].shape[-1]**-0.5)
+        self.assertIs(call[7], args[11])
+
+    def test_support_gate_runs_before_performance_gate(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args()
+        with (
+                mock.patch.object(
+                    provider.gfx950_bwd,
+                    "fa_backward_support_error",
+                    return_value="kernel contract rejected the call",
+                ) as support,
+                mock.patch.object(provider, "_is_performance_validated") as performance,
+        ):
+            error = provider._tlx_support_error(*args[:12], scale=0.5)
+
+        self.assertEqual(error, "kernel contract rejected the call")
+        support.assert_called_once_with(args[1], args[2], args[3], args[4], args[0], args[5], 0.5, args[11])
+        performance.assert_not_called()
+
+    def test_support_gate_rejects_unsupported_dispatch_contracts(self):
+        from triton.tlx import pytorch as provider
+
+        cases = []
+        args = list(self._wrapper_args())
+        args[10] = 0.1
+        cases.append(("dropout", args, False, "dropout_p must be zero"))
+        args = list(self._wrapper_args())
+        args[6] = torch.tensor([0, 2])
+        cases.append(("varlen", args, False, "only dense attention is supported"))
+        args = list(self._wrapper_args())
+        args[1] = args[1].to_sparse()
+        cases.append(("layout", args, False, "query must use strided layout"))
+        args = list(self._wrapper_args())
+        cases.append(("deterministic", args, True, "deterministic algorithms are enabled"))
+        args = list(self._wrapper_args())
+        args[1] = torch.randn(1, 2, 4)
+        cases.append(("rank", args, False, "query and key must be rank-4 BHSD tensors"))
+        args = list(self._wrapper_args())
+        args[8] += 1
+        cases.append(("sequence length", args, False, "max_q and max_k must match the dense sequence lengths"))
+
+        for name, args, deterministic, expected in cases:
+            with (
+                    self.subTest(case=name),
+                    mock.patch.object(torch, "are_deterministic_algorithms_enabled", return_value=deterministic),
+                    mock.patch.object(provider.gfx950_bwd, "fa_backward_support_error") as support,
+                    mock.patch.object(provider, "_is_performance_validated") as performance,
+            ):
+                self.assertEqual(provider._tlx_support_error(*args[:12], scale=None), expected)
+                support.assert_not_called()
+                performance.assert_not_called()
+
+        args = self._wrapper_args()
+        with (
+                mock.patch.object(provider.gfx950_bwd, "fa_backward_support_error", return_value=None),
+                mock.patch.object(provider, "_is_performance_validated", return_value=False),
+        ):
+            self.assertEqual(
+                provider._tlx_support_error(*args[:12], scale=None),
+                "shape is supported but not performance-validated for dispatcher use",
+            )
+
+    def test_unsupported_route_calls_captured_kernel_once(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args()
+        expected = tuple(torch.empty(0) for _ in range(3))
+        native = self._NativeKernel(expected)
+        keyset = object()
+        with (
+                mock.patch.object(provider, "_tlx_support_error", return_value="unsupported"),
+                mock.patch.object(provider.gfx950_bwd, "fa_backward") as tlx_backward,
+        ):
+            actual = provider._tlx_scaled_dot_product_flash_attention_backward(
+                native,
+                keyset,
+                *args,
+                scale=0.25,
+            )
+
+        self.assertIs(actual, expected)
+        tlx_backward.assert_not_called()
+        self.assertEqual(len(native.calls), 1)
+        fallback_args, fallback_kwargs = native.calls[0]
+        self.assertIs(fallback_args[0], keyset)
+        for actual_arg, expected_arg in zip(fallback_args[1:], args, strict=True):
+            self.assertIs(actual_arg, expected_arg)
+        self.assertEqual(fallback_kwargs, {"scale": 0.25})
+
+    def test_zero_head_dimension_uses_native_fallback(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args(shape=(1, 1, 2, 0))
+        expected = tuple(torch.empty(0) for _ in range(3))
+        native = self._NativeKernel(expected)
+        keyset = object()
+        with mock.patch.object(provider.gfx950_bwd, "fa_backward") as tlx_backward:
+            actual = provider._tlx_scaled_dot_product_flash_attention_backward(
+                native,
+                keyset,
+                *args,
+                scale=None,
+            )
+
+        self.assertIs(actual, expected)
+        tlx_backward.assert_not_called()
+        self.assertEqual(len(native.calls), 1)
+
+    def test_registration_captures_kernel_at_each_activation(self):
+        from triton.tlx import pytorch as provider
+
+        first = object()
+        second = object()
+        libraries = [mock.Mock(), mock.Mock()]
+        with (
+                mock.patch.object(torch.library, "get_kernel", side_effect=(first, second)) as get_kernel,
+                mock.patch.object(torch.library, "Library", side_effect=libraries),
+        ):
+            first_handle = provider.register_tlx_gfx950_flash_attention_backward()
+            second_handle = provider.register_tlx_gfx950_flash_attention_backward()
+
+        self.assertEqual(get_kernel.call_count, 2)
+        for library, original in zip(libraries, (first, second), strict=True):
+            implementation = library.impl.call_args.args[1]
+            self.assertIs(implementation.args[0], original)
+            self.assertTrue(library.impl.call_args.kwargs["with_keyset"])
+        first_handle.remove()
+        second_handle.remove()
+        self.assertIsNone(first_handle.library)
+        self.assertIsNone(second_handle.library)
+
+    def test_only_measured_signatures_are_selected(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((1, 16, 4096, 64), (1, 2, 4096, 64))
+        with mock.patch.object(
+                provider.gfx950_bwd,
+                "_select_d64_dispatch_for_device",
+                return_value=mock.Mock(family="noncausal_fused_n256"),
+        ):
+            self.assertTrue(provider._is_performance_validated(*tensors, 0.125, False))
+            self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+
+        # This maps to the same noncausal fused family, but its checked-in CK
+        # benchmark loses. Family-wide routing would incorrectly select TLX.
+        tensors = self._performance_tensors((2, 32, 16384, 64), (2, 4, 16384, 64))
+        self.assertFalse(provider._is_performance_validated(*tensors, 0.125, False))
+
+    def test_d64_signature_requires_measured_dispatch_family(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((4, 48, 1024, 64), (4, 6, 1024, 64))
+        with mock.patch.object(
+                provider.gfx950_bwd,
+                "_select_d64_dispatch_for_device",
+                return_value=mock.Mock(family="causal_scheduled_gqa8"),
+        ):
+            self.assertTrue(provider._is_performance_validated(*tensors, 0.125, True))
+        with mock.patch.object(
+                provider.gfx950_bwd,
+                "_select_d64_dispatch_for_device",
+                return_value=mock.Mock(family="causal_m192"),
+        ):
+            self.assertFalse(provider._is_performance_validated(*tensors, -0.125, True))
+
+    def test_short_d128_is_not_selected_on_backward_only_gain(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((16, 27, 200, 128), (16, 27, 200, 128))
+        self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+    def test_every_tensor_base_must_be_aligned(self):
+        from triton.tlx import pytorch as provider
+
+        names = ("query", "key", "value", "out", "grad_out", "logsumexp")
+        tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
+            for name, tensor in zip(names, tensors, strict=True):
+                with self.subTest(tensor=name):
+                    tensor.data_ptr.return_value = 2
+                    self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+                    tensor.data_ptr.return_value = 0
+
+    def test_d128_experimental_regalloc_options_are_not_selected(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
+        options = (
+            amd_fa_bwd._D128_SINK_INSTS_ENV,
+            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+            amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
+        for option in options:
+            with self.subTest(option=option), mock.patch.dict(os.environ, {option: "1"}, clear=True):
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+    def test_d256_forced_staged_route_is_not_selected(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((32, 1, 2600, 256), (32, 1, 2600, 256))
+        with mock.patch.dict(os.environ, {"TLX_FA_BWD_FORCE_STAGED": "1"}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 256**-0.5, False))
+            self.assertFalse(provider._is_performance_validated(*tensors, 256**-0.5, True))
+
+
+@unittest.skipUnless(is_hip_cdna4(), "Requires gfx950 hardware")
+class TestDenseFABackwardSupportGfx950(unittest.TestCase):
+
+    @staticmethod
+    def _aligned_support_args():
+        shape = (1, 1, 256, 64)
+        q = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+        out = torch.empty_like(q)
+        grad_out = torch.empty_like(q)
+        lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+        return [q, k, v, out, grad_out, lse]
+
+    def test_support_gate_rejects_nonfinite_scale(self):
+        args = self._aligned_support_args()
+        self.assertIsNone(amd_fa_bwd.fa_backward_support_error(*args, 0.125, False))
+        for scale in (float("inf"), float("nan")):
+            with self.subTest(scale=scale):
+                self.assertEqual(
+                    amd_fa_bwd.fa_backward_support_error(*args, scale, False),
+                    "sm_scale must be a finite number",
+                )
+
+    def test_d256_scratch_producer_covers_consumer(self):
+        shape = (32, 1, 2600, 256)
+        q = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.ones_like(q)
+        v = torch.zeros_like(q)
+        out = torch.zeros_like(q)
+        grad_out = torch.zeros_like(q)
+        lse = torch.zeros(shape[:-1], device="cuda", dtype=torch.float32)
+        scale = shape[-1]**-0.5
+
+        for causal in (False, True):
+            with self.subTest(causal=causal):
+                delta = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+                dq = torch.empty_like(q)
+                dk = torch.empty_like(k)
+                dv = torch.empty_like(v)
+                amd_fa_bwd._run_bwd_preprocess(out, grad_out, delta)
+                amd_fa_bwd._run_bwd_d256(
+                    q,
+                    k,
+                    v,
+                    grad_out,
+                    lse,
+                    delta,
+                    dq,
+                    dk,
+                    dv,
+                    scale,
+                    causal,
+                    poison_scratch=True,
+                )
+                self.assertTrue(torch.isfinite(dq).all().item())
+
+
+@unittest.skipUnless(
+    flash_attention_registry_available() and is_hip_cdna4(),
+    "Need the public PyTorch registry and AMD MI350X (gfx950)",
+)
+class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
+
+    @contextlib.contextmanager
+    def _activated(self):
+        import torch.nn.attention as attention
+        from triton.tlx import pytorch as provider
+
+        previous = attention.current_flash_attention_impl()
+        attention.activate_flash_attention_impl(provider.PROVIDER_NAME)
+        try:
+            yield provider
+        finally:
+            attention.restore_flash_attention_impl()
+            if previous is not None:
+                attention.activate_flash_attention_impl(previous)
+
+    @staticmethod
+    def _run_sdpa_grads(query, key, value, grad_out, *, causal, enable_gqa):
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        q, k, v = (tensor.detach().requires_grad_(True) for tensor in (query, key, value))
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=causal,
+                enable_gqa=enable_gqa,
+            )
+        return torch.autograd.grad(out, (q, k, v), grad_out)
+
+    def _assert_sdpa_autograd_routes_to_tlx(
+        self,
+        query_shape,
+        key_shape,
+        *,
+        causal,
+        enable_gqa=False,
+        seed,
+        max_relative_l2,
+    ):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        query = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        key = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        value = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        grad_out = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+
+        expected = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        with self._activated(), mock.patch.object(
+                amd_fa_bwd,
+                "fa_backward",
+                wraps=amd_fa_bwd.fa_backward,
+        ) as tlx_backward:
+            actual = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        tlx_backward.assert_called_once()
+        self.assertTrue(all(tensor.is_contiguous() for tensor in tlx_backward.call_args.args[:6]))
+        for result, reference in zip(actual, expected, strict=True):
+            relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+                reference.float())
+            self.assertLess(relative_l2.item(), max_relative_l2)
+
+    def _assert_misaligned_query_uses_native(self, query_shape, key_shape, *, causal, enable_gqa, seed):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        query_storage = torch.randn(
+            torch.Size(query_shape).numel() + 1,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        query = query_storage[1:].view(query_shape)
+        self.assertTrue(query.is_contiguous())
+        self.assertNotEqual(query.data_ptr() % 16, 0)
+        key = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        value = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        grad_out = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+
+        expected = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        with self._activated(), mock.patch.object(
+                amd_fa_bwd,
+                "fa_backward",
+                wraps=amd_fa_bwd.fa_backward,
+        ) as tlx_backward:
+            actual = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        tlx_backward.assert_not_called()
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference)
+
+    def test_sdpa_autograd_routes_d64_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (1, 24, 4096, 64),
+            (1, 24, 4096, 64),
+            causal=True,
+            seed=3639,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_d64_noncausal_mha_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (1, 16, 4096, 64),
+            (1, 16, 4096, 64),
+            causal=False,
+            seed=3642,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_d128_gqa_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (16, 64, 1024, 128),
+            (16, 8, 1024, 128),
+            causal=False,
+            enable_gqa=True,
+            seed=3640,
+            max_relative_l2=1e-2,
+        )
+
+    def test_sdpa_autograd_routes_d256_to_tlx(self):
+        for causal in (False, True):
+            with self.subTest(causal=causal):
+                self._assert_sdpa_autograd_routes_to_tlx(
+                    (32, 1, 2600, 256),
+                    (32, 1, 2600, 256),
+                    causal=causal,
+                    seed=3641 + causal,
+                    max_relative_l2=1e-2,
+                )
+
+    def test_measured_causal_d64_shape_with_misaligned_base_uses_native(self):
+        self._assert_misaligned_query_uses_native(
+            (4, 48, 1024, 64),
+            (4, 6, 1024, 64),
+            causal=True,
+            enable_gqa=True,
+            seed=3643,
+        )
+
+    def test_measured_d128_shape_with_misaligned_base_uses_native(self):
+        self._assert_misaligned_query_uses_native(
+            (16, 64, 1024, 128),
+            (16, 8, 1024, 128),
+            causal=False,
+            enable_gqa=True,
+            seed=3644,
+        )
+
+    def test_unprofitable_shape_uses_native_fallback(self):
+        shape = (1, 8, 256, 64)
+        q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        grad_out = torch.randn_like(q)
+        state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, False, False)
+        out, lse, cum_q, cum_k, max_q, max_k, seed, offset, _ = state
+
+        def backward():
+            return torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+                grad_out,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                cum_q,
+                cum_k,
+                max_q,
+                max_k,
+                0.0,
+                False,
+                seed,
+                offset,
+            )
+
+        expected = backward()
+        with self._activated(), mock.patch.object(
+                amd_fa_bwd,
+                "fa_backward",
+                wraps=amd_fa_bwd.fa_backward,
+        ) as tlx_backward:
+            actual = backward()
+        tlx_backward.assert_not_called()
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

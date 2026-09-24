@@ -1550,7 +1550,7 @@ def test_concrete_helper_release_preserves_values_gfx950(condition):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_pinned_buffer_load_layout_correctness_gfx950(device):
-    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
         _attn_bwd_dq_native_convert_kernel, )
 
     m = torch.arange(128, device=device, dtype=torch.int64)[:, None]
