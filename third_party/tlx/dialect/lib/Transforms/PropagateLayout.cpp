@@ -31,18 +31,19 @@ namespace tlx {
 #define GEN_PASS_DEF_TLXPROPAGATELAYOUT
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
-static bool hasCoordinateRematerializationAttrs(Operation *op) {
-  return op->hasAttr("tlx.rematerialize_coordinates") ||
-         op->hasAttr("tlx.rematerialize_coordinates_group");
+static bool hasCoordinateRematerializationAttr(Operation *op) {
+  return op->hasAttr("tlx.rematerialize_coordinates");
 }
 
-static void copyCoordinateRematerializationAttrs(Operation *source,
-                                                 Operation *target) {
+static void copyCoordinateRematerializationAttr(Operation *source,
+                                                Operation *target) {
   if (Attribute attr = source->getAttr("tlx.rematerialize_coordinates"))
     target->setAttr("tlx.rematerialize_coordinates", attr);
-  if (Attribute attr =
-          source->getAttr("tlx.rematerialize_coordinates_group"))
-    target->setAttr("tlx.rematerialize_coordinates_group", attr);
+}
+
+static bool hasCoordinateRematerializationMetadata(Operation *op) {
+  return op->hasAttr("tlx.rematerialize_coordinates") ||
+         op->hasAttr("tlx.rematerialize_coordinates_group");
 }
 
 class RequireLayoutPattern : public mlir::OpRewritePattern<RequireLayoutOp> {
@@ -62,14 +63,14 @@ public:
       auto boundary = ttg::RequireLayoutOp::create(
           rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
           requireLayoutOp.getSrc());
-      copyCoordinateRematerializationAttrs(requireLayoutOp, boundary);
+      copyCoordinateRematerializationAttr(requireLayoutOp, boundary);
       rewriter.replaceOp(requireLayoutOp, boundary);
       return success();
     }
-    bool hasRematerializationMetadata =
-        hasCoordinateRematerializationAttrs(requireLayoutOp);
+    bool rematerializeCoordinates =
+        hasCoordinateRematerializationAttr(requireLayoutOp);
     if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType() &&
-        !hasRematerializationMetadata) {
+        !rematerializeCoordinates) {
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
@@ -77,8 +78,8 @@ public:
     auto convert = ttg::ConvertLayoutOp::create(
         rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
         requireLayoutOp.getSrc());
-    if (hasRematerializationMetadata)
-      copyCoordinateRematerializationAttrs(requireLayoutOp, convert);
+    if (rematerializeCoordinates)
+      copyCoordinateRematerializationAttr(requireLayoutOp, convert);
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
   }
@@ -131,7 +132,8 @@ public:
     auto allocOp = localLoadOp.getSrc().getDefiningOp<ttg::LocalAllocOp>();
     if (!allocOp || !allocOp.getSrc())
       return failure();
-    if (isUserPinnedAlloc(allocOp))
+    if (isUserPinnedAlloc(allocOp) ||
+        hasCoordinateRematerializationMetadata(localLoadOp))
       return failure();
     if (localLoadOp.getToken())
       return failure();
@@ -171,7 +173,8 @@ public:
     SmallVector<ttg::LocalLoadOp> loads;
     for (Operation *user : allocOp->getUsers()) {
       auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
-      if (!localLoadOp || localLoadOp.getToken())
+      if (!localLoadOp || localLoadOp.getToken() ||
+          hasCoordinateRematerializationMetadata(localLoadOp))
         return failure();
       auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
       if (!resultType ||
@@ -451,7 +454,7 @@ static bool isRetaggableLocalAllocLoadFallback(ttg::LocalAllocOp allocOp) {
 
   for (Operation *user : allocOp->getUsers()) {
     auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
-    if (!localLoadOp)
+    if (!localLoadOp || hasCoordinateRematerializationMetadata(localLoadOp))
       return false;
     auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
     if (!resultType ||

@@ -29,18 +29,14 @@ namespace tlx {
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
-static bool hasCoordinateRematerializationAttrs(Operation *op) {
-  return op->hasAttr("tlx.rematerialize_coordinates") ||
-         op->hasAttr("tlx.rematerialize_coordinates_group");
+static bool hasCoordinateRematerializationAttr(Operation *op) {
+  return op->hasAttr("tlx.rematerialize_coordinates");
 }
 
-static void copyCoordinateRematerializationAttrs(Operation *source,
-                                                 Operation *target) {
+static void copyCoordinateRematerializationAttr(Operation *source,
+                                                Operation *target) {
   if (Attribute attr = source->getAttr("tlx.rematerialize_coordinates"))
     target->setAttr("tlx.rematerialize_coordinates", attr);
-  if (Attribute attr =
-          source->getAttr("tlx.rematerialize_coordinates_group"))
-    target->setAttr("tlx.rematerialize_coordinates_group", attr);
 }
 
 /// Check if an attribute is any of the dummy layout types
@@ -542,13 +538,12 @@ static void lowerRequireLayouts(ModuleOp moduleOp) {
   moduleOp.walk([&](ttg::RequireLayoutOp op) { requireLayouts.push_back(op); });
 
   for (ttg::RequireLayoutOp op : requireLayouts) {
-    bool hasRematerializationMetadata =
-        hasCoordinateRematerializationAttrs(op);
+    bool rematerializeCoordinates = hasCoordinateRematerializationAttr(op);
     if (op.getSrc().getType() == op.getType()) {
-      if (hasRematerializationMetadata) {
+      if (rematerializeCoordinates) {
         if (auto sourceConvert =
                 op.getSrc().getDefiningOp<ttg::ConvertLayoutOp>()) {
-          copyCoordinateRematerializationAttrs(op, sourceConvert);
+          copyCoordinateRematerializationAttr(op, sourceConvert);
           op.getResult().replaceAllUsesWith(op.getSrc());
           op.erase();
           continue;
@@ -563,8 +558,8 @@ static void lowerRequireLayouts(ModuleOp moduleOp) {
     OpBuilder builder(op);
     auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
                                                 op.getType(), op.getSrc());
-    if (hasRematerializationMetadata)
-      copyCoordinateRematerializationAttrs(op, convert);
+    if (rematerializeCoordinates)
+      copyCoordinateRematerializationAttr(op, convert);
     op.getResult().replaceAllUsesWith(convert.getResult());
     op.erase();
   }
@@ -572,8 +567,7 @@ static void lowerRequireLayouts(ModuleOp moduleOp) {
 
 static void lowerReleaseLayouts(ModuleOp moduleOp) {
   SmallVector<ttg::ReleaseLayoutOp> releaseLayouts;
-  moduleOp.walk(
-      [&](ttg::ReleaseLayoutOp op) { releaseLayouts.push_back(op); });
+  moduleOp.walk([&](ttg::ReleaseLayoutOp op) { releaseLayouts.push_back(op); });
 
   for (ttg::ReleaseLayoutOp op : releaseLayouts) {
     if (op.getSrc().getType() == op.getType()) {
@@ -630,7 +624,7 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   SmallVector<ttg::ConvertLayoutOp> identityConversions;
   moduleOp.walk([&](ttg::ConvertLayoutOp convert) {
     if (convert.getSrc().getType() == convert.getType() &&
-        !hasCoordinateRematerializationAttrs(convert))
+        !hasCoordinateRematerializationAttr(convert))
       identityConversions.push_back(convert);
   });
   for (ttg::ConvertLayoutOp convert : identityConversions) {

@@ -135,25 +135,63 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
 
 // -----
 
-// Coordinate-rematerialization groups are semantic metadata on a pinned
-// boundary. Propagation and finalization must preserve the group even when
-// unwrapping makes the eventual conversion an identity.
+// Coordinate-rematerialization groups belong to concrete local loads. The
+// boolean request may cross a pinned boundary, but the group must not follow it
+// onto the finalized conversion, even if the source requirement also carries
+// stale group metadata.
 
 #group_physical = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #group_user = #tlx.user_layout<#group_physical>
+#group_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#group_smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
-  // CHECK-LABEL: @preserve_rematerialization_group
-  // CANON-LABEL: @preserve_rematerialization_group
-  tt.func @preserve_rematerialization_group(
+  // CHECK-LABEL: @preserve_load_group_and_boundary_boolean
+  // CANON-LABEL: @preserve_load_group_and_boundary_boolean
+  tt.func @preserve_load_group_and_boundary_boolean(
       %src: tensor<128x64xf16, #group_physical>)
       -> tensor<128x64xf16, #group_user> {
-    // CHECK-NOT: ttg.require_layout
-    // CHECK: %[[REMAT:.*]] = ttg.convert_layout %arg0 {tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #{{.*}}>
-    // CANON: %[[REMAT:.*]] = ttg.convert_layout %arg0 {tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #{{.*}}> -> tensor<128x64xf16, #{{.*}}>
-    %required = tlx.require_layout %src {tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #group_physical> -> tensor<128x64xf16, #group_user>
+    // CHECK: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CHECK: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 21 : i32}
+    // CHECK: %[[REMAT:.*]] = ttg.convert_layout %[[LOAD]] {tlx.rematerialize_coordinates} :
+    // CANON: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CANON: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 21 : i32}
+    // CANON: %[[REMAT:.*]] = ttg.convert_layout %[[LOAD]] {tlx.rematerialize_coordinates} :
+    %buffer = ttg.local_alloc %src : (tensor<128x64xf16, #group_physical>) -> !ttg.memdesc<128x64xf16, #group_shared, #group_smem, mutable>
+    %loaded = ttg.local_load %buffer {tlx.rematerialize_coordinates_group = 21 : i32} : !ttg.memdesc<128x64xf16, #group_shared, #group_smem, mutable> -> tensor<128x64xf16, #group_physical>
+    %required = tlx.require_layout %loaded {tlx.rematerialize_coordinates, tlx.rematerialize_coordinates_group = 21 : i32} : tensor<128x64xf16, #group_physical> -> tensor<128x64xf16, #group_user>
     // CHECK: tt.return %[[REMAT]]
     // CANON: tt.return %[[REMAT]]
     tt.return %required : tensor<128x64xf16, #group_user>
+  }
+}
+
+// -----
+
+// The fallback local_alloc/local_load elimination must not erase active load
+// metadata or move a load-owned group onto a replacement convert_layout.
+
+#fallback_src = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#fallback_dot = #ttg.dot_op<{opIdx = 0, parent = #fallback_src}>
+#fallback_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#fallback_smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @metadata_local_load_not_folded
+  // CANON-LABEL: @metadata_local_load_not_folded
+  tt.func @metadata_local_load_not_folded(
+      %src: tensor<64x32xf16, #fallback_src>)
+      -> tensor<64x32xf16, #fallback_dot> {
+    // CHECK: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CHECK: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 9 : i32, ttg.amdg.syncedViaAsyncWait = true}
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: tt.return %[[LOAD]]
+    // CANON: %[[BUFFER:.*]] = ttg.local_alloc %arg0
+    // CANON: %[[LOAD:.*]] = ttg.local_load %[[BUFFER]] {tlx.rematerialize_coordinates_group = 9 : i32, ttg.amdg.syncedViaAsyncWait = true}
+    // CANON-NOT: ttg.convert_layout
+    // CANON: tt.return %[[LOAD]]
+    %buffer = ttg.local_alloc %src : (tensor<64x32xf16, #fallback_src>) -> !ttg.memdesc<64x32xf16, #fallback_shared, #fallback_smem, mutable>
+    %loaded = ttg.local_load %buffer {tlx.rematerialize_coordinates_group = 9 : i32, ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<64x32xf16, #fallback_shared, #fallback_smem, mutable> -> tensor<64x32xf16, #fallback_dot>
+    tt.return %loaded : tensor<64x32xf16, #fallback_dot>
   }
 }
