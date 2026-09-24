@@ -882,7 +882,8 @@ def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
 
     The region must contain exactly one block and may not contain nested
     dynamic control flow. Cross-lane operations require `wave_uniform`, which
-    declares that every lane in each wavefront observes the same predicate.
+    declares that every lane in each wavefront observes the same predicate, and
+    no enclosing non-wave-uniform predicate may already have masked lanes.
     Reductions spanning multiple warps remain unsupported. Other operations
     with nested regions are rejected. Each init, result, and yielded value at
     a given position must have the same type. A tensor predicate must have the

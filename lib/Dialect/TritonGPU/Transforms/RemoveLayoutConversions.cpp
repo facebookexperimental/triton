@@ -45,6 +45,25 @@ static bool hasPinnedEncoding(Type type) {
   return false;
 }
 
+static bool hasDeferredTlxEncoding(Type type) {
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  return tensorType &&
+         (hasPinnedEncoding(type) ||
+          triton::encodingContainsTlxNoVerifyLayout(tensorType.getEncoding()));
+}
+
+static bool isEffectivelyWaveUniform(WarpPredicateOp predicateOp) {
+  if (!predicateOp.getWaveUniform().value_or(false))
+    return false;
+  for (Operation *parent = predicateOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto enclosing = dyn_cast<WarpPredicateOp>(parent);
+        enclosing && !enclosing.getWaveUniform().value_or(false))
+      return false;
+  }
+  return true;
+}
+
 static bool isPinnedConvertLayout(ConvertLayoutOp op) {
   return hasPinnedEncoding(op.getType());
 }
@@ -173,6 +192,7 @@ public:
   void rewriteIfOp(scf::IfOp ifOp);
   void rewriteWarpPredicateOp(WarpPredicateOp predicateOp);
   void rewriteRequireLayoutOp(RequireLayoutOp requireOp);
+  void rewriteReleaseLayoutOp(ReleaseLayoutOp releaseOp);
   void rewriteYieldOp(scf::YieldOp yieldOp);
   void rewritePredicateYieldOp(PredicateYieldOp yieldOp);
   void rewriteConditionOp(scf::ConditionOp conditionOp);
@@ -930,9 +950,9 @@ projectToPredicateEncoding(RankedTensorType valueType,
 // externally required result layouts after reconvergence.
 LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
   WalkResult walkResult = funcOp.walk([&](WarpPredicateOp predicateOp) {
-    // Wave-uniform predicates permit warp-local cross-lane operations because
-    // every participating wave executes with all lanes active.
-    if (predicateOp.getWaveUniform().value_or(false))
+    // A wave-uniform predicate is cross-lane safe only if no enclosing
+    // non-wave-uniform predicate has already masked lanes from EXEC.
+    if (isEffectivelyWaveUniform(predicateOp))
       return WalkResult::advance();
 
     auto yieldOp = dyn_cast<PredicateYieldOp>(
@@ -983,8 +1003,15 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       // the conversion can be recreated after waves reconverge.
       Value bodyRoot = yielded;
       if (auto boundary = yielded.getDefiningOp<ConvertLayoutOp>();
-          boundary && boundary->hasOneUse())
+          boundary && boundary->hasOneUse()) {
         bodyRoot = boundary.getSrc();
+      } else if (auto release = yielded.getDefiningOp<ReleaseLayoutOp>();
+                 release && release->hasOneUse()) {
+        // Finalization lowers a non-identity release to convert_layout. Treat a
+        // yielded release as that future boundary now, while RLC can still move
+        // the conversion after EXEC reconverges.
+        bodyRoot = release.getSrc();
+      }
       auto bodyRootType = cast<RankedTensorType>(bodyRoot.getType());
       Attribute bodyEncoding = chooseBodyEncoding(bodyRoot, result);
       bodyRoots.push_back(bodyRoot);
@@ -1006,6 +1033,7 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
     // projection when available; register enumeration is checked separately
     // below and is allowed to differ.
     std::optional<Attribute> predicateEncoding;
+    bool skipCarrierResolution = false;
     if (predicateType) {
       for (std::optional<Attribute> candidate : projectedEncodings) {
         if (!candidate)
@@ -1015,8 +1043,9 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
              !isMmaFamilyEncoding(*predicateEncoding)))
           predicateEncoding = *candidate;
       }
-      if (!predicateEncoding)
-        return WalkResult::advance();
+      bool hasTensorCarrier = llvm::any_of(
+          bodyEncodings, [](Attribute encoding) { return bool(encoding); });
+      skipCarrierResolution = !predicateEncoding && hasTensorCarrier;
     }
 
     auto isInsideRestrictedExec = [](Value value) {
@@ -1111,6 +1140,31 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
                                /*preferRequested=*/pinned);
       if (failed(selected))
         return failure();
+
+      // Finalization turns a non-identity release into convert_layout after the
+      // last RLC pass. Under restricted EXEC, force its source to the selected
+      // result encoding now so the release finalizes to an identity.
+      if (auto release = dyn_cast_or_null<ReleaseLayoutOp>(producer)) {
+        if (failed(forceSlice(release.getSrc(), *selected,
+                              /*ignoreRegisterOrder=*/false)))
+          return failure();
+        return *selected;
+      }
+
+      // Finalization also repairs reshapes whose deferred TLX wrapper hid a
+      // source/result inference mismatch. Force the inverse source encoding now
+      // so that repair does not create a conversion under restricted EXEC.
+      if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer);
+          reshape && (hasDeferredTlxEncoding(reshape.getSrc().getType()) ||
+                      hasDeferredTlxEncoding(reshape.getType()))) {
+        Attribute operandEncoding = inferSrcEncoding(reshape, *selected);
+        if (!operandEncoding ||
+            failed(forceSlice(reshape.getSrc(), operandEncoding,
+                              /*ignoreRegisterOrder=*/false)))
+          return failure();
+        return *selected;
+      }
+
       if (layoutsAreEquivalent(valueType, current, *selected,
                                /*ignoreRegisterOrder=*/false))
         return *selected;
@@ -1166,6 +1220,8 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
 
     for (auto [index, result, yielded, bodyRoot] : llvm::enumerate(
              predicateOp.getResults(), yieldOp.getValues(), bodyRoots)) {
+      if (skipCarrierResolution)
+        break;
       auto resultType = dyn_cast<RankedTensorType>(result.getType());
       if (!resultType || !bodyEncodings[index])
         continue;
@@ -1264,6 +1320,51 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
         }
       }
     }
+
+    // Release is a propagation fence, but finalization also treats a
+    // non-identity release as a latent convert_layout. Account for every such
+    // boundary in this restricted region, including releases that do not feed
+    // a carried result, so finalization cannot introduce a cross-lane op after
+    // the last RLC pass.
+    predicateOp.getRegion().walk([&](ReleaseLayoutOp releaseOp) {
+      if (conflict)
+        return WalkResult::interrupt();
+      auto resultType = cast<RankedTensorType>(releaseOp.getType());
+      Attribute encoding = getEffectiveLayoutEncoding(resultType.getEncoding());
+      if (auto forced =
+              forcedWarpPredicateEncodings.find(releaseOp.getResult());
+          forced != forcedWarpPredicateEncodings.end())
+        encoding = forced->second;
+      if (failed(forceSlice(releaseOp.getResult(), encoding,
+                            /*ignoreRegisterOrder=*/false))) {
+        conflict = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+
+    // Wrapper removal can similarly expose a reshape inference mismatch and
+    // repair it with a post-RLC convert_layout. Resolve every wrapped reshape
+    // while conversions can still be placed outside restricted EXEC.
+    predicateOp.getRegion().walk([&](ReshapeOp reshapeOp) {
+      if (conflict)
+        return WalkResult::interrupt();
+      if (!hasDeferredTlxEncoding(reshapeOp.getSrc().getType()) &&
+          !hasDeferredTlxEncoding(reshapeOp.getType()))
+        return WalkResult::advance();
+      auto resultType = cast<RankedTensorType>(reshapeOp.getType());
+      Attribute encoding = getEffectiveLayoutEncoding(resultType.getEncoding());
+      if (auto forced =
+              forcedWarpPredicateEncodings.find(reshapeOp.getResult());
+          forced != forcedWarpPredicateEncodings.end())
+        encoding = forced->second;
+      if (failed(forceSlice(reshapeOp.getResult(), encoding,
+                            /*ignoreRegisterOrder=*/false))) {
+        conflict = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
 
     if (conflict) {
       predicateOp.emitError(
@@ -1459,6 +1560,8 @@ void LayoutPropagation::rewriteRegion(Region &region) {
           queue.push_back(&R);
       } else if (auto requireOp = dyn_cast<RequireLayoutOp>(&op)) {
         rewriteRequireLayoutOp(requireOp);
+      } else if (auto releaseOp = dyn_cast<ReleaseLayoutOp>(&op)) {
+        rewriteReleaseLayoutOp(releaseOp);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(&op)) {
         rewriteYieldOp(yieldOp);
       } else if (auto yieldOp = dyn_cast<PredicateYieldOp>(&op)) {
@@ -1702,6 +1805,8 @@ void LayoutPropagation::rewriteOp(Operation *op) {
     rewriteWarpPredicateOp(predicateOp);
   else if (auto requireOp = dyn_cast<RequireLayoutOp>(op))
     rewriteRequireLayoutOp(requireOp);
+  else if (auto releaseOp = dyn_cast<ReleaseLayoutOp>(op))
+    rewriteReleaseLayoutOp(releaseOp);
   else {
     Attribute encoding = *layouts[op->getResult(0)].encodings.begin();
     if (canUseResultEncoding(op, getEffectiveLayoutEncoding(encoding))) {
@@ -1722,6 +1827,15 @@ void LayoutPropagation::rewriteRequireLayoutOp(RequireLayoutOp requireOp) {
   auto resultType = cast<RankedTensorType>(requireOp.getType());
   requireOp.getSrcMutable().assign(
       getValueAs(requireOp.getSrc(), resultType.getEncoding()));
+}
+
+void LayoutPropagation::rewriteReleaseLayoutOp(ReleaseLayoutOp releaseOp) {
+  auto forced = forcedWarpPredicateEncodings.find(releaseOp.getResult());
+  if (forced == forcedWarpPredicateEncodings.end())
+    return;
+  releaseOp.getSrcMutable().assign(
+      getValueAs(releaseOp.getSrc(), forced->second));
+  setEncodingInPlace(releaseOp.getResult(), forced->second);
 }
 
 bool canBeRemat(Operation *op) {
