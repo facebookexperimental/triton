@@ -192,6 +192,47 @@ def _to_mxfp8_32x32_block(
 
 
 @triton.jit
+def _to_mxfp8_32x32_block_scaled(
+    data_input,
+    input_scale,
+    VEC_SIZE: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """Quantize a scaled input without materializing the scaled FP32 tile."""
+    BLOCK_M: tl.constexpr = data_input.shape[0]
+    BLOCK_K: tl.constexpr = data_input.shape[1]
+    NUM_SCALES: tl.constexpr = BLOCK_K // VEC_SIZE
+    tl.static_assert(VEC_SIZE == 32)
+    tl.static_assert(BLOCK_K % VEC_SIZE == 0)
+    tl.static_assert(BLOCK_M % VEC_SIZE == 0)
+
+    if dtype == tl.float8e4nv:
+        FLOAT_MAX: tl.constexpr = 448.0
+    else:
+        tl.static_assert(dtype == tl.float8e5)
+        FLOAT_MAX: tl.constexpr = 57344.0
+
+    data_reshaped = tl.reshape(data_input, [BLOCK_M, NUM_SCALES, VEC_SIZE])
+    per_row_amax = tl.max(tl.abs(data_reshaped), axis=2)
+    block_amax = warp_redux(per_row_amax, "max")
+    scale_u32, quant_scale = _fused_amax_to_e8m0(
+        block_amax, input_scale * (1.0 / FLOAT_MAX)
+    )
+    scale_e8m0 = scale_u32.to(tl.uint8)
+
+    quant_scale = quant_scale * input_scale
+    quant_scale_expanded = tl.reshape(quant_scale, [BLOCK_M, NUM_SCALES, 1])
+    scaled_data = _mul_f32x2(data_reshaped, quant_scale_expanded)
+
+    if dtype == tl.float8e4nv:
+        data_fp8 = _cvt_e4m3x4_f32(scaled_data)
+    else:
+        data_fp8 = _cvt_e5m2x4_f32(scaled_data)
+
+    return tl.reshape(data_fp8, [BLOCK_M, BLOCK_K]), scale_e8m0
+
+
+@triton.jit
 def _to_mxfp8_block(
     data_input,
     VEC_SIZE: tl.constexpr,
