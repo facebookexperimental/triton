@@ -430,17 +430,64 @@ def _local_split_u_config(plan):
 
 
 def _configs():
-    """Compact generic search space for the direct-load kernel."""
+    """Curated ROCm search space plus every incumbent TLX configuration."""
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, waves_per_eu)
+    candidates = [
+        (16, 16, 256, 4, 4, 2),
+        (32, 16, 256, 4, 4, 0),
+        (32, 32, 16, 8, 4, 2),
+        (32, 32, 128, 8, 4, 0),
+        (32, 64, 64, 8, 4, 0),
+        (64, 16, 128, 8, 4, 2),
+        (64, 32, 32, 8, 4, 0),
+        (64, 32, 64, 8, 4, 0),
+        (64, 32, 64, 8, 8, 0),
+        (64, 32, 128, 8, 4, 0),
+        (64, 64, 16, 8, 4, 0),
+        (64, 64, 64, 4, 4, 0),
+        (64, 64, 128, 16, 8, 0),
+        (64, 64, 256, 4, 8, 0),
+        (64, 128, 32, 4, 4, 2),
+        (64, 128, 32, 8, 8, 0),
+        (64, 128, 64, 4, 8, 0),
+        (64, 128, 128, 4, 8, 0),
+        (128, 32, 32, 8, 4, 0),
+        (128, 32, 64, 8, 4, 0),
+        (128, 64, 32, 8, 4, 2),
+        (128, 64, 64, 16, 4, 0),
+        (128, 64, 128, 4, 8, 0),
+        (128, 128, 32, 16, 4, 2),
+        (128, 128, 32, 16, 8, 0),
+        (128, 128, 32, 16, 8, 2),
+        (128, 128, 64, 16, 4, 0),
+        (128, 128, 64, 8, 8, 0),
+        (128, 128, 128, 16, 8, 0),
+        (128, 256, 32, 16, 4, 2),
+        (128, 256, 64, 4, 8, 0),
+        (256, 64, 64, 4, 8, 0),
+        (256, 128, 32, 4, 4, 2),
+        (256, 128, 32, 16, 8, 0),
+        (256, 128, 64, 4, 8, 0),
+        (256, 256, 64, 4, 8, 0),
+        # Preserve the original compact TLX search space as a strict subset.
+        (64, 64, 128, 8, 8, 0),
+        (128, 64, 64, 4, 8, 0),
+        (64, 128, 64, 8, 8, 0),
+        (128, 128, 32, 8, 4, 0),
+        (256, 128, 32, 8, 8, 0),
+        (128, 256, 32, 8, 8, 0),
+        (256, 256, 64, 8, 8, 0),
+    ]
     return [
-        _config(64, 64, 64, 4, 4),
-        _config(64, 64, 128, 8, 8),
-        _config(128, 64, 64, 4, 8),
-        _config(64, 128, 64, 8, 8),
-        _config(128, 128, 32, 8, 4),
-        _config(128, 128, 64, 8, 8),
-        _config(256, 128, 32, 8, 8),
-        _config(128, 256, 32, 8, 8),
-        _config(256, 256, 64, 8, 8),
+        _config(
+            block_m,
+            block_n,
+            block_k,
+            group_m,
+            num_warps,
+            waves_per_eu=waves_per_eu,
+        )
+        for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
     ]
 
 
@@ -456,20 +503,67 @@ SMOKE_CONFIGS = _smoke_configs
 
 def heuristic_config(M, N, K):
     """Choose one direct-load configuration without runtime autotuning."""
+    # This measured large-N case uses the split-panel algorithm to share each B tile across 160 output rows.
     if (M, N, K) == (2048, 10240, 25408):
         return [_config(160, 512, 32, 8, 8, split_m_128_32=True)]
-    if min(M, N) <= 64:
-        return [_config(64, 64, 64, 4, 4)]
-    if K <= 256:
+    # Very short M workloads use small direct tiles when they are not intercepted by the measured LocalSplitU path.
+    if M <= 16:
+        return [_config(32, 32, 128, 8, 4)]
+    # Small-M, shallow-K workloads have enough N tiles to favor the efficient 128-square MFMA shape.
+    if M <= 384 and K <= 2048:
+        return [_config(128, 128, 128, 16, 8)]
+    # Small-M workloads with both a narrow output and deep K favor a compact tile with a long K step.
+    if M <= 384 and N <= 2048:
+        return [_config(64, 64, 256, 4, 8)]
+    # Remaining small-M workloads favor a rectangular tile that limits masked rows while retaining N reuse.
+    if M <= 384:
+        return [_config(64, 128, 128, 4, 8)]
+    # Moderately short M workloads expose enough row tiles for the high-reuse 128-square K=128 configuration.
+    if M <= 768:
+        return [_config(128, 128, 128, 16, 8)]
+    # At M near 1024, K-dominant matrices favor square output tiles and a K=64 reduction step.
+    if M <= 1024 and K >= 2 * N:
+        return [_config(128, 128, 64, 8, 8)]
+    # At M near 1024, strongly N-dominant matrices favor four-wave 128-square tiles with a short K step.
+    if M <= 1024 and N >= 2 * K:
         return [_config(128, 128, 32, 8, 4)]
-    wide_workgroups = triton.cdiv(M, 256) * triton.cdiv(N, 256)
-    if M >= 2048 and N >= 2048 and wide_workgroups >= 256:
+    # Remaining M-near-1024 matrices benefit from a wider N tile without enlarging the M tile.
+    if M <= 1024:
+        return [_config(128, 256, 64, 4, 8)]
+    # Narrow-output, deep-reduction matrices need compact output tiles to expose sufficient parallelism.
+    if M <= 4096 and N <= 2048 and K >= 16 * N:
+        return [_config(64, 64, 256, 4, 8)]
+    # M-near-2048 matrices with a strongly K-dominant aspect ratio favor four-wave 128-square tiles.
+    if M <= 2048 and K >= 4 * N:
+        return [_config(128, 128, 64, 16, 4)]
+    # M-near-2048 matrices with a moderately K-dominant aspect ratio favor the larger K=128 step.
+    if M <= 2048 and K >= 2 * N:
+        return [_config(128, 128, 128, 16, 8)]
+    # M-near-2048 matrices with shallow K favor wide 256-square output tiles.
+    if M <= 2048 and K <= 1024:
+        return [_config(256, 256, 64, 4, 8)]
+    # Remaining M-near-2048 matrices have enough output work to amortize 256-square tiles.
+    if M <= 2048:
         return [_config(256, 256, 64, 8, 8)]
-    if M < N:
-        return [_config(128, 256, 32, 8, 8)]
-    if N < M:
-        return [_config(256, 128, 32, 8, 8)]
-    return [_config(128, 128, 64, 8, 8)]
+    # M-near-4096 matrices with extremely deep K and modest N need compact tiles and a K=256 step.
+    if M <= 4096 and K >= 16 * N:
+        return [_config(64, 64, 256, 4, 8)]
+    # Other M-near-4096 matrices favor a wide N tile and four-wave scheduling.
+    if M <= 4096:
+        return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
+    # Very large M with shallow K favors a wide N tile to reduce the number of output workgroups.
+    if M >= 1048576:
+        return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
+    # Tall matrices with a very shallow reduction favor a larger M tile and narrower N tile.
+    if K <= 256:
+        return [_config(256, 128, 32, 16, 8)]
+    # Tall matrices with shallow K and N-dominant output favor four-wave rectangular tiles.
+    if N >= 2 * K:
+        return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
+    # Tall matrices with narrow N favor square 256 tiles to maximize reuse across output rows.
+    if N <= 256:
+        return [_config(256, 256, 64, 8, 8)]
+    return [_config(256, 256, 64, 4, 8)]
 
 
 def _candidate_configs(shape, enable_local_split_u=False):
@@ -495,7 +589,10 @@ def _tuned(space, shape=None, enable_local_split_u=False):
         configs = SMOKE_CONFIGS()
     else:
         raise ValueError(f"Unknown gfx942 MM search space: {space}")
-    return triton.autotune(configs=configs, key=["M", "N", "K", "ADD_BIAS"])(matmul_kernel_gfx942)
+    keys = ["M", "N", "K", "ADD_BIAS"]
+    if space == "full":
+        keys += ["stride_am", "stride_ak", "stride_bk", "stride_bn"]
+    return triton.autotune(configs=configs, key=keys)(matmul_kernel_gfx942)
 
 
 def _validate_operands(a, b, out):
