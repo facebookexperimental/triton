@@ -237,6 +237,33 @@ one resident CTA, 12.46% achieved occupancy, 52.92% memory throughput, 46.30%
 DRAM throughput, and 19.48% compute throughput. Matching-fbsource and
 full-forward validation remain before promotion.
 
+## Current `T289757919` batched GEMM-concat prototype
+
+The OSS benchmark and tuned implementations are in
+`third_party/tlx/tutorials/fwd_batched_gemm_concat.py` and
+`fwd_batched_gemm_concat_tlx.py`. This is an epilogue fusion: a batched
+`[32,256] @ [256,64]` projection is concatenated with 4096 feature elements and
+2328 extra elements per batch, then written to compact and padded-stride
+destinations.
+
+The winning Triton kernel assigns one CTA to each of 5120 batches. It copies
+the independent concat tail first, computes the exact `32x64` accumulator in
+two K=128 steps, and writes the projection directly to both outputs. Locked
+GB200 `10/50/5` best-of-five medians are `195.136 us` for the OSS unfused
+composition and `98.880 us` fused, a `1.97x` speedup. The tuned kernel is also
+1.6% faster than the task's historical fbsource unfused result of `100.46 us`.
+Both outputs are bit exact for seeds 0/1/2 while preserving BF16 inputs, FP32
+accumulation, and BF16 outputs.
+
+The persistent TLX comparison uses four TMA operand buffers, one TMEM buffer,
+one producer warp, and an eight-warp epilogue, and reaches `124.224 us`. TLX is
+disadvantaged here because Blackwell MMAv5 requires at least M=64, doubling
+work for the logical M=32 batch. PTXAS reports 50 registers/thread and no
+spills for the Triton winner; NCU reports 24.58 KiB dynamic shared memory,
+47.29% achieved occupancy, 64.20% DRAM throughput, and 22.11% SM throughput.
+The OSS concat-only baseline is anomalously slow, so matching-fbsource and
+full-forward validation remain before promotion.
+
 ## Current `T290084482` TLX prototype
 
 The OSS prototype is in
