@@ -1012,6 +1012,20 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
     if (!yieldOp)
       return WalkResult::advance();
 
+    // Forcing a wave-uniform island is an optimization: ordinary RLC may handle
+    // a complex body better, and final AMD lowering rejects any shared-memory
+    // conversion that remains under divergent waves. Keep the attempt
+    // transactional so a conflict can fall back without leaking constraints.
+    std::optional<decltype(layouts)> savedLayouts;
+    std::optional<decltype(forcedWarpPredicateEncodings)> savedForcedEncodings;
+    std::optional<decltype(forcedWarpPredicatePredicates)>
+        savedForcedPredicates;
+    if (effectivelyWaveUniform) {
+      savedLayouts.emplace(layouts);
+      savedForcedEncodings.emplace(forcedWarpPredicateEncodings);
+      savedForcedPredicates.emplace(forcedWarpPredicatePredicates);
+    }
+
     auto predicateType =
         dyn_cast<RankedTensorType>(predicateOp.getPredicate().getType());
     SmallVector<Value> bodyRoots;
@@ -1090,9 +1104,8 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       for (std::optional<Attribute> candidate : projectedEncodings) {
         if (!candidate)
           continue;
-        if (!predicateEncoding ||
-            (isMmaFamilyEncoding(*candidate) &&
-             !isMmaFamilyEncoding(*predicateEncoding)))
+        if (!predicateEncoding || (isMmaFamilyEncoding(*candidate) &&
+                                   !isMmaFamilyEncoding(*predicateEncoding)))
           predicateEncoding = *candidate;
       }
       bool hasTensorCarrier = llvm::any_of(
@@ -1400,9 +1413,14 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
     predicateOp.getRegion().walk([&](ReshapeOp reshapeOp) {
       if (conflict)
         return WalkResult::interrupt();
+      // Wait for placeholder resolution to turn a deferred wave-uniform
+      // reshape mismatch into a concrete require boundary. Forcing through the
+      // wrapper would duplicate TLX inference and can select an encoding that
+      // RLC cannot apply to the unresolved tlx.require_layout producer.
       bool hasDeferredEncoding =
-          hasDeferredTlxEncoding(reshapeOp.getSrc().getType()) ||
-          hasDeferredTlxEncoding(reshapeOp.getType());
+          !effectivelyWaveUniform &&
+          (hasDeferredTlxEncoding(reshapeOp.getSrc().getType()) ||
+           hasDeferredTlxEncoding(reshapeOp.getType()));
       RequireLayoutOp repairBoundary;
       if (reshapeOp.getResult().hasOneUse())
         repairBoundary = dyn_cast<RequireLayoutOp>(
@@ -1425,6 +1443,12 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
     });
 
     if (conflict) {
+      if (effectivelyWaveUniform) {
+        layouts = std::move(*savedLayouts);
+        forcedWarpPredicateEncodings = std::move(*savedForcedEncodings);
+        forcedWarpPredicatePredicates = std::move(*savedForcedPredicates);
+        return WalkResult::advance();
+      }
       predicateOp.emitError(
           "cannot form a cross-lane-free warp_predicate layout island");
       return WalkResult::interrupt();
