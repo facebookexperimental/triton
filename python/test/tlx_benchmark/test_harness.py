@@ -711,9 +711,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     expected = {
         "triton.tlx.ops.kernels.addmm._shapes": {
             "gfx942": ("gfx942_1", ),
-            "gfx950": ("gfx950_1", ),
+            "gfx950": ("gfx950_all", ),
         },
-        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
@@ -743,6 +743,12 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
     assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+    addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
+    assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
+
+    bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
+    assert bmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
 def test_focus_suite_selection_rejects_unknown_names():

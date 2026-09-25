@@ -28,7 +28,7 @@ def test_forced_mode_assesses_only_tlx_candidates(monkeypatch):
         return select(name, choices, *args, **kwargs)
 
     monkeypatch.setattr(inductor_mm, "autotune_select_algorithm", spy)
-    entry = [512, 192, 512, (512, 1), (1, 512), "fp16"]
+    entry = [512, 192, 512, (512, 1), (1, 512), (1, ), "fp16"]
     bias, a, b = inputs(entry, torch.float16)
     torch._dynamo.reset()
     with fresh_cache():
@@ -49,10 +49,10 @@ def _cases():
     return [entry for entry in entries if tuple(entry[:3]) not in FAILED_SHAPES]
 
 
-@pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", _cases())
-def test_forced_mode_matches_eager(m, n, k, a_strides, b_strides, dtype_name):
+@pytest.mark.parametrize("m,n,k,a_strides,b_strides,bias_strides,dtype_name", _cases())
+def test_forced_mode_matches_eager(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
-    entry = [m, n, k, a_strides, b_strides, dtype_name]
+    entry = [m, n, k, a_strides, b_strides, bias_strides, dtype_name]
     bias, a, b = inputs(entry, dtype)
 
     torch._dynamo.reset()
