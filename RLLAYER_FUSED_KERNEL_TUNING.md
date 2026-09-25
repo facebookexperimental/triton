@@ -184,6 +184,34 @@ the exact-width accumulator orientation. The original fbsource unfused result
 is much faster (`59.58 us`), so the production/full-forward win remains to be
 confirmed in that environment.
 
+## Current `T289757895` direct-layout prototype
+
+The OSS benchmark and tuned implementations are in
+`third_party/tlx/tutorials/fwd_skinny_gemm_layout_n80.py` and
+`fwd_skinny_gemm_layout_n80_tlx.py`. The `(1310720,80,64)` GEMM writes the
+physical `[5120,80,256]` grouped layout directly.
+
+The winning Triton formulation computes the transposed-equivalent contraction
+and splits N into exact 64- and 16-column phases, avoiding the waste of a
+padded N=128 accumulator. It uses a 512-row tile, one persistent CTA per GB200
+SM, eight warps, and three stages. Locked `10/50/5` best-of-five medians are
+`994.336 us` for the OSS unfused composition and `107.392 us` fused, a `9.26x`
+OSS speedup. The more meaningful cross-environment comparison is `107.392 us`
+against the task's original fbsource unfused baseline of `135.55 us`, a
+`1.26x` win. All paths are bit exact for seeds 0/1/2 while preserving BF16
+inputs, FP32 accumulation, and BF16 output.
+
+The OSS unfused layout copy alone is anomalously slow (`916.944 us`, versus
+`72.22 us` in the original full-forward attribution); OSS GEMM alone is
+`91.488 us`. The TLX comparison uses `BM64/BN128/BK64`, four M groups, one A
+buffer, and one TMEM buffer. It measures `109.504 us` when paired with unfused
+and loses a direct head-to-head comparison by about 2.5% because its N=128
+accumulator/epilogue pads 48 columns. NCU for the Triton winner reports 228
+registers/thread without spills, 206.86 KiB dynamic SMEM, one resident CTA,
+12.46% achieved occupancy, 50.04% memory throughput, 31.32% DRAM throughput,
+and 24.35% compute throughput. The task remains pending matching-fbsource and
+full-forward validation.
+
 ## Current `T290084482` TLX prototype
 
 The OSS prototype is in
