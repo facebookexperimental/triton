@@ -3178,6 +3178,8 @@ TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ign
 
 # Register graph-level GEMM + normalization rewrites when callers import the
 # TLX integration before compilation.
-from .gemm_norm_gfx950 import register_gemm_norm_patterns
+from .gemm_rmsnorm_gfx950 import register_gemm_rmsnorm_pattern
+from .gemm_layernorm_gfx950 import register_gemm_layernorm_pattern
 
-register_gemm_norm_patterns()
+register_gemm_rmsnorm_pattern()
+register_gemm_layernorm_pattern()

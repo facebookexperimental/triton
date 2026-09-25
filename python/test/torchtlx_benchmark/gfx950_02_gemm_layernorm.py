@@ -1,7 +1,11 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-import torch
-import torch.nn.functional as F
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 NAME = "gfx950_02_gemm_layernorm"
 CANDIDATE_NAME = "gemm_layernorm"
@@ -52,7 +56,7 @@ def model(
     norm_bias: torch.Tensor,
 ) -> torch.Tensor:
     value = torch.addmm(gemm_bias, x, weight.t())
-    return F.layer_norm(value, (N, ), scale, norm_bias, EPS)
+    return torch.nn.functional.layer_norm(value, (N, ), scale, norm_bias, EPS)
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:

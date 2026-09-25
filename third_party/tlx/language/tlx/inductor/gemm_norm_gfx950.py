@@ -1,4 +1,4 @@
-"""gfx950 addmm + normalization fusion for TorchInductor."""
+"""Shared gfx950 addmm + normalization kernels and registration helpers."""
 
 from __future__ import annotations
 
@@ -7,15 +7,13 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor import config
-from torch._inductor.pattern_matcher import fwd_only, Match, register_replacement
+from torch._inductor.pattern_matcher import Match
 from torch.library import wrap_triton
 from triton.tlx.ops.kernels.mm import gfx950 as gfx950_mm
 
 from ..hw.target import current_target
 
 
-_LAYERNORM_SHAPE = (2032, 2560, 2560)
-_RMSNORM_SHAPE = (677, 8192, 4096)
 _BLOCK_K = 64
 _GEMM_BLOCK_N = 128
 _NORM_BLOCK_N = 4096
@@ -24,40 +22,6 @@ _SPLIT_REDUCE_BLOCK_N = 256
 _EPILOGUE_STATS = "epilogue_stats"
 _SPLIT_STATS = "split_stats"
 _SPLIT_ROW_NORM = "split_row_norm"
-
-# A plan is (kind, block_m, block_n, block_k, group_m, num_xcds, split_k,
-# num_warps, num_stages, matrix_instr_nonkdim, waves_per_eu, kpack,
-# disable_agpr). Keeping this immutable makes it a valid CustomOpConfig value.
-_LAYER_NORM_DEFAULT_PLAN = (
-    "lds",
-    128,
-    128,
-    64,
-    4,
-    8,
-    1,
-    4,
-    1,
-    16,
-    0,
-    1,
-    True,
-)
-_RMS_NORM_DEFAULT_PLAN = (
-    "lds",
-    192,
-    256,
-    64,
-    4,
-    8,
-    4,
-    8,
-    1,
-    16,
-    0,
-    1,
-    True,
-)
 
 
 def _register_plans() -> tuple[tuple[object, ...], ...]:
@@ -87,74 +51,32 @@ def _plan_split_k(plan: tuple[object, ...]) -> int:
 
 
 _REGISTER_PLANS = _register_plans()
-_LAYER_NORM_LDS_PLANS = tuple(
-    (
-        "lds",
-        block_m,
-        block_n,
-        64,
-        group_m,
-        num_xcds,
-        split_k,
-        4 if block_m == 128 else 8,
-        1,
-        16,
-        0,
-        1,
-        True,
+
+
+def _make_lds_plans(
+    tile_plans: tuple[tuple[int, int, int], ...],
+) -> tuple[tuple[object, ...], ...]:
+    """Expand compact (block_m, block_n, split_k) choices into GEMM plans."""
+    return tuple(
+        (
+            "lds",
+            block_m,
+            block_n,
+            64,
+            group_m,
+            num_xcds,
+            split_k,
+            4 if block_m == 128 else 8,
+            1,
+            16,
+            0,
+            1,
+            True,
+        )
+        for block_m, block_n, split_k in tile_plans
+        for group_m in (1, 4, 8)
+        for num_xcds in (1, 8)
     )
-    for block_m, block_n, split_k in (
-        (128, 128, 1),
-        (128, 256, 1),
-        (192, 256, 1),
-        (192, 256, 2),
-        (256, 128, 1),
-        (256, 256, 1),
-        (256, 256, 2),
-    )
-    for group_m in (1, 4, 8)
-    for num_xcds in (1, 8)
-)
-_RMS_NORM_LDS_PLANS = tuple(
-    (
-        "lds",
-        block_m,
-        block_n,
-        64,
-        group_m,
-        num_xcds,
-        split_k,
-        4 if block_m == 128 else 8,
-        1,
-        16,
-        0,
-        1,
-        True,
-    )
-    for block_m, block_n, split_k in (
-        (128, 128, 1),
-        (128, 256, 2),
-        (192, 256, 2),
-        (192, 256, 4),
-        (256, 128, 2),
-        (256, 256, 2),
-        (256, 256, 4),
-        (256, 256, 5),
-    )
-    for group_m in (1, 4, 8)
-    for num_xcds in (1, 8)
-)
-_LAYER_NORM_FOCUSED_PLANS = (
-    ("register", 128, 128, 64, 8, 1, 1, 8, 2, 16, 0, 1, False),
-    ("register", 128, 128, 64, 8, 8, 1, 4, 2, 16, 0, 1, False),
-    ("register", 128, 128, 64, 16, 8, 1, 4, 2, 16, 0, 1, False),
-)
-_RMS_NORM_FOCUSED_PLANS = (
-    ("register", 128, 64, 64, 4, 8, 1, 4, 3, 16, 0, 1, False),
-    ("register", 128, 128, 128, 16, 1, 1, 8, 2, 16, 0, 1, False),
-    ("lds", 256, 256, 64, 4, 8, 4, 8, 1, 16, 0, 1, True),
-    ("lds", 256, 256, 64, 4, 8, 5, 8, 1, 16, 0, 1, True),
-)
 
 
 @triton.jit
@@ -583,163 +505,6 @@ def _launch_gfx950_addmm_norm(
     return output
 
 
-def _fused_gfx950_addmm_rmsnorm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    eps: float,
-    *,
-    gemm_plan: tuple[object, ...] = _RMS_NORM_DEFAULT_PLAN,
-    norm_impl: str = _SPLIT_STATS,
-    norm_num_warps: int = 8,
-    apply_block_n: int = _NORM_BLOCK_N,
-    stats_block_m: int = _SPLIT_REDUCE_BLOCK_M,
-    stats_block_n: int = _SPLIT_REDUCE_BLOCK_N,
-    stats_num_warps: int = 4,
-) -> torch.Tensor:
-    return _launch_gfx950_addmm_norm(
-        x,
-        weight,
-        gemm_bias,
-        scale,
-        scale,
-        eps,
-        is_rms_norm=True,
-        gemm_plan=gemm_plan,
-        norm_impl=norm_impl,
-        norm_num_warps=norm_num_warps,
-        apply_block_n=apply_block_n,
-        stats_block_m=stats_block_m,
-        stats_block_n=stats_block_n,
-        stats_num_warps=stats_num_warps,
-    )
-
-
-def _fused_gfx950_addmm_layernorm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    norm_bias: torch.Tensor,
-    eps: float,
-    *,
-    gemm_plan: tuple[object, ...] = _LAYER_NORM_DEFAULT_PLAN,
-    norm_impl: str = _SPLIT_STATS,
-    norm_num_warps: int = 8,
-    apply_block_n: int = _NORM_BLOCK_N,
-    stats_block_m: int = _SPLIT_REDUCE_BLOCK_M,
-    stats_block_n: int = _SPLIT_REDUCE_BLOCK_N,
-    stats_num_warps: int = 4,
-) -> torch.Tensor:
-    return _launch_gfx950_addmm_norm(
-        x,
-        weight,
-        gemm_bias,
-        scale,
-        norm_bias,
-        eps,
-        is_rms_norm=False,
-        gemm_plan=gemm_plan,
-        norm_impl=norm_impl,
-        norm_num_warps=norm_num_warps,
-        apply_block_n=apply_block_n,
-        stats_block_m=stats_block_m,
-        stats_block_n=stats_block_n,
-        stats_num_warps=stats_num_warps,
-    )
-
-
-def _aten_gfx950_addmm_rmsnorm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    value = torch.addmm(gemm_bias, x, weight)
-    return torch.nn.functional.rms_norm(value, (value.shape[-1],), scale, eps)
-
-
-def _aten_gfx950_addmm_layernorm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    norm_bias: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    value = torch.addmm(gemm_bias, x, weight)
-    return torch.nn.functional.layer_norm(
-        value,
-        (value.shape[-1],),
-        scale,
-        norm_bias,
-        eps,
-    )
-
-
-@torch.library.custom_op("torch_tlx::gfx950_addmm_rmsnorm", mutates_args=())
-def gfx950_addmm_rmsnorm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return _aten_gfx950_addmm_rmsnorm(x, weight, gemm_bias, scale, eps)
-
-
-@gfx950_addmm_rmsnorm.register_fake
-def _(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return torch.empty(
-        (x.shape[0], weight.shape[1]),
-        device=x.device,
-        dtype=x.dtype,
-    )
-
-
-@torch.library.custom_op("torch_tlx::gfx950_addmm_layernorm", mutates_args=())
-def gfx950_addmm_layernorm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    norm_bias: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return _aten_gfx950_addmm_layernorm(
-        x,
-        weight,
-        gemm_bias,
-        scale,
-        norm_bias,
-        eps,
-    )
-
-
-@gfx950_addmm_layernorm.register_fake
-def _(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    gemm_bias: torch.Tensor,
-    scale: torch.Tensor,
-    norm_bias: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    return torch.empty(
-        (x.shape[0], weight.shape[1]),
-        device=x.device,
-        dtype=x.dtype,
-    )
-
-
 def _eligible(match: Match, expected_shape: tuple[int, int, int]) -> bool:
     if config.triton.tlx_mode not in ("allow", "force"):
         return False
@@ -799,20 +564,14 @@ def _eligible(match: Match, expected_shape: tuple[int, int, int]) -> bool:
     )
 
 
-def _eligible_rmsnorm(match: Match) -> bool:
-    return _eligible(match, _RMSNORM_SHAPE)
-
-
-def _eligible_layernorm(match: Match) -> bool:
-    return _eligible(match, _LAYERNORM_SHAPE)
-
-
-def _candidate_configs(CustomOpConfig, fused_impl, *, is_rms_norm: bool):
-    if is_rms_norm:
-        lds_plans = _RMS_NORM_LDS_PLANS
-    else:
-        lds_plans = _LAYER_NORM_LDS_PLANS
-
+def _candidate_configs(
+    CustomOpConfig,
+    fused_impl,
+    *,
+    lds_plans: tuple[tuple[object, ...], ...],
+    focused_plans: tuple[tuple[object, ...], ...],
+    is_rms_norm: bool,
+):
     configs = []
     # Exercise every register-resident plan maintained by tlx.ops. The GEMM
     # epilogue emits partial row statistics while its accumulators are live.
@@ -851,11 +610,6 @@ def _candidate_configs(CustomOpConfig, fused_impl, *, is_rms_norm: bool):
                 )
 
     # Search normalization occupancy for the strongest measured GEMM plans.
-    focused_plans = (
-        _RMS_NORM_FOCUSED_PLANS
-        if is_rms_norm
-        else _LAYER_NORM_FOCUSED_PLANS
-    )
     for plan in focused_plans:
         norm_impl = (
             _SPLIT_STATS
@@ -897,6 +651,8 @@ def _register_autotuned_region(
     aten_impl,
     name: str,
     *,
+    lds_plans: tuple[tuple[object, ...], ...],
+    focused_plans: tuple[tuple[object, ...], ...],
     is_rms_norm: bool,
 ) -> None:
     from torch._inductor.kernel.custom_op import (
@@ -908,6 +664,8 @@ def _register_autotuned_region(
     fused_configs = _candidate_configs(
         CustomOpConfig,
         fused_impl,
+        lds_plans=lds_plans,
+        focused_plans=focused_plans,
         is_rms_norm=is_rms_norm,
     )
     register_custom_op_autotuning(
@@ -934,109 +692,3 @@ def _register_autotuned_region(
         return allow_lowering(*args, **kwargs)
 
     user_lowerings[op_overload] = lowering
-
-
-@functools.cache
-def register_gemm_norm_patterns() -> None:
-    from torch._inductor.fx_passes.post_grad import pass_patterns
-
-    _register_autotuned_region(
-        gfx950_addmm_rmsnorm,
-        _fused_gfx950_addmm_rmsnorm,
-        _aten_gfx950_addmm_rmsnorm,
-        "tlx_gfx950_addmm_rmsnorm",
-        is_rms_norm=True,
-    )
-    _register_autotuned_region(
-        gfx950_addmm_layernorm,
-        _fused_gfx950_addmm_layernorm,
-        _aten_gfx950_addmm_layernorm,
-        "tlx_gfx950_addmm_layernorm",
-        is_rms_norm=False,
-    )
-
-    n = _LAYERNORM_SHAPE[2]
-    example_x = torch.empty((2, 64), dtype=torch.bfloat16)
-    example_weight = torch.empty((64, n), dtype=torch.bfloat16)
-    example_gemm_bias = torch.empty((n,), dtype=torch.bfloat16)
-    example_scale = torch.empty((n,), dtype=torch.bfloat16)
-    example_norm_bias = torch.empty((n,), dtype=torch.bfloat16)
-
-    def rmsnorm_pattern(x, weight, gemm_bias, scale):
-        value = torch.addmm(gemm_bias, x, weight)
-        value_fp32 = torch.ops.prims.convert_element_type.default(
-            value,
-            torch.float32,
-        )
-        mean_square = torch.ops.aten.mean.dim(
-            torch.ops.aten.pow.Tensor_Scalar(value_fp32, 2),
-            [1],
-            True,
-        )
-        inverse_std = torch.ops.aten.rsqrt.default(
-            torch.ops.aten.add.Scalar(mean_square, 1.0e-5)
-        )
-        normalized = torch.ops.aten.mul.Tensor(value_fp32, inverse_std)
-        scaled = torch.ops.aten.mul.Tensor(normalized, scale)
-        return torch.ops.prims.convert_element_type.default(scaled, torch.bfloat16)
-
-    def rmsnorm_replacement(x, weight, gemm_bias, scale):
-        return gfx950_addmm_rmsnorm(
-            x,
-            weight,
-            gemm_bias,
-            scale,
-            1.0e-5,
-        )
-
-    def layernorm_pattern(x, weight, gemm_bias, scale, norm_bias):
-        value = torch.addmm(gemm_bias, x, weight)
-        return torch.nn.functional.layer_norm(
-            value,
-            (value.shape[-1],),
-            scale,
-            norm_bias,
-            1.0e-5,
-        )
-
-    def layernorm_replacement(x, weight, gemm_bias, scale, norm_bias):
-        return gfx950_addmm_layernorm(
-            x,
-            weight,
-            gemm_bias,
-            scale,
-            norm_bias,
-            1.0e-5,
-        )
-
-    rmsnorm_inputs = (
-        example_x,
-        example_weight,
-        example_gemm_bias,
-        example_scale,
-    )
-    layernorm_inputs = (
-        example_x,
-        example_weight,
-        example_gemm_bias,
-        example_scale,
-        example_norm_bias,
-    )
-    register_replacement(
-        rmsnorm_pattern,
-        rmsnorm_replacement,
-        rmsnorm_inputs,
-        fwd_only,
-        pass_patterns[0],
-        extra_check=_eligible_rmsnorm,
-        pattern_name="tlx_gfx950_addmm_rmsnorm",
-    )
-    register_replacement(
-        layernorm_pattern,
-        layernorm_replacement,
-        layernorm_inputs,
-        fwd_only,
-        pass_patterns[0],
-        extra_check=_eligible_layernorm,
-        pattern_name="tlx_gfx950_addmm_layernorm",
-    )
