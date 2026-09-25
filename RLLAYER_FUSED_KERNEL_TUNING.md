@@ -41,7 +41,7 @@ statistics are FP32.
 |---|---|---|---|
 | `T289901422` | `(4096, 8192, 5120)` | reconstruct `BF16(SiLU(gate) * up)` in the `dW_down` GEMM prologue | Preserve the BF16 activation boundary, FP32 GEMM accumulation, and BF16 output. |
 | `T290084482` | two `(2097152, 256, 1024)` GEMMs | GEMM -> affine LayerNorm backward -> residual add | Emit dx and FP32 dweight/dbias partials; a second kernel finalizes dweight/dbias. |
-| `T289840347` | two `(5120,1024,2048)` and one `(5120,512,2048)` | GEMM -> RMSNorm/SiLU backward | Preserve BF16 GEMM output for the sibling dweight reduction. D=512 is close to parity. |
+| `T289840347` | two `(5120,1024,2048)` and one `(5120,512,2048)` | GEMM -> RMSNorm/SiLU backward | Preserve BF16 GEMM output for the sibling dweight reduction. D=512 now has a standalone TLX win. |
 | `T289881412` | rows=5120, D=8472 | weighted RMSNorm backward, tiled multipass | No GEMM. Emit dx plus FP32 dweight partials and finalize dweight. This already wins substantially. |
 | `T289845731` | reduction width 40; D in `{2048,1024,2048,1024,2048,512}` | six FP32 partial-tensor -> BF16 N:1 reductions | Only D=512 currently wins; keep FP32 accumulation through the final cast. |
 | `T289866753` | two `(5120, 2048, 1024)` addmm regions | addmm -> two-pass normalization/SiLU consumer -> deferred aliasing store | GEMM output must materialize as BF16 between passes; defer the destination write until all aliased reads complete. |
@@ -206,6 +206,31 @@ the common 1-GiB BF16 activation once. A next design needs one shared
 producer/materialization serving both GEMM orientations, not further local
 hill-climbing of either standalone route.
 
+A follow-up monolithic kernel distributes dW as eight `(128,256)` tiles and
+folds six `(64,128)` projection tiles into the same 152 persistent CTAs. It is
+bit-exact but measures `4.66 ms`; physical eight-CTA clustering measures
+`7.90 ms`, and its dW-only ablation is `2.94 ms`. The competitive dW schedule
+needs two concurrent M128xN256 accumulator groups and consumes all 512 TMEM
+columns, so projection cannot be added without falling back to this weaker
+half-width dW schedule.
+
+## Current `T289840347` D=512 TLX prototype
+
+The OSS benchmark and TLX kernel are in
+`third_party/tlx/tutorials/bwd_rmsnorm_silu_gemm.py` and
+`bwd_rmsnorm_silu_gemm_tlx.py`. The winning schedule uses `BM64/BK64`, four A
+stages, two B stages, two N=256 TMEM accumulators, and two parallel eight-warp
+RMSNorm/SiLU epilogue tasks. Each epilogue task also emits its FP32 dweight
+partial, removing that standalone launch; the existing final reduction remains.
+
+Locked GB200 best-of-five medians are `147.344 us` unfused, `99.136 us` for
+the compact Triton fused seed, and `123.104 us` for TLX. TLX is 16.5% faster
+than unfused; the seed is 32.7% faster. Projection, dx, and dweight are bit-exact
+for seeds 0/1/2. NCU reports 128 registers/thread, 181.11 KiB dynamic SMEM, and
+one resident block; instrumented tensor-pipe activity is 30.0%. Four A stages
+improve the TLX path by about 3 us over three, while a third B stage regresses
+to about 212 us and exceeds the useful SMEM pipeline depth.
+
 ## GEO Kernel Optimizer
 
 GEO has a general TLX-capable Kernel Optimizer under
@@ -309,7 +334,8 @@ amortized by A reuse.
 ## Suggested order of work
 
 1. Promote the existing narrow wins: `T289881412`, the materialized-SwiGLU
-   boundary of `T289775012`, and D=512 from `T289845731`.
+   boundary of `T289775012`, D=512 from `T289845731`, and the D=512 route from
+   `T289840347`.
 2. Tune `T290084482` from the affine `mm_layernorm_grad` family rather than
    extending its current pointer-load correctness seed.
 3. Revisit `T290079238` only with producer sharing across CTAs/output-N tiles

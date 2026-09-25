@@ -347,6 +347,235 @@ def saved_layernorm_projection_weight_stationary_tlx(
                 pid_m += PROGRAMS_PER_N
 
 
+@triton.jit
+def saved_layernorm_dual_persistent_tlx(
+    x_ptr,
+    projection_weight_desc,
+    gradient_desc,
+    gamma_ptr,
+    beta_ptr,
+    mean_ptr,
+    rstd_ptr,
+    bias_ptr,
+    projection_ptr,
+    workspace_ptr,
+    M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    PROJECTION_N: tl.constexpr,
+    DWEIGHT_N: tl.constexpr,
+    FEATURES: tl.constexpr,
+    H_SLOTS: tl.constexpr,
+    B_SLOTS: tl.constexpr,
+    PRODUCER_WARPS: tl.constexpr,
+    PRODUCER_REGS: tl.constexpr,
+    DO_PROJECTION: tl.constexpr,
+):
+    projection_block_n: tl.constexpr = PROJECTION_N // 6
+    dweight_block_n: tl.constexpr = DWEIGHT_N // 4
+    projection_k_tiles: tl.constexpr = FEATURES // BLOCK_ROWS
+    h_buffers_0 = tlx.local_alloc((BLOCK_ROWS, FEATURES // 2), tl.bfloat16, H_SLOTS)
+    h_buffers_1 = tlx.local_alloc((BLOCK_ROWS, FEATURES // 2), tl.bfloat16, H_SLOTS)
+    projection_b = tlx.local_alloc(
+        (BLOCK_ROWS, projection_block_n), tl.bfloat16, B_SLOTS
+    )
+    gradient_b = tlx.local_alloc((BLOCK_ROWS, dweight_block_n), tl.bfloat16, H_SLOTS)
+    projection_tmem = tlx.local_alloc(
+        (BLOCK_ROWS, projection_block_n),
+        tl.float32,
+        1,
+        tlx.storage_kind.tmem,
+    )
+    dweight_tmem = tlx.local_alloc(
+        (FEATURES // 2, dweight_block_n),
+        tl.float32,
+        1,
+        tlx.storage_kind.tmem,
+    )
+    h_full = tlx.alloc_barriers(H_SLOTS, arrive_count=1)
+    h_empty = tlx.alloc_barriers(H_SLOTS, arrive_count=1)
+    projection_b_full = tlx.alloc_barriers(B_SLOTS, arrive_count=1)
+    projection_b_empty = tlx.alloc_barriers(B_SLOTS, arrive_count=1)
+    gradient_full = tlx.alloc_barriers(H_SLOTS, arrive_count=1)
+    gradient_empty = tlx.alloc_barriers(H_SLOTS, arrive_count=1)
+    projection_full = tlx.alloc_barriers(1, arrive_count=1)
+    projection_empty = tlx.alloc_barriers(1, arrive_count=1)
+    dweight_full = tlx.alloc_barriers(1, arrive_count=1)
+
+    cta_rank = tl.program_id(0) % 8
+    split_id = tl.program_id(0) // 8
+    rows_per_split: tl.constexpr = tl.cdiv(M, SPLIT_K)
+    rows_per_split = tl.cdiv(rows_per_split, BLOCK_ROWS) * BLOCK_ROWS
+    row_start = split_id * rows_per_split
+    row_end = tl.minimum(row_start + rows_per_split, M)
+
+    with tlx.async_tasks(no_ending_cluster_sync=True):
+        with tlx.async_task("default", num_regs=160):
+            row = row_start
+            tile_count = 0
+            while row < row_end:
+                if DO_PROJECTION and cta_rank < 6:
+                    tlx.barrier_wait(projection_full[0], tile_count & 1)
+                    projection = tlx.local_load(projection_tmem[0])
+                    tlx.barrier_arrive(projection_empty[0], 1)
+                    rows = row + tl.arange(0, BLOCK_ROWS)
+                    columns = cta_rank * projection_block_n + tl.arange(
+                        0, projection_block_n
+                    )
+                    bias = tl.load(bias_ptr + columns).to(tl.float32)
+                    offsets = rows[:, None] * PROJECTION_N + columns[None, :]
+                    tl.store(
+                        projection_ptr + offsets,
+                        (projection + bias[None, :]).to(tl.bfloat16),
+                    )
+                row += BLOCK_ROWS
+                tile_count += 1
+
+            tlx.barrier_wait(dweight_full[0], 0)
+            for n_start in tl.static_range(0, dweight_block_n, 32):
+                tile = tlx.local_load(
+                    tlx.local_slice(
+                        dweight_tmem[0],
+                        [0, n_start],
+                        [FEATURES // 2, 32],
+                    )
+                )
+                rows = (cta_rank // 4) * (FEATURES // 2) + tl.arange(0, FEATURES // 2)
+                columns = (cta_rank % 4) * dweight_block_n + n_start + tl.arange(0, 32)
+                offsets = (split_id * FEATURES + rows[:, None]) * DWEIGHT_N + columns[
+                    None, :
+                ]
+                tl.store(workspace_ptr + offsets, tile)
+
+        with tlx.async_task(num_warps=1, num_regs=24):
+            row = row_start
+            tile_count = 0
+            projection_b_count = 0
+            while row < row_end:
+                h_buf, h_phase = get_bufidx_phase(tile_count, H_SLOTS)
+                tlx.barrier_wait(h_full[h_buf], h_phase)
+                tlx.barrier_wait(gradient_full[h_buf], h_phase)
+                if DO_PROJECTION and cta_rank < 6:
+                    tlx.barrier_wait(projection_empty[0], (tile_count & 1) ^ 1)
+                    for k in tl.static_range(projection_k_tiles):
+                        b_buf, b_phase = get_bufidx_phase(projection_b_count, B_SLOTS)
+                        tlx.barrier_wait(projection_b_full[b_buf], b_phase)
+                        if k < 2:
+                            h_slice = tlx.local_slice(
+                                h_buffers_0[h_buf],
+                                [0, k * BLOCK_ROWS],
+                                [BLOCK_ROWS, BLOCK_ROWS],
+                            )
+                        else:
+                            h_slice = tlx.local_slice(
+                                h_buffers_1[h_buf],
+                                [0, (k - 2) * BLOCK_ROWS],
+                                [BLOCK_ROWS, BLOCK_ROWS],
+                            )
+                        tlx.async_dot(
+                            h_slice,
+                            projection_b[b_buf],
+                            projection_tmem[0],
+                            use_acc=k > 0,
+                            mBarriers=[projection_b_empty[b_buf]],
+                            out_dtype=tl.float32,
+                        )
+                        projection_b_count += 1
+                    tlx.tcgen05_commit(projection_full[0])
+                if cta_rank < 4:
+                    h_group = h_buffers_0[h_buf]
+                else:
+                    h_group = h_buffers_1[h_buf]
+                tlx.async_dot(
+                    tlx.local_trans(h_group),
+                    gradient_b[h_buf],
+                    dweight_tmem[0],
+                    use_acc=tile_count > 0,
+                    mBarriers=[h_empty[h_buf], gradient_empty[h_buf]],
+                    out_dtype=tl.float32,
+                )
+                row += BLOCK_ROWS
+                tile_count += 1
+            tlx.tcgen05_commit(dweight_full[0])
+
+        with tlx.async_task(num_warps=PRODUCER_WARPS, num_regs=PRODUCER_REGS):
+            row = row_start
+            tile_count = 0
+            projection_b_count = 0
+            features_0 = tl.arange(0, FEATURES // 2)
+            features_1 = FEATURES // 2 + tl.arange(0, FEATURES // 2)
+            gamma_0 = tl.load(gamma_ptr + features_0).to(tl.float32)
+            gamma_1 = tl.load(gamma_ptr + features_1).to(tl.float32)
+            beta_0 = tl.load(beta_ptr + features_0).to(tl.float32)
+            beta_1 = tl.load(beta_ptr + features_1).to(tl.float32)
+            while row < row_end:
+                h_buf, h_phase = get_bufidx_phase(tile_count, H_SLOTS)
+                tlx.barrier_wait(h_empty[h_buf], h_phase ^ 1)
+                tlx.barrier_wait(gradient_empty[h_buf], h_phase ^ 1)
+                tlx.barrier_expect_bytes(
+                    gradient_full[h_buf],
+                    2 * BLOCK_ROWS * dweight_block_n,
+                )
+                tlx.async_descriptor_load(
+                    gradient_desc,
+                    gradient_b[h_buf],
+                    [row, (cta_rank % 4) * dweight_block_n],
+                    gradient_full[h_buf],
+                )
+
+                if DO_PROJECTION and cta_rank < 6:
+                    for k in tl.static_range(2):
+                        b_buf, b_phase = get_bufidx_phase(projection_b_count, B_SLOTS)
+                        tlx.barrier_wait(projection_b_empty[b_buf], b_phase ^ 1)
+                        tlx.barrier_expect_bytes(
+                            projection_b_full[b_buf],
+                            2 * BLOCK_ROWS * projection_block_n,
+                        )
+                        tlx.async_descriptor_load(
+                            projection_weight_desc,
+                            projection_b[b_buf],
+                            [k * BLOCK_ROWS, cta_rank * projection_block_n],
+                            projection_b_full[b_buf],
+                            eviction_policy="evict_last",
+                        )
+                        projection_b_count += 1
+
+                rows = row + tl.arange(0, BLOCK_ROWS)
+                mean = tl.load(mean_ptr + rows).to(tl.float32)
+                rstd = tl.load(rstd_ptr + rows).to(tl.float32)
+                offsets_0 = rows[:, None] * FEATURES + features_0[None, :]
+                offsets_1 = rows[:, None] * FEATURES + features_1[None, :]
+                x_0 = tl.load(x_ptr + offsets_0).to(tl.float32)
+                x_1 = tl.load(x_ptr + offsets_1).to(tl.float32)
+                hidden_0 = (x_0 - mean[:, None]) * rstd[:, None]
+                hidden_1 = (x_1 - mean[:, None]) * rstd[:, None]
+                hidden_0 = hidden_0 * gamma_0[None, :] + beta_0[None, :]
+                hidden_1 = hidden_1 * gamma_1[None, :] + beta_1[None, :]
+                tlx.local_store(h_buffers_0[h_buf], hidden_0.to(tl.bfloat16))
+                tlx.local_store(h_buffers_1[h_buf], hidden_1.to(tl.bfloat16))
+                tlx.fence("async_shared")
+                tlx.barrier_arrive(h_full[h_buf], 1)
+
+                if DO_PROJECTION and cta_rank < 6:
+                    for k in tl.static_range(2, projection_k_tiles):
+                        b_buf, b_phase = get_bufidx_phase(projection_b_count, B_SLOTS)
+                        tlx.barrier_wait(projection_b_empty[b_buf], b_phase ^ 1)
+                        tlx.barrier_expect_bytes(
+                            projection_b_full[b_buf],
+                            2 * BLOCK_ROWS * projection_block_n,
+                        )
+                        tlx.async_descriptor_load(
+                            projection_weight_desc,
+                            projection_b[b_buf],
+                            [k * BLOCK_ROWS, cta_rank * projection_block_n],
+                            projection_b_full[b_buf],
+                            eviction_policy="evict_last",
+                        )
+                        projection_b_count += 1
+                row += BLOCK_ROWS
+                tile_count += 1
+
+
 PROJECTION_CONFIG = {
     "BLOCK_M": 64,
     "BLOCK_N": 256,
@@ -370,6 +599,16 @@ DWEIGHT_CONFIG = {
     "NUM_CTAS": 1,
     "SPLIT_K": 38,
     "INTERLEAVE_EPILOGUE": 1,
+}
+
+DUAL_PERSISTENT_CONFIG = {
+    "SPLIT_K": 19,
+    "BLOCK_ROWS": 64,
+    "H_SLOTS": 2,
+    "B_SLOTS": 2,
+    "PRODUCER_WARPS": 8,
+    "PRODUCER_REGS": 96,
+    "DO_PROJECTION": True,
 }
 
 
@@ -565,6 +804,61 @@ def run_dual_tlx(
 ) -> None:
     run_projection_tlx(inputs, outputs)
     run_dweight_tlx(inputs, outputs, workspace)
+
+
+def run_dual_persistent_tlx(
+    inputs: baseline.TensorMap,
+    outputs: baseline.TensorMap,
+    workspace: torch.Tensor,
+    *,
+    config: dict[str, int] | None = None,
+) -> None:
+    config = DUAL_PERSISTENT_CONFIG if config is None else config
+    block_rows = config["BLOCK_ROWS"]
+    projection_block_n = baseline.PROJECTION // 6
+    dweight_block_n = baseline.GRADIENT // 4
+    projection_weight_desc = TensorDescriptor(
+        inputs["projection_weight"],
+        inputs["projection_weight"].shape,
+        inputs["projection_weight"].stride(),
+        [block_rows, projection_block_n],
+    )
+    gradient_desc = TensorDescriptor(
+        inputs["gradient"],
+        inputs["gradient"].shape,
+        inputs["gradient"].stride(),
+        [block_rows, dweight_block_n],
+    )
+    cast(Any, saved_layernorm_dual_persistent_tlx)[(config["SPLIT_K"] * 8,)](
+        inputs["x"],
+        projection_weight_desc,
+        gradient_desc,
+        inputs["gamma"],
+        inputs["beta"],
+        inputs["mean"],
+        inputs["rstd"],
+        inputs["projection_bias"],
+        outputs["projection"],
+        workspace,
+        M=inputs["x"].shape[0],
+        PROJECTION_N=baseline.PROJECTION,
+        DWEIGHT_N=baseline.GRADIENT,
+        FEATURES=baseline.FEATURES,
+        **config,
+        num_warps=4,
+        num_stages=1,
+    )
+    cast(Any, baseline.finish_dweight)[
+        (triton.cdiv(baseline.FEATURES * baseline.GRADIENT, 256),)
+    ](
+        workspace,
+        outputs["dweight"],
+        D=baseline.FEATURES,
+        N=baseline.GRADIENT,
+        SPLIT=config["SPLIT_K"],
+        BLOCK=256,
+        num_warps=8,
+    )
 
 
 def run_dual_seed(inputs: baseline.TensorMap, outputs: baseline.TensorMap) -> None:
