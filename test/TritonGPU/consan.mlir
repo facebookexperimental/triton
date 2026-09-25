@@ -1154,7 +1154,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
   // CHECK: arith.constant 3 : i32
   // CHECK: tt.call @__triton_consan_verify_write_visibility
   // CHECK: tt.call @__triton_consan_verify_read_visibility
-  // CHECK: tt.call @__triton_consan_set_write_visibility
+  // CHECK: tt.call @__triton_consan_publish_write_visibility
   // CHECK: ttng.tmem_shift
   tt.func public @tmem_shift_2cta() {
     %buffer = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>
