@@ -24,7 +24,7 @@ statistics are FP32.
 
 | Task | Core shape | Operator and fusion boundary | Required outputs / constraints |
 |---|---|---|---|
-| `T289775012` | two `(5120, 4096, 8192)` GEMMs; output viewed as `[81920,256]` | two down GEMMs -> residual add -> weighted RMSNorm -> direct stores | Preserve post-add BF16 state, FP32 rstd, normalized BF16 output, and destination partitioning. The overlapping partial boundary already has a small TLX win. |
+| `T289775012` | two `(5120, 4096, 8192)` GEMMs; output viewed as `[81920,256]` | two down GEMMs -> residual add -> weighted RMSNorm -> direct stores | OSS TLX now confirms `725.712 -> 699.984 us`; preserve post-add BF16 state, FP32 rstd, normalized BF16 output, and destination partitioning. |
 | `T289757910` | `(5120, 512, 8192)` | GEMM -> weighted RMSNorm D=512 -> SiLU | Integrated ABI also saves raw GEMM output, normalized/SiLU output, and rstd. |
 | `T289757930` | two `(5120, 1024, 2048)` GEMMs | GEMM -> weighted RMSNorm D=1024 -> SiLU | Preserve both raw GEMM outputs, both activated outputs, and rstd. |
 | `T289757870` | two `(5120, 16384, 4096)` packed gate/up GEMMs | two GEMMs -> split gate/up -> `SiLU(gate) * up` | Training ABI saves packed GEMM output; a direct-hidden-only route is a different contract. |
@@ -348,6 +348,27 @@ bit-exact but measures `4.66 ms`; physical eight-CTA clustering measures
 needs two concurrent M128xN256 accumulator groups and consumes all 512 TMEM
 columns, so projection cannot be added without falling back to this weaker
 half-width dW schedule.
+
+## Current `T289775012` down-GEMM/RMSNorm TLX prototype
+
+The OSS benchmark and fused kernel are in
+`third_party/tlx/tutorials/fwd_gemm_rmsnorm_direct_store.py` and
+`fwd_gemm_rmsnorm_direct_store_tlx.py`. Each of the two launches fuses a
+`(5120,4096,8192)` down GEMM with the residual add, weighted D=256 RMSNorm,
+saved post-add/rstd outputs, and two direct destination stores.
+
+The winning schedule uses `BM128/BN256/BK64`, four TMA operand stages, one
+FP32 TMEM accumulator, and one uncapped eight-warp epilogue. Locked GB200
+`10/50/5` best-of-five medians are `725.712 us` OSS unfused and `699.984 us`
+fused, a `25.728 us` saving (`1.0368x`). Post-add is bit exact over seeds
+0/1/2; maximum rstd and normalized-destination errors are `2.29e-5` and
+`4.88e-4`, respectively, from allowed FP32 reduction reassociation.
+
+PTXAS reports 168 registers/thread and only 144-byte stack/spill storage.
+Three-stage, BK128, BM64, two-task epilogue, narrower epilogue-subtile, and
+160-register-cap variants all regress. This independently confirms the
+materialized-SwiGLU hybrid's narrow win. Matching fbsource full-forward
+validation remains before promotion.
 
 ## Current `T289840347` D=512 TLX prototype
 
