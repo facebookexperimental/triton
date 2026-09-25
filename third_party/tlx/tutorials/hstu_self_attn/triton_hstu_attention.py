@@ -1220,11 +1220,14 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
                         ],
                     } if DQ_REUSE else None),
                 ) * alpha)
+            if not DQ_FP32:
+                # Narrow the full accumulator before splitting it. Converting
+                # each slice separately keeps the full FP32 value live across
+                # every reduction store and causes substantial register spills.
+                dq = dq.to(k.dtype)
             dqs = _split_n_2D(dq, DQ_ITERS)
             for _s in tl.static_range(DQ_ITERS):
                 dq_slice = dqs[_s]
-                if not DQ_FP32:
-                    dq_slice = dq_slice.to(k.dtype)
                 device_desc_dq.store(
                     [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
                     dq_slice,
