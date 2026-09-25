@@ -1238,9 +1238,25 @@ class CliTest(unittest.TestCase):
         )
         self.assertIsNone(args.task)
         self.assertIsNone(args.output_dir)
+        self.assertFalse(args.tune_after_authoring)
         self.assertEqual(args.device, "auto")
         self.assertTrue(args.govern)
         self.assertEqual(_resolve_task(args), "tuning")
+
+    def test_tune_after_authoring_is_explicit_and_infers_authoring(self) -> None:
+        args = _parse_args(
+            [
+                "--op",
+                "mm",
+                "--arch",
+                "gfx942",
+                "--suite",
+                "gfx942_all",
+                "--tune-after-authoring",
+            ]
+        )
+        self.assertTrue(args.tune_after_authoring)
+        self.assertEqual(_resolve_task(args), "authoring")
 
     def test_old_objective_name_warns_and_maps_to_tuning(self) -> None:
         args = _parse_args(["--objective", "heuristic-policy"])
@@ -1249,6 +1265,64 @@ class CliTest(unittest.TestCase):
             task = _resolve_task(args)
         self.assertEqual(task, "tuning")
         self.assertIn("deprecated", stderr.getvalue())
+
+    def test_production_authoring_does_not_tune_without_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "out").mkdir()
+            cases = root / "cases.json"
+            cases.write_text('[{"case_id": "a"}]')
+            target = root / "target.json"
+            target.write_text('{"backend": "fake", "architecture": "gfx942"}')
+            result = KernelOptimizationResult(
+                success=True,
+                best_kernel="AUTHORED = True\n",
+                baseline=_performance(("a", 100.0)),
+                final=_performance(("a", 80.0)),
+                experiments=(),
+                artifacts_dir=root / "out",
+                stopping_reason="budget_exhausted",
+            )
+            args = _parse_args(
+                [
+                    "--task",
+                    "authoring",
+                    "--op",
+                    "mm",
+                    "--arch",
+                    "gfx942",
+                    "--suite",
+                    "gfx942_all",
+                    "--output-dir",
+                    str(root / "out"),
+                    "--harness",
+                    str(Path(__file__)),
+                    "--cases",
+                    str(cases),
+                    "--target",
+                    str(target),
+                    "--provider",
+                    "mock",
+                    "--no-commit-winner",
+                ]
+            )
+            optimizer = Mock()
+            optimizer.optimize.return_value = result
+            with (
+                patch.object(
+                    cli_module,
+                    "_resolve_harness_paths",
+                    return_value=(Path(__file__), cases, target),
+                ),
+                patch.object(cli_module, "KernelOptimizer", return_value=optimizer),
+                patch.object(tuning_module, "run_tuning") as run_tuning,
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = _run_task(args, environment_ready=True)
+
+            self.assertEqual(exit_code, 0)
+            run_tuning.assert_not_called()
+            self.assertFalse((root / "out" / "task_result.json").exists())
 
     def test_authoring_passes_its_winner_to_tuning_epilogue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1277,6 +1351,7 @@ class CliTest(unittest.TestCase):
                     "gfx942",
                     "--suite",
                     "gfx942_all",
+                    "--tune-after-authoring",
                     "--output-dir",
                     str(root / "out"),
                     "--harness",

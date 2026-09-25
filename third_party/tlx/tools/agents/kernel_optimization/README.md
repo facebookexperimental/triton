@@ -123,7 +123,9 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
 ```
 
 `--task tuning` is inferred when `--op` or `--suite` is present, but the examples
-spell it explicitly. `authoring` is inferred otherwise.
+spell it explicitly. `--tune-after-authoring` instead infers `authoring`;
+production authoring without that flag should pass `--task authoring`
+explicitly.
 The former `--objective kernel|heuristic-policy` spelling is deprecated and
 accepted only as a compatibility alias.
 
@@ -147,9 +149,9 @@ compact `summary.json`, and complete `result.json`. Candidates may change only
 `--heuristic-rounds` to budget the search. `--search-rounds` remains accepted as
 a deprecated no-op for command-line compatibility.
 
-`tuning` is also available as the epilogue of `authoring`. Supplying the
-production operation and suite makes the successful authored source—not merely
-the on-disk source—the input to tuning:
+Production authoring and heuristic tuning are independent. Use production
+authoring by itself when changing kernel implementation source or validating a
+production operation against its real shape suite:
 
 ```bash
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
@@ -158,6 +160,22 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
   --output-dir /tmp/tlx-agent-gfx942-mm-authoring
 ```
 
+This infers the production kernel, harness, and cases but does not run heuristic
+tuning. Add `--tune-after-authoring` only when the authored kernel is ready and
+its source changes may alter which configurations win across the production
+suite:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
+  --op mm --arch gfx942 --suite gfx942_all \
+  --tune-after-authoring \
+  --output-dir /tmp/tlx-agent-gfx942-mm-authoring
+```
+
+The flag is disabled by default and requires `--op`, `--arch`, and `--suite`.
+The successful authored source—not merely the on-disk source—becomes the input
+to tuning. For tuning without an authoring pass, use `--task tuning` instead.
 The epilogue writes its artifacts under `<output-dir>/tuning/`; the combined
 task result is `<output-dir>/task_result.json`. If authoring does not pass its
 gates, tuning is not run.

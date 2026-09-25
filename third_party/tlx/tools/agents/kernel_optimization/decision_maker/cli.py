@@ -66,8 +66,24 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--op", default=None, help="tlx.ops name for an inferred production kernel")
-    parser.add_argument("--suite", default=None, help="production shape suite for tuning")
+    parser.add_argument(
+        "--op",
+        default=None,
+        help="tlx.ops name for production authoring or tuning",
+    )
+    parser.add_argument(
+        "--suite",
+        default=None,
+        help="production shape suite for authoring or tuning",
+    )
+    parser.add_argument(
+        "--tune-after-authoring",
+        action="store_true",
+        help=(
+            "after successful production authoring, tune its heuristic policy "
+            "(default: disabled; requires --op, --arch, and --suite)"
+        ),
+    )
     parser.add_argument(
         "--search-rounds",
         type=int,
@@ -527,6 +543,8 @@ def _resolve_task(args: argparse.Namespace) -> str:
         return task
     if args.task is not None:
         return args.task
+    if args.tune_after_authoring:
+        return "authoring"
     return "tuning" if args.op is not None or args.suite is not None else "authoring"
 
 
@@ -535,19 +553,25 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
     args.task = task
     args.objective = None
     if task == "tuning":
+        if args.tune_after_authoring:
+            raise SystemExit("--tune-after-authoring requires --task authoring")
         if not args.op or not args.arch or not args.suite:
             raise SystemExit("--task tuning requires --op, --arch, and --suite")
         if args.kernel is not None:
             raise SystemExit("--kernel is inferred for tuning; remove the redundant argument")
-    tuning_epilogue = task == "authoring" and (args.op is not None or args.suite is not None)
-    if tuning_epilogue and (not args.op or not args.arch or not args.suite):
-        raise SystemExit("authoring's tuning epilogue requires --op, --arch, and --suite")
+    tuning_epilogue = task == "authoring" and args.tune_after_authoring
+    production_authoring = task == "authoring" and (
+        args.op is not None or args.suite is not None or tuning_epilogue
+    )
+    if production_authoring and (not args.op or not args.arch or not args.suite):
+        requirement = "--tune-after-authoring" if tuning_epilogue else "production authoring"
+        raise SystemExit(f"{requirement} requires --op, --arch, and --suite")
     if args.output_dir is None:
         if task != "tuning" or not args.op or not args.arch or not args.suite:
             raise SystemExit("--output-dir is required for --task authoring")
         args.output_dir = Path(f"/tmp/tlx-agent-{args.arch}-{args.op}-{args.suite}")
 
-    repository = _repository_root() if task == "tuning" or tuning_epilogue else None
+    repository = _repository_root() if task == "tuning" or production_authoring else None
     if repository is not None and not environment_ready:
         from .benchmark_environment import governed_benchmark_device
 
@@ -588,7 +612,7 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
         print(json.dumps(result["summary"], indent=2, sort_keys=True))
         return exit_code
 
-    if tuning_epilogue:
+    if production_authoring:
         from .tuning import _tuning_target, infer_kernel_path, production_cases
 
         assert repository is not None
@@ -597,10 +621,12 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
             args.kernel = production_kernel
         elif args.kernel.resolve() != production_kernel:
             raise SystemExit(
-                f"authoring's tuning epilogue targets {production_kernel}, but --kernel is {args.kernel.resolve()}")
+                f"production authoring targets {production_kernel}, "
+                f"but --kernel is {args.kernel.resolve()}"
+            )
     if args.kernel is None:
         raise SystemExit("--kernel is required for standalone authoring")
-    if tuning_epilogue and args.harness is None and args.cases is None and args.target is None:
+    if production_authoring and args.harness is None and args.cases is None and args.target is None:
         harness_path = Path(__file__).with_name("tuning_harnesses") / f"{args.op}.py"
         cases = production_cases(args.op, args.suite)
         target = _tuning_target(args.op, args.arch)
