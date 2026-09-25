@@ -88,10 +88,44 @@ def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
 def test_flash_attn_fwd_config(head_dim, causal, expected_block_n, expected_num_buffers):
     from triton.tlx.ops.kernels.flash_attn.sm90 import _prune_configs_by_head_dim, configs
 
-    selected = _prune_configs_by_head_dim(configs, {}, HEAD_DIM=head_dim, CAUSAL=causal)
+    selected = _prune_configs_by_head_dim(
+        configs,
+        {},
+        HEAD_DIM=head_dim,
+        CAUSAL=causal,
+        USE_BM192=False,
+    )
     assert len(selected) == 1
     assert selected[0].kwargs["BLOCK_N"] == expected_block_n
     assert selected[0].kwargs["NUM_BUFFERS"] == expected_num_buffers
+
+
+def test_flash_attn_fwd_bm192_config():
+    from triton.tlx.ops.kernels.flash_attn.sm90 import _prune_configs_by_head_dim, configs
+
+    selected = _prune_configs_by_head_dim(
+        configs,
+        {},
+        HEAD_DIM=64,
+        CAUSAL=False,
+        USE_BM192=True,
+    )
+    assert len(selected) == 1
+    assert selected[0].kwargs["BLOCK_M"] == 192
+    assert selected[0].kwargs["BLOCK_N"] == 128
+    assert selected[0].kwargs["NUM_BUFFERS"] == 3
+    assert selected[0].kwargs["NUM_MMA_GROUPS"] == 3
+
+
+@pytest.mark.parametrize("N_CTX", (1024, 2048, 4096, 8192))
+def test_flash_attn_fwd_bm192(N_CTX):
+    from triton.tlx.ops import flash_attn
+
+    torch.manual_seed(0)
+    q, k, v = _qkv(4, 48, N_CTX, 64, torch.bfloat16)
+    out = flash_attn(q, k, v, causal=False, sm_scale=0.7, space="smoke")
+    ref = _sdpa(q, k, v, causal=False, scale=0.7)
+    torch.testing.assert_close(out, ref, atol=4e-2, rtol=0)
 
 
 def test_flash_attn_fwd_launch_policy():
@@ -108,10 +142,11 @@ def test_flash_attn_fwd_launch_policy():
     )
     assert (steady_unroll, target_workers) == (1, 132)
 
-    _, steady_unroll, target_workers = _select_forward_policy(
-        False, shape, torch.bfloat16, 128, 132
-    )
-    assert (steady_unroll, target_workers) == (2, 264)
+    for n_ctx in (1024, 2048, 4096, 8192):
+        _, steady_unroll, target_workers = _select_forward_policy(
+            False, (4, 48, n_ctx, 64), torch.bfloat16, 192, 132
+        )
+        assert (steady_unroll, target_workers) == (1, 132)
 
     _, steady_unroll, target_workers = _select_forward_policy(
         True, (4, 48, 4096, 64), torch.bfloat16, 128, 132
