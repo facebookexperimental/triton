@@ -413,6 +413,19 @@ llvm::StringMap<StringRef> buildOpNameMap() {
   return map;
 }
 
+// Make an MLIR name usable as a Python identifier. MLIR admits characters
+// Python does not -- the dots in block-pointer-derived names like
+// `V_block_ptr.offsets.1`, and `.` or `$` in function symbols.
+static std::string sanitizePyIdentifier(StringRef raw) {
+  std::string name = raw.str();
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
+  if (!name.empty() && std::isdigit(name.front()))
+    name = "var_" + name;
+  return name;
+}
+
 // Format a raw SSA name from printAsOperand into a clean variable name.
 static std::string formatSSAName(StringRef raw) {
   std::string name = raw.str();
@@ -423,14 +436,7 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  // MLIR names may carry characters Python identifiers cannot, notably the
-  // dots in block-pointer-derived names like `V_block_ptr.offsets.1`.
-  for (char &c : name)
-    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
-      c = '_';
-  if (!name.empty() && std::isdigit(name.front()))
-    name = "var_" + name;
-  return name;
+  return sanitizePyIdentifier(name);
 }
 
 // Thread-local pointer to the value name cache built once per module.
@@ -501,6 +507,7 @@ static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
 }
 
 std::string getElementTypeName(Type type);
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os);
 
 // Casts that change a value's element type. These are user-visible in TLX --
 // the kernel wrote `x.to(dtype)` -- unlike the width/index casts below.
@@ -559,6 +566,59 @@ static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
          isNameableElementType(
              getElementType(castOp->getResult(0).getType())) &&
          operandName != "None";
+}
+
+// tt.extern_elementwise dispatches on a {(arg dtypes): (symbol, ret dtype)}
+// dict. Emitting that literal inside the kernel does not work -- the Triton
+// frontend traces container literals and the tuple key comes back as a list --
+// so each one is hoisted to a module-scope wrapper, named here.
+static thread_local DenseMap<Operation *, std::string> *externSigNames =
+    nullptr;
+
+// Names already given to a module-scope def in the current print. Sanitizing is
+// many-to-one, so two tt.func symbols can collapse to one identifier and their
+// per-function counters both start at 0; the later Python def would silently
+// shadow the earlier. Reset per module in runOnOperation.
+static thread_local llvm::StringSet<> moduleScopeDefNames;
+
+static std::string uniqueModuleScopeName(StringRef base) {
+  std::string name = base.str();
+  unsigned n = 0;
+  while (!moduleScopeDefNames.insert(name).second)
+    name = base.str() + "_" + std::to_string(++n);
+  return name;
+}
+
+// Whether an extern_elementwise has a signature we can spell as TLX dtypes.
+static bool canNameExternSignature(Operation *op) {
+  if (op->getNumResults() != 1 || !op->getAttrOfType<StringAttr>("symbol"))
+    return false;
+  if (!isNameableElementType(getElementType(op->getResult(0).getType())))
+    return false;
+  return llvm::all_of(op->getOperands(), [](Value v) {
+    return isNameableElementType(getElementType(v.getType()));
+  });
+}
+
+// tlx.warp_predicate takes its region as a separate @triton.jit function, so
+// each ttg.warp_predicate gets a module-scope body emitted for it, named here.
+static thread_local DenseMap<Operation *, std::string>
+    *warpPredicateBodyNames = nullptr;
+
+// Values a region uses but does not define, which the body function has to
+// receive as arguments.
+static void collectRegionCaptures(Region &region,
+                                  SmallVectorImpl<Value> &captures) {
+  llvm::SetVector<Value> seen;
+  region.walk([&](Operation *op) {
+    for (Value v : op->getOperands()) {
+      Region *defining = v.getParentRegion();
+      if (!defining || region.isAncestor(defining))
+        continue;
+      seen.insert(v);
+    }
+  });
+  captures.assign(seen.begin(), seen.end());
 }
 
 // Get simplified name for a value (just the SSA name)
@@ -631,6 +691,8 @@ getValueName(Value v,
     // implicit. The float element-type casts are still listed: the block above
     // intercepts them whenever their dtype is nameable, so reaching one here
     // means it is not, and erasing it beats emitting an uncompilable dtype.
+    // amdg.in_thread_transpose is a CDNA variant of ttg.convert_layout that the
+    // AMD backend inserts itself; recompiling the generated TLX re-creates it.
     static const llvm::StringSet<> transparentOps = {
         "ttg.convert_layout",
         "arith.extui",
@@ -649,6 +711,7 @@ getValueName(Value v,
         "tt.broadcast",
         "ttng.user_named_barrier_id",
         "ttng.compiler_named_barrier_id",
+        "amdg.in_thread_transpose",
     };
     if (transparentOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
@@ -977,6 +1040,7 @@ bool shouldSkipOp(
       "tt.broadcast",
       "tt.map_elementwise.return",
       "ttng.tcgen5_global_alloc",
+      "amdg.in_thread_transpose",
   };
   // Emit ttg.memdesc_index as tlx.local_view when a real consumer needs the
   // view (MMA, wait, local_store, loop iter-arg, ...). Skip it when it has no
@@ -1109,6 +1173,18 @@ void printWhileOp(Operation *op, llvm::raw_ostream &os,
                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
                   DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
+void printBlockOps(Block &block, llvm::raw_ostream &os,
+                   const llvm::StringMap<StringRef> &opNameMap,
+                   const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                   llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                   DenseMap<Value, Value> *argSubstitutionMap);
+
+void printSimplifiedOp(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap, unsigned indent,
+    const DenseMap<Value, Value> *argSubstitutionMap);
 
 // Print scf.for in Python range syntax
 void printForOp(Operation *op, llvm::raw_ostream &os,
@@ -1277,6 +1353,54 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
       os << "else:\n";
       os << elseStr;
     }
+  }
+}
+
+// AMD's WarpPipeliner tags the region with a string stage label. A tag of any
+// other type is not one of ours: gating on the type here rather than on
+// hasAttr sends it to the generic path, which still surfaces the region body.
+// Shared by both traversals -- they drifted once already, which is how the
+// CF printer ended up re-emitting hoisted bodies.
+static bool isWarpPipelineStage(Operation *op) {
+  return op->getName().getStringRef() == "scf.execute_region" &&
+         op->getAttrOfType<StringAttr>("triton.warp_pipeline.stage");
+}
+
+// AMD's WarpPipeliner materializes each `with tlx.warp_pipeline_stage(...)`
+// block as an scf.execute_region tagged with the stage label and priority.
+void printWarpPipelineStage(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  // isWarpPipelineStage gates the dispatch on the attribute's type, so this
+  // is non-null.
+  auto stage = op->getAttrOfType<StringAttr>("triton.warp_pipeline.stage");
+
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "with tlx.warp_pipeline_stage(";
+  printPythonStringLiteral(stage.getValue(), os);
+  // The frontend defaults priority to -1 when the kwarg is omitted; the
+  // pipeliner only attaches the attribute when one was actually given.
+  if (auto priority =
+          op->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority"))
+    os << ", priority=" << priority.getInt();
+  os << "):\n";
+
+  SmallVector<Value> stageResults(op->getResults());
+  std::string bodyStr;
+  llvm::raw_string_ostream bodyOs(bodyStr);
+  printRegion(op->getRegion(0), bodyOs, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap, stageResults);
+  bodyOs.flush();
+  if (bodyStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << bodyStr;
   }
 }
 
@@ -1588,6 +1712,44 @@ static Value getSegmentOperand(Operation *op, unsigned segmentIdx) {
   for (unsigned i = 0; i < segmentIdx; ++i)
     start += sizes[i];
   return start < op->getNumOperands() ? op->getOperand(start) : nullptr;
+}
+
+// Parameters of a warp_predicate body. The region has no block arguments: it
+// names the inits and its other captures directly, and tlx.warp_predicate
+// calls body(*inits, *args), so the inits lead. A capture whose name is not an
+// identifier is an inlined literal and needs none. `params` is optional -- the
+// call site emits only captures -- but both sites share this selection, so
+// their arities cannot drift.
+static void getWarpPredicateBodyArgs(Operation *wp,
+                                     SmallVectorImpl<std::string> *params,
+                                     SmallVectorImpl<Value> &captures) {
+  llvm::StringSet<> taken;
+  unsigned synthesized = 0;
+  for (Value init : wp->getOperands().drop_front()) {
+    // Inits are passed positionally, so one whose name is an inlined literal
+    // (`0`, `float('-inf')`) or that repeats an earlier name still needs a
+    // parameter -- just not that name, which Python would reject. Renaming is
+    // safe precisely because such a value is never referred to by name inside
+    // the body: every use of it renders as the literal.
+    std::string name = getValueName(init);
+    if (!isPythonIdentifier(name) || !taken.insert(name).second) {
+      do {
+        name = "_wp_init_" + std::to_string(synthesized++);
+      } while (!taken.insert(name).second);
+    }
+    if (params)
+      params->push_back(name);
+  }
+  SmallVector<Value> raw;
+  collectRegionCaptures(wp->getRegion(0), raw);
+  for (Value c : raw) {
+    std::string name = getValueName(c);
+    if (!isPythonIdentifier(name) || !taken.insert(name).second)
+      continue;
+    if (params)
+      params->push_back(name);
+    captures.push_back(c);
+  }
 }
 
 // Print operation in simplified TLX format
@@ -2642,6 +2804,58 @@ void printSimplifiedOp(
     }
   }
 
+  // tt.extern_elementwise names its callee in attributes, which the generic
+  // path drops. Call the module-scope wrapper emitted for it instead.
+  if (opName == "tt.extern_elementwise" && op->getNumResults() == 1 &&
+      externSigNames) {
+    auto sig = externSigNames->find(op);
+    if (sig != externSigNames->end()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+         << sig->second << "(";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // ttg.warp_predicate's region is emitted as a module-scope body function;
+  // here we only need the call that binds its results.
+  if (opName == "ttg.warp_predicate" && warpPredicateBodyNames) {
+    // Membership alone says a body was hoisted -- the emitter records only ops
+    // it emitted one for, and the region-comment guards key off it too.
+    auto body = warpPredicateBodyNames->find(op);
+    if (body != warpPredicateBodyNames->end()) {
+      if (op->getNumResults() == 1) {
+        os << getValueName(op->getResult(0), argSubstitutionMap);
+      } else {
+        os << "(";
+        for (unsigned i = 0; i < op->getNumResults(); ++i)
+          os << (i ? ", " : "")
+             << getValueName(op->getResult(i), argSubstitutionMap);
+        os << ")";
+      }
+      os << " = tlx.warp_predicate("
+         << getValueName(op->getOperand(0), argSubstitutionMap) << ", (";
+      // Trailing commas keep single-element tuples from collapsing.
+      for (unsigned i = 1; i < op->getNumOperands(); ++i)
+        os << getValueName(op->getOperand(i), argSubstitutionMap) << ", ";
+      os << "), " << body->second << ", (";
+      SmallVector<Value> captures;
+      getWarpPredicateBodyArgs(op, /*params=*/nullptr, captures);
+      for (Value c : captures)
+        os << getValueName(c, argSubstitutionMap) << ", ";
+      os << ")";
+      if (op->hasAttr("wave_uniform"))
+        os << ", wave_uniform=True";
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
@@ -2780,8 +2994,106 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       os << "except ModuleNotFoundError:\n";
       os << "    import triton.language.extra.tlx as tlx\n";
       os << "\n";
+
+      // Emit a module-scope @extern wrapper per extern_elementwise; see
+      // externSigNames. This mirrors how libdevice declares its own bindings.
+      static thread_local DenseMap<Operation *, std::string> sigNames;
+      sigNames.clear();
+      externSigNames = &sigNames;
+      unsigned sigIdx = 0;
+      funcOp.walk([&](Operation *externOp) {
+        if (externOp->getName().getStringRef() != "tt.extern_elementwise" ||
+            !canNameExternSignature(externOp))
+          return;
+        // Qualify by function: sigIdx restarts per tt.func, so a bare index
+        // would give two functions in one module the same module-scope def.
+        // The symbol is sanitized because it lands in a Python `def`.
+        std::string name = uniqueModuleScopeName(
+            "_extern_fn_" + sanitizePyIdentifier(funcOp.getName()) + "_" +
+            std::to_string(sigIdx++));
+        sigNames[externOp] = name;
+        auto libname = externOp->getAttrOfType<StringAttr>("libname");
+        auto libpath = externOp->getAttrOfType<StringAttr>("libpath");
+        auto pure = externOp->getAttrOfType<BoolAttr>("pure");
+        unsigned n = externOp->getNumOperands();
+        os << "@tl.core.extern\n";
+        os << "def " << name << "(";
+        for (unsigned i = 0; i < n; ++i)
+          os << "arg" << i << ", ";
+        os << "_semantic=None):\n";
+        os << "    return tl.core.extern_elementwise(";
+        printPythonStringLiteral(libname ? libname.getValue() : StringRef(""),
+                                 os);
+        os << ", ";
+        printPythonStringLiteral(libpath ? libpath.getValue() : StringRef(""),
+                                 os);
+        os << ", [";
+        for (unsigned i = 0; i < n; ++i)
+          os << (i ? ", " : "") << "arg" << i;
+        os << "], {(";
+        for (Value v : externOp->getOperands())
+          // The trailing comma keeps a single-operand key a tuple.
+          os << getElementTypeName(getElementType(v.getType())) << ", ";
+        os << "): (";
+        printPythonStringLiteral(
+            externOp->getAttrOfType<StringAttr>("symbol").getValue(), os);
+        os << ", "
+           << getElementTypeName(
+                  getElementType(externOp->getResult(0).getType()))
+           << ")}, is_pure=" << ((pure && pure.getValue()) ? "True" : "False")
+           << ", _semantic=_semantic)\n\n";
+      });
+
+      // Emit a module-scope body function per ttg.warp_predicate; see
+      // warpPredicateBodyNames.
+      static thread_local DenseMap<Operation *, std::string> bodyNames;
+      bodyNames.clear();
+      warpPredicateBodyNames = &bodyNames;
+      unsigned bodyIdx = 0;
+      funcOp.walk([&](Operation *wp) {
+        // Needs a predicate and at least one init, or the call site falls to
+        // the generic printer and this body would go uncalled.
+        // WarpPredicateOp::verify pins #inits == #results == #yields, so a
+        // skipped op yields nothing and an emitted one has a result; it also
+        // guarantees exactly one block with a ttg.predicate_yield terminator,
+        // so front() is the whole body and its terminator is the yield.
+        if (wp->getName().getStringRef() != "ttg.warp_predicate" ||
+            wp->getNumOperands() < 2 || wp->getNumRegions() == 0 ||
+            wp->getRegion(0).empty())
+          return;
+        // Qualify by function: bodyIdx restarts per tt.func, so a bare index
+        // would give two functions in one module the same module-scope def.
+        // The symbol is sanitized because it lands in a Python `def`.
+        std::string name = uniqueModuleScopeName(
+            "_wp_body_" + sanitizePyIdentifier(funcOp.getName()) + "_" +
+            std::to_string(bodyIdx++));
+        bodyNames[wp] = name;
+        Block &body = wp->getRegion(0).front();
+        SmallVector<std::string> params;
+        SmallVector<Value> captures;
+        getWarpPredicateBodyArgs(wp, &params, captures);
+        os << "@triton.jit\n";
+        os << "def " << name << "(";
+        for (unsigned i = 0; i < params.size(); ++i)
+          os << (i ? ", " : "") << params[i];
+        os << "):\n";
+        // printBlockOps stops at the terminator and, unlike printSimplifiedOp
+        // alone, resolves reduce combiners into tl.max / tl.sum.
+        printBlockOps(body, os, opNameMap, allocInfoMap, skippedOps, 1,
+                      nullptr);
+        if (Operation *yield = body.getTerminator()) {
+          os << "  return ";
+          for (unsigned i = 0; i < yield->getNumOperands(); ++i)
+            os << (i ? ", " : "") << getValueName(yield->getOperand(i));
+          os << "\n";
+        }
+        os << "\n";
+      });
+
       os << "@triton.jit\n";
-      os << "def " << funcOp.getName() << "(";
+      os << "def "
+         << uniqueModuleScopeName(sanitizePyIdentifier(funcOp.getName()))
+         << "(";
       // Print function arguments, collapsing expanded TensorDescriptor args.
       // A host-side TensorDescriptor lowers to a !tt.tensordesc value followed
       // by expanded shape/stride scalars that share the descriptor's name, in
@@ -2888,6 +3200,12 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       continue;
     }
 
+    if (isWarpPipelineStage(&op)) {
+      printWarpPipelineStage(&op, os, opNameMap, allocInfoMap, skippedOps,
+                             indent, argSubstitutionMap);
+      continue;
+    }
+
     // Special handling for scf.while - preserve condition/body and carries.
     if (op.getName().getStringRef() == "scf.while") {
       printWhileOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
@@ -2970,6 +3288,10 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getNumRegions() > 0) {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
+      // warp_predicate already emitted its region as a body function.
+      if (op.getName().getStringRef() == "ttg.warp_predicate" &&
+          warpPredicateBodyNames && warpPredicateBodyNames->count(&op))
+        continue;
       // Print region body as # comments (valid Python syntax)
       for (Region &region : op.getRegions()) {
         for (Block &bodyBlock : region) {
@@ -3064,6 +3386,11 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
                 argSubstitutionMap);
       continue;
     }
+    if (isWarpPipelineStage(&op)) {
+      printWarpPipelineStage(&op, os, opNameMap, allocInfoMap, skippedOps,
+                             indent, argSubstitutionMap);
+      continue;
+    }
     if (isInlinableMapElementwise(&op)) {
       printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                           argSubstitutionMap);
@@ -3130,6 +3457,12 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getNumRegions() > 0) {
       printSimplifiedOp(&op, os, opNameMap, allocInfoMap, indent,
                         argSubstitutionMap);
+      // warp_predicate already emitted its region as a body function. The same
+      // guard is in printBlock; this traversal needs it too, because the
+      // CF-aware printer reaches ops through here.
+      if (op.getName().getStringRef() == "ttg.warp_predicate" &&
+          warpPredicateBodyNames && warpPredicateBodyNames->count(&op))
+        continue;
       for (Region &region : op.getRegions()) {
         for (Block &bodyBlock : region) {
           for (Operation &bodyOp : bodyBlock) {
@@ -3663,6 +3996,8 @@ public:
         ++numErrors;
       return failure();
     });
+
+    moduleScopeDefNames.clear();
 
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();

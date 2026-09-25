@@ -1744,3 +1744,228 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// tt.extern_elementwise names its callee in libname/libpath/symbol attributes,
+// which the generic operand-only path threw away. The dispatcher cannot be
+// called from a traced kernel body -- the frontend rewrites the list and dict
+// literals -- so each call gets a module-scope @extern wrapper, the same shape
+// libdevice uses for its own bindings.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: @tl.core.extern
+  // CHECK: def _extern_fn_extern_elementwise_wrapper_0(arg0, _semantic=None):
+  // CHECK: tl.core.extern_elementwise("", "", [arg0], {(tl.float32, ): ("__triton_hip_fast_expf", tl.float32)}, is_pure=True, _semantic=_semantic)
+  // CHECK-LABEL: def extern_elementwise_wrapper(
+  // CHECK: = _extern_fn_extern_elementwise_wrapper_0(arg0)
+  tt.func public @extern_elementwise_wrapper(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x {libname = "", libpath = "", symbol = "__triton_hip_fast_expf", pure = true} : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Two operands exercise the per-argument list and the dtype-tuple key, and
+  // pure = false is the other side of the is_pure branch.
+  // CHECK: @tl.core.extern
+  // CHECK: def _extern_fn_extern_elementwise_binary_impure_0(arg0, arg1, _semantic=None):
+  // CHECK: tl.core.extern_elementwise("", "", [arg0, arg1], {(tl.float32, tl.float32, ): ("__triton_hip_fast_fdividef", tl.float32)}, is_pure=False, _semantic=_semantic)
+  // CHECK-LABEL: def extern_elementwise_binary_impure(
+  // CHECK: = _extern_fn_extern_elementwise_binary_impure_0(arg0, arg1)
+  tt.func public @extern_elementwise_binary_impure(%x: tensor<256xf32, #blocked>, %y: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x, %y {libname = "", libpath = "", symbol = "__triton_hip_fast_fdividef", pure = false} : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // The wrapper name embeds the enclosing symbol, which MLIR lets carry `.`
+  // and `$`; unsanitized those reach a Python `def`. libname/libpath go inside
+  // a double-quoted literal, so a quote or a backslash has to be escaped.
+  // CHECK: @tl.core.extern
+  // CHECK: def _extern_fn_odd_name_v1_0(arg0, _semantic=None):
+  // CHECK: tl.core.extern_elementwise("li\"b", "/a\\b", [arg0],
+  // CHECK-LABEL: def odd_name_v1(
+  // CHECK: = _extern_fn_odd_name_v1_0(arg0)
+  tt.func public @"odd.name$v1"(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x {libname = "li\"b", libpath = "/a\\b", symbol = "__triton_hip_fast_expf", pure = true} : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // `odd.name$v1` and `odd-name-v1` sanitize to the same identifier, so both
+  // wrappers would be called _extern_fn_odd_name_v1_0 and the second Python
+  // def would shadow the first -- one kernel dispatching through the other's
+  // symbol. The second claimant gets a suffix.
+  // CHECK: def _extern_fn_odd_name_v1_0_1(arg0, _semantic=None):
+  // CHECK: "__triton_hip_fast_fdividef"
+  // CHECK-LABEL: def odd_name_v1_1(
+  // CHECK: = _extern_fn_odd_name_v1_0_1(arg0)
+  tt.func public @"odd-name-v1"(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x {libname = "", libpath = "", symbol = "__triton_hip_fast_fdividef", pure = true} : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// ttg.warp_predicate carries real code in a region. Without a mapping the
+// region-bearing op fell to the generic printer, which emitted the whole body
+// as inert `#` comments while still binding the results -- silently dropping
+// the computation. tlx.warp_predicate takes the body as a separate
+// @triton.jit function, so hoist it to module scope. The region has no block
+// arguments: it names the inits and its other captures directly, and
+// body(*inits, *args) has to receive them in that order.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: @triton.jit
+  // CHECK: def _wp_body_warp_predicate_body_0(
+  // The body is real code, not commented out, and returns the yielded value.
+  // CHECK: {{[a-z0-9_]+}} = {{[a-z0-9_]+}} * {{[a-z0-9_]+}}
+  // CHECK: return
+  // CHECK-LABEL: def warp_predicate_body(
+  // CHECK: = tlx.warp_predicate(arg1, ({{.*}}, ), _wp_body_warp_predicate_body_0, (
+  tt.func public @warp_predicate_body(%x: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // An init that renders as an inlined literal -- ub.poison comes back as
+  // tl.full(..., float('-inf'), ...) -- cannot be the parameter name, but the
+  // body still needs a positional parameter for it.
+  // CHECK: @triton.jit
+  // CHECK: def _wp_body_warp_predicate_literal_init_0(_wp_init_0
+  // CHECK-LABEL: def warp_predicate_literal_init(
+  tt.func public @warp_predicate_literal_init(%p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %c = ub.poison : tensor<256xf32, #blocked>
+    %r = ttg.warp_predicate %p(%c) {
+      %m = arith.mulf %c, %c : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // The body name embeds the enclosing symbol, which MLIR lets carry `.`; it
+  // has to be sanitized before it lands in a Python `def`.
+  // CHECK: def _wp_body_wp_odd_name_0(
+  // CHECK-LABEL: def wp_odd_name(
+  // CHECK: = tlx.warp_predicate({{.*}}, _wp_body_wp_odd_name_0, (
+  tt.func public @"wp.odd.name"(%x: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // A value that is both an init and a region capture must be skipped on the
+  // capture pass -- it is already a parameter. The skip cannot desynchronize
+  // the two sides: one loop fills both the definition's parameter list and the
+  // call's argument tuple, so `continue` drops the value from both. Here the
+  // body takes 2 params and the call passes 1 init + 1 arg.
+  // CHECK: def _wp_body_init_also_captured_0(arg0, arg1):
+  // CHECK-LABEL: def init_also_captured(
+  // CHECK: = tlx.warp_predicate(arg2, (arg0, ), _wp_body_init_also_captured_0, (arg1, ))
+  tt.func public @init_also_captured(%x: tensor<256xf32, #blocked>, %y: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %y : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // A multi-block region goes through the CF-aware printer, which walks ops
+  // with its own traversal. That one needs the same hoisted-body guard: without
+  // it the region is re-emitted as comments, carrying a spurious UNSUPPORTED
+  // marker for the yield that makes the dump look like it has a coverage gap.
+  // CHECK-LABEL: def warp_predicate_in_cf(
+  // CHECK: = tlx.warp_predicate(
+  // CHECK-NOT: {{UNSUPPORTED}}: no TLX mapping for ttg.predicate_yield
+  tt.func public @warp_predicate_in_cf(%x: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    cf.br ^bb1
+  ^bb1:
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// AMD's WarpPipeliner materializes each `with tlx.warp_pipeline_stage(...)`
+// block as an scf.execute_region carrying the stage label and priority. Without
+// a mapping the region-bearing op falls to the generic printer, which emits the
+// whole stage body as inert `#` comments.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def warp_pipeline_stages(
+  // CHECK: with tlx.warp_pipeline_stage("mfma", priority=0):
+  // The stage body is real code, not commented out, and its yield assigns the
+  // region result so later stages can name it.
+  // CHECK: [[R:[a-z0-9_]+]] = arg0 * arg0
+  // CHECK: [[OUT:[a-z0-9_]+]] = [[R]]
+  // CHECK: with tlx.warp_pipeline_stage("mem", priority=1):
+  // CHECK: [[OUT]] + arg0
+  tt.func public @warp_pipeline_stages(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %s = scf.execute_region -> tensor<256xf32, #blocked> {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield %m : tensor<256xf32, #blocked>
+    } {triton.warp_pipeline.priority = 0 : i32, triton.warp_pipeline.stage = "mfma"}
+    scf.execute_region {
+      %a = arith.addf %s, %x : tensor<256xf32, #blocked>
+      scf.yield
+    } {triton.warp_pipeline.priority = 1 : i32, triton.warp_pipeline.stage = "mem"}
+    tt.return
+  }
+}
+
+// -----
+
+// A stage without an explicit priority: the pipeliner only attaches the
+// attribute when the kwarg was given, so the emitted call must omit it rather
+// than invent the frontend's -1 default.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def warp_pipeline_stage_without_priority(
+  // CHECK: with tlx.warp_pipeline_stage("mfma"):
+  // CHECK-NOT: priority=
+  tt.func public @warp_pipeline_stage_without_priority(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    scf.execute_region {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield
+    } {triton.warp_pipeline.stage = "mfma"}
+    tt.return
+  }
+
+  // A stage tag of the wrong type is not ours. It must reach the generic path
+  // too, and crucially that path still surfaces the region body as comments --
+  // swallowing it would be the very bug this diff exists to fix.
+  // CHECK-LABEL: def wrong_typed_stage_tag(
+  // CHECK-NOT: tlx.warp_pipeline_stage
+  // CHECK: # {{[a-z0-9_]+}} = {{[a-z0-9_]+}} * {{[a-z0-9_]+}}
+  tt.func public @wrong_typed_stage_tag(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    scf.execute_region {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield
+    } {triton.warp_pipeline.stage = 42 : i32}
+    tt.return
+  }
+
+  // Only a tagged region is a pipeline stage. An untagged scf.execute_region
+  // has no TLX spelling, so it must stay on the generic path -- pinning that
+  // catches a regression in the gating condition.
+  // CHECK-LABEL: def untagged_execute_region_is_not_a_stage(
+  // CHECK-NOT: tlx.warp_pipeline_stage
+  tt.func public @untagged_execute_region_is_not_a_stage(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    scf.execute_region {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield
+    }
+    tt.return
+  }
+}

@@ -1250,10 +1250,7 @@ def test_hopper_fa_ws_pipelined_pingpong_bwd(causal):
 
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("config_name", ["amd_fa_pipelined"])
-# Gated to gfx950 (CDNA4): the kernel passes on MI350 but fails to lower
-# (MLIR -> LLVM `unrealized_conversion_cast`) on gfx942/MI300, matching the
-# arch-gating of the sibling AMD GEMM tests below.
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skipif(not is_hip(), reason="Requires AMD GPU")
 def test_amd_fa_pipelined(config_name, causal):
     config = FlashAttention.CONFIGS[config_name]
     sm_scale = 0.5
