@@ -191,6 +191,32 @@ staging, cached gamma, more/fewer pipeline buffers, alternate tile widths,
 subtiling, and lower register caps all regressed. BF16 dweight math was also
 rejected because relative-L2 rose above the `2e-3` contract.
 
+## Current `T290058050` TLX prototype
+
+The OSS prototype is in
+`third_party/tlx/tutorials/fwd_layernorm_mul_gemm_tlx.py`, with its standalone
+reference in `fwd_layernorm_mul_gemm.py` and detailed results in
+`fwd_layernorm_mul_gemm.md`.
+
+The winning static-persistent schedule uses `BM64/BN256/BK128`, separate
+two-entry A/B shared-memory rings, one TMEM accumulator, and an eight-warp
+computed-prologue producer. The LayerNorm statistics pass batches 16 rows per
+program. The 2 GiB concatenated BF16 activation is never written to global
+memory.
+
+On a locked GB200, the tuned TLX path measures `1.446 ms`, versus `5.011 ms`
+for the OSS fused Triton seed and `1.754 ms` for activation materialization plus
+PyTorch/cuBLAS. It is 3.47x faster than the seed and 17.6% faster than unfused.
+Projection relative-L2 against the FP32-accumulating BF16-boundary reference is
+at most `6.01e-6` over seeds 0/1/2 and at most `1.78e-5` against the fused seed.
+
+NCU reports 128 registers/thread, 172.31 KiB dynamic SMEM, 25% occupancy, and
+small but nonzero local traffic (5.28 MB loads, 1.12 MB stores over the whole
+launch). Lower/higher register caps and a de-unrolled producer all regress.
+The GEO single-X-read full-K A-ring pattern is correct here but slower at
+`~1.78 ms`: with only one output-N tile, its extra normalizer task is not
+amortized by A reuse.
+
 ## Tuning guidance by fusion family
 
 ### Computed GEMM prologues
@@ -245,8 +271,9 @@ rejected because relative-L2 rose above the `2e-3` contract.
    extending its current pointer-load correctness seed.
 3. Revisit `T290079238` only with producer sharing across CTAs/output-N tiles
    or fusion with its backward outputs; retain FP32 workspace as the baseline.
-4. Establish competitive `(2097152,256,512)` and `(256,1024,2097152)` GEMM
-   routes before composing `T290058050` and `T290048886` fan-out fusion.
+4. Use the now-competitive `(2097152,256,512)` TLX route for `T290058050`'s
+   opt-in integration, then establish the `(256,1024,2097152)` route needed by
+   `T290048886`'s fan-out fusion.
 5. Treat the skinny/layout and batched-concat tasks as direct-store schedule
    work; do not begin by adding more pointwise work to a weak GEMM core.
 6. Attempt the full `T289914992` boundary only after reconstructed-hidden reuse
