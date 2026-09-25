@@ -2,23 +2,11 @@
 import pytest
 import torch
 from triton._internal_testing import is_blackwell
-
-SM100_ARCH = "sm100"
-
-SM100_SHAPES = [
-    [1, 256, 4, 128, True],
-    [2, 512, 4, 128, True],
-    [2, 512, 8, 64, True],
-    [1, 1024, 4, 64, True],
-    # Batch- vs sequence-dominated.
-    [4, 256, 4, 128, True],
-    [2, 1024, 4, 128, True],
-    [8, 128, 4, 128, True],
-    [2, 256, 16, 64, True],
-    [1, 2048, 2, 128, True],
-]
+from triton.tlx.ops.kernels.hstu_attn._shapes import CORRECTNESS_SHAPES, SYNTHETIC
 
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+L1_SHAPES = tuple(dict.fromkeys((*CORRECTNESS_SHAPES, *(shape._replace(dtype="fp16") for shape in SYNTHETIC))))
 
 
 def _inputs(Z, max_seq_len, H, head_dim, dtype):
@@ -45,17 +33,16 @@ def _float_ref(q, k, v, offsets, attn_scale, alpha, causal):
     return torch.cat(outs, 0)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-@pytest.mark.parametrize("Z, MAX_SEQ_LEN, H, HEAD_DIM, causal", SM100_SHAPES)
-def test_hstu_attn_sm100(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype):
+@pytest.mark.parametrize("Z,MAX_SEQ_LEN,H,HEAD_DIM,causal,dtype_name", L1_SHAPES)
+def test_hstu_attn_sm100(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import hstu_attn_dev as tlx_hstu_attn
 
+    dtype = DTYPES[dtype_name]
     q, k, v, offsets, attn_scale = _inputs(Z, MAX_SEQ_LEN, H, HEAD_DIM, dtype)
     alpha = 1.0 / HEAD_DIM
 
-    out = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, attn_scale, alpha=alpha, causal=causal, arch=SM100_ARCH,
-                        space="smoke")
+    out = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, attn_scale, alpha=alpha, causal=causal, space="smoke")
 
     ref = _float_ref(q, k, v, offsets, attn_scale, alpha, causal).to(out.dtype)
     precision = REL_PRECISION[dtype]
@@ -75,4 +62,4 @@ def test_non_causal_rejected():
 
     q, k, v, offsets, attn_scale = _inputs(2, 512, 4, 128, torch.bfloat16)
     with pytest.raises(InvalidInput, match="causal"):
-        tlx_hstu_attn(q, k, v, offsets, 512, attn_scale, alpha=1.0 / 128, causal=False, arch=SM100_ARCH, space="smoke")
+        tlx_hstu_attn(q, k, v, offsets, 512, attn_scale, alpha=1.0 / 128, causal=False, space="smoke")

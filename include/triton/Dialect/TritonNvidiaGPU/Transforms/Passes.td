@@ -290,6 +290,55 @@ def TritonNvidiaGPUPruneUnusedBarriersPass
   ];
 }
 
+def TritonNvidiaGPUPromoteMBarrierToNamedBarrierPass
+    : Pass<"triton-nvidia-gpu-promote-mbarrier-to-named-barrier", "mlir::ModuleOp"> {
+  let summary = "Promote eligible mbarriers to hardware named barriers";
+
+  let description = [{
+    Replaces eligible CTA-local mbarriers with named barriers after reserving
+    user and warp-specialization IDs from the unified named-barrier pool.
+
+    Enforced eligibility checks:
+    - One initialization, one static arrive, and one static wait for a
+      single-slot allocation, with no unknown synchronization uses. The
+      initialization and arrival counts must match; they may exceed one.
+    - Unpredicated, warp-uniform arrive and wait in distinct partitions of
+      the same warp-specialize operation. Enclosing for-loop nests must have
+      equivalent bounds and steps; other nested control flow is rejected.
+    - CTA locality of the actual barrier descriptors. Ordinary shared-memory
+      barriers broadcast across CTAs are rejected along with cluster memory.
+    - No asynchronous byte tracking, per-thread or multicast arrival, wait
+      dependencies, or other unsupported uses.
+
+    Protocol assumptions, not proved by these checks:
+    - Each dynamic wait observes a distinct phase completed by the
+      corresponding arrival. Wait phases must implement that correspondence.
+    - The surrounding synchronization and barrier lifetime prevent reuse
+      from advancing past a phase that a consumer still needs to observe.
+
+    An mbarrier wait observes phase completion; a named-barrier wait also
+    participates in a synchronization round. Two waits may validly observe
+    the same completed mbarrier phase without a second arrival. Replacing
+    them with two named waits can deadlock. Matching loop nests rejects the
+    one-arrival/two-wait case, but does not prove arbitrary phase sequencing
+    or that a wait cannot be redundant in a larger protocol.
+
+    If named-barrier IDs cannot be reserved, promotion is skipped without
+    emitting a diagnostic or failing this pass.
+
+    This is an opt-in optimization, not a general proof of synchronization
+    equivalence. The CUDA pipeline leaves it disabled unless
+    TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER is enabled. Validate the workload's
+    phase protocol before enabling it.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
   let summary = "Verify legal and consistent two_ctas usage across matmuls";
 

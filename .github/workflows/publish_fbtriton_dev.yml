@@ -1,0 +1,121 @@
+name: Publish fbtriton dev wheels
+# Builds fbtriton wheels from a ref and uploads them to a GitHub release, so
+# people can pip install a dev build without building from source:
+#
+#   pip install https://github.com/<owner>/<repo>/releases/download/dev/<wheel>
+#
+# Deliberately minimal: no tag, no release notes, no PyPI, no package index.
+# Sits alongside publish_fbtriton.yml, which is the PyPI path.
+#
+# Two different refs are in play, so they have different names:
+#   build_ref    picks which commit gets BUILT. This is the one you set.
+#   --ref        ("Use workflow from" in the UI) picks which branch's copy of
+#                THIS WORKFLOW runs. Leave it alone: it already defaults to
+#                the default branch, which is the only branch carrying this
+#                file. Only change it to test an edit to the workflow itself.
+#
+#   gh workflow run publish_fbtriton_dev.yml -f build_ref=release/3.8.x
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Tag of the GitHub release to upload into"
+        type: string
+        default: "dev"
+      build_ref:
+        description: "Branch, tag or SHA to build. Blank = the branch you dispatched on (NOT gh's --ref, which selects the workflow file)."
+        type: string
+        required: false
+        default: ""
+      pythons:
+        description: "ABI matrix, JSON array"
+        type: string
+        default: '["cp312"]'
+      arches:
+        description: "Arch matrix, JSON array"
+        type: string
+        default: '["x86_64","aarch64"]'
+
+# read-all so the build job can satisfy wheels_fb.yml's own `permissions:
+# read-all` -- a reusable workflow cannot request more than its caller.
+permissions: read-all
+
+concurrency:
+  group: publish-fbtriton-dev-${{ inputs.release }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.build_ref || github.ref_name }}
+      - id: pick
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    # Passing the resolved SHA rather than the ref name is load-bearing, and
+    # not only to pin the commit while a branch moves. actions/checkout
+    # detaches HEAD for a SHA, so setup.py's get_git_branch() returns "HEAD",
+    # which does not start with "release", so get_git_version_suffix() appends
+    # +git<short> and the wheel comes out as fbtriton-<base>+git<sha>.
+    # Checking out a release/* branch by *name* would instead yield a bare
+    # <base>, and every build of that line would collide on filename.
+    #
+    # That is also why no `version` is passed: setup.py already produces the
+    # scheme we want, so wheels_fb.yml needs no changes.
+    uses: ./.github/workflows/wheels_fb.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      pythons: ${{ inputs.pythons }}
+      arches: ${{ inputs.arches }}
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # upload release assets
+      actions: read     # download-artifact
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # This job never checks out, so gh has no git remote to infer the repo
+      # from and would fail with "fatal: not a git repository".
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release }}
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: Ensure the release exists
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --prerelease --latest=false \
+              --title "fbtriton $RELEASE_TAG wheels" \
+              --notes "Bucket for dev wheels. Published by publish_fbtriton_dev.yml."
+
+      - name: Upload wheels
+        run: |
+          ls -la dist/
+          # --clobber so re-running against the same commit replaces the
+          # assets instead of failing.
+          gh release upload "$RELEASE_TAG" dist/*.whl --clobber
+
+      - name: Summary
+        env:
+          BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download
+        run: |
+          {
+            echo "Built \`${{ needs.resolve.outputs.sha }}\` into \`$RELEASE_TAG\`."
+            echo
+            for w in dist/*.whl; do
+              echo "    pip install $BASE_URL/$RELEASE_TAG/$(basename "$w")"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

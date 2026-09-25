@@ -1,39 +1,67 @@
 from __future__ import annotations
 
-# Entries are [Z, H, N_CTX, HEAD_DIM, causal, dtype].
+from typing import NamedTuple
+
+from .._shape_suites import FocusRegistry, FocusSuite
+
+
+class FlashAttentionShape(NamedTuple):
+    batch: int
+    heads: int
+    context: int
+    head_dim: int
+    causal: bool
+    dtype: str
+
 
 #: Identical to `test_flash_attn.py::SHAPES`.
-SYNTHETIC: list[list] = [
-    [1, 1, 256, 64, False, "fp16"],
-    [1, 2, 512, 64, True, "fp16"],
-    [2, 4, 1024, 64, False, "fp16"],
-    [2, 4, 1024, 128, False, "fp16"],
-    [2, 4, 1024, 128, True, "fp16"],
-    [4, 8, 2048, 128, True, "fp16"],
-    [1, 16, 4096, 128, False, "fp16"],
-    [2, 32, 2048, 64, False, "fp16"],
-    [4, 8, 512, 64, True, "fp16"],
-    [1, 1, 8192, 128, True, "fp16"],
-]
+SYNTHETIC: tuple[FlashAttentionShape, ...] = (
+    FlashAttentionShape(1, 1, 256, 64, False, "fp16"),
+    FlashAttentionShape(1, 2, 512, 64, True, "fp16"),
+    FlashAttentionShape(2, 4, 1024, 64, False, "fp16"),
+    FlashAttentionShape(2, 4, 1024, 128, False, "fp16"),
+    FlashAttentionShape(2, 4, 1024, 128, True, "fp16"),
+    FlashAttentionShape(4, 8, 2048, 128, True, "fp16"),
+    FlashAttentionShape(1, 16, 4096, 128, False, "fp16"),
+    FlashAttentionShape(2, 32, 2048, 64, False, "fp16"),
+    FlashAttentionShape(4, 8, 512, 64, True, "fp16"),
+    FlashAttentionShape(1, 1, 8192, 128, True, "fp16"),
+)
 
-SM90_FOCUS: list[list] = [
-    [4, 48, 1024, 128, False, "bf16"],
-    [4, 48, 2048, 128, True, "bf16"],
-    [4, 48, 4096, 128, False, "bf16"],
-    [4, 48, 4096, 128, True, "bf16"],
-    [4, 48, 8192, 128, True, "bf16"],
-    [4, 48, 4096, 128, False, "fp16"],
-]
+FOCUS_SUITES = (
+    FocusSuite(
+        name="sm90_1",
+        op="flash_attn",
+        shapes=(
+            FlashAttentionShape(4, 48, 1024, 128, False, "bf16"),
+            FlashAttentionShape(4, 48, 2048, 128, True, "bf16"),
+            FlashAttentionShape(4, 48, 4096, 128, False, "bf16"),
+            FlashAttentionShape(4, 48, 4096, 128, True, "bf16"),
+            FlashAttentionShape(4, 48, 8192, 128, True, "bf16"),
+            FlashAttentionShape(4, 48, 4096, 128, False, "fp16"),
+        ),
+    ),
+    # TODO: Replace placeholders with captured shapes.
+    FocusSuite(
+        name="sm100_1",
+        op="flash_attn",
+        shapes=(
+            FlashAttentionShape(4, 32, 4096, 128, False, "bf16"),
+            FlashAttentionShape(4, 32, 4096, 128, True, "bf16"),
+            FlashAttentionShape(2, 32, 8192, 128, True, "bf16"),
+            FlashAttentionShape(1, 16, 16384, 128, True, "bf16"),
+            FlashAttentionShape(4, 32, 4096, 64, False, "bf16"),
+            FlashAttentionShape(4, 32, 4096, 128, False, "fp16"),
+        ),
+    ),
+)
 
-#: TODO: placeholder shapes, not a capture. Awaiting real ones.
-SM100_FOCUS: list[list] = [
-    [4, 32, 4096, 128, False, "bf16"],
-    [4, 32, 4096, 128, True, "bf16"],
-    [2, 32, 8192, 128, True, "bf16"],
-    [1, 16, 16384, 128, True, "bf16"],
-    [4, 32, 4096, 64, False, "bf16"],
-    [4, 32, 4096, 128, False, "fp16"],
-]
+DEFAULT_SUITES = {
+    "sm90": ("sm90_1", ),
+    "sm100": ("sm100_1", ),
+}
+FOCUS = FocusRegistry("flash_attn", FOCUS_SUITES, DEFAULT_SUITES)
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 
 def qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=False, device="cuda"):
@@ -59,6 +87,5 @@ def flops(Z, H, N_CTX, HEAD_DIM, causal, direction="fwd"):
 
 
 def label(Z, H, N_CTX, HEAD_DIM, causal, dtype, direction="fwd") -> str:
-    """The report's input column."""
     return (f"((), {{'dtype': '{dtype}', 'causal': '{causal}', 'dir': '{direction}', "
             f"'Z': '{Z}', 'H': '{H}', 'N_CTX': '{N_CTX}', 'HEAD_DIM': '{HEAD_DIM}'}})")

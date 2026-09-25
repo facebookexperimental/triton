@@ -11,30 +11,15 @@ the backward HEAD_DIM x NUM_CTAS matrix. Nothing tests them today.
 import pytest
 import torch
 from triton._internal_testing import is_blackwell
+from triton.tlx.ops.kernels.flash_attn._shapes import CORRECTNESS_SHAPES, SYNTHETIC
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.flash_attn is sm100-only today")
 
 torch.manual_seed(0)
 
-ARCH = "sm100"
-
-SHAPES = [
-    [1, 1, 256, 64, False],
-    [1, 2, 512, 64, True],
-    # Both head dims: head dim selects the pipeline.
-    [2, 4, 1024, 64, False],
-    [2, 4, 1024, 128, False],
-    [2, 4, 1024, 128, True],
-    [4, 8, 2048, 128, True],
-    [1, 16, 4096, 128, False],
-    # Head-dominated grid.
-    [2, 32, 2048, 64, False],
-    [4, 8, 512, 64, True],
-    # Long context.
-    [1, 1, 8192, 128, True],
-]
-
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+FWD_SHAPES = tuple(dict.fromkeys((*CORRECTNESS_SHAPES, *(shape._replace(dtype="bf16") for shape in SYNTHETIC))))
 
 
 def _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=False):
@@ -52,30 +37,31 @@ def _assert_close(out, ref, dtype):
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM, causal", SHAPES)
-def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype):
+@pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal,dtype_name", FWD_SHAPES)
+def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn as tlx_flash_attn
 
+    dtype = DTYPES[dtype_name]
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype)
-    out = tlx_flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke")
+    out = tlx_flash_attn(q, k, v, causal=causal, space="smoke")
     _assert_close(out, _sdpa(q, k, v, causal), dtype)
 
 
-@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM, causal", SHAPES)
-def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal):
+@pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal,dtype_name", CORRECTNESS_SHAPES)
+def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     """The kernel carries the full backward path even though the op defers it."""
     from triton.tlx.ops import flash_attn as tlx_flash_attn
 
-    q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, torch.float16, requires_grad=True)
+    dtype = DTYPES[dtype_name]
+    q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=True)
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
     do = torch.randn_like(q)
 
-    tlx_flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke").backward(do)
+    tlx_flash_attn(q, k, v, causal=causal, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal).backward(do)
 
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
-        _assert_close(got, want, torch.float16)
+        _assert_close(got, want, dtype)
 
 
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [[2, 4, 1024, 128], [1, 16, 4096, 128], [2, 32, 2048, 64]])
@@ -86,7 +72,7 @@ def test_flash_attn_bwd_bf16_accuracy(Z, H, N_CTX, HEAD_DIM):
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
     do = torch.randn_like(q)
 
-    tlx_flash_attn(q, k, v, causal=False, arch=ARCH, space="smoke").backward(do)
+    tlx_flash_attn(q, k, v, causal=False, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal=False).backward(do)
 
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):

@@ -954,11 +954,28 @@ public:
     unsigned m = 128;
     unsigned n = retShapePerCTA[1] >= 256 ? 256 : retShapePerCTA[1];
 
+    // Honor tt.dot_scaled's two_ctas flag. Needs a cluster of at least 2 CTAs;
+    // otherwise warn and fall back to 1-CTA so the kernel still compiles.
+    // BLOCK_M >= 128 is already guaranteed by the retShapePerCTA bail above.
+    bool useTwoCTAs = false;
+    if (dotOp.getTwoCtas()) {
+      auto mod = dotOp->getParentOfType<ModuleOp>();
+      auto clusterDims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+      if (clusterDims[0] < 2) {
+        dotOp.emitWarning()
+            << "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
+               "cluster-dim-x is "
+            << clusterDims[0] << ". Falling back to 1-CTA scaled MMA.";
+      } else {
+        useTwoCTAs = true;
+      }
+    }
+
     auto bitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        context, m, n, colStride, CGALayout, false,
-        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT, false);
+        context, m, n, colStride, CGALayout, useTwoCTAs,
+        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT, /*fp4Padded=*/false);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =
@@ -1010,7 +1027,7 @@ public:
     auto mmaOp = triton::nvidia_gpu::TCGen5MMAScaledOp::create(
         rewriter, loc, tokType, a, b, acc.getResult(), acc.getToken(), scaleA,
         scaleB, dotOp.getAElemType(), dotOp.getBElemType(),
-        /*useD=*/vTrue, /*pred=*/vTrue);
+        /*useD=*/vTrue, /*pred=*/vTrue, /*two_ctas=*/useTwoCTAs);
     // Propagate discardable attributes (e.g. tt.autows) from the original dot.
     for (auto attr : dotOp->getDiscardableAttrs())
       mmaOp->setDiscardableAttr(attr.getName(), attr.getValue());
@@ -1079,6 +1096,14 @@ static void decomposeMixedModeDotOp(ModuleOp mod, int computeCapability) {
 
 // Transpose scaled_dot ops that have a scale on lhs.
 static void transposeDotOp(DotScaledOp dotOp) {
+  // two_ctas means the CTA pair splits M, so it cannot be carried across a
+  // transpose that swaps M and N. Drop it, but say so: every other unsupported
+  // 2-CTA config warns before falling back, and silently ignoring the flag
+  // would leave the user wondering why no cta_group::2 was emitted.
+  if (dotOp.getTwoCtas())
+    dotOp.emitWarning() << "two_ctas=True is not supported when only the rhs "
+                           "is scaled, because the dot is transposed here. "
+                           "Falling back to 1-CTA scaled MMA.";
   OpBuilder builder(dotOp);
   Value lhs = dotOp.getA();
   std::array<int, 2> transOrder = {1, 0};

@@ -203,6 +203,8 @@ private:
       return failure();
     }
 
+    // FuncOpConversion runs before CallOpConversion, so this call's enclosing
+    // function should already have the program-context arguments appended.
     auto callerArgs = caller.getArguments();
     if (callerArgs.size() < cpu::kNumProgramContextArgs) {
       callOp.emitOpError("caller is missing pid and num_programs arguments");

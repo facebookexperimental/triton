@@ -22,9 +22,6 @@ from triton.language.extra.tlx.mxfp8_utils import (
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._shapes import SM100_FOCUS
-
-PERF_SHAPES = SM100_FOCUS
 
 
 def _mxf8_host_descriptor_pre_hook(nargs):

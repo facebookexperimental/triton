@@ -26,7 +26,7 @@ from torch._inductor.codegen.triton import (
     triton_type,
 )
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, Reduction
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 from torch._inductor.utils import get_dtype_size, IndentedBuffer
 from torch._inductor.virtualized import V
@@ -62,17 +62,26 @@ class LocalBufferRetentionPolicy:
 # protect occupancy; larger budgets should be separate MultiKernel candidates
 # so Inductor can benchmark and select them only when profitable.
 _LOCAL_BUFFER_RETENTION_POLICIES = {
-    "gfx950": LocalBufferRetentionPolicy(
-        max_local_bytes=32 * 1024,
-        reduction_block_limit=2048,
-        num_warps=4,
-        backend_options=(("waves_per_eu", 4),),
+    "gfx950": (
+        LocalBufferRetentionPolicy(
+            max_local_bytes=32 * 1024,
+            reduction_block_limit=2048,
+            num_warps=4,
+            backend_options=(("waves_per_eu", 4),),
+        ),
     ),
-    "sm90": LocalBufferRetentionPolicy(
-        max_local_bytes=32 * 1024,
-        reduction_block_limit=8192,
-        num_warps=8,
-        round_reduction_block_up=True,
+    "sm90": (
+        LocalBufferRetentionPolicy(
+            max_local_bytes=32 * 1024,
+            reduction_block_limit=8192,
+            num_warps=8,
+            round_reduction_block_up=True,
+        ),
+        LocalBufferRetentionPolicy(
+            max_local_bytes=64 * 1024,
+            reduction_block_limit=4096,
+            num_warps=8,
+        ),
     ),
 }
 
@@ -109,17 +118,21 @@ class LocalBufferRetention:
     """Find cross-phase values that can stay on-chip instead of round-tripping HBM."""
 
     @staticmethod
-    def _policy() -> LocalBufferRetentionPolicy | None:
+    def _policies() -> tuple[LocalBufferRetentionPolicy, ...]:
         if config.triton.tlx_mode != "allow":
-            return None
+            return ()
         try:
             device = V.graph.get_current_device_or_throw()
             if device.type != "cuda":
-                return None
+                return ()
             target = target_for_device(device)
         except (AssertionError, RuntimeError, ValueError):
-            return None
-        return _LOCAL_BUFFER_RETENTION_POLICIES.get(target.key)
+            return ()
+        return _LOCAL_BUFFER_RETENTION_POLICIES.get(target.key, ())
+
+    @classmethod
+    def _policy(cls) -> LocalBufferRetentionPolicy | None:
+        return next(iter(cls._policies()), None)
 
     @classmethod
     def _is_enabled(cls) -> bool:
@@ -203,9 +216,11 @@ class LocalBufferRetention:
 
     @classmethod
     def plan_for(
-        cls, node_schedule: Sequence[object]
+        cls,
+        node_schedule: Sequence[object],
+        policy: LocalBufferRetentionPolicy | None = None,
     ) -> LocalBufferRetentionPlan | None:
-        policy = cls._policy()
+        policy = policy or cls._policy()
         if policy is None:
             return None
 
@@ -219,6 +234,7 @@ class LocalBufferRetention:
             return None
 
         reductions: list[SchedulerNode] = []
+        reduction_output_names: OrderedSet[str] = OrderedSet()
         for scheduled_node in scheduled_nodes:
             for node in scheduled_node.get_nodes():
                 if not node.is_reduction():
@@ -230,6 +246,12 @@ class LocalBufferRetention:
                 if node.has_strict_reduction():
                     return None
                 reductions.append(node)
+                if isinstance(node.node.data, Reduction):
+                    reduction_output_names.update(
+                        dep.name
+                        for dep in node.read_writes.writes
+                        if isinstance(dep, MemoryDep) and dep.mode is None
+                    )
 
         if not reductions:
             return None
@@ -261,6 +283,10 @@ class LocalBufferRetention:
         used_bytes = 0
 
         for name in sorted(writes.keys() & reads.keys()):
+            # TritonKernel.store_reduction() bypasses store(), so this subclass
+            # cannot redirect reduction outputs to LDS yet.
+            if name in reduction_output_names:
+                continue
             write_phases = sorted(writes[name])
             read_phases = sorted(reads[name])
             for store_phase in write_phases:
@@ -349,6 +375,17 @@ class LocalBufferRetention:
             num_warps=policy.num_warps,
             backend_options=policy.backend_options,
         )
+
+    @classmethod
+    def plans_for(
+        cls, node_schedule: Sequence[object]
+    ) -> tuple[LocalBufferRetentionPlan, ...]:
+        plans: list[LocalBufferRetentionPlan] = []
+        for policy in cls._policies():
+            plan = cls.plan_for(node_schedule, policy)
+            if plan is not None and plan not in plans:
+                plans.append(plan)
+        return tuple(plans)
 
 
 class LocalBufferRetentionKernel(TritonKernel):
@@ -642,15 +679,14 @@ def get_extra_kernel_choices(
     """Return the opt-in local-retention candidate for a compatible schedule."""
     if kernel_cls is not TritonKernel or "fixed_config" in kernel_kwargs:
         return []
-    plan = LocalBufferRetention.plan_for(features.node_schedule)
-    if plan is None:
-        return []
-
-    retained_kwargs = {
-        **kernel_kwargs,
-        "local_buffer_retention_plan": plan,
-        "override_persistent_reduction": False,
-        "override_cooperative_reduction": False,
-        "fixed_config": FixedTritonConfig(plan.triton_config),
-    }
-    return [LocalBufferRetentionKernel(*kernel_args, **retained_kwargs)]
+    kernels = []
+    for plan in LocalBufferRetention.plans_for(features.node_schedule):
+        retained_kwargs = {
+            **kernel_kwargs,
+            "local_buffer_retention_plan": plan,
+            "override_persistent_reduction": False,
+            "override_cooperative_reduction": False,
+            "fixed_config": FixedTritonConfig(plan.triton_config),
+        }
+        kernels.append(LocalBufferRetentionKernel(*kernel_args, **retained_kwargs))
+    return kernels

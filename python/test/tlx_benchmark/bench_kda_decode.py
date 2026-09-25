@@ -7,13 +7,14 @@ Correctness is covered by the TLX ops unit tests.
 
 from __future__ import annotations
 
-import importlib
 import pathlib
 import sys
 
 import torch
 import torch.nn.functional as F
-from triton.tlx.ops.kernels.kda._shapes import FLOOR_TFLOPS, GFX950_DECODE_SYNTHETIC
+from triton.tlx.ops.kernels.kda._decode_shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.kda._decode_shapes import SYNTHETIC
+from triton.tlx.ops.kernels.kda._shapes import FLOOR_TFLOPS
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -28,11 +29,8 @@ COLD_COMPILE = "first"
 DTYPES = {"bf16": torch.bfloat16}
 
 
-def shapes(synthetic: bool = False) -> list[list]:
-    if synthetic:
-        return list(GFX950_DECODE_SYNTHETIC)
-    module = importlib.import_module(f"triton.tlx.ops.kernels.kda.{driver.arch()}_decode")
-    return list(module.PERF_SHAPES)
+def shapes(synthetic: bool = False, suites=None) -> list:
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
 def _label(batch: int, heads: int, key_dim: int, value_dim: int, dtype: str) -> str:
@@ -40,7 +38,7 @@ def _label(batch: int, heads: int, key_dim: int, value_dim: int, dtype: str) -> 
             f"'K': '{key_dim}', 'V': '{value_dim}'}})")
 
 
-def cases(synthetic: bool = False) -> list[Case]:
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
     return [
         Case(
             op=OP,
@@ -48,8 +46,7 @@ def cases(synthetic: bool = False) -> list[Case]:
             dtype=str(DTYPES[entry[4]]).removeprefix("torch."),
             shape=tuple(entry[:4]),
             label=_label(*entry),
-        )
-        for entry in shapes(synthetic)
+        ) for entry in shapes(synthetic, suites)
     ]
 
 
@@ -91,7 +88,6 @@ def prepare(case: Case, space: str) -> Prepared:
         read_indices=read_indices,
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
-        arch=driver.arch(),
     )
     return Prepared(
         tlx_fn=tlx_fn,

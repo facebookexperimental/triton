@@ -8,6 +8,8 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include <deque>
 
+namespace ttng = mlir::triton::nvidia_gpu;
+
 namespace mlir {
 
 /// Given a value produced by memdesc_index, possibly wrapped in transparent
@@ -294,6 +296,8 @@ bool containsLocalBarrier(Operation *op) {
     return true;
   if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
     return barrier.hasLocal();
+  if (auto wgWait = dyn_cast<ttng::WarpGroupDotWaitOp>(op))
+    return !wgWait.getWarpGroupLocal() && triton::gpu::lookupNumWarps(op) > 4;
   return false;
 }
 
@@ -375,6 +379,8 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
   for (Operation *next = op->getNextNode(); next; next = next->getNextNode()) {
     if (isa<triton::gpu::SchedulingBarrierOpInterface>(next))
       continue;
+    if (isa<ttng::BarrierExpectOp>(next))
+      return true;
 
     auto stages = getLocalBarrierStages(next, allocation);
     if (stages.beforeMemoryEffects ||
@@ -401,6 +407,17 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
   auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op);
+
+  // A later CTA-wide synchronization can also synchronize this wait, provided
+  // no memory is accessed before reaching it.
+  if (auto wgWait = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
+    if (!wgWait.getWarpGroupLocal() &&
+        triton::gpu::lookupNumWarps(wgWait) > 4 &&
+        hasSyncPointBeforeMemoryEffect(wgWait, allocation)) {
+      wgWait->setAttr("warpGroupLocal", builder->getUnitAttr());
+    }
+  }
+
   auto barrierStages = getLocalBarrierStages(op, allocation);
   if (barrierStages.beforeMemoryEffects) {
     // Model a leading local barrier before handling the operation's effects.

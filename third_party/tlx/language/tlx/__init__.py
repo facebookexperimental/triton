@@ -31,6 +31,7 @@ from .mem_ops import (
     async_amd_descriptor_store,
     async_amd_descriptor_wait,
     async_store,
+    async_descriptor_gather,
     async_descriptor_load,
     assume_uniform,
     buffer_atomic_add,
@@ -68,6 +69,7 @@ from .mem_ops import (
     storage_alias_spec,
     subslice,
     tmem_copy,
+    tmem_shift,
     update_tensor_descriptor,
 )
 from .mma_ops import (
@@ -198,6 +200,7 @@ __all__ = [
     "dump_layout",
     "local_load",
     "local_store",
+    "tmem_shift",
     "local_gather",
     "local_scatter",
     "local_trans",
@@ -210,6 +213,7 @@ __all__ = [
     "async_amd_descriptor_store",
     "async_amd_descriptor_wait",
     "amd_descriptor_prefetch_tensor",
+    "async_descriptor_gather",
     "async_descriptor_load",
     "async_descriptor_prefetch_tensor",
     "async_descriptor_store",

@@ -611,7 +611,8 @@ def test_a_missing_extra_key_renders_as_absent_not_as_a_crash():
     result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]), extra={})
     # The data row, not the dashed separator: the cell itself must be a dash.
     row = report.table([result], (("Mtok/s", "mtokens_per_s"), )).splitlines()[2]
-    assert row.endswith("-  ok")
+    # ... <extra cell>  <status>  <best config>
+    assert row.split()[-3:] == ["-", "ok", "-"]
 
 
 # --------------------------------------------------------------------------
@@ -647,10 +648,134 @@ def test_the_speedup_floor_wins_when_a_reference_exists():
 
 
 # --------------------------------------------------------------------------
+# focus suites: composition and selection
+# --------------------------------------------------------------------------
+
+
+def test_focus_suites_are_hardware_agnostic_and_deduplicate_in_definition_order():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    common = FocusSuite("common", "mm", ((1, ), (2, )))
+    workload = FocusSuite("workload", "mm", ((2, ), (3, )))
+    defaults = {"gfx942": ("common", ), "gfx950": ("common", )}
+    registry = FocusRegistry("mm", (common, workload), defaults)
+
+    assert registry.shapes("gfx950") == ((1, ), (2, ))
+    assert registry.shapes("gfx942") == ((1, ), (2, ))
+    assert registry.selected_suite_names("gfx950") == ("common", )
+    assert registry.shapes("gfx950", ("common", "workload")) == ((1, ), (2, ), (3, ))
+    assert registry.shapes("gfx950", ("workload", )) == ((2, ), (3, ))
+    assert registry.shapes("gfx942", ("workload", )) == ((2, ), (3, ))
+
+
+def test_focus_suite_can_union_other_suites():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    first = FocusSuite("first", "mm", ((1, ), (2, )))
+    second = FocusSuite("second", "mm", ((2, ), (3, )))
+    combined = FocusSuite("all", "mm", includes=("first", "second"))
+    registry = FocusRegistry("mm", (first, second, combined), {"gfx950": ("all", )})
+
+    assert registry.resolved_shapes("all") == ((1, ), (2, ), (3, ))
+    assert registry.all_shapes() == ((1, ), (2, ), (3, ))
+    assert registry.shapes("gfx950") == ((1, ), (2, ), (3, ))
+    assert registry.selected_suite_names("gfx950") == ("all", )
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.bmm._shapes",
+        "triton.tlx.ops.kernels.flash_attn._shapes",
+        "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes",
+        "triton.tlx.ops.kernels.hstu_attn._shapes",
+        "triton.tlx.ops.kernels.kda._shapes",
+        "triton.tlx.ops.kernels.kda._prefill_shapes",
+        "triton.tlx.ops.kernels.kda._decode_shapes",
+        "triton.tlx.ops.kernels.mm._shapes",
+    ],
+)
+def test_operator_shape_modules_expose_the_l1_union(module_name):
+    import importlib
+
+    shapes = importlib.import_module(module_name)
+    expected = tuple(dict.fromkeys((*shapes.SYNTHETIC, *shapes.FOCUS.all_shapes())))
+    assert shapes.CORRECTNESS_SHAPES == expected
+
+
+def test_operator_focus_suite_names_and_host_defaults_are_stable():
+    import importlib
+    import re
+
+    expected = {
+        "triton.tlx.ops.kernels.addmm._shapes": {
+            "gfx942": ("gfx942_1", ),
+            "gfx950": ("gfx950_1", ),
+        },
+        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.flash_attn._shapes": {
+            "sm90": ("sm90_1", ),
+            "sm100": ("sm100_1", ),
+        },
+        "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {"sm100": ("sm100_1", )},
+        "triton.tlx.ops.kernels.hstu_attn._shapes": {
+            "sm100": ("sm100_1", ),
+            "gfx950": (),
+        },
+        "triton.tlx.ops.kernels.kda._shapes": {"sm100": ("sm100_1", )},
+        "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.mm._shapes": {
+            "sm100": ("sm100_1", ),
+            "gfx950": ("gfx950_all", ),
+            "gfx942": ("gfx942_all", ),
+        },
+    }
+    pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
+    for module_name, defaults in expected.items():
+        registry = importlib.import_module(module_name).FOCUS
+        assert dict(registry.defaults) == defaults
+        assert all(pattern.fullmatch(suite.name) for suite in registry.suites)
+
+    mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
+    assert mm.suite("gfx942_2").includes == ("gfx950_2", )
+    assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
+    assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
+    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+
+def test_focus_suite_selection_rejects_unknown_names():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    baseline = FocusSuite("baseline", "mm", ((1, ), ))
+    registry = FocusRegistry("mm", (baseline, ), {"sm100": ("baseline", )})
+    with pytest.raises(ValueError, match="unknown focus suite.*missing.*baseline"):
+        registry.shapes("sm100", ("missing", ))
+
+
+def test_focus_suite_op_mismatch_is_rejected_explicitly():
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    wrong_op = FocusSuite("baseline", "bmm", ((1, ), ))
+    with pytest.raises(ValueError, match="baseline.*do not map to op 'mm'"):
+        FocusRegistry("mm", (wrong_op, ), {"sm100": ("baseline", )})
+
+
+# --------------------------------------------------------------------------
 # driver: the adapter contract
 # --------------------------------------------------------------------------
 
-BENCH_MODULES = ("bench_mm", "bench_flash_attn", "bench_hstu_attn", "bench_kda")
+BENCH_MODULES = (
+    "bench_addmm",
+    "bench_flash_attn",
+    "bench_flash_attn_mxfp8",
+    "bench_hstu_attn",
+    "bench_kda",
+    "bench_kda_decode",
+    "bench_kda_prefill",
+    "bench_mm",
+)
 
 
 @pytest.mark.parametrize("module_name", BENCH_MODULES)
@@ -658,7 +783,8 @@ def test_every_bench_module_satisfies_the_adapter_contract(module_name):
     import importlib
 
     bench = importlib.import_module(module_name)
-    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "cases", "prepare", "supported", "default_json", "run", "main"):
+    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "SHAPE_SUITES", "cases", "prepare", "supported", "default_json",
+                 "run", "main"):
         assert hasattr(bench, name), f"{module_name} is missing {name}"
     assert all(len(col) == 2 for col in bench.EXTRA_COLUMNS)
     # An op with no reference must say so rather than leave it implicit.
@@ -701,6 +827,91 @@ def test_bind_returns_the_four_entry_points_bound_to_the_module():
     supported, default_json, run, main = driver.bind(bench)
     assert callable(supported) and callable(run) and callable(main)
     assert default_json() == bench.default_json()
+    assert default_json(("common", "large_m")).endswith(".common+large_m.json")
+
+
+def test_suite_listing_shows_defaults():
+    from _harness import driver
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    common = FocusSuite("common", "mm", ((1, ), ))
+    optional = FocusSuite("optional", "mm", ((2, ), ))
+    combined = FocusSuite("all", "mm", includes=("common", "optional"))
+    bench = type("Bench", (), {
+        "SHAPE_SUITES":
+        FocusRegistry("mm", (common, optional, combined), {
+            "gfx950": ("all", ),
+            "gfx942": ("common", ),
+        })
+    })
+
+    assert driver.suite_listing(bench) == ("gfx950 default => all => common+optional\n"
+                                           "gfx942 default => common")
+
+
+def test_suite_listing_shows_an_explicit_empty_default():
+    from _harness import driver
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry
+
+    bench = type("Bench", (), {"SHAPE_SUITES": FocusRegistry("fake", (), {"gfx950": ()})})
+    assert driver.suite_listing(bench) == "gfx950 default => (none)"
+
+
+def test_suite_shape_listing_shows_typed_shapes():
+    from _harness import driver
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    suite = FocusSuite("baseline", "mm", ((1, 2), (3, 4)))
+    bench = type("Bench", (), {"SHAPE_SUITES": FocusRegistry("mm", (suite, ), {"sm100": ("baseline", )})})
+
+    assert driver.suite_shape_listing(bench, "baseline") == "baseline (2 shapes)\n(1, 2)\n(3, 4)"
+
+
+# --------------------------------------------------------------------------
+# driver: the best-config column
+# --------------------------------------------------------------------------
+
+
+def test_a_config_is_abbreviated_whichever_tile_spelling_a_kernel_uses():
+    from _harness import driver
+
+    config = triton.Config({"BLOCK_M": 128, "BLOCK_SIZE_N": 256, "SPLIT_K": 2}, num_warps=8, num_stages=3)
+    assert driver._fmt_config(config) == "BM=128 BN=256 SPLIT_K=2 w8 s3"
+
+
+def test_every_autotuned_kernel_a_case_launches_is_recorded(monkeypatch):
+    """The column is the harness's, not an op's: whatever ran is what is named."""
+    import types
+
+    from triton.runtime.autotuner import Autotuner
+
+    from _harness import driver
+
+    stub = lambda self, *a, **k: None  # noqa: E731
+    monkeypatch.setattr(Autotuner, "run", stub)
+
+    def attn_fwd():
+        pass
+
+    def attn_bwd():
+        pass
+
+    captured: dict = {}
+    with driver._record_configs(captured):
+        for fn, warps in ((attn_fwd, 4), (attn_bwd, 8)):
+            Autotuner.run(
+                types.SimpleNamespace(base_fn=fn, best_config=triton.Config({"BLOCK_M": 64}, num_warps=warps,
+                                                                            num_stages=2)))
+    assert Autotuner.run is stub, "the patch must not outlive the launch"
+    assert driver._render_configs(captured) == "attn_fwd: BM=64 w4 s2 | attn_bwd: BM=64 w8 s2"
+
+
+def test_an_op_whose_kernels_are_not_autotuned_reports_no_config():
+    from _harness import driver, report
+
+    assert driver._render_configs({}) is None
+    result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]))
+    assert report.table([result]).splitlines()[2].endswith("-")
 
 
 # --------------------------------------------------------------------------
@@ -714,14 +925,17 @@ class _FakeBench:
     OP = "fake"
     REF_NAME = ""
     EXTRA_COLUMNS = ()
+    SHAPE_SUITES = None
 
     def __init__(self, cold_compile=None, directions=("fwd", "bwd"), n=3):
         if cold_compile is not None:
             self.COLD_COMPILE = cold_compile
         self._directions = directions
         self._n = n
+        self.requested_suites = None
 
-    def cases(self, synthetic=False):
+    def cases(self, synthetic=False, suites=None):
+        self.requested_suites = suites
         return [
             Case(op=self.OP, arch="sm100", dtype="bfloat16", shape=(i, ), direction=d)
             for i in range(self._n)
@@ -778,6 +992,25 @@ def test_an_unknown_cold_compile_mode_is_rejected():
 
     with pytest.raises(ValueError, match="cold_compile"):
         driver.resolve_cold_compile(_FakeBench(), "sometimes")
+
+
+def test_focus_suite_selection_is_forwarded_and_recorded(monkeypatch):
+    from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+
+    bench = _FakeBench(cold_compile="none")
+    common = FocusSuite("common", "fake", ((1, ), ))
+    large_m = FocusSuite("large_m", "fake", ((2, ), ))
+    bench.SHAPE_SUITES = FocusRegistry("fake", (common, large_m), {"sm100": ("common", )})
+    _, env = _picked(monkeypatch, bench, suites=("common", "large_m"))
+    assert bench.requested_suites == ("common", "large_m")
+    assert env["shape_suites"] == ["common", "large_m"]
+
+
+def test_synthetic_and_focus_suite_selection_are_mutually_exclusive(monkeypatch):
+    from _harness import driver
+
+    with pytest.raises(ValueError, match="--synthetic and --suite"):
+        driver.run(_FakeBench(), space="full", synthetic=True, suites=("baseline", ))
 
 
 def test_mm_still_times_every_case_and_the_full_space_ops_do_not():

@@ -160,6 +160,8 @@ static const TTGIRToTLXMapping opMappings[] = {
     // TMA operations
     {"ttng.async_tma_copy_global_to_local", "tlx.async_descriptor_load",
      "TMA load from global to shared memory"},
+    {"ttng.async_tma_gather", "tlx.async_descriptor_gather",
+     "TMA gather from global to shared memory"},
     {"ttng.async_tma_copy_local_to_global", "tlx.async_descriptor_store",
      "TMA store from shared to global memory"},
     {"ttng.tma_store_wait", "tlx.async_descriptor_store_wait",
@@ -228,9 +230,9 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"arith.constant", "const", "Constant value"},
     {"arith.select", "tl.where", "Select operation"},
     {"arith.maxf", "tl.maximum", "Float max"},
-    {"arith.maxnumf", "tl.maximum", "Float max (NaN-propagating)"},
+    {"arith.maxnumf", "tl.maximum", "Float max (NaN-quieting)"},
     {"arith.minf", "tl.minimum", "Float min"},
-    {"arith.minnumf", "tl.minimum", "Float min (NaN-propagating)"},
+    {"arith.minnumf", "tl.minimum", "Float min (NaN-quieting)"},
     // Elementwise binary min/max. NOTE: tl.min/tl.max are reductions, so
     // they are not used here. Use tl.minimum/maximum similar to float above.
     {"arith.maxsi", "tl.maximum", "Signed integer max"},
@@ -281,7 +283,10 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.precise_sqrt", "tl.math.sqrt_rn", "IEEE-rounded square root"},
 
     // GPU operations
-    {"gpu.barrier", "gpu.barrier", "GPU barrier"},
+    // Reachable only if gpu.barrier is taken off the skip list, and
+    // tlx.workgroup_barrier is AMD-only -- gate it on isAMDTarget if so, the
+    // way the ttg.barrier handler does.
+    {"gpu.barrier", "tlx.workgroup_barrier", "Workgroup-wide barrier"},
     {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
 };
 
@@ -418,7 +423,11 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  std::replace(name.begin(), name.end(), '#', '_');
+  // MLIR names may carry characters Python identifiers cannot, notably the
+  // dots in block-pointer-derived names like `V_block_ptr.offsets.1`.
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
   if (!name.empty() && std::isdigit(name.front()))
     name = "var_" + name;
   return name;
@@ -435,26 +444,59 @@ static DenseMap<Value, std::string> *getValueNameCachePtr() {
 static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
   DenseMap<Value, std::string> cache;
   AsmState asmState(rootOp, OpPrintingFlags().printNameLocAsPrefix(true));
-  rootOp->walk([&](Operation *op) {
-    for (Value result : op->getResults()) {
-      std::string buf;
-      llvm::raw_string_ostream os(buf);
-      result.printAsOperand(os, asmState);
-      os.flush();
-      cache[result] = formatSSAName(buf);
-    }
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        for (BlockArgument arg : block.getArguments()) {
-          std::string buf;
-          llvm::raw_string_ostream os(buf);
-          arg.printAsOperand(os, asmState);
-          os.flush();
-          cache[arg] = formatSSAName(buf);
+
+  // Sanitization is many-to-one -- `a.b` and `a_b` both become `a_b` -- and two
+  // values sharing a name in one emitted function would shadow each other,
+  // which is valid Python but a different program. Deduplicate within a
+  // function, not across the module: separate functions get separate Python
+  // scopes, and each legitimately has its own `arg0`.
+  auto nameScope = [&](Operation *scope) {
+    llvm::StringMap<unsigned> used;
+    auto claim = [&](StringRef raw) {
+      std::string name = formatSSAName(raw);
+      auto [it, inserted] = used.try_emplace(name, 0);
+      if (inserted)
+        return name;
+      // Copy the counter out rather than holding `it` across the loop: the
+      // insertions below can grow the map, and StringMap iterators point into
+      // a bucket table that growth reallocates.
+      unsigned suffix = it->second;
+      std::string candidate;
+      do {
+        candidate = name + "_" + std::to_string(++suffix);
+      } while (!used.try_emplace(candidate, 0).second);
+      used[name] = suffix;
+      return candidate;
+    };
+    scope->walk([&](Operation *op) {
+      for (Value result : op->getResults()) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        result.printAsOperand(os, asmState);
+        os.flush();
+        cache[result] = claim(buf);
+      }
+      for (Region &region : op->getRegions()) {
+        for (Block &block : region) {
+          for (BlockArgument arg : block.getArguments()) {
+            std::string buf;
+            llvm::raw_string_ostream os(buf);
+            arg.printAsOperand(os, asmState);
+            os.flush();
+            cache[arg] = claim(buf);
+          }
         }
       }
-    }
+    });
+  };
+
+  bool sawFunc = false;
+  rootOp->walk([&](tt::FuncOp f) {
+    sawFunc = true;
+    nameScope(f);
   });
+  if (!sawFunc)
+    nameScope(rootOp);
   return cache;
 }
 
@@ -466,6 +508,16 @@ static const llvm::StringSet<> elementTypeCastOps = {
     "arith.extf",   "arith.truncf", "arith.sitofp",
     "arith.uitofp", "arith.fptosi", "arith.fptoui",
 };
+
+// Several TLX primitives lower to ROCDL and so are only usable on CDNA; the
+// target lives on the module as `ttg.target`, e.g. "hip:gfx950".
+static bool isAMDTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return false;
+  auto target = mod->getAttrOfType<StringAttr>("ttg.target");
+  return target && target.getValue().starts_with("hip");
+}
 
 // Element types getElementTypeName can spell as a TLX dtype. Anything else it
 // renders as raw MLIR, which is not usable in emitted Python.
@@ -717,19 +769,7 @@ void printConstantValue(Attribute attr, llvm::raw_ostream &os) {
       } else {
         printConstantValue(splatAttr, os);
       }
-      os << ", ";
-      Type et = tensorType.getElementType();
-      if (et.isF32())
-        os << "tl.float32";
-      else if (et.isBF16())
-        os << "tl.bfloat16";
-      else if (et.isF16())
-        os << "tl.float16";
-      else if (et.isInteger(32))
-        os << "tl.int32";
-      else
-        os << "tl.float32";
-      os << ")";
+      os << ", " << getElementTypeName(tensorType.getElementType()) << ")";
     } else {
       os << "dense<...>";
     }
@@ -917,6 +957,7 @@ bool shouldSkipOp(
       "ttg.convert_layout",
       "tt.return",
       "tt.reduce.return",
+      "tt.scan.return",
       "arith.extui",
       "arith.extsi",
       "arith.extf",
@@ -1943,6 +1984,32 @@ void printSimplifiedOp(
     return;
   }
 
+  // ttng.async_tma_gather: reorder args for Python API
+  // TTGIR operands: desc, x_offsets, y_offset, barrier, result, pred
+  // Python API: async_descriptor_gather(desc, result, x_offsets, y_offset,
+  //                                     barrier)
+  if (opName == "ttng.async_tma_gather") {
+    Value desc = op->getOperand(0);
+    Value xOffsets = op->getOperand(1);
+    Value yOffset = op->getOperand(2);
+    Value barrier = op->getOperand(3);
+    Value result = op->getOperand(4);
+    Value pred = op->getOperand(5);
+    os << "tlx.async_descriptor_gather("
+       << getValueName(desc, argSubstitutionMap) << ", "
+       << getValueName(result, argSubstitutionMap) << ", "
+       << getValueName(xOffsets, argSubstitutionMap) << ", "
+       << getValueName(yOffset, argSubstitutionMap) << ", "
+       << getValueName(barrier, argSubstitutionMap);
+    if (!isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    if (op->hasAttr("multicast"))
+      os << ", multicast=True";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // ttng.async_tma_copy_global_to_local: reorder args for Python API
   // TTGIR operands: desc, coords..., result_buf, barrier, pred
   // Python API: async_descriptor_load(desc, result_buf, [coords], barrier)
@@ -2379,6 +2446,202 @@ void printSimplifiedOp(
     return;
   }
 
+  // AMD-only: create_workgroup_barrier brackets the ttg.barrier with two
+  // rocdl.sched.barrier guards, which a non-AMD target cannot lower; on AMD
+  // they constrain scheduling but not results. Local must match exactly -- a
+  // wider mask would be silently under-fenced, so it goes to the generic path.
+  if (auto barrier = dyn_cast<ttg::BarrierOp>(op)) {
+    if (isAMDTarget(op) && barrier.getAddrSpace() == ttg::AddrSpace::Local) {
+      os << "tlx.workgroup_barrier()";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tl.maximum/minimum/clamp default to propagate_nan=NONE, which is the
+  // NaN-quieting behaviour of maxnumf/minnumf. maximumf/minimumf propagate
+  // NaN instead, and tt.clampf carries the choice in an attribute, so all
+  // three have to say so explicitly or the round trip changes NaN semantics.
+  if ((opName == "arith.maximumf" || opName == "arith.minimumf") &&
+      op->getNumOperands() == 2 && op->getNumResults() == 1) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+       << (opName == "arith.maximumf" ? "tl.maximum(" : "tl.minimum(")
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap)
+       << ", propagate_nan=tl.PropagateNan.ALL)";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
+    os << getValueName(op->getResult(0), argSubstitutionMap) << " = tl.clamp(";
+    for (unsigned i = 0; i < 3; ++i)
+      os << (i ? ", " : "") << getValueName(op->getOperand(i), argSubstitutionMap);
+    if (clamp.getPropagateNan() == tt::PropagateNan::ALL)
+      os << ", propagate_nan=tl.PropagateNan.ALL";
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // amdg.extract_slice takes its offsets as an attribute and gets its shape
+  // from the result type; tlx.extract_slice wants both spelled out.
+  if (opName == "amdg.extract_slice" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1) {
+    auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    auto srcTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto offsets = op->getAttrOfType<DenseI64ArrayAttr>("static_offsets");
+    // tlx.extract_slice takes the shape and the offsets as equal-length lists;
+    // emitting mismatched ranks would be silently wrong, so leave a disagreeing
+    // op to the generic path, which flags it. A dynamic dimension is the same
+    // hazard: getDimSize would hand back ShapedType::kDynamic and that negative
+    // sentinel would be emitted as the shape. The encodings have to agree too:
+    // only the shape and offsets are emitted, and create_amd_extract_slice
+    // rebuilds the result type from the source encoding, so a result that was
+    // laid out differently would come back silently relaid out. The verifier
+    // pins lane and warp bases but not the register bases, so they can differ.
+    if (resTy && srcTy && resTy.hasStaticShape() &&
+        resTy.getEncoding() == srcTy.getEncoding() && offsets &&
+        offsets.size() == resTy.getRank()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tlx.extract_slice("
+         << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+      for (unsigned i = 0; i < resTy.getRank(); ++i)
+        os << (i ? ", " : "") << resTy.getDimSize(i);
+      os << "], [";
+      for (unsigned i = 0; i < offsets.size(); ++i)
+        os << (i ? ", " : "") << offsets[i];
+      os << "])";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // gpu.thread_id carries its axis in a `dimension` enum attribute rather than
+  // an operand, so the generic path would drop it.
+  if (opName == "gpu.thread_id" && op->getNumResults() == 1) {
+    if (Attribute dimAttr = op->getAttr("dimension")) {
+      std::string dim;
+      llvm::raw_string_ostream dimOs(dim);
+      dimAttr.print(dimOs);
+      dimOs.flush();
+      // The enum prints as `#gpu<dim y>`. Match the final token exactly rather
+      // than searching the whole string, where an incidental 'y' or 'z' would
+      // pick the wrong axis. An unrecognised or absent dimension falls through
+      // to the generic path, which flags it, rather than defaulting to x.
+      StringRef token = StringRef(dim).rtrim(" >");
+      size_t cut = token.find_last_of(" <");
+      if (cut != StringRef::npos)
+        token = token.drop_front(cut + 1);
+      int axis = token == "x" ? 0 : token == "y" ? 1 : token == "z" ? 2 : -1;
+      if (axis >= 0) {
+        os << getValueName(op->getResult(0), argSubstitutionMap)
+           << " = tlx.thread_id(" << axis << ")";
+        printLocComment(op, os);
+        return;
+      }
+    }
+  }
+
+  // Parsed IR carries the mask as a SchedGroupMask attribute, so only `none`
+  // is named and other masks are flagged rather than guessed at. A plain
+  // IntegerAttr mask shares tlx.amd_sched_barrier's encoding and rides through.
+  if (opName == "rocdl.sched.barrier") {
+    if (auto m = op->getAttrOfType<IntegerAttr>("mask")) {
+      os << "tlx.amd_sched_barrier(" << m.getInt() << ")";
+      printLocComment(op, os);
+      return;
+    }
+    std::string mask;
+    llvm::raw_string_ostream maskOs(mask);
+    if (Attribute a = op->getAttr("mask"))
+      a.print(maskOs);
+    maskOs.flush();
+    // Anchored on the closing bracket, not a substring search: the attribute
+    // prints as `#rocdl<sched_group_mask none>`, and `none` has to be the whole
+    // payload. A bare contains() would also accept a combined mask that merely
+    // mentions it, and `non_mem_non_sideeffect` sits one character away.
+    if (StringRef(mask).ends_with("sched_group_mask none>")) {
+      os << "tlx.amd_sched_barrier(0)";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tt.atomic_rmw selects its operation with an enum attribute; each maps to a
+  // distinct tl.atomic_* builtin. The switch is exhaustive on purpose: a new
+  // RMWOp then fails the build rather than silently losing which atomic it was.
+  if (auto rmw = dyn_cast<tt::AtomicRMWOp>(op)) {
+    StringRef fn;
+    switch (rmw.getAtomicRmwOp()) {
+    case tt::RMWOp::AND:
+      fn = "tl.atomic_and";
+      break;
+    case tt::RMWOp::OR:
+      fn = "tl.atomic_or";
+      break;
+    case tt::RMWOp::XOR:
+      fn = "tl.atomic_xor";
+      break;
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      fn = "tl.atomic_add";
+      break;
+    case tt::RMWOp::MAX:
+    case tt::RMWOp::UMAX:
+      fn = "tl.atomic_max";
+      break;
+    case tt::RMWOp::MIN:
+    case tt::RMWOp::UMIN:
+      fn = "tl.atomic_min";
+      break;
+    case tt::RMWOp::XCHG:
+      fn = "tl.atomic_xchg";
+      break;
+    }
+    if (!fn.empty()) {
+      if (op->getNumResults() == 1)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << fn << "(" << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", " << getValueName(op->getOperand(1), argSubstitutionMap);
+      if (op->getNumOperands() > 2)
+        os << ", mask=" << getValueName(op->getOperand(2), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tt.scan carries its combiner in a region. An add combiner is a cumulative
+  // sum, which tl.cumsum expresses directly; other combiners have no builtin
+  // and fall through to the unsupported path.
+  if (opName == "tt.scan" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1 && op->getNumRegions() > 0) {
+    // Only the combiner's own top-level ops decide the kind, matching the
+    // tt.reduce detector. A recursive walk would let an arith.addf nested in,
+    // say, an scf.if masquerade as a cumulative sum.
+    bool isSum = false;
+    for (Block &block : op->getRegion(0))
+      for (Operation &bodyOp : block) {
+        StringRef n = bodyOp.getName().getStringRef();
+        if (n == "arith.addf" || n == "arith.addi")
+          isSum = true;
+      }
+    auto axis = op->getAttrOfType<IntegerAttr>("axis");
+    auto reverse = op->getAttrOfType<BoolAttr>("reverse");
+    if (isSum && axis) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tl.cumsum("
+         << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", axis=" << axis.getInt();
+      if (reverse && reverse.getValue())
+        os << ", reverse=True";
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
@@ -2412,6 +2675,12 @@ void printSimplifiedOp(
     os << getValueName(operand, argSubstitutionMap);
   }
   os << ")";
+
+  // An unmapped op is emitted as its raw MLIR name, which is not valid Python.
+  // Flag it inline so the gap is visible in the dump rather than surfacing as
+  // an unexplained NameError when the regenerated kernel is launched.
+  if (it == opNameMap.end())
+    os << "  # UNSUPPORTED: no TLX mapping for " << opName;
 
   printLocComment(op, os);
 }
@@ -2632,18 +2901,24 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       continue;
     }
 
-    // Special handling for tt.reduce — detect combiner and emit tl.max/tl.sum
+    // Special handling for tt.reduce — detect combiner and emit
+    // tl.max/tl.min/tl.sum
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
       // Detect combiner type by looking at ops in the body region
-      bool isMax = false, isSum = false;
+      bool isMax = false, isMin = false, isSum = false;
       for (Region &bodyRegion : op.getRegions()) {
         for (Block &block : bodyRegion) {
           for (Operation &bodyOp : block) {
             StringRef bodyOpName = bodyOp.getName().getStringRef();
             if (bodyOpName == "arith.maxf" || bodyOpName == "arith.maxnumf" ||
-                bodyOpName == "arith.maxsi" || bodyOpName == "arith.maxui")
+                bodyOpName == "arith.maximumf" || bodyOpName == "arith.maxsi" ||
+                bodyOpName == "arith.maxui")
               isMax = true;
+            if (bodyOpName == "arith.minf" || bodyOpName == "arith.minnumf" ||
+                bodyOpName == "arith.minimumf" || bodyOpName == "arith.minsi" ||
+                bodyOpName == "arith.minui")
+              isMin = true;
             if (bodyOpName == "arith.addf" || bodyOpName == "arith.addi")
               isSum = true;
           }
@@ -2654,6 +2929,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
       if (isMax)
         os << "tl.max(";
+      else if (isMin)
+        os << "tl.min(";
       else if (isSum)
         os << "tl.sum(";
       else
@@ -2795,14 +3072,19 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     // Special handling for tt.reduce in CF printer
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
-      bool isMax = false, isSum = false;
+      bool isMax = false, isMin = false, isSum = false;
       for (Region &bodyRegion : op.getRegions()) {
         for (Block &block : bodyRegion) {
           for (Operation &bodyOp : block) {
             StringRef n = bodyOp.getName().getStringRef();
             if (n == "arith.maxf" || n == "arith.maxnumf" ||
-                n == "arith.maxsi" || n == "arith.maxui")
+                n == "arith.maximumf" || n == "arith.maxsi" ||
+                n == "arith.maxui")
               isMax = true;
+            if (n == "arith.minf" || n == "arith.minnumf" ||
+                n == "arith.minimumf" || n == "arith.minsi" ||
+                n == "arith.minui")
+              isMin = true;
             if (n == "arith.addf" || n == "arith.addi")
               isSum = true;
           }
@@ -2813,6 +3095,8 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
       os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
       if (isMax)
         os << "tl.max(";
+      else if (isMin)
+        os << "tl.min(";
       else if (isSum)
         os << "tl.sum(";
       else

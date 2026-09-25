@@ -1082,7 +1082,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   }
 
   // CHECK: def diagnostic_memory_ops(
-  // CHECK: var_{{[0-9]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
+  // CHECK: var_{{[0-9_]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
   // CHECK: tlx.async_remote_shmem_copy(
   // CHECK: tlx.async_descriptor_store({{.*}}, store_reduce="and")
   tt.func public @diagnostic_memory_ops(
@@ -1106,12 +1106,12 @@ module {
   // CHECK: tlx.async_descriptor_store_wait(1)
   // CHECK: arg2 = arg0
   // CHECK: while True:
-  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 < arg1
-  // CHECK-NEXT:   if not var_{{[0-9]+}}:
-  // CHECK-NEXT:     var_{{[0-9]+}} = arg2
+  // CHECK-NEXT:   var_{{[0-9_]+}} = arg2 < arg1
+  // CHECK-NEXT:   if not var_{{[0-9_]+}}:
+  // CHECK-NEXT:     var_{{[0-9_]+}} = arg2
   // CHECK-NEXT:     break
-  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 + arg1
-  // CHECK-NEXT:   arg2 = var_{{[0-9]+}}
+  // CHECK-NEXT:   var_{{[0-9_]+}} = arg2 + arg1
+  // CHECK-NEXT:   arg2 = var_{{[0-9_]+}}
   tt.func public @clc_while(%start: i32, %limit: i32) -> i32 {
     %token = ub.poison : !ttg.async.token
     ttng.async_tma_store_token_wait %token {planned_pending_count = 1 : i32} : !ttg.async.token
@@ -1147,8 +1147,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: [[ACC:[a-z0-9_]+]] = cst
   // CHECK: for {{[a-z0-9_]+}} in range(
   // CHECK: [[ACC]] = {{[a-z0-9_]+}}
-  // The carry between the two loops, and not a fresh -inf tensor.
-  // CHECK: [[ACC]] = [[ACC]]
+  // The carry between the two loops, and not a fresh -inf tensor. The two
+  // loops' iter_args are distinct values, so the second is a distinct name.
+  // CHECK: {{[a-z0-9_]+}} = [[ACC]]
   // CHECK-NOT: tl.full({{.*}}-inf
   // CHECK: for {{[a-z0-9_]+}} in range(
   tt.func public @ws_chained_loops(%n: i32) attributes {noinline = false} {
@@ -1420,6 +1421,326 @@ module {
     %compiler = ttng.compiler_named_barrier_id %c10 : i32
     ttng.wait_barrier_named %user, %c128 : !ttng.named_barrier_id, i32
     ttng.arrive_barrier_named %compiler, %c128 : !ttng.named_barrier_id, i32
+    tt.return
+  }
+}
+
+// -----
+
+// MLIR value names can carry characters a Python identifier cannot -- notably
+// the dots in names derived from block-pointer fields -- so they are sanitized.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def dotted_value_name(
+  // CHECK: V_block_ptr_offsets_1 = arg0 * arg0
+  // CHECK-NOT: V_block_ptr.offsets.1
+  tt.func public @dotted_value_name(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked> loc(#loc_dot)
+    tt.return
+  }
+}
+#loc_dot = loc("V_block_ptr.offsets.1")
+
+// -----
+
+// Sanitization is many-to-one, so two MLIR names can want the same Python
+// identifier. Shadowing one with the other is valid Python but a different
+// program, so the second claimant is suffixed.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // A third claimant keeps counting up rather than reusing the first suffix.
+  // CHECK-LABEL: def colliding_value_names(
+  // CHECK: v_a_b = arg0 * arg0
+  // CHECK: v_a_b_1 = v_a_b + arg0
+  // CHECK: v_a_b_2 = v_a_b_1 - arg0
+  tt.func public @colliding_value_names(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked> loc(#loc_dotted)
+    %a = arith.addf %m, %x : tensor<256xf32, #blocked> loc(#loc_under)
+    %s = arith.subf %a, %x : tensor<256xf32, #blocked> loc(#loc_dashed)
+    tt.return
+  }
+}
+#loc_dotted = loc("v.a.b")
+#loc_under = loc("v_a_b")
+#loc_dashed = loc("v-a-b")
+
+// -----
+
+// Splat constants outside the hand-rolled dtype ladder were all typed
+// float32, silently changing the dtype of anything built from them.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def splat_constant_dtypes(
+  // CHECK-DAG: tl.full([256], 0, tl.float64)
+  // CHECK-DAG: tl.full([256], 0, tl.int64)
+  tt.func public @splat_constant_dtypes() attributes {noinline = false} {
+    %cf = arith.constant dense<0.000000e+00> : tensor<256xf64, #blocked>
+    %ci = arith.constant dense<0> : tensor<256xi64, #blocked>
+    %a = arith.addf %cf, %cf : tensor<256xf64, #blocked>
+    %b = arith.addi %ci, %ci : tensor<256xi64, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// An op with no TLX mapping is emitted as its raw MLIR name, which is not
+// valid Python. Say so inline, so the gap shows up in the dump instead of as
+// an unexplained NameError when the regenerated kernel is launched.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def unsupported_op_is_flagged(
+  // The marker word is escaped below, and avoided in prose here, because lit
+  // treats that word followed by a colon as one of its own directives and
+  // tries to parse the rest of the line as a boolean expression.
+  // CHECK: arith.remf({{.*}}) # {{UNSUPPORTED}}: no TLX mapping for arith.remf
+  tt.func public @unsupported_op_is_flagged(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %r = arith.remf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// A workgroup barrier is not a no-op: dropping it or emitting it as raw MLIR
+// both change what the regenerated kernel does. ttg.barrier is the spelling
+// AMD pipelining leaves behind.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def workgroup_barrier(
+  // CHECK: tlx.workgroup_barrier()
+  tt.func public @workgroup_barrier(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    ttg.barrier local
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // tlx.workgroup_barrier fences Local only, so a wider barrier must not be
+  // spelled with it -- that would silently drop the other address spaces.
+  // CHECK-LABEL: def wider_barrier_is_not_mapped(
+  // CHECK-NOT: tlx.workgroup_barrier()
+  tt.func public @wider_barrier_is_not_mapped(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    ttg.barrier all
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// tlx.workgroup_barrier brackets its ttg.barrier with two rocdl.sched.barrier
+// guards, so it is only emittable on CDNA. The same barrier on an NVIDIA
+// target must fall through rather than inject ROCDL into the kernel.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // Assert the fall-through positively too: a bare CHECK-NOT would also pass
+  // if the barrier were dropped from the output altogether.
+  // CHECK-LABEL: def barrier_is_not_mapped_off_amd(
+  // CHECK-NOT: tlx.workgroup_barrier()
+  // CHECK: {{UNSUPPORTED}}: no TLX mapping for ttg.barrier
+  tt.func public @barrier_is_not_mapped_off_amd(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    ttg.barrier local
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// Elementwise ops that already have an exact TLX spelling. The NaN-quieting
+// arith.maximumf/minimumf were missing alongside their maxnumf/minnumf peers.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // Ordered rather than DAG-matched. The closing paren right after the third
+  // operand is what proves propagateNan = none emitted no argument, and
+  // ordering gives the negative check below a defined start -- after a DAG
+  // group it would constrain only the text following whichever of those
+  // matched last.
+  // CHECK-LABEL: def elementwise_min_max_clamp(
+  // CHECK: = tl.maximum({{.*}}, propagate_nan=tl.PropagateNan.ALL)
+  // CHECK: = tl.minimum({{.*}}, propagate_nan=tl.PropagateNan.ALL)
+  // CHECK: = tl.clamp({{[a-z0-9_]+}}, {{[a-z0-9_]+}}, {{[a-z0-9_]+}})
+  // CHECK-NOT: UNSUPPORTED
+  tt.func public @elementwise_min_max_clamp(%x: tensor<256xf32, #blocked>, %lo: tensor<256xf32, #blocked>, %hi: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %a = arith.maximumf %x, %lo : tensor<256xf32, #blocked>
+    %b = arith.minimumf %x, %hi : tensor<256xf32, #blocked>
+    %c = tt.clampf %x, %lo, %hi, propagateNan = none : tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // The other side of the enum. Read through ClampFOp's typed accessor, so a
+  // change in the attribute's printed spelling cannot silently drop it and
+  // leave the clamp NaN-quieting.
+  // CHECK-LABEL: def clamp_propagate_nan_all(
+  // CHECK: = tl.clamp({{.*}}, propagate_nan=tl.PropagateNan.ALL)
+  tt.func public @clamp_propagate_nan_all(%x: tensor<256xf32, #blocked>, %lo: tensor<256xf32, #blocked>, %hi: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %c = tt.clampf %x, %lo, %hi, propagateNan = all : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// amdg.extract_slice keeps its offsets in an attribute and its shape in the
+// result type, both of which the generic operand-only path drops.
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [32, 32, 8], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def amd_extract_slice(
+  // CHECK: tlx.extract_slice(arg0, [128, 32], [0, 0])
+  tt.func public @amd_extract_slice(%x: tensor<256x64xf16, #mma>) attributes {noinline = false} {
+    %s = amdg.extract_slice %x [0, 0] : tensor<256x64xf16, #mma> to tensor<128x32xf16, #mma>
+    tt.return
+  }
+
+  // Distinct non-zero offsets: all-zero offsets would not catch the shape
+  // being emitted in the offset list, or the two lists being swapped.
+  // CHECK-LABEL: def amd_extract_slice_offsets(
+  // CHECK: tlx.extract_slice(arg0, [128, 32], [128, 0])
+  tt.func public @amd_extract_slice_offsets(%x: tensor<256x64xf16, #mma>) attributes {noinline = false} {
+    %s = amdg.extract_slice %x [128, 0] : tensor<256x64xf16, #mma> to tensor<128x32xf16, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Both of these keep their only meaningful operand in an attribute, so the
+// generic operand-only path emitted them as raw MLIR with the axis and the
+// scheduling mask thrown away.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def amd_thread_id_and_sched_barrier(
+  // CHECK: tlx.thread_id(0)
+  // CHECK: tlx.amd_sched_barrier(0)
+  tt.func public @amd_thread_id_and_sched_barrier(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %tid = gpu.thread_id x
+    rocdl.sched.barrier none
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Parsed IR carries the mask as a SchedGroupMask enum attribute, not an
+  // integer, so anything but `none` reaches the string path and is flagged.
+  // CHECK-LABEL: def amd_sched_barrier_other_mask(
+  // CHECK-NOT: tlx.amd_sched_barrier(
+  tt.func public @amd_sched_barrier_other_mask(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    rocdl.sched.barrier mfma_wmma
+    // The nearest near-miss to `none` in the enum's spellings.
+    rocdl.sched.barrier non_mem_non_sideeffect
+    %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// tt.atomic_rmw picks its operation from an I32Enum attribute, which the
+// generic path drops; each case has its own tl.atomic_* builtin.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def atomic_rmw_kinds(
+  // CHECK-DAG: tl.atomic_add(arg0, {{.*}}, mask=True)
+  // CHECK-DAG: tl.atomic_max(arg0, {{.*}}, mask=True)
+  tt.func public @atomic_rmw_kinds(%p: !tt.ptr<f32>) attributes {noinline = false} {
+    %v = arith.constant 1.000000e+00 : f32
+    %t = arith.constant true
+    %a = tt.atomic_rmw fadd, acq_rel, gpu, %p, %v, %t : (!tt.ptr<f32>, f32, i1) -> f32
+    %b = tt.atomic_rmw max, acq_rel, gpu, %p, %v, %t : (!tt.ptr<f32>, f32, i1) -> f32
+    tt.return
+  }
+
+  // The remaining enum cases, so a mis-numbered entry in the ladder is caught
+  // rather than silently spelling one atomic as another.
+  // CHECK-LABEL: def atomic_rmw_remaining_kinds(
+  // CHECK-DAG: tl.atomic_min(arg0,
+  // CHECK-DAG: tl.atomic_xchg(arg0,
+  // CHECK-DAG: tl.atomic_and(arg0,
+  // CHECK-DAG: tl.atomic_or(arg0,
+  // CHECK-DAG: tl.atomic_xor(arg0,
+  tt.func public @atomic_rmw_remaining_kinds(%p: !tt.ptr<i32>) attributes {noinline = false} {
+    %v = arith.constant 1 : i32
+    %t = arith.constant true
+    %a = tt.atomic_rmw min, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %b = tt.atomic_rmw exch, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %c = tt.atomic_rmw and, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %d = tt.atomic_rmw or, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %e = tt.atomic_rmw xor, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+
+  // The last three enum values. Integer add(4) sits next to fadd(5), and
+  // umax(8)/umin(9) next to max(6)/min(7), so an off-by-one in the ladder
+  // would otherwise be spelled as the neighbouring atomic.
+  // CHECK-LABEL: def atomic_rmw_unsigned_and_int_add(
+  // CHECK-DAG: tl.atomic_add(arg0,
+  // CHECK-DAG: tl.atomic_max(arg0,
+  // CHECK-DAG: tl.atomic_min(arg0,
+  tt.func public @atomic_rmw_unsigned_and_int_add(%p: !tt.ptr<i32>) attributes {noinline = false} {
+    %v = arith.constant 1 : i32
+    %t = arith.constant true
+    %a = tt.atomic_rmw add, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %b = tt.atomic_rmw umax, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %c = tt.atomic_rmw umin, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+}
+
+// -----
+
+// Region-carrying reductions. The reduce combiner detector knew maxf/maxnumf
+// but not the NaN-quieting maximumf, and had no min case at all, so those fell
+// back to a bare tl.reduce missing its combine_fn. tt.scan had no mapping.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def reduce_and_scan_combiners(
+  // CHECK-DAG: tl.max(
+  // CHECK-DAG: tl.min(
+  // CHECK-DAG: tl.cumsum(arg0, axis=0)
+  // CHECK-NOT: tl.reduce(
+  tt.func public @reduce_and_scan_combiners(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %hi = "tt.reduce"(%x) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %m = arith.maximumf %a, %b : f32
+      tt.reduce.return %m : f32
+    }) : (tensor<256xf32, #blocked>) -> f32
+    %lo = "tt.reduce"(%x) <{axis = 0 : i32}> ({
+    ^bb0(%c: f32, %d: f32):
+      %n = arith.minimumf %c, %d : f32
+      tt.reduce.return %n : f32
+    }) : (tensor<256xf32, #blocked>) -> f32
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%e: f32, %f: f32):
+      %g = arith.addf %e, %f : f32
+      tt.scan.return %g : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Only the combiner's top-level ops name the kind. An arith.addf buried in
+  // an scf.if is not a cumulative sum, and a recursive walk would call it one.
+  // CHECK-LABEL: def scan_nested_add_is_not_cumsum(
+  // CHECK-NOT: tl.cumsum(
+  tt.func public @scan_nested_add_is_not_cumsum(%x: tensor<256xf32, #blocked>, %c: i1) attributes {noinline = false} {
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%e: f32, %f: f32):
+      %g = scf.if %c -> f32 {
+        %n = arith.addf %e, %f : f32
+        scf.yield %n : f32
+      } else {
+        scf.yield %e : f32
+      }
+      tt.scan.return %g : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
     tt.return
   }
 }

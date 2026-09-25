@@ -1971,16 +1971,16 @@ void init_triton_ir(py::module_ &m) {
              std::optional<mlir::Value> &lhs_scale, ScaleDotElemType lhs_format,
              mlir::Value &rhs, std::optional<mlir::Value> &rhs_scale,
              ScaleDotElemType rhs_format, bool fast_math, bool lhs_k_pack,
-             bool rhs_k_pack, mlir::Value &c) -> mlir::Value {
+             bool rhs_k_pack, mlir::Value &c, bool two_ctas) -> mlir::Value {
             return self.create<DotScaledOp>(
                 c.getType(), lhs, rhs, c, lhs_scale.value_or(Value()),
                 rhs_scale.value_or(Value()), lhs_format, rhs_format, fast_math,
-                lhs_k_pack, rhs_k_pack);
+                lhs_k_pack, rhs_k_pack, two_ctas);
           },
           py::arg("lhs"), py::arg("lhs_scale").none(), py::arg("lhs_format"),
           py::arg("rhs"), py::arg("rhs_scale").none(), py::arg("rhs_format"),
           py::arg("fast_math"), py::arg("lhs_k_pack"), py::arg("rhs_k_pack"),
-          py::arg("c"))
+          py::arg("c"), py::arg("two_ctas"))
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::FloorOp>(val);
@@ -2162,6 +2162,11 @@ void init_triton_ir(py::module_ &m) {
              auto ctx = self.getContext();
              border->setAttr("triton.warp_pipeline.border",
                              StringAttr::get(ctx, marker));
+             // TLX stages predate the source-order memory policy. Preserve
+             // their original scheduling freedom; unmarked stages retain the
+             // existing policy.
+             border->setAttr("triton.warp_pipeline.allow_memory_reorder",
+                             UnitAttr::get(ctx));
              if (priority > -1) {
                auto i32Ty = IntegerType::get(ctx, 32);
                border->setAttr("triton.warp_pipeline.priority",
@@ -2377,7 +2382,11 @@ PyObject *py_getenv(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
     PyErr_SetString(PyExc_TypeError, "name must be a string");
     return NULL;
   }
-  char *env_val = getenv(PyUnicode_AsUTF8(name));
+  Py_ssize_t name_size;
+  const char *name_cstr = PyUnicode_AsUTF8AndSize(name, &name_size);
+  if (!name_cstr)
+    return NULL;
+  char *env_val = getenv(name_cstr);
   if (!env_val) {
     Py_INCREF(default_val);
     return default_val;
@@ -2397,7 +2406,11 @@ PyObject *py_getenv_bool(PyObject *self, PyObject *const *args,
     PyErr_SetString(PyExc_TypeError, "name must be a string");
     return NULL;
   }
-  char *env_val = getenv(PyUnicode_AsUTF8(name));
+  Py_ssize_t name_size;
+  const char *name_cstr = PyUnicode_AsUTF8AndSize(name, &name_size);
+  if (!name_cstr)
+    return NULL;
+  char *env_val = getenv(name_cstr);
   PyObject *res = default_val;
   if (env_val) {
     res = is_truthy(env_val) ? Py_True : Py_False;

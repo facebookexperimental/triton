@@ -75,10 +75,8 @@ class TritonSemantic(Generic[TensorTy]):
         if a_is_scalar != b_is_scalar:
             scalar_ty, tensor_ty = (a_ty, b_ty) if a_is_scalar else (b_ty, a_ty)
             if scalar_ty.kind().value <= tensor_ty.kind().value:
-                # Upcast because of 2) below!
-                if div_or_mod and tensor_ty.is_floating():
-                    return tl.float32
-                return tensor_ty
+                # Ignore the scalar and apply the remaining promotion rules.
+                a_ty, b_ty = tensor_ty, tensor_ty
 
         # 1) if one operand is double, the other is implicitly
         #    converted to double
@@ -1818,10 +1816,11 @@ class TritonSemantic(Generic[TensorTy]):
 
     def dot_scaled(self, lhs: TensorTy, lhs_scale: TensorTy, lhs_format: str, rhs: TensorTy,
                    rhs_scale: Optional[TensorTy], rhs_format: str, acc: TensorTy | None, fast_math: bool,
-                   lhs_k_pack: bool, rhs_k_pack: bool, out_dtype: tl.dtype) -> TensorTy:
+                   lhs_k_pack: bool, rhs_k_pack: bool, out_dtype: tl.dtype, two_ctas: bool = False) -> TensorTy:
         fast_math = tl._unwrap_if_constexpr(fast_math)
         lhs_k_pack = tl._unwrap_if_constexpr(lhs_k_pack)
         rhs_k_pack = tl._unwrap_if_constexpr(rhs_k_pack)
+        two_ctas = tl._unwrap_if_constexpr(two_ctas)
         assert lhs.type.is_block() and rhs.type.is_block(), "dot_scaled operands must be block tensors (not scalars)"
         # TODO: validate types.
         lhs_rank = len(lhs.shape)
@@ -1886,6 +1885,7 @@ class TritonSemantic(Generic[TensorTy]):
                 lhs_k_pack,
                 rhs_k_pack,
                 acc_handle,
+                two_ctas,
             ),
             ret_ty,
         )

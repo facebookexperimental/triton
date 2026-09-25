@@ -444,10 +444,13 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
 
 ### Current Limitations
 
-1. **Single phase bit per per-MMA barrier**: `Insert2CTASync` uses one barrier
-   slot per MMA with `phase = (iv - lb) % 2`. This is enough for the current
-   pipeline pattern, but deeper or more complex pipelines may need
-   multi-buffered cross-CTA barriers.
+1. **Rendezvous depth is tied to the operand pipeline**: `Insert2CTASync`
+   multi-buffers the per-MMA barrier to the depth of the MMA's SMEM operand
+   buffers (`getOperandPipelineDepth`) and indexes it with the same slot/phase,
+   so a follower CTA that runs ahead lands on a distinct slot instead of lapping
+   a single barrier's phase bit. Follower drift is therefore bounded by operand
+   buffer availability. A schedule that let the follower advance past its own
+   operand pipeline would still lap the barrier.
 
 2. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
    pairs and the paired CTAs must map to compatible logical tiles. For the
@@ -463,9 +466,15 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    emits a warning and falls back to 1-CTA MMA if `two_ctas=True` with
    `BLOCK_M < 128`.
 
-4. **`TCGen5MMAScaledOp` is not handled by the load transform**: The current
-   `Transform2CTALoads` implementation handles `TCGen5MMAOp`. The scaled variant
-   still needs explicit support before scaled MMA can use this 2-CTA path.
+4. **Scaled 2-CTA MMA does not support dependent chains**: `Transform2CTALoads`
+   and `Insert2CTASync` both reach `TCGen5MMAScaledOp` through
+   `MMAv5OpInterface`, so a standalone scaled MMA can use this 2-CTA path.
+   `Transform2CTALoads` halves the B operand but deliberately keeps the B scale
+   full width per CTA, because the block-scale MMA addresses each CTA's N-half
+   out of the full scale. The dependent-chain machinery has no scaled support:
+   `Analyze2CTADependencies` and `Plan2CTAExchange` walk only `TCGen5MMAOp`, so
+   `CheckMatmulTwoCTAs` rejects a dependent chain involving a scaled dot when
+   `allowDependentChains=false`.
 
 5. **Mixed 2-CTA per kernel is impossible**: The PTX ISA requires all tcgen05
    instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
@@ -687,7 +696,11 @@ Key properties:
 - The barrier is allocated in the **leader CTA's SMEM** with `InitBarrierOp(count=2)`
 - Both CTAs arrive via `MapToRemoteBufferOp` (PTX `mapa` instruction)
 - Only the leader waits (predicated on `ctaRank % 2 == 0`)
-- The barrier is **single-buffered** with `phase = (iv - lb) / step % 2`
+- The barrier is **multi-buffered** to the MMA's operand pipeline depth `D`. For
+  the linearized loop iteration `i` (`computeLinearBarrierIter`), the slot is
+  `i % D` and the phase is `(i / D) & 1`. At `D == 1` the slot is elided and the
+  phase is the raw parity `i % 2`, so single-buffered kernels emit the same IR
+  as before multi-buffering
 - This barrier is completely separate from the WS pipeline barriers
 
 #### B-Empty Signaling Across CTAs

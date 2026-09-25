@@ -464,7 +464,7 @@ def TTNG_WarpGroupDotWaitOp
                                       AllTypesMatch<["inputs", "outputs"]>]> {
   let summary = "warp group dot wait";
   let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs,
-      I32Attr:$pendings);
+      I32Attr:$pendings, UnitAttr:$warpGroupLocal);
   let results = (outs Variadic<TTG_TensorOrMemDesc>:$outputs);
   let description = [{
     Waits until there are $pendings or fewer outstanding async dot operations.
@@ -473,6 +473,11 @@ def TTNG_WarpGroupDotWaitOp
     waiting on. For example, if there are N pending async dot ops and we wait
     until one remains pending, then $inputs must include the results of the
     first N - 1 dot ops.
+
+    The `warpGroupLocal` attribute specifies that we only wait for the local
+    warp group, and if num_warps > 4 then shared memory inputs may still be in
+    use by other warp groups. This is useful when only the result register
+    values need to be ready and the shared memory inputs will not be overwritten.
   }];
 
   let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
@@ -1500,6 +1505,26 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
       OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size, "int":$dim)>,
     ];
   let results = (outs TTG_MemDescType:$result);
+  let hasVerifier = 1;
+}
+
+def TTNG_TMEMShiftOp : TTNG_Op<"tmem_shift"> {
+  let summary = "Shift tensor-memory rows down by one row";
+  let description = [{
+    Initiates asynchronous in-place shifts across every 32-byte column segment
+    in the tensor-memory buffer. Within each 32-row TMEM group, destination row
+    `r` receives the previous contents of source row `r + 1` for `r` in 0
+    through 30, while destination row 31 retains its previous contents.
+
+    This op lowers to one `tcgen05.shift.down` instruction per 32-byte column
+    segment. Completion must be tracked with `tcgen05.commit` and an mbarrier
+    before the buffer is consumed.
+  }];
+
+  let arguments = (ins Arg<TTG_MemDescType, "",
+      [MemRead<TensorMemory>, MemWrite<TensorMemory>]>:$buffer);
+
+  let assemblyFormat = [{$buffer attr-dict `:` qualified(type($buffer))}];
   let hasVerifier = 1;
 }
 

@@ -11,7 +11,8 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `mm`, `flash_attn`, `hstu_attn`, `kda`, `kda_prefill`,
+`{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`flash_attn`, `flash_attn_mxfp8`, `hstu_attn`, `kda`, `kda_prefill`,
 `kda_decode`.
 
 ```
@@ -23,8 +24,12 @@ options:
                         else measures a path users do not take
   --head N              only the first N cases PER DIRECTION, for a quick look; on an op with a
                         backward, --head 10 is 10 fwd and 10 bwd
-  --synthetic           run the correctness shapes instead of this arch's focus list; they are
+  --synthetic           run the hardware-agnostic synthetic shapes instead of this arch's focus list; they are
                         mostly too small to time, so this is for looking, not for gating
+  --suite SUITE         run one focus suite; repeat to combine suites (default: this
+                        architecture's configured set)
+  --list-suites         list focus suites and exit
+  --list-suite NAME     list one focus suite's shapes and exit
   --fwd-only            skip the backward cases
   --bwd-only            skip the forward cases
   --latency-measure-mode {wallclock,gpu_events}
@@ -33,7 +38,7 @@ options:
   --cold-compile {all,first,none}
                         how often to time a first call on a fresh cache; the default is each
                         op's own (mm: all, everything else: first)
-  --json JSON           machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>.json)
+  --json JSON           machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>[.<suites>].json)
 ```
 
 - built in (default on) denoise (freq-lock)
@@ -45,17 +50,31 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
+| `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
+| `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
+| `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
+| `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
+| `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
 
-Only `mm` has a `heuristic_config`, so it is the only op whose default is a
-single analytically chosen config. The rest autotune a full space on their first
-call, which is minutes rather than seconds; they raise `cap_s` accordingly rather
-than measure a `smoke` space no user takes. Writing a `heuristic_config` for each
-is the real fix and is tracked in the `tlx.ops` module docstring.
+The direct `mm` provider has a `heuristic_config`, so its default is a single
+analytically chosen config. The TorchTLX providers use Inductor's template
+selection and expose `heuristic` as the suite's comparable default label. The
+remaining direct providers autotune a full space on their first call, which is
+minutes rather than seconds; they raise `cap_s` accordingly rather than measure
+a `smoke` space no user takes.
+
+The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
+They force the TLX template (`tlx_mode="force"`) and race it against the same
+compile with TLX off, so `speedup > 1` is exactly "TLX would have won the
+autotune under `tlx_mode="allow"`". `mm_torchtlx` covers Blackwell and MI350X;
+`addmm_torchtlx` and `bmm_torchtlx` cover MI350X. They need `torch >= 2.14` for
+`config.triton.tlx_mode`. A shape where Inductor emits no TLX kernel at all is
+an error row, not a quiet 1.00x.
 
 There is no vendor library for SiLU-scaled ragged attention, so `hstu_attn`
 races the Triton kernel that ships today. The two are not tuned symmetrically --
@@ -77,6 +96,12 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
 3. Additional stats: samples, CV%, p50, p95, p99 (all based on TFLOP/s)
 4. Op-specific columns, if the op declared any (see below)
 5. status: ok/pip/noisy/error/...
+6. best config: the config each autotuned kernel the case launched actually ran,
+   abbreviated (`BM=` for `BLOCK_M`/`BLOCK_SIZE_M`, `w`/`s` for warps/stages).
+   With a single-config space that is the shape-picked config; otherwise it is
+   the autotune winner. An op launching several autotuned kernels gets one entry
+   per kernel, `name: config` separated by `|`; a kernel that is not autotuned
+   reports `-`. Recorded by the harness, so every op has the column.
 
 ### Common vs op-specific metrics
 
@@ -160,33 +185,56 @@ Latency is not reported: it is `flop_count / TFLOP/s`, both in the artifact.
 
 ## shapes
 
-1. Synthetic (general): L1 only.
-2. Focus shapes (arch specific): L2. Need to match the GPU arch. e.g. mm shapes sm100 and mm shapes gfx942
+1. Synthetic (general): hardware-agnostic shapes included in L1.
+2. Focus suites: production-derived shape groups. L1 covers their union; L2
+   selects only the running host's default group.
 
-`--synthetic` runs list 1 under L2 instead. The focus list may be empty.
+By default, an L2 run uses the suites in the op's `DEFAULT_SUITES` entry for
+the selected GPU. `--suite NAME` overrides the default; repeat it to combine
+suites. Suites are hardware-agnostic but belong to exactly one op. Selected
+suite names are recorded in the JSON artifact. `--synthetic` selects the L1
+list instead and cannot be combined with `--suite`. An empty architecture
+default records that no production-derived L2 suite is available yet; pytest
+reports that operator as skipped rather than substituting synthetic shapes.
+
+List an op's suites without selecting a GPU or starting a benchmark:
+
+```bash
+python python/test/tlx_benchmark/bench_mm.py --list-suites
+python python/test/tlx_benchmark/bench_mm.py --list-suite gfx942_all
+```
 
 Each entry carries its own strides and dtype, so there is no dtype
 cross-product. Strides, not a row/col flag: a leading stride wider than the row
 is a padded slice, and 0 is a broadcast.
 
-Shape lists live beside the kernel, in `tlx/ops/kernels/<op>/_shapes.py`, with
-each arch module re-exporting its own as `PERF_SHAPES`. Not in this directory,
-because the L1 correctness suites import the same lists -- one list, two
-consumers, no drift. Only `mm`'s focus lists come from production captures;
-the rest are hand-picked and marked provisional.
+Shape definitions live in `tlx/ops/kernels/<op>/_shapes.py`: a typed shape,
+`SYNTHETIC`, `FOCUS_SUITES`, `DEFAULT_SUITES`, `FOCUS`, and the deduplicated
+`CORRECTNESS_SHAPES` union used by L1. Architecture implementation modules do
+not own or re-export benchmark shapes. A package containing several public
+operators uses one shape module per operator, as KDA does with
+`_shapes.py`, `_prefill_shapes.py`, and `_decode_shapes.py`.
+
+Leaf focus suites use `<arch>_<request-index>` names such as `gfx950_1`. When
+an architecture selects multiple captured requests, its default is an
+`<arch>_all` suite that includes those leaves. A suite may be selected by more
+than one architecture; the architecture in its name records its origin, not an
+execution restriction.
 
 ## Adding an op
 
-Write `tlx/ops/kernels/<op>/_shapes.py` (`SYNTHETIC`, `<ARCH>_FOCUS`, `inputs()`,
-`flops()`, `label()`), re-export `PERF_SHAPES` from each arch module, then a
-`bench_<op>.py` with five names and one line of wiring:
+Write `tlx/ops/kernels/<op>/_shapes.py` with a typed shape, `SYNTHETIC`, one or
+more `FocusSuite` values, a `DEFAULT_SUITES` mapping, a `FOCUS` registry,
+`CORRECTNESS_SHAPES`, `inputs()`, `flops()`, and `label()`. Then add a
+`bench_<op>.py` with the adapter names and one line of wiring:
 
 ```python
 OP = "<op>"                    # catalog op name
 REF_NAME = "..."               # what ref_fn is; "" when there is none
 EXTRA_COLUMNS = ()             # ((header, Result.extra key), ...)
+SHAPE_SUITES = FOCUS           # the op's FocusRegistry
 
-def cases(synthetic=False) -> list[Case]: ...
+def cases(synthetic=False, suites=None) -> list[Case]: ...
 def prepare(case, space) -> Prepared: ...   # operands + closures + flop_count
 
 supported, default_json, run, main = driver.bind(sys.modules[__name__])

@@ -7,13 +7,14 @@ without a speedup gate. Correctness is covered by the TLX ops unit tests.
 
 from __future__ import annotations
 
-import importlib
 import pathlib
 import sys
 
 import torch
 import torch.nn.functional as F
-from triton.tlx.ops.kernels.kda._shapes import FLOOR_TFLOPS, GFX950_PREFILL_SYNTHETIC, flops
+from triton.tlx.ops.kernels.kda._prefill_shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.kda._prefill_shapes import SYNTHETIC
+from triton.tlx.ops.kernels.kda._shapes import FLOOR_TFLOPS, flops
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -28,11 +29,8 @@ COLD_COMPILE = "first"
 DTYPES = {"bf16": torch.bfloat16}
 
 
-def shapes(synthetic: bool = False) -> list[list]:
-    if synthetic:
-        return list(GFX950_PREFILL_SYNTHETIC)
-    module = importlib.import_module(f"triton.tlx.ops.kernels.kda.{driver.arch()}_prefill")
-    return list(module.PERF_SHAPES)
+def shapes(synthetic: bool = False, suites=None) -> list:
+    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
 def _label(total_tokens: int, sequences: int, heads: int, key_dim: int, value_dim: int, dtype: str) -> str:
@@ -40,7 +38,7 @@ def _label(total_tokens: int, sequences: int, heads: int, key_dim: int, value_di
             f"'H': '{heads}', 'K': '{key_dim}', 'V': '{value_dim}'}})")
 
 
-def cases(synthetic: bool = False) -> list[Case]:
+def cases(synthetic: bool = False, suites=None) -> list[Case]:
     return [
         Case(
             op=OP,
@@ -48,8 +46,7 @@ def cases(synthetic: bool = False) -> list[Case]:
             dtype=str(DTYPES[entry[5]]).removeprefix("torch."),
             shape=tuple(entry[:5]),
             label=_label(*entry),
-        )
-        for entry in shapes(synthetic)
+        ) for entry in shapes(synthetic, suites)
     ]
 
 
@@ -103,7 +100,6 @@ def prepare(case: Case, space: str) -> Prepared:
         scale=1.0,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
-        arch=driver.arch(),
     )
     return Prepared(
         tlx_fn=tlx_fn,

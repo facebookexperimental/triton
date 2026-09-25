@@ -4,7 +4,7 @@ from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
 
-from ..hw.target import is_rocm
+from ..hw.target import current_target, is_rocm
 
 # TLX kernel .jinja templates ship alongside this module (packaged as buck
 # resources of the triton beta python library), so load them from here rather
@@ -48,6 +48,16 @@ def _mm_grid_split_k(m, n, meta, *, cdiv):
 
 
 @SymbolicGridFn
+def _mm_grid_local_split_u(m, n, meta, *, cdiv):
+    return (cdiv(n, meta["TILE_N"]), 1, 1)
+
+
+@SymbolicGridFn
+def _mm_grid_fixed_programs(m, n, meta):
+    return (meta["NUM_PROGRAMS"], 1, 1)
+
+
+@SymbolicGridFn
 def _bmm_grid_warppipe(b, m, n, meta, *, cdiv):
     """1-D grid for the warp-pipe bmm: BATCH * grid_m * grid_n programs, one per (batch, tile).
 
@@ -83,9 +93,35 @@ gfx950_addmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_warppipe"),
 )
 
-# gfx950-only inter-wave addmm candidate derived from the a16w16 tutorial. The
-# tutorial is tuned for K-contiguous (column-major) B; the Inductor integration
-# also supports N-contiguous B with a layout-specific shared-memory swizzle.
+# gfx950-only inter-wave GEMM candidates derived from the a16w16 tutorial. The
+# kernel is tuned for K-contiguous (column-major) B and also supports
+# N-contiguous B with a layout-specific shared-memory swizzle. Plain mm and
+# addmm use distinct template identities because their heuristic registrations
+# and epilogue contracts differ, while sharing the same kernel source.
+gfx950_mm_interwave_template = TritonTemplate(
+    name="tlx_gfx950_mm_interwave",
+    grid=mm_grid,
+    source=load_tlx_template("gfx950_addmm_interwave"),
+)
+
+gfx950_mm_local_split_u_template = TritonTemplate(
+    name="tlx_gfx950_mm_local_split_u",
+    grid=_mm_grid_local_split_u,
+    source=load_tlx_template("gfx950_mm_local_split_u"),
+)
+
+gfx950_mm_register_template = TritonTemplate(
+    name="tlx_gfx950_mm_register",
+    grid=mm_grid,
+    source=load_tlx_template("gfx950_mm_register"),
+)
+
+gfx950_mm_persistent_template = TritonTemplate(
+    name="tlx_gfx950_mm_persistent",
+    grid=_mm_grid_fixed_programs,
+    source=load_tlx_template("gfx950_mm_persistent"),
+)
+
 gfx950_addmm_interwave_template = TritonTemplate(
     name="tlx_gfx950_addmm_interwave",
     grid=mm_grid,
@@ -127,36 +163,49 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 )
 
 
-def append_tlx(templates, op_name="mm"):
+def append_tlx(templates, op_name, kernel_inputs):
     # Import registry to trigger heuristic registration via decorators
     from . import registry  # noqa: F401
 
     if is_rocm():
         return _append_tlx_amd(templates, op_name)
-    return _append_tlx_nvidia(templates, op_name)
+    if current_target().is_blackwell:
+        return _append_tlx_blackwell(templates, op_name)
+    return templates
 
 
 def _append_tlx_amd(templates, op_name):
-    if op_name == "addmm":
-        # The warp-pipe addmm competes as an ADDITIONAL candidate alongside the stock
-        # mm_template + vendor (aten). tuned_addmm issues several get_template_configs
-        # calls (aten, subgraph, unified); inject only into the call that already carries
-        # mm_template (the unified one) so the warp-pipe is added exactly once.
+    if op_name in ("mm", "addmm"):
+        # Both operations inject only into a choice set that already contains
+        # the stock mm_template. tuned_addmm issues several get_template_configs
+        # calls (aten, subgraph, unified), so this also identifies its unified
+        # choice set and prevents duplicate TLX candidates.
         from torch._inductor.kernel.mm import mm_template
 
         uids = {getattr(t, "uid", None) for t in templates}
-        if mm_template.uid in uids:
-            # Inter-wave candidate for contiguous row- or column-major B.
-            if gfx950_addmm_interwave_template.uid not in uids:
-                templates.append(gfx950_addmm_interwave_template)
-            # per-tile warp-pipe (existing candidate)
-            if gfx950_addmm_warppipe_template.uid not in uids:
-                templates.append(gfx950_addmm_warppipe_template)
-            # persistent warp-pipe (new): competes as an ADDITIONAL addmm candidate,
-            # kept a distinct template so the sweep attributes its selection count
-            # separately from the per-tile warp-pipe.
-            if gfx950_addmm_persistent_warppipe_template.uid not in uids:
-                templates.append(gfx950_addmm_persistent_warppipe_template)
+        if mm_template.uid not in uids:
+            return templates
+        if op_name == "mm":
+            for template in (
+                gfx950_mm_interwave_template,
+                gfx950_mm_local_split_u_template,
+                gfx950_mm_register_template,
+                gfx950_mm_persistent_template,
+            ):
+                if template.uid not in uids:
+                    templates.append(template)
+            return templates
+        # Inter-wave candidate for contiguous row- or column-major B.
+        if gfx950_addmm_interwave_template.uid not in uids:
+            templates.append(gfx950_addmm_interwave_template)
+        # per-tile warp-pipe (existing candidate)
+        if gfx950_addmm_warppipe_template.uid not in uids:
+            templates.append(gfx950_addmm_warppipe_template)
+        # persistent warp-pipe (new): competes as an ADDITIONAL addmm candidate,
+        # kept a distinct template so the sweep attributes its selection count
+        # separately from the per-tile warp-pipe.
+        if gfx950_addmm_persistent_warppipe_template.uid not in uids:
+            templates.append(gfx950_addmm_persistent_warppipe_template)
     elif op_name == "bmm":
         # Compete as an additional candidate alongside the stock bmm_template + aten. Inject once,
         # gated on bmm_template already being present (the unified choice call).
@@ -168,15 +217,13 @@ def _append_tlx_amd(templates, op_name):
                 templates.append(gfx950_bmm_warppipe_template)
             if amd_bmm_shared_a_template.uid not in uids:
                 templates.append(amd_bmm_shared_a_template)
-    # else: no AMD TLX template for plain mm (or any other op) yet. Proposing
-    # the Blackwell one here is the bug reported in P2462423082: it cannot be
-    # selected on gfx9xx and only produces log noise.
+    # No AMD TLX template is available for other ops. Proposing the Blackwell
+    # one here is the bug reported in P2462423082: it cannot be selected on
+    # gfx9xx and only produces log noise.
     return templates
 
 
-def _append_tlx_nvidia(templates, op_name):
-    # This helper runs for every NVIDIA target, but only plain mm is eligible
-    # for its Blackwell-specific TLX template. Other operations keep their choices.
+def _append_tlx_blackwell(templates, op_name):
     if op_name != "mm":
         return templates
     templates.append(blackwell_gemm_ws_template)

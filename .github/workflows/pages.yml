@@ -1,0 +1,97 @@
+name: Pages
+# Single owner of the github-pages environment. Nothing else may deploy to it:
+# actions/deploy-pages replaces the whole site, so a second publisher silently
+# erases the first. Publishing source must be set to "GitHub Actions" in
+# Settings -> Pages, otherwise the legacy branch builder races this workflow.
+#
+# The artifact is assembled from independent inputs, each rebuilt from a durable
+# source rather than carried over from a previous deploy:
+#   /                  website/content/*.md via generate_tlx_site.py
+#   /nightly/simple/   the rolling 'nightly' release, via the releases API
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'index.html'
+      - '.github/workflows/pages.yml'
+      - '.github/scripts/nightly_build_index.py'
+      - '.github/scripts/nightly_gen_simple_index.py'
+  # Republish after the nightly so the wheel index picks up the new assets.
+  workflow_run:
+    workflows: ["Nightly fbtriton"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deploys; never cancel one in flight, a half-applied site is worse
+# than a stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # workflow_run fires on failure too; only mirror a nightly that finished.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # website/*.html and the root index.html are generated, not authored.
+      # Rendering here makes website/content/*.md the only source of truth, so a
+      # contributor who edits Markdown without running the generator locally
+      # can no longer ship a stale page.
+      - name: Render site
+        run: python3 website/generate_tlx_site.py
+
+      - name: Assemble artifact
+        run: |
+          mkdir -p public/website
+          cp index.html public/
+          cp website/*.html public/website/
+          cp -r website/assets public/website/
+
+      # Reads assets straight off the rolling 'nightly' release, so the index is
+      # reproducible on any run and does not depend on a wheel build here.
+      - name: Render nightly index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly_build_index.py public/nightly/simple
+
+      # Reserved: /bench/ and /docs/ mount here, as producer jobs that publish
+      # to a release and are pulled in above. They must not deploy themselves.
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      # A deploy that drops an input still reports success, which is how the
+      # site and the wheel index each spent a month intermittently 404ing.
+      # Fail loudly instead.
+      - name: Smoke test published site
+        run: |
+          base="${{ steps.deploy.outputs.page_url }}"
+          base="${base%/}/"
+          rc=0
+          for path in '' 'website/tlx.html' 'website/assets/tlx.css' 'nightly/simple/fbtriton/'; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                     --retry 5 --retry-delay 5 --retry-all-errors "${base}${path}")
+            printf '%s  %s\n' "$code" "${base}${path}"
+            [ "$code" = 200 ] || rc=1
+          done
+          exit $rc

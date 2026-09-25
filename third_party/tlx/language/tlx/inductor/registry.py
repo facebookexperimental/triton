@@ -22,7 +22,6 @@ import contextlib
 import dataclasses
 import logging
 import os
-from collections.abc import Sequence
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -39,7 +38,7 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_num_sms
+from torch._inductor.utils import get_num_sms, tma_inner_dim
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -73,11 +72,15 @@ def _sizevar_hint(sizevars, expr, fallback):
 from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
+    blackwell_gemm_ws_template,
+    gfx950_addmm_interwave_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_addmm_warppipe_template,
     gfx950_bmm_warppipe_template,
-    blackwell_gemm_ws_template,
-    gfx950_addmm_interwave_template,
+    gfx950_mm_interwave_template,
+    gfx950_mm_local_split_u_template,
+    gfx950_mm_persistent_template,
+    gfx950_mm_register_template,
 )
 
 
@@ -918,10 +921,14 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
     @staticmethod
     def _row_major_kwargs(kernel_inputs: KernelInputs) -> dict[str, bool]:
         """A_ROW_MAJOR/B_ROW_MAJOR, spelled exactly as TMATemplateConfigMixin does."""
-        mat1, mat2 = kernel_inputs.mat1mat2()
+        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
+        strides = kernel_inputs.strides_hinted()
+        mat1_inner_dim = tma_inner_dim(strides[kernel_inputs._mat1_idx])
+        mat2_inner_dim = tma_inner_dim(strides[kernel_inputs._mat2_idx])
+        assert mat1_inner_dim is not None and mat2_inner_dim is not None
         return {
-            "A_ROW_MAJOR": not mat1.layout.is_transposed(),
-            "B_ROW_MAJOR": not mat2.layout.is_transposed(),
+            "A_ROW_MAJOR": mat1_inner_dim == 1,
+            "B_ROW_MAJOR": mat2_inner_dim == 1,
         }
 
     @staticmethod
@@ -930,13 +937,9 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             return False
 
         strides = kernel_inputs.strides_hinted()
-
-        def is_dense_2d(s: Sequence[int]) -> bool:
-            return s[-1] == 1 or s[-2] == 1
-
-        return not (
-            is_dense_2d(strides[kernel_inputs._mat1_idx])
-            and is_dense_2d(strides[kernel_inputs._mat2_idx])
+        return any(
+            tma_inner_dim(strides[idx]) is None
+            for idx in (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
         )
 
     def _get_template_configs_impl(
@@ -1178,16 +1181,165 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
 
 
-@register_template_heuristic(
-    gfx950_addmm_interwave_template.uid,
-    "cuda",
-    register=IS_ROCM,
-    op_name="addmm",
-)
-class Gfx950AddMMInterWaveTemplateConfigHeuristic(
-    AddMMConfigMixin, ROCmMMTemplateConfigHeuristic
-):
-    """Narrow config gate for the gfx950 a16w16 inter-wave kernel.
+def _gfx950_static_tn_problem(kernel_inputs, dtypes):
+    if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
+        return None
+    dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+    if dtype not in dtypes or kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype:
+        return None
+
+    m, n, k = kernel_inputs.mnk_symbolic()
+    strides = kernel_inputs.strides_hinted()
+    a_strides = strides[kernel_inputs._mat1_idx]
+    b_strides = strides[kernel_inputs._mat2_idx]
+    values = (m, n, k, *a_strides[-2:], *b_strides[-2:])
+    if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+        return None
+
+    m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (
+        int(value) for value in values
+    )
+    if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+        return None
+    if stride_ak != 1 or stride_bk != 1:
+        return None
+
+    out_dtype = kernel_inputs.out_dtype()
+    int32_max = torch.iinfo(torch.int32).max
+    # `tt.pointer_range=32` is a byte-range promise for A, B, and the
+    # contiguous output, not merely a bound on their element offsets.
+    a_span_bytes = ((m - 1) * stride_am + k) * dtype.itemsize
+    b_span_bytes = (k + (n - 1) * stride_bn) * dtype.itemsize
+    c_span_bytes = m * n * out_dtype.itemsize
+    if max(a_span_bytes, b_span_bytes, c_span_bytes) > int32_max:
+        return None
+    return m, n, k, out_dtype
+
+
+_GFX950_REGISTER_BLOCK_M = 256
+_GFX950_REGISTER_BLOCK_K = 64
+_GFX950_REGISTER_NUM_CU = 256
+_GFX950_REGISTER_MIN_KTILES_PER_SPLIT = 16
+
+
+def _gfx950_register_cdiv(value, divisor):
+    return (value + divisor - 1) // divisor
+
+
+def _gfx950_register_split_k_for(grid_mn, k):
+    min_ks = (
+        _GFX950_REGISTER_MIN_KTILES_PER_SPLIT
+        * _GFX950_REGISTER_BLOCK_K
+    )
+    best = 1
+    for split_k in range(2, _GFX950_REGISTER_NUM_CU // grid_mn + 1):
+        split_size = k // split_k
+        if (
+            k % split_k == 0
+            and split_size >= min_ks
+            and split_size % _GFX950_REGISTER_BLOCK_K == 0
+        ):
+            best = split_k
+    return best
+
+
+def _gfx950_register_default_lds_block_m(m, n, k):
+    large_grid = _gfx950_register_cdiv(
+        m, 256
+    ) * _gfx950_register_cdiv(n, 256)
+    large_fill = large_grid * _gfx950_register_split_k_for(large_grid, k)
+    if large_fill >= _GFX950_REGISTER_NUM_CU // 2:
+        return 256
+    small_grid = _gfx950_register_cdiv(
+        m, 128
+    ) * _gfx950_register_cdiv(n, 128)
+    small_fill = small_grid * _gfx950_register_split_k_for(small_grid, k)
+    return 128 if small_fill > large_fill else 256
+
+
+def _gfx950_register_full_grid_config(m, n, k):
+    small_grid = _gfx950_register_cdiv(
+        m, 128
+    ) * _gfx950_register_cdiv(n, 128)
+    large_grid = _gfx950_register_cdiv(
+        m, 256
+    ) * _gfx950_register_cdiv(n, 256)
+    if not (
+        k > 512
+        and k % _GFX950_REGISTER_BLOCK_K
+        == _GFX950_REGISTER_BLOCK_K // 2
+        and large_grid < _GFX950_REGISTER_NUM_CU <= small_grid
+    ):
+        return None
+    return {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_M": 8,
+        "NUM_XCDS": 8,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+
+
+def _gfx950_register_intermediate_config(m, n, k):
+    if n >= 2 * k:
+        block_m, block_n, block_k = 128, 128, 128
+        group_m, num_warps, num_stages = 16, 8, 2
+    elif (
+        k >= 2 * n
+        and 4 * m < 3 * _gfx950_register_cdiv(m, 128) * 128
+    ):
+        block_m, block_n, block_k = 64, 32, 128
+        group_m, num_warps, num_stages = 8, 4, 2
+    elif k >= 2 * n:
+        block_m, block_n, block_k = 128, 64, 128
+        group_m, num_warps, num_stages = 4, 8, 3
+    else:
+        block_m, block_n, block_k = 128, 64, 64
+        group_m, num_warps, num_stages = 4, 4, 3
+    grid_mn = _gfx950_register_cdiv(
+        m, block_m
+    ) * _gfx950_register_cdiv(n, block_n)
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "GROUP_M": group_m,
+        "NUM_XCDS": 8 if grid_mn >= _GFX950_REGISTER_NUM_CU else 1,
+        "matrix_instr_nonkdim": 16 if block_m == 64 else 32,
+        "waves_per_eu": 0,
+        "kpack": 1,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+def _gfx950_register_plan_for(m, n, k):
+    config = _gfx950_register_full_grid_config(m, n, k)
+    if config is not None:
+        return config
+
+    block_m = _gfx950_register_default_lds_block_m(m, n, k)
+    padded_m = _gfx950_register_cdiv(m, block_m) * block_m
+    is_intermediate_m = (
+        _GFX950_REGISTER_BLOCK_M // 4
+        < m
+        < 4 * _GFX950_REGISTER_BLOCK_M
+    )
+    has_high_m_padding = 4 * m < 3 * padded_m
+    if not is_intermediate_m or (
+        block_m == _GFX950_REGISTER_BLOCK_M and not has_high_m_padding
+    ):
+        return None
+    return _gfx950_register_intermediate_config(m, n, k)
+
+
+class _Gfx950InterWaveTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Shared config gate for the gfx950 a16w16 inter-wave kernel.
 
     The reference kernel consumes row-major A directly and relies on a fixed
     two-buffer, four-quadrant LDS layout. It accepts either row-major B or the
@@ -1291,6 +1443,197 @@ class Gfx950AddMMInterWaveTemplateConfigHeuristic(
             yield self._convert_config_to_template_kwargs(
                 triton_config, m, n, k, out_dtype
             )
+
+
+@register_template_heuristic(
+    gfx950_mm_interwave_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMInterWaveTemplateConfigHeuristic(
+    _Gfx950InterWaveTemplateConfigHeuristic
+):
+    """Plain-MM heuristic for the gfx950 inter-wave kernel."""
+
+
+@register_template_heuristic(
+    gfx950_mm_local_split_u_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMLocalSplitUTemplateConfigHeuristic(
+    ROCmMMTemplateConfigHeuristic
+):
+    """Offer LocalSplitU only for its two validated small-M shapes."""
+
+    # (M, N, K): (TILE_M, TILE_N, LOCAL_SPLIT_U, WAVE_K, K_WIDTH)
+    LOCAL_SPLIT_U_CONFIGS = {
+        (7, 8192, 2048): (16, 32, 16, 32, 8),
+        (7, 2048, 4096): (16, 16, 4, 256, 8),
+    }
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_tn_problem(
+            kernel_inputs,
+            (torch.float16,),
+        )
+        if problem is None:
+            return
+        m, n, k, out_dtype = problem
+        plan = self.LOCAL_SPLIT_U_CONFIGS.get((m, n, k))
+        if plan is None:
+            return
+        tile_m, tile_n, local_split_u, wave_k, k_width = plan
+        triton_config = self.triton_config(
+            1,
+            local_split_u,
+            BLOCK_M=tile_m,
+            BLOCK_N=tile_n,
+            BLOCK_K=wave_k,
+            TILE_M=tile_m,
+            TILE_N=tile_n,
+            LOCAL_SPLIT_U=local_split_u,
+            WAVE_K=wave_k,
+            K_WIDTH=k_width,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+            kpack=1,
+            sink_insts_to_avoid_spills=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_register_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Offer the register fallback only when its geometry policy selects it."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_tn_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, out_dtype = problem
+        plan = _gfx950_register_plan_for(m, n, k)
+        if plan is None:
+            return
+
+        disable_agpr = (k == 256 and n > 256) or (
+            k > 512
+            and (k % 64 != 0 or m * n <= 2 * 1024 * 1024)
+        )
+        triton_config = self.triton_config(
+            plan["num_stages"],
+            plan["num_warps"],
+            BLOCK_M=plan["BLOCK_M"],
+            BLOCK_N=plan["BLOCK_N"],
+            BLOCK_K=plan["BLOCK_K"],
+            GROUP_M=plan["GROUP_M"],
+            NUM_XCDS=plan["NUM_XCDS"],
+            matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
+            waves_per_eu=plan["waves_per_eu"],
+            kpack=plan["kpack"],
+            llvm_fn_attrs=(
+                (("amdgpu-agpr-alloc", "0,0"),)
+                if disable_agpr
+                else ()
+            ),
+            reverse_local_assignment=(
+                plan["BLOCK_K"] == 128 and plan["num_stages"] == 3
+            ),
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_persistent_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMPersistentTemplateConfigHeuristic(
+    ROCmMMTemplateConfigHeuristic
+):
+    """Offer the N160/N192 persistent kernels only for their tuned shapes."""
+
+    PERSISTENT_CONFIGS = {
+        (1024, 20480, 6144): 160,
+        (1024, 24576, 6144): 192,
+    }
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_tn_problem(
+            kernel_inputs,
+            (torch.float16,),
+        )
+        if problem is None:
+            return
+        m, n, k, out_dtype = problem
+        block_n = self.PERSISTENT_CONFIGS.get((m, n, k))
+        if block_n is None:
+            return
+
+        triton_config = self.triton_config(
+            1,
+            4,
+            BLOCK_M=256,
+            BLOCK_N=block_n,
+            BLOCK_K=64,
+            NUM_PROGRAMS=256,
+            matrix_instr_nonkdim=16,
+            enable_sched_group_barrier_scheduler=True,
+            sched_group_barrier_mfma_per_dwordx4=1,
+            regclass_priority_trumps_globalness=True,
+            reverse_local_assignment=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_addmm_interwave_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx950AddMMInterWaveTemplateConfigHeuristic(
+    AddMMConfigMixin, _Gfx950InterWaveTemplateConfigHeuristic
+):
+    """AddMM heuristic for the gfx950 inter-wave kernel."""
 
 
 @register_template_heuristic(

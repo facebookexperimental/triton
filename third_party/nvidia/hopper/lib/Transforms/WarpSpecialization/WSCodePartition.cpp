@@ -564,26 +564,13 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     // consumer-before-producer pair it has no way to synchronize. Refuse to
     // hoist an op above another op that touches one of the same underlying
     // buffers. Sinking, and ops with no memdesc operand, are unaffected.
-    auto isMemDescView = [](Operation *op) {
-      return isa<ttg::MemDescIndexOp, ttg::MemDescTransOp,
-                 ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp,
-                 ttg::MemDescSubsliceOp>(op);
-    };
-    auto memDescRoot = [&](Value v) {
-      while (Operation *def = v.getDefiningOp()) {
-        if (!isMemDescView(def))
-          break;
-        v = def->getOperand(0);
-      }
-      return v;
-    };
     auto hoistsAcrossMemoryOp = [&](Operation *op, Operation *insertAfter) {
       if (!insertAfter->isBeforeInBlock(op))
         return false;
       DenseSet<Value> roots;
       for (Value v : op->getOperands())
         if (isa<ttg::MemDescType>(v.getType()))
-          roots.insert(memDescRoot(v));
+          roots.insert(mlir::getMemDescRoot(v));
       if (roots.empty())
         return false;
       for (Operation *cur = insertAfter->getNextNode(); cur && cur != op;
@@ -592,7 +579,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
           continue;
         for (Value v : cur->getOperands())
           if (isa<ttg::MemDescType>(v.getType()) &&
-              roots.contains(memDescRoot(v)))
+              roots.contains(mlir::getMemDescRoot(v)))
             return true;
       }
       return false;
@@ -887,6 +874,15 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
     }
     // Restore insertion point to user
     builder.setInsertionPoint(user);
+  } else if (reuseGrp >= 0 && channel) {
+    // No enclosing loop anywhere, but this allocation is the shared circular
+    // buffer of a reuse group: every member owns a distinct slot. accumCnt is 0
+    // (no iteration) and getStaggeredAccumCnt adds the member's group position,
+    // which is what keeps the data partitions of an epilogue store apart.
+    // `channel` must be the channel that owns `user`, not the group
+    // representative, or all users collapse onto the representative's slot.
+    getBufferIdxAndPhase(builder, user, numBuffers, regionsWithChannels,
+                         bufferIdx, _phase, config, reuseGrp, channel);
   } else {
     // Fallback: if we can't find a parent loop, use constant 0
     // (this should only happen for operations truly outside any loop)
@@ -1943,6 +1939,21 @@ DenseMap<Channel *, Value> createBufferForAllocs(
     DenseMap<Operation *, Value> userToBufIdx;
     int reuseGrp = channelInReuseGroup(channel, config);
 
+    // One allocation can back several channels (one producer/consumer pair per
+    // data partition or epilogue subtile). Slot selection is per channel, so a
+    // user must be attributed to the channel it actually belongs to; `channel`
+    // is only the group representative.
+    SmallVector<Channel *> allocChannels;
+    for (auto *c : orderedChannels)
+      if (c->getAllocOp() == oldAllocOp)
+        allocChannels.push_back(c);
+    auto ownerChannelFor = [&](Operation *user) -> Channel * {
+      for (auto *c : allocChannels)
+        if (c->getSrcOp() == user || c->getDstOp() == user)
+          return c;
+      return channel;
+    };
+
     bool isOperandDTmem = false;
     if (channel->channelKind == DataChannelKind::TMEMAlloc) {
       auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(channel);
@@ -1980,7 +1991,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
                                bufferIdx, _phase, config, reuseGrp, channel);
         } else {
           std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
-              builder, user, channel, oldAllocOp, numBuffers,
+              builder, user, ownerChannelFor(user), oldAllocOp, numBuffers,
               regionsWithChannels, config, reuseGrp);
         }
       } else if (auto forOp = user->getParentOfType<scf::ForOp>()) {
@@ -2031,8 +2042,8 @@ DenseMap<Channel *, Value> createBufferForAllocs(
         // iteration. Find the parent loop that this
         // operation came from by walking up the IR.
         std::tie(bufferIdx, _phase) = getBufferIdxAndPhaseForOutsideLoopOps(
-            builder, user, channel, oldAllocOp, numBuffers, regionsWithChannels,
-            config, reuseGrp);
+            builder, user, ownerChannelFor(user), oldAllocOp, numBuffers,
+            regionsWithChannels, config, reuseGrp);
       }
       userToBufIdx[user] = bufferIdx;
     }
@@ -3463,6 +3474,17 @@ void insertAsyncComm(
                            kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
+    } else if (reuseGrp >= 0) {
+      // Producer is outside any loop but shares one barrier array with the
+      // other members of its reuse group (buffer.copy > 1 -- see
+      // channelInReuseGroup). There is no iteration to count, so accumCnt is 0,
+      // but the members must still land on distinct slots; getStaggeredAccumCnt
+      // supplies the member's group position.
+      builder.setInsertionPoint(tmaHeadProducer);
+      getBufferIdxAndPhase(builder, headProducer,
+                           kv.second.front()->getNumBuffers(),
+                           regionsWithChannels, bufferIdx, phase, config,
+                           reuseGrp, masterChannel);
     } else {
       // Producer is truly outside any loop, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
@@ -3822,6 +3844,60 @@ void insertAsyncComm(
           producerAcquirePoint = producerAcquireForChannelLoop;
         }
         bool addCompletionBarrier = nestedInsertionTarget == nullptr;
+        // An outer-produced operand can be consumed by multiple sequential
+        // inner loops (for example HSTU's masked loop followed by an optional
+        // unmasked loop). An inline EMPTY completion on the last loop's MMA is
+        // insufficient: when that loop has zero iterations, no completion is
+        // emitted and the next persistent tile deadlocks acquiring the input.
+        // Commit once after the last sibling loop instead. The commit follows
+        // all MMAs from every nonempty sibling and still arrives when all of
+        // them are empty, matching the one-load/one-release outer cadence.
+        SmallVector<scf::ForOp> siblingConsumerLoops;
+        if (addCompletionBarrier) {
+          Operation *siblingParent = nullptr;
+          bool areSiblings = true;
+          for (Operation *consumer : filteredOps) {
+            auto loop = consumer->getParentOfType<scf::ForOp>();
+            if (!loop) {
+              areSiblings = false;
+              break;
+            }
+            if (!siblingParent)
+              siblingParent = loop->getParentOp();
+            else if (loop->getParentOp() != siblingParent) {
+              areSiblings = false;
+              break;
+            }
+            if (!llvm::is_contained(siblingConsumerLoops, loop))
+              siblingConsumerLoops.push_back(loop);
+          }
+          if (!areSiblings)
+            siblingConsumerLoops.clear();
+        }
+        if (siblingConsumerLoops.size() > 1) {
+          llvm::sort(siblingConsumerLoops, [](scf::ForOp lhs, scf::ForOp rhs) {
+            return lhs->isBeforeInBlock(rhs);
+          });
+          Operation *prodLoop = headProducer->getParentOp();
+          while (prodLoop && !isa<scf::ForOp, scf::WhileOp>(prodLoop))
+            prodLoop = prodLoop->getParentOp();
+          bool producerLoopEnclosesConsumers = false;
+          for (Operation *anc = siblingConsumerLoops.front()->getParentOp();
+               anc && !isa<triton::FuncOp>(anc); anc = anc->getParentOp()) {
+            if (anc == prodLoop) {
+              producerLoopEnclosesConsumers = true;
+              break;
+            }
+          }
+          if (producerLoopEnclosesConsumers) {
+            nestedInsertionTarget = siblingConsumerLoops.back();
+            addCompletionBarrier = false;
+            LDBG("outer-produced channel "
+                 << masterChannel->uniqID << " spans "
+                 << siblingConsumerLoops.size()
+                 << " sibling MMA loops; commit after the final loop");
+          }
+        }
         if (!addCompletionBarrier) {
           // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
@@ -5351,13 +5427,7 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   SmallVector<ttg::LocalAllocOp> buffers;
   DenseSet<Operation *> seen;
   WalkResult result = funcOp.walk([&](ttnvws::DescriptorLoadOp load) {
-    Value buffer = load.getResult();
-    while (Operation *def = buffer.getDefiningOp()) {
-      if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-               ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp>(def))
-        break;
-      buffer = def->getOperand(0);
-    }
+    Value buffer = mlir::getMemDescRoot(load.getResult());
     auto alloc = buffer.getDefiningOp<ttg::LocalAllocOp>();
     if (!alloc) {
       load.emitError("expected descriptor load destination to be backed by "

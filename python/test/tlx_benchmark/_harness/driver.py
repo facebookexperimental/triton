@@ -7,12 +7,13 @@ window, the verdict, the table and the artifact all live here, so adding an op
 does not mean copying a CLI.
 
 The adapter is the bench module itself, duck-typed, because `test_ops_perf.py`
-already discovers and calls bench modules that way. Five names:
+already discovers and calls bench modules that way. Six names:
 
     OP              str                       -- catalog op name
     REF_NAME        str                       -- what `ref_fn` is; lands in env["ref"]
     EXTRA_COLUMNS   ((header, key), ...)      -- which Result.extra keys get a column
-    cases(synthetic)            -> list[Case]
+    SHAPE_SUITES    FocusRegistry | None      -- focus-suite selection and validation
+    cases(synthetic, suites)    -> list[Case]
     prepare(case, space)        -> Prepared
 
 and one line of wiring:
@@ -23,6 +24,7 @@ and one line of wiring:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import functools
 import os
@@ -72,9 +74,9 @@ class Prepared:
     cap_s: float = COLD_COMPILE_CAP_S
 
 
-#: The GPU this run is about. Everything downstream -- which `PERF_SHAPES` are
-#: imported, which `arch=` the op is pinned to, which device's clocks are
-#: captured, what the artifact is named -- has to agree with it.
+#: The GPU this run is about. Everything downstream -- which focus suites are
+#: selected, which architecture is recorded in each case, which device's
+#: clocks are captured, what the artifact is named -- has to agree with it.
 #:
 #: Set once by `select`, from `main`'s `--device`. Absent that (the pytest
 #: entry point, which does no selection) it falls back to the first device,
@@ -127,6 +129,64 @@ def close_enough(out, ref, rel: float) -> tuple:
     return True, ""
 
 
+#: Kwarg-name prefixes worth dropping from the reported config: the kernels
+#: spell the tile either BLOCK_M or BLOCK_SIZE_M, and neither prefix carries
+#: information once the column is called "best config".
+_CONFIG_ABBREV = (("BLOCK_SIZE_", "B"), ("BLOCK_", "B"))
+
+
+def _fmt_config(config) -> str:
+    parts = []
+    for key, value in config.kwargs.items():
+        for long, short in _CONFIG_ABBREV:
+            if key.startswith(long):
+                key = short + key[len(long):]
+                break
+        parts.append(f"{key}={value}")
+    return " ".join(parts + [f"w{config.num_warps}", f"s{config.num_stages}"])
+
+
+@contextlib.contextmanager
+def _record_configs(into: dict):
+    """Record the config every autotuned kernel launched in this block ran with.
+
+    Wraps `Autotuner.run` rather than using `knobs.autotuning.listener`: the
+    listener only fires for a multi-config space, and a single-config one --
+    what an op with a `heuristic_config` uses by default -- is the case most
+    worth labelling. Doing it here rather than in a bench module is what makes
+    the column op-agnostic: an op that launches several autotuned kernels (a
+    flash_attn backward) contributes one entry per kernel, keyed by name.
+    """
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:  # nothing to record; not a reason to fail a measurement
+        yield
+        return
+
+    original = Autotuner.run
+
+    def run(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        config = getattr(self, "best_config", None)
+        if config is not None:
+            into[self.base_fn.__name__] = _fmt_config(config)
+        return out
+
+    Autotuner.run = run
+    try:
+        yield
+    finally:
+        Autotuner.run = original
+
+
+def _render_configs(configs: dict) -> Optional[str]:
+    if not configs:
+        return None  # the op's kernels are not autotuned
+    if len(configs) == 1:
+        return next(iter(configs.values()))
+    return " | ".join(f"{name}: {config}" for name, config in configs.items())
+
+
 def supported(bench) -> bool:
     # Both halves matter. No GPU means no arch; an arch the catalog has no entry
     # for means every case would raise UnsupportedOp, and N error rows read like
@@ -136,8 +196,49 @@ def supported(bench) -> bool:
     return arch() is not None and has_impl(bench.OP, arch())
 
 
-def default_json(bench) -> str:
-    return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}.json"
+def default_json(bench, suites=None) -> str:
+    suite_suffix = "" if not suites else "." + "+".join(suites)
+    return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}{suite_suffix}.json"
+
+
+def _selected_suite_names(bench, suites=None) -> tuple[str, ...]:
+    registry = bench.SHAPE_SUITES
+    return () if registry is None else registry.selected_suite_names(arch(), suites)
+
+
+def suite_listing(bench) -> str:
+    registry = bench.SHAPE_SUITES
+    if registry is None:
+        return "no focus suites available"
+
+    def components(name):
+        suite = registry.suite(name)
+        if not suite.includes:
+            return (name, )
+        return tuple(component for included in suite.includes for component in components(included))
+
+    lines = []
+    for arch_name, defaults in registry.defaults.items():
+        if not defaults:
+            lines.append(f"{arch_name} default => (none)")
+            continue
+        names = dict.fromkeys(component for name in defaults for component in components(name))
+        selected = "+".join(defaults)
+        expanded = "+".join(names)
+        suffix = f" => {expanded}" if expanded != selected else ""
+        lines.append(f"{arch_name} default => {selected}{suffix}")
+    return "\n".join(lines)
+
+
+def suite_shape_listing(bench, name: str) -> str:
+    registry = bench.SHAPE_SUITES
+    if registry is None:
+        raise ValueError("no focus suites available")
+    suite = registry.suite(name)
+    suite_shapes = registry.resolved_shapes(name)
+    shapes = "\n".join(repr(shape) for shape in suite_shapes)
+    header = f"{suite.name} ({len(suite_shapes)} shapes)"
+    return f"{header}\n{shapes}" if shapes else header
 
 
 def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: str = "wallclock") -> Result:
@@ -154,7 +255,9 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     # `resolve_cold_compile` for why that is the default on some ops.
     compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s) if cold else None
 
-    prep.tlx_fn()  # tune and compile outside the measured window
+    configs: dict = {}
+    with _record_configs(configs):
+        prep.tlx_fn()  # tune and compile outside the measured window
     if prep.ref_fn is not None:
         prep.ref_fn()
     torch.cuda.synchronize()
@@ -175,6 +278,7 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
                            accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
     result.flop_count = prep.flop_count
     result.extra = dict(prep.extra)
+    result.best_config = _render_configs(configs)
 
     # Optional adapter hook, for an op-specific metric that can only be computed
     # from the measurement -- `prepare` runs before there is one. Mutates in
@@ -244,14 +348,16 @@ def _head_per_direction(cases, head: int):
     return kept
 
 
-def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_compile_mode=None, directions=None,
-        latency_mode="wallclock"):
+def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=None, cold_compile_mode=None,
+        directions=None, latency_mode="wallclock"):
+    if synthetic and suites:
+        raise ValueError("--synthetic and --suite cannot be used together")
     space = resolve_space(bench, space)
     cold_mode = resolve_cold_compile(bench, cold_compile_mode)
     env = capture_env(device_index())
     if governor is not None:
         env["governed"] = governor.to_dict()
-    cases = bench.cases(synthetic)
+    cases = bench.cases(synthetic, suites)
     if directions:
         cases = [c for c in cases if c.direction in directions]
     if head:
@@ -282,6 +388,8 @@ def run(bench, *, space=None, head=None, synthetic=False, governor=None, cold_co
     if head:
         env["head"] = head
     env["shapes"] = "synthetic" if synthetic else "focus"
+    if not synthetic:
+        env["shape_suites"] = list(_selected_suite_names(bench, suites))
     env["run"] = {k: info[k] for k in ("problems", "clock_trace", "elapsed_s") if k in info}
     return results, env
 
@@ -295,10 +403,16 @@ def main(bench, argv=None) -> int:
         "uses by default, and measuring anything else measures a path users do not take")
     parser.add_argument("--head", type=int, default=None, metavar="N",
                         help="only the first N cases per direction, for a quick look")
-    parser.add_argument(
+    shape_options = parser.add_mutually_exclusive_group()
+    shape_options.add_argument(
         "--synthetic", action="store_true",
         help="run the correctness shapes instead of this arch's focus list; they are "
         "mostly too small to time, so this is for looking, not for gating")
+    shape_options.add_argument(
+        "--suite", action="append", default=None,
+        help="run one focus suite; repeat to combine suites (default: this architecture's configured set)")
+    shape_options.add_argument("--list-suites", action="store_true", help="list focus suites and exit")
+    shape_options.add_argument("--list-suite", metavar="NAME", help="list one focus suite's shapes and exit")
     # An op with a backward reports both by default, in two tables.
     only = parser.add_mutually_exclusive_group()
     only.add_argument("--fwd-only", action="store_true", help="skip the backward cases")
@@ -313,8 +427,17 @@ def main(bench, argv=None) -> int:
         help=f"how often to time a first call on a fresh cache (default {resolve_cold_compile(bench, None)}); "
         "'all' is per case, 'first' samples one case per direction, 'none' skips it")
     parser.add_argument("--json", default=None,
-                        help="machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>.json)")
+                        help="machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>[.<suites>].json)")
     args = parser.parse_args(argv)
+    if args.list_suites:
+        print(suite_listing(bench))
+        return 0
+    if args.list_suite:
+        try:
+            print(suite_shape_listing(bench, args.list_suite))
+        except ValueError as exc:
+            parser.error(str(exc))
+        return 0
     directions = ("fwd", ) if args.fwd_only else ("bwd", ) if args.bwd_only else None
 
     # Pick and pin the GPU before torch touches CUDA. Selection has to happen
@@ -322,15 +445,20 @@ def main(bench, argv=None) -> int:
     # and it has to happen before the first CUDA call because the visibility
     # variable is read once at context creation.
     device = select_device(args.device)
-    # Pin it before anything reads `arch()`: the shape import, the `arch=` the
-    # op is dispatched on, the denoise capture and the artifact name all come
-    # from this one object.
+    # Pin it before anything reads `arch()`: the shape import, case metadata,
+    # denoise capture and artifact name all come from this one object. Public
+    # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
         os.environ[device.visibility_env] = str(device.index)
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")
+    try:
+        if not args.synthetic:
+            _selected_suite_names(bench, args.suite)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Governing is unconditional: a number taken on an ungoverned machine is not
     # comparable to anything, so there is no switch to take one.
@@ -340,7 +468,8 @@ def main(bench, argv=None) -> int:
         for step in governor.skipped:
             print(f"  denoise: SKIPPED {step}")
         results, env = run(bench, space=args.space, head=args.head, synthetic=args.synthetic, governor=governor,
-                           cold_compile_mode=args.cold_compile, directions=directions, latency_mode=args.latency_mode)
+                           suites=args.suite, cold_compile_mode=args.cold_compile, directions=directions,
+                           latency_mode=args.latency_mode)
     if not results:
         # An empty focus list is legitimate -- an arch may have no capture yet --
         # but a silent zero-row table reads like a pass. Say what was empty.
@@ -349,7 +478,9 @@ def main(bench, argv=None) -> int:
             what += f" with direction in {sorted(directions)}"
         print(f"{what}; nothing measured")
         return 0
-    print(report_mod.render(results, env, args.json or default_json(bench), getattr(bench, "EXTRA_COLUMNS", ())))
+    print(
+        report_mod.render(results, env, args.json or default_json(bench, args.suite),
+                          getattr(bench, "EXTRA_COLUMNS", ())))
 
     return 1 if report_mod.failures(results) else 0
 

@@ -268,7 +268,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttng.async_tma_store_token_wait %20   {async_task_id = array<i32: 3>} : !ttg.async.token
       %sched_49, %sched_50, %sched_51, %sched_52 = ttng.clc_read %sched_14 {async_task_id = array<i32: 0, 1, 2, 3>} : !ttg.async.token -> i1, i32, i32, i32
       scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %sched_49, %sched_50 : i1, i32
-    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.smem_alloc_algo = 2 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32}
+    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.smem_alloc_algo = 1 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
 }

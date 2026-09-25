@@ -1,6 +1,14 @@
 """TLX AMD tests -- CDNA4 (gfx950)."""
+import gc
+import math
+import os
+import statistics
+import subprocess
+import sys
+
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
@@ -9,6 +17,7 @@ from triton._internal_testing import is_hip_cdna4
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     _cluster_causal_query_tile as _amd_fa_cluster_causal_query_tile,
     _cluster_direct_workgroup_window as _amd_fa_cluster_direct_workgroup_window,
+    attention as _amd_fa_cluster_attention,
     persistent_attention as _amd_fa_cluster_persistent_attention,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import (
@@ -65,6 +74,76 @@ def _amd_fa_cluster_workgroup_order_kernel(
     raw_linear = raw_off_h + raw_pid_m * H
     mapped_linear = off_h + pid_m * H
     tl.store(output + raw_linear, mapped_linear, mask=raw_pid_m < num_m_blocks)
+
+
+_AMD_FA_CLUSTER_REGRESSION_WORKER = "TRITON_TLX_AMD_FA_CLUSTER_REGRESSION_WORKER"
+_AMD_FA_CLUSTER_MIN_SNR_DB = 35.0
+_AMD_FA_CLUSTER_REFERENCE_TFLOPS = 1010.5
+_AMD_FA_CLUSTER_MIN_TFLOPS = 925.0
+_AMD_FA_CLUSTER_CASES = tuple(
+    (dtype, 16384 // seq_len, 64, seq_len, 128, causal)
+    for dtype in (torch.float16, torch.bfloat16)
+    for causal in (False, True)
+    for seq_len in (512, 1024, 2048, 4096, 8192, 16384)) + tuple(
+        (dtype, 16, 64, 1024, 64, causal) for dtype in (torch.float16, torch.bfloat16) for causal in (False, True))
+
+
+def _amd_fa_cluster_sample_indices(size):
+    return tuple(dict.fromkeys((0, size // 2, size - 1)))
+
+
+def _amd_fa_cluster_sampled_fp32(actual, q, k, v, scale, causal):
+    query_indices = _amd_fa_cluster_sample_indices(q.shape[2])
+    query_positions = torch.tensor(query_indices, device=q.device)
+    key_positions = torch.arange(k.shape[2], device=q.device)
+    actual_rows = []
+    reference_rows = []
+    for batch in _amd_fa_cluster_sample_indices(q.shape[0]):
+        for head in _amd_fa_cluster_sample_indices(q.shape[1]):
+            q_rows = q[batch, head, query_positions].float()
+            k_rows = k[batch, head].float()
+            v_rows = v[batch, head].float()
+            scores = torch.matmul(q_rows, k_rows.transpose(0, 1)) * scale
+            if causal:
+                scores.masked_fill_(key_positions[None, :] > query_positions[:, None], float("-inf"))
+            reference_rows.append(torch.matmul(torch.softmax(scores, dim=-1), v_rows))
+            actual_rows.append(actual[batch, head, query_positions].float())
+    return torch.cat(actual_rows), torch.cat(reference_rows)
+
+
+def _amd_fa_cluster_snr_db(actual, expected):
+    actual = actual.float()
+    expected = expected.float()
+    signal = torch.linalg.vector_norm(expected)
+    noise = torch.linalg.vector_norm(actual - expected)
+    if noise.item() == 0.0:
+        return float("inf")
+    if signal.item() == 0.0:
+        return float("-inf")
+    return float(20.0 * torch.log10(signal / noise))
+
+
+def _run_amd_fa_cluster_regression_isolated(test_name):
+    if os.environ.get(_AMD_FA_CLUSTER_REGRESSION_WORKER) == test_name:
+        assert os.environ.get("DISABLE_LLVM_OPT") == "disable-machine-sink"
+        return False
+
+    env = os.environ.copy()
+    env[_AMD_FA_CLUSTER_REGRESSION_WORKER] = test_name
+    env["DISABLE_LLVM_OPT"] = "disable-machine-sink"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-s", "--tb=short", f"{__file__}::{test_name}"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"isolated Flash Attention cluster regression {test_name} failed:\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}")
+    print(result.stdout)
+    return True
 
 
 @triton.jit
@@ -1264,6 +1343,76 @@ def _run_load_to_local_1d(device, kernel_fn, size, n_valid, other_val, block_siz
         num_stages=1,
     )
     return x, out
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_fa_cluster_numerical_matrix_gfx950():
+    test_name = "test_amd_fa_cluster_numerical_matrix_gfx950"
+    if _run_amd_fa_cluster_regression_isolated(test_name):
+        return
+
+    for dtype, batch, heads, seq_len, head_dim, causal in _AMD_FA_CLUSTER_CASES:
+        torch.manual_seed(42)
+        shape = (batch, heads, seq_len, head_dim)
+        q = torch.randn(shape, dtype=dtype, device="cuda")
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        scale = 1.0 / math.sqrt(head_dim)
+
+        out = _amd_fa_cluster_attention(q, k, v, scale, causal)
+        reference = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+        assert torch.isfinite(out).all(), (dtype, batch, seq_len, head_dim, causal)
+        measured_snr = _amd_fa_cluster_snr_db(out, reference)
+        assert measured_snr >= _AMD_FA_CLUSTER_MIN_SNR_DB, (
+            dtype,
+            batch,
+            seq_len,
+            head_dim,
+            causal,
+            measured_snr,
+        )
+        actual_rows, reference_rows = _amd_fa_cluster_sampled_fp32(out, q, k, v, scale, causal)
+        torch.testing.assert_close(actual_rows, reference_rows, atol=2e-2, rtol=2e-2)
+
+        del q, k, v, out, reference, actual_rows, reference_rows
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_fa_cluster_performance_gfx950():
+    test_name = "test_amd_fa_cluster_performance_gfx950"
+    if _run_amd_fa_cluster_regression_isolated(test_name):
+        return
+
+    batch, heads, seq_len, head_dim = 1, 64, 16384, 128
+    torch.manual_seed(42)
+    shape = (batch, heads, seq_len, head_dim)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    scale = 1.0 / math.sqrt(head_dim)
+    run = lambda: _amd_fa_cluster_attention(q, k, v, scale, False)
+
+    out = run()
+    reference = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=scale)
+    assert torch.isfinite(out).all()
+    measured_snr = _amd_fa_cluster_snr_db(out, reference)
+    assert measured_snr >= _AMD_FA_CLUSTER_MIN_SNR_DB, measured_snr
+    actual_rows, reference_rows = _amd_fa_cluster_sampled_fp32(out, q, k, v, scale, False)
+    torch.testing.assert_close(actual_rows, reference_rows, atol=2e-2, rtol=2e-2)
+
+    latencies_ms = [triton.testing.do_bench(run, warmup=500, rep=500, return_mode="median") for _ in range(3)]
+    median_ms = statistics.median(latencies_ms)
+    flops = 4.0 * batch * heads * seq_len * seq_len * head_dim
+    measured_tflops = flops * 1e-12 / (median_ms * 1e-3)
+    print(f"TLX AMD FA cluster: windows_ms={latencies_ms}, median_ms={median_ms:.4f}, "
+          f"throughput={measured_tflops:.1f} TFLOP/s, reference={_AMD_FA_CLUSTER_REFERENCE_TFLOPS:.1f} TFLOP/s")
+    assert math.isfinite(measured_tflops) and measured_tflops > 0.0
+    assert measured_tflops >= _AMD_FA_CLUSTER_MIN_TFLOPS, (
+        f"PERF REGRESSION: {measured_tflops:.1f} TFLOP/s < "
+        f"{_AMD_FA_CLUSTER_MIN_TFLOPS:.1f} TFLOP/s floor "
+        f"({_AMD_FA_CLUSTER_REFERENCE_TFLOPS:.1f} TFLOP/s reference)")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

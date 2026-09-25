@@ -42,9 +42,6 @@ from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
     bmm as _shared_a_bmm,
     bmm_register_staged_template,
 )
-from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16 import (
-    matmul_kernel as _amd_gemm, )
-
 # Arch-gated: importing another arch's tutorials is not free. They pull that
 # arch's optional deps (the mxfp8 FA tutorial imports torchao), and at module
 # scope a missing one is an ImportError that fails the whole file instead of
@@ -1830,110 +1827,6 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 # already agrees with `register` -- so a wrong `inter_wave` would be dropped
 # from the race and the suite would still pass. Iterating `available_paths`
 # asserts every path a shape can take against torch, independently.
-def test_amd_gemm_offset_width_selection():
-    i32_max_element = (1 << 30) - 1
-    within_i32 = torch.empty((i32_max_element + 1, ), device="meta", dtype=torch.float16)
-    beyond_i32 = torch.empty((i32_max_element + 2, ), device="meta", dtype=torch.float16)
-
-    assert not _amd_gemm._needs_i64_offsets(within_i32)
-    assert _amd_gemm._needs_i64_offsets(beyond_i32)
-
-
-def test_amd_gemm_output_offset_width_selection(monkeypatch):
-    launches = []
-
-    class FakeKernel:
-
-        def __getitem__(self, grid):
-
-            def launch(*args, **kwargs):
-                launches.append((grid, kwargs["USE_I64_C_OFFSETS"]))
-
-            return launch
-
-    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
-    for M, N in [(256, 256), (925210, 4096)]:
-        a = torch.empty((M, 128), device="meta", dtype=torch.float16)
-        b = torch.empty((128, N), device="meta", dtype=torch.float16)
-        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
-
-    assert [use_i64_c_offsets for _, use_i64_c_offsets in launches] == [False, True]
-
-
-def test_amd_gemm_input_offset_width_selection(monkeypatch):
-    launches = []
-
-    class FakeKernel:
-
-        def __getitem__(self, grid):
-
-            def launch(*args, **kwargs):
-                launches.append((
-                    kwargs["USE_I64_A_OFFSETS"],
-                    kwargs["USE_I64_B_OFFSETS"],
-                    kwargs["HAS_M_TAIL"],
-                    kwargs["HAS_N_TAIL"],
-                ))
-
-            return launch
-
-    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
-    cases = [
-        ((256, 256, 4096), (False, False, False, False)),
-        ((257, 256, 4096), (False, False, True, False)),
-        ((256, 257, 4096), (False, False, False, True)),
-        ((262400, 256, 4096), (True, False, False, False)),
-        ((256, 262400, 4096), (False, True, False, False)),
-    ]
-    for (M, N, K), _ in cases:
-        a = torch.empty((M, K), device="meta", dtype=torch.float16)
-        b = torch.empty((K, N), device="meta", dtype=torch.float16)
-        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
-
-    assert launches == [expected for _, expected in cases]
-
-
-def test_amd_gemm_irregular_shape_policy():
-    assert _amd_gemm.choose_tile(677, 4096, 8192) == (256, 256, 4)
-
-    deep_k = _amd_gemm._intermediate_register_config(677, 2048, 4096)
-    assert (
-        deep_k["BLOCK_M"],
-        deep_k["BLOCK_N"],
-        deep_k["BLOCK_K"],
-        deep_k["matrix_instr_nonkdim"],
-        deep_k["num_warps"],
-        deep_k["num_stages"],
-    ) == (128, 64, 128, 32, 8, 3)
-
-    high_padding = _amd_gemm._intermediate_register_config(279, 2048, 4096)
-    assert (
-        high_padding["BLOCK_M"],
-        high_padding["BLOCK_N"],
-        high_padding["matrix_instr_nonkdim"],
-    ) == (64, 32, 16)
-
-
-@pytest.mark.parametrize(
-    "split_k,defer_epilogue",
-    [(2, False)],
-    ids=["split-k"],
-)
-def test_amd_gemm_rejects_large_workspace(split_k, defer_epilogue):
-    M, N, K = 262145, 2048, 256
-    a = torch.empty((M, K), device="meta", dtype=torch.float16)
-    b = torch.empty((K, N), device="meta", dtype=torch.float16)
-
-    with pytest.raises(ValueError, match="FP32 workspace exceeds signed-i32 byte offsets"):
-        _amd_gemm._launch(
-            a,
-            b,
-            SPLIT_K=split_k,
-            TILE=(256, 256),
-            DEFER_EPILOGUE=defer_epilogue,
-        )
-
-
 def test_amd_addmm_rejects_register_config_for_inter_wave():
     a = torch.empty((256, 2048), device="meta", dtype=torch.float16)
     b = torch.empty((256, 2048), device="meta", dtype=torch.float16).T
