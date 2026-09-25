@@ -10,11 +10,26 @@ import subprocess
 import sys
 import tempfile
 
-import torch
-import triton  # @manual=//triton:triton
-
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
+
+
+def load_runtime(case) -> None:
+    # Keep case discovery and --list usable without loading GPU extension
+    # modules. This also lets users inspect available cases before activating
+    # the PyTorch environment used to run them.
+    global torch, triton, run_and_get_code
+
+    import torch as torch_module
+    import triton as triton_module  # @manual=//triton:triton
+    from torch._inductor.utils import run_and_get_code as torch_run_and_get_code
+
+    import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+    torch = torch_module
+    triton = triton_module
+    run_and_get_code = torch_run_and_get_code
+    case.torch = torch_module
 
 
 def discover_cases() -> dict[str, object]:
@@ -132,6 +147,7 @@ def main() -> None:
         for listed_case in cases.values():
             print(f"{listed_case.NAME}: {listed_case.problem()}")
         return
+    load_runtime(case)
     if args.variant:
         result = run_variant(case, args.variant, args)
         if args.result_json:

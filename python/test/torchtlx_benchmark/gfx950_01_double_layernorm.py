@@ -1,7 +1,11 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-import torch
-import torch.nn.functional as F
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 NAME = "gfx950_01_double_layernorm"
 CANDIDATE_NAME = "local_buffer_retention"
@@ -41,8 +45,8 @@ def model(
     weight2: torch.Tensor,
     bias2: torch.Tensor,
 ) -> torch.Tensor:
-    z = residual + F.layer_norm(x, (N, ), weight1, bias1, EPS)
-    return z * torch.sigmoid(F.layer_norm(z, (N, ), weight2, bias2, EPS))
+    z = residual + torch.nn.functional.layer_norm(x, (N, ), weight1, bias1, EPS)
+    return z * torch.sigmoid(torch.nn.functional.layer_norm(z, (N, ), weight2, bias2, EPS))
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:
