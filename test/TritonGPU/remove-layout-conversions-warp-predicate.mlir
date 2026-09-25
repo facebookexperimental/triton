@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions | FileCheck %s
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions -tritongpu-remove-layout-conversions | FileCheck %s
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions -tlx-finalize-user-layouts | FileCheck %s --check-prefix=FINAL
+// RUN: triton-opt %s -split-input-file -tlx-propagate-layout -tlx-resolve-placeholder-layouts -tritongpu-remove-layout-conversions -tlx-finalize-user-layouts | FileCheck %s --check-prefix=RESOLVED
 
 #blocked_acc = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked_row = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
@@ -464,22 +465,22 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
     tt.return
   }
 
-  // FINAL-LABEL: tt.func @wave_uniform_reshape_repair_stays_outside
-  // FINAL-SAME: %[[UNIFORM_RESHAPE_PRED:.*]]: i1, %[[UNIFORM_RESHAPE_SRC:.*]]: tensor<128x128xf32, #{{.*}}>, %[[UNIFORM_RESHAPE_PTRS:.*]]: tensor<128x2x64x!tt.ptr<f32>, #[[$RESHAPE_DST]]>
+  // RESOLVED-LABEL: tt.func @wave_uniform_reshape_repair_stays_outside
+  // RESOLVED-SAME: %[[UNIFORM_RESHAPE_PRED:.*]]: i1, %[[UNIFORM_RESHAPE_SRC:.*]]: tensor<128x128xf32, #{{.*}}>, %[[UNIFORM_RESHAPE_PTRS:.*]]: tensor<128x2x64x!tt.ptr<f32>, #[[$UNIFORM_RESHAPE_DST:.*]]>
   tt.func @wave_uniform_reshape_repair_stays_outside(
       %predicate: i1, %src: tensor<128x128xf32, #reshape_src>,
       %ptrs: tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>) {
-    // FINAL: %[[UNIFORM_COMPATIBLE_SRC:.*]] = ttg.convert_layout %[[UNIFORM_RESHAPE_SRC]]
-    // FINAL: ttg.warp_predicate %[[UNIFORM_RESHAPE_PRED]]() {
-    // FINAL-NOT: ttg.convert_layout
+    // RESOLVED: %[[UNIFORM_COMPATIBLE_SRC:.*]] = ttg.convert_layout %[[UNIFORM_RESHAPE_SRC]]
+    // RESOLVED: ttg.warp_predicate %[[UNIFORM_RESHAPE_PRED]]() {
+    // RESOLVED-NOT: ttg.convert_layout
     ttg.warp_predicate %predicate () {
-      // FINAL: %[[UNIFORM_RESHAPED:.*]] = tt.reshape %[[UNIFORM_COMPATIBLE_SRC]] : {{.*}} -> tensor<128x2x64xf32, #[[$RESHAPE_DST]]>
+      // RESOLVED: %[[UNIFORM_RESHAPED:.*]] = tt.reshape %[[UNIFORM_COMPATIBLE_SRC]] : {{.*}} -> tensor<128x2x64xf32, #[[$UNIFORM_RESHAPE_DST]]>
       %reshaped = tt.reshape %src : tensor<128x128xf32, #reshape_src> -> tensor<128x2x64xf32, #reshape_wrapped_dst>
-      // FINAL: tt.store %[[UNIFORM_RESHAPE_PTRS]], %[[UNIFORM_RESHAPED]]
+      // RESOLVED: tt.store %[[UNIFORM_RESHAPE_PTRS]], %[[UNIFORM_RESHAPED]]
       tt.store %ptrs, %reshaped : tensor<128x2x64x!tt.ptr<f32>, #reshape_wrapped_dst>
       ttg.predicate_yield
     } {wave_uniform} : (i1) -> ()
-    // FINAL: tt.return
+    // RESOLVED: tt.return
     tt.return
   }
 }
