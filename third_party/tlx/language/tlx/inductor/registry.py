@@ -38,7 +38,22 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_num_sms, tma_inner_dim
+from torch._inductor.utils import get_num_sms
+
+try:
+    from torch._inductor.utils import tma_inner_dim
+except ImportError:
+
+    def tma_inner_dim(strides) -> int | None:
+        """Compatibility fallback for PyTorch versions predating this helper."""
+        from torch._inductor.virtualized import V
+
+        inner = [
+            i
+            for i, stride in enumerate(strides)
+            if V.graph.sizevars.statically_known_equals(stride, 1)
+        ]
+        return inner[0] if len(inner) == 1 else None
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
