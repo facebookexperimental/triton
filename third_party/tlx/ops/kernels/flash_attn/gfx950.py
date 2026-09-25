@@ -9,6 +9,7 @@ forward-kernel experiments.
 """
 
 import math
+import warnings
 
 import torch
 
@@ -3559,13 +3560,16 @@ def persistent_attention(q, k, v, sm_scale, causal, config=None):
     return flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=causal, **config)
 
 
-def _validate_public_flash_attn_inputs(q, k, v, sm_scale, causal):
+def _validate_public_flash_attn_inputs(q, k, v, causal):
     if not isinstance(causal, bool):
         raise InvalidInput(f"causal must be a bool, got {type(causal).__name__}")
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise InvalidInput("gfx950 tlx.ops.flash_attn expects rank-4 B,H,N,D tensors")
-    if q.shape != k.shape or q.shape != v.shape:
-        raise InvalidInput("gfx950 tlx.ops.flash_attn currently requires identical Q, K, and V shapes")
+    try:
+        _validate_cluster_inputs(q, k, v)
+    except ValueError as error:
+        raise InvalidInput(f"gfx950 tlx.ops.flash_attn: {error}") from error
+
+
+def _validate_public_flash_attn_backward_inputs(q, k, v, sm_scale, causal):
     error = gfx950_bwd.fa_backward_input_support_error(q, k, v, sm_scale, causal)
     if error is not None:
         raise InvalidInput(f"gfx950 tlx.ops.flash_attn: {error}")
@@ -3573,7 +3577,7 @@ def _validate_public_flash_attn_inputs(q, k, v, sm_scale, causal):
 
 def _flash_attn_forward(q, k, v, sm_scale, causal, space):
     """Run the differentiable forward and return output plus natural-log LSE."""
-    _validate_public_flash_attn_inputs(q, k, v, sm_scale, causal)
+    _validate_public_flash_attn_backward_inputs(q, k, v, sm_scale, causal)
     lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
     config = {} if space == "full" else {"USE_DIRECT_LOAD": False}
     return flash_attn_cluster_pipeline(
@@ -3595,6 +3599,24 @@ def _flash_attn_inference(q, k, v, sm_scale, causal, space):
     return flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=causal, **config)
 
 
+def _alert_nondeterministic_backward():
+    if not torch.are_deterministic_algorithms_enabled():
+        return
+
+    caller = "tlx.ops.flash_attn backward"
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        warnings.warn(
+            f"{caller} does not have a deterministic implementation, but "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)' is enabled",
+            stacklevel=2,
+        )
+        return
+    raise RuntimeError(
+        f"{caller} does not have a deterministic implementation, but "
+        "'torch.use_deterministic_algorithms(True)' is enabled"
+    )
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -3608,12 +3630,24 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
+        do = do.contiguous()
+        if torch.are_deterministic_algorithms_enabled() and not gfx950_bwd.fa_backward_is_deterministic(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            ctx.sm_scale,
+            ctx.causal,
+        ):
+            _alert_nondeterministic_backward()
         dq, dk, dv = gfx950_bwd.fa_backward(
             q,
             k,
             v,
             o,
-            do.contiguous(),
+            do,
             lse,
             ctx.sm_scale,
             ctx.causal,
@@ -3625,8 +3659,7 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     """Differentiable BF16 D64/D128 attention over ``(B, H, N, D)``."""
     if space not in ("full", "smoke"):
         raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space!r}")
-    if not isinstance(causal, bool):
-        raise InvalidInput(f"causal must be a bool, got {type(causal).__name__}")
+    _validate_public_flash_attn_inputs(q, k, v, causal)
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
     try:

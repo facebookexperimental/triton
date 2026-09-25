@@ -103,12 +103,19 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
 
     `sm_scale` defaults to `HEAD_DIM ** -0.5`.
     """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise InvalidInput("tlx.ops.flash_attn expects rank-4 Q/K/V tensors")
     if space not in ("full", "smoke"):
         raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space!r}")
     fn, spec = impl_for("flash_attn", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)
-    return fn(q, k, v, causal, sm_scale, space=space)
+    # Triton's launcher uses the process' current device rather than deriving it
+    # from pointer arguments. Keep compilation and launch on the input device;
+    # the context manager restores the caller's current device afterwards.
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, causal, sm_scale, space=space)
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):

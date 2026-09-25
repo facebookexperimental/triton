@@ -493,16 +493,17 @@ def _tlx_scaled_dot_product_flash_attention_backward(
         )
 
     resolved_scale = query.shape[-1]**-0.5 if scale is None else scale
-    return gfx950_bwd.fa_backward(
-        query,
-        key,
-        value,
-        out,
-        grad_out,
-        logsumexp,
-        resolved_scale,
-        is_causal,
-    )
+    with torch.cuda.device(query.device):
+        return gfx950_bwd.fa_backward(
+            query,
+            key,
+            value,
+            out,
+            grad_out,
+            logsumexp,
+            resolved_scale,
+            is_causal,
+        )
 
 
 def register_tlx_gfx950_flash_attention_backward() -> _TLXFlashAttentionHandle:

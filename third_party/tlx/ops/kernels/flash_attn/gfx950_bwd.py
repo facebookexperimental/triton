@@ -4642,6 +4642,23 @@ def _validate_inputs(q, k, v, o, do, lse, sm_scale, causal):
         raise ValueError(error)
 
 
+def fa_backward_is_deterministic(q, k, v, o, do, lse, sm_scale, causal):
+    """Return whether the selected backward route avoids cross-CTA atomics."""
+    _validate_inputs(q, k, v, o, do, lse, sm_scale, causal)
+    if _is_supported_d64_shape(tuple(q.shape), tuple(k.shape)):
+        sm_scale = _validate_d64_sm_scale(sm_scale)
+        dispatch = _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal)
+        return dispatch.family != "noncausal_fused_n256"
+    gqa_signature = (
+        q.shape[0],
+        q.shape[1],
+        k.shape[1],
+        q.shape[2],
+        q.shape[3],
+    )
+    return not _is_supported_gqa_shape(gqa_signature)
+
+
 def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
     _validate_inputs(q, k, v, o, do, lse, sm_scale, causal)
     if _is_supported_d64_shape(tuple(q.shape), tuple(k.shape)):
