@@ -1925,6 +1925,49 @@ class TestTLXTemplates(TestCase):
         "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_persistent_warppipe_single_steady_iteration(self):
+        """A single-trip K loop keeps the persistent candidate compilable."""
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        M, K, N = 4096, 128, 512
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        def _only_persistent(templates, op_name, kernel_inputs):
+            from torch._inductor.kernel.mm import mm_template
+
+            uids = {getattr(t, "uid", None) for t in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                if _tlx_mm.gfx950_addmm_persistent_warppipe_template.uid not in uids:
+                    templates.append(_tlx_mm.gfx950_addmm_persistent_warppipe_template)
+            return templates
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _only_persistent),
+            config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+            }),
+        ):
+            actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize("K", (1024, 1032))
     def test_tlx_addmm_persistent_warppipe_split_k(self, K: int):
         """Persistent split-K handles complete and partial final K tiles."""
