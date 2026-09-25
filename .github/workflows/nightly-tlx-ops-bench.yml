@@ -104,7 +104,7 @@ jobs:
     if: needs.resolve.outputs.version != ''
     permissions:
       id-token: write
-      contents: read
+      contents: write   # publish: the dashboard's release
       issues: write
       actions: read
     uses: ./.github/workflows/_tlx-ops-bench.yml
@@ -121,7 +121,7 @@ jobs:
     if: needs.resolve.outputs.version != ''
     permissions:
       id-token: write
-      contents: read
+      contents: write   # publish: the dashboard's release
       issues: write
       actions: read
     uses: ./.github/workflows/_tlx-ops-bench.yml
@@ -138,7 +138,7 @@ jobs:
     if: needs.resolve.outputs.version != ''
     permissions:
       id-token: write
-      contents: read
+      contents: write   # publish: the dashboard's release
       issues: write
       actions: read
     uses: ./.github/workflows/_tlx-ops-bench.yml
@@ -149,3 +149,16 @@ jobs:
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
+
+  prune:
+    needs: [resolve, b200, h100, mi350]
+    if: always() && needs.resolve.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep the last 60 nights on the tlx-ops-bench release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/tlx_ops_bench_dashboard.py prune 60

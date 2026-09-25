@@ -110,6 +110,38 @@ jobs:
             --job "${{ inputs.platform }}-tlx-ops-bench" \
             ${FAILED_FLAG}
 
+  # Feeds the /bench/ dashboard that pages.yml renders from this release. Kept
+  # off the GPU runner so it never holds a write token.
+  publish:
+    needs: bench
+    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tlx-ops-bench-${{ inputs.platform }}-${{ inputs.version }}
+          path: raw
+      - name: Upload summary to the tlx-ops-bench release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          DATE=$(sed -nE 's/.*\.dev([0-9]{8}).*/\1/p' <<< "${VERSION}")
+          [[ -n "${DATE}" ]] || { echo "no .devYYYYMMDD in ${VERSION}"; exit 1; }
+          SUMMARY="${DATE}.${{ inputs.platform }}.json"
+          python3 .github/scripts/tlx_ops_bench_dashboard.py summarize raw \
+            --platform "${{ inputs.platform }}" --version "${VERSION}" --sha "${{ inputs.sha }}" --out "${SUMMARY}"
+          # The three platforms publish concurrently; whichever loses the create race finds it made.
+          gh release view tlx-ops-bench >/dev/null 2>&1 \
+            || gh release create tlx-ops-bench --prerelease --latest=false --title "tlx.ops nightly perf" \
+                 --notes "Per-night tlx.ops perf summaries behind the /bench/ dashboard." \
+            || gh release view tlx-ops-bench >/dev/null
+          gh release upload tlx-ops-bench "${SUMMARY}" --clobber
+
   report:
     needs: bench
     if: always() && needs.bench.outputs.failures != '' && needs.bench.outputs.failures != '[]'
