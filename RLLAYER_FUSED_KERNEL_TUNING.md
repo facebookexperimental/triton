@@ -366,6 +366,33 @@ one resident block; instrumented tensor-pipe activity is 30.0%. Four A stages
 improve the TLX path by about 3 us over three, while a third B stage regresses
 to about 212 us and exceeds the useful SMEM pipeline depth.
 
+## Current `T289881412` row-owned RMSNorm-backward prototype
+
+The OSS benchmark and tuned kernel are in
+`third_party/tlx/tutorials/bwd_rmsnorm_d8472.py`. This is a reduction-only
+fusion rather than a GEMM prologue or epilogue. It consumes BF16 `x` and `dy`
+with shape `[5120,8472]` (`x` has physical row stride 8512), BF16 weight, and
+FP32 rstd, and emits BF16 dx and dweight.
+
+The winning two-kernel schedule assigns four rows to each CTA and traverses
+five 2048-column chunks twice. It retains the row-dot reduction in registers,
+writes dx and one FP32 dweight partial on the second pass, then reduces 1280
+dweight partials. Moving row-invariant rstd outside the first reduction saves
+one FP32 multiply per element. Locked GB200 `10/50/5` best-of-five medians are
+`2185.344 us` for the OSS source and `106.464 us` for the tuned kernel, a
+`20.53x` speedup. It is also 45.5% faster than the prior `195.50 us`
+column-split candidate.
+
+Across seeds 0/1/2, dx relative-L2 is at most `2.21e-6` and dweight relative-L2
+is at most `7.32e-5`. The maximum absolute differences are `0.0078125` and
+`0.5`, respectively. Reduction reassociation is allowed; FP32 accumulation and
+BF16 outputs are unchanged. PTXAS reports 79 registers/thread and no spills.
+NCU reports 8.19 KiB dynamic shared memory, 34.52% achieved occupancy, 38.14%
+DRAM throughput, and 47.84% SM throughput. A TLX task split does not help this
+dependency chain; the useful transformation is keeping the row reduction
+local and removing the global row-partial launch. Matching-fbsource and full
+backward validation remain before promotion.
+
 ## GEO Kernel Optimizer
 
 GEO has a general TLX-capable Kernel Optimizer under
