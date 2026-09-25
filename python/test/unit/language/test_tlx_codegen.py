@@ -2397,6 +2397,29 @@ def test_amd_fa_cluster_rejects_unsupported_inputs():
         _validate_amd_fa_cluster_tiles(256, 128)
 
 
+def test_amd_fa_cluster_tutorial_compatibility_shim():
+    from triton.language.extra.tlx.tutorials import amd_fa_cluster as tutorial_cluster
+
+    compatibility_names = {
+        "CDNA_MFMA_ROWS_PER_WAVE",
+        "CDNA_WAVE_SIZE",
+        "CLUSTER_BUF_DEPTH",
+        "CLUSTER_PIPELINE_STAGES",
+        "DIAGONAL_LAZY_RESCALE_THRESHOLD",
+        "DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16",
+        "LAZY_RESCALE_THRESHOLD",
+        "LazyProbabilityState",
+        "SoftmaxState",
+        "attention",
+        "flash_attn_cluster_persistent_pipeline",
+        "flash_attn_cluster_pipeline",
+        "persistent_attention",
+    }
+    assert compatibility_names <= set(tutorial_cluster.__all__)
+    for name in compatibility_names:
+        assert getattr(tutorial_cluster, name) is getattr(_amd_fa_cluster_module, name)
+
+
 @pytest.mark.parametrize(
     ("dtype", "n_ctx", "head_dim", "causal", "config", "expected"),
     [
