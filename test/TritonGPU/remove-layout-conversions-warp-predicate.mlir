@@ -272,6 +272,7 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
 // -----
 
 #cross_warp_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#cross_warp_mid = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 #cross_warp_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
 #cross_warp_src_pinned = #tlx.no_verify_layout<#tlx.user_layout<#cross_warp_src>>
 #cross_warp_dst_pinned = #tlx.no_verify_layout<#tlx.user_layout<#cross_warp_dst>>
@@ -309,6 +310,167 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
       %required = ttg.require_layout %src : tensor<64x64xf32, #cross_warp_src_pinned> -> tensor<64x64xf32, #cross_warp_dst_pinned>
       // FINAL: tt.store %[[REQ_PTRS]], %[[REQUIRED]]
       tt.store %ptrs, %required : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @warp_predicate_forces_internal_require_source
+  // FINAL-SAME: %[[INTERNAL_REQ_PRED:.*]]: i1, %[[INTERNAL_REQ_LHS:.*]]: tensor<64x64xf32, #[[$INTERNAL_REQ_SRC:.*]]>, %[[INTERNAL_REQ_RHS:.*]]: tensor<64x64xf32, #[[$INTERNAL_REQ_SRC]]>, %[[INTERNAL_REQ_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$INTERNAL_REQ_DST:.*]]>
+  tt.func @warp_predicate_forces_internal_require_source(
+      %predicate: i1, %lhs: tensor<64x64xf32, #cross_warp_src>,
+      %rhs: tensor<64x64xf32, #cross_warp_src>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL-DAG: %[[INTERNAL_REQ_LHS_DST:.*]] = ttg.convert_layout %[[INTERNAL_REQ_LHS]] : tensor<64x64xf32, #[[$INTERNAL_REQ_SRC]]> -> tensor<64x64xf32, #[[$INTERNAL_REQ_DST]]>
+    // FINAL-DAG: %[[INTERNAL_REQ_RHS_DST:.*]] = ttg.convert_layout %[[INTERNAL_REQ_RHS]] : tensor<64x64xf32, #[[$INTERNAL_REQ_SRC]]> -> tensor<64x64xf32, #[[$INTERNAL_REQ_DST]]>
+    // FINAL: ttg.warp_predicate %[[INTERNAL_REQ_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.require_layout
+    ttg.warp_predicate %predicate () {
+      // FINAL: %[[INTERNAL_REQ_SUM:.*]] = arith.addf %[[INTERNAL_REQ_LHS_DST]], %[[INTERNAL_REQ_RHS_DST]] : tensor<64x64xf32, #[[$INTERNAL_REQ_DST]]>
+      %sum = arith.addf %lhs, %rhs : tensor<64x64xf32, #cross_warp_src>
+      %required = ttg.require_layout %sum : tensor<64x64xf32, #cross_warp_src> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[INTERNAL_REQ_PTRS]], %[[INTERNAL_REQ_SUM]]
+      tt.store %ptrs, %required : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @wave_uniform_forces_internal_convert_source
+  // FINAL-SAME: %[[INTERNAL_CVT_PRED:.*]]: i1, %[[INTERNAL_CVT_LHS:.*]]: tensor<64x64xf32, #[[$INTERNAL_CVT_SRC:.*]]>, %[[INTERNAL_CVT_RHS:.*]]: tensor<64x64xf32, #[[$INTERNAL_CVT_SRC]]>, %[[INTERNAL_CVT_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$INTERNAL_CVT_DST:.*]]>
+  tt.func @wave_uniform_forces_internal_convert_source(
+      %predicate: i1, %lhs: tensor<64x64xf32, #cross_warp_src>,
+      %rhs: tensor<64x64xf32, #cross_warp_src>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL-DAG: %[[INTERNAL_CVT_LHS_DST:.*]] = ttg.convert_layout %[[INTERNAL_CVT_LHS]] : tensor<64x64xf32, #[[$INTERNAL_CVT_SRC]]> -> tensor<64x64xf32, #[[$INTERNAL_CVT_DST]]>
+    // FINAL-DAG: %[[INTERNAL_CVT_RHS_DST:.*]] = ttg.convert_layout %[[INTERNAL_CVT_RHS]] : tensor<64x64xf32, #[[$INTERNAL_CVT_SRC]]> -> tensor<64x64xf32, #[[$INTERNAL_CVT_DST]]>
+    // FINAL: ttg.warp_predicate %[[INTERNAL_CVT_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    ttg.warp_predicate %predicate () {
+      // FINAL: %[[INTERNAL_CVT_SUM:.*]] = arith.addf %[[INTERNAL_CVT_LHS_DST]], %[[INTERNAL_CVT_RHS_DST]] : tensor<64x64xf32, #[[$INTERNAL_CVT_DST]]>
+      %sum = arith.addf %lhs, %rhs : tensor<64x64xf32, #cross_warp_src>
+      %converted = ttg.convert_layout %sum : tensor<64x64xf32, #cross_warp_src> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[INTERNAL_CVT_PTRS]], %[[INTERNAL_CVT_SUM]]
+      tt.store %ptrs, %converted : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @wave_uniform_hoists_captured_convert
+  // FINAL-SAME: %[[CAPTURED_CVT_PRED:.*]]: i1, %[[CAPTURED_CVT_SRC:.*]]: tensor<64x64xf32, #[[$CAPTURED_CVT_SRC_LAYOUT:.*]]>, %[[CAPTURED_CVT_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$CAPTURED_CVT_DST_LAYOUT:.*]]>
+  tt.func @wave_uniform_hoists_captured_convert(
+      %predicate: i1, %src: tensor<64x64xf32, #cross_warp_src_pinned>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL: %[[CAPTURED_CVT_VALUE:.*]] = ttg.convert_layout %[[CAPTURED_CVT_SRC]] : tensor<64x64xf32, #[[$CAPTURED_CVT_SRC_LAYOUT]]> -> tensor<64x64xf32, #[[$CAPTURED_CVT_DST_LAYOUT]]>
+    // FINAL: ttg.warp_predicate %[[CAPTURED_CVT_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    ttg.warp_predicate %predicate () {
+      %converted = ttg.convert_layout %src : tensor<64x64xf32, #cross_warp_src_pinned> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[CAPTURED_CVT_PTRS]], %[[CAPTURED_CVT_VALUE]]
+      tt.store %ptrs, %converted : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @warp_predicate_collapses_internal_convert_chain
+  // FINAL-SAME: %[[CHAIN_PRED:.*]]: i1, %[[CHAIN_LHS:.*]]: tensor<64x64xf32, #[[$CHAIN_SRC:.*]]>, %[[CHAIN_RHS:.*]]: tensor<64x64xf32, #[[$CHAIN_SRC]]>, %[[CHAIN_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$CHAIN_DST:.*]]>
+  tt.func @warp_predicate_collapses_internal_convert_chain(
+      %predicate: i1, %lhs: tensor<64x64xf32, #cross_warp_src>,
+      %rhs: tensor<64x64xf32, #cross_warp_src>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL: ttg.warp_predicate %[[CHAIN_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    ttg.warp_predicate %predicate () {
+      // FINAL: %[[CHAIN_SUM:.*]] = arith.addf {{.*}} : tensor<64x64xf32, #[[$CHAIN_DST]]>
+      %sum = arith.addf %lhs, %rhs : tensor<64x64xf32, #cross_warp_src>
+      %mid = ttg.convert_layout %sum : tensor<64x64xf32, #cross_warp_src> -> tensor<64x64xf32, #cross_warp_mid>
+      %converted = ttg.convert_layout %mid : tensor<64x64xf32, #cross_warp_mid> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[CHAIN_PTRS]], %[[CHAIN_SUM]]
+      tt.store %ptrs, %converted : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      ttg.predicate_yield
+    } : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+
+  // FINAL-LABEL: tt.func @warp_predicate_uses_internal_boundary_for_carrier
+  // FINAL-SAME: %[[CARRIER_PRED:.*]]: i1, %[[CARRIER_INIT:.*]]: tensor<64x64xf32, #[[$CARRIER_SRC:.*]]>, %[[CARRIER_LHS:.*]]: tensor<64x64xf32, #[[$CARRIER_SRC]]>, %[[CARRIER_RHS:.*]]: tensor<64x64xf32, #[[$CARRIER_SRC]]>, %[[CARRIER_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$CARRIER_DST:[A-Za-z0-9_]+]]>
+  tt.func @warp_predicate_uses_internal_boundary_for_carrier(
+      %predicate: i1, %init: tensor<64x64xf32, #cross_warp_src>,
+      %lhs: tensor<64x64xf32, #cross_warp_src>,
+      %rhs: tensor<64x64xf32, #cross_warp_src>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>)
+      -> tensor<64x64xf32, #cross_warp_src> {
+    // FINAL: %[[CARRIER_RESULT:.*]] = ttg.warp_predicate %[[CARRIER_PRED]]({{.*}}) {
+    // FINAL-NOT: ttg.convert_layout
+    %result = ttg.warp_predicate %predicate (%init) {
+      // FINAL: %[[CARRIER_SUM:.*]] = arith.addf {{.*}} : tensor<64x64xf32, #[[$CARRIER_DST]]>
+      %sum = arith.addf %lhs, %rhs : tensor<64x64xf32, #cross_warp_src>
+      %required = ttg.require_layout %sum : tensor<64x64xf32, #cross_warp_src> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+      // FINAL: tt.store %[[CARRIER_PTRS]], %[[CARRIER_SUM]]
+      tt.store %ptrs, %required : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+      // FINAL: ttg.predicate_yield %[[CARRIER_SUM]] : tensor<64x64xf32, #[[$CARRIER_DST]]>
+      ttg.predicate_yield %sum : tensor<64x64xf32, #cross_warp_src>
+    } : (i1, tensor<64x64xf32, #cross_warp_src>) -> tensor<64x64xf32, #cross_warp_src>
+    // FINAL: %[[CARRIER_RESTORED:.*]] = ttg.convert_layout %[[CARRIER_RESULT]] : tensor<64x64xf32, #[[$CARRIER_DST]]> -> tensor<64x64xf32, #[[$CARRIER_SRC]]>
+    // FINAL: tt.return %[[CARRIER_RESTORED]]
+    tt.return %result : tensor<64x64xf32, #cross_warp_src>
+  }
+
+  // FINAL-LABEL: tt.func @nested_wave_uniform_hoists_captured_convert
+  // FINAL-SAME: %[[NESTED_CVT_OUTER_PRED:.*]]: i1, %[[NESTED_CVT_INNER_PRED:.*]]: i1, %[[NESTED_CVT_SRC:.*]]: tensor<64x64xf32, #[[$NESTED_CVT_SRC_LAYOUT:.*]]>, %[[NESTED_CVT_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$NESTED_CVT_DST_LAYOUT:.*]]>
+  tt.func @nested_wave_uniform_hoists_captured_convert(
+      %outer_predicate: i1, %inner_predicate: i1,
+      %src: tensor<64x64xf32, #cross_warp_src_pinned>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>) {
+    // FINAL: %[[NESTED_CVT_VALUE:.*]] = ttg.convert_layout %[[NESTED_CVT_SRC]] : tensor<64x64xf32, #[[$NESTED_CVT_SRC_LAYOUT]]> -> tensor<64x64xf32, #[[$NESTED_CVT_DST_LAYOUT]]>
+    // FINAL: ttg.warp_predicate %[[NESTED_CVT_OUTER_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    ttg.warp_predicate %outer_predicate () {
+      // FINAL: ttg.warp_predicate %[[NESTED_CVT_INNER_PRED]]() {
+      // FINAL-NOT: ttg.convert_layout
+      ttg.warp_predicate %inner_predicate () {
+        %converted = ttg.convert_layout %src : tensor<64x64xf32, #cross_warp_src_pinned> -> tensor<64x64xf32, #cross_warp_dst_pinned>
+        // FINAL: tt.store %[[NESTED_CVT_PTRS]], %[[NESTED_CVT_VALUE]]
+        tt.store %ptrs, %converted : tensor<64x64x!tt.ptr<f32>, #cross_warp_dst_pinned>
+        ttg.predicate_yield
+      } {wave_uniform} : (i1) -> ()
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    // FINAL: tt.return
+    tt.return
+  }
+}
+
+// -----
+
+#override_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#override_dst = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
+#override_src_pinned = #tlx.no_verify_layout<#tlx.user_layout<#override_src>>
+#override_dst_pinned = #tlx.no_verify_layout<#tlx.user_layout<#override_dst>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // FINAL-LABEL: tt.func @wave_uniform_uses_function_num_warps
+  // FINAL-SAME: %[[OVERRIDE_PRED:.*]]: i1, %[[OVERRIDE_SRC:.*]]: tensor<64x64xf32, #[[$OVERRIDE_SRC_LAYOUT:.*]]>, %[[OVERRIDE_PTRS:.*]]: tensor<64x64x!tt.ptr<f32>, #[[$OVERRIDE_DST_LAYOUT:.*]]>
+  tt.func @wave_uniform_uses_function_num_warps(
+      %predicate: i1, %src: tensor<64x64xf32, #override_src_pinned>,
+      %ptrs: tensor<64x64x!tt.ptr<f32>, #override_dst_pinned>)
+      attributes {"ttg.num-warps" = 4 : i32} {
+    // FINAL: %[[OVERRIDE_REQUIRED:.*]] = ttg.convert_layout %[[OVERRIDE_SRC]] : tensor<64x64xf32, #[[$OVERRIDE_SRC_LAYOUT]]> -> tensor<64x64xf32, #[[$OVERRIDE_DST_LAYOUT]]>
+    // FINAL: ttg.warp_predicate %[[OVERRIDE_PRED]]() {
+    // FINAL-NOT: ttg.convert_layout
+    // FINAL-NOT: ttg.require_layout
+    ttg.warp_predicate %predicate () {
+      %required = ttg.require_layout %src : tensor<64x64xf32, #override_src_pinned> -> tensor<64x64xf32, #override_dst_pinned>
+      // FINAL: tt.store %[[OVERRIDE_PTRS]], %[[OVERRIDE_REQUIRED]]
+      tt.store %ptrs, %required : tensor<64x64x!tt.ptr<f32>, #override_dst_pinned>
       ttg.predicate_yield
     } {wave_uniform} : (i1) -> ()
     // FINAL: tt.return

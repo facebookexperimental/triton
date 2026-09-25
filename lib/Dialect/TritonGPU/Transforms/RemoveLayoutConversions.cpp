@@ -225,6 +225,8 @@ private:
   // Encodings selected atomically for values inside warp_predicate islands.
   DenseMap<Value, Attribute> forcedWarpPredicateEncodings;
   DenseMap<Operation *, Attribute> forcedWarpPredicatePredicates;
+  DenseMap<Operation *, SmallVector<std::pair<ConvertLayoutOp, Attribute>>>
+      hoistedWarpPredicateConversions;
   // original encodings of tensor values rewritten in place.
   DenseMap<Value, Attribute> originalEncodings;
   FuncOp funcOp;
@@ -963,8 +965,7 @@ projectToPredicateEncoding(RankedTensorType valueType,
 LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
   WalkResult walkResult = funcOp.walk([&](WarpPredicateOp predicateOp) {
     bool effectivelyWaveUniform = isEffectivelyWaveUniform(predicateOp);
-    ModuleOp module = predicateOp->getParentOfType<ModuleOp>();
-    if (effectivelyWaveUniform && module && lookupNumWarps(module) == 1)
+    if (effectivelyWaveUniform && lookupNumWarps(predicateOp) == 1)
       return WalkResult::advance();
     if (effectivelyWaveUniform) {
       // Wave-uniform EXEC makes warp shuffles safe, but waves may still take
@@ -1094,25 +1095,6 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       projectedEncodings.push_back(projected);
     }
 
-    // EXEC is controlled per lane, so every carried group must project to the
-    // same lane/warp ownership on the predicate shape.  Prefer an MMA-derived
-    // projection when available; register enumeration is checked separately
-    // below and is allowed to differ.
-    std::optional<Attribute> predicateEncoding;
-    bool skipCarrierResolution = false;
-    if (predicateType) {
-      for (std::optional<Attribute> candidate : projectedEncodings) {
-        if (!candidate)
-          continue;
-        if (!predicateEncoding || (isMmaFamilyEncoding(*candidate) &&
-                                   !isMmaFamilyEncoding(*predicateEncoding)))
-          predicateEncoding = *candidate;
-      }
-      bool hasTensorCarrier = llvm::any_of(
-          bodyEncodings, [](Attribute encoding) { return bool(encoding); });
-      skipCarrierResolution = !predicateEncoding && hasTensorCarrier;
-    }
-
     auto isInsideRestrictedExec = [](Value value) {
       Operation *scope = value.getDefiningOp();
       scope =
@@ -1135,6 +1117,27 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       return ignoreRegisterOrder
                  ? isLayoutEquivalentIgnoringRegisterOrder(lhsLayout, rhsLayout)
                  : lhsLayout == rhsLayout;
+    };
+
+    auto isUnsafeAtDefinition = [&](Value value, Attribute requested) {
+      auto valueType = cast<RankedTensorType>(value.getType());
+      Attribute current = getEffectiveLayoutEncoding(valueType.getEncoding());
+      requested = getEffectiveLayoutEncoding(requested);
+      auto sourceType = valueType.cloneWithEncoding(current);
+      auto resultType = valueType.cloneWithEncoding(requested);
+      Operation *scope = value.getDefiningOp();
+      scope =
+          scope ? scope->getParentOp() : value.getParentBlock()->getParentOp();
+      for (Operation *op = scope; op; op = op->getParentOp()) {
+        auto enclosing = dyn_cast<WarpPredicateOp>(op);
+        if (!enclosing)
+          continue;
+        if (!isEffectivelyWaveUniform(enclosing) ||
+            (lookupNumWarps(enclosing) > 1 &&
+             conversionNeedsSharedMemory(sourceType, resultType)))
+          return true;
+      }
+      return false;
     };
 
     auto recordForcedEncoding =
@@ -1173,7 +1176,7 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       Region *valueRegion = value.getParentRegion();
       bool captured = valueRegion != &predicateOp.getRegion() &&
                       !predicateOp.getRegion().isAncestor(valueRegion);
-      if (captured && !isInsideRestrictedExec(value))
+      if (captured && !isUnsafeAtDefinition(value, requested))
         return requested;
 
       Attribute current = getEffectiveLayoutEncoding(valueType.getEncoding());
@@ -1257,16 +1260,6 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       return *selected;
     };
 
-    if (predicateEncoding) {
-      FailureOr<Attribute> selectedPredicate =
-          forceSlice(predicateOp.getPredicate(), *predicateEncoding,
-                     /*ignoreRegisterOrder=*/true);
-      if (failed(selectedPredicate))
-        conflict = true;
-      else
-        predicateEncoding = *selectedPredicate;
-    }
-
     auto synchronizeBoundaryEncoding =
         [&](Value value, Attribute requested) -> LogicalResult {
       auto type = cast<RankedTensorType>(value.getType());
@@ -1280,6 +1273,138 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
       layouts[value].insertEncoding(requested);
       return success();
     };
+
+    // Internal layout boundaries may not feed a carried result, so seed their
+    // producer slices explicitly. Otherwise a side-effect-only body can retain
+    // an unsafe conversion even though the pre-scan selected it as an island.
+    struct PendingHoist {
+      Operation *before;
+      ConvertLayoutOp convert;
+      Attribute encoding;
+    };
+    SmallVector<Operation *> internalBoundaries;
+    SmallVector<PendingHoist> pendingHoists;
+    predicateOp.getRegion().walk<WalkOrder::PreOrder>([&](Operation *nested) {
+      if (nested != predicateOp.getOperation() && isa<WarpPredicateOp>(nested))
+        return WalkResult::skip();
+      if (isa<RequireLayoutOp, ConvertLayoutOp>(nested))
+        internalBoundaries.push_back(nested);
+      return WalkResult::advance();
+    });
+
+    // Consumer boundaries decide the island encoding. Process them backwards
+    // so an unpinned A -> B -> C chain is forced to C instead of treating B as
+    // a competing constraint.
+    for (Operation *boundary : llvm::reverse(internalBoundaries)) {
+      Value source;
+      Value result;
+      if (auto require = dyn_cast<RequireLayoutOp>(boundary)) {
+        source = require.getSrc();
+        result = require.getResult();
+      } else {
+        auto convert = cast<ConvertLayoutOp>(boundary);
+        // A one-use conversion yielded directly from the predicate is a
+        // restoration boundary handled by carrier resolution below.
+        if (convert->hasOneUse() &&
+            *convert->getUsers().begin() == yieldOp.getOperation())
+          continue;
+        source = convert.getSrc();
+        result = convert.getResult();
+      }
+
+      auto sourceType = cast<RankedTensorType>(source.getType());
+      auto resultType = cast<RankedTensorType>(result.getType());
+      bool changesLayout = !layoutsAreEquivalent(
+          sourceType, sourceType.getEncoding(), resultType.getEncoding(),
+          /*ignoreRegisterOrder=*/false);
+      bool needsRoot = changesLayout &&
+                       (!effectivelyWaveUniform ||
+                        conversionNeedsSharedMemory(sourceType, resultType));
+      if (!needsRoot)
+        continue;
+
+      Attribute encoding = getEffectiveLayoutEncoding(resultType.getEncoding());
+      if (auto forced = forcedWarpPredicateEncodings.find(result);
+          forced != forcedWarpPredicateEncodings.end())
+        encoding = forced->second;
+      FailureOr<Attribute> selected =
+          forceSlice(source, encoding, /*ignoreRegisterOrder=*/false);
+      if (failed(selected) ||
+          failed(synchronizeBoundaryEncoding(result, *selected))) {
+        conflict = true;
+        break;
+      }
+
+      Region *sourceRegion = source.getParentRegion();
+      bool captured = sourceRegion != &predicateOp.getRegion() &&
+                      !predicateOp.getRegion().isAncestor(sourceRegion);
+      if (auto convert = dyn_cast<ConvertLayoutOp>(boundary);
+          convert && captured && !isUnsafeAtDefinition(source, *selected)) {
+        Operation *hoistBefore = predicateOp;
+        for (Operation *parent = predicateOp->getParentOp(); parent;
+             parent = parent->getParentOp()) {
+          auto enclosing = dyn_cast<WarpPredicateOp>(parent);
+          if (!enclosing)
+            continue;
+          bool capturedByEnclosing =
+              sourceRegion != &enclosing.getRegion() &&
+              !enclosing.getRegion().isAncestor(sourceRegion);
+          if (!capturedByEnclosing)
+            break;
+          hoistBefore = enclosing;
+        }
+        pendingHoists.push_back({hoistBefore, convert, *selected});
+      }
+    }
+
+    // Boundary roots can select a better body encoding than the original
+    // carried value. Re-project those selections before fixing the predicate
+    // and carrier encodings.
+    for (auto [index, bodyRoot] : llvm::enumerate(bodyRoots)) {
+      auto forced = forcedWarpPredicateEncodings.find(bodyRoot);
+      if (forced == forcedWarpPredicateEncodings.end() || !bodyEncodings[index])
+        continue;
+      bodyEncodings[index] = forced->second;
+      if (!predicateType)
+        continue;
+      auto bodyRootType = cast<RankedTensorType>(bodyRoot.getType());
+      auto nativeType = bodyRootType.cloneWithEncoding(forced->second);
+      if (FailureOr<Attribute> encoding =
+              projectToPredicateEncoding(nativeType, predicateType);
+          succeeded(encoding))
+        projectedEncodings[index] = *encoding;
+      else
+        projectedEncodings[index] = std::nullopt;
+    }
+
+    // EXEC is controlled per lane, so every carried group must project to the
+    // same lane/warp ownership on the predicate shape. Prefer an MMA-derived
+    // projection when available; register enumeration is checked separately
+    // below and is allowed to differ.
+    std::optional<Attribute> predicateEncoding;
+    bool skipCarrierResolution = false;
+    if (predicateType) {
+      for (std::optional<Attribute> candidate : projectedEncodings) {
+        if (!candidate)
+          continue;
+        if (!predicateEncoding || (isMmaFamilyEncoding(*candidate) &&
+                                   !isMmaFamilyEncoding(*predicateEncoding)))
+          predicateEncoding = *candidate;
+      }
+      bool hasTensorCarrier = llvm::any_of(
+          bodyEncodings, [](Attribute encoding) { return bool(encoding); });
+      skipCarrierResolution = !predicateEncoding && hasTensorCarrier;
+    }
+
+    if (predicateEncoding) {
+      FailureOr<Attribute> selectedPredicate =
+          forceSlice(predicateOp.getPredicate(), *predicateEncoding,
+                     /*ignoreRegisterOrder=*/true);
+      if (failed(selectedPredicate))
+        conflict = true;
+      else
+        predicateEncoding = *selectedPredicate;
+    }
 
     for (auto [index, result, yielded, bodyRoot] : llvm::enumerate(
              predicateOp.getResults(), yieldOp.getValues(), bodyRoots)) {
@@ -1459,6 +1584,8 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
     if (predicateEncoding)
       forcedWarpPredicatePredicates[predicateOp.getOperation()] =
           *predicateEncoding;
+    for (auto [before, convert, encoding] : pendingHoists)
+      hoistedWarpPredicateConversions[before].emplace_back(convert, encoding);
     return WalkResult::advance();
   });
   return failure(walkResult.wasInterrupted());
@@ -1634,7 +1761,8 @@ void LayoutPropagation::rewriteRegion(Region &region) {
         needRewrite = true;
       }
       if (isa<WarpPredicateOp>(op) &&
-          forcedWarpPredicatePredicates.count(&op))
+          (forcedWarpPredicatePredicates.count(&op) ||
+           hoistedWarpPredicateConversions.count(&op)))
         needRewrite = true;
       if (needRewrite) {
         rewriteOp(&op);
@@ -1785,6 +1913,15 @@ void LayoutPropagation::rewriteIfOp(scf::IfOp ifOp) {
 }
 
 void LayoutPropagation::rewriteWarpPredicateOp(WarpPredicateOp predicateOp) {
+  if (auto hoists =
+          hoistedWarpPredicateConversions.find(predicateOp.getOperation());
+      hoists != hoistedWarpPredicateConversions.end()) {
+    for (auto [convert, encoding] : hoists->second) {
+      setEncodingInPlace(convert.getResult(), encoding);
+      convert->moveBefore(predicateOp);
+    }
+  }
+
   if (auto forced =
           forcedWarpPredicatePredicates.find(predicateOp.getOperation());
       forced != forcedWarpPredicatePredicates.end())
