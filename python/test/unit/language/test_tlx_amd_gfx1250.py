@@ -50,10 +50,12 @@ def _async_amd_desc_load_fused_kernel(
         b_buf = tlx.local_alloc((M, N), tl.float16, 1, layout=SHARED_LAYOUT)
     a_smem = tlx.local_view(a_buf, 0)
     b_smem = tlx.local_view(b_buf, 0)
+    # A missing member load must not pass by reading a previous launch's LDS.
+    tlx.local_store(a_smem, tl.full((M, N), float("nan"), tl.float16))
+    tlx.local_store(b_smem, tl.full((M, N), float("nan"), tl.float16))
+    tlx.workgroup_barrier()
     a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
     b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
-    if SHARED_LAYOUT is not None:
-        tlx.cluster_barrier()
     if MASK_SHIFT_BITS and MULTICAST_MASKS is not None:
         shift = tlx.cluster_cta_rank() & MASK_SHIFT_BITS
         token = tlx.async_amd_descriptor_load_fused([(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
@@ -63,13 +65,15 @@ def _async_amd_desc_load_fused_kernel(
         token = tlx.async_amd_descriptor_load_fused([(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
                                                     multicast_masks=MULTICAST_MASKS)
     tlx.async_amd_descriptor_wait(tokens=[token])
-    if SHARED_LAYOUT is not None:
-        tlx.cluster_barrier()
-    result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    # TDM completion is per wave. Consumers only read their own CTA's LDS,
+    # so the handoff requires workgroup synchronization, not a cluster barrier.
+    tlx.workgroup_barrier()
+    a = tlx.local_load(a_smem)
+    b = tlx.local_load(b_smem)
     offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
-    tl.store(output_ptr + offsets, result)
-    if SHARED_LAYOUT is not None:
-        tlx.cluster_barrier()
+    # Check each member separately: A+B would also pass if A and B were swapped.
+    tl.store(output_ptr + offsets, a)
+    tl.store(output_ptr + M * N + offsets, b)
 
 
 @triton.jit
@@ -215,9 +219,9 @@ def test_async_amd_desc_load_fused_correctness_gfx1250(device):
     rows, cols = 16, 32
     a = torch.randn((rows, cols), device=device, dtype=torch.float16)
     b = torch.randn((rows, cols), device=device, dtype=torch.float16)
-    output = torch.empty_like(a)
+    output = torch.full((2, rows, cols), float("nan"), device=device, dtype=torch.float16)
     _async_amd_desc_load_fused_kernel[(1, )](a, b, output, M=rows, N=cols)
-    torch.testing.assert_close(output, a + b)
+    torch.testing.assert_close(output, torch.stack((a, b)), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
@@ -657,15 +661,75 @@ def _tdm_fused_distributed_constants(num_ctas, split_m, mask_mode):
         numCTAOrder=[1, 0],
     )
     # Adjacent CTAs share a row partition, matching the default register layout
-    # without requiring cross-CTA shared loads. Explicit masks
-    # enable multicast for A and disable it for B despite B's replicated layout.
+    # without requiring cross-CTA shared loads. Explicit masks disable one
+    # member's multicast despite its replicated layout; test both member orders.
     mask = (1 << replicas) - 1
-    masks = None if mask_mode == "inferred" else (mask, 0) if mask_mode == "explicit" else (0, 0)
+    masks = {"inferred": None, "explicit": (mask, 0), "explicit_b": (0, mask), "disabled": (0, 0)}[mask_mode]
     return dict(M=64, N=64, SHARED_LAYOUT=shared, MULTICAST_MASKS=masks, MASK_SHIFT_BITS=num_ctas - replicas)
 
 
+def _check_tdm_fused_multicast_codegen(llvm_ir, num_ctas, split_m, mask_mode):
+    from triton._filecheck import run_filecheck
+
+    # Numerical correctness cannot distinguish multicast from separate loads.
+    # Follow descriptor group 1, whose low 16 bits select recipients, all the
+    # way to the TDM intrinsic. Also check which producer waves select each mask.
+    enabled = (mask_mode in ("inferred", "explicit"), mask_mode in ("inferred", "explicit_b"))
+    checks = ["CHECK: [[WAVE:%[^ ]+]] = {{.*}}call i32 @llvm.amdgcn.wave.id()"]
+    dynamic_mask = split_m > 1 and any(enabled)
+    if dynamic_mask:
+        # With four CTAs and two row partitions, recipient groups are {0,1}
+        # and {2,3}. Layout inference clears the replica bit; explicit masks
+        # select the partition bit. Both must reach the descriptor's mask.
+        partition_bits = -2 if mask_mode == "inferred" else 2
+        checks += [
+            "CHECK: [[CTA:%[^ ]+]] = {{.*}}call i32 @llvm.amdgcn.cluster.workgroup.id.x()",
+            f"CHECK: [[SHIFT:%[^ ]+]] = and i32 [[CTA]], {partition_bits}",
+            "CHECK: [[MASK:%[^ ]+]] = shl {{.*}}i32 3, [[SHIFT]]",
+        ]
+        mask_value = "[[MASK]]"
+        if mask_mode == "inferred":
+            checks += ["CHECK: [[CLEAN_MASK:%[^ ]+]] = and i32 [[MASK]], -327681"]
+            mask_value = "[[CLEAN_MASK]]"
+        checks += [f"CHECK-DAG: [[WORD:%[^ ]+]] = or {{{{.*}}}}i32 {mask_value}, 65536"]
+
+    for multicast in dict.fromkeys(enabled):
+        group = "MULTICAST" if multicast else "UNICAST"
+        if multicast and dynamic_mask:
+            checks += [
+                "CHECK-DAG: [[PARTIAL:%[^ ]+]] = insertelement <8 x i32> {{.*}}, i32 [[WORD]], i64 0",
+                f"CHECK-DAG: [[{group}:%[^ ]+]] = insertelement <8 x i32> [[PARTIAL]], i32 {{{{.*}}}}, i64 2",
+            ]
+        else:
+            # data_size=1 (f16) occupies bit 16; all other control bits are zero.
+            word = 65536 | ((1 << num_ctas) - 1 if multicast else 0)
+            checks += [
+                f"CHECK-DAG: [[{group}:%[^ ]+]] = insertelement <8 x i32> "
+                f"<i32 {word}, {{{{.*}}}}>, i32 {{{{.*}}}}, i64 2"
+            ]
+
+    groups = ["[[MULTICAST]]" if multicast else "[[UNICAST]]" for multicast in enabled]
+    if enabled[0] != enabled[1]:
+        checks += [
+            "CHECK: [[IS_B:%[^ ]+]] = icmp ugt i32 [[WAVE]], 1",
+            f"CHECK: [[GROUP1:%[^ ]+]] = select i1 [[IS_B]], <8 x i32> {groups[1]}, <8 x i32> {groups[0]}",
+        ]
+        group1 = "[[GROUP1]]"
+    else:
+        group1 = groups[0]
+    checks += [
+        "CHECK: call void @llvm.amdgcn.tensor.load.to.lds(<4 x i32> {{[^,]+}}, <8 x i32> " + group1 + ",",
+        "CHECK-NOT: = load {{.*}}ptr addrspace(3)",
+        "CHECK: call void @llvm.amdgcn.s.wait.tensorcnt(i16 0)",
+        "CHECK-NOT: = load {{.*}}ptr addrspace(3)",
+        "CHECK: call void @llvm.amdgcn.s.barrier()",
+        "CHECK: = load {{.*}}ptr addrspace(3)",
+    ]
+    run_filecheck("tdm_fused_multicast", llvm_ir, "\n".join(checks))
+
+
 @pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
-@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "disabled"])
+@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "explicit_b", "disabled"])
 def test_tdm_fused_multicast_distributed_compiles(num_ctas, split_m, mask_mode):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -680,18 +744,26 @@ def test_tdm_fused_multicast_distributed_compiles(num_ctas, split_m, mask_mode):
     assert compiled.asm["amdgcn"].count("tensor_load_to_lds") == 1
     if split_m > 1:
         assert "CGALayout = [[0, 0], [1, 0]]" in compiled.asm["ttgir"]
+    assert "amdg.cluster_barrier" not in compiled.asm["ttgir"]
+    assert "s_barrier_signal -3" not in compiled.asm["amdgcn"]
+    assert "s_barrier_wait -3" not in compiled.asm["amdgcn"]
+    _check_tdm_fused_multicast_codegen(compiled.asm["llir"], num_ctas, split_m, mask_mode)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
-@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "disabled"])
+@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "explicit_b", "disabled"])
 def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, mask_mode):
-    a = torch.randn((64, 64), dtype=torch.float16, device=device)
-    b = torch.randn_like(a)
-    output = torch.empty_like(a)
+    # Distinct members and row partitions expose swapped descriptors, incorrect
+    # CTA offsets, and missing stores from any CTA. Build the reference on CPU.
+    generator = torch.Generator().manual_seed(0)
+    inputs = torch.randint(1, 1000, (2, 64, 64), generator=generator).to(torch.float16)
+    inputs[1].neg_()
+    a, b = inputs[0].to(device), inputs[1].to(device)
+    output = torch.full((2, 64, 64), float("nan"), dtype=torch.float16, device=device)
     constants = _tdm_fused_distributed_constants(num_ctas, split_m, mask_mode)
     _async_amd_desc_load_fused_kernel[(1, )](a, b, output, **constants, num_ctas=num_ctas)
-    torch.testing.assert_close(output, a + b, rtol=0, atol=0)
+    torch.testing.assert_close(output.cpu(), inputs, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
