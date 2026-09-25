@@ -167,6 +167,9 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="tlx",
         impl="triton.tlx.ops.kernels.hstu_attn.gfx950:hstu_attn",
         dtypes=_FP16,
+        # Causal-only, non-causal is not supported yet.
+        accepts=lambda d: bool(d.get("causal", True)),
+        supports_backward=True,
     ),
     OpSpec(
         op="kimi_delta_attention",
