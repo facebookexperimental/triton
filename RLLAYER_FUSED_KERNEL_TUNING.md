@@ -159,6 +159,31 @@ registers/thread, 201.01 KiB dynamic SMEM, one resident block, 37.5% occupancy,
 route measures `884.064 us`; an attempted four-CTA DSMEM broadcast did not
 complete and is not exposed by the driver.
 
+## Current `T289757859` direct-layout prototype
+
+The OSS benchmark, output-major Triton winner, and TLX comparison are in
+`third_party/tlx/tutorials/fwd_skinny_gemm_layout.py` and
+`fwd_skinny_gemm_layout_tlx.py`. The `(1310720,16,64)` GEMM writes the physical
+`[5120,16,256]` grouped layout without materializing row-major `[M,16]`.
+
+The winning formulation computes the transposed-equivalent contraction
+`B[16,64] @ A_tile[256,64].T`, so its FP32 accumulator is already in the exact
+physical output orientation. It uses 256 rows, eight warps, two compiler
+stages, `maxnreg=64`, and four persistent programs per GB200 SM. In the OSS
+environment, locked `10/50/5` best-of-five medians are `157.888 us` for cuBLAS
+plus the layout copy and `65.632 us` fused, a `2.41x` speedup. All five fused
+repetitions beat all five unfused repetitions. Results are bit exact for seeds
+0/1/2, while the actual contract permits reduction reassociation and preserves
+BF16 inputs, FP32 accumulation, and BF16 output.
+
+NCU reports 64 registers/thread, 51.20 KiB dynamic SMEM, four resident blocks,
+50% theoretical and 41.5% achieved occupancy, 62.6% memory throughput, 49.0%
+DRAM throughput, and 32.0% compute throughput. A TLX variant with a padded
+`BN32` MMA reaches `66.672 us`; the logical `N=16` prevents TLX from matching
+the exact-width accumulator orientation. The original fbsource unfused result
+is much faster (`59.58 us`), so the production/full-forward win remains to be
+confirmed in that environment.
+
 ## Current `T290084482` TLX prototype
 
 The OSS prototype is in
