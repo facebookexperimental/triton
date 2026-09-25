@@ -100,31 +100,34 @@ def test_flash_attn_fwd_config(head_dim, causal, expected_block_n, expected_num_
     assert selected[0].kwargs["NUM_BUFFERS"] == expected_num_buffers
 
 
-def test_flash_attn_fwd_bm192_config():
+@pytest.mark.parametrize("causal,expected_num_buffers", ((False, 3), (True, 2)))
+def test_flash_attn_fwd_bm192_config(causal, expected_num_buffers):
     from triton.tlx.ops.kernels.flash_attn.sm90 import _prune_configs_by_head_dim, configs
 
     selected = _prune_configs_by_head_dim(
         configs,
         {},
         HEAD_DIM=64,
-        CAUSAL=False,
+        CAUSAL=causal,
         USE_BM192=True,
     )
     assert len(selected) == 1
     assert selected[0].kwargs["BLOCK_M"] == 192
     assert selected[0].kwargs["BLOCK_N"] == 128
-    assert selected[0].kwargs["NUM_BUFFERS"] == 3
+    assert selected[0].kwargs["NUM_BUFFERS"] == expected_num_buffers
     assert selected[0].kwargs["NUM_MMA_GROUPS"] == 3
 
 
+@pytest.mark.parametrize("causal", (False, True))
 @pytest.mark.parametrize("N_CTX", (1024, 2048, 4096, 8192))
-def test_flash_attn_fwd_bm192(N_CTX):
+def test_flash_attn_fwd_bm192(N_CTX, causal):
     from triton.tlx.ops import flash_attn
 
     torch.manual_seed(0)
     q, k, v = _qkv(4, 48, N_CTX, 64, torch.bfloat16)
-    out = flash_attn(q, k, v, causal=False, sm_scale=0.7, space="smoke")
-    ref = _sdpa(q, k, v, causal=False, scale=0.7)
+    out = flash_attn(q, k, v, causal=causal, sm_scale=0.7, space="smoke")
+    ref = _sdpa(q, k, v, causal=causal, scale=0.7)
+    assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=4e-2, rtol=0)
 
 
@@ -145,6 +148,16 @@ def test_flash_attn_fwd_launch_policy():
     for n_ctx in (1024, 2048, 4096, 8192):
         _, steady_unroll, target_workers = _select_forward_policy(
             False, (4, 48, n_ctx, 64), torch.bfloat16, 192, 132
+        )
+        assert (steady_unroll, target_workers) == (1, 132)
+
+        _, steady_unroll, target_workers = _select_forward_policy(
+            True,
+            (4, 48, n_ctx, 64),
+            torch.bfloat16,
+            192,
+            132,
+            use_bm192=True,
         )
         assert (steady_unroll, target_workers) == (1, 132)
 
