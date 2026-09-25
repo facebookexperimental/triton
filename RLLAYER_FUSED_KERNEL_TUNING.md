@@ -212,6 +212,31 @@ registers/thread without spills, 206.86 KiB dynamic SMEM, one resident CTA,
 and 24.35% compute throughput. The task remains pending matching-fbsource and
 full-forward validation.
 
+## Current `T289757878` three-layout prototype
+
+The OSS benchmark and tuned kernels are in
+`third_party/tlx/tutorials/fwd_skinny_gemm_multi_layout.py` and
+`fwd_skinny_gemm_multi_layout_tlx.py`. The `(1310720,64,112)` GEMM writes two
+row-major BF16 copies and one `[5120,64,256]` grouped layout directly.
+
+The winning Triton kernel retains the row-major accumulator orientation, casts
+it once, and writes all three outputs. Its static-persistent schedule uses
+`BLOCK_ROWS=256`, one CTA per GB200 SM, eight warps, and three compiler stages.
+Locked `10/50/5` best-of-five medians are `821.088 us` for the OSS unfused
+composition and `160.704 us` fused, a `5.11x` OSS speedup. The tuned fused
+latency is also 8.0% below the task's original fbsource unfused baseline of
+`174.69 us`. All three outputs are bit exact for seeds 0/1/2; BF16 inputs,
+FP32 accumulation, and BF16 outputs are preserved.
+
+The OSS three-output copy is anomalously slow (`731.472 us`, versus `99.54 us`
+in the original full-forward attribution), while OSS GEMM alone is
+`98.528 us`. The TLX comparison uses `BM128/BN64/BK64`, two M groups, two TMEM
+buffers, and cached K blocks; it reaches `164.096 us`. NCU for the Triton
+winner reports 154 registers/thread without spills, 155.67 KiB dynamic SMEM,
+one resident CTA, 12.46% achieved occupancy, 52.92% memory throughput, 46.30%
+DRAM throughput, and 19.48% compute throughput. Matching-fbsource and
+full-forward validation remain before promotion.
+
 ## Current `T290084482` TLX prototype
 
 The OSS prototype is in
