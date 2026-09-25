@@ -1640,3 +1640,107 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// tt.atomic_rmw picks its operation from an I32Enum attribute, which the
+// generic path drops; each case has its own tl.atomic_* builtin.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def atomic_rmw_kinds(
+  // CHECK-DAG: tl.atomic_add(arg0, {{.*}}, mask=True)
+  // CHECK-DAG: tl.atomic_max(arg0, {{.*}}, mask=True)
+  tt.func public @atomic_rmw_kinds(%p: !tt.ptr<f32>) attributes {noinline = false} {
+    %v = arith.constant 1.000000e+00 : f32
+    %t = arith.constant true
+    %a = tt.atomic_rmw fadd, acq_rel, gpu, %p, %v, %t : (!tt.ptr<f32>, f32, i1) -> f32
+    %b = tt.atomic_rmw max, acq_rel, gpu, %p, %v, %t : (!tt.ptr<f32>, f32, i1) -> f32
+    tt.return
+  }
+
+  // The remaining enum cases, so a mis-numbered entry in the ladder is caught
+  // rather than silently spelling one atomic as another.
+  // CHECK-LABEL: def atomic_rmw_remaining_kinds(
+  // CHECK-DAG: tl.atomic_min(arg0,
+  // CHECK-DAG: tl.atomic_xchg(arg0,
+  // CHECK-DAG: tl.atomic_and(arg0,
+  // CHECK-DAG: tl.atomic_or(arg0,
+  // CHECK-DAG: tl.atomic_xor(arg0,
+  tt.func public @atomic_rmw_remaining_kinds(%p: !tt.ptr<i32>) attributes {noinline = false} {
+    %v = arith.constant 1 : i32
+    %t = arith.constant true
+    %a = tt.atomic_rmw min, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %b = tt.atomic_rmw exch, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %c = tt.atomic_rmw and, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %d = tt.atomic_rmw or, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %e = tt.atomic_rmw xor, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+
+  // The last three enum values. Integer add(4) sits next to fadd(5), and
+  // umax(8)/umin(9) next to max(6)/min(7), so an off-by-one in the ladder
+  // would otherwise be spelled as the neighbouring atomic.
+  // CHECK-LABEL: def atomic_rmw_unsigned_and_int_add(
+  // CHECK-DAG: tl.atomic_add(arg0,
+  // CHECK-DAG: tl.atomic_max(arg0,
+  // CHECK-DAG: tl.atomic_min(arg0,
+  tt.func public @atomic_rmw_unsigned_and_int_add(%p: !tt.ptr<i32>) attributes {noinline = false} {
+    %v = arith.constant 1 : i32
+    %t = arith.constant true
+    %a = tt.atomic_rmw add, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %b = tt.atomic_rmw umax, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    %c = tt.atomic_rmw umin, acq_rel, gpu, %p, %v, %t : (!tt.ptr<i32>, i32, i1) -> i32
+    tt.return
+  }
+}
+
+// -----
+
+// Region-carrying reductions. The reduce combiner detector knew maxf/maxnumf
+// but not the NaN-quieting maximumf, and had no min case at all, so those fell
+// back to a bare tl.reduce missing its combine_fn. tt.scan had no mapping.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def reduce_and_scan_combiners(
+  // CHECK-DAG: tl.max(
+  // CHECK-DAG: tl.min(
+  // CHECK-DAG: tl.cumsum(arg0, axis=0)
+  // CHECK-NOT: tl.reduce(
+  tt.func public @reduce_and_scan_combiners(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %hi = "tt.reduce"(%x) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %m = arith.maximumf %a, %b : f32
+      tt.reduce.return %m : f32
+    }) : (tensor<256xf32, #blocked>) -> f32
+    %lo = "tt.reduce"(%x) <{axis = 0 : i32}> ({
+    ^bb0(%c: f32, %d: f32):
+      %n = arith.minimumf %c, %d : f32
+      tt.reduce.return %n : f32
+    }) : (tensor<256xf32, #blocked>) -> f32
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%e: f32, %f: f32):
+      %g = arith.addf %e, %f : f32
+      tt.scan.return %g : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Only the combiner's top-level ops name the kind. An arith.addf buried in
+  // an scf.if is not a cumulative sum, and a recursive walk would call it one.
+  // CHECK-LABEL: def scan_nested_add_is_not_cumsum(
+  // CHECK-NOT: tl.cumsum(
+  tt.func public @scan_nested_add_is_not_cumsum(%x: tensor<256xf32, #blocked>, %c: i1) attributes {noinline = false} {
+    %cs = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}> ({
+    ^bb0(%e: f32, %f: f32):
+      %g = scf.if %c -> f32 {
+        %n = arith.addf %e, %f : f32
+        scf.yield %n : f32
+      } else {
+        scf.yield %e : f32
+      }
+      tt.scan.return %g : f32
+    }) : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}

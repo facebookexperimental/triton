@@ -957,6 +957,7 @@ bool shouldSkipOp(
       "ttg.convert_layout",
       "tt.return",
       "tt.reduce.return",
+      "tt.scan.return",
       "arith.extui",
       "arith.extsi",
       "arith.extf",
@@ -2567,6 +2568,80 @@ void printSimplifiedOp(
     }
   }
 
+  // tt.atomic_rmw selects its operation with an enum attribute; each maps to a
+  // distinct tl.atomic_* builtin. The switch is exhaustive on purpose: a new
+  // RMWOp then fails the build rather than silently losing which atomic it was.
+  if (auto rmw = dyn_cast<tt::AtomicRMWOp>(op)) {
+    StringRef fn;
+    switch (rmw.getAtomicRmwOp()) {
+    case tt::RMWOp::AND:
+      fn = "tl.atomic_and";
+      break;
+    case tt::RMWOp::OR:
+      fn = "tl.atomic_or";
+      break;
+    case tt::RMWOp::XOR:
+      fn = "tl.atomic_xor";
+      break;
+    case tt::RMWOp::ADD:
+    case tt::RMWOp::FADD:
+      fn = "tl.atomic_add";
+      break;
+    case tt::RMWOp::MAX:
+    case tt::RMWOp::UMAX:
+      fn = "tl.atomic_max";
+      break;
+    case tt::RMWOp::MIN:
+    case tt::RMWOp::UMIN:
+      fn = "tl.atomic_min";
+      break;
+    case tt::RMWOp::XCHG:
+      fn = "tl.atomic_xchg";
+      break;
+    }
+    if (!fn.empty()) {
+      if (op->getNumResults() == 1)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << fn << "(" << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", " << getValueName(op->getOperand(1), argSubstitutionMap);
+      if (op->getNumOperands() > 2)
+        os << ", mask=" << getValueName(op->getOperand(2), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
+  // tt.scan carries its combiner in a region. An add combiner is a cumulative
+  // sum, which tl.cumsum expresses directly; other combiners have no builtin
+  // and fall through to the unsupported path.
+  if (opName == "tt.scan" && op->getNumResults() == 1 &&
+      op->getNumOperands() == 1 && op->getNumRegions() > 0) {
+    // Only the combiner's own top-level ops decide the kind, matching the
+    // tt.reduce detector. A recursive walk would let an arith.addf nested in,
+    // say, an scf.if masquerade as a cumulative sum.
+    bool isSum = false;
+    for (Block &block : op->getRegion(0))
+      for (Operation &bodyOp : block) {
+        StringRef n = bodyOp.getName().getStringRef();
+        if (n == "arith.addf" || n == "arith.addi")
+          isSum = true;
+      }
+    auto axis = op->getAttrOfType<IntegerAttr>("axis");
+    auto reverse = op->getAttrOfType<BoolAttr>("reverse");
+    if (isSum && axis) {
+      os << getValueName(op->getResult(0), argSubstitutionMap)
+         << " = tl.cumsum("
+         << getValueName(op->getOperand(0), argSubstitutionMap)
+         << ", axis=" << axis.getInt();
+      if (reverse && reverse.getValue())
+        os << ", reverse=True";
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
@@ -2826,18 +2901,24 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       continue;
     }
 
-    // Special handling for tt.reduce — detect combiner and emit tl.max/tl.sum
+    // Special handling for tt.reduce — detect combiner and emit
+    // tl.max/tl.min/tl.sum
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
       // Detect combiner type by looking at ops in the body region
-      bool isMax = false, isSum = false;
+      bool isMax = false, isMin = false, isSum = false;
       for (Region &bodyRegion : op.getRegions()) {
         for (Block &block : bodyRegion) {
           for (Operation &bodyOp : block) {
             StringRef bodyOpName = bodyOp.getName().getStringRef();
             if (bodyOpName == "arith.maxf" || bodyOpName == "arith.maxnumf" ||
-                bodyOpName == "arith.maxsi" || bodyOpName == "arith.maxui")
+                bodyOpName == "arith.maximumf" || bodyOpName == "arith.maxsi" ||
+                bodyOpName == "arith.maxui")
               isMax = true;
+            if (bodyOpName == "arith.minf" || bodyOpName == "arith.minnumf" ||
+                bodyOpName == "arith.minimumf" || bodyOpName == "arith.minsi" ||
+                bodyOpName == "arith.minui")
+              isMin = true;
             if (bodyOpName == "arith.addf" || bodyOpName == "arith.addi")
               isSum = true;
           }
@@ -2848,6 +2929,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
       if (isMax)
         os << "tl.max(";
+      else if (isMin)
+        os << "tl.min(";
       else if (isSum)
         os << "tl.sum(";
       else
@@ -2989,14 +3072,19 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     // Special handling for tt.reduce in CF printer
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
-      bool isMax = false, isSum = false;
+      bool isMax = false, isMin = false, isSum = false;
       for (Region &bodyRegion : op.getRegions()) {
         for (Block &block : bodyRegion) {
           for (Operation &bodyOp : block) {
             StringRef n = bodyOp.getName().getStringRef();
             if (n == "arith.maxf" || n == "arith.maxnumf" ||
-                n == "arith.maxsi" || n == "arith.maxui")
+                n == "arith.maximumf" || n == "arith.maxsi" ||
+                n == "arith.maxui")
               isMax = true;
+            if (n == "arith.minf" || n == "arith.minnumf" ||
+                n == "arith.minimumf" || n == "arith.minsi" ||
+                n == "arith.minui")
+              isMin = true;
             if (n == "arith.addf" || n == "arith.addi")
               isSum = true;
           }
@@ -3007,6 +3095,8 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
       os << getValueName(op.getResult(0), argSubstitutionMap) << " = ";
       if (isMax)
         os << "tl.max(";
+      else if (isMin)
+        os << "tl.min(";
       else if (isSum)
         os << "tl.sum(";
       else

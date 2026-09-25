@@ -739,7 +739,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         assert all(pattern.fullmatch(suite.name) for suite in registry.suites)
 
     mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
-    assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx950_2")
+    assert mm.suite("gfx942_2").includes == ("gfx950_2", )
+    assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
+    assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 

@@ -1508,6 +1508,26 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
   let hasVerifier = 1;
 }
 
+def TTNG_TMEMShiftOp : TTNG_Op<"tmem_shift"> {
+  let summary = "Shift tensor-memory rows down by one row";
+  let description = [{
+    Initiates asynchronous in-place shifts across every 32-byte column segment
+    in the tensor-memory buffer. Within each 32-row TMEM group, destination row
+    `r` receives the previous contents of source row `r + 1` for `r` in 0
+    through 30, while destination row 31 retains its previous contents.
+
+    This op lowers to one `tcgen05.shift.down` instruction per 32-byte column
+    segment. Completion must be tracked with `tcgen05.commit` and an mbarrier
+    before the buffer is consumed.
+  }];
+
+  let arguments = (ins Arg<TTG_MemDescType, "",
+      [MemRead<TensorMemory>, MemWrite<TensorMemory>]>:$buffer);
+
+  let assemblyFormat = [{$buffer attr-dict `:` qualified(type($buffer))}];
+  let hasVerifier = 1;
+}
+
 def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {
   let summary = "Initiate an asynchronous copy operation from shared memory to "
                 "tensor memory.";

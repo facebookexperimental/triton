@@ -2021,6 +2021,29 @@ void TMEMAllocOp::getEffects(
                          TensorMemory::get());
 }
 
+LogicalResult TMEMShiftOp::verify() {
+  auto bufferTy = getBuffer().getType();
+  if (!isa<TensorMemorySpaceAttr>(bufferTy.getMemorySpace()))
+    return emitOpError("buffer must be in tensor memory");
+  if (!bufferTy.getMutableMemory())
+    return emitOpError("buffer must be mutable");
+  if (bufferTy.getRank() != 2)
+    return emitOpError("buffer must be rank 2");
+  if (!isa<TensorMemoryEncodingAttr>(bufferTy.getEncoding()))
+    return emitOpError("buffer must use the standard tensor memory encoding");
+
+  TMemAllocation alloc = getTmemAllocSizes(bufferTy);
+  if (alloc.numRows != 128)
+    return emitOpError("buffer must occupy 128 physical TMEM rows, but got ")
+           << alloc.numRows;
+  // A shift instruction covers 32 bytes, or eight physical TMEM columns.
+  constexpr int kShiftColumns = 8;
+  if (alloc.numCols % kShiftColumns != 0)
+    return emitOpError("buffer physical column count must be a multiple of ")
+           << kShiftColumns << ", but got " << alloc.numCols;
+  return success();
+}
+
 LogicalResult TMEMCopyOp::verify() {
   if (!isa<triton::gpu::SharedMemorySpaceAttr>(
           getSrc().getType().getMemorySpace()))
