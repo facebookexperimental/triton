@@ -208,7 +208,7 @@ def tma_kernel(desc):
     layout: ttgl.constexpr = ttgl.BlockedLayout([1, 2], [4, 8], [4, 1], [1, 0])
     value = ttgl.full(desc.block_shape, 0, desc.dtype, layout)
     alloc = ttgl.allocate_shared_memory(desc.dtype, desc.block_shape, desc.layout, value)
-    tma.async_copy_shared_to_global(desc, [0, 0], alloc)
+    tma.async_store(desc, [0, 0], alloc)
     tma.store_wait(0)
     alloc._keep_alive()
 
@@ -235,10 +235,10 @@ def tma_round_f32_to_tf32_kernel(in_desc, out_desc):
     bar = mbarrier.allocate_mbarrier()
     mbarrier.init(bar, count=1)
     mbarrier.expect(bar, in_desc.nbytes_per_cta)
-    tma.async_copy_global_to_shared(in_desc, [0, 0], bar, smem)
+    tma.async_load(in_desc, [0, 0], bar, smem)
     mbarrier.wait(bar, phase=0, deps=[smem])
     mbarrier.invalidate(bar)
-    tma.async_copy_shared_to_global(out_desc, [0, 0], smem)
+    tma.async_store(out_desc, [0, 0], smem)
     tma.store_wait(0)
     smem._keep_alive()
 
@@ -282,10 +282,10 @@ def tma_im2col_kernel(in_desc, out_desc):
     bar = mbarrier.allocate_mbarrier()
     mbarrier.init(bar, count=1)
     mbarrier.expect(bar, in_desc.block_type.nbytes)
-    tma.async_copy_global_to_shared_im2col(in_desc, [0, 0, 0, 0], [0, 0], bar, smem)
+    tma.async_load_im2col(in_desc, [0, 0, 0, 0], [0, 0], bar, smem)
     mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
-    tma.async_copy_shared_to_global(out_desc, [0, 0], smem)
+    tma.async_store(out_desc, [0, 0], smem)
     tma.store_wait(pendings=0)
 
 
@@ -335,10 +335,10 @@ def tma_multicast_copy_kernel(in_desc, out_desc):
     mbarrier.init(bar, count=1)
 
     mbarrier.expect(bar, in_desc.nbytes_per_cta)
-    tma.async_copy_global_to_shared(in_desc, [0, 0], bar, smem, multicast=True)
+    tma.async_load(in_desc, [0, 0], bar, smem, multicast=True)
     mbarrier.wait(bar, phase=0, deps=[smem])
 
-    tma.async_copy_shared_to_global(out_desc, [0, 0], smem)
+    tma.async_store(out_desc, [0, 0], smem)
     tma.store_wait(0)
 
     mbarrier.invalidate(bar)
@@ -394,7 +394,7 @@ def tma_gather_scatter_kernel(in_desc, gather_out_desc, scatter_out_desc, gather
     mbarrier.invalidate(bar)
 
     scatter_offsets = ttgl.load(scatter_idx_ptr + ttgl.arange(0, BLOCK_M, layout=x_offsets_layout))
-    tma.async_copy_shared_to_global(gather_out_desc, [0, 0], smem)
+    tma.async_store(gather_out_desc, [0, 0], smem)
     blackwell_tma.async_scatter(scatter_out_desc, scatter_offsets, 0, smem)
     tma.store_wait(0)
 
@@ -460,6 +460,65 @@ def test_tma_gather_scatter_multi_cta(cga_layout):
 
 
 @gluon.jit
+def tma_gather_scatter_subslice_kernel(in_desc, out_desc, parent_out, KIND: ttgl.constexpr):
+    cga_layout: ttgl.constexpr = () if KIND == "row" else ((1, 0), )
+    shared_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(128, 16, rank=2, cga_layout=cga_layout)
+    parent_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [4, 8], [4, 1], [1, 0], cga_layout=cga_layout)
+    indices_layout: ttgl.constexpr = ttgl.SliceLayout(
+        1, ttgl.BlockedLayout([4, 1], [1, 32], [4, 1], [0, 1], cga_layout=cga_layout))
+    shape: ttgl.constexpr = (64, 256) if KIND == "column" else (128, 128)
+    parent = ttgl.allocate_shared_memory(ttgl.float16, shape, shared_layout,
+                                         value=ttgl.full(shape, -7, ttgl.float16, layout=parent_layout))
+    dim: ttgl.constexpr = 1 if KIND == "column" else 0
+    tile = parent.slice(shape[dim] // 2, shape[dim] // 2, dim=dim)
+
+    indices = ttgl.arange(0, 64, layout=indices_layout)
+    barrier = mbarrier.allocate_mbarrier()
+    mbarrier.init(barrier, count=1)
+    mbarrier.expect(barrier, tile.nbytes_per_cta)
+    blackwell_tma.async_gather(in_desc, 63 - indices, 0, barrier, tile)
+    mbarrier.wait(barrier, phase=0, deps=[tile])
+    if KIND != "row":
+        ttgl.barrier(cluster=True)
+
+    if KIND != "remote":
+        blackwell_tma.async_scatter(out_desc, (indices + 1) % 64, 0, tile)
+        tma.store_wait(0)
+
+    values = parent.load(parent_layout)
+    offsets = ttgl.arange(0, shape[0])[:, None] * shape[1] + ttgl.arange(0, shape[1])[None, :]
+    ttgl.store(parent_out + ttgl.set_auto_layout(offsets, values.type.layout), values)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("kind", ["row", "column", "remote"])
+def test_tma_gather_scatter_subslice(kind):
+    values = torch.arange(64 * 128, dtype=torch.float16, device="cuda").reshape(64, 128)
+    scatter_out = torch.zeros_like(values)
+    parent_out = torch.empty((64, 256) if kind == "column" else (128, 128), dtype=torch.float16, device="cuda")
+    cga_layout = () if kind == "row" else ((1, 0), )
+    shared_layout = ttgl.NVMMASharedLayout(128, 16, rank=2, cga_layout=cga_layout)
+    in_desc = TensorDescriptor.from_tensor(values, [1, 128], shared_layout)
+    out_desc = TensorDescriptor.from_tensor(scatter_out, [1, 128], shared_layout)
+
+    compiled = tma_gather_scatter_subslice_kernel[(1, )](in_desc, out_desc, parent_out, kind, num_warps=4,
+                                                         num_ctas=1 << len(cga_layout))
+
+    gathered = values.flip(0)
+    expected_parent = torch.full_like(parent_out, -7)
+    if kind == "column":
+        expected_parent[:, 128:] = gathered
+    else:
+        expected_parent[64:] = gathered
+    if kind == "remote":
+        assert "mapa.shared::cluster" in compiled.asm["ptx"]
+        assert "tile::gather4.cta_group::2.shared::cluster" in compiled.asm["ptx"]
+    else:
+        torch.testing.assert_close(scatter_out, gathered.roll(1, 0), atol=0, rtol=0)
+    torch.testing.assert_close(parent_out, expected_parent, atol=0, rtol=0)
+
+
+@gluon.jit
 def tcgen05_mma_multicast_commit_kernel(a_desc, b_desc, out_ptrs, BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr,
                                         acc_tmem_layout: ttgl.constexpr, blocked_c: ttgl.constexpr):
     smem_a = ttgl.allocate_shared_memory(a_desc.dtype, a_desc.block_shape, a_desc.layout)
@@ -472,8 +531,8 @@ def tcgen05_mma_multicast_commit_kernel(a_desc, b_desc, out_ptrs, BLOCK_M: ttgl.
     mbarrier.init(mma_bar, count=tcgen05_mma_barrier_count([smem_a, smem_b], True, acc_tmem.type.layout.two_ctas))
 
     mbarrier.expect(tma_bar, a_desc.nbytes_per_cta + b_desc.nbytes_per_cta)
-    tma.async_copy_global_to_shared(a_desc, [0, 0], tma_bar, smem_a, multicast=True)
-    tma.async_copy_global_to_shared(b_desc, [0, 0], tma_bar, smem_b, multicast=True)
+    tma.async_load(a_desc, [0, 0], tma_bar, smem_a, multicast=True)
+    tma.async_load(b_desc, [0, 0], tma_bar, smem_b, multicast=True)
     mbarrier.wait(tma_bar, phase=0, deps=[smem_a, smem_b])
     mbarrier.invalidate(tma_bar)
 
@@ -659,8 +718,8 @@ def tcgen05_mma_scaled_direct_multicast_kernel(a_desc, b_desc, out_ptr, BLOCK_M:
     for k in range(NUM_K_TILES):
         offs_k = k * BLOCK_K
         mbarrier.expect(tma_bar, a_desc.nbytes_per_cta + b_desc.nbytes_per_cta)
-        tma.async_copy_global_to_shared(a_desc, [0, offs_k], tma_bar, smem_a, multicast=True)
-        tma.async_copy_global_to_shared(b_desc, [offs_k, 0], tma_bar, smem_b, multicast=True)
+        tma.async_load(a_desc, [0, offs_k], tma_bar, smem_a, multicast=True)
+        tma.async_load(b_desc, [offs_k, 0], tma_bar, smem_b, multicast=True)
         mbarrier.wait(tma_bar, phase_tma, deps=[smem_a, smem_b])
         tcgen05_mma_scaled(smem_a, smem_b, acc, a_scale, b_scale, "e5m2", "e5m2", use_acc=k != 0, multicast=True,
                            mbarriers=[mma_bar])
@@ -713,7 +772,7 @@ def async_copy_mbarrier_kernel(out, inp, xnumel, XBLOCK: ttgl.constexpr, YBLOCK:
     xindex = ttgl.arange(0, XBLOCK, ttgl.SliceLayout(1, block_layout))[:, None]
     yindex = ttgl.arange(0, YBLOCK, ttgl.SliceLayout(0, block_layout))[None, :]
     mask = xindex < xnumel
-    async_copy.async_copy_global_to_shared(
+    async_copy.async_load(
         smem,
         inp + xindex * YBLOCK + yindex,
         mask,
@@ -824,7 +883,7 @@ def test_device_tma_load():
         mbarrier.init(bar, count=1)
 
         mbarrier.expect(bar, input_desc.nbytes_per_cta)
-        tma.async_copy_global_to_shared(input_desc, [0, 0], bar, smem)
+        tma.async_load(input_desc, [0, 0], bar, smem)
         mbarrier.wait(bar, 0)
         mbarrier.invalidate(bar)
 
@@ -869,7 +928,7 @@ def test_device_tma_store():
             block_shape=[XBLOCK, XBLOCK],
             layout=smem_layout,
         )
-        tma.async_copy_shared_to_global(out_desc, [0, 0], alloc)
+        tma.async_store(out_desc, [0, 0], alloc)
         tma.store_wait(0)
         alloc._keep_alive()
 
@@ -974,6 +1033,71 @@ def test_warpgroup_mma(ASYNC):
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-1)
 
 
+@gluon.jit
+def warpgroup_mma_wait_multi_warpgroup_kernel(a_ptr, b0_ptr, b1_ptr, out_ptr, D: ttgl.constexpr, NBLK: ttgl.constexpr,
+                                              WG: ttgl.constexpr):
+    M: ttgl.constexpr = 64 * WG
+    c_layout: ttgl.constexpr = ttgl.NVMMADistributedLayout([3, 0], warps_per_cta=[4 * WG, 1], instr_shape=[16, 64, 16])
+    smem_b: ttgl.constexpr = ttgl.NVMMASharedLayout.get_default_for([D, D], ttgl.bfloat16)
+    smem_a: ttgl.constexpr = ttgl.NVMMASharedLayout.get_default_for([M, D], ttgl.bfloat16)
+    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4 * WG, 1], [1, 0])
+
+    a_smem = ttgl.allocate_shared_memory(ttgl.bfloat16, [M, D], smem_a)
+    b0_smem = ttgl.allocate_shared_memory(ttgl.bfloat16, [D, D], smem_b)
+    b1_smem = ttgl.allocate_shared_memory(ttgl.bfloat16, [D, D], smem_b)
+
+    rows = ttgl.arange(0, D, layout=ttgl.SliceLayout(1, layout))
+    cols = ttgl.arange(0, D, layout=ttgl.SliceLayout(0, layout))
+    offs = rows[:, None] * D + cols[None, :]
+    aoffs = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None] * D + cols[None, :]
+
+    acc = ttgl.zeros([M, D], ttgl.float32, c_layout)
+    inflight = hopper.warpgroup_mma_init(acc)
+
+    async_copy.async_load(a_smem, a_ptr + aoffs)
+    async_copy.commit_group()
+
+    for i in tl.range(0, NBLK):
+        async_copy.async_load(b0_smem, b0_ptr + i * D * D + offs)
+        acc = hopper.warpgroup_mma_wait(num_outstanding=0, deps=(inflight, ))
+        async_copy.async_load(b1_smem, b1_ptr + i * D * D + offs)
+        async_copy.commit_group()
+        async_copy.wait_group(0)
+        hopper.fence_async_shared()
+        acc = hopper.warpgroup_mma(a_smem, b0_smem, acc, use_acc=True, is_async=True)
+        acc = hopper.warpgroup_mma_wait(num_outstanding=0, deps=(acc, ))
+        inflight = hopper.warpgroup_mma(a_smem, b1_smem, acc, use_acc=True, is_async=True)
+    acc = hopper.warpgroup_mma_wait(num_outstanding=0, deps=(inflight, ))
+
+    out_r = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, c_layout))
+    out_c = ttgl.arange(0, D, layout=ttgl.SliceLayout(0, c_layout))
+    pid = ttgl.program_id(0)
+    ttgl.store(out_ptr + pid.to(ttgl.int64) * (M * D) + out_r[:, None] * D + out_c[None, :], acc)
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
+def test_warpgroup_mma_wait_synchronizes_warpgroups():
+    torch.manual_seed(0)
+    d, num_warp_groups = 64, 2
+    m = 64 * num_warp_groups
+    num_blocks, grid = 512, 528
+
+    b0 = torch.randint(-3, 4, (num_blocks, d, d), device="cuda", dtype=torch.float32)
+    b1 = torch.randint(-3, 4, (num_blocks, d, d), device="cuda", dtype=torch.float32)
+    expected = (b0.sum(dim=(0, 1)) + b1.sum(dim=(0, 1)))[None, :].expand(m, d)
+    assert expected.abs().max() < 2**24
+
+    a = torch.ones((m, d), device="cuda", dtype=torch.bfloat16)
+    b0 = b0.to(torch.bfloat16)
+    b1 = b1.to(torch.bfloat16)
+
+    for _ in range(5):
+        out = torch.empty((grid, m, d), dtype=torch.float32, device="cuda")
+        warpgroup_mma_wait_multi_warpgroup_kernel[(grid, )](a, b0, b1, out, D=d, NBLK=num_blocks, WG=num_warp_groups,
+                                                            num_warps=4 * num_warp_groups)
+        torch.testing.assert_close(out, expected[None, :, :].expand_as(out), atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tcgen05_mma_two_ctas_transposed_lhs_shared_layout():
     torch.manual_seed(0)
@@ -1072,8 +1196,8 @@ def tma_mma_shared_inputs_kernel(a_desc, b_desc, out_ptr, out_desc, gather_idx_p
         if use_gather_scatter:
             blackwell_tma.async_gather(a_desc, gather_offsets, k * BLOCK_K, tma_bar, smem_a, multicast=multicast)
         else:
-            tma.async_copy_global_to_shared(a_desc, [0, k * BLOCK_K], tma_bar, smem_a, multicast=multicast)
-        tma.async_copy_global_to_shared(b_desc, [k * BLOCK_K, 0], tma_bar, smem_b, multicast=multicast)
+            tma.async_load(a_desc, [0, k * BLOCK_K], tma_bar, smem_a, multicast=multicast)
+        tma.async_load(b_desc, [k * BLOCK_K, 0], tma_bar, smem_b, multicast=multicast)
         mbarrier.wait(tma_bar, phase=phase_tma, deps=[smem_a, smem_b])
         phase_tma ^= 1
 
@@ -2267,13 +2391,13 @@ def test_tma_slice():
         mbarrier.init(bar, count=1)
 
         mbarrier.expect(bar, in_desc.nbytes_per_cta)
-        tma.async_copy_global_to_shared(in_desc, [0, 0], bar, smem_slice1)
+        tma.async_load(in_desc, [0, 0], bar, smem_slice1)
         mbarrier.wait(bar, phase=0)
 
         blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [1, 4], [1, 0])
         smem_slice0.store(ttgl.zeros((XBLOCK, YBLOCK), dtype=ttgl.float32, layout=blocked))
 
-        tma.async_copy_shared_to_global(out_desc, [0, 0], smem_slice1)
+        tma.async_store(out_desc, [0, 0], smem_slice1)
         tma.store_wait(0)
 
     input = torch.rand((XBLOCK, YBLOCK), dtype=torch.float32, device="cuda")
@@ -3550,6 +3674,62 @@ def test_shared_subslice_two_ctas(op):
             assert "red.shared::cluster.cluster.relaxed.inc.u32" in ptx
             torch.testing.assert_close(result, inp[2:4], atol=0, rtol=0)
         torch.testing.assert_close(final, expected, atol=0, rtol=0)
+
+
+@gluon.jit
+def cross_cta_tma_kernel(desc, out, cga_layout: ttgl.constexpr, MODE: ttgl.constexpr):
+    alloc_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [4, 8], [4, 1], [1, 0], cga_layout=cga_layout)
+    shared_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(128, 32, rank=2, cga_layout=cga_layout)
+    parent = ttgl.allocate_shared_memory(ttgl.int32, [256, 64], shared_layout,
+                                         value=ttgl.full([256, 64], -5, ttgl.int32, layout=alloc_layout))
+    tile = parent.slice(128, 128, dim=0)
+    if MODE == "load":
+        bar = mbarrier.allocate_mbarrier()
+        mbarrier.init(bar, count=1)
+        mbarrier.expect(bar, desc.nbytes_per_cta)
+        tma.async_load(desc, [0, 0], bar, tile)
+        mbarrier.wait(bar, phase=0)
+        ttgl.barrier(cluster=True)
+        result = parent.load(alloc_layout)
+        offsets = ttgl.arange(0, 256)[:, None] * 64 + ttgl.arange(0, 64)[None, :]
+        offsets = ttgl.set_auto_layout(offsets, result.type.layout)
+        ttgl.store(out + offsets, result)
+    elif MODE == "store":
+        tma.async_store(desc, [0, 0], tile)
+    else:
+        tma.async_atomic_add(desc, [0, 0], tile)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper")
+@pytest.mark.parametrize("mode,cga_layout", [
+    ("load", ((1, 0), )),
+    ("load", ((1, 0), (0, 0))),
+    ("load", ((0, 0), (1, 0))),
+    ("store", ((1, 0), )),
+    ("reduce", ((1, 0), )),
+], ids=["two-ctas", "four-ctas", "nonpeer", "store", "reduce"])
+def test_cross_cta_tma(mode, cga_layout, capfd):
+    if mode == "load" and not is_blackwell():
+        pytest.skip("Requires Blackwell CTA-pair completion")
+    inp = torch.arange(128 * 64, device="cuda", dtype=torch.int32).reshape(128, 64)
+    out = torch.full((256, 64), -1, device="cuda", dtype=torch.int32)
+    layout = ttgl.NVMMASharedLayout(128, 32, rank=2, cga_layout=cga_layout)
+    desc = TensorDescriptor.from_tensor(inp, [128, 64], layout)
+
+    if mode != "load":
+        with pytest.raises(RuntimeError, match="error encountered during parsing"):
+            cross_cta_tma_kernel.warmup(desc, out, cga_layout, MODE=mode, grid=(1, ), num_warps=4, num_ctas=2)
+        assert "source subview may have an origin in another CTA" in "".join(capfd.readouterr())
+    elif cga_layout[0] == (0, 0):
+        with pytest.raises(RuntimeError, match="error encountered during parsing"):
+            cross_cta_tma_kernel.warmup(desc, out, cga_layout, MODE=mode, grid=(1, ), num_warps=4, num_ctas=4)
+        assert "TMA destination and completion barrier must belong to the same CTA or a CTA pair" in "".join(
+            capfd.readouterr())
+    else:
+        compiled = cross_cta_tma_kernel[(1, )](desc, out, cga_layout, mode, num_warps=4, num_ctas=1 << len(cga_layout))
+        assert "mapa.shared::cluster" in compiled.asm["ptx"]
+        assert "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global" in compiled.asm["ptx"]
+        torch.testing.assert_close(out, torch.cat((torch.full_like(inp, -5), inp)), atol=0, rtol=0)
 
 
 @gluon.jit
@@ -5306,12 +5486,12 @@ def mma_scaled_tcgen05_copy_kernel(a_desc, b_desc, c_desc, a_scale_desc, b_scale
         EXPECTED_BYTES: ttgl.constexpr = (a_desc.nbytes_per_cta + b_desc.nbytes_per_cta + a_scale_desc.nbytes_per_cta +
                                           b_scale_desc.nbytes_per_cta)
         mbarrier.expect(tma_bar, EXPECTED_BYTES)
-        tma.async_copy_global_to_shared(a_desc, [off_m, off_k_a], tma_bar, a_smem, multicast=multicast)
-        tma.async_copy_global_to_shared(b_desc, [off_n, off_k_b], tma_bar, b_smem, multicast=multicast)
-        tma.async_copy_global_to_shared(a_scale_desc, [0, off_m_a_scale, off_k_a_scale, 0, 0], tma_bar, a_scale_smem,
-                                        multicast=multicast)
-        tma.async_copy_global_to_shared(b_scale_desc, [0, off_n_b_scale, off_k_b_scale, 0, 0], tma_bar, b_scale_smem,
-                                        multicast=multicast)
+        tma.async_load(a_desc, [off_m, off_k_a], tma_bar, a_smem, multicast=multicast)
+        tma.async_load(b_desc, [off_n, off_k_b], tma_bar, b_smem, multicast=multicast)
+        tma.async_load(a_scale_desc, [0, off_m_a_scale, off_k_a_scale, 0, 0], tma_bar, a_scale_smem,
+                       multicast=multicast)
+        tma.async_load(b_scale_desc, [0, off_n_b_scale, off_k_b_scale, 0, 0], tma_bar, b_scale_smem,
+                       multicast=multicast)
         mbarrier.wait(tma_bar, phase_tma, deps=[a_smem, b_smem, a_scale_smem, b_scale_smem])
         phase_tma ^= 1
 
@@ -5335,7 +5515,7 @@ def mma_scaled_tcgen05_copy_kernel(a_desc, b_desc, c_desc, a_scale_desc, b_scale
     acc = acc.to(c_desc.dtype)
     acc_smem = ttgl.allocate_shared_memory(c_desc.dtype, c_desc.block_type.shape, c_desc.layout)
     acc_smem.store(acc)
-    tma.async_copy_shared_to_global(c_desc, [off_m, off_n], acc_smem)
+    tma.async_store(c_desc, [off_m, off_n], acc_smem)
     tma.store_wait(0)
 
 

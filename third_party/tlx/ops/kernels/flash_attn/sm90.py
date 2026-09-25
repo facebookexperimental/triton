@@ -1,7 +1,7 @@
 """Hopper (sm90) Flash Attention implementation for ``tlx.ops``.
 
 Promoted from ``tutorials/hopper_fa_ws_pipelined_pingpong.py``. The supported
-contract is contiguous square FP16/BF16 attention with ``HEAD_DIM=128``.
+contract is contiguous square FP16/BF16 attention with ``HEAD_DIM`` 64 or 128.
 """
 
 import torch
@@ -75,7 +75,26 @@ _DEFAULT_LAUNCH_TUNING = {
     "STEADY_UNROLL": 2,
     "WORKER_CAP": None,
 }
+_NONCAUSAL_WORKLOAD_LAUNCH_TUNING = {
+    (torch.bfloat16, 4, 48, 2048, 64): {
+        "STEADY_UNROLL": 2,
+        "WORKER_CAP": None,
+        "WORKER_MULTIPLIER": 2,
+    },
+}
 _CAUSAL_WORKLOAD_LAUNCH_TUNING = {
+    (torch.bfloat16, 4, 48, 1024, 128): {
+        "STEADY_UNROLL": 1,
+        "WORKER_CAP": None,
+    },
+    (torch.bfloat16, 4, 48, 2048, 64): {
+        "STEADY_UNROLL": 1,
+        "WORKER_CAP": None,
+    },
+    (torch.bfloat16, 4, 48, 4096, 64): {
+        "STEADY_UNROLL": 2,
+        "WORKER_CAP": 129,
+    },
     (torch.bfloat16, 4, 48, 2048, 128): {
         "STEADY_UNROLL": 1,
         "WORKER_CAP": None,
@@ -97,10 +116,12 @@ def _select_row_schedule(causal, n_ctx, block_m):
 def _select_forward_policy(causal, shape, dtype, block_m, num_sms):
     row_schedule = _select_row_schedule(causal, shape[2], block_m)
     workload_key = (dtype, *shape)
-    launch_tuning = (_CAUSAL_WORKLOAD_LAUNCH_TUNING.get(workload_key, _DEFAULT_LAUNCH_TUNING)
-                     if causal else _DEFAULT_LAUNCH_TUNING)
+    workload_tuning = _CAUSAL_WORKLOAD_LAUNCH_TUNING if causal else _NONCAUSAL_WORKLOAD_LAUNCH_TUNING
+    launch_tuning = workload_tuning.get(workload_key, _DEFAULT_LAUNCH_TUNING)
     worker_cap = launch_tuning["WORKER_CAP"]
-    target_workers = num_sms if worker_cap is None else min(num_sms, worker_cap)
+    target_workers = num_sms * launch_tuning.get("WORKER_MULTIPLIER", 1)
+    if worker_cap is not None:
+        target_workers = min(target_workers, worker_cap)
     return row_schedule, launch_tuning["STEADY_UNROLL"], target_workers
 
 
@@ -108,16 +129,27 @@ configs = [
     triton.Config(
         {
             "BLOCK_M": _DEFAULT_BLOCK_M,
-            "BLOCK_N": 128,
-            "NUM_BUFFERS": 2,
+            "BLOCK_N": block_n,
+            "NUM_BUFFERS": num_buffers,
             "NUM_MMA_WARPS": 8,
             "NUM_MMA_GROUPS": 2,
         },
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    ),
+    ) for block_n, num_buffers in ((128, 2), (128, 3), (64, 2))
 ]
+
+
+def _prune_configs_by_head_dim(configs, named_args, **kwargs):
+    head_dim = kwargs["HEAD_DIM"]
+    causal = kwargs["CAUSAL"]
+    block_n = 128 if head_dim == 64 else head_dim
+    num_buffers = 3 if head_dim == 64 and not causal else 2
+    return [
+        config for config in configs
+        if config.kwargs["BLOCK_N"] == block_n and config.kwargs["NUM_BUFFERS"] == num_buffers
+    ]
 
 
 @triton.jit
@@ -164,7 +196,11 @@ def _compute_offsets(
     return start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y
 
 
-@triton.autotune(configs=configs, key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "CAUSAL"])
+@triton.autotune(
+    configs=configs,
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "CAUSAL"],
+    prune_configs_by={"early_config_prune": _prune_configs_by_head_dim},
+)
 @triton.jit
 def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                     Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -186,8 +222,10 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                     NUM_MMA_WARPS: tl.constexpr,  #
                                     NUM_MMA_GROUPS: tl.constexpr,  #
                                     ):
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    tl.static_assert(BLOCK_N <= HEAD_DIM or (HEAD_DIM == 64 and BLOCK_N == 128))
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
+    SERIALIZE_QK: tl.constexpr = CAUSAL or HEAD_DIM == 128
+    USE_K_AHEAD: tl.constexpr = not CAUSAL and HEAD_DIM == 64
 
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
     K_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_k))
@@ -235,6 +273,12 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
     with tlx.async_tasks(exclusive=True):
         # producer group
         with tlx.async_task("default"):
+            if not CAUSAL and HEAD_DIM == 64:
+                if tlx.thread_id(0) == 0:
+                    tlx.prefetch(desc_q, tensormap=True)
+                    tlx.prefetch(desc_k, tensormap=True)
+                    tlx.prefetch(desc_v, tensormap=True)
+                    tlx.prefetch(desc_o, tensormap=True)
             accum_cnt_kv = 0
 
             for i in range(0, tiles_per_prog):
@@ -257,9 +301,15 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     ROW_SWAP_XOR=ROW_SWAP_XOR,
                 )
 
-                # Publish both Q splits before starting the KV stream. The two
-                # consumers rendezvous before issuing the first QK, so neither can
-                # use an intervening K load until both Q splits are ready.
+                # Give QK priority on the D64 noncausal producer TMA stream.
+                # Other paths retain their established K/V issue order.
+                if USE_K_AHEAD:
+                    kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+                    kv_offset = kv_offset_y + lo
+                    tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
+                    tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                    tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
+
                 _, q_phase = get_bufidx_phase(i, 1)
                 q_cid: tl.constexpr = 0
                 tlx.barrier_wait(q_empties[q_cid], q_phase ^ 1)
@@ -274,35 +324,51 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                     tlx.async_descriptor_load(desc_q, q_tiles[cid], [qo_offset_y_split, 0], q_fulls[cid])
 
-                kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                kv_offset = kv_offset_y + lo
-                tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
+                if USE_K_AHEAD:
+                    for kv_idx in tl.range(lo + BLOCK_N, hi, BLOCK_N, loop_unroll_factor=STEADY_UNROLL):
+                        next_kv_count = accum_cnt_kv + 1
+                        k_buf_id, k_phase = get_bufidx_phase(next_kv_count, NUM_BUFFERS)
+                        k_offset = kv_offset_y + kv_idx
+                        tlx.barrier_wait(k_empties[k_buf_id], k_phase ^ 1)
+                        tlx.barrier_expect_bytes(k_fulls[k_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                        tlx.async_descriptor_load(desc_k, k_tiles[k_buf_id], [k_offset, 0], k_fulls[k_buf_id])
 
-                tlx.barrier_wait(v_empties[kv_buf_id], kv_phase ^ 1)
-                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [kv_offset, 0], v_fulls[kv_buf_id])
-                accum_cnt_kv += 1
+                        v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+                        v_offset = kv_offset_y + kv_idx - BLOCK_N
+                        tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
+                        tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                        tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id])
+                        accum_cnt_kv = next_kv_count
 
-                # Keep the established K-then-V order for the steady-state ring.
-                for kv_idx in tl.range(lo + BLOCK_N, hi, BLOCK_N, loop_unroll_factor=STEADY_UNROLL):
+                    v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+                    v_offset = kv_offset_y + hi - BLOCK_N
+                    tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
+                    tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                    tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id])
+                    accum_cnt_kv += 1
+                else:
                     kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                    kv_offset = kv_offset_y + kv_idx
-
-                    # wait for the K buffer to be released by both consumers
+                    kv_offset = kv_offset_y + lo
                     tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
-                    # load K
                     tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
                     tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
 
-                    # wait for the V buffer to be released by both consumers
                     tlx.barrier_wait(v_empties[kv_buf_id], kv_phase ^ 1)
-                    # load V
                     tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
                     tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [kv_offset, 0], v_fulls[kv_buf_id])
-
                     accum_cnt_kv += 1
+
+                    for kv_idx in tl.range(lo + BLOCK_N, hi, BLOCK_N, loop_unroll_factor=STEADY_UNROLL):
+                        kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+                        kv_offset = kv_offset_y + kv_idx
+                        tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
+                        tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                        tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
+
+                        tlx.barrier_wait(v_empties[kv_buf_id], kv_phase ^ 1)
+                        tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                        tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [kv_offset, 0], v_fulls[kv_buf_id])
+                        accum_cnt_kv += 1
 
                 tile_idx += num_progs
 
@@ -316,7 +382,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
             cid: tl.constexpr = tlx.async_task_replica_id()
 
             # Bootstrap the pingpong sequence once before the persistent tile loop.
-            if cid == 1:
+            if SERIALIZE_QK and cid == 1:
                 tlx.named_barrier_arrive(9, 256)
 
             for i in range(0, tiles_per_prog):
@@ -360,21 +426,23 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # -- compute qk[0] ----
                 k_tile = tlx.local_trans(k_tiles[k_buf_id])
 
-                if cid == 0:
-                    # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
-                    tlx.named_barrier_wait(9, 256)
-                else:
-                    # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
-                    tlx.named_barrier_wait(10, 256)
+                if SERIALIZE_QK:
+                    if cid == 0:
+                        # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+                        tlx.named_barrier_wait(9, 256)
+                    else:
+                        # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+                        tlx.named_barrier_wait(10, 256)
 
                 qk = tlx.async_dot(q_tiles[cid], k_tile)
 
-                if cid == 0:
-                    # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
-                    tlx.named_barrier_arrive(10, 256)
-                else:
-                    # Consumer 1 signals barrier 9 to unblock Consumer 0.
-                    tlx.named_barrier_arrive(9, 256)
+                if SERIALIZE_QK:
+                    if cid == 0:
+                        # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+                        tlx.named_barrier_arrive(10, 256)
+                    else:
+                        # Consumer 1 signals barrier 9 to unblock Consumer 0.
+                        tlx.named_barrier_arrive(9, 256)
 
                 # wait for the MMA to complete
                 qk = tlx.async_dot_wait(0, qk)
@@ -387,7 +455,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # -- compute m_i and l_i ----
                 if CAUSAL:
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                    if lo + BLOCK_N == hi:
+                    if lo + BLOCK_M >= hi:
                         offs_n = lo + tl.arange(0, BLOCK_N)
                         qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -403,8 +471,9 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 accum_cnt_kv += 1
 
                 # Keep the steady-state loop branch-free. In the causal case,
-                # peel the final diagonal tile and apply its mask separately.
-                steady_hi = hi - BLOCK_N if CAUSAL else hi
+                # peel every KV tile that intersects the BLOCK_M-wide diagonal
+                # region. The max keeps the initial tile out of the later loops.
+                steady_hi = tl.maximum(lo + BLOCK_N, hi - BLOCK_M) if CAUSAL else hi
                 steady_tiles = (steady_hi - (lo + BLOCK_N)) // BLOCK_N
                 paired_hi = steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi
                 for kv_idx in tl.range(
@@ -421,21 +490,23 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     # compute qk for the current iteration
                     k_tile = tlx.local_trans(k_tiles[k_buf_id])
 
-                    if cid == 0:
-                        # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
-                        tlx.named_barrier_wait(9, 256)
-                    else:
-                        # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
-                        tlx.named_barrier_wait(10, 256)
+                    if SERIALIZE_QK:
+                        if cid == 0:
+                            # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+                            tlx.named_barrier_wait(9, 256)
+                        else:
+                            # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+                            tlx.named_barrier_wait(10, 256)
 
                     qk = tlx.async_dot(q_tiles[cid], k_tile)
 
-                    if cid == 0:
-                        # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
-                        tlx.named_barrier_arrive(10, 256)
-                    else:
-                        # Consumer 1 signals barrier 9 to unblock Consumer 0.
-                        tlx.named_barrier_arrive(9, 256)
+                    if SERIALIZE_QK:
+                        if cid == 0:
+                            # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+                            tlx.named_barrier_arrive(10, 256)
+                        else:
+                            # Consumer 1 signals barrier 9 to unblock Consumer 0.
+                            tlx.named_barrier_arrive(9, 256)
 
                     # compute pv from the previous iteration
                     # wait for the previous V buffer to be populated by the producer
@@ -475,17 +546,19 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
                         k_tile = tlx.local_trans(k_tiles[k_buf_id])
 
-                        if cid == 0:
-                            tlx.named_barrier_wait(9, 256)
-                        else:
-                            tlx.named_barrier_wait(10, 256)
+                        if SERIALIZE_QK:
+                            if cid == 0:
+                                tlx.named_barrier_wait(9, 256)
+                            else:
+                                tlx.named_barrier_wait(10, 256)
 
                         qk = tlx.async_dot(q_tiles[cid], k_tile)
 
-                        if cid == 0:
-                            tlx.named_barrier_arrive(10, 256)
-                        else:
-                            tlx.named_barrier_arrive(9, 256)
+                        if SERIALIZE_QK:
+                            if cid == 0:
+                                tlx.named_barrier_arrive(10, 256)
+                            else:
+                                tlx.named_barrier_arrive(9, 256)
 
                         v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
                         tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
@@ -497,7 +570,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         if kv_idx + BLOCK_N == hi:
                             tlx.barrier_arrive(q_empties[cid], 1)
 
-                        if kv_idx + BLOCK_N == hi:
+                        if kv_idx + BLOCK_M >= hi:
                             offs_n = kv_idx + tl.arange(0, BLOCK_N)
                             qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
                         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -867,7 +940,8 @@ class _attention(torch.autograd.Function):
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K == 128
+        assert HEAD_DIM_K in (64, 128)
+        assert q.shape[2] % _DEFAULT_BLOCK_M == 0
         o = torch.empty_like(q)
         extra_kern_args = {}
 
@@ -1020,8 +1094,8 @@ def attention(q, k, v, sm_scale, causal=False, config=None):
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Fused D128 attention over ``(Z, H, N_CTX, HEAD_DIM)``."""
-    # SM90 currently has one validated configuration, shared by both spaces.
+    """Fused D64/D128 attention over ``(Z, H, N_CTX, HEAD_DIM)``."""
+    # SM90 uses one head-dimension-specific configuration in both spaces.
     if space not in ("full", "smoke"):
         raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
     if sm_scale is None:

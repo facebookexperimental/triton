@@ -12,10 +12,11 @@ Production-ready kernels promoted from the TLX tutorials into the FBTriton op li
 ```python
 from triton.tlx.ops import mm as tlx_mm
 
-out = tlx_mm(a, b, arch="sm100")
+out = tlx_mm(a, b)
 ```
 
-`sm100` rather than `blackwell`, to align with the PTX convention.
+`tlx.ops` infers the architecture from the input tensors and dispatches to the
+matching registered implementation.
 
 ## Structure
 

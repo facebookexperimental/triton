@@ -41,7 +41,7 @@ static bool isWritingAlloc(Operation *op) {
 }
 
 static bool isMMALikeOp(Operation *op) {
-  return isa<TCGen5MMAOp, TCGen5MMAScaledOp, TMEMCopyOp>(op);
+  return isa<TCGen5MMAOp, TCGen5MMAScaledOp, TMEMCopyOp, TMEMShiftOp>(op);
 }
 
 static TMemAccessKind getTMemAccessKind(Operation *op) {
@@ -211,8 +211,8 @@ static bool filterFn(Operation *lhs, Operation *rhs, bool /*lhsIsRead*/,
   bool waw =
       lhsKind == TMemAccessKind::Store && rhsKind == TMemAccessKind::Store;
 
-  // MMAv5 ops and tmem_copy are special cases, we care about load->mma and
-  // store->mma dependencies but mma -> load/store doesn't require a barrier
+  // Elected async TMEM ops are special cases: we care about load/store -> op
+  // dependencies, but op -> load/store doesn't require a barrier
   // since it would need a mbarrier wait that will ensure the op is finished
   // before any thread can reach the load/store.
   bool loadToMma =
@@ -481,6 +481,9 @@ void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
     }
   } else if (auto copy = dyn_cast<TMEMCopyOp>(op)) {
     appendWriteSlices(copy.getDst(), op, &curBlockInfo);
+  } else if (auto shift = dyn_cast<TMEMShiftOp>(op)) {
+    appendReadSlices(shift.getBuffer(), op, &curBlockInfo);
+    appendWriteSlices(shift.getBuffer(), op, &curBlockInfo);
   }
 
   if (blockInfo->isIntersected(curBlockInfo, filter, allocation)) {

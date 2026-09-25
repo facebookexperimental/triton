@@ -32,6 +32,7 @@
 
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
+
 - `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[sm90+, gfx942+?]**
 
     Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.

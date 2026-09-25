@@ -95,7 +95,7 @@ def prepare(case: Case, space: str) -> Prepared:
     dtype = getattr(torch, case.dtype)
     q, k, v = qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=backward)
 
-    tlx_fwd = lambda: tlx_flash_attn(q, k, v, causal=causal, arch=driver.arch(), space=space)  # noqa: E731
+    tlx_fwd = lambda: tlx_flash_attn(q, k, v, causal=causal, space=space)  # noqa: E731
     ref_fwd = lambda: F.scaled_dot_product_attention(  # noqa: E731
         q, k, v, is_causal=causal, scale=HEAD_DIM**-0.5)
     extra = {"ref_backend": _ref_backend(q, k, v, causal)}

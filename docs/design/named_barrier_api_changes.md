@@ -147,18 +147,43 @@ configurations:
 
 ### 5.1 Promotion safety
 
-An mbarrier is promotable only when all of the following are proven:
+The current single-slot pass checks structural eligibility:
 
-1. Its uses consist only of arrivals without an expected byte count and wait
-   operations. Asynchronous-proxy operations are excluded.
-2. Its arrival count and total participating thread count are statically
-   known.
-3. Every arrival and wait is warp-uniform. The participating thread count must
-   be a multiple of the warp size, and no use may be nested in warp-divergent
-   control flow.
-4. It does not have cluster scope.
+1. There is one initialization, one static arrival, and one static wait, with
+   only supported views, captures, and lifecycle uses. Asynchronous byte
+   tracking, predicates, per-thread or multicast arrivals, and wait
+   dependencies are excluded. The initialization count must equal the arrival
+   count. A count above one is allowed: initialization with count `N` followed
+   by one arrival with count `N` completes one phase.
+2. The arrival and wait execute uniformly across distinct partitions of the
+   same warp-specialize operation. Their enclosing `scf.for` nests have
+   equivalent bounds and steps. The participant count comes from both
+   partitions' warp counts; unsupported control flow is rejected.
+3. The actual barrier descriptors are CTA-local. Ordinary shared memory can
+   contain a cross-CTA broadcast barrier, so its memory-space attribute alone
+   is insufficient to establish locality.
+4. A compiler-owned named-barrier ID is available after reservations. If
+   reservation fails, this optional pass leaves the mbarriers unchanged
+   without emitting a diagnostic or failing compilation at this pass.
 
-Failure to prove any condition leaves the mbarrier unchanged.
+These checks are necessary, but do not prove general synchronization
+equivalence. The producing transformation or workload validation must also
+establish that each dynamic wait observes the distinct phase completed by its
+corresponding arrival and the surrounding synchronization prevents premature
+reuse. The pass does not currently prove these phase-progression or lifetime
+properties.
+
+For example, one arrival can complete phase 0 and two mbarrier waits can
+validly observe that same completed phase. The second wait is redundant;
+replacing it with a named-barrier wait can hang because it participates in a
+new synchronization round. Matching loop nests rejects a single arrival
+paired with a two-iteration wait loop. Equal execution counts alone still do
+not prove that each wait observes a different phase in a larger protocol.
+
+Failed eligibility checks leave the mbarrier unchanged. Passing them does
+not validate the protocol assumptions above. Promotion remains disabled by
+default behind `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER`; enable it only for
+protocols whose equivalence has been established.
 
 ### 5.2 Profitability
 

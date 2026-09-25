@@ -1274,6 +1274,28 @@ def tmem_copy(
 
 
 @tl.builtin
+def tmem_shift(buffer: tlx.buffered_tensor, _semantic=None) -> None:
+    """Shift every row of a tensor-memory buffer down by one row.
+
+    The operation is asynchronous and maps to one ``tcgen05.shift.down``
+    instruction per 32-byte row segment. Within each 32-row TMEM group, rows
+    0 through 30 receive the previous contents of the following row and row 31
+    is unchanged.
+
+    Call :func:`tcgen05_commit` with an mbarrier and wait on that barrier before
+    consuming the shifted buffer.
+
+    Args:
+        buffer: Mutable rank-2 tensor-memory buffer to shift in place.
+    """
+    assert isinstance(buffer, tlx.buffered_tensor), "buffer must be a buffered tensor"
+    assert buffer.type.storage == tlx.storage_kind.tmem, "buffer must be in tensor memory"
+    assert len(buffer.type.shape) == 2, "buffer must be rank 2"
+    _assert_blackwell_for_tmem(_semantic.builder.options.arch)
+    _semantic.builder.create_tmem_shift(buffer.handle)
+
+
+@tl.builtin
 def local_trans(input: tlx.buffered_tensor, dims: Tuple[int] = (1, 0), _semantic=None) -> tlx.buffered_tensor:
     """
     Permutes the dimensions of a tensor.
@@ -1443,6 +1465,86 @@ def async_descriptor_load(
         eviction,
         False,
         bool(two_ctas),
+    )
+
+
+@tl.builtin
+def async_descriptor_gather(
+    desc: tl.tensor_descriptor_base,
+    result: tlx.buffered_tensor,
+    x_offsets: tl.tensor,
+    y_offset: tl.tensor,
+    barrier: tlx.mbarrier,
+    pred: tl.tensor = None,
+    multicast: bool = False,
+    _semantic=None,
+) -> None:
+    """Asynchronously gather rows from global memory into shared memory.
+
+    ``desc`` must describe a 2D tensor with a one-row block. ``x_offsets``
+    selects the source row for each row of ``result``, while ``y_offset`` is
+    the common column offset. The TMA transaction signals ``barrier`` when all
+    bytes have arrived.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base), "desc must be a tensor descriptor"
+    arch = _semantic.builder.options.arch
+    try:
+        capability = int(cuda_parse_arch(arch))
+    except (TypeError, ValueError):
+        raise NotImplementedError(
+            f"tlx.async_descriptor_gather is only available on Blackwell; got arch {arch!r}") from None
+    if capability < 100:
+        raise NotImplementedError(f"tlx.async_descriptor_gather is only available on Blackwell; got arch {arch!r}")
+
+    assert isinstance(result, tlx.buffered_tensor) and result.type.storage == tlx.storage_kind.smem, (
+        "result must be a buffered tensor in SMEM")
+    assert isinstance(barrier, tlx.mbarrier), "barrier must be an mbarrier"
+    assert len(desc.block_shape) == 2, f"descriptor must be 2D, but got block shape {desc.block_shape}"
+    assert int(desc.block_shape[0]) == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
+
+    assert isinstance(x_offsets, tl.tensor) and x_offsets.type.is_block(), "x_offsets must be a tensor"
+    assert len(x_offsets.shape) == 1, f"x_offsets must be 1D, but got shape {x_offsets.shape}"
+    assert x_offsets.dtype in (tl.int16,
+                               tl.int32), (f"x_offsets must have dtype int16 or int32, but got {x_offsets.dtype}")
+
+    result_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in result.shape]
+    block_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in desc.block_shape]
+    num_rows = int(tl._unwrap_if_constexpr(x_offsets.shape[0]))
+    assert result_shape == [num_rows, block_shape[1]
+                            ], (f"result shape must be [{num_rows}, {block_shape[1]}], but got {result_shape}")
+    assert result.dtype == desc.dtype, f"result dtype must match descriptor dtype {desc.dtype}, but got {result.dtype}"
+    assert num_rows >= 8, f"descriptor gather must have at least 8 rows, but got {num_rows}"
+    assert num_rows % 4 == 0, f"descriptor gather row count must be a multiple of 4, but got {num_rows}"
+    assert result.dtype.primitive_bitwidth <= 32, (
+        f"descriptor gather dtype cannot be greater than 32 bits, but got {result.dtype}")
+    min_cols = 32 // result.dtype.primitive_bitwidth * 8
+    assert block_shape[1] >= min_cols, (
+        f"descriptor gather of {result.dtype} must have at least {min_cols} columns, but got {block_shape[1]}")
+
+    if x_offsets.dtype == tl.int16:
+        x_offsets = _semantic.cast(x_offsets, tl.int32)
+    y_offset = _semantic.to_tensor(y_offset)
+    assert not y_offset.type.is_block() and y_offset.dtype.is_int(), "y_offset must be a scalar integer"
+    y_offset = _semantic.cast(y_offset, tl.int32)
+
+    if pred is None:
+        pred_handle = _semantic.builder.get_int1(True)
+    else:
+        pred = _semantic.to_tensor(pred)
+        assert not pred.type.is_block(), "pred must be a scalar"
+        pred_handle = _semantic.cast(pred, tl.int1).handle
+
+    multicast = tl._unwrap_if_constexpr(multicast)
+    assert isinstance(multicast, bool), f"multicast must be a constexpr bool, got {type(multicast).__name__}"
+    result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
+    _semantic.builder.create_async_TMA_gather(
+        desc.handle,
+        x_offsets.handle,
+        y_offset.handle,
+        barrier.handle,
+        result_handle,
+        pred_handle,
+        multicast,
     )
 
 

@@ -533,9 +533,14 @@ FOCUS_SUITES = (
         ),
     ),
     FocusSuite(
+        name="gfx942_2",
+        op="mm",
+        includes=("gfx950_2", ),
+    ),
+    FocusSuite(
         name="gfx942_all",
         op="mm",
-        includes=("gfx942_1", "gfx950_2"),
+        includes=("gfx942_1", "gfx942_2"),
     ),
     FocusSuite(
         name="gfx950_all",

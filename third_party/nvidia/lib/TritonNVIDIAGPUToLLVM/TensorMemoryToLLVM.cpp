@@ -892,6 +892,51 @@ struct TensorMemoryCopyOpConversion
   }
 };
 
+struct TensorMemoryShiftOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::TMEMShiftOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::TMEMShiftOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
+
+    bool twoCTAs = getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
+    if (twoCTAs) {
+      pred =
+          b.and_(pred, LLVM::NVIDIA::createLeaderCTAPredicate(loc, rewriter));
+    }
+
+    auto *currentBlock = rewriter.getInsertionBlock();
+    auto *endBlock = currentBlock->splitBlock(rewriter.getInsertionPoint());
+    auto *shiftBlock = rewriter.createBlock(
+        currentBlock->getParent(), std::next(Region::iterator(currentBlock)));
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::CondBrOp::create(rewriter, loc, pred, shiftBlock, endBlock);
+    rewriter.setInsertionPointToEnd(shiftBlock);
+
+    auto bufferTy = op.getBuffer().getType();
+    TMemAllocation alloc = getTmemAllocSizes(bufferTy);
+    constexpr int kShiftColumns = 8;
+    auto tmemPtrTy = ptr_ty(rewriter.getContext(), 6);
+    Value base = b.ptrtoint(i32_ty, adaptor.getBuffer());
+    auto group =
+        twoCTAs ? NVVM::CTAGroupKind::CTA_2 : NVVM::CTAGroupKind::CTA_1;
+    for (int col = 0; col < alloc.numCols; col += kShiftColumns) {
+      Value address = b.add(base, b.i32_val(col));
+      Value taddr = b.inttoptr(tmemPtrTy, address);
+      NVVM::Tcgen05ShiftOp::create(rewriter, loc, taddr, group);
+    }
+    LLVM::BrOp::create(rewriter, loc, endBlock);
+
+    rewriter.setInsertionPointToStart(endBlock);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct MemDescIndexOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::MemDescIndexOp> {
   using ConvertOpToLLVMPattern<
@@ -979,9 +1024,9 @@ struct TMEMSubSliceOpConversion
 void mlir::triton::NVIDIA::populateTensorMemoryOpToLLVMPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
-  patterns.add<TensorMemoryCopyOpConversion, TensorMemoryLoadOpConversion,
-               TensorMemoryStoreOpConversion, TensorMemoryAllocOpConversion>(
-      typeConverter, benefit);
+  patterns.add<TensorMemoryCopyOpConversion, TensorMemoryShiftOpConversion,
+               TensorMemoryLoadOpConversion, TensorMemoryStoreOpConversion,
+               TensorMemoryAllocOpConversion>(typeConverter, benefit);
 }
 
 void mlir::triton::NVIDIA::populateTensorMemorySubviewOpToLLVMPattern(

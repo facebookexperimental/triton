@@ -310,12 +310,11 @@ def test_self_attention_bwd_autows_clc(L, Z, dq_fp32):
 @pytest.mark.parametrize("target_count", [0, 20], ids=["causal", "target-20"])
 @pytest.mark.parametrize("dq_fp32", [False, True], ids=["dq-bf16", "dq-fp32"])
 def test_self_attention_bwd_autows_clc_jagged_production(L, Z, target_count, dq_fp32):
-    """Exercise both dQ precisions and mask modes across reused CLC CTAs.
+    """Exercise both dQ precisions, masks, and sibling-loop releases.
 
-    The Z=120 grid reuses physical CTAs and exercises the persistent-while
-    accumulation-counter path. With num_targets=20, the full target-aware mask
-    remains active; causal-prefix peeling is intentionally disabled. The matrix
-    test separately covers the split-loop empty-sibling release.
+    The L=256 shape leaves the final KV tile's unmasked Q loop empty. The
+    Z=120 grid reuses physical CTAs, exposing a missing outer-cadence K/V EMPTY
+    completion as a deadlock on the next tile.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
