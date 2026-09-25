@@ -69,19 +69,19 @@ def _process_fused_producer_tile(
     SPLIT_K: tl.constexpr,
     D: tl.constexpr,
     PROLOGUE_K: tl.constexpr,
+    SAVED_LAYERNORM_ONLY: tl.constexpr,
 ):
     mn_tile_id = tile_id % num_mn_tiles
-    pid_m, pid_n = _core._compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+    pid_m, pid_n = _core._compute_pid(
+        mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M
+    )
     k_tile_start, k_tile_end = _core._compute_k_tile_range(
         tile_id, num_mn_tiles, k_tiles_total, SPLIT_K
     )
     block_m_split: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     offs_bn = pid_n * BLOCK_SIZE_N + cluster_cta_rank * (BLOCK_SIZE_N // NUM_CTAS)
     b_bytes: tl.constexpr = (
-        tlx.size_of(tlx.dtype_of(b_desc))
-        * BLOCK_SIZE_N
-        * BLOCK_SIZE_K
-        // NUM_CTAS
+        tlx.size_of(tlx.dtype_of(b_desc)) * BLOCK_SIZE_N * BLOCK_SIZE_K // NUM_CTAS
     )
     is_leader = cluster_cta_rank == 0
 
@@ -112,22 +112,29 @@ def _process_fused_producer_tile(
             a_buf = group_id * NUM_SMEM_BUFFERS + buf
             feature_base = pid_m * BLOCK_SIZE_M + group_id * block_m_split
             features = feature_base + tl.arange(0, block_m_split)
-            source_features = features % D
+            source_features = features if SAVED_LAYERNORM_ONLY else features % D
             gamma = tl.load(gamma_ptr + source_features).to(tl.float32)
             beta = tl.load(beta_ptr + source_features).to(tl.float32)
 
             for k_subtile in tl.static_range(0, BLOCK_SIZE_K, PROLOGUE_K):
                 rows = offs_k + k_subtile + tl.arange(0, PROLOGUE_K)
                 offsets = rows[:, None] * D + source_features[None, :]
-                u = tl.load(u_ptr + offsets).to(tl.float32)
-                if feature_base < D:
-                    activation = u * tl.sigmoid(u)
-                else:
+                if SAVED_LAYERNORM_ONLY:
                     x = tl.load(x_ptr + offsets).to(tl.float32)
                     mean = tl.load(mean_ptr + rows).to(tl.float32)
                     rstd = tl.load(rstd_ptr + rows).to(tl.float32)
                     normalized = (x - mean[:, None]) * rstd[:, None]
-                    activation = (normalized * gamma[None, :] + beta[None, :]) * u
+                    activation = normalized * gamma[None, :] + beta[None, :]
+                else:
+                    u = tl.load(u_ptr + offsets).to(tl.float32)
+                    if feature_base < D:
+                        activation = u * tl.sigmoid(u)
+                    else:
+                        x = tl.load(x_ptr + offsets).to(tl.float32)
+                        mean = tl.load(mean_ptr + rows).to(tl.float32)
+                        rstd = tl.load(rstd_ptr + rows).to(tl.float32)
+                        normalized = (x - mean[:, None]) * rstd[:, None]
+                        activation = (normalized * gamma[None, :] + beta[None, :]) * u
                 dst = tlx.local_slice(
                     buffers_a[a_buf],
                     [k_subtile, 0],
@@ -181,6 +188,7 @@ def layernorm_mul_dweight_tlx(
     PROLOGUE_K: tl.constexpr = 16,
     PRODUCER_WARPS: tl.constexpr = 4,
     PRODUCER_REGS: tl.constexpr = 128,
+    SAVED_LAYERNORM_ONLY: tl.constexpr = False,
 ):
     block_m_split: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     buffers_a = tlx.local_alloc(
@@ -420,6 +428,7 @@ def layernorm_mul_dweight_tlx(
                         SPLIT_K,
                         D,
                         PROLOGUE_K,
+                        SAVED_LAYERNORM_ONLY,
                     )
                 tile_id = tlx.clc_consumer(
                     clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2
@@ -476,9 +485,7 @@ def run_fused_tlx(
     )
     num_pid_n = triton.cdiv(GRADIENT_FEATURES, config["BLOCK_SIZE_N"])
     grid = (num_pid_m * num_pid_n * config["SPLIT_K"],)
-    launch_options = (
-        {"ctas_per_cga": (2, 1, 1)} if config["NUM_CTAS"] == 2 else {}
-    )
+    launch_options = {"ctas_per_cga": (2, 1, 1)} if config["NUM_CTAS"] == 2 else {}
     cast(Any, layernorm_mul_dweight_tlx)[grid](
         inputs["x"],
         inputs["u"],
@@ -492,7 +499,9 @@ def run_fused_tlx(
         2 * FEATURES,
         GRADIENT_FEATURES,
         rows,
-        NUM_SMS=torch.cuda.get_device_properties(inputs["x"].device).multi_processor_count,
+        NUM_SMS=torch.cuda.get_device_properties(
+            inputs["x"].device
+        ).multi_processor_count,
         FP16_WORKSPACE=fp16_workspace,
         D=FEATURES,
         PROLOGUE_K=prologue_k,
@@ -518,9 +527,7 @@ def run_fused_tlx(
     )
 
 
-def _make_workspace(
-    config: dict[str, int], *, fp16_workspace: bool
-) -> torch.Tensor:
+def _make_workspace(config: dict[str, int], *, fp16_workspace: bool) -> torch.Tensor:
     rows_per_split = sm100._workspace_rows_per_split(
         2 * FEATURES, config["BLOCK_SIZE_M"], config["NUM_CTAS"]
     )
@@ -557,9 +564,7 @@ def _validate_seed(
     candidate = baseline._make_outputs()
     workspace = _make_workspace(FP32_CONFIG, fp16_workspace=fp16_workspace)
     baseline._run_unfused(inputs, reference)
-    _run_tlx_backward(
-        inputs, candidate, workspace, fp16_workspace=fp16_workspace
-    )
+    _run_tlx_backward(inputs, candidate, workspace, fp16_workspace=fp16_workspace)
     torch.cuda.synchronize()
     return baseline._accuracy(reference, candidate)
 
@@ -590,9 +595,7 @@ def main() -> int:
     inputs = baseline._make_inputs(args.rows)
     reference = baseline._make_outputs()
     candidate = baseline._make_outputs()
-    workspace = _make_workspace(
-        FP32_CONFIG, fp16_workspace=args.fp16_workspace
-    )
+    workspace = _make_workspace(FP32_CONFIG, fp16_workspace=args.fp16_workspace)
 
     def unfused() -> None:
         baseline._run_unfused(inputs, reference)
@@ -622,9 +625,7 @@ def main() -> int:
     timing = (
         None
         if args.check_only or not passed
-        else baseline._measure(
-            unfused, fused_tlx, args.warmup, args.samples, args.reps
-        )
+        else baseline._measure(unfused, fused_tlx, args.warmup, args.samples, args.reps)
     )
     result = {
         "schema_version": 1,

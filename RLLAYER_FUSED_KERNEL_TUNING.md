@@ -1,6 +1,6 @@
 # RLLayer fused-kernel tuning map
 
-Last updated: 2026-09-24
+Last updated: 2026-09-25
 
 This document maps the current RLLayer tuning backlog to reusable TLX patterns
 already present in the GEO BF16 fused-kernel library. It is a tuning aid, not a
@@ -163,6 +163,49 @@ NCU instrumented duration from `3.93` to `3.70 ms`, raises tensor-pipe activity
 from `40.1%` to `42.6%`, and reduces long-scoreboard stalls from `22.0%` to
 `20.7%`; barrier stalls remain about `23.7%`.
 
+## Current `T290048886` TLX prototype
+
+The OSS reproducer is in `third_party/tlx/tutorials/bwd_saved_layernorm_gemm.py`;
+the TLX projection and transposed-dW routes are in
+`bwd_saved_layernorm_gemm_tlx.py`. Both consume saved mean/rstd and reconstruct
+the affine-LayerNorm BF16 boundary in their GEMM prologues.
+
+The projection winner uses `BM64/BN256/BK128`, two A slots, two B slots, two
+TMEM accumulators, and one static persistent CTA per GB200 SM. One normalized A
+tile is reused across all three output-N tiles. The dW winner uses
+`BM256/BN256/BK64`, one CTA, three SMEM stages, two 128-row MMA groups, and
+split-K 38 with an FP32 workspace.
+
+Locked GB200 best-of-five medians (`warmup=5`, `samples=20`):
+
+| Region | Unfused | Original fused seed | Tuned TLX |
+|---|---:|---:|---:|
+| projection `(2097152,768,256)` | `1.125 ms` | `2.221 ms` | `1.295 ms` |
+| dW `(256,1024,2097152)` | `1.182 ms` | `2.168 ms` | `1.791 ms` |
+| complete fan-out | `1.900 ms` | `4.198 ms` | `3.048 ms` |
+
+Projection is bit-exact to the fused reference for seeds 0/1/2. dW
+relative-L2 against materialized-BF16 PyTorch/cuBLAS is
+`5.84e-4 / 5.91e-4 / 5.94e-4`, within the `1e-3` task limit. TLX improves the
+two fused seeds by 1.72x and 1.21x, respectively, but the complete fused route
+is still 60% slower than unfused because it reconstructs the common activation
+independently for the two incompatible GEMM orientations.
+
+NCU reports 128 registers/thread and 205.13 KiB dynamic SMEM for projection;
+dW uses 60 registers/thread and 205.32 KiB. Both are limited to one resident
+block by registers and shared memory. A weight-stationary projection schedule
+that retains the two weight tiles measured `1.333 ms` at BM64 and `1.892 ms` at
+BM128, so reusing A across the three N tiles remains preferable. For dW,
+split-K 38 improved on split-K 76 (`~1.80` versus `~1.82 ms`); split-K 19 and
+152 measured `3.37` and `1.89 ms`. A BN128 route measured `3.33 ms`; the
+tested two-CTA route was numerically invalid.
+
+This result is a useful negative boundary: optimizing the two prologue-fused
+GEMMs independently cannot beat the unfused fan-out, which computes and stores
+the common 1-GiB BF16 activation once. A next design needs one shared
+producer/materialization serving both GEMM orientations, not further local
+hill-climbing of either standalone route.
+
 ## GEO Kernel Optimizer
 
 GEO has a general TLX-capable Kernel Optimizer under
@@ -271,9 +314,10 @@ amortized by A reuse.
    extending its current pointer-load correctness seed.
 3. Revisit `T290079238` only with producer sharing across CTAs/output-N tiles
    or fusion with its backward outputs; retain FP32 workspace as the baseline.
-4. Use the now-competitive `(2097152,256,512)` TLX route for `T290058050`'s
-   opt-in integration, then establish the `(256,1024,2097152)` route needed by
-   `T290048886`'s fan-out fusion.
+4. Treat `T290048886` as a cross-GEMM reuse problem: its independently tuned
+   projection and dW routes remain slower than materializing the shared BF16
+   activation once. Resume only with a design that shares that producer across
+   both GEMM orientations.
 5. Treat the skinny/layout and batched-concat tasks as direct-store schedule
    work; do not begin by adding more pointwise work to a weak GEMM core.
 6. Attempt the full `T289914992` boundary only after reconstructed-hidden reuse
