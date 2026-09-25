@@ -129,6 +129,30 @@ either:
 2. publish each reconstructed A tile once for multiple consumers/CTAs/output-N
    tiles rather than recomputing it.
 
+## Current `T289901422` TLX prototype
+
+The OSS benchmark and TLX kernel are in
+`third_party/tlx/tutorials/bwd_swiglu_gemm.py` and
+`bwd_swiglu_gemm_tlx.py`. They reproduce the `(4096,8192,5120)` transposed-dW
+GEMM and preserve the FP32 SwiGLU computation, BF16 pre-dot boundary, FP32 MMA
+accumulation, and BF16 output.
+
+The best exact schedule uses `BM128/BN128/BK64`, four M accumulator groups, one
+A slot, three computed-B slots, sixteen producer warps, and a four-warp
+eight-subtile epilogue. Reusing each reconstructed B tile across four MMAs is
+the largest valid improvement found. Locked GB200 best-of-five medians are
+`272.320 us` unfused, `798.368 us` for the fused Triton seed, and `813.760 us`
+for TLX. All three verification seeds are bit exact.
+
+The negative result is structural. Plain `tlx.ops.mm` is close to cuBLAS at
+this shape (`254.714` versus `230.817 us`), but exact sigmoid reconstruction is
+repeated for every output-M group. NCU reports 40 registers/thread, 119.11 KiB
+dynamic SMEM, 37.5% theoretical occupancy, and only 27.6% compute throughput.
+A GEO-style approximate sigmoid lowers the fused TLX time to `525.408 us`, but
+changes the BF16 output (`relative_l2=4.55e-4`, max abs `0.015625`) and is
+therefore rejected. A correct two-CTA route measures `884.064 us`; an attempted
+four-CTA DSMEM broadcast did not complete and is not exposed by the driver.
+
 ## Current `T290084482` TLX prototype
 
 The OSS prototype is in
