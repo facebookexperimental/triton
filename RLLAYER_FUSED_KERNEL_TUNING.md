@@ -137,22 +137,59 @@ standalone reference in `bwd_weighted_layernorm_gemm.py` and detailed results
 in `bwd_weighted_layernorm_gemm.md`.
 
 The winning schedule uses `BM64/BN128/BK64`, two CTAs split across N, six SMEM
-stages, two TMEM buffers, and eight epilogue warps. The CTAs exchange the two
-LayerNorm row reductions through double-buffered DSMEM. Dweight/dbias remain
-FP32 in per-CTA register accumulators and are atomically finalized once per
-persistent CTA. The GEMM and dx BF16 boundaries are preserved exactly.
+stages, two TMEM buffers, eight epilogue warps, and one static persistent wave
+(152 CTAs on GB200). The CTAs exchange the two LayerNorm row reductions through
+double-buffered DSMEM. Dweight/dbias remain FP32 in per-CTA register
+accumulators and are atomically finalized once per persistent CTA. The GEMM and
+dx BF16 boundaries are preserved exactly.
 
-On a locked GB200, the tuned TLX kernel measures `2.577 ms`, versus `7.713 ms`
-for the original fused seed and `2.325 ms` for the optimized OSS unfused
-composition. It is a 2.99x improvement over the seed, but is still 10.8%
-slower than unfused. Final relative-L2 is at most `5.36e-6` across seeds 0/1/2;
+On a locked GB200, the tuned TLX kernel measures `2.462 ms`, versus `7.715 ms`
+for the original fused seed and `2.332 ms` for the optimized OSS unfused
+composition. It is a 3.13x improvement over the seed, but is still 5.6% slower
+than unfused. Final relative-L2 is at most `5.36e-6` across seeds 0/1/2;
 dweight/dbias match after their BF16 output cast.
 
 The rejected pair-CTA schedule avoids duplicated A traffic and gives a strong
 bare GEMM (~`1.04 ms`), but leaves each CTA responsible for all 256 LayerNorm
-columns and measures `3.60 ms` or worse after fusion. The next useful
-experiment is A multicast for the winning N-split schedule, with independent
-per-CTA MMA consumers and a carefully audited completion protocol.
+columns and measures `3.60 ms` or worse after fusion. A multicast on the
+winning N-split schedule is correct but neutral/slightly slower because its
+cross-CTA readiness handshake offsets the saved traffic. Static grid-stride
+scheduling is the latest win: CLC measures `2.53-2.59 ms` on this uniform grid.
+
+NCU reports 168 registers/thread, about 154 KB dynamic SMEM, no local-memory
+traffic, and one resident CTA per SM. Lower max-register limits regress and
+cannot raise occupancy because SMEM is also limiting. Static persistence lowers
+NCU instrumented duration from `3.93` to `3.70 ms`, raises tensor-pipe activity
+from `40.1%` to `42.6%`, and reduces long-scoreboard stalls from `22.0%` to
+`20.7%`; barrier stalls remain about `23.7%`.
+
+## GEO Kernel Optimizer
+
+GEO has a general TLX-capable Kernel Optimizer under
+`fbcode/gem/next_gen/geo/agents/kernel_optimizer`; it is not a TLX-only agent.
+It freezes a GEO-style accuracy and benchmark contract, uses NCU for iteration,
+and separates setup/optimization execution from independent supervision. Its
+`non-geo-kernel-launcher-skill.md` can adapt an external or custom kernel only
+after the source is available inside the selected fbsource checkout, so the OSS
+prototype here was tuned manually without modifying GEO.
+
+The most useful GEO implementation patterns for this task were:
+
+- static persistent grid-stride scheduling for uniform shapes, reserving CLC
+  for ragged or variable work;
+- a broad joint search over BM/BN/BK, SMEM stages, TMEM buffers, warp count, and
+  epilogue subtiles;
+- loading non-GEMM epilogue inputs after the K-loop in the TMA producer, when
+  the added SMEM and barrier cost is justified;
+- keeping parameter gradients in FP32 across persistent iterations and paying
+  one atomic flush per resident CTA; and
+- using explicit low-register producer/MMA tasks and checking NCU local-memory
+  traffic before treating register count itself as a problem.
+
+For this shape, only static persistence improved the result. Extra epilogue TMA
+staging, cached gamma, more/fewer pipeline buffers, alternate tile widths,
+subtiling, and lower register caps all regressed. BF16 dweight math was also
+rejected because relative-L2 rose above the `2e-3` contract.
 
 ## Tuning guidance by fusion family
 

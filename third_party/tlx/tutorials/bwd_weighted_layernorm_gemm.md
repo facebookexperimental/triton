@@ -20,6 +20,7 @@ and benchmark driver are in `bwd_weighted_layernorm_gemm_tlx.py`.
 
 - `BM64 / BN128 / BK64`
 - two-CTA cluster split across the 256 output columns
+- one resident wave (152 CTAs on GB200) with a static grid-stride loop
 - six SMEM stages and two TMEM buffers
 - eight epilogue warps
 - two FP32 row scalars exchanged through DSMEM
@@ -45,18 +46,33 @@ GB200 locked-clock medians (20 samples, three repetitions):
 
 | Implementation | Medians (ms) | Best (ms) |
 |---|---:|---:|
-| optimized OSS unfused | 2.325, 2.333, 2.386 | 2.325 |
-| original fused Triton seed | 7.720, 7.713, 7.721 | 7.713 |
-| tuned fused TLX | 2.585, 2.578, 2.577 | 2.577 |
+| optimized OSS unfused | 2.333, 2.332, 2.332, 2.333, 2.357 | 2.332 |
+| original fused Triton seed | 7.716, 7.724, 7.724, 7.715, 7.720 | 7.715 |
+| tuned fused TLX | 2.462, 2.475, 2.469, 2.474, 2.467 | 2.462 |
 
-The tuned kernel is 2.99x faster than the fused seed but remains 10.8% slower
-than the optimized unfused composition. Across seeds 0/1/2, final relative-L2
+The tuned kernel is 3.13x faster than the fused seed and is 5.6% slower than
+the optimized unfused composition. Across seeds 0/1/2, final relative-L2
 is `5.18e-6 / 4.90e-6 / 5.36e-6`; dweight and dbias match after their BF16
 output cast.
 
-The remaining gap is not the GEMM. A bare pair-CTA TLX GEMM is about 1.04 ms
-at this shape. The fused schedule pays for the LayerNorm row exchange and
-column-gradient reductions, while the N-split GEMM also reloads A in both
-CTAs. A likely next step is an A-multicast N-split schedule, provided both CTA
-MMAs can consume the multicast operand with a correct per-CTA completion
-protocol.
+Static persistence wins because every row tile has identical work and the
+stride preserves the two-CTA N split. CLC measures about `2.53-2.59 ms`; a
+non-persistent 65,536-CTA launch is about `8.58 ms` because it also flushes
+dweight/dbias atomics per tile.
+
+NCU reports 168 registers/thread, about 154 KB dynamic SMEM, 18.5% achieved
+occupancy, and zero local-memory load/store traffic. The kernel therefore has
+no register spills, and reducing the register cap cannot create another
+resident block because both registers and SMEM limit occupancy. Compared with
+the CLC version under NCU, the static schedule reduces instrumented duration
+from `3.93` to `3.70 ms`, raises tensor-pipe activity from `40.1%` to `42.6%`,
+and lowers long-scoreboard stalls from `22.0%` to `20.7%`. Barrier stalls remain
+about `23.7%`.
+
+Rejected local experiments include 4/5/7/8 SMEM stages, BK32/BK128, BM128,
+one or three TMEM buffers, epilogue subtiles, lower register caps, a separate
+statistics task, cached gamma, TMA-staged x/residual inputs, and A multicast.
+The A-multicast path was correct but its per-stage cross-CTA readiness barrier
+offset the saved traffic (`2.524-2.532 ms`). The remaining gap is in the
+LayerNorm DSMEM rendezvous and column-gradient reductions rather than the bare
+GEMM, which is about `1.04 ms` for the pair-CTA TLX implementation.

@@ -760,9 +760,9 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
     final_ptr,
     dweight_acc_ptr,
     dbias_acc_ptr,
-    M,
-    N,
-    K,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -774,6 +774,7 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
     COL_STATS: tl.constexpr,
     STATS_IN_REGS: tl.constexpr,
     SPLIT_STATS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     buffers_a = tlx.local_alloc(
         (BLOCK_SIZE_M, BLOCK_SIZE_K),
@@ -817,19 +818,15 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
     reduce_dot = tlx.local_alloc((BLOCK_SIZE_M, 1), tl.float32, 2 * num_dsmem_buffers)
     expected_reduce_bytes: tl.constexpr = BLOCK_SIZE_M * 4 * 2
     cta_rank = tlx.cluster_cta_rank()
-    clc = tlx.clc_create_context(
-        num_consumers=(4 if SPLIT_STATS else 3) * 2, num_stages=1
-    )
 
     with tlx.async_tasks():
         with tlx.async_task("default"):
             tlx.cluster_barrier()
             start_pid = tl.program_id(0)
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * num_pid_n
             tile_id = start_pid
             tmem_count = 0
-            producer_phase = 1
-            consumer_phase = 0
             reduce_buf = 0
             reduce_full_phase = 0
             reduce_empty_phase = 1
@@ -840,8 +837,6 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
                 tlx.local_store(db_accum[0], tl.zeros((1, BLOCK_SIZE_N), tl.float32))
 
             while tile_id != -1:
-                tlx.clc_producer(clc, producer_phase, multi_ctas=True)
-                producer_phase ^= 1
                 pid_m = tile_id // num_pid_n
                 pid_n = tile_id % num_pid_n
                 rows = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -987,8 +982,9 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
                     reduce_full_phase ^= 1
                     reduce_empty_phase ^= 1
                 tmem_count += 1
-                tile_id = tlx.clc_consumer(clc, consumer_phase, multi_ctas=True)
-                consumer_phase ^= 1
+                tile_id += NUM_PROGRAMS
+                if tile_id >= num_tiles:
+                    tile_id = -1
 
             if COL_STATS and not SPLIT_STATS:
                 if STATS_IN_REGS:
@@ -1012,9 +1008,9 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
                 tlx.cluster_barrier()
                 start_pid = tl.program_id(0)
                 num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+                num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * num_pid_n
                 tile_id = start_pid
                 tmem_count = 0
-                consumer_phase = 0
                 dw_regs = tl.zeros((1, BLOCK_SIZE_N), tl.float32)
                 db_regs = tl.zeros((1, BLOCK_SIZE_N), tl.float32)
                 while tile_id != -1:
@@ -1036,8 +1032,9 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
                     dw_regs += tl.sum(dy * xhat, axis=0, keep_dims=True)
                     db_regs += tl.sum(dy, axis=0, keep_dims=True)
                     tmem_count += 1
-                    tile_id = tlx.clc_consumer(clc, consumer_phase, multi_ctas=True)
-                    consumer_phase ^= 1
+                    tile_id += NUM_PROGRAMS
+                    if tile_id >= num_tiles:
+                        tile_id = -1
 
                 final_cols = cta_rank * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
                 tl.atomic_add(
@@ -1052,11 +1049,11 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
         with tlx.async_task(num_warps=1, num_regs=24):
             tlx.cluster_barrier()
             start_pid = tl.program_id(0)
+            num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
             tile_id = start_pid
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             smem_count = 0
             tmem_count = 0
-            consumer_phase = 0
             while tile_id != -1:
                 tmem_buf, tmem_phase = get_bufidx_phase(tmem_count, NUM_TMEM_BUFFERS)
                 smem_count = _nsplit_mma_tile(
@@ -1075,17 +1072,18 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
                     NUM_SMEM_BUFFERS,
                 )
                 tmem_count += 1
-                tile_id = tlx.clc_consumer(clc, consumer_phase, multi_ctas=True)
-                consumer_phase ^= 1
+                tile_id += NUM_PROGRAMS
+                if tile_id >= num_tiles:
+                    tile_id = -1
 
         with tlx.async_task(num_warps=1, num_regs=24):
             tlx.cluster_barrier()
             start_pid = tl.program_id(0)
             tile_id = start_pid
             num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+            num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * num_pid_n
             k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
             smem_count = 0
-            consumer_phase = 0
             while tile_id != -1:
                 smem_count = _nsplit_producer_tile(
                     tile_id,
@@ -1104,8 +1102,9 @@ def fused_weighted_layernorm_bwd_nsplit_tlx(
                     BLOCK_SIZE_K,
                     NUM_SMEM_BUFFERS,
                 )
-                tile_id = tlx.clc_consumer(clc, consumer_phase, multi_ctas=True)
-                consumer_phase ^= 1
+                tile_id += NUM_PROGRAMS
+                if tile_id >= num_tiles:
+                    tile_id = -1
 
         with tlx.async_task(num_warps=2, num_regs=24):
             tlx.cluster_barrier()
@@ -1211,6 +1210,7 @@ def run_tlx_nsplit(
     accum_db: torch.Tensor,
     *,
     epilogue_warps: int = 8,
+    maxnreg: int | None = None,
 ) -> None:
     rows = inputs["gradient"].shape[0]
     accum_dw.zero_()
@@ -1227,10 +1227,19 @@ def run_tlx_nsplit(
         inputs["projection_weight"].stride(),
         [NSPLIT_CONFIG["BLOCK_SIZE_N"], NSPLIT_CONFIG["BLOCK_SIZE_K"]],
     )
-    grid = (
-        triton.cdiv(rows, NSPLIT_CONFIG["BLOCK_SIZE_M"])
-        * triton.cdiv(baseline.FEATURES, NSPLIT_CONFIG["BLOCK_SIZE_N"]),
+    logical_tiles = triton.cdiv(rows, NSPLIT_CONFIG["BLOCK_SIZE_M"]) * triton.cdiv(
+        baseline.FEATURES, NSPLIT_CONFIG["BLOCK_SIZE_N"]
     )
+    num_sms = torch.cuda.get_device_properties(
+        inputs["gradient"].device
+    ).multi_processor_count
+    # Keep one persistent CTA per SM and preserve adjacent N-split CTA pairs.
+    num_programs = min(logical_tiles, num_sms)
+    num_programs -= num_programs % 2
+    grid = (num_programs,)
+    launch_options: dict[str, Any] = {"ctas_per_cga": (2, 1, 1)}
+    if maxnreg is not None:
+        launch_options["maxnreg"] = maxnreg
     cast(Any, fused_weighted_layernorm_bwd_nsplit_tlx)[grid](
         gradient_desc,
         weight_desc,
@@ -1245,10 +1254,11 @@ def run_tlx_nsplit(
         rows,
         baseline.FEATURES,
         baseline.GEMM_K,
+        NUM_PROGRAMS=num_programs,
         **NSPLIT_CONFIG,
         num_warps=epilogue_warps,
         num_stages=1,
-        ctas_per_cga=(2, 1, 1),
+        **launch_options,
     )
     cast(Any, baseline.cast_dwdb)[(1,)](
         accum_dw,
