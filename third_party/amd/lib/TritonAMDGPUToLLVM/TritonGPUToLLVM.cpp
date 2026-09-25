@@ -245,7 +245,7 @@ static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
       if (triton::gpu::toLinearLayout(srcType) ==
           triton::gpu::toLinearLayout(dstType))
         return WalkResult::advance();
-      if (waveUniform && (triton::gpu::lookupNumWarps(mod) == 1 ||
+      if (waveUniform && (triton::gpu::lookupNumWarps(predicateOp) == 1 ||
                           !cvtNeedsSharedMemory(srcType, dstType)))
         return WalkResult::advance();
       unsafeConvert = convert;
