@@ -142,16 +142,22 @@ A slot, three computed-B slots, sixteen producer warps, and a four-warp
 eight-subtile epilogue. Reusing each reconstructed B tile across four MMAs is
 the largest valid improvement found. Locked GB200 best-of-five medians are
 `272.320 us` unfused, `798.368 us` for the fused Triton seed, and `813.760 us`
-for TLX. All three verification seeds are bit exact.
+for TLX. All three verification seeds happen to be bit exact; exact equality is
+not a requirement because GEMM reduction reassociation is allowed.
 
 The negative result is structural. Plain `tlx.ops.mm` is close to cuBLAS at
 this shape (`254.714` versus `230.817 us`), but exact sigmoid reconstruction is
 repeated for every output-M group. NCU reports 40 registers/thread, 119.11 KiB
 dynamic SMEM, 37.5% theoretical occupancy, and only 27.6% compute throughput.
-A GEO-style approximate sigmoid lowers the fused TLX time to `525.408 us`, but
-changes the BF16 output (`relative_l2=4.55e-4`, max abs `0.015625`) and is
-therefore rejected. A correct two-CTA route measures `884.064 us`; an attempted
-four-CTA DSMEM broadcast did not complete and is not exposed by the driver.
+The optional GEO-style packed-FP32 `tanh.approx` sigmoid, tuned to
+`BM128/BN128/BK128` with two computed-B slots, lowers fused TLX to `495.360 us`.
+It preserves the BF16 pre-dot boundary, FP32 accumulation, and BF16 output;
+relative-L2 is `4.54e-4` to `4.61e-4` and max abs is `0.015625` across seeds
+0/1/2. The corresponding 2-CTA form is slower at `539.904 us`. NCU reports 70
+registers/thread, 201.01 KiB dynamic SMEM, one resident block, 37.5% occupancy,
+48.3% compute throughput, and 17.3% DRAM throughput. A correct exact 2-CTA
+route measures `884.064 us`; an attempted four-CTA DSMEM broadcast did not
+complete and is not exposed by the driver.
 
 ## Current `T290084482` TLX prototype
 
