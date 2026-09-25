@@ -89,6 +89,14 @@ _NONCAUSAL_WORKLOAD_LAUNCH_TUNING = {
     }
     for n_ctx in (1024, 2048, 4096, 8192)
 }
+_CAUSAL_BM192_WORKLOAD_LAUNCH_TUNING = {
+    (torch.bfloat16, 4, 48, n_ctx, 64): {
+        "STEADY_UNROLL": 1,
+        "WORKER_CAP": None,
+        "WORKER_MULTIPLIER": 1,
+    }
+    for n_ctx in (1024, 2048, 4096, 8192)
+}
 _CAUSAL_WORKLOAD_LAUNCH_TUNING = {
     (torch.bfloat16, 4, 48, 1024, 128): {
         "STEADY_UNROLL": 1,
@@ -120,10 +128,13 @@ def _select_row_schedule(causal, n_ctx, block_m):
     return dict(_CAUSAL_ROW_SCHEDULES.get(num_row_tiles, _DEFAULT_ROW_SCHEDULE))
 
 
-def _select_forward_policy(causal, shape, dtype, block_m, num_sms):
+def _select_forward_policy(causal, shape, dtype, block_m, num_sms, use_bm192=False):
     row_schedule = _select_row_schedule(causal, shape[2], block_m)
     workload_key = (dtype, *shape)
-    workload_tuning = _CAUSAL_WORKLOAD_LAUNCH_TUNING if causal else _NONCAUSAL_WORKLOAD_LAUNCH_TUNING
+    if causal and use_bm192:
+        workload_tuning = _CAUSAL_BM192_WORKLOAD_LAUNCH_TUNING
+    else:
+        workload_tuning = _CAUSAL_WORKLOAD_LAUNCH_TUNING if causal else _NONCAUSAL_WORKLOAD_LAUNCH_TUNING
     launch_tuning = workload_tuning.get(workload_key, _DEFAULT_LAUNCH_TUNING)
     worker_cap = launch_tuning["WORKER_CAP"]
     target_workers = num_sms * launch_tuning.get("WORKER_MULTIPLIER", 1)
@@ -150,7 +161,7 @@ configs = [
         {
             "BLOCK_M": 192,  # noqa: TR002 - FA3's D64 tile lowers TMA traffic.
             "BLOCK_N": 128,
-            "NUM_BUFFERS": 3,
+            "NUM_BUFFERS": num_buffers,
             "NUM_MMA_WARPS": 12,
             "NUM_MMA_GROUPS": 3,
         },
@@ -158,6 +169,7 @@ configs = [
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     )
+    for num_buffers in (2, 3)
 ]
 
 
@@ -194,22 +206,49 @@ def _compute_offsets(
     ROW_SWAP_SRC_1: tl.constexpr,
     ROW_SWAP_XOR: tl.constexpr,
 ):
-    group_id = tile_idx // num_pid_in_group
-    first_pid_n = group_id
-    off_hz = first_pid_n
-    start_m = tile_idx % num_pid_in_group
-    if CAUSAL:
-        if ROW_REVERSE_HEAD_GROUP != 0:
-            reverse_rows = ((off_hz // ROW_REVERSE_HEAD_GROUP) & 1) != 0
-            start_m = tl.where(reverse_rows, ROW_REVERSE_MAX - start_m, start_m)
+    if CAUSAL and BLOCK_M == 192:
+        l2_head_group: tl.constexpr = 64 if N_CTX <= 2048 else (32 if N_CTX == 4096 else 16)
+        section_size = num_pid_in_group * l2_head_group
+        section_id = tile_idx // section_size
+        section_offset = tile_idx % section_size
+        row_slot = section_offset // l2_head_group
+        start_m = num_pid_in_group - 1 - row_slot
+        if N_CTX == 1024:
+            start_m = tl.where(row_slot == 2, 2, start_m)
+            start_m = tl.where(row_slot == 3, 3, start_m)
+        elif N_CTX == 2048:
+            start_m = tl.where(row_slot == 0, 7, start_m)
+            start_m = tl.where(row_slot == 3, 10, start_m)
+        elif N_CTX == 4096:
+            start_m = tl.where(row_slot == 0, 11, start_m)
+            start_m = tl.where(row_slot == 10, 21, start_m)
+        else:
+            start_m = tl.where(row_slot == 10, 20, start_m)
+            start_m = tl.where(row_slot == 22, 32, start_m)
+            start_m = tl.where(row_slot == 11, 21, start_m)
+            start_m = tl.where(row_slot == 21, 31, start_m)
+            start_m = tl.where(row_slot == 25, 10, start_m)
+            start_m = tl.where(row_slot == 32, 17, start_m)
+            start_m = tl.where(row_slot == 0, 37, start_m)
+            start_m = tl.where(row_slot == 5, 42, start_m)
+        off_hz = section_id * l2_head_group + section_offset % l2_head_group
+    else:
+        group_id = tile_idx // num_pid_in_group
+        first_pid_n = group_id
+        off_hz = first_pid_n
+        start_m = tile_idx % num_pid_in_group
+        if CAUSAL:
+            if ROW_REVERSE_HEAD_GROUP != 0:
+                reverse_rows = ((off_hz // ROW_REVERSE_HEAD_GROUP) & 1) != 0
+                start_m = tl.where(reverse_rows, ROW_REVERSE_MAX - start_m, start_m)
 
-        if ROW_AFFINE_MOD != 0:
-            source_m = start_m
-            mapped_m = (source_m * ROW_AFFINE_MUL + ROW_AFFINE_ADD) % ROW_AFFINE_MOD
-            if ROW_SWAP_XOR != 0:
-                swap_rows = (source_m == ROW_SWAP_SRC_0) | (source_m == ROW_SWAP_SRC_1)
-                mapped_m = tl.where(swap_rows, mapped_m ^ ROW_SWAP_XOR, mapped_m)
-            start_m = mapped_m
+            if ROW_AFFINE_MOD != 0:
+                source_m = start_m
+                mapped_m = (source_m * ROW_AFFINE_MUL + ROW_AFFINE_ADD) % ROW_AFFINE_MOD
+                if ROW_SWAP_XOR != 0:
+                    swap_rows = (source_m == ROW_SWAP_SRC_0) | (source_m == ROW_SWAP_SRC_1)
+                    mapped_m = tl.where(swap_rows, mapped_m ^ ROW_SWAP_XOR, mapped_m)
+                start_m = mapped_m
     off_z = off_hz // H
     off_h = off_hz % H
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
@@ -249,9 +288,11 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                     ):
     tl.static_assert(BLOCK_N <= HEAD_DIM or (HEAD_DIM == 64 and BLOCK_N == 128))
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
-    SERIALIZE_QK: tl.constexpr = CAUSAL or HEAD_DIM == 128
+    SERIALIZE_QK: tl.constexpr = (CAUSAL and not USE_BM192) or HEAD_DIM == 128
     USE_SCHEDULER_BARRIER: tl.constexpr = USE_BM192
-    USE_K_AHEAD: tl.constexpr = not CAUSAL and HEAD_DIM == 64 and not USE_BM192
+    USE_K_AHEAD: tl.constexpr = HEAD_DIM == 64 and (
+        (not CAUSAL and not USE_BM192) or (CAUSAL and USE_BM192)
+    )
     PRODUCER_REGISTERS: tl.constexpr = 32 if USE_BM192 else None
     CONSUMER_REGISTERS: tl.constexpr = 160 if USE_BM192 else _FWD_CONSUMER_REGISTERS
 
@@ -329,14 +370,25 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     ROW_SWAP_XOR=ROW_SWAP_XOR,
                 )
 
-                # Give QK priority on the D64 noncausal producer TMA stream.
-                # Other paths retain their established K/V issue order.
+                # Keep K one pipeline stage ahead of V so the next QK can issue
+                # while the previous probability tile multiplies V.
                 if USE_K_AHEAD:
                     kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                    kv_offset = kv_offset_y + lo
+                    first_kv_idx = ((hi - 1) // BLOCK_N) * BLOCK_N if CAUSAL and USE_BM192 else lo
+                    kv_offset = kv_offset_y + first_kv_idx
                     tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                     tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
+                    if USE_BM192:
+                        tlx.async_descriptor_load(
+                            desc_k,
+                            k_tiles[kv_buf_id],
+                            [off_hz, first_kv_idx, 0],
+                            k_fulls[kv_buf_id],
+                        )
+                    else:
+                        tlx.async_descriptor_load(
+                            desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id]
+                        )
 
                 _, q_phase = get_bufidx_phase(i, 1)
                 q_cid: tl.constexpr = 0
@@ -373,26 +425,65 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         )
 
                 if USE_K_AHEAD:
-                    for kv_idx in tl.range(lo + BLOCK_N, hi, BLOCK_N, loop_unroll_factor=STEADY_UNROLL):
+                    if CAUSAL and USE_BM192:
+                        producer_loop_start = first_kv_idx - BLOCK_N
+                        producer_loop_end = lo - BLOCK_N
+                        PRODUCER_LOOP_STEP: tl.constexpr = -BLOCK_N
+                    else:
+                        producer_loop_start = lo + BLOCK_N
+                        producer_loop_end = hi
+                        PRODUCER_LOOP_STEP: tl.constexpr = BLOCK_N
+                    for kv_idx in tl.range(
+                        producer_loop_start,
+                        producer_loop_end,
+                        PRODUCER_LOOP_STEP,
+                        loop_unroll_factor=STEADY_UNROLL,
+                    ):
                         next_kv_count = accum_cnt_kv + 1
                         k_buf_id, k_phase = get_bufidx_phase(next_kv_count, NUM_BUFFERS)
                         k_offset = kv_offset_y + kv_idx
                         tlx.barrier_wait(k_empties[k_buf_id], k_phase ^ 1)
                         tlx.barrier_expect_bytes(k_fulls[k_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        tlx.async_descriptor_load(desc_k, k_tiles[k_buf_id], [k_offset, 0], k_fulls[k_buf_id])
+                        if USE_BM192:
+                            tlx.async_descriptor_load(
+                                desc_k, k_tiles[k_buf_id], [off_hz, kv_idx, 0], k_fulls[k_buf_id]
+                            )
+                        else:
+                            tlx.async_descriptor_load(
+                                desc_k, k_tiles[k_buf_id], [k_offset, 0], k_fulls[k_buf_id]
+                            )
 
                         v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                        v_offset = kv_offset_y + kv_idx - BLOCK_N
+                        previous_kv_idx = kv_idx - PRODUCER_LOOP_STEP
+                        v_offset = kv_offset_y + previous_kv_idx
                         tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
                         tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id])
+                        if USE_BM192:
+                            tlx.async_descriptor_load(
+                                desc_v,
+                                v_tiles[v_buf_id],
+                                [off_hz, previous_kv_idx, 0],
+                                v_fulls[v_buf_id],
+                            )
+                        else:
+                            tlx.async_descriptor_load(
+                                desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id]
+                            )
                         accum_cnt_kv = next_kv_count
 
                     v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                    v_offset = kv_offset_y + hi - BLOCK_N
+                    final_v_idx = lo if CAUSAL and USE_BM192 else hi - BLOCK_N
+                    v_offset = kv_offset_y + final_v_idx
                     tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
                     tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id])
+                    if USE_BM192:
+                        tlx.async_descriptor_load(
+                            desc_v, v_tiles[v_buf_id], [off_hz, final_v_idx, 0], v_fulls[v_buf_id]
+                        )
+                    else:
+                        tlx.async_descriptor_load(
+                            desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id]
+                        )
                     accum_cnt_kv += 1
                 else:
                     kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
@@ -505,6 +596,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 tlx.barrier_wait(q_fulls[cid], q_phase)
 
                 k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+                first_kv_idx = ((hi - 1) // BLOCK_N) * BLOCK_N if CAUSAL and USE_BM192 else lo
 
                 # wait for the K[0] buffer to be populated by the producer
                 tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
@@ -535,20 +627,28 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # release the K buffer
                 tlx.barrier_arrive(k_empties[k_buf_id], 1)
                 # The single-tile path has completed its final QK read.
-                if lo + BLOCK_N == hi:
+                if (CAUSAL and USE_BM192 and first_kv_idx == lo) or (
+                    not (CAUSAL and USE_BM192) and lo + BLOCK_N == hi
+                ):
                     tlx.barrier_arrive(q_empties[cid], 1)
 
                 # -- compute m_i and l_i ----
                 if CAUSAL:
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                    if lo + BLOCK_M >= hi:
-                        offs_n = lo + tl.arange(0, BLOCK_N)
+                    if (CAUSAL and USE_BM192) or lo + BLOCK_M >= hi:
+                        offs_n = first_kv_idx + tl.arange(0, BLOCK_N)
                         qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+                if CAUSAL and USE_BM192:
+                    all_masked = m_ij == -float("inf")
                 qk = qk * qk_scale - m_ij[:, None]
-                p = tl.math.exp2(qk)
-                # -- compute correction factor
-                alpha = tl.math.exp2(m_i - m_ij)
+                if CAUSAL and USE_BM192:
+                    p = tl.where(all_masked[:, None], 0.0, tl.math.exp2(qk))
+                    alpha = tl.where(all_masked, 1.0, tl.math.exp2(m_i - m_ij))
+                else:
+                    p = tl.math.exp2(qk)
+                    # -- compute correction factor
+                    alpha = tl.math.exp2(m_i - m_ij)
                 # -- update output accumulator[0] --
                 acc = acc * alpha[:, None]
                 l_ij = tl.sum(p, 1)
@@ -561,13 +661,26 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # Keep the steady-state loop branch-free. In the causal case,
                 # peel every KV tile that intersects the BLOCK_M-wide diagonal
                 # region. The max keeps the initial tile out of the later loops.
-                steady_hi = tl.maximum(lo + BLOCK_N, hi - BLOCK_M) if CAUSAL else hi
-                steady_tiles = (steady_hi - (lo + BLOCK_N)) // BLOCK_N
-                paired_hi = steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi
+                if CAUSAL and USE_BM192:
+                    loop_start = first_kv_idx - BLOCK_N
+                    loop_end = lo - BLOCK_N
+                    LOOP_STEP: tl.constexpr = -BLOCK_N
+                    paired_hi = loop_end
+                else:
+                    if CAUSAL:
+                        steady_hi = tl.maximum(lo + BLOCK_N, hi - BLOCK_M)
+                        steady_hi = (steady_hi // BLOCK_N) * BLOCK_N
+                    else:
+                        steady_hi = hi
+                    steady_tiles = (steady_hi - (lo + BLOCK_N)) // BLOCK_N
+                    paired_hi = steady_hi - (steady_tiles % 2) * BLOCK_N if CAUSAL else steady_hi
+                    loop_start = lo + BLOCK_N
+                    loop_end = paired_hi
+                    LOOP_STEP: tl.constexpr = BLOCK_N
                 for kv_idx in tl.range(
-                        lo + BLOCK_N,
-                        paired_hi,
-                        BLOCK_N,
+                        loop_start,
+                        loop_end,
+                        LOOP_STEP,
                         loop_unroll_factor=STEADY_UNROLL,
                 ):
                     k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
@@ -625,6 +738,12 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     qk = tlx.async_dot_wait(1, qk)
                     # release the K buffer
                     tlx.barrier_arrive(k_empties[k_buf_id], 1)
+                    if CAUSAL and USE_BM192:
+                        if kv_idx == lo:
+                            tlx.barrier_arrive(q_empties[cid], 1)
+                        if kv_idx + BLOCK_N + BLOCK_M > hi:
+                            offs_n = kv_idx + tl.arange(0, BLOCK_N)
+                            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
 
                     # -- compute m_i and l_i ----
                     m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
@@ -647,7 +766,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     acc = acc * alpha[:, None]
                     accum_cnt_kv += 1
 
-                if CAUSAL:
+                if CAUSAL and not USE_BM192:
                     for kv_idx in tl.range(paired_hi, hi, BLOCK_N):
                         k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
                         tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
@@ -1062,7 +1181,6 @@ class _attention(torch.autograd.Function):
         extra_kern_args = {}
         use_bm192 = (
             config is None
-            and not causal
             and q.dtype == torch.bfloat16
             and q.shape[0] == 4
             and q.shape[1] == 48
@@ -1108,6 +1226,7 @@ class _attention(torch.autograd.Function):
             q.dtype,
             block_m,
             NUM_SMS,
+            use_bm192=use_bm192,
         )
 
         def grid(META):
