@@ -1744,3 +1744,62 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// tt.extern_elementwise names its callee in libname/libpath/symbol attributes,
+// which the generic operand-only path threw away. The dispatcher cannot be
+// called from a traced kernel body -- the frontend rewrites the list and dict
+// literals -- so each call gets a module-scope @extern wrapper, the same shape
+// libdevice uses for its own bindings.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: @tl.core.extern
+  // CHECK: def _extern_fn_extern_elementwise_wrapper_0(arg0, _semantic=None):
+  // CHECK: tl.core.extern_elementwise("", "", [arg0], {(tl.float32, ): ("__triton_hip_fast_expf", tl.float32)}, is_pure=True, _semantic=_semantic)
+  // CHECK-LABEL: def extern_elementwise_wrapper(
+  // CHECK: = _extern_fn_extern_elementwise_wrapper_0(arg0)
+  tt.func public @extern_elementwise_wrapper(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x {libname = "", libpath = "", symbol = "__triton_hip_fast_expf", pure = true} : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // Two operands exercise the per-argument list and the dtype-tuple key, and
+  // pure = false is the other side of the is_pure branch.
+  // CHECK: @tl.core.extern
+  // CHECK: def _extern_fn_extern_elementwise_binary_impure_0(arg0, arg1, _semantic=None):
+  // CHECK: tl.core.extern_elementwise("", "", [arg0, arg1], {(tl.float32, tl.float32, ): ("__triton_hip_fast_fdividef", tl.float32)}, is_pure=False, _semantic=_semantic)
+  // CHECK-LABEL: def extern_elementwise_binary_impure(
+  // CHECK: = _extern_fn_extern_elementwise_binary_impure_0(arg0, arg1)
+  tt.func public @extern_elementwise_binary_impure(%x: tensor<256xf32, #blocked>, %y: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x, %y {libname = "", libpath = "", symbol = "__triton_hip_fast_fdividef", pure = false} : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // The wrapper name embeds the enclosing symbol, which MLIR lets carry `.`
+  // and `$`; unsanitized those reach a Python `def`. libname/libpath go inside
+  // a double-quoted literal, so a quote or a backslash has to be escaped.
+  // CHECK: @tl.core.extern
+  // CHECK: def _extern_fn_odd_name_v1_0(arg0, _semantic=None):
+  // CHECK: tl.core.extern_elementwise("li\"b", "/a\\b", [arg0],
+  // CHECK-LABEL: def odd_name_v1(
+  // CHECK: = _extern_fn_odd_name_v1_0(arg0)
+  tt.func public @"odd.name$v1"(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x {libname = "li\"b", libpath = "/a\\b", symbol = "__triton_hip_fast_expf", pure = true} : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // `odd.name$v1` and `odd-name-v1` sanitize to the same identifier, so both
+  // wrappers would be called _extern_fn_odd_name_v1_0 and the second Python
+  // def would shadow the first -- one kernel dispatching through the other's
+  // symbol. The second claimant gets a suffix.
+  // CHECK: def _extern_fn_odd_name_v1_0_1(arg0, _semantic=None):
+  // CHECK: "__triton_hip_fast_fdividef"
+  // CHECK-LABEL: def odd_name_v1_1(
+  // CHECK: = _extern_fn_odd_name_v1_0_1(arg0)
+  tt.func public @"odd-name-v1"(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %e = tt.extern_elementwise %x {libname = "", libpath = "", symbol = "__triton_hip_fast_fdividef", pure = true} : (tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
