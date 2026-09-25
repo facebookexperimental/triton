@@ -19,6 +19,7 @@ from triton._filecheck import run_parser
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language._core import builtin as gluon_builtin
+import builtins
 import dataclasses
 import importlib.util
 import re
@@ -2396,6 +2397,462 @@ def test_amd_fa_cluster_rejects_unsupported_inputs():
         _validate_amd_fa_cluster_tiles(256, 128)
 
 
+def test_amd_fa_cluster_origami_models_attention_geometry(monkeypatch):
+    calls = {"latencies": []}
+
+    class FakeOrigami:
+        grid_selection_t = SimpleNamespace(data_parallel="data_parallel")
+        transpose_t = SimpleNamespace(N="N", T="T")
+
+        @staticmethod
+        def string_to_datatype(name):
+            return name
+
+        @staticmethod
+        def get_hardware_for_device(device_index):
+            calls["device_index"] = device_index
+            return SimpleNamespace()
+
+        @staticmethod
+        def problem_t():
+            return SimpleNamespace()
+
+        @staticmethod
+        def dim3_t(m, n, k):
+            return SimpleNamespace(m=m, n=n, k=k)
+
+        @staticmethod
+        def config_t():
+            return SimpleNamespace()
+
+        @staticmethod
+        def compute_total_latency(problem, hardware, config, num_cu):
+            calls["latencies"].append((problem, hardware, config, num_cu))
+            if problem.b_transpose == "T":
+                return {128: 1.0, 256: 2.0}[config.mt.m]
+            return {128: 2.0, 256: 1.0}[config.mt.m]
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: FakeOrigami)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+    tiles = _amd_fa_cluster_module._cluster_origami_tiles(2, 3, 2048, 64, torch.bfloat16, 7, 256)
+
+    assert tiles == ((128, 64), (256, 64))
+    assert calls["device_index"] == 7
+    qk_calls = [call for call in calls["latencies"] if call[0].b_transpose == "T"]
+    pv_calls = [call for call in calls["latencies"] if call[0].b_transpose == "N"]
+    assert len(qk_calls) == len(pv_calls) == 2
+    qk_problem = qk_calls[0][0]
+    pv_problem = pv_calls[0][0]
+    assert (qk_problem.size.m, qk_problem.size.n, qk_problem.size.k) == (2048, 2048, 64)
+    assert (pv_problem.size.m, pv_problem.size.n, pv_problem.size.k) == (2048, 64, 2048)
+    assert qk_problem.batch == pv_problem.batch == 6
+    assert all(call[3] == 256 for call in calls["latencies"])
+    assert all(call[2].grid_selection == "data_parallel" for call in calls["latencies"])
+    assert [(call[2].mt.m, call[2].mt.n, call[2].mt.k, call[2].mi.m, call[2].mi.n, call[2].mi.k,
+             call[2].occupancy) for call in qk_calls] == [
+                 (128, 64, 64, 32, 32, 16, 2),
+                 (256, 64, 64, 32, 32, 16, 2),
+             ]
+    assert [(call[2].mt.m, call[2].mt.n, call[2].mt.k) for call in pv_calls] == [
+        (128, 64, 64),
+        (256, 64, 64),
+    ]
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+
+def test_amd_fa_cluster_origami_unavailable_falls_back(monkeypatch):
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: None)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 1, 2048, 64, torch.bfloat16, 0, 256) == ()
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+
+def test_amd_fa_cluster_origami_import_failure_falls_back(monkeypatch):
+    import_module = builtins.__import__
+
+    def fail_origami_import(name, *args, **kwargs):
+        if name == "origami":
+            raise RuntimeError("incompatible native extension")
+        return import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_origami_import)
+    _amd_fa_cluster_module._get_origami_module.cache_clear()
+
+    assert _amd_fa_cluster_module._get_origami_module() is None
+    _amd_fa_cluster_module._get_origami_module.cache_clear()
+
+
+def test_amd_fa_cluster_origami_retains_shallow_grid_alternate(monkeypatch):
+
+    class FakeOrigami:
+        grid_selection_t = SimpleNamespace(data_parallel="data_parallel")
+        model_t = SimpleNamespace(gemm="gemm")
+        transpose_t = SimpleNamespace(N="N", T="T")
+
+        string_to_datatype = staticmethod(lambda name: name)
+        get_hardware_for_device = staticmethod(lambda device_index: SimpleNamespace())
+        problem_t = staticmethod(lambda: SimpleNamespace(num_cus=0))
+        dim3_t = staticmethod(lambda m, n, k: SimpleNamespace(m=m, n=n, k=k))
+        config_t = staticmethod(SimpleNamespace)
+
+        @staticmethod
+        def compute_total_latency(problem, hardware, config):
+            assert problem.num_cus == 256
+            block_n = config.mt.n if problem.b_transpose == "T" else config.mt.k
+            return {
+                (128, 64): 2.0,
+                (256, 64): 1.0,
+            }[(config.mt.m, block_n)]
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: FakeOrigami)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 8, 2048, 64, torch.bfloat16, 0, 256) == (
+        (128, 64),
+        (256, 64),
+    )
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 128, 2048, 64, torch.bfloat16, 0, 256) == ((256, 64), )
+    assert _amd_fa_cluster_module._cluster_origami_tiles(32, 64, 512, 64, torch.bfloat16, 0, 256) == ((256, 64), )
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+
+def test_amd_fa_cluster_origami_retains_weak_model_margin(monkeypatch):
+
+    class FakeOrigami:
+        grid_selection_t = SimpleNamespace(data_parallel="data_parallel")
+        model_t = SimpleNamespace(gemm="gemm")
+        transpose_t = SimpleNamespace(N="N", T="T")
+
+        string_to_datatype = staticmethod(lambda name: name)
+        get_hardware_for_device = staticmethod(lambda device_index: SimpleNamespace())
+        problem_t = staticmethod(lambda: SimpleNamespace(num_cus=0))
+        dim3_t = staticmethod(lambda m, n, k: SimpleNamespace(m=m, n=n, k=k))
+        config_t = staticmethod(SimpleNamespace)
+
+        @staticmethod
+        def compute_total_latency(problem, hardware, config):
+            block_n = config.mt.n if problem.b_transpose == "T" else config.mt.k
+            scores = {
+                "T": {
+                    (128, 64): 1.20,
+                    (256, 64): 1.00,
+                },
+                "N": {
+                    (128, 64): 1.08,
+                    (256, 64): 1.00,
+                },
+            }
+            return scores[problem.b_transpose][(config.mt.m, block_n)]
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: FakeOrigami)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+    # This grid sits just above the four-programs-per-CU cutoff, but measured
+    # BF16 attention still favors BM128 when the projected margin is this weak.
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 171, 1472, 64, torch.bfloat16, 0, 256) == (
+        (128, 64),
+        (256, 64),
+    )
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+
+def test_amd_fa_cluster_origami_incomplete_model_falls_back(monkeypatch):
+
+    class IncompleteOrigami:
+        grid_selection_t = SimpleNamespace(data_parallel="data_parallel")
+        model_t = SimpleNamespace(gemm="gemm")
+        transpose_t = SimpleNamespace(N="N", T="T")
+
+        string_to_datatype = staticmethod(lambda name: name)
+        get_hardware_for_device = staticmethod(lambda device_index: SimpleNamespace())
+        problem_t = staticmethod(lambda: SimpleNamespace(num_cus=0))
+        dim3_t = staticmethod(lambda m, n, k: SimpleNamespace(m=m, n=n, k=k))
+        config_t = staticmethod(SimpleNamespace)
+
+        @staticmethod
+        def compute_total_latency(problem, hardware, config):
+            block_n = config.mt.n if problem.b_transpose == "T" else config.mt.k
+            return math.nan if (config.mt.m, block_n) == (128, 64) else 1.0
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: IncompleteOrigami)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 64, 2048, 64, torch.float16, 0, 256) == ()
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError, OverflowError, KeyError])
+def test_amd_fa_cluster_origami_model_failure_falls_back(monkeypatch, error_type):
+
+    class FailingOrigami:
+        grid_selection_t = SimpleNamespace(data_parallel="data_parallel")
+        model_t = SimpleNamespace(gemm="gemm")
+        transpose_t = SimpleNamespace(N="N", T="T")
+
+        string_to_datatype = staticmethod(lambda name: name)
+        get_hardware_for_device = staticmethod(lambda device_index: SimpleNamespace())
+        problem_t = staticmethod(lambda: SimpleNamespace(num_cus=0))
+        dim3_t = staticmethod(lambda m, n, k: SimpleNamespace(m=m, n=n, k=k))
+        config_t = staticmethod(SimpleNamespace)
+        compute_total_latency = staticmethod(lambda *args: (_ for _ in ()).throw(error_type("model failure")))
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: FailingOrigami)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 64, 2048, 64, torch.float16, 0, 256) == ()
+    assert _amd_fa_cluster_module._cluster_origami_tiles(1, 64, 2048, 64, torch.float16, 0, 0) == ()
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+
+
+def test_amd_fa_cluster_origami_uses_visible_device_geometry(monkeypatch):
+    device = torch.device("cuda:7")
+    tensor = SimpleNamespace(
+        shape=(1, 64, 2048, 64),
+        dtype=torch.bfloat16,
+        device=device,
+        is_contiguous=lambda: True,
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        _amd_fa_cluster_module.torch.cuda,
+        "get_device_properties",
+        lambda queried_device: SimpleNamespace(
+            gcnArchName="gfx950:sramecc+:xnack-",
+            multi_processor_count=120,
+        ),
+    )
+
+    def select_tiles(*args):
+        captured["args"] = args
+        return ((256, 64), )
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_cluster_origami_tiles", select_tiles)
+
+    assert _amd_fa_cluster_module._select_cluster_origami_tiles(tensor, tensor, tensor, False) == ((256, 64), )
+    assert captured["args"][-2:] == (7, 120)
+
+
+@pytest.mark.parametrize(
+    ("arch", "cu_count"),
+    [
+        ("gfx942:sramecc+:xnack-", 304),
+        ("gfx950:sramecc+:xnack-", 0),
+    ],
+)
+def test_amd_fa_cluster_origami_rejects_incompatible_device(monkeypatch, arch, cu_count):
+    tensor = SimpleNamespace(device=torch.device("cuda:3"))
+    monkeypatch.setattr(
+        _amd_fa_cluster_module.torch.cuda,
+        "get_device_properties",
+        lambda queried_device: SimpleNamespace(gcnArchName=arch, multi_processor_count=cu_count),
+    )
+
+    assert _amd_fa_cluster_module._cluster_origami_device_key(tensor) is None
+
+
+def test_amd_fa_cluster_origami_device_query_failure_falls_back(monkeypatch):
+    tensor = SimpleNamespace(device=torch.device("cuda:3"))
+
+    def fail_device_query(device):
+        raise OSError("device properties unavailable")
+
+    monkeypatch.setattr(_amd_fa_cluster_module.torch.cuda, "get_device_properties", fail_device_query)
+
+    assert _amd_fa_cluster_module._cluster_origami_device_key(tensor) is None
+
+
+def test_amd_fa_cluster_origami_autotune_cache_is_per_device(monkeypatch):
+    get_tuner = _amd_fa_cluster_module._cluster_tile_autotuner_for_device
+    get_tuner.cache_clear()
+    monkeypatch.setattr(_amd_fa_cluster_module.triton.knobs.autotuning, "cache", True)
+    device_key = (3, "gfx950:sramecc+:xnack-", 256)
+
+    first = get_tuner(device_key)
+    same = get_tuner(device_key)
+    other_device = get_tuner((7, device_key[1], device_key[2]))
+    partitioned = get_tuner((3, device_key[1], 120))
+
+    assert first is same
+    assert first is not other_device
+    assert first is not partitioned
+    assert first.cache is not other_device.cache
+    assert first.cache is not partitioned.cache
+    assert first.cache_results is False
+    assert other_device.cache_results is False
+    assert partitioned.cache_results is False
+    assert first.do_bench is _amd_fa_cluster_module._cluster_origami_bench
+    get_tuner.cache_clear()
+
+
+def test_amd_fa_cluster_origami_uses_stable_benchmark_window(monkeypatch):
+    captured = {}
+    result = object()
+
+    def do_bench(fn, **kwargs):
+        captured.update(kwargs)
+        return result
+
+    monkeypatch.setattr(_amd_fa_cluster_module.triton.testing, "do_bench", do_bench)
+
+    assert _amd_fa_cluster_module._cluster_origami_bench(lambda: None, (0.5, 0.2, 0.8)) is result
+    assert captured == {
+        "warmup": 300,
+        "rep": 100,
+        "quantiles": (0.5, 0.2, 0.8),
+    }
+
+
+def test_amd_fa_cluster_origami_prunes_same_candidate_universe(monkeypatch):
+    configs = _amd_fa_cluster_module._cluster_tile_configs()
+    tensor = object()
+    named_args = {"Q": tensor, "K": tensor, "V": tensor}
+    monkeypatch.setattr(
+        _amd_fa_cluster_module,
+        "_select_cluster_origami_tiles",
+        lambda *args: ((128, 64), (256, 64)),
+    )
+
+    exhaustive = _amd_fa_cluster_module._prune_cluster_tile_configs(
+        configs,
+        named_args,
+        REQUESTED_BLOCK_M=256,
+        REQUESTED_BLOCK_N=64,
+        USE_ORIGAMI_SELECTOR=True,
+        N_CTX=2048,
+        IS_CAUSAL=False,
+    )
+    monkeypatch.setattr(
+        _amd_fa_cluster_module,
+        "_select_cluster_origami_tiles",
+        lambda *args: ((256, 64), ),
+    )
+    pruned = _amd_fa_cluster_module._prune_cluster_tile_configs(
+        configs,
+        named_args,
+        REQUESTED_BLOCK_M=256,
+        REQUESTED_BLOCK_N=64,
+        USE_ORIGAMI_SELECTOR=True,
+        N_CTX=2048,
+        IS_CAUSAL=False,
+    )
+    regular = _amd_fa_cluster_module._prune_cluster_tile_configs(
+        configs,
+        named_args,
+        REQUESTED_BLOCK_M=128,
+        REQUESTED_BLOCK_N=32,
+        USE_ORIGAMI_SELECTOR=False,
+        N_CTX=2048,
+        IS_CAUSAL=False,
+    )
+
+    assert [(config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.kwargs["USE_DIRECT_LOAD"])
+            for config in exhaustive] == [(128, 64, False), (256, 64, False)]
+    assert [(config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.kwargs["USE_DIRECT_LOAD"])
+            for config in pruned] == [(256, 64, False)]
+    assert [(config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.kwargs["USE_DIRECT_LOAD"])
+            for config in regular] == [(128, 32, False)]
+
+
+def test_amd_fa_cluster_origami_launch_uses_selected_tile(monkeypatch):
+    n_ctx = 2048
+    strides = (64 * n_ctx * 64, n_ctx * 64, 64, 1)
+    tensor = SimpleNamespace(
+        shape=(1, 1, n_ctx, 64),
+        dtype=torch.bfloat16,
+        stride=lambda dim: strides[dim],
+        is_contiguous=lambda: True,
+    )
+    captured = {}
+
+    class CaptureKernel:
+
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+
+            def launch(*args, **kwargs):
+                captured["kwargs"] = kwargs
+
+            return launch
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_validate_cluster_inputs", lambda q, k, v: None)
+    device_key = (7, "gfx950:sramecc+:xnack-", 120)
+    monkeypatch.setattr(_amd_fa_cluster_module, "_cluster_origami_device_key", lambda q: device_key)
+    monkeypatch.setattr(_amd_fa_cluster_module.torch, "empty_like", lambda q: q)
+
+    def get_tuner(key):
+        captured["device_key"] = key
+        return CaptureKernel()
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_cluster_tile_autotuner_for_device", get_tuner)
+
+    out = _amd_fa_cluster_module.flash_attn_cluster_pipeline(
+        tensor,
+        tensor,
+        tensor,
+        1.0,
+        False,
+        USE_ORIGAMI=True,
+    )
+
+    assert out is tensor
+    assert captured["device_key"] == device_key
+    assert captured["grid"]({"BLOCK_M": 128}) == (16, 1, 1)
+    assert captured["kwargs"]["REQUESTED_BLOCK_M"] == 256
+    assert captured["kwargs"]["REQUESTED_BLOCK_N"] == 64
+    assert captured["kwargs"]["USE_ORIGAMI_SELECTOR"] is True
+    assert "BLOCK_M" not in captured["kwargs"]
+    assert "BLOCK_N" not in captured["kwargs"]
+    assert "USE_DIRECT_LOAD" not in captured["kwargs"]
+    assert "num_warps" not in captured["kwargs"]
+    assert captured["kwargs"]["waves_per_eu"] == 2
+
+
+def test_amd_fa_cluster_explicit_config_bypasses_origami(monkeypatch):
+    n_ctx = 2048
+    strides = (n_ctx * 64, n_ctx * 64, 64, 1)
+    tensor = SimpleNamespace(shape=(1, 1, n_ctx, 64), dtype=torch.bfloat16, stride=lambda dim: strides[dim])
+    captured = {}
+
+    class CaptureKernel:
+
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+
+            def launch(*args, **kwargs):
+                captured["kwargs"] = kwargs
+
+            return launch
+
+    def unexpected_device_query(*args):
+        pytest.fail("explicit tuning must bypass Origami")
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_validate_cluster_inputs", lambda q, k, v: None)
+    monkeypatch.setattr(_amd_fa_cluster_module, "_cluster_origami_device_key", unexpected_device_query)
+    monkeypatch.setattr(_amd_fa_cluster_module.torch, "empty_like", lambda q: q)
+    monkeypatch.setattr(_amd_fa_cluster_module, "_attn_fwd_cluster_pipeline", CaptureKernel())
+
+    out = _amd_fa_cluster_module.flash_attn_cluster_pipeline(
+        tensor,
+        tensor,
+        tensor,
+        1.0,
+        False,
+        USE_ORIGAMI=True,
+        BLOCK_M=128,
+        BLOCK_N=64,
+        num_warps=4,
+        waves_per_eu=2,
+        USE_DIRECT_LOAD=False,
+    )
+
+    assert out is tensor
+    assert captured["grid"] == (16, 1, 1)
+    assert captured["kwargs"]["BLOCK_M"] == 128
+    assert captured["kwargs"]["BLOCK_N"] == 64
+
+
 @pytest.mark.parametrize(
     ("dtype", "n_ctx", "head_dim", "causal", "config", "expected"),
     [
@@ -2462,8 +2919,10 @@ def test_amd_fa_cluster_launch_forwards_static_k_row_stride(monkeypatch, dtype, 
     out = _amd_fa_cluster_module.flash_attn_cluster_pipeline(tensor, tensor, tensor, 1.3, False)
 
     assert out is tensor
-    assert captured["grid"] == (n_ctx // 256, 64, 1)
+    assert captured["grid"]({"BLOCK_M": 256}) == (n_ctx // 256, 64, 1)
     assert captured["kwargs"]["STATIC_STRIDE_KN"] == expected
+    assert captured["kwargs"]["REQUESTED_BLOCK_M"] == 256
+    assert captured["kwargs"]["REQUESTED_BLOCK_N"] == 64
     assert captured["kwargs"]["enable_sched_group_barrier_scheduler"] is False
 
 

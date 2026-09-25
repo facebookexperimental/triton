@@ -1,4 +1,13 @@
-"""AMD CDNA4 Flash Attention forward with a rotated 4-cluster pipeline."""
+"""AMD CDNA4 Flash Attention forward with a rotated 4-cluster pipeline.
+
+Pass ``config={"USE_ORIGAMI": True}`` to enable optional tile selection with
+the ``rocm-origami`` package, imported as ``origami``. Missing or incompatible
+versions preserve the incumbent tile.
+"""
+
+import functools
+import math
+import operator
 
 import torch
 
@@ -27,6 +36,16 @@ _CLUSTER_SHORT_N512_LLVM_FN_ATTRS = (
     *_CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
 )
 _CLUSTER_SHORT_N1024_LLVM_FN_ATTRS = _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS
+# Fixed tile-search universe: Origami ranks these candidates before Triton's
+# measured autotuner compiles the retained subset.
+_CLUSTER_ORIGAMI_TILES = ((128, 64), (256, 64))
+_CLUSTER_ORIGAMI_INCUMBENT = (256, 64)
+_CLUSTER_ORIGAMI_MFMA = (32, 32, 16)
+_CLUSTER_ORIGAMI_MIN_N = 1024
+_CLUSTER_ORIGAMI_MIN_PROGRAMS_PER_CU = 4
+_CLUSTER_ORIGAMI_NEAR_BEST_RATIO = 1.10
+_CLUSTER_ORIGAMI_AUTOTUNE_WARMUP_MS = 300
+_CLUSTER_ORIGAMI_AUTOTUNE_REP_MS = 100
 
 
 def _cluster_short_load_configs():
@@ -35,6 +54,162 @@ def _cluster_short_load_configs():
         for num_warps in _CLUSTER_AUTOTUNE_NUM_WARPS
         for use_direct_load in (False, True)
     ]
+
+
+def _cluster_tile_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "USE_DIRECT_LOAD": use_direct_load,
+            },
+            num_warps=block_m // 32,
+            num_stages=3,
+        )
+        for block_m in (128, 256)
+        for block_n in (32, 64)
+        for use_direct_load in (False, True)
+    ]
+
+
+@functools.cache
+def _get_origami_module():
+    try:
+        import origami
+    except Exception:
+        # An optional model dependency must not break the incumbent launch.
+        return None
+    return origami
+
+
+@functools.cache
+def _cluster_origami_tiles(batch, heads, n_ctx, head_dim, dtype, device_index, cu_count):
+    """Project D64 attention to QK/PV GEMMs and retain safe tile candidates."""
+    origami = _get_origami_module()
+    if origami is None:
+        return ()
+
+    dtype_name = {
+        torch.float16: "f16",
+        torch.bfloat16: "bf16",
+    }.get(dtype)
+    if dtype_name is None:
+        return ()
+
+    try:
+        cu_count = operator.index(cu_count)
+        if cu_count <= 0:
+            return ()
+        origami_dtype = origami.string_to_datatype(dtype_name)
+        hardware = origami.get_hardware_for_device(device_index)
+        problems = []
+        for m, n, k, b_transpose in (
+            (n_ctx, n_ctx, head_dim, origami.transpose_t.T),
+            (n_ctx, head_dim, n_ctx, origami.transpose_t.N),
+        ):
+            problem = origami.problem_t()
+            problem.size = origami.dim3_t(m, n, k)
+            problem.batch = batch * heads
+            problem.a_transpose = origami.transpose_t.N
+            problem.b_transpose = b_transpose
+            problem.a_dtype = origami_dtype
+            problem.b_dtype = origami_dtype
+            problem.c_dtype = origami_dtype
+            problem.d_dtype = origami_dtype
+            problem.mi_dtype = origami_dtype
+            if hasattr(problem, "num_cus"):
+                problem.num_cus = cu_count
+            problems.append(problem)
+
+        qk_scores = {}
+        pv_scores = {}
+        for block_m, block_n in _CLUSTER_ORIGAMI_TILES:
+            qk_config = origami.config_t()
+            qk_config.mt = origami.dim3_t(block_m, block_n, head_dim)
+            qk_config.mi = origami.dim3_t(*_CLUSTER_ORIGAMI_MFMA)
+            qk_config.occupancy = 2
+            qk_config.grid_selection = origami.grid_selection_t.data_parallel
+            pv_config = origami.config_t()
+            pv_config.mt = origami.dim3_t(block_m, head_dim, block_n)
+            pv_config.mi = origami.dim3_t(*_CLUSTER_ORIGAMI_MFMA)
+            pv_config.occupancy = 2
+            pv_config.grid_selection = origami.grid_selection_t.data_parallel
+            if hasattr(qk_config, "stream_k"):
+                qk_config.stream_k = 0
+                pv_config.stream_k = 0
+            # Origami 0.1 derives the CU count from hardware; 0.0.x accepts it
+            # as an explicit fourth argument.
+            if hasattr(origami, "model_t"):
+                qk_latency = origami.compute_total_latency(problems[0], hardware, qk_config)
+                pv_latency = origami.compute_total_latency(problems[1], hardware, pv_config)
+            else:
+                qk_latency = origami.compute_total_latency(problems[0], hardware, qk_config, cu_count)
+                pv_latency = origami.compute_total_latency(problems[1], hardware, pv_config, cu_count)
+            tile = (block_m, block_n)
+            if math.isfinite(qk_latency) and qk_latency > 0:
+                qk_scores[tile] = qk_latency
+            if math.isfinite(pv_latency) and pv_latency > 0:
+                pv_scores[tile] = pv_latency
+    except Exception:
+        # Origami is a pruning hint. API or model failures must fail closed.
+        return ()
+    if set(qk_scores) != set(_CLUSTER_ORIGAMI_TILES) or set(pv_scores) != set(_CLUSTER_ORIGAMI_TILES):
+        return ()
+
+    def retain_near_best(scores, candidates):
+        best = min(scores[tile] for tile in candidates)
+        return {tile for tile in candidates if scores[tile] <= _CLUSTER_ORIGAMI_NEAR_BEST_RATIO * best}
+
+    selected = {_CLUSTER_ORIGAMI_INCUMBENT}
+    incumbent_programs = batch * heads * triton.cdiv(n_ctx, _CLUSTER_ORIGAMI_INCUMBENT[0])
+    if incumbent_programs < _CLUSTER_ORIGAMI_MIN_PROGRAMS_PER_CU * cu_count:
+        # Standalone GEMM projections do not model fused-kernel occupancy well
+        # for shallow grids, so preserve both BLOCK_M candidates.
+        selected.update(_CLUSTER_ORIGAMI_TILES)
+    else:
+        selected.update(retain_near_best(qk_scores, _CLUSTER_ORIGAMI_TILES))
+        selected.update(retain_near_best(pv_scores, _CLUSTER_ORIGAMI_TILES))
+    return tuple(tile for tile in _CLUSTER_ORIGAMI_TILES if tile in selected)
+
+
+def _can_use_cluster_origami(q, k, v, causal):
+    return (not causal and q.shape[3] == 64 and q.shape[2] >= _CLUSTER_ORIGAMI_MIN_N and q.is_contiguous()
+            and k.is_contiguous() and v.is_contiguous())
+
+
+def _cluster_origami_device_key(q):
+    try:
+        properties = torch.cuda.get_device_properties(q.device)
+        if not properties.gcnArchName.startswith("gfx950"):
+            return None
+        device_index = q.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        cu_count = operator.index(properties.multi_processor_count)
+        if cu_count <= 0:
+            return None
+    except (AttributeError, OSError, OverflowError, RuntimeError, TypeError, ValueError):
+        return None
+    return device_index, properties.gcnArchName, cu_count
+
+
+def _select_cluster_origami_tiles(q, k, v, causal):
+    if not _can_use_cluster_origami(q, k, v, causal):
+        return ()
+    device_key = _cluster_origami_device_key(q)
+    if device_key is None:
+        return ()
+    device_index, _, cu_count = device_key
+    return _cluster_origami_tiles(
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        q.shape[3],
+        q.dtype,
+        device_index,
+        cu_count,
+    )
 
 
 def _cluster_meta_arg(name, named_args, kwargs):
@@ -84,7 +259,44 @@ def _prune_cluster_short_load_configs(configs, named_args, **kwargs):
     return candidates
 
 
+def _prune_cluster_tile_configs(configs, named_args, **kwargs):
+    block_m = _cluster_meta_arg("REQUESTED_BLOCK_M", named_args, kwargs)
+    block_n = _cluster_meta_arg("REQUESTED_BLOCK_N", named_args, kwargs)
+    n_ctx = _cluster_meta_arg("N_CTX", named_args, kwargs)
+    is_causal = _cluster_meta_arg("IS_CAUSAL", named_args, kwargs)
+    selected_tiles = {(block_m, block_n)}
+    if _cluster_meta_arg("USE_ORIGAMI_SELECTOR", named_args, kwargs):
+        q = _cluster_meta_arg("Q", named_args, kwargs)
+        k = _cluster_meta_arg("K", named_args, kwargs)
+        v = _cluster_meta_arg("V", named_args, kwargs)
+        modeled_tiles = _select_cluster_origami_tiles(q, k, v, is_causal)
+        if modeled_tiles:
+            selected_tiles = set(modeled_tiles)
+
+    candidates = []
+    for config in configs:
+        config_block_m = config.kwargs["BLOCK_M"]
+        config_block_n = config.kwargs["BLOCK_N"]
+        if (config_block_m, config_block_n) not in selected_tiles:
+            continue
+        if (config.kwargs["USE_DIRECT_LOAD"]
+                and not _cluster_has_short_range(n_ctx, config_block_m, config_block_n, is_causal)):
+            continue
+        candidates.append(config)
+    return candidates
+
+
 _CLUSTER_AUTOTUNE_KEY = ["Z", "H", "N_CTX", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "IS_CAUSAL"]
+_CLUSTER_TILE_AUTOTUNE_KEY = [
+    "Z",
+    "H",
+    "N_CTX",
+    "HEAD_DIM",
+    "REQUESTED_BLOCK_M",
+    "REQUESTED_BLOCK_N",
+    "USE_ORIGAMI_SELECTOR",
+    "IS_CAUSAL",
+]
 _CLUSTER_PERSISTENT_AUTOTUNE_KEY = [*_CLUSTER_AUTOTUNE_KEY, "NUM_SMS", "NUM_XCDS"]
 
 
@@ -2775,6 +2987,9 @@ def _attn_fwd_cluster_pipeline(
     USE_DIRECT_LOAD: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     STATIC_STRIDE_KN: tl.constexpr = -1,
+    REQUESTED_BLOCK_M: tl.constexpr = 0,
+    REQUESTED_BLOCK_N: tl.constexpr = 0,
+    USE_ORIGAMI_SELECTOR: tl.constexpr = False,
 ):
     if STATIC_STRIDE_KN >= 0:
         tile_stride_kn = STATIC_STRIDE_KN
@@ -3201,14 +3416,40 @@ def _attn_fwd_cluster_persistent_pipeline(
                     tl.debug_barrier()
 
 
-# Short cluster kernels can exhaust ROCm event resources in the entropy
-# benchmarker. Use the standard benchmarker for this small two-config sweep.
-_attn_fwd_cluster_pipeline_autotuned = triton.autotune(
-    configs=_cluster_short_load_configs(),
-    key=_CLUSTER_AUTOTUNE_KEY,
-    prune_configs_by={"early_config_prune": _prune_cluster_short_load_configs},
-    do_bench=triton.testing.do_bench,
-)(_attn_fwd_cluster_pipeline)
+def _cluster_origami_bench(fn, quantiles):
+    # Close candidates need a longer clock warmup than Triton's default; the
+    # autotuner bypasses this benchmark entirely when pruning leaves one tile.
+    return triton.testing.do_bench(
+        fn,
+        warmup=_CLUSTER_ORIGAMI_AUTOTUNE_WARMUP_MS,
+        rep=_CLUSTER_ORIGAMI_AUTOTUNE_REP_MS,
+        quantiles=quantiles,
+    )
+
+
+def _make_cluster_tile_autotuner(do_bench=triton.testing.do_bench):
+    # Cluster kernels can exhaust ROCm event resources in the entropy
+    # benchmarker. Candidate pruning keeps this standard-benchmarker sweep
+    # small.
+    return triton.autotune(
+        configs=_cluster_tile_configs(),
+        key=_CLUSTER_TILE_AUTOTUNE_KEY,
+        prune_configs_by={"early_config_prune": _prune_cluster_tile_configs},
+        do_bench=do_bench,
+    )(_attn_fwd_cluster_pipeline)
+
+
+_attn_fwd_cluster_pipeline_autotuned = _make_cluster_tile_autotuner()
+
+
+@functools.cache
+def _cluster_tile_autotuner_for_device(device_key):
+    """Keep measured winners isolated by gfx950 device and visible CU count."""
+    tuner = _make_cluster_tile_autotuner(_cluster_origami_bench)
+    # Triton's optional disk cache does not include this Python-level device
+    # key, so keep device-specific winners in this tuner's isolated RAM cache.
+    tuner.cache_results = False
+    return tuner
 
 _attn_fwd_cluster_persistent_pipeline_autotuned = triton.autotune(
     configs=_cluster_short_load_configs(),
@@ -3266,11 +3507,17 @@ def _validate_cluster_tiles(block_m, block_n):
 def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
     _validate_cluster_inputs(q, k, v)
     B, H, N_CTX, D = q.shape
+    use_origami = bool(kw.pop("USE_ORIGAMI", False))
+    origami_device_key = None
+    if use_origami and not kw and _can_use_cluster_origami(q, k, v, causal):
+        origami_device_key = _cluster_origami_device_key(q)
+    use_origami_selector = origami_device_key is not None
     use_short_causal_defaults = (causal and D == 128 and N_CTX <= 1024 and N_CTX % 128 == 0 and "BLOCK_M" not in kw
                                  and "BLOCK_N" not in kw and kw.get("num_warps", 4) == 4
                                  and kw.get("num_stages", 3) == 3)
     mfma_m = 32
-    block_m = kw.pop("BLOCK_M", 128 if use_short_causal_defaults else 256)
+    default_block_m = 128 if use_short_causal_defaults else 256
+    block_m = kw.pop("BLOCK_M", default_block_m)
     block_n = kw.pop(
         "BLOCK_N",
         64 if use_short_causal_defaults and block_m == 128 else _cluster_default_block_n(causal),
@@ -3286,7 +3533,6 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
     use_direct_load = kw.pop("USE_DIRECT_LOAD", None)
     o = torch.empty_like(q)
     m_blocks = triton.cdiv(N_CTX, block_m)
-    grid = (H, m_blocks, B) if causal else (m_blocks, H, B)
     use_autotune = (use_direct_load is None and not has_explicit_num_warps and not has_explicit_waves_per_eu and not kw)
     use_pruned_n2048_defaults = (use_autotune and causal and D == 128 and N_CTX == 2048 and block_m == 256
                                  and block_n == 32 and num_warps == 8)
@@ -3311,17 +3557,35 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
     if use_short_causal_classes:
         kernel = _attn_fwd_cluster_short_causal_pipeline
         use_autotune = False
+    elif use_autotune and use_origami_selector:
+        kernel = _cluster_tile_autotuner_for_device(origami_device_key)
     else:
         kernel = _attn_fwd_cluster_pipeline_autotuned if use_autotune else _attn_fwd_cluster_pipeline
+    if use_autotune:
+        if causal:
+            grid = lambda meta: (H, triton.cdiv(N_CTX, meta["BLOCK_M"]), B)
+        else:
+            grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), H, B)
+    else:
+        grid = (H, m_blocks, B) if causal else (m_blocks, H, B)
     launch_meta = {
-        "BLOCK_M": block_m,
-        "BLOCK_N": block_n,
         "BUF_DEPTH": CLUSTER_BUF_DEPTH,
         "HEAD_DIM": D,
         "IS_CAUSAL": causal,
         "waves_per_eu": waves_per_eu,
         **kw,
     }
+    if use_autotune:
+        launch_meta.update({
+            "REQUESTED_BLOCK_M": block_m,
+            "REQUESTED_BLOCK_N": block_n,
+            "USE_ORIGAMI_SELECTOR": use_origami_selector,
+        })
+    else:
+        launch_meta.update({
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+        })
     # This port must remain correct and performant with the stock LLVM
     # scheduler.  Keep Triton's experimental sched-group pass opt-in even if
     # the process-wide environment knob is enabled.
