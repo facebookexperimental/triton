@@ -189,6 +189,30 @@ def test_mm_lds_respects_output_strides():
     )
 
 
+def test_mm_lds_dynamic_m_reuses_compiled_kernel():
+    device_id = torch.cuda.current_device()
+    kernel_cache = _gfx950.a16w16_8wave.device_caches[device_id][0]
+    kernel_cache.clear()
+
+    dtype = torch.bfloat16
+    k = n = 512
+    b = torch.randn((n, k), device="cuda", dtype=dtype).T
+    for m in (768, 1280):
+        a = torch.randn((m, k), device="cuda", dtype=dtype)
+        bias = torch.randn((m, n), device="cuda", dtype=dtype)
+        actual = _gfx950._launch_lds(
+            a,
+            b,
+            bias=bias,
+            SPLIT_K=1,
+            TILE=(256, 256),
+        )
+        expected = torch.addmm(bias, a, b)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    assert len(kernel_cache) == 1
+
+
 def test_mm_offset_width_selection():
     i32_max_element = (1 << 30) - 1
     within_i32 = torch.empty((i32_max_element + 1, ), device="meta", dtype=torch.float16)

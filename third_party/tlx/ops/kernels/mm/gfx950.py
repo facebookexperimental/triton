@@ -776,7 +776,6 @@ def a16w16_8wave(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     NUM_XCDS: tl.constexpr,
-    GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     HAS_REGISTER_TAIL: tl.constexpr,
@@ -789,7 +788,7 @@ def a16w16_8wave(
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
 ):
-    # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
+    # ── Split-K: grid is grid_mn*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Exact partitions use KS; uneven partitions
     # derive a contiguous whole-K64 range from split_id.
     # We do NOT shift a_ptr/b_ptr (AMD buffer_load builds its resource descriptor
@@ -805,8 +804,10 @@ def a16w16_8wave(
     # offset from the coalesced #linear layout to #blocked and fails to lower. As
     # an arg, KS gets Triton's div-by-16 specialization, so split_id*KS*stride
     # keeps enough divisibility for #linear.
-    split_id = tl.program_id(0) // GRID_MN
-    pid = tl.program_id(0) % GRID_MN
+    linear_pid = tl.program_id(0)
+    grid_mn = tl.num_programs(0) // SPLIT_K
+    split_id = linear_pid // grid_mn
+    pid = linear_pid % grid_mn
     if UNEVEN_SPLIT_K:
         full_k_tiles = K // BLOCK_K
         base_k_tiles = full_k_tiles // SPLIT_K
@@ -833,8 +834,8 @@ def a16w16_8wave(
 
     # ── Grid-level scheduling: XCD PID remap + GROUP_SIZE_M swizzle (v9-style) ──
     if NUM_XCDS != 1:
-        pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-        tall_xcds = GRID_MN % NUM_XCDS
+        pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds = grid_mn % NUM_XCDS
         tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
         xcd = pid % NUM_XCDS
         local_pid = pid // NUM_XCDS
@@ -1799,7 +1800,6 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         BLOCK_K=BLOCK_K,
         GROUP_SIZE_M=4 if M == N and K >= 8192 else (2 if M <= 1024 and N >= 16384 else GROUP_SIZE_M),
         NUM_XCDS=1 if M == N and K >= 8192 else NUM_XCDS,
-        GRID_MN=GRID_MN,
         SPLIT_K=SPLIT_K,
         ADD_BIAS=bias is not None,
         HAS_REGISTER_TAIL=(
