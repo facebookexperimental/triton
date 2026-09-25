@@ -6358,15 +6358,8 @@ def test_trans_reshape(device, with_allocator):
 
     @triton.jit
     def kernel(in_base_ptr, out_base_ptr, IN_SHAPE0: tl.constexpr, IN_SHAPE1: tl.constexpr):
-        in_block_ptr = tl.make_block_ptr(
-            base=in_base_ptr,
-            shape=(IN_SHAPE0, IN_SHAPE1),
-            strides=(IN_SHAPE1, 1),
-            offsets=(0, 0),
-            block_shape=(IN_SHAPE0, IN_SHAPE1),
-            order=(1, 0),
-        )
-        x = tl.load(in_block_ptr)
+        x = tl.load(in_base_ptr + tl.arange(0, IN_SHAPE0 * IN_SHAPE1))
+        x = tl.reshape(x, (IN_SHAPE0, IN_SHAPE1))
         x = tl.reshape(x, (32, 4, 4, 2))
         x = tl.permute(x, (1, 2, 3, 0))
         x = tl.reshape(x, (IN_SHAPE0 * IN_SHAPE1, ))

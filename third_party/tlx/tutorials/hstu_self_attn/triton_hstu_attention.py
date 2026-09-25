@@ -867,8 +867,10 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
     K,
     V,
     acc,
-    K_block_ptr,
-    V_block_ptr,
+    stride_kh,
+    stride_kn,
+    stride_vh,
+    stride_vn,
     device_desc_k,
     device_desc_v,
     offset_kh,
@@ -900,7 +902,11 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
         # tma can only be loaded in one order, use trans afterwards
         qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32)
     else:
-        k = tl.load(K_block_ptr, boundary_check=(1, ), padding_option="zero")
+        offs_kd = tl.arange(0, BLOCK_D_Q)
+        offs_kv_n = start_n + tl.arange(0, BLOCK_N)
+        k = tl.load(K + off_h * stride_kh + seq_start_kv * stride_kn + offs_kd[:, None] +
+                    offs_kv_n[None, :] * stride_kn,
+                    mask=offs_kv_n[None, :] < seq_len_kv, other=0.0)
         qk = tl.dot(q, k, allow_tf32=ALLOW_TF32)
     valid_mask = forward_valid_mask(
         offs_m,
@@ -918,7 +924,11 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
     if ENABLE_TMA:
         v = device_desc_v.load([(seq_start_kv + start_n).to(tl.int32), offset_vh.to(tl.int32)])
     else:
-        v = tl.load(V_block_ptr, boundary_check=(0, ), padding_option="zero")
+        offs_vd = tl.arange(0, BLOCK_D_V)
+        offs_v_n = start_n + tl.arange(0, BLOCK_N)
+        v = tl.load(V + off_h * stride_vh + seq_start_kv * stride_vn + offs_v_n[:, None] * stride_vn +
+                    offs_vd[None, :],
+                    mask=offs_v_n[:, None] < seq_len_kv, other=0.0)
     act_qk = act_qk.to(v.dtype)
     acc += tl.dot(act_qk, v, allow_tf32=ALLOW_TF32)
     return acc
@@ -1291,36 +1301,11 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.static_assert(ATTN_SCALE_TYPE == "dynamic")
             scale = tl.load(attn_scale + seq_start_q + offs_m, mask=offs_m < seq_len_q).to(tl.float32)
 
-        Q_block_ptr = None
-        K_block_ptr = None
-        V_block_ptr = None
         if not ENABLE_TMA:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + off_h * stride_qh + seq_start_q * stride_qm,
-                shape=(seq_len_q, BLOCK_D_Q),
-                strides=(stride_qm, 1),
-                offsets=(start_m, 0),
-                block_shape=(BLOCK_M, BLOCK_D_Q),
-                order=(1, 0),
-            )
-            q = tl.load(Q_block_ptr, boundary_check=(0, ), padding_option="zero")
-
-            K_block_ptr = tl.make_block_ptr(
-                base=K + off_h * stride_kh + seq_start_kv * stride_kn,
-                shape=(BLOCK_D_Q, seq_len_kv),
-                strides=(1, stride_kn),
-                offsets=(0, 0),
-                block_shape=(BLOCK_D_Q, BLOCK_N),
-                order=(0, 1),
-            )
-            V_block_ptr = tl.make_block_ptr(
-                base=V + off_h * stride_vh + seq_start_kv * stride_vn,
-                shape=(seq_len_kv, BLOCK_D_V),
-                strides=(stride_vn, 1),
-                offsets=(0, 0),
-                block_shape=(BLOCK_N, BLOCK_D_V),
-                order=(1, 0),
-            )
+            Q_base = Q + off_h * stride_qh + seq_start_q * stride_qm
+            offs_qd = tl.arange(0, BLOCK_D_Q)
+            q = tl.load(Q_base + offs_m[:, None] * stride_qm + offs_qd[None, :],
+                        mask=offs_m[:, None] < seq_len_q, other=0.0)
         else:
             device_desc_q = tl.make_tensor_descriptor(
                 Q,
@@ -1374,7 +1359,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
             n_tgt = tl.where(has_tgt, (BLOCK_M + BLOCK_N - 1) // BLOCK_N, 0)
             tgt_lo = start_m
         n_iters = n_uih + n_tgt
-        ptr_pos = 0  # non-TMA: absolute key position the K/V block ptrs point at
         for it in tl.range(
                 0,
                 n_iters,
@@ -1384,12 +1368,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
             is_tgt = it >= n_uih
             blk = tl.where(is_tgt, it - n_uih, it)
             start_n = tl.where(is_tgt, tgt_lo + blk * BLOCK_N, uih_lo + blk * BLOCK_N)
-            if not ENABLE_TMA:
-                adv = (start_n - ptr_pos).to(tl.int32)
-                if adv != 0:
-                    K_block_ptr = tl.advance(K_block_ptr, (0, adv))
-                    V_block_ptr = tl.advance(V_block_ptr, (adv, 0))
-                ptr_pos = start_n
             acc = _hstu_attn_fwd_one_block_0(
                 start_n=start_n,
                 seq_len_q=seq_len_q,
@@ -1401,8 +1379,10 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 K=K,
                 V=V,
                 acc=acc,
-                K_block_ptr=K_block_ptr,
-                V_block_ptr=V_block_ptr,
+                stride_kh=stride_kh,
+                stride_kn=stride_kn,
+                stride_vh=stride_vh,
+                stride_vn=stride_vn,
                 device_desc_k=device_desc_k,
                 device_desc_v=device_desc_v,
                 offset_kh=off_h * stride_kh,
