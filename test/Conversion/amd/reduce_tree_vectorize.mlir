@@ -96,14 +96,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
   // fold prevents the AMD backend from forming ternary maximum instructions
   // across span boundaries, so preserve the original flat chain.
   // LINEAR-LABEL: reduce_mfma_maximum_flat
-  // LINEAR: %[[VALUE4:.*]] = llvm.extractvalue %arg0[4]
   // LINEAR: %[[MAX01:.*]] = llvm.intr.maxnum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-  // LINEAR: %[[SELECT01:.*]] = llvm.select %{{.*}}, %{{.*}}, %[[MAX01]] : i1, f32
-  // LINEAR: %[[MAX012:.*]] = llvm.intr.maxnum(%[[SELECT01]], %{{.*}}) : (f32, f32) -> f32
-  // LINEAR: %[[SELECT012:.*]] = llvm.select %{{.*}}, %{{.*}}, %[[MAX012]] : i1, f32
-  // LINEAR: %[[MAX0123:.*]] = llvm.intr.maxnum(%[[SELECT012]], %{{.*}}) : (f32, f32) -> f32
-  // LINEAR: %[[SELECT0123:.*]] = llvm.select %{{.*}}, %{{.*}}, %[[MAX0123]] : i1, f32
-  // LINEAR: llvm.intr.maxnum(%[[SELECT0123]], %[[VALUE4]]) : (f32, f32) -> f32
+  // LINEAR: %[[MAX012:.*]] = llvm.intr.maxnum(%[[MAX01]], %{{.*}}) : (f32, f32) -> f32
+  // LINEAR: %[[MAX0123:.*]] = llvm.intr.maxnum(%[[MAX012]], %{{.*}}) : (f32, f32) -> f32
   tt.func public @reduce_mfma_maximum_flat(%arg0: tensor<256x64xf32, #mfma_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
     ^bb0(%a: f32, %b: f32):

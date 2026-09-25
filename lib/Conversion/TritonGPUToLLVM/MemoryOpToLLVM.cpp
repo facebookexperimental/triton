@@ -17,12 +17,13 @@ using namespace mlir::triton::gpu;
 
 static std::pair<LinearLayout, LinearLayout>
 getPhysicalLayouts(LinearLayout regLayout, MemDescType memDescTy) {
-  auto sharedLayout = toLinearLayout(memDescTy);
+  auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
   if (!regLayout.isModular())
     return {std::move(regLayout), std::move(sharedLayout)};
 
   auto allocShape = getAllocationShapePerCTA(memDescTy);
-  sharedLayout = toLinearLayout(allocShape, memDescTy.getEncoding());
+  sharedLayout =
+      toLinearLayoutIgnoringPadding(allocShape, memDescTy.getEncoding());
   SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
   for (auto dim : regLayout.getOutDimNames())
     paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
@@ -74,15 +75,10 @@ LogicalResult lowerLocalStore(
   assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
          "expected register broadcasting to be removed by the caller");
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
-  LinearLayout cvt = LinearLayout::empty();
-  if (isPaddedEncoding(memDescTy.getEncoding())) {
-    cvt = invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
-  } else {
-    auto [physicalRegLayout, sharedLayout] =
-        getPhysicalLayouts(regLayout, memDescTy);
-    regLayout = std::move(physicalRegLayout);
-    cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
-  }
+  auto [physicalRegLayout, sharedLayout] =
+      getPhysicalLayouts(regLayout, memDescTy);
+  regLayout = std::move(physicalRegLayout);
+  auto cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
 
@@ -213,16 +209,10 @@ public:
 
     auto regLayout =
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
-    LinearLayout cvt = LinearLayout::empty();
-    if (isPaddedEncoding(memDescTy.getEncoding())) {
-      cvt =
-          invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
-    } else {
-      auto [physicalRegLayout, sharedLayout] =
-          getPhysicalLayouts(regLayout, memDescTy);
-      regLayout = std::move(physicalRegLayout);
-      cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
-    }
+    auto [physicalRegLayout, sharedLayout] =
+        getPhysicalLayouts(regLayout, memDescTy);
+    regLayout = std::move(physicalRegLayout);
+    auto cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
 
     std::optional<std::pair<Value, Value>> distributedCoordinates;
     if (auto group = op->getAttrOfType<IntegerAttr>(

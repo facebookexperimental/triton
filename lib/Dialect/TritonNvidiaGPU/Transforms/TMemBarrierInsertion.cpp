@@ -436,12 +436,11 @@ static void appendWriteSlices(Value value, Operation *op,
 
 class TMemBarrierAnalysis : public MembarOrFenceAnalysis {
 public:
-  explicit TMemBarrierAnalysis(Allocation *allocation, MembarFilterFn filter)
-      : MembarOrFenceAnalysis(allocation, filter) {}
+  using MembarOrFenceAnalysis::MembarOrFenceAnalysis;
 
 private:
-  void update(Operation *operation, BlockInfo *blockInfo,
-              FuncBlockInfoMapT *funcBlockInfoMap, OpBuilder *builder) override;
+  void update(Operation *operation, BlockInfo *blockInfo, FuncMapT *funcMap,
+              OpBuilder *builder) override;
 
   void insertBarrier(Operation *operation, OpBuilder *builder);
 };
@@ -453,8 +452,7 @@ void TMemBarrierAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
 }
 
 void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
-                                 FuncBlockInfoMapT *funcBlockInfoMap,
-                                 OpBuilder *builder) {
+                                 FuncMapT *funcMap, OpBuilder *builder) {
   if (mlir::containsLocalBarrier(op)) {
     blockInfo->sync();
     return;
@@ -464,7 +462,7 @@ void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
   if (isa<triton::CallOp>(op)) {
     auto call = dyn_cast<CallOpInterface>(op);
     if (auto callee = dyn_cast<FunctionOpInterface>(call.resolveCallable()))
-      curBlockInfo = funcBlockInfoMap->lookup(callee);
+      curBlockInfo = funcMap->lookup(callee);
   } else if (auto load = dyn_cast<TMEMLoadOp>(op)) {
     appendReadSlices(load.getSrc(), op, &curBlockInfo);
   } else if (auto store = dyn_cast<TMEMStoreOp>(op)) {
@@ -486,7 +484,7 @@ void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
     appendWriteSlices(shift.getBuffer(), op, &curBlockInfo);
   }
 
-  if (blockInfo->isIntersected(curBlockInfo, filter, allocation)) {
+  if (blockInfo->isIntersected(curBlockInfo, filter, &allocation)) {
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
     blockInfo->sync();
@@ -511,7 +509,7 @@ struct TMemBarrierInsertionPass
                                 bool rhsIsRead, Allocation *allocation) {
       return filterFn(lhs, rhs, lhsIsRead, rhsIsRead, allocation, cache);
     };
-    ModuleMembarOrFenceAnalysis<TMemBarrierAnalysis> analysis(&allocation,
+    ModuleMembarOrFenceAnalysis<TMemBarrierAnalysis> analysis(allocation,
                                                               filter);
     analysis.run();
   }
