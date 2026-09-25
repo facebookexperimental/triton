@@ -1,0 +1,152 @@
+name: tlx-ops-bench
+# One platform of nightly-tlx-ops-bench.yml: install an fbtriton nightly into a
+# clean venv, run the tlx.ops perf suite, and file/close nightly issues from it.
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: "b200 | h100 | mi350; scopes artifact names and issue titles"
+        required: true
+        type: string
+      runner:
+        description: "runs-on label"
+        required: true
+        type: string
+      torch_index:
+        description: "PyTorch wheel index matching the runner's GPU stack"
+        required: true
+        type: string
+      version:
+        description: "fbtriton nightly version; names the artifact"
+        required: true
+        type: string
+      wheel_url:
+        description: "Release asset URL of that version's cp313 x86_64 wheel"
+        required: true
+        type: string
+      sha:
+        description: "Commit the wheel was built from; the suite is checked out at it"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TORCH_VERSION: "2.14.0"
+
+jobs:
+  bench:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 150
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Install torch and the fbtriton nightly
+        run: |
+          set -eux
+          uv venv --python 3.13 "${RUNNER_TEMP}/bench-venv"
+          PY="${RUNNER_TEMP}/bench-venv/bin/python"
+          uv pip install --python "${PY}" "torch==${TORCH_VERSION}" --index-url "${{ inputs.torch_index }}"
+          # torch depends on its own Triton build, which installs the same
+          # `triton` package the fbtriton wheel does.
+          uv pip uninstall --python "${PY}" triton pytorch-triton pytorch-triton-rocm triton-rocm || true
+          uv pip install --python "${PY}" --no-deps "${{ inputs.wheel_url }}"
+          # torchao: flash_attn_mxfp8 quantizes its inputs with it.
+          uv pip install --python "${PY}" pytest numpy torchao
+          "${PY}" - <<'PY'
+          import torch
+          import triton
+          import triton.tlx.ops
+
+          print(f"torch  -> {torch.__version__} ({torch.__file__})")
+          print(f"triton -> {triton.__version__} ({triton.__file__})")
+          assert torch.cuda.is_available(), "torch sees no GPU"
+          PY
+      - name: Run tlx.ops perf suite
+        id: run_bench
+        timeout-minutes: 120
+        run: |
+          # The harness writes its JSON to a fixed path that outlives the job on
+          # a self-hosted runner.
+          rm -rf /tmp/tlx_benchmark
+          # TorchTLX benches need Meta's Inductor patches; the per-platform
+          # *-torchtlx-test jobs already run them.
+          "${RUNNER_TEMP}/bench-venv/bin/python" -m pytest python/test/tlx_benchmark/test_ops_perf.py \
+            -k "not torchtlx" -v -s --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlx-ops-bench-${{ inputs.platform }}-${{ inputs.version }}
+          path: |
+            /tmp/tlx_benchmark/*.json
+            ${{ runner.temp }}/tlx-ops-bench.xml
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Collect failures
+        id: parse
+        if: always()
+        run: |
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_bench.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket ${{ inputs.platform }}-tlx-ops-bench-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit "${RUNNER_TEMP}/tlx-ops-bench.xml" \
+            --budget "${RUNNER_TEMP}/tlx-ops-bench.xml=120" \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "${{ inputs.platform }}-tlx-ops-bench" \
+            ${FAILED_FLAG}
+
+  report:
+    needs: bench
+    if: always() && needs.bench.outputs.failures != '' && needs.bench.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.bench.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: refs/heads/main
+      sha: ${{ inputs.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+
+  reconcile:
+    needs: bench
+    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ inputs.platform }}-tlx-ops-bench
+      failures: ${{ needs.bench.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

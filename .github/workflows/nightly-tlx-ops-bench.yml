@@ -1,0 +1,151 @@
+name: Nightly TLX.ops Bench
+# Runs the tlx.ops perf suite (python/test/tlx_benchmark) against the fbtriton
+# nightly wheel on B200, H100 and MI350. Triggered by a published nightly, so it
+# measures the wheel users install, built from a commit that already passed the
+# correctness checks the nightly is gated on.
+on:
+  workflow_run:
+    workflows: ["Nightly fbtriton"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "fbtriton nightly version, e.g. 3.8.0.dev20260923 (blank = latest published)"
+        required: false
+        default: ""
+      sha:
+        description: "Commit that version was built from (required when version is set)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-tlx-ops-bench
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    # The benched commit is checked out and run on GPU runners, so it must be a main commit the nightly shipped:
+    # only this repo's scheduled or dispatched nightly may trigger, never a fork or a pull request.
+    if: >-
+      github.repository_owner == 'facebookexperimental' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      sha: ${{ steps.pick.outputs.sha }}
+      wheel_url: ${{ steps.pick.outputs.wheel_url }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Pick the wheel to bench
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            [[ -n "${INPUT_SHA}" ]] || { echo "sha is required when version is set"; exit 1; }
+            VERSION="${INPUT_VERSION}"
+            SHA="${INPUT_SHA}"
+          else
+            # A green nightly run ships nothing when no newer commit is green;
+            # benching latest.json then would re-measure yesterday's wheel.
+            if [[ -n "${RUN_ID}" ]]; then
+              PUBLISH=$(gh run view "${RUN_ID}" --json jobs --jq '.jobs[] | select(.name == "publish") | .conclusion')
+              if [[ "${PUBLISH}" != "success" ]]; then
+                echo "Nightly run ${RUN_ID} published nothing (publish: ${PUBLISH:-skipped}); nothing to bench."
+                exit 0
+              fi
+            fi
+            gh release download nightly --pattern latest.json --output latest.json
+            VERSION=$(jq -r .version latest.json)
+            SHA=$(jq -r .commit latest.json)
+          fi
+          # From the release, not the Pages index: pages.yml republishes the
+          # index on the same trigger as this workflow, so it may still lag.
+          export VERSION
+          WHEEL_URL=$(gh release view nightly --json assets --jq '.assets[]
+            | select(.name | startswith("fbtriton-" + env.VERSION + "-cp313-cp313-") and endswith("x86_64.whl"))
+            | .url')
+          [[ $(wc -l <<< "${WHEEL_URL}") -eq 1 && -n "${WHEEL_URL}" ]] || {
+            echo "expected one cp313 x86_64 wheel for ${VERSION} on the nightly release, found: ${WHEEL_URL:-none}"
+            exit 1
+          }
+          # Whatever its source (latest.json or a dispatch input), only a main commit is ever checked out downstream.
+          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SHA}"; exit 1; }
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || { echo "not a nightly version: ${VERSION}"; exit 1; }
+          git merge-base --is-ancestor "${SHA}" origin/main || { echo "${SHA} is not on main"; exit 1; }
+          echo "Benching ${WHEEL_URL} (${SHA})"
+          {
+            echo "version=${VERSION}"
+            echo "sha=${SHA}"
+            echo "wheel_url=${WHEEL_URL}"
+          } >> "$GITHUB_OUTPUT"
+
+  b200:
+    needs: resolve
+    if: needs.resolve.outputs.version != ''
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/_tlx-ops-bench.yml
+    with:
+      platform: b200
+      runner: nvidia-dgx-b200
+      torch_index: https://download.pytorch.org/whl/cu130
+      version: ${{ needs.resolve.outputs.version }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      wheel_url: ${{ needs.resolve.outputs.wheel_url }}
+
+  h100:
+    needs: resolve
+    if: needs.resolve.outputs.version != ''
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/_tlx-ops-bench.yml
+    with:
+      platform: h100
+      runner: linux-gcp-h100
+      torch_index: https://download.pytorch.org/whl/cu130
+      version: ${{ needs.resolve.outputs.version }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      wheel_url: ${{ needs.resolve.outputs.wheel_url }}
+
+  mi350:
+    needs: resolve
+    if: needs.resolve.outputs.version != ''
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/_tlx-ops-bench.yml
+    with:
+      platform: mi350
+      runner: linux-fb-triton-mi350-1
+      torch_index: https://download.pytorch.org/whl/rocm7.2
+      version: ${{ needs.resolve.outputs.version }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      wheel_url: ${{ needs.resolve.outputs.wheel_url }}
