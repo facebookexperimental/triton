@@ -1,0 +1,8 @@
+#!/bin/sh
+
+set -eu
+
+: "${GEO_OSS_ADAPTER:?Set GEO_OSS_ADAPTER to geo_oss_adapter.py}"
+: "${GEO_OSS_PYTHON:?Set GEO_OSS_PYTHON to the OSS Triton Python}"
+
+exec "$GEO_OSS_PYTHON" "$GEO_OSS_ADAPTER" buck2 "$@"

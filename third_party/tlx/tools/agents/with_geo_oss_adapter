@@ -1,0 +1,14 @@
+#!/bin/sh
+
+set -eu
+
+agent_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+: "${GEO_OSS_PYTHON:?Set GEO_OSS_PYTHON to the OSS Triton Python}"
+: "${GEO_OSS_FBCODE_ROOT:?Set GEO_OSS_FBCODE_ROOT to the fbcode root}"
+
+export GEO_OSS_ADAPTER="$agent_dir/geo_oss_adapter.py"
+export GEO_OSS_REAL_BUCK2="${GEO_OSS_REAL_BUCK2:-/usr/local/bin/buck2}"
+export PATH="$agent_dir/geo_oss_bin:$PATH"
+
+exec "$@"
