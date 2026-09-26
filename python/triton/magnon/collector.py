@@ -6,6 +6,8 @@ A task dir ($COMPILE_IQ_TASK_DIR/<ptx_sha[:16]>/) contains exactly:
     kernel.ptx   the emitted PTX (the ACF is tuned for this; ptxas assembles it -> SASS)
     spec.json    the source-free launch description -- identity, arch, entry, block/grid, shared,
                  and the post-specialization kernel-param layout (see ptx_launch.build_spec)
+    <sha256>.pkl the pre-launch data of each tensor arg under 1MB (a pickled CPU torch.Tensor),
+                 named by the sha256 of the file and referenced by spec.json's "pickle_sha256"
 
 NO source.py is dumped: the factory never recompiles from source, it only runs ptxas (PTX->SASS)
 and launches the cubin via the CUDA driver API, so the Python source is not needed. The store key
@@ -16,11 +18,17 @@ Only kernels the PTX-direct path covers are collected; anything build_spec can't
 skipped fail-open -- the user's run is never affected. WS/TMA support extends build_spec later.
 """
 
+import hashlib
 import json
 import os
+import pickle
+
+from triton.backends.nvidia.compiler import get_ptxas
 
 from . import ptx_launch
 from .store import dlog, ptx_sha256
+
+_PICKLE_MAX_BYTES = 1 << 20
 
 
 def task_root() -> str:
@@ -31,7 +39,20 @@ def _dtype_str(dt) -> str:
     return str(dt).replace("torch.", "")
 
 
-def _ordered_args(bound_args, constexpr_names):
+def _tensor_info(t, blobs):
+    """Describe a tensor for build_spec. Tensors under _PICKLE_MAX_BYTES also get their data pickled
+    into `blobs` (sha256 -> bytes) and the hash recorded as "pickle_sha256"."""
+    info = {"id": t.data_ptr(), "shape": list(t.shape), "dtype": _dtype_str(t.dtype), "strides": list(t.stride())}
+    if t.numel() * t.element_size() < _PICKLE_MAX_BYTES:
+        # clone() so a small view doesn't pickle its whole (possibly huge) backing storage.
+        data = pickle.dumps(t.detach().cpu().clone())
+        sha = hashlib.sha256(data).hexdigest()
+        blobs[sha] = data
+        info["pickle_sha256"] = sha
+    return info
+
+
+def _ordered_args(bound_args, constexpr_names, blobs):
     """Classify each bound arg (in order) for build_spec: constexpr / tensor / tensordesc / scalar."""
     import torch
     ordered = []
@@ -39,17 +60,10 @@ def _ordered_args(bound_args, constexpr_names):
         if name in constexpr_names:
             ordered.append(("constexpr", ))
         elif isinstance(val, torch.Tensor):
-            ordered.append(("tensor", {
-                "id": val.data_ptr(), "shape": list(val.shape), "dtype": _dtype_str(val.dtype), "strides":
-                list(val.stride())
-            }))
+            ordered.append(("tensor", _tensor_info(val, blobs)))
         elif type(val).__name__ == "TensorDescriptor":  # host-side TMA descriptor (no hard import)
-            base = val.base
             ordered.append(("tensordesc", {
-                "base": {
-                    "id": base.data_ptr(), "shape": list(base.shape), "dtype": _dtype_str(base.dtype), "strides":
-                    list(base.stride())
-                },
+                "base": _tensor_info(val.base, blobs),
                 "desc_shape": list(val.shape),
                 "desc_strides": list(val.strides),
                 "block_shape": list(val.block_shape),
@@ -80,9 +94,10 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
             if isinstance(path, tuple) and len(path) == 1 and path[0] < len(names):
                 constexpr_names.add(names[path[0]])
 
-        ptxas = os.environ.get("TRITON_PTXAS_BLACKWELL_PATH") or os.environ.get("TRITON_PTXAS_PATH", "")
-        spec = ptx_launch.build_spec(ptx, kernel.metadata, tuple(grid), _ordered_args(bound_args, constexpr_names),
-                                     ptxas)
+        ptxas = get_ptxas(kernel.metadata.target.arch)
+        blobs = {}
+        spec = ptx_launch.build_spec(ptx, kernel.metadata, tuple(grid),
+                                     _ordered_args(bound_args, constexpr_names, blobs), ptxas.path, ptxas.version)
         spec.update(
             ptx_sha256=sha,
             kernel_name=getattr(kernel.metadata, "name", getattr(jitfn, "__name__", "kernel")),
@@ -92,6 +107,11 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
         os.makedirs(tdir, exist_ok=True)
         with open(os.path.join(tdir, "kernel.ptx"), "w") as f:
             f.write(ptx)
+        # Before spec.json: its existence marks the task complete (see the skip check above). Only
+        # write blobs the spec references -- build_spec dedupes tensors by data_ptr, dropping the rest.
+        for blob_sha in {t["pickle_sha256"] for t in spec["tensors"] if "pickle_sha256" in t}:
+            with open(os.path.join(tdir, f"{blob_sha}.pkl"), "wb") as f:
+                f.write(blobs[blob_sha])
         with open(done, "w") as f:
             json.dump(spec, f, indent=2, default=str)
         dlog(
