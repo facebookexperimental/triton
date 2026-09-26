@@ -22,6 +22,14 @@ The loop is:
 build -> verify -> benchmark -> profile -> propose source mutation -> repeat
 ```
 
+Production `tlx.ops` tuning treats the existing full search space as a fixed
+oracle and edits only `heuristic_config`. The Decision Maker requires one
+heuristic config, at least 98% weighted geometric-mean parity with full, and at
+least 95% parity on every stable production shape. Intermediate decision trees
+that improve the parity objective become the parent for the next round. If the
+run ends before reaching the absolute targets, a revalidated tree that still
+improves the incumbent is retained and may reach VCS instead of being discarded.
+
 The Decision Maker establishes the authoritative baseline and supplies normalized evidence
 to the Optimizer.
 
@@ -73,10 +81,17 @@ group. Large profile payloads (>1MB inline JSON) are spilled to
 
 ## CLI
 
-Run the module directly from the Triton source repository root:
+TLX-agent exposes two tasks:
+
+- `authoring`: optimize kernel implementation source against its target harness.
+- `tuning`: expand a production configuration space and distill its full-space
+  winners into a heuristic dispatch policy.
+
+Run standalone authoring from the Triton source repository root:
 
 ```bash
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
   --kernel my_kernel.py --reference-kernel reference_kernel.py \
   --output-dir /tmp/tlx-kernel-agent-run \
   --max-rounds 5 \
@@ -84,16 +99,86 @@ python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
 
 # Continue from a completed run without adopting its winner:
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-next \
   --prior-run /tmp/tlx-kernel-agent-run \
   --provider codex --arch blackwell
 
 # A revalidated winner is committed by default:
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-run \
   --vcs auto \
   --commit-message "Optimize my kernel with TLX agent"
 ```
+
+Run standalone tuning for a production MM configuration space and heuristic
+policy. The kernel path is
+inferred as `third_party/tlx/ops/kernels/<op>/<arch>.py`, and cases are loaded
+directly from the named production suite so updates are picked up automatically:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task tuning --op mm --arch gfx942 --suite gfx942_all
+```
+
+`--task tuning` is inferred when `--op` or `--suite` is present, but the examples
+spell it explicitly. `--tune-after-authoring` instead infers `authoring`;
+production authoring without that flag should pass `--task authoring`
+explicitly.
+The former `--objective kernel|heuristic-policy` spelling is deprecated and
+accepted only as a compatibility alias.
+
+The tuning task selects the least-used GPU matching `--arch`, sets its
+visibility before PyTorch initializes, applies the benchmark clock/power
+governor, and binds the process to the GPU-local NUMA node. Use `--device N` to
+pin a physical GPU, `--no-govern` for an intentionally ungoverned run, or
+`--no-commit-winner` for artifact-only execution. Artifacts default to
+`/tmp/tlx-agent-<arch>-<op>-<suite>`.
+
+MM tuning is operation-level rather than architecture-specific. It executes
+candidate implementations through `tlx.ops.mm`, while the selected device
+chooses the architecture implementation. An implementation is ready for this
+task when it exposes `space="full"`, `space="heuristic"`, a full-space factory,
+and `heuristic_config`. The tuning task requires at least 16 candidates in the
+fixed full space; a smaller oracle is rejected rather than mutated.
+
+The output contains a `heuristic/` agent run plus a top-level `best_kernel.py`,
+compact `summary.json`, and complete `result.json`. Candidates may change only
+`heuristic_config`, and each branch must carry a one-sentence explanation. Use
+`--heuristic-rounds` to budget the search. `--search-rounds` remains accepted as
+a deprecated no-op for command-line compatibility.
+
+Production authoring and heuristic tuning are independent. Use production
+authoring by itself when changing kernel implementation source or validating a
+production operation against its real shape suite:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
+  --op mm --arch gfx942 --suite gfx942_all \
+  --output-dir /tmp/tlx-agent-gfx942-mm-authoring
+```
+
+This infers the production kernel, harness, and cases but does not run heuristic
+tuning. Add `--tune-after-authoring` only when the authored kernel is ready and
+its source changes may alter which configurations win across the production
+suite:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
+  --op mm --arch gfx942 --suite gfx942_all \
+  --tune-after-authoring \
+  --output-dir /tmp/tlx-agent-gfx942-mm-authoring
+```
+
+The flag is disabled by default and requires `--op`, `--arch`, and `--suite`.
+The successful authored source—not merely the on-disk source—becomes the input
+to tuning. For tuning without an authoring pass, use `--task tuning` instead.
+The epilogue writes its artifacts under `<output-dir>/tuning/`; the combined
+task result is `<output-dir>/task_result.json`. If authoring does not pass its
+gates, tuning is not run.
 
 `--arch` and `--target-name` select a manifest-backed bundle under
 `decision_maker/targets/<vendor>/<arch>/<target-name>`. `--target-name` defaults to the
@@ -228,6 +313,7 @@ For an initial AMD smoke run, disable automatic commits and use a small search b
 
 ```bash
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
   --kernel third_party/tlx/tutorials/amd_gemm_warp_pipeline.py \
   --arch gfx950 --target-name gemm \
   --output-dir /tmp/tlx-agent-gfx950 \
@@ -242,8 +328,9 @@ synthetic `LATENCY_US` timing so unit tests pass on any host.
 ## H100 pilot
 
 ```bash
-# Kernel-only: arch auto-resolved, or pass --arch hopper for H100
+# Standalone authoring: arch auto-resolved, or pass --arch hopper for H100
 python -m third_party.tlx.tools.agents.kernel_optimization.decision_maker.cli \
+  --task authoring \
   --kernel my_gemm_kernel.py --reference-kernel baseline_gemm.py \
   --arch hopper \
   --output-dir /tmp/tlx-agent-h100 \

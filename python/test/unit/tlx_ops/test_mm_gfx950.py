@@ -102,6 +102,24 @@ def test_mm_small_square_register_plan(m):
     )
 
 
+def test_mm_register_fallback_for_row_major_b(monkeypatch):
+    from triton.tlx.ops.kernels.mm.gfx950 import mm
+
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 32), device="cuda", dtype=torch.float16)
+    expected = torch.empty((64, 32), device="cuda", dtype=torch.float16)
+
+    def launch_register_plan(actual_a, actual_b, *, config, out, _validated):
+        assert actual_a is a
+        assert actual_b is b
+        assert config == _gfx950._intermediate_register_config(64, 32, 128)
+        assert _validated
+        return expected
+
+    monkeypatch.setattr(_gfx950, "_launch_register_plan", launch_register_plan)
+    assert mm(a, b, space="heuristic") is expected
+
+
 def test_mm_rejects_invalid_rank():
     from triton.tlx.ops import mm as tlx_mm
 
@@ -138,13 +156,30 @@ def test_mm_rejects_mismatched_device():
         tlx_mm(a, b)
 
 
+def test_mm_accepts_full_space(monkeypatch):
+    from triton.tlx.ops.kernels.mm.gfx950 import mm
+
+    a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
+    b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
+    expected = torch.empty((7, 8192), device="cuda", dtype=torch.float16)
+
+    def launch_register(actual_a, actual_b, *, out):
+        assert actual_a is a
+        assert actual_b is b
+        assert out.shape == expected.shape
+        return expected
+
+    monkeypatch.setattr(_gfx950, "_launch_register", launch_register)
+    assert mm(a, b, space="full") is expected
+
+
 def test_mm_rejects_invalid_space():
     from triton.tlx.ops.kernels.mm.gfx950 import mm
 
     a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
     b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
-    with pytest.raises(InvalidInput, match="space='heuristic'"):
-        mm(a, b, space="full")
+    with pytest.raises(InvalidInput, match="unknown gfx950 mm search space"):
+        mm(a, b, space="bogus")
 
 
 def test_mm_rejects_unsupported_operands():

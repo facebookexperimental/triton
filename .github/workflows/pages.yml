@@ -8,6 +8,7 @@ name: Pages
 # source rather than carried over from a previous deploy:
 #   /                  website/content/*.md via generate_tlx_site.py
 #   /nightly/simple/   the rolling 'nightly' release, via the releases API
+#   /bench/            the 'tlx-ops-bench' release, via tlx_ops_bench_dashboard.py
 on:
   push:
     branches: [main]
@@ -17,9 +18,12 @@ on:
       - '.github/workflows/pages.yml'
       - '.github/scripts/nightly_build_index.py'
       - '.github/scripts/nightly_gen_simple_index.py'
-  # Republish after the nightly so the wheel index picks up the new assets.
+      - '.github/scripts/tlx_ops_bench_dashboard.py'
+      - '.github/scripts/tlx_ops_bench_dashboard.html'
+  # Republish after the nightly so the wheel index picks up the new assets, and
+  # after its bench so /bench/ picks up the new results.
   workflow_run:
-    workflows: ["Nightly fbtriton"]
+    workflows: ["Nightly fbtriton", "Nightly TLX.ops Bench"]
     types: [completed]
   workflow_dispatch:
 
@@ -37,7 +41,12 @@ concurrency:
 jobs:
   deploy:
     # workflow_run fires on failure too; only mirror a nightly that finished.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # The bench concludes failure whenever a case is PIP, and those are exactly
+    # the results the dashboard exists to show.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event.workflow_run.name == 'Nightly TLX.ops Bench'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -70,8 +79,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/nightly_build_index.py public/nightly/simple
 
-      # Reserved: /bench/ and /docs/ mount here, as producer jobs that publish
-      # to a release and are pulled in above. They must not deploy themselves.
+      - name: Render tlx.ops bench dashboard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/tlx_ops_bench_dashboard.py render public/bench
+
+      # Reserved: /docs/ mounts here, as a producer job that publishes to a
+      # release and is pulled in above. It must not deploy itself.
 
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -88,7 +102,7 @@ jobs:
           base="${{ steps.deploy.outputs.page_url }}"
           base="${base%/}/"
           rc=0
-          for path in '' 'website/tlx.html' 'website/assets/tlx.css' 'nightly/simple/fbtriton/'; do
+          for path in '' 'website/tlx.html' 'website/assets/tlx.css' 'nightly/simple/fbtriton/' 'bench/'; do
             code=$(curl -sS -o /dev/null -w '%{http_code}' \
                      --retry 5 --retry-delay 5 --retry-all-errors "${base}${path}")
             printf '%s  %s\n' "$code" "${base}${path}"

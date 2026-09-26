@@ -413,6 +413,19 @@ llvm::StringMap<StringRef> buildOpNameMap() {
   return map;
 }
 
+// Make an MLIR name usable as a Python identifier. MLIR admits characters
+// Python does not -- the dots in block-pointer-derived names like
+// `V_block_ptr.offsets.1`, and `.` or `$` in function symbols.
+static std::string sanitizePyIdentifier(StringRef raw) {
+  std::string name = raw.str();
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
+  if (!name.empty() && std::isdigit(name.front()))
+    name = "var_" + name;
+  return name;
+}
+
 // Format a raw SSA name from printAsOperand into a clean variable name.
 static std::string formatSSAName(StringRef raw) {
   std::string name = raw.str();
@@ -423,14 +436,7 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  // MLIR names may carry characters Python identifiers cannot, notably the
-  // dots in block-pointer-derived names like `V_block_ptr.offsets.1`.
-  for (char &c : name)
-    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
-      c = '_';
-  if (!name.empty() && std::isdigit(name.front()))
-    name = "var_" + name;
-  return name;
+  return sanitizePyIdentifier(name);
 }
 
 // Thread-local pointer to the value name cache built once per module.
@@ -559,6 +565,38 @@ static bool spellsElementTypeCast(Operation *castOp, StringRef operandName) {
          isNameableElementType(
              getElementType(castOp->getResult(0).getType())) &&
          operandName != "None";
+}
+
+// tt.extern_elementwise dispatches on a {(arg dtypes): (symbol, ret dtype)}
+// dict. Emitting that literal inside the kernel does not work -- the Triton
+// frontend traces container literals and the tuple key comes back as a list --
+// so each one is hoisted to a module-scope wrapper, named here.
+static thread_local DenseMap<Operation *, std::string> *externSigNames =
+    nullptr;
+
+// Names already given to a module-scope def in the current print. Sanitizing is
+// many-to-one, so two tt.func symbols can collapse to one identifier and their
+// per-function counters both start at 0; the later Python def would silently
+// shadow the earlier. Reset per module in runOnOperation.
+static thread_local llvm::StringSet<> moduleScopeDefNames;
+
+static std::string uniqueModuleScopeName(StringRef base) {
+  std::string name = base.str();
+  unsigned n = 0;
+  while (!moduleScopeDefNames.insert(name).second)
+    name = base.str() + "_" + std::to_string(++n);
+  return name;
+}
+
+// Whether an extern_elementwise has a signature we can spell as TLX dtypes.
+static bool canNameExternSignature(Operation *op) {
+  if (op->getNumResults() != 1 || !op->getAttrOfType<StringAttr>("symbol"))
+    return false;
+  if (!isNameableElementType(getElementType(op->getResult(0).getType())))
+    return false;
+  return llvm::all_of(op->getOperands(), [](Value v) {
+    return isNameableElementType(getElementType(v.getType()));
+  });
 }
 
 // Get simplified name for a value (just the SSA name)
@@ -2643,6 +2681,23 @@ void printSimplifiedOp(
     }
   }
 
+  // tt.extern_elementwise names its callee in attributes, which the generic
+  // path drops. Call the module-scope wrapper emitted for it instead.
+  if (opName == "tt.extern_elementwise" && op->getNumResults() == 1 &&
+      externSigNames) {
+    auto sig = externSigNames->find(op);
+    if (sig != externSigNames->end()) {
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = "
+         << sig->second << "(";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << ")";
+      printLocComment(op, os);
+      return;
+    }
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
@@ -2781,8 +2836,60 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       os << "except ModuleNotFoundError:\n";
       os << "    import triton.language.extra.tlx as tlx\n";
       os << "\n";
+
+      // Emit a module-scope @extern wrapper per extern_elementwise; see
+      // externSigNames. This mirrors how libdevice declares its own bindings.
+      static thread_local DenseMap<Operation *, std::string> sigNames;
+      sigNames.clear();
+      externSigNames = &sigNames;
+      unsigned sigIdx = 0;
+      funcOp.walk([&](Operation *externOp) {
+        if (externOp->getName().getStringRef() != "tt.extern_elementwise" ||
+            !canNameExternSignature(externOp))
+          return;
+        // Qualify by function: sigIdx restarts per tt.func, so a bare index
+        // would give two functions in one module the same module-scope def.
+        // The symbol is sanitized because it lands in a Python `def`.
+        std::string name = uniqueModuleScopeName(
+            "_extern_fn_" + sanitizePyIdentifier(funcOp.getName()) + "_" +
+            std::to_string(sigIdx++));
+        sigNames[externOp] = name;
+        auto libname = externOp->getAttrOfType<StringAttr>("libname");
+        auto libpath = externOp->getAttrOfType<StringAttr>("libpath");
+        auto pure = externOp->getAttrOfType<BoolAttr>("pure");
+        unsigned n = externOp->getNumOperands();
+        os << "@tl.core.extern\n";
+        os << "def " << name << "(";
+        for (unsigned i = 0; i < n; ++i)
+          os << "arg" << i << ", ";
+        os << "_semantic=None):\n";
+        os << "    return tl.core.extern_elementwise(";
+        printPythonStringLiteral(libname ? libname.getValue() : StringRef(""),
+                                 os);
+        os << ", ";
+        printPythonStringLiteral(libpath ? libpath.getValue() : StringRef(""),
+                                 os);
+        os << ", [";
+        for (unsigned i = 0; i < n; ++i)
+          os << (i ? ", " : "") << "arg" << i;
+        os << "], {(";
+        for (Value v : externOp->getOperands())
+          // The trailing comma keeps a single-operand key a tuple.
+          os << getElementTypeName(getElementType(v.getType())) << ", ";
+        os << "): (";
+        printPythonStringLiteral(
+            externOp->getAttrOfType<StringAttr>("symbol").getValue(), os);
+        os << ", "
+           << getElementTypeName(
+                  getElementType(externOp->getResult(0).getType()))
+           << ")}, is_pure=" << ((pure && pure.getValue()) ? "True" : "False")
+           << ", _semantic=_semantic)\n\n";
+      });
+
       os << "@triton.jit\n";
-      os << "def " << funcOp.getName() << "(";
+      os << "def "
+         << uniqueModuleScopeName(sanitizePyIdentifier(funcOp.getName()))
+         << "(";
       // Print function arguments, collapsing expanded TensorDescriptor args.
       // A host-side TensorDescriptor lowers to a !tt.tensordesc value followed
       // by expanded shape/stride scalars that share the descriptor's name, in
@@ -3664,6 +3771,8 @@ public:
         ++numErrors;
       return failure();
     });
+
+    moduleScopeDefNames.clear();
 
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();

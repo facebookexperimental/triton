@@ -86,8 +86,11 @@ class KernelTarget:
         ExperimentKind.PROMOTABLE,
         ExperimentKind.HUMAN_REVIEW,
     )
+    evaluation_policy: Mapping[str, JsonValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.evaluation_policy, Mapping):
+            raise ValueError("evaluation_policy must be a mapping")
         raw_skills = self.optimization_skills
         if not isinstance(raw_skills, (list, tuple)):
             raise ValueError("optimization_skills must be a sequence of names")

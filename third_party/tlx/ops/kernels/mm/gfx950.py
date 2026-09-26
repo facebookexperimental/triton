@@ -434,6 +434,14 @@ _REGISTER_CONFIGS += [
     )
 ]
 
+
+def _configs():
+    """Return the full register-kernel autotune space."""
+    return list(_REGISTER_CONFIGS)
+
+
+CONFIGS = _configs
+
 # Coalesced SIMD register layout for the [HALF_M, HALF_N] = [128, 128] fp16 quadrant
 # store (num_warps=8, warp_size=64): each thread holds 8 contiguous N elements ->
 # 128-bit buffer_store_dwordx4. Applied to the epilogue store via tlx.require_layout
@@ -486,7 +494,7 @@ _A_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((8, 1024, 6
 _B_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((1024, 16, 1), (128, 8)))
 
 _register_kernel = triton.autotune(
-    configs=_REGISTER_CONFIGS,
+    configs=CONFIGS(),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_register_configs},
 )(_register_kernel_impl)
@@ -3362,6 +3370,83 @@ def _dispatch_plan(m, n, k, dtype, element_size):
     return "lds", (block_m, block_n, split_k)
 
 
+def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
+    """Return one production plan selected from measured gfx950 families."""
+
+    def register(block_m, block_n, block_k, group_m, num_xcds, waves_per_eu, num_warps, num_stages):
+        return "register", {
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "GROUP_M": group_m,
+            "NUM_XCDS": num_xcds,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": waves_per_eu,
+            "kpack": 1,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
+    # Only genuinely strided operands retain the generic register fallback; either dense B orientation is eligible below.
+    if a_strides[1] != 1 or (b_strides[0] != 1 and b_strides[1] != 1):
+        return "register", _register_plan_for_shape(m, n, k) or _intermediate_register_config(m, n, k)
+
+    # Sub-1024 row problems retain their measured LDS, persistent, and LocalSplitU algorithm choices.
+    if m < 1024:
+        return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Small output grids and shallow medium-M reductions retain their measured incumbent algorithms.
+    if m < 4096 and (m * n <= 4 * 1024 * 1024 or n <= 512 or k <= 512):
+        return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Extremely reduction-heavy matrices retain the incumbent split-K plan.
+    if k >= 64 * n:
+        return _dispatch_plan(m, n, k, dtype, element_size)
+
+    # Short reductions favor the measured 128x256 K32 wave-limited family.
+    if k <= 256:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
+
+    # Narrow outputs favor the measured 256x256 two-stage family despite the N tail.
+    if n <= 256:
+        return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Extreme N-major shapes favor the wide-N K32 family.
+    if n >= 8 * k:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
+
+    # Large-M throughput shapes favor the measured 256x256 two-stage family.
+    if m >= 16384:
+        return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Low-M N-major shapes amortize best with the larger square tile.
+    if n >= 2 * k and m <= 1024:
+        return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Low-M broad K-major shapes favor the measured XCD-swizzled square family.
+    if m <= 1024 and k >= 2 * n and n >= 4096:
+        return register(128, 128, 64, 8, 8, 0, 4, 2)
+
+    # Remaining N-major shapes favor the XCD-swizzled 128x128 family.
+    if n >= 2 * k:
+        return register(128, 128, 64, 16, 8, 0, 4, 2)
+
+    # Broad K-major outputs favor the non-swizzled 128x128 family.
+    if k >= 2 * n and n >= 4096:
+        return register(128, 128, 64, 16, 1, 0, 4, 2)
+
+    # Narrower K-major outputs favor the XCD-swizzled 128x128 family with shorter grouping.
+    if k >= 2 * n:
+        return register(128, 128, 64, 8, 8, 0, 4, 2)
+
+    # Balanced shapes with at least 4096 rows favor the wide-N K32 family.
+    if m >= 4096:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
+
+    # Remaining balanced shapes use the measured XCD-swizzled square family.
+    return register(128, 128, 64, 8, 8, 0, 4, 2)
+
+
 def _dispatch_for(a, b):
     problem = _problem_for(a, b)
     if problem is None:
@@ -3426,24 +3511,28 @@ def matmul(a, b, out=None):
 
 def mm(a, b, *, space="heuristic"):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation."""
-    if space != "heuristic":
-        raise InvalidInput("gfx950 mm currently supports space='heuristic' only")
-    if not a.is_cuda or a.stride(1) != 1 or b.stride(0) != 1:
+    if space not in ("full", "heuristic"):
+        raise InvalidInput(f"unknown gfx950 mm search space: {space}")
+    if not a.is_cuda or any(stride <= 0 for stride in (*a.stride(), *b.stride())):
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     m, k = a.shape
     _, n = b.shape
-    dispatch = _dispatch_plan(
+    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    if space == "full":
+        return _launch_register(a, b, out=out)
+    dispatch = heuristic_config(
         m,
         n,
         k,
         a.dtype,
         a.element_size(),
+        a.stride(),
+        b.stride(),
     )
     if dispatch is None:
         raise InvalidInput("gfx950 mm does not support "
                            f"a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
-    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch

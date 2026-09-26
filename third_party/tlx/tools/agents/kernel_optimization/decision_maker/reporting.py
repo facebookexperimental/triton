@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -194,6 +195,22 @@ def rejection_feedback(
         speedup = speedups.get(evaluation.case_id)
         if speedup is not None:
             case_parts.append(f"speedup={speedup:.4f}x")
+        policy_metrics = {
+            key: evaluation.verification.metrics[key]
+            for key in (
+                "full_space_parity",
+                "heuristic_config_count",
+                "heuristic_median_us",
+                "full_median_us",
+                "parity_stable",
+            )
+            if key in evaluation.verification.metrics
+        }
+        if policy_metrics:
+            case_parts.append(
+                "metrics="
+                + json.dumps(policy_metrics, sort_keys=True, separators=(",", ":"))
+            )
         case_parts.extend(profile_log_parts(evaluation.profile))
         parts.append("case=" + ",".join(case_parts))
     return " ".join(parts)[:4000]

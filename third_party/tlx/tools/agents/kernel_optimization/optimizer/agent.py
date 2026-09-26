@@ -8,19 +8,18 @@ import subprocess
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Protocol, TypeAlias
 
 from ..contracts import (
     BlastRadius,
     CandidateChange,
+    CaseEvaluation,
     ChangeScope,
     DiagnosticEvidence,
     ExperimentKind,
     JsonValue,
     KernelOptimizationRequest,
-    KernelTarget,
     PerformanceSummary,
     ResearchEvidence,
     VALID_HYPOTHESIS_KINDS,
@@ -34,7 +33,6 @@ from ..decision_maker.profiling import (
 from .knowledge import load_knowledge
 from .source import (
     source_digest,
-    validate_diagnostic_instrumentation_source,
     validate_replacement_source,
 )
 from .strategy import OPTIMIZATION_STRATEGY
@@ -758,16 +756,16 @@ def _read_candidate_metadata(
     legacy_schema = schema_version == _LEGACY_METADATA_SCHEMA_VERSION
 
     metadata: dict[str, object] = {}
-    for field in _SHORT_METADATA_FIELDS:
-        value = payload.get(field)
+    for field_name in _SHORT_METADATA_FIELDS:
+        value = payload.get(field_name)
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"candidate metadata field {field!r} must be non-empty")
-        metadata[field] = value.strip()
-    for field in _SHORT_METADATA_FIELDS:
-        text = str(metadata[field])
+            raise ValueError(f"candidate metadata field {field_name!r} must be non-empty")
+        metadata[field_name] = value.strip()
+    for field_name in _SHORT_METADATA_FIELDS:
+        text = str(metadata[field_name])
         if "\n" in text or len(text) > 240:
-            raise ValueError(f"candidate metadata field {field!r} must be one line under 240 characters")
-        metadata[field] = _clean_short_metadata(text)
+            raise ValueError(f"candidate metadata field {field_name!r} must be one line under 240 characters")
+        metadata[field_name] = _clean_short_metadata(text)
 
     if not legacy_schema and "experiment_kind" not in payload:
         raise ValueError("experiment_kind must name a supported experiment kind")
@@ -1529,6 +1527,7 @@ def _build_prompt(
         f"{case.timing.median_us if case.timing else 'unavailable'}, "
         f"p95_us={case.timing.p95_us if case.timing else 'unavailable'}, "
         f"cv={case.timing.coefficient_of_variation if case.timing else 'unavailable'}, "
+        f"{_verification_metrics_prompt(case)}"
         f"profile={_profile_prompt_summary(dict(case.profile))}"
         for case in context.current_performance.cases
     )
@@ -1575,6 +1574,13 @@ def _build_prompt(
     supported_kinds = ", ".join(
         kind.value for kind in request.target.supported_experiment_kinds
     )
+    evaluation_policy_block = (
+        "Evaluation policy: "
+        + json.dumps(dict(request.target.evaluation_policy), sort_keys=True)
+        + "\n"
+        if request.target.evaluation_policy
+        else ""
+    )
     diagnostic_evidence_block = _diagnostic_evidence_prompt_block(context)
     diagnostic_history_block = _agent_diagnostic_history_prompt_block(context)
     research_history_block = _agent_research_history_prompt_block(context)
@@ -1592,7 +1598,7 @@ diagnosed if it fails.
 
 Target: backend={request.target.backend}, architecture={request.target.architecture}
 Target-supported experiment kinds: {supported_kinds}
-Round: {context.round_index}, candidate: {context.candidate_index}
+{evaluation_policy_block}Round: {context.round_index}, candidate: {context.candidate_index}
 Cases:
 {case_lines}
 
@@ -1607,3 +1613,8 @@ Recent failed-candidate diagnostics:
 Current source: read `candidate.py` in the working directory and follow the selected
 action's mutation rules exactly.
 """
+
+
+def _verification_metrics_prompt(case: CaseEvaluation) -> str:
+    metrics = dict(case.verification.metrics)
+    return f"metrics={metrics}, " if metrics else ""
