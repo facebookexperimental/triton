@@ -1803,3 +1803,92 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// ttg.warp_predicate carries real code in a region. Without a mapping the
+// region-bearing op fell to the generic printer, which emitted the whole body
+// as inert `#` comments while still binding the results -- silently dropping
+// the computation. tlx.warp_predicate takes the body as a separate
+// @triton.jit function, so hoist it to module scope. The region has no block
+// arguments: it names the inits and its other captures directly, and
+// body(*inits, *args) has to receive them in that order.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: @triton.jit
+  // CHECK: def _wp_body_warp_predicate_body_0(
+  // The body is real code, not commented out, and returns the yielded value.
+  // CHECK: {{[a-z0-9_]+}} = {{[a-z0-9_]+}} * {{[a-z0-9_]+}}
+  // CHECK: return
+  // CHECK-LABEL: def warp_predicate_body(
+  // CHECK: = tlx.warp_predicate(arg1, ({{.*}}, ), _wp_body_warp_predicate_body_0, (
+  tt.func public @warp_predicate_body(%x: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // An init that renders as an inlined literal -- ub.poison comes back as
+  // tl.full(..., float('-inf'), ...) -- cannot be the parameter name, but the
+  // body still needs a positional parameter for it.
+  // CHECK: @triton.jit
+  // CHECK: def _wp_body_warp_predicate_literal_init_0(_wp_init_0
+  // CHECK-LABEL: def warp_predicate_literal_init(
+  tt.func public @warp_predicate_literal_init(%p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %c = ub.poison : tensor<256xf32, #blocked>
+    %r = ttg.warp_predicate %p(%c) {
+      %m = arith.mulf %c, %c : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // The body name embeds the enclosing symbol, which MLIR lets carry `.`; it
+  // has to be sanitized before it lands in a Python `def`.
+  // CHECK: def _wp_body_wp_odd_name_0(
+  // CHECK-LABEL: def wp_odd_name(
+  // CHECK: = tlx.warp_predicate({{.*}}, _wp_body_wp_odd_name_0, (
+  tt.func public @"wp.odd.name"(%x: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // A value that is both an init and a region capture must be skipped on the
+  // capture pass -- it is already a parameter. The skip cannot desynchronize
+  // the two sides: one loop fills both the definition's parameter list and the
+  // call's argument tuple, so `continue` drops the value from both. Here the
+  // body takes 2 params and the call passes 1 init + 1 arg.
+  // CHECK: def _wp_body_init_also_captured_0(arg0, arg1):
+  // CHECK-LABEL: def init_also_captured(
+  // CHECK: = tlx.warp_predicate(arg2, (arg0, ), _wp_body_init_also_captured_0, (arg1, ))
+  tt.func public @init_also_captured(%x: tensor<256xf32, #blocked>, %y: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %y : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+
+  // A multi-block region goes through the CF-aware printer, which walks ops
+  // with its own traversal. That one needs the same hoisted-body guard: without
+  // it the region is re-emitted as comments, carrying a spurious UNSUPPORTED
+  // marker for the yield that makes the dump look like it has a coverage gap.
+  // CHECK-LABEL: def warp_predicate_in_cf(
+  // CHECK: = tlx.warp_predicate(
+  // CHECK-NOT: {{UNSUPPORTED}}: no TLX mapping for ttg.predicate_yield
+  tt.func public @warp_predicate_in_cf(%x: tensor<256xf32, #blocked>, %p: tensor<256xi1, #blocked>) attributes {noinline = false} {
+    cf.br ^bb1
+  ^bb1:
+    %r = ttg.warp_predicate %p(%x) {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      ttg.predicate_yield %m : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
