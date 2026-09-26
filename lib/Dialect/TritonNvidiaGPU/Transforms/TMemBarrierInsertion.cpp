@@ -455,6 +455,17 @@ void TMemBarrierAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
 void TMemBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
                                  FuncBlockInfoMapT *funcBlockInfoMap,
                                  OpBuilder *builder) {
+  // Per-thread arrives are not local barriers at all (see
+  // containsLocalBarrier), so they fall through to the generic path untouched.
+  if (auto arrive = dyn_cast<ArriveBarrierOp>(op);
+      arrive && !arrive.getPerThread()) {
+    // An mbarrier arrive signals another task; it orders nothing across this
+    // task's own warps. Drop pending writes (same-task WAW needs no barrier)
+    // but keep pending reads: a later store to the same TMEM is an intra-task
+    // WAR hazard that still needs a barrier.
+    blockInfo->syncWriteSlices.clear();
+    return;
+  }
   if (mlir::containsLocalBarrier(op)) {
     blockInfo->sync();
     return;
