@@ -172,11 +172,13 @@ def amd_scheduled_mfma(
     does not apply these class constraints and leaves physical placement to
     LLVM; use :func:`amd_register_resident` for a hard source residency point.
 
-    The compiler recognizes eligible persistent AGPR accumulator chains ending
-    at ``amd_mfma_commit``. After scheduling and physical register assignment,
-    it repairs source and EXEC hazards and drains outstanding results before
-    any physical AGPR read or overwrite. Unknown dataflow and VGPR accumulators
-    retain conservative waits.
+    On gfx950, the compiler recognizes eligible persistent AGPR or VGPR
+    accumulator chains ending at a matching ``amd_mfma_commit`` boundary.
+    After scheduling and physical register assignment, it repairs source,
+    accumulator, and EXEC hazards and inserts any required waits before
+    physical-register reads or overwrites of outstanding results. Unproven
+    persistent chains and those on other supported targets retain conservative
+    waits.
 
     CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
     ``accumulator_register_class="vgpr"``. The inputs must be matching BF16 or
