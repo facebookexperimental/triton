@@ -56,6 +56,9 @@ plan = prepare_varlen_backward(
 )
 dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale)
 
+# Use FP32 dQ accumulation and atomics; inputs and returned gradients stay BF16.
+dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, dq_atomic_fp32=True)
+
 # Causal packed self-attention. Q and KV offsets and head counts must match.
 dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, causal=True)
 ```
@@ -82,6 +85,15 @@ key/value token.
 V may use the TritonBench-style `v_storage[:, 0]` view: the head and D axes must
 remain dense while the token stride may include gaps.  Returned `dv` is always
 contiguous.
+
+The FP32 option uses a shared interleaved schedule for eligible aligned
+non-causal MHA and GQA cases. Each KV tile reuses K/V across its query heads,
+retains their dK/dV contributions in FP32, and stores the final gradients once.
+Long-query prefix GQA assigns chunks of query rows to two owners, then reduces
+their FP32 dK/dV partials before the final BF16 stores. The public dispatcher
+selects this schedule for the tuned configurations. Other shapes, causal
+attention, and BF16 dQ accumulation retain their existing paths, except that
+misaligned inputs bypass wide aligned copies through the generic BM16 kernel.
 
 In non-causal mode the Q and KV offsets are independent.  To model an
 extend-attention workload, pack only the extend tokens in Q and pack the full
