@@ -4316,10 +4316,9 @@ def _bwd_compute_inner_loop(
     tl.static_assert(not PRENORMALIZED_DO or STAGE != 1)
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
-    # Named-barrier rendezvous for the aliased-TMEM WAR (Hazard 1): all 8 compute
-    # warps must finish reading qk/dp before any overwrites it with P/dsT. One
-    # named_barrier_wait is a full bar.sync; indices 7-15 are free (0-6 reserved).
-    QK_READ_DONE_BAR: tl.constexpr = 10
+    # dsT (f16) aliases dp's (f32) TMEM region, but TMemBarrierInsertion stays
+    # silent there: the mbarrier arrives between the dp read and the dsT store
+    # clear its tracking state. This rendezvous is load-bearing; keep it.
     DP_READ_DONE_BAR: tl.constexpr = 11
     NUM_COMPUTE_THREADS: tl.constexpr = 8 * 32
     if num_steps_override > 0:
@@ -4368,7 +4367,8 @@ def _bwd_compute_inner_loop(
                 ppT = p_h
             else:
                 ppT = pT.to(do_out_dtype)
-            tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
+            # P (f16) aliases the upper half of the qk (f32) TMEM region; this
+            # intra-task WAR is ordered by the compiler's TMemBarrierInsertion pass.
             tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
             if USE_2CTA:
                 tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
@@ -4390,6 +4390,8 @@ def _bwd_compute_inner_loop(
             else:
                 dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
                 dsT = dsT.to(q_out_dtype)
+            # Intra-task WAR rendezvous (see above); TMemBarrierInsertion does not
+            # cover this store, so the explicit wait is required.
             tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
             tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
             if not REUSE_DP_FOR_DQ and not USE_2CTA:
