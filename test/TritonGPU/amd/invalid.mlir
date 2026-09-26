@@ -1,5 +1,132 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+// Reject zero warp counts before querying native MFMA fragment ownership.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [0, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_zero_batch_warps(
+      %a: tensor<2x16x32xbf16, #lhs>, %b: tensor<2x32x16xbf16, #rhs>, %acc: tensor<2x16x16xf32, #mma>) {
+    // expected-error @+1 {{MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent" register_class "agpr" initialize true
+        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x16xbf16, #rhs>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 0, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_zero_m_warps_rank3(
+      %a: tensor<2x16x32xbf16, #lhs>, %b: tensor<2x32x16xbf16, #rhs>, %acc: tensor<2x16x16xf32, #mma>) {
+    // expected-error @+1 {{MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent" register_class "agpr" initialize true
+        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x16xbf16, #rhs>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 0], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_zero_n_warps_rank3(
+      %a: tensor<2x16x32xbf16, #lhs>, %b: tensor<2x32x16xbf16, #rhs>, %acc: tensor<2x16x16xf32, #mma>) {
+    // expected-error @+1 {{MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent" register_class "agpr" initialize true
+        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x16xbf16, #rhs>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [0, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_zero_m_warps_rank2(
+      %a: tensor<16x32xf16, #lhs>, %b: tensor<32x16xf16, #rhs>, %acc: tensor<16x16xf32, #mma>) {
+    // expected-error @+1 {{MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<16x32xf16, #lhs>, tensor<32x16xf16, #rhs>, tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 0], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_zero_n_warps_rank2(
+      %a: tensor<16x32xf16, #lhs>, %b: tensor<32x16xf16, #rhs>, %acc: tensor<16x16xf32, #mma>) {
+    // expected-error @+1 {{MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<16x32xf16, #lhs>, tensor<32x16xf16, #rhs>, tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [0, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_zero_batch_warps(%acc: tensor<2x16x16xf32, #mma>) {
+    // expected-error @+1 {{input 0 MFMA warpsPerCTA entries must be positive}}
+    %result = amdg.mfma_commit %acc : tensor<2x16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#bad_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [0, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #bad_mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_zero_batch_warps_bf16_dependency(
+      %acc: tensor<2x16x16xf32, #mma>, %b: tensor<2x32x16xbf16, #rhs>) {
+    // expected-error @+1 {{input 1 MFMA warpsPerCTA entries must be positive}}
+    %result, %preserved = amdg.mfma_commit %acc, %b
+        : tensor<2x16x16xf32, #mma>, tensor<2x32x16xbf16, #rhs>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#bad_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [0, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #bad_mma, kWidth = 4}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_zero_m_warps_f16_dependency(
+      %acc: tensor<16x16xf32, #mma>, %a: tensor<16x32xf16, #lhs>) {
+    // expected-error @+1 {{input 1 MFMA warpsPerCTA entries must be positive}}
+    %result, %preserved = amdg.mfma_commit %acc, %a
+        : tensor<16x16xf32, #mma>, tensor<16x32xf16, #lhs>
+    tt.return
+  }
+}
+
+// -----
+
 // Matching padding alone does not make a transposed view TDM-compatible.
 #desc_layout = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 #view_layout = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>

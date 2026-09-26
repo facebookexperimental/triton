@@ -1013,9 +1013,13 @@ LogicalResult RegisterClassAnchorOp::verify() {
 }
 
 static LogicalResult
-verifyNativeMfmaInstrShape(Operation *op,
-                           mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
-                           const Twine &prefix) {
+verifyNativeMfmaLayout(Operation *op,
+                       mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
+                       const Twine &prefix) {
+  if (llvm::is_contained(mfma.getWarpsPerCTA(), 0u))
+    return op->emitOpError()
+           << prefix << "MFMA warpsPerCTA entries must be positive";
+
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
   bool isCDNA3Shape = instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
                       instrShape == ArrayRef<unsigned>({16, 16, 16});
@@ -1074,8 +1078,8 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
-                                            "input " + Twine(index) + " ")))
+      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
+                                       "input " + Twine(index) + " ")))
         return failure();
       // SCF-to-CF turns a runtime loop's yielded accumulator into a loop-header
       // block argument used by the mutually exclusive body and exit blocks.
@@ -1112,8 +1116,8 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
-                                            "input " + Twine(index) + " ")))
+      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
+                                       "input " + Twine(index) + " ")))
         return failure();
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
@@ -1208,7 +1212,7 @@ LogicalResult ScheduledMfmaOp::verify() {
     return emitOpError() << "uses MFMA version " << mfma.getVersion()
                          << ", but the target requires version "
                          << *targetVersion;
-  if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma, /*prefix=*/"")))
+  if (failed(verifyNativeMfmaLayout(getOperation(), mfma, /*prefix=*/"")))
     return failure();
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
 

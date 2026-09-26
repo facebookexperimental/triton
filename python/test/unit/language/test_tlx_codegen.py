@@ -3438,6 +3438,27 @@ def test_amd_scheduled_mfma_32x32_compiles_gfx942(elem_ty, persistent):
     assert f"v_mfma_f32_32x32x8_{asm_ty}" in compiled.asm["amdgcn"]
 
 
+@triton.jit
+def _amd_scheduled_mfma_zero_batch_warps_kernel():
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4, instr_shape=[16, 16, 32], transposed=True,
+        warps_per_cta=[0, 1, 1],
+    )
+    lhs: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rhs: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    a = tlx.zeros((2, 16, 32), tl.bfloat16, layout=lhs)
+    b = tlx.zeros((2, 32, 16), tl.bfloat16, layout=rhs)
+    acc = tlx.zeros((2, 16, 16), tl.float32, layout=mma)
+    tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", initialize=True)
+
+
+def test_amd_scheduled_mfma_zero_batch_warps_rejected():
+    # Build the layout through the DSL to exercise unchecked attribute builders,
+    # which do not run the textual parser's attribute validation.
+    with pytest.raises(RuntimeError, match="MFMA warpsPerCTA entries must be positive"):
+        compile_for_gfx950(_amd_scheduled_mfma_zero_batch_warps_kernel, signature={}, constexprs={})
+
+
 def test_amd_scheduled_mfma_rejects_target_version_mismatch():
     with pytest.raises(RuntimeError, match=r"scheduled_mfma.*target requires version 3"):
         compile_for_target(
