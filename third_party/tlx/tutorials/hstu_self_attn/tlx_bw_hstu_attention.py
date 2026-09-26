@@ -4860,6 +4860,13 @@ def backward_custom_vars(
     return M, Delta, stride_mm
 
 
+def _switch_bwd_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
+    """Keep packed QKV views when each head's feature dimension is contiguous."""
+    if x.stride(-1) == 1:
+        return x
+    return x.contiguous()
+
+
 def tlx_hstu_attention_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -4884,10 +4891,10 @@ def tlx_hstu_attention_bwd(
     use_persistent: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass for HSTU attention with jagged sequences."""
-    q = switch_to_contiguous_if_needed(q)
-    k = switch_to_contiguous_if_needed(k)
-    v = switch_to_contiguous_if_needed(v)
-    dout = switch_to_contiguous_if_needed(dout)
+    q = _switch_bwd_to_contiguous_if_needed(q)
+    k = _switch_bwd_to_contiguous_if_needed(k)
+    v = _switch_bwd_to_contiguous_if_needed(v)
+    dout = _switch_bwd_to_contiguous_if_needed(dout)
 
     Z = seq_offsets.numel() - 1
     total_seq_len_q, H, HEAD_DIM = q.shape
@@ -4906,47 +4913,53 @@ def tlx_hstu_attention_bwd(
         # accumulate dq in fp32
         dq = torch.empty_like(q, dtype=torch.float32)
 
-    # TMA descriptors
+    # TMA descriptors. Packed QKV views keep the full allocation's row/head
+    # strides, so make the flattened descriptor wide enough to address the
+    # final head without densifying the input.
     dummy_block = [1, 1]
+
+    def _packed_width(t, head_dim):
+        return (H - 1) * t.stride(1) + head_dim
+
     desc_q = TensorDescriptor(
         q,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(q, HEAD_DIM)],
         strides=[q.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_k = TensorDescriptor(
         k,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(k, HEAD_DIM)],
         strides=[k.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_v = TensorDescriptor(
         v,
-        shape=[total_seq_len_q, H * DimV],
+        shape=[total_seq_len_q, _packed_width(v, DimV)],
         strides=[v.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_do = TensorDescriptor(
         dout,
-        shape=[total_seq_len_q, H * DimV],
+        shape=[total_seq_len_q, _packed_width(dout, DimV)],
         strides=[dout.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_dq = TensorDescriptor(
         dq,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(dq, HEAD_DIM)],
         strides=[dq.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_dk = TensorDescriptor(
         dk,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(dk, HEAD_DIM)],
         strides=[dk.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_dv = TensorDescriptor(
         dv,
-        shape=[total_seq_len_q, H * DimV],
+        shape=[total_seq_len_q, _packed_width(dv, DimV)],
         strides=[dv.stride(0), 1],
         block_shape=dummy_block,
     )
@@ -4966,15 +4979,15 @@ def tlx_hstu_attention_bwd(
         k_scaled = k * (alpha * RCP_LN2)
         desc_k = TensorDescriptor(
             k_scaled,
-            shape=[total_seq_len_q, H * HEAD_DIM],
-            strides=[k.stride(0), 1],
+            shape=[total_seq_len_q, _packed_width(k_scaled, HEAD_DIM)],
+            strides=[k_scaled.stride(0), 1],
             block_shape=dummy_block,
         )
     else:
         # SiLU case: no pre-scaling of K
         desc_k = TensorDescriptor(
             k,
-            shape=[total_seq_len_q, H * HEAD_DIM],
+            shape=[total_seq_len_q, _packed_width(k, HEAD_DIM)],
             strides=[k.stride(0), 1],
             block_shape=dummy_block,
         )
