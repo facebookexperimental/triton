@@ -5,6 +5,7 @@ import os
 import statistics
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 import traceback
 from triton._internal_testing import is_hip_cdna4
+from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     _cluster_causal_query_tile as _amd_fa_cluster_causal_query_tile,
     _cluster_direct_workgroup_window as _amd_fa_cluster_direct_workgroup_window,
@@ -1357,6 +1359,118 @@ def test_amd_fa_cluster_numerical_matrix_gfx950():
         del q, k, v, out, reference, actual_rows, reference_rows
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("shape", "qk_scores", "pv_scores", "expected_tiles"),
+    [
+        (
+            (16, 64, 1024, 64),
+            {(128, 64): 1.13, (256, 64): 1.00},
+            {(128, 64): 1.17, (256, 64): 1.00},
+            [(256, 64, False)],
+        ),
+        (
+            (1, 171, 1472, 64),
+            {(128, 64): 1.12, (256, 64): 1.00},
+            {(128, 64): 1.06, (256, 64): 1.00},
+            [(128, 64, False), (256, 64, False)],
+        ),
+    ],
+    ids=("confident-incumbent", "weak-pv-margin"),
+)
+def test_amd_fa_cluster_origami_candidates_gfx950(
+    monkeypatch,
+    shape,
+    qk_scores,
+    pv_scores,
+    expected_tiles,
+):
+    class FakeOrigami:
+        grid_selection_t = SimpleNamespace(data_parallel="data_parallel")
+        model_t = SimpleNamespace(gemm="gemm")
+        transpose_t = SimpleNamespace(N="N", T="T")
+
+        string_to_datatype = staticmethod(lambda name: name)
+        get_hardware_for_device = staticmethod(lambda device_index: SimpleNamespace())
+        problem_t = staticmethod(lambda: SimpleNamespace(num_cus=0))
+        dim3_t = staticmethod(lambda m, n, k: SimpleNamespace(m=m, n=n, k=k))
+        config_t = staticmethod(SimpleNamespace)
+
+        @staticmethod
+        def compute_total_latency(problem, hardware, config):
+            assert problem.num_cus == visible_cus
+            block_n = config.mt.n if problem.b_transpose == "T" else config.mt.k
+            scores = qk_scores if problem.b_transpose == "T" else pv_scores
+            return scores[(config.mt.m, block_n)]
+
+    monkeypatch.setattr(_amd_fa_cluster_module, "_get_origami_module", lambda: FakeOrigami)
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+    _amd_fa_cluster_module._cluster_tile_autotuner_for_device.cache_clear()
+    torch.manual_seed(42)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    visible_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+    device_key = _amd_fa_cluster_module._cluster_origami_device_key(q)
+    tuner = _amd_fa_cluster_module._cluster_tile_autotuner_for_device(device_key)
+    retained = []
+    production_prune = tuner.early_config_prune
+
+    def record_pruned_configs(configs, named_args, **kwargs):
+        pruned = production_prune(configs, named_args, **kwargs)
+        retained[:] = [
+            (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"], config.kwargs["USE_DIRECT_LOAD"])
+            for config in pruned
+        ]
+        return pruned
+
+    monkeypatch.setattr(tuner, "early_config_prune", record_pruned_configs)
+
+    out = _amd_fa_cluster_attention(q, k, v, scale, False, config={"USE_ORIGAMI": True})
+    reference = F.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    assert retained == expected_tiles
+    assert torch.isfinite(out).all()
+    assert _amd_fa_cluster_snr_db(out, reference) >= _AMD_FA_CLUSTER_MIN_SNR_DB
+    _amd_fa_cluster_module._cluster_origami_tiles.cache_clear()
+    _amd_fa_cluster_module._cluster_tile_autotuner_for_device.cache_clear()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16"))
+@pytest.mark.parametrize("n_ctx", (1024, 1056), ids=("aligned", "ragged"))
+@pytest.mark.parametrize(
+    ("block_m", "block_n"),
+    ((128, 64), (256, 64)),
+    ids=("bm128-bn64", "bm256-bn64"),
+)
+def test_amd_fa_cluster_origami_tiles_numerical_gfx950(dtype, n_ctx, block_m, block_n):
+    torch.manual_seed(42)
+    shape = (1, 2, n_ctx, 64)
+    q = torch.randn(shape, dtype=dtype, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    scale = 1.0 / math.sqrt(q.shape[-1])
+
+    out = _amd_fa_cluster_attention(
+        q,
+        k,
+        v,
+        scale,
+        False,
+        config={
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "USE_DIRECT_LOAD": False,
+        },
+    )
+    reference = F.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    assert torch.isfinite(out).all()
+    assert _amd_fa_cluster_snr_db(out, reference) >= _AMD_FA_CLUSTER_MIN_SNR_DB
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
