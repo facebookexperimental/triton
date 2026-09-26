@@ -57,8 +57,8 @@ namespace { // anonymous namespace
 /// (libdevice does not use lg2.approx; the approx lowering is disabled by
 /// default) and erf (no approx path).
 static bool isSFUMathOp(Operation *op) {
-  return isa<math::ExpOp, math::Exp2Op, math::SinOp, math::CosOp,
-             math::TanhOp, math::SqrtOp, math::RsqrtOp>(op);
+  return isa<math::ExpOp, math::Exp2Op, math::SinOp, math::CosOp, math::TanhOp,
+             math::SqrtOp, math::RsqrtOp>(op);
 }
 
 /// SFU-backed inline asm: pure elementwise asm blocks invoking PTX
@@ -86,9 +86,8 @@ static bool isSFUInlineAsmOp(Operation *op) {
     return false;
   StringRef asmStr = asmOp.getAsmString();
   static constexpr StringRef kSFUApproxMnemonics[] = {
-      "sin.approx", "cos.approx", "ex2.approx",   "lg2.approx",
-      "tanh.approx", "rcp.approx", "rsqrt.approx", "sqrt.approx",
-      "div.approx"};
+      "sin.approx", "cos.approx",   "ex2.approx",  "lg2.approx", "tanh.approx",
+      "rcp.approx", "rsqrt.approx", "sqrt.approx", "div.approx"};
   bool hasSFU = llvm::any_of(kSFUApproxMnemonics, [&](StringRef mnemonic) {
     return asmStr.contains(mnemonic);
   });
@@ -96,15 +95,32 @@ static bool isSFUInlineAsmOp(Operation *op) {
     return false;
   static constexpr StringRef kUnsafeSubstrings[] = {
       // Barriers and synchronization.
-      "bar.", "barrier", "mbarrier",
+      "bar.",
+      "barrier",
+      "mbarrier",
       // Memory ordering.
-      "fence", "membar",
+      "fence",
+      "membar",
       // Memory access.
-      "ld.", "st.", "cp.", "atom.", "red.", "prefetch",
+      "ld.",
+      "st.",
+      "cp.",
+      "atom.",
+      "red.",
+      "prefetch",
       // Control flow ("bra " matches branches, not identifiers like bravo).
-      "bra ", "bra\t", "bra.", "call", "ret;", "exit", "trap",
+      "bra ",
+      "bra\t",
+      "bra.",
+      "call",
+      "ret;",
+      "exit",
+      "trap",
       // Async / collective operations.
-      "wgmma", "tcgen05", "shfl", "vote",
+      "wgmma",
+      "tcgen05",
+      "shfl",
+      "vote",
   };
   return !llvm::any_of(kUnsafeSubstrings, [&](StringRef substr) {
     return asmStr.contains(substr);

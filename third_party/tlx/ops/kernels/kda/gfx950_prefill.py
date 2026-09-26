@@ -31,11 +31,9 @@ _VALUE_DIM = 128
 
 
 def _chunk_pairs(boundaries: list[int], chunk_size: int) -> list[tuple[int, int]]:
-    return [
-        (sequence, local_chunk)
-        for sequence, (begin, end) in enumerate(pairwise(boundaries))
-        for local_chunk in range((end - begin + chunk_size - 1) // chunk_size)
-    ]
+    return [(sequence, local_chunk)
+            for sequence, (begin, end) in enumerate(pairwise(boundaries))
+            for local_chunk in range((end - begin + chunk_size - 1) // chunk_size)]
 
 
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int = CHUNK_SIZE) -> torch.Tensor:
@@ -70,8 +68,8 @@ def _prepare_prefill_metadata(cu_seqlens: torch.Tensor, device: torch.device, to
     if cu_device.device != device or cu_device.dtype != torch.int32 or not cu_device.is_contiguous():
         cu_device = cu_device.to(device=device, dtype=torch.int32).contiguous()
     pairs = _chunk_pairs(boundaries, CHUNK_SIZE)
-    chunk_indices = (torch.tensor(pairs, dtype=torch.int32, device=device) if pairs else
-                     torch.empty((0, 2), dtype=torch.int32, device=device))
+    chunk_indices = (torch.tensor(pairs, dtype=torch.int32, device=device) if pairs else torch.empty(
+        (0, 2), dtype=torch.int32, device=device))
     value = (cu_device, chunk_indices)
     _PREFILL_METADATA_CACHE[:] = [cu_seqlens, version, device, total_tokens, value]
     return value
@@ -206,11 +204,8 @@ def _preprocess_chunk_kernel(
                 acc_k = tl.where(lower_mask, acc_k, 0.0)
                 acc_q = tl.where(causal_mask, acc_q, 0.0)
 
-            out_offsets = (
-                ((begin + token0 + row_block * BC + out_rows[:, None]) * H + head) * BT
-                + col_block * BC
-                + out_cols[None, :]
-            ).to(tl.int32)
+            out_offsets = (((begin + token0 + row_block * BC + out_rows[:, None]) * H + head) * BT + col_block * BC +
+                           out_cols[None, :]).to(tl.int32)
             out_offsets = tlx.require_layout(out_offsets, mfma_layout, pin=False)
             out_mask = tlx.require_layout(
                 (token0 + row_block * BC + out_rows[:, None] < length).to(tl.int8),
@@ -286,11 +281,7 @@ def _load_akk_block(
 ):
     rows = tl.arange(0, BC)
     cols = tl.arange(0, BC)
-    offsets = (
-        ((begin + token0 + ROW_BLOCK * BC + rows[:, None]) * H + head) * BT
-        + COL_BLOCK * BC
-        + cols[None, :]
-    )
+    offsets = (((begin + token0 + ROW_BLOCK * BC + rows[:, None]) * H + head) * BT + COL_BLOCK * BC + cols[None, :])
     return tl.load(
         Akk + offsets,
         mask=token0 + ROW_BLOCK * BC + rows[:, None] < length,
@@ -340,11 +331,7 @@ def _store_inverse_block(
 ):
     rows = tl.arange(0, BC)
     cols = tl.arange(0, BC)
-    offsets = (
-        ((begin + token0 + ROW_BLOCK * BC + rows[:, None]) * H + head) * BT
-        + COL_BLOCK * BC
-        + cols[None, :]
-    )
+    offsets = (((begin + token0 + ROW_BLOCK * BC + rows[:, None]) * H + head) * BT + COL_BLOCK * BC + cols[None, :])
     tl.store(
         TInverse + offsets,
         value.to(TInverse.dtype.element_ty),
@@ -668,17 +655,13 @@ def _output_tail_kernel(
     tlx.async_load_commit_group([token])
 
     value_cols = value_block * BV + tl.arange(0, BV)
-    value_offsets = (
-        ((begin + token0 + cols[:, None]) * H + head) * V + value_cols[None, :]
-    )
+    value_offsets = (((begin + token0 + cols[:, None]) * H + head) * V + value_cols[None, :])
     value_mask = row_mask[:, None] & (value_cols[None, :] < V)
     vnew = tl.load(VNew + value_offsets, mask=value_mask, other=0.0)
     wait_token = tlx.async_load_wait_group(0)
     causal = tlx.local_load(tlx.local_view(a_buffer, 0), token=wait_token)
     intra = tl.dot(causal, vnew)
-    output_offsets = (
-        ((begin + token0 + rows[:, None]) * H + head) * V + value_cols[None, :]
-    )
+    output_offsets = (((begin + token0 + rows[:, None]) * H + head) * V + value_cols[None, :])
     old = tl.load(Output + output_offsets, mask=value_mask, other=0.0).to(tl.float32)
     tl.store(
         Output + output_offsets,

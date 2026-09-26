@@ -1872,9 +1872,8 @@ class _attention_opt(torch.autograd.Function):
             if use_clc:
                 # One physical CTA per M tile, matching the static 2-CTA
                 # schedule where neighboring CTAs cover neighboring M tiles.
-                assert total_tiles % num_ctas == 0, (
-                    f"CLC 2-CTA needs one physical CTA per M tile, so total_tiles "
-                    f"({total_tiles}) must be a multiple of NUM_CTAS ({num_ctas})")
+                assert total_tiles % num_ctas == 0, (f"CLC 2-CTA needs one physical CTA per M tile, so total_tiles "
+                                                     f"({total_tiles}) must be a multiple of NUM_CTAS ({num_ctas})")
                 return (total_tiles, 1, 1)
             # Clamp to one cluster: total_tiles // num_ctas floors to 0 when there
             # are fewer tiles than CTAs, which would launch a (0, 1, 1) grid and

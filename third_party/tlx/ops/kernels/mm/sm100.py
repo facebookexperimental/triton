@@ -18,6 +18,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from . import _sm100_core as _core
 
+
 # Cached SM count — never changes during program lifetime.
 # Calling torch.cuda.get_device_properties() on every matmul() call
 # adds measurable overhead that degrades benchmark throughput on fast kernels.

@@ -170,9 +170,7 @@ def _torch_ref(q, k, v, do, so, asc, num_targets=None):
         else:
             max_id = n - int(num_targets[z])
             clamped_i = torch.minimum(i, torch.tensor(max_id, device=i.device))
-            valid = (i[:, None] == i[None, :]) | (
-                clamped_i[:, None] > clamped_i[None, :]
-            )
+            valid = (i[:, None] == i[None, :]) | (clamped_i[:, None] > clamped_i[None, :])
         sig = sig * valid.float()[None]
         outs.append(torch.einsum("hqk,khd->qhd", sig, vf[s:e]))
     torch.cat(outs, 0).backward(do.float())
@@ -201,9 +199,7 @@ def _run_autows_bwd(L, Z, jagged=False, target_count=0):
     do = gq()
     num_targets = None
     if target_count:
-        num_targets = torch.tensor(
-            [min(target_count, n) for n in lens], device="cuda", dtype=torch.int64
-        )
+        num_targets = torch.tensor([min(target_count, n) for n in lens], device="cuda", dtype=torch.int64)
 
     rq, rk, rv = _torch_ref(q, k, v, do, so, asc, num_targets)
 
@@ -385,8 +381,8 @@ def test_self_attention_bwd_autows_clc_jagged_production(L, Z, target_count, dq_
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     r = subprocess.run(
-        [sys.executable, __file__, "--run-clc-jagged", str(L),
-         str(Z), str(target_count)],
+        [sys.executable, __file__, "--run-clc-jagged",
+         str(L), str(Z), str(target_count)],
         env=_clc_subprocess_env(dq_fp32),
         capture_output=True,
         text=True,

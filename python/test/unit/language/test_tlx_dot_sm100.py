@@ -1470,12 +1470,8 @@ def test_async_dot_scaled_fp4(device, scale_format, vec_size):
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K // 2), tl.uint8, tl.constexpr(1))
         b_tile = tlx.local_alloc((BLOCK_N, BLOCK_K // 2), tl.uint8, tl.constexpr(1))
         # 5D scale buffers: [1, REP_M/N, SCALE_REP_K, 2, 256]
-        a_scale_tile = tlx.local_alloc(
-            (1, REP_M, SCALE_REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1)
-        )
-        b_scale_tile = tlx.local_alloc(
-            (1, REP_N, SCALE_REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1)
-        )
+        a_scale_tile = tlx.local_alloc((1, REP_M, SCALE_REP_K, 2, 256), tlx.dtype_of(a_scale_desc), tl.constexpr(1))
+        b_scale_tile = tlx.local_alloc((1, REP_N, SCALE_REP_K, 2, 256), tlx.dtype_of(b_scale_desc), tl.constexpr(1))
 
         load_bar = tlx.alloc_barriers(tl.constexpr(1))
         DATA_BYTES: tl.constexpr = BLOCK_M * BLOCK_K // 2 + BLOCK_N * BLOCK_K // 2

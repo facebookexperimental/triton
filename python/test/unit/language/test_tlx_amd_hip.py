@@ -83,7 +83,7 @@ def _compile_register_staged_bmm_gfx950(m, n, k, kernel_spec):
             BATCH_GROUP=8,
             GMN=tiles_per_batch,
             NT=tiles_per_batch,
-            grid=(tiles_per_batch,),
+            grid=(tiles_per_batch, ),
             num_warps=warps_per_cta[0] * warps_per_cta[1],
             num_stages=1,
             matrix_instr_nonkdim=instr_shape[0],
@@ -92,15 +92,9 @@ def _compile_register_staged_bmm_gfx950(m, n, k, kernel_spec):
 
 def test_shared_a_bmm_tuned_dispatches_keep_wide_unaligned_loads_gfx950():
     compiled = [
-        _compile_register_staged_bmm_gfx950(
-            40, 256, 1956, _MT64X256_MI32_KERNEL_SPEC
-        ),
-        _compile_register_staged_bmm_gfx950(
-            262, 256, 294, _MT144X256_MI16_KERNEL_SPEC
-        ),
-        _compile_register_staged_bmm_gfx950(
-            448, 160, 931, _MT224X160_MI16_KERNEL_SPEC
-        ),
+        _compile_register_staged_bmm_gfx950(40, 256, 1956, _MT64X256_MI32_KERNEL_SPEC),
+        _compile_register_staged_bmm_gfx950(262, 256, 294, _MT144X256_MI16_KERNEL_SPEC),
+        _compile_register_staged_bmm_gfx950(448, 160, 931, _MT224X160_MI16_KERNEL_SPEC),
     ]
     amdgcn = "\n".join(kernel.asm["amdgcn"] for kernel in compiled)
 

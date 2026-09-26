@@ -26,7 +26,6 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
 pytestmark = pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -1004,6 +1003,8 @@ def test_op(HEAD_DIM, baseVariant):
     }
     tri = attention(q, k, v, False, sm_scale, baseVariant, config=dict(cfg)).half()
     torch.testing.assert_close(tri, ref, atol=1e-2, rtol=0)
+
+
 def test_bench():
     Z, H, N, D = 4, 32, 4096, 128
     q = torch.randn((Z, H, N, D), dtype=torch.float16, device="cuda")

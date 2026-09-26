@@ -21,7 +21,6 @@ def _has_hopper():
 
 pytestmark = pytest.mark.skipif(not _has_hopper(), reason="Requires Hopper or newer (sm90+)")
 
-
 # (shape, block_shape, elem_size_bytes, host_tma_dtype)
 # host_tma_dtype: CUtensorMapDataType — 6=FLOAT16, 7=FLOAT32, 4=INT32, 5=INT64
 _CASES = [
@@ -30,6 +29,8 @@ _CASES = [
     ((128, 256), (32, 64), 4, 7),
     ((64, 128, 256), (16, 32, 64), 2, 6),
 ]
+
+
 @pytest.mark.parametrize("shape,block,elem_size,host_dtype", _CASES)
 def test_core_recipe_matches_fill_tma_tiled(shape, block, elem_size, host_dtype):
     mod = triton.runtime.driver.active.utils

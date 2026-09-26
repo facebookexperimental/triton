@@ -277,6 +277,8 @@ def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
     assert "two_ctas" in ttgir
+
+
 def test_tl_dot_2cta_sliced_dependent_chain(device):
     torch.manual_seed(0)
     q = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
@@ -305,6 +307,8 @@ def test_tl_dot_2cta_sliced_dependent_chain(device):
     ttgir = compiled.asm["ttgir"]
     assert ttgir.count('ttng.two_cta_dependency = "collective_contraction"') == 2
     assert 'ttng.two_cta_dependency = "requires_peer_gather"' not in ttgir
+
+
 def test_tl_dot_2cta_sliced_dependent_chain_ws(device):
     torch.manual_seed(0)
     q = torch.randn((256, 128), device=device, dtype=torch.bfloat16)

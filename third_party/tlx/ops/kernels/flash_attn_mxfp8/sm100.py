@@ -23,7 +23,6 @@ from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
-
 def _mxf8_host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
@@ -3150,7 +3149,6 @@ def attention_bwd(
     return dq, dk, dv
 
 
-
 def swizzled_to_tma_preshuffled(swizzled_scales, M, K, block_size, batch):
     """
     Convert from to_blocked() swizzled format to TMA preshuffled format.
@@ -3179,8 +3177,6 @@ def swizzled_to_tma_preshuffled(swizzled_scales, M, K, block_size, batch):
     tma_format = sf_tiles.view(batch, B, C, 2, 256)
 
     return tma_format
-
-
 
 
 def _quantize_mxfp8_operand(ref, transpose_for_reduction=False):

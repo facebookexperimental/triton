@@ -1493,6 +1493,7 @@ def _attn_predicated_causal_tile(
         acc = _attn_dot_pv_mfma32(state.acc, p_dot, v_dot)
     return acc, state.l_i, state.m_i
 
+
 @triton.jit
 def _attn_predicated_causal_regs_bn32(
     acc,

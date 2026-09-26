@@ -2382,12 +2382,8 @@ def _bwd_compute_inner_loop(
         # already observes the completed P store; no manual wait.
         if USE_2CTA:
             # These TMEM handshakes do not publish ordinary memory.
-            tlx.barrier_arrive(
-                qk_empties[tmem_buf_id], 1, remote_cta_rank=0
-            )
-            tlx.barrier_arrive(
-                p_fulls[tmem_buf_id], 1, remote_cta_rank=0
-            )
+            tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
+            tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
             tlx.barrier_arrive(qk_empties[tmem_buf_id])
             tlx.barrier_arrive(p_fulls[tmem_buf_id])
@@ -2416,9 +2412,7 @@ def _bwd_compute_inner_loop(
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:
             # This token reports TMEM store completion, not SMEM publication.
-            tlx.barrier_arrive(
-                dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0
-            )
+            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0)
             _, ds_phase = get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
             # Wait for MMA Dot 5 to finish reading ds_tiles before overwriting.
             tlx.barrier_wait(ds_empties[ds_buf_id], ds_phase ^ 1)
@@ -2439,9 +2433,7 @@ def _bwd_compute_inner_loop(
             peer_data = tlx.local_load(peer_tmem)
             # Signal dp_empties right after TMEM reload is done —
             # dsT_tmem is no longer needed, MMA can overwrite dp/dq TMEM.
-            tlx.barrier_arrive(
-                dp_empties[tmem_buf_id], 1, remote_cta_rank=0
-            )
+            tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
             tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
             tlx.fence("async_shared")
             remote_dst = own_smem
@@ -2953,9 +2945,7 @@ def _attn_bwd_ws(
                 )
             if USE_2CTA:
                 # The dV accumulator has been consumed; no SMEM is published.
-                tlx.barrier_arrive(
-                    dv_empties[kv_buf_id], 1, remote_cta_rank=0
-                )
+                tlx.barrier_arrive(dv_empties[kv_buf_id], 1, remote_cta_rank=0)
             else:
                 tlx.barrier_arrive(dv_empties[kv_buf_id])
             tlx.barrier_wait(dk_fulls[kv_buf_id], kv_phase)
@@ -2989,9 +2979,7 @@ def _attn_bwd_ws(
             # once the KV ring cycles, also arrive k_empties here.
             if USE_2CTA:
                 # The dK accumulator and staging aliases are ready for reuse.
-                tlx.barrier_arrive(
-                    dk_empties[kv_buf_id], 1, remote_cta_rank=0
-                )
+                tlx.barrier_arrive(dk_empties[kv_buf_id], 1, remote_cta_rank=0)
             else:
                 tlx.barrier_arrive(k_empties[kv_buf_id])
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
@@ -3607,6 +3595,6 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     if space not in ("full", "smoke"):
         raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
-        sm_scale = q.shape[-1] ** -0.5
+        sm_scale = q.shape[-1]**-0.5
     _SPACE = space
     return _attention.apply(q, k, v, sm_scale, causal)

@@ -2514,7 +2514,8 @@ void printSimplifiedOp(
   if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
     os << getValueName(op->getResult(0), argSubstitutionMap) << " = tl.clamp(";
     for (unsigned i = 0; i < 3; ++i)
-      os << (i ? ", " : "") << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
     if (clamp.getPropagateNan() == tt::PropagateNan::ALL)
       os << ", propagate_nan=tl.PropagateNan.ALL";
     os << ")";
