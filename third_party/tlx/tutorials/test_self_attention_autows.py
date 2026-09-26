@@ -96,7 +96,7 @@ _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
 # select the config (before the kernel import below) from argv.
-if "--run-clc" in sys.argv or "--run-clc-jagged" in sys.argv or "--run-clc-matrix" in sys.argv:
+if any(mode in sys.argv for mode in ("--run-clc", "--run-clc-jagged", "--run-clc-matrix", "--run-clc-packed")):
     clc_cfg = dict(_CLC_CFG)
     clc_cfg["dq_fp32"] = os.environ.get("HSTU_SELF_TEST_DQ_FP32", "1") == "1"
     if "--run-clc-matrix" in sys.argv:
@@ -170,9 +170,7 @@ def _torch_ref(q, k, v, do, so, asc, num_targets=None):
         else:
             max_id = n - int(num_targets[z])
             clamped_i = torch.minimum(i, torch.tensor(max_id, device=i.device))
-            valid = (i[:, None] == i[None, :]) | (
-                clamped_i[:, None] > clamped_i[None, :]
-            )
+            valid = (i[:, None] == i[None, :]) | (clamped_i[:, None] > clamped_i[None, :])
         sig = sig * valid.float()[None]
         outs.append(torch.einsum("hqk,khd->qhd", sig, vf[s:e]))
     torch.cat(outs, 0).backward(do.float())
@@ -183,7 +181,7 @@ def _rel_l2(a, b):
     return (torch.norm(a.float() - b.float()) / (torch.norm(b.float()) + 1e-12)).item()
 
 
-def _run_autows_bwd(L, Z, jagged=False, target_count=0):
+def _run_autows_bwd(L, Z, jagged=False, target_count=0, packed=False):
     """Run the (already-imported) autoWS kernel fwd+bwd and return the grads plus
     the torch-float reference grads. Config is whatever env was baked at import."""
     torch.manual_seed(0)
@@ -195,7 +193,12 @@ def _run_autows_bwd(L, Z, jagged=False, target_count=0):
         lens = [L - (i % 2) * 128 for i in range(Z)]
     t = sum(lens)
     gq = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
-    q, k, v = gq().requires_grad_(True), gq().requires_grad_(True), gq().requires_grad_(True)
+    if packed:
+        qkv = torch.randn(t, H, 3 * D, device="cuda", dtype=torch.bfloat16)
+        q, k, v = (x.detach().requires_grad_(True) for x in torch.split(qkv, [D, D, D], dim=-1))
+        assert not q.is_contiguous() and q.stride(-1) == 1
+    else:
+        q, k, v = gq().requires_grad_(True), gq().requires_grad_(True), gq().requires_grad_(True)
     so = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device="cuda", dtype=torch.int64)
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
     do = gq()
@@ -325,6 +328,23 @@ def test_self_attention_bwd_autows_clc(L, Z, dq_fp32):
     assert r.returncode == 0, (f"CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU for CLC")
+def test_self_attention_bwd_autows_clc_packed_qkv():
+    """CLC backward accepts last-dimension-contiguous packed QKV views."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    r = subprocess.run(
+        [sys.executable, __file__, "--run-clc-packed", "256", "2", "20"],
+        env=_clc_subprocess_env(True),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    assert r.returncode == 0, f"packed-QKV CLC autoWS bwd failed:\n{r.stdout}\n{r.stderr}"
+
+
 @pytest.mark.parametrize(
     "split_causal_loops,dq_transposed",
     [
@@ -370,6 +390,7 @@ def test_self_attention_bwd_autows_clc_loop_dq_matrix(split_causal_loops, dq_tra
         pytest.xfail("split/direct dQ still exceeds Blackwell SMEM after TMEM-safe subtiling")
     assert r.returncode == 0, ("CLC autoWS loop/dQ matrix failed "
                                f"(split={split_causal_loops}, dq_transposed={dq_transposed}):\n{r.stdout}\n{r.stderr}")
+
 
 
 @pytest.mark.parametrize("L,Z", [(4096, 2), (256, 120)])
@@ -456,17 +477,18 @@ if __name__ == "__main__":
     # Subprocess entry point for the dq-reduce config. _DQREDUCE_CFG was applied
     # via set_config() at the top of this file (argv --run-dqreduce) before the
     # kernel import, so the dq-reduce constexprs / autotune config are baked on.
-    bwd_modes = ("--run-dqreduce", "--run-clc", "--run-clc-jagged", "--run-clc-matrix")
+    bwd_modes = ("--run-dqreduce", "--run-clc", "--run-clc-jagged", "--run-clc-matrix", "--run-clc-packed")
     if len(sys.argv) >= 4 and sys.argv[1] in bwd_modes:
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
-        assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged", "--run-clc-matrix"))
+        assert A._AUTOWS_CFG.clc == (sys.argv[1]
+                                     in ("--run-clc", "--run-clc-jagged", "--run-clc-matrix", "--run-clc-packed"))
         if sys.argv[1] == "--run-clc-matrix":
             assert A._AUTOWS_CFG.split_causal_loops == bool(int(sys.argv[4]))
             assert A._AUTOWS_CFG.dq_transposed == bool(int(sys.argv[5]))
         if sys.argv[1] == "--run-clc-matrix" and len(sys.argv) > 6:
             target_count = int(sys.argv[6])
-        elif sys.argv[1] == "--run-clc-jagged":
+        elif sys.argv[1] in ("--run-clc-jagged", "--run-clc-packed"):
             target_count = int(sys.argv[4]) if len(sys.argv) > 4 else 0
         else:
             target_count = 0
@@ -475,6 +497,7 @@ if __name__ == "__main__":
             _Z,
             jagged=sys.argv[1] == "--run-clc-jagged",
             target_count=target_count,
+            packed=sys.argv[1] == "--run-clc-packed",
         )
         rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
         print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "

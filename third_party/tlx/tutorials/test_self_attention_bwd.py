@@ -33,13 +33,18 @@ import bench_self as bs  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed-qkv"])
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
-def test_self_attention_bwd_triton_vs_tlx(L, Z):
+def test_self_attention_bwd_triton_vs_tlx(L, Z, packed):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
     torch.manual_seed(0)
     q, k, v, do, so, asc = bs.make(L, Z)
+    if packed:
+        qkv = torch.cat((q.detach(), k.detach(), v.detach()), dim=-1)
+        q, k, v = (x.detach().requires_grad_(True) for x in torch.split(qkv, [bs.D, bs.D, bs.D], dim=-1))
+        assert not q.is_contiguous() and q.stride(-1) == 1
     rq, rk, rv = bs.torch_ref(q, k, v, do, so, asc, causal=True)
 
     _, dq_t, dk_t, dv_t = bs.grads(bs.run_triton, q, k, v, so, L, asc, do)
