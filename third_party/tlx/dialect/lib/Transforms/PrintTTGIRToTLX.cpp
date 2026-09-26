@@ -691,6 +691,8 @@ getValueName(Value v,
     // implicit. The float element-type casts are still listed: the block above
     // intercepts them whenever their dtype is nameable, so reaching one here
     // means it is not, and erasing it beats emitting an uncompilable dtype.
+    // amdg.in_thread_transpose is a CDNA variant of ttg.convert_layout that the
+    // AMD backend inserts itself; recompiling the generated TLX re-creates it.
     static const llvm::StringSet<> transparentOps = {
         "ttg.convert_layout",
         "arith.extui",
@@ -709,6 +711,7 @@ getValueName(Value v,
         "tt.broadcast",
         "ttng.user_named_barrier_id",
         "ttng.compiler_named_barrier_id",
+        "amdg.in_thread_transpose",
     };
     if (transparentOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
@@ -1037,6 +1040,7 @@ bool shouldSkipOp(
       "tt.broadcast",
       "tt.map_elementwise.return",
       "ttng.tcgen5_global_alloc",
+      "amdg.in_thread_transpose",
   };
   // Emit ttg.memdesc_index as tlx.local_view when a real consumer needs the
   // view (MMA, wait, local_store, loop iter-arg, ...). Skip it when it has no
