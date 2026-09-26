@@ -36,23 +36,44 @@ def _async_amd_desc_load_fused_kernel(
     output_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
+    MULTICAST_MASKS: tl.constexpr = None,
+    SHARED_LAYOUT: tl.constexpr = None,
+    MASK_SHIFT_BITS: tl.constexpr = 0,
 ):
     a_desc = tl.make_tensor_descriptor(a_ptr, [M, N], [N, 1], [M, N])
     b_desc = tl.make_tensor_descriptor(b_ptr, [M, N], [N, 1], [M, N])
-    a_buf = tlx.local_alloc((M, N), tl.float16, 1)
-    b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    if SHARED_LAYOUT is None:
+        a_buf = tlx.local_alloc((M, N), tl.float16, 1)
+        b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    else:
+        a_buf = tlx.local_alloc((M, N), tl.float16, 1, layout=SHARED_LAYOUT)
+        b_buf = tlx.local_alloc((M, N), tl.float16, 1, layout=SHARED_LAYOUT)
     a_smem = tlx.local_view(a_buf, 0)
     b_smem = tlx.local_view(b_buf, 0)
+    # A missing member load must not pass by reading a previous launch's LDS.
+    tlx.local_store(a_smem, tl.full((M, N), float("nan"), tl.float16))
+    tlx.local_store(b_smem, tl.full((M, N), float("nan"), tl.float16))
+    tlx.workgroup_barrier()
     a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
     b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
-    token = tlx.async_amd_descriptor_load_fused([
-        (a_desc, a_smem, 0b0011),
-        (b_desc, b_smem, 0b1100),
-    ])
+    if MASK_SHIFT_BITS and MULTICAST_MASKS is not None:
+        shift = tlx.cluster_cta_rank() & MASK_SHIFT_BITS
+        token = tlx.async_amd_descriptor_load_fused([(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
+                                                    multicast_masks=(MULTICAST_MASKS[0] << shift,
+                                                                     MULTICAST_MASKS[1] << shift))
+    else:
+        token = tlx.async_amd_descriptor_load_fused([(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
+                                                    multicast_masks=MULTICAST_MASKS)
     tlx.async_amd_descriptor_wait(tokens=[token])
-    result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    # TDM completion is per wave. Consumers only read their own CTA's LDS,
+    # so the handoff requires workgroup synchronization, not a cluster barrier.
+    tlx.workgroup_barrier()
+    a = tlx.local_load(a_smem)
+    b = tlx.local_load(b_smem)
     offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
-    tl.store(output_ptr + offsets, result)
+    # Check each member separately: A+B would also pass if A and B were swapped.
+    tl.store(output_ptr + offsets, a)
+    tl.store(output_ptr + M * N + offsets, b)
 
 
 @triton.jit
@@ -198,9 +219,9 @@ def test_async_amd_desc_load_fused_correctness_gfx1250(device):
     rows, cols = 16, 32
     a = torch.randn((rows, cols), device=device, dtype=torch.float16)
     b = torch.randn((rows, cols), device=device, dtype=torch.float16)
-    output = torch.empty_like(a)
+    output = torch.full((2, rows, cols), float("nan"), device=device, dtype=torch.float16)
     _async_amd_desc_load_fused_kernel[(1, )](a, b, output, M=rows, N=cols)
-    torch.testing.assert_close(output, a + b)
+    torch.testing.assert_close(output, torch.stack((a, b)), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
@@ -555,3 +576,326 @@ test_gfx1250_grouped_gemm_tdm_asymmetric_depth3 = _gfx1250_grouped.test_grouped_
 test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch = _gfx1250_grouped.test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250
 
 test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm_xcd_remap_gfx1250
+
+
+@triton.jit
+def _amd_wave_sched_mode_kernel(VALUE: tl.constexpr, OFFSET: tl.constexpr, WIDTH: tl.constexpr):
+    tlx.amd_set_wave_sched_mode(VALUE, offset=OFFSET, width=WIDTH)
+
+
+@pytest.mark.parametrize("value,offset,width", [(1, 2, 1), (0, 2, 1), (2, 0, 2)])
+def test_amd_wave_sched_mode_compiles(value, offset, width):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=value, OFFSET=offset,
+                                                                                  WIDTH=width))
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32))
+    hwreg = 26 | offset << 6 | (width - 1) << 11
+    # A result-free intrinsic must survive optimization even in an empty kernel.
+    assert f"call void @llvm.amdgcn.s.setreg(i32 {hwreg}, i32 {value})" in compiled.asm["llir"]
+    assert "asm sideeffect" not in compiled.asm["llir"]
+    instruction = f"s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, {offset}, {width}), {value}"
+    assert instruction in compiled.asm["amdgcn"]
+    assert "s_mov_b32" not in compiled.asm["amdgcn"]
+
+
+@pytest.mark.parametrize("value,offset,width,message", [
+    (-1, 2, 1, "value must fit"),
+    (2, 2, 1, "value must fit"),
+    (1, -1, 1, "field must fit"),
+    (1, 32, 1, "field must fit"),
+    (0, 2, 0, "field must fit"),
+    (1, 31, 2, "field must fit"),
+    (1.0, 2, 1, "constexpr integers"),
+])
+def test_amd_wave_sched_mode_invalid_field(value, offset, width, message):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=value, OFFSET=offset,
+                                                                                  WIDTH=width))
+    with pytest.raises(triton.CompilationError, match=message):
+        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32))
+
+
+def test_amd_wave_sched_mode_unsupported_target():
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_amd_wave_sched_mode_kernel, signature={}, constexprs=dict(VALUE=1, OFFSET=2, WIDTH=1))
+    with pytest.raises(triton.CompilationError, match="requires an AMD gfx12 target"):
+        triton.compile(source, target=GPUTarget("hip", "gfx942", 64))
+
+
+@pytest.mark.parametrize("independent_ctas", [False, True])
+@pytest.mark.parametrize("cluster_size,masks,message", [
+    (4, (-1, 3), "outside the cluster"),
+    (4, (16, 3), "outside the cluster"),
+    (4, (3, ), "one multicast mask per member"),
+    (4, (1.5, 3), "scalar integers"),
+    (8, (63, 3), "at most 5 recipients"),
+])
+def test_tdm_fused_multicast_invalid_masks(cluster_size, masks, message, independent_ctas):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.compiler.errors import CompilationError
+    source = ASTSource(_async_amd_desc_load_fused_kernel,
+                       signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr":
+                                  "*fp16"}, constexprs={"M": 64, "N": 64, "MULTICAST_MASKS": masks})
+    options = dict(ctas_per_cga=(cluster_size, 1, 1)) if independent_ctas else dict(num_ctas=cluster_size)
+    with pytest.raises(CompilationError, match=message):
+        triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, **options))
+
+
+def _tdm_fused_distributed_constants(num_ctas, split_m, mask_mode):
+    replicas = num_ctas // split_m
+    shared = tlx.swizzled_shared_layout_encoding(
+        vectorSize=1,
+        perPhase=1,
+        maxPhase=1,
+        order=[1, 0],
+        numCTAs=num_ctas,
+        numCTAsPerCGA=[split_m, replicas],
+        numCTASplit=[split_m, 1],
+        numCTAOrder=[1, 0],
+    )
+    # Adjacent CTAs share a row partition, matching the default register layout
+    # without requiring cross-CTA shared loads. Explicit masks disable one
+    # member's multicast despite its replicated layout; test both member orders.
+    mask = (1 << replicas) - 1
+    masks = {"inferred": None, "explicit": (mask, 0), "explicit_b": (0, mask), "disabled": (0, 0)}[mask_mode]
+    return dict(M=64, N=64, SHARED_LAYOUT=shared, MULTICAST_MASKS=masks, MASK_SHIFT_BITS=num_ctas - replicas)
+
+
+def _check_tdm_fused_multicast_codegen(llvm_ir, num_ctas, split_m, mask_mode):
+    from triton._filecheck import run_filecheck
+
+    # Numerical correctness cannot distinguish multicast from separate loads.
+    # Follow descriptor group 1, whose low 16 bits select recipients, all the
+    # way to the TDM intrinsic. Also check which producer waves select each mask.
+    enabled = (mask_mode in ("inferred", "explicit"), mask_mode in ("inferred", "explicit_b"))
+    checks = ["CHECK: [[WAVE:%[^ ]+]] = {{.*}}call i32 @llvm.amdgcn.wave.id()"]
+    dynamic_mask = split_m > 1 and any(enabled)
+    if dynamic_mask:
+        # With four CTAs and two row partitions, recipient groups are {0,1}
+        # and {2,3}. Layout inference clears the replica bit; explicit masks
+        # select the partition bit. Both must reach the descriptor's mask.
+        partition_bits = -2 if mask_mode == "inferred" else 2
+        checks += [
+            "CHECK: [[CTA:%[^ ]+]] = {{.*}}call i32 @llvm.amdgcn.cluster.workgroup.id.x()",
+            f"CHECK: [[SHIFT:%[^ ]+]] = and i32 [[CTA]], {partition_bits}",
+            "CHECK: [[MASK:%[^ ]+]] = shl {{.*}}i32 3, [[SHIFT]]",
+        ]
+        mask_value = "[[MASK]]"
+        if mask_mode == "inferred":
+            checks += ["CHECK: [[CLEAN_MASK:%[^ ]+]] = and i32 [[MASK]], -327681"]
+            mask_value = "[[CLEAN_MASK]]"
+        checks += [f"CHECK-DAG: [[WORD:%[^ ]+]] = or {{{{.*}}}}i32 {mask_value}, 65536"]
+
+    for multicast in dict.fromkeys(enabled):
+        group = "MULTICAST" if multicast else "UNICAST"
+        if multicast and dynamic_mask:
+            checks += [
+                "CHECK-DAG: [[PARTIAL:%[^ ]+]] = insertelement <8 x i32> {{.*}}, i32 [[WORD]], i64 0",
+                f"CHECK-DAG: [[{group}:%[^ ]+]] = insertelement <8 x i32> [[PARTIAL]], i32 {{{{.*}}}}, i64 2",
+            ]
+        else:
+            # data_size=1 (f16) occupies bit 16; all other control bits are zero.
+            word = 65536 | ((1 << num_ctas) - 1 if multicast else 0)
+            checks += [
+                f"CHECK-DAG: [[{group}:%[^ ]+]] = insertelement <8 x i32> "
+                f"<i32 {word}, {{{{.*}}}}>, i32 {{{{.*}}}}, i64 2"
+            ]
+
+    groups = ["[[MULTICAST]]" if multicast else "[[UNICAST]]" for multicast in enabled]
+    if enabled[0] != enabled[1]:
+        checks += [
+            "CHECK: [[IS_B:%[^ ]+]] = icmp ugt i32 [[WAVE]], 1",
+            f"CHECK: [[GROUP1:%[^ ]+]] = select i1 [[IS_B]], <8 x i32> {groups[1]}, <8 x i32> {groups[0]}",
+        ]
+        group1 = "[[GROUP1]]"
+    else:
+        group1 = groups[0]
+    checks += [
+        "CHECK: call void @llvm.amdgcn.tensor.load.to.lds(<4 x i32> {{[^,]+}}, <8 x i32> " + group1 + ",",
+        "CHECK-NOT: = load {{.*}}ptr addrspace(3)",
+        "CHECK: call void @llvm.amdgcn.s.wait.tensorcnt(i16 0)",
+        "CHECK-NOT: = load {{.*}}ptr addrspace(3)",
+        "CHECK: call void @llvm.amdgcn.s.barrier()",
+        "CHECK: = load {{.*}}ptr addrspace(3)",
+    ]
+    run_filecheck("tdm_fused_multicast", llvm_ir, "\n".join(checks))
+
+
+@pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
+@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "explicit_b", "disabled"])
+def test_tdm_fused_multicast_distributed_compiles(num_ctas, split_m, mask_mode):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_async_amd_desc_load_fused_kernel,
+                       signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr":
+                                  "*fp16"}, constexprs=_tdm_fused_distributed_constants(num_ctas, split_m, mask_mode))
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, num_ctas=num_ctas))
+    assert compiled.metadata.num_ctas == num_ctas
+    assert (" multicast " in compiled.asm["ttgir"]) == (mask_mode != "inferred")
+    assert compiled.asm["amdgcn"].count("tensor_load_to_lds") == 1
+    if split_m > 1:
+        assert "CGALayout = [[0, 0], [1, 0]]" in compiled.asm["ttgir"]
+    assert "amdg.cluster_barrier" not in compiled.asm["ttgir"]
+    assert "s_barrier_signal -3" not in compiled.asm["amdgcn"]
+    assert "s_barrier_wait -3" not in compiled.asm["amdgcn"]
+    _check_tdm_fused_multicast_codegen(compiled.asm["llir"], num_ctas, split_m, mask_mode)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
+@pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "explicit_b", "disabled"])
+def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, mask_mode):
+    # Distinct members and row partitions expose swapped descriptors, incorrect
+    # CTA offsets, and missing stores from any CTA. Build the reference on CPU.
+    generator = torch.Generator().manual_seed(0)
+    inputs = torch.randint(1, 1000, (2, 64, 64), generator=generator).to(torch.float16)
+    inputs[1].neg_()
+    a, b = inputs[0].to(device), inputs[1].to(device)
+    output = torch.full((2, 64, 64), float("nan"), dtype=torch.float16, device=device)
+    constants = _tdm_fused_distributed_constants(num_ctas, split_m, mask_mode)
+    _async_amd_desc_load_fused_kernel[(1, )](a, b, output, **constants, num_ctas=num_ctas)
+    torch.testing.assert_close(output.cpu(), inputs, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton import knobs
+
+    constants = dict(NUM_PROGRAMS=16, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
+                     L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2, NUM_XCDS=8,
+                     XCD_CHUNK=2, K=512, group_size=group_size, CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast)
+    source = ASTSource(
+        _gfx1250_grouped.grouped_gemm_tdm_kernel, signature={
+            k: v
+            for k, v in _gfx1250_grouped._grouped_gemm_tdm_compile_signature().items()
+            if k not in constants
+        }, constexprs=constants, attrs=_gfx1250_grouped._grouped_gemm_tdm_compile_attrs())
+    assert knobs.runtime.add_stages_inspection_hook is None
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1)))
+    assert compiled.metadata.num_ctas == 1
+    assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+    assert "call void @llvm.amdgcn.s.setreg(i32 154, i32 1)" in compiled.asm["llir"]
+    assert f'"amdgpu-cluster-dims"="{cluster_size},1,1"' in compiled.asm["llir"]
+    assert compiled.metadata.global_scratch_size == 0
+    assert compiled.metadata.shared <= 320 * 1024
+    assert ("amdg.cluster_barrier_arrive" in compiled.asm["ttgir"]) == (cluster_size > 1)
+    assert ("amdg.cluster_barrier_wait" in compiled.asm["ttgir"]) == (cluster_size > 1)
+    assert (" multicast " in compiled.asm["ttgir"]) == (multicast and cluster_size > 1)
+
+
+@pytest.mark.parametrize("dims,num_ctas,arch", [
+    ((3, 1, 1), 1, "gfx1250"),
+    ((4, 2, 1), 1, "gfx1250"),
+    ((4, 1), 1, "gfx1250"),
+    ((4, 1, 1), 2, "gfx1250"),
+    ((4, 1, 1), 1, "gfx950"),
+])
+def test_amd_independent_cluster_invalid_options(dims, num_ctas, arch):
+    from triton.backends.amd.compiler import HIPOptions
+    with pytest.raises(ValueError, match="ctas_per_cga"):
+        HIPOptions(arch=arch, num_ctas=num_ctas, ctas_per_cga=dims)
+
+
+@pytest.mark.parametrize("m_list,n,num_programs,valid", [
+    ([4096, 4096], 4096, 32, True),
+    ([4096, 4096], 4096, 256, True),
+    ([4096, 2048], 4096, 32, False),
+    ([0, 4096], 4096, 32, False),
+    ([4096, 4096], 768, 32, False),
+    ([4096, 4096], 4096, 24, False),
+    ([4096, 4096], 4096, 48, False),
+])
+def test_grouped_gemm_multicast_config_validation(m_list, n, num_programs, valid):
+
+    def validate():
+        _gfx1250_grouped._validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=256, block_n=256,
+                                                               block_k=128, group_m=4, tdm_pipeline_depth=2,
+                                                               l2_prefetch_distance=0, c_staging_mode=0,
+                                                               cross_tile_prefetch=True, auto_config=False,
+                                                               xcd_remap_mode="chunked", num_xcds=8, xcd_chunk=2)
+
+    if valid:
+        validate()
+    else:
+        with pytest.raises(ValueError):
+            validate()
+
+
+@triton.jit
+def _amd_independent_cluster_ids(output):
+    pid = tl.program_id(0)
+    rank = tlx.cluster_cta_rank()
+    tlx.cluster_barrier()
+    tl.store(output + pid, pid * 16 + rank)
+
+
+@pytest.mark.parametrize("arch,cluster_size", [
+    ("gfx1250", None),
+    ("gfx1250", 1),
+    ("gfx1250", 2),
+    ("gfx1250", 4),
+    ("gfx950", None),
+    ("gfx950", 1),
+])
+def test_amd_cluster_barrier_compiles(arch, cluster_size):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    options = dict(num_warps=4)
+    if cluster_size is not None:
+        options["ctas_per_cga"] = (cluster_size, 1, 1)
+    source = ASTSource(_amd_independent_cluster_ids, signature={"output": "*i32"})
+    compiled = triton.compile(source, target=GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64), options=options)
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.barrier local" in ttgir
+    assert "amdg.cluster_barrier_arrive" in ttgir
+    assert "amdg.cluster_barrier_wait" in ttgir
+    assert "s_barrier" in compiled.asm["amdgcn"]
+    multi_cta = cluster_size is not None and cluster_size > 1
+    assert ("s_barrier_signal -3" in compiled.asm["amdgcn"]) == multi_cta
+    assert ("s_barrier_wait -3" in compiled.asm["amdgcn"]) == multi_cta
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+def test_amd_independent_cluster_launch_grid_and_cache():
+    output = torch.empty((8, ), device="cuda", dtype=torch.int32)
+    pid = torch.arange(8, dtype=torch.int32)
+    # Switching cluster shapes with one JIT signature must retain physical
+    # program IDs and must not reuse a cached launch with the wrong cluster.
+    for size in (1, 4, 2, 1):
+        _amd_independent_cluster_ids[(8, )](output, ctas_per_cga=(size, 1, 1))
+        torch.testing.assert_close(output.cpu(), pid * 16 + pid % size)
+    with pytest.raises(ValueError, match="grid X must be divisible"):
+        _amd_independent_cluster_ids[(3, )](output, ctas_per_cga=(4, 1, 1))
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size):
+    # Distinct CPU inputs detect sharing the wrong tile; two persistent tiles
+    # per program exercise ring reuse, and G=2 also exercises a group boundary.
+    torch.manual_seed(123)
+    m, n, k = 2048, 1024, 512
+    a = torch.randn((group_size * m, k), dtype=torch.float16)
+    b = torch.randn((group_size, n, k), dtype=torch.float16)
+    offsets = torch.arange(group_size + 1, dtype=torch.int32) * m
+    out = _gfx1250_grouped.grouped_gemm_tdm(a.cuda(), b.cuda(), offsets.cuda(), block_m=256, block_n=256,
+                                            num_programs=16, cross_tile_prefetch=True, xcd_remap_mode="chunked",
+                                            cluster_size=cluster_size, cluster_multicast=multicast).cpu()
+    for group in range(group_size):
+        expected = (a[group * m:(group + 1) * m].float() @ b[group].float().T).half()
+        torch.testing.assert_close(out[group * m:(group + 1) * m], expected, atol=1e-2, rtol=1e-2)

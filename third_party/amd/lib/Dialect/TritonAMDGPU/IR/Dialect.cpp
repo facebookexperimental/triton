@@ -24,6 +24,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
 #include "third_party/amd/include/Utils/Utility.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
@@ -1460,6 +1461,23 @@ LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
         "requires the same number of descriptors and destinations");
   if (getWarpUsedHints().size() != numMembers)
     return emitOpError("requires one warp_used_hint per member");
+  if (!getMulticastMasks().empty()) {
+    if (getMulticastMasks().size() != numMembers)
+      return emitOpError("requires one multicast mask per member");
+    int64_t clusterSize = gpu::lookupPhysicalNumCTAs(getOperation());
+    if (clusterSize < 1 || clusterSize > 16)
+      return emitOpError("multicast requires a cluster of at most 16 CTAs");
+    for (Value mask : getMulticastMasks()) {
+      APInt constant;
+      if (!matchPattern(mask, m_ConstantInt(&constant)))
+        continue;
+      if (constant.isNegative() ||
+          constant.getZExtValue() >= (1u << clusterSize))
+        return emitOpError("multicast mask names a CTA outside the cluster");
+      if (constant.popcount() > 5)
+        return emitOpError("multicast masks support at most 5 recipients");
+    }
+  }
 
   auto firstDescTy = cast<triton::TensorDescType>(getDescs().front().getType());
   unsigned rank = firstDescTy.getShape().size();
@@ -1818,22 +1836,6 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
 
   inferredReturnTypes.push_back(tensorTy);
 
-  return success();
-}
-
-// -- ClusterBarrierSignalOp --
-LogicalResult ClusterBarrierArriveOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
-  return success();
-}
-
-// -- ClusterBarrierWaitOp --
-LogicalResult ClusterBarrierWaitOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
   return success();
 }
 

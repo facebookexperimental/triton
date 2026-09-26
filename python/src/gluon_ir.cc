@@ -1200,7 +1200,7 @@ void init_gluon_ir(py::module_ &m) {
             auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
             auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
             self.create<ttag::AsyncTDMFusedCopyGlobalToLocalOp>(
-                tokenType, descs, dests, hints, cacheModifier);
+                tokenType, descs, dests, ValueRange{}, hints, cacheModifier);
           },
           py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
           py::arg("cacheModifier") = tt::CacheModifier::NONE)

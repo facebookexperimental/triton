@@ -1105,7 +1105,7 @@ def AsyncTDMCopyGlobalToLocalOp
 
 def AsyncTDMFusedCopyGlobalToLocalOp
     : TT_AMDGPU_Op<"async_tdm_fused_copy_global_to_local",
-                   [SameVariadicOperandSize]> {
+                   [AttrSizedOperandSegments]> {
   let summary = "Fuse multiple TDM global-to-local copies into one async "
                 "operation";
 
@@ -1114,11 +1114,22 @@ def AsyncTDMFusedCopyGlobalToLocalOp
     member provides a positioned tensor descriptor, destination shared-memory
     descriptor, and `warp_used_hint`. Member hints must be legal and pairwise
     disjoint. All members share one cache modifier.
+
+    Optional `multicast_masks` specify one scalar i32 recipient bitmask per
+    member, overriding layout-derived multicast. Bit n names CTA n in the
+    physical cluster; zero disables multicast for that member.
+    Each mask may select at most five recipients on gfx1250. Dynamic masks
+    must satisfy the same range and recipient-count restrictions as constants.
+    The caller must ensure every recipient issues the same source request to
+    the same LDS offset and synchronize accesses to destination shared memory
+    across recipient CTAs.
+    When omitted, multicast is inferred from the descriptor's CGA layout.
   }];
 
   let arguments = (ins
     Arg<Variadic<TT_TensorDescType>, "", [MemRead<GlobalMemory>]>:$descs,
     Arg<Variadic<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$dests,
+    Variadic<I32>:$multicast_masks,
     DenseI32ArrayAttr:$warp_used_hints,
     DefaultValuedAttr<TT_CacheModifierAttr,
                       "triton::CacheModifier::NONE">:$cache
@@ -1127,7 +1138,7 @@ def AsyncTDMFusedCopyGlobalToLocalOp
   let results = (outs TTG_AsyncToken:$token);
 
   let assemblyFormat = [{
-    $descs `into` $dests attr-dict `:` qualified(type($descs)) `->` qualified(type($dests))
+    $descs `into` $dests (`multicast` $multicast_masks^)? attr-dict `:` qualified(type($descs)) `->` qualified(type($dests))
   }];
 
   let hasVerifier = 1;
@@ -1548,17 +1559,17 @@ def AsyncCopyMbarrierArriveOp
 }
 
 //===----------------------------------------------------------------------===//
-// ClusterBarrierSignalOp
+// ClusterBarrierArriveOp
 //===----------------------------------------------------------------------===//
 
 def ClusterBarrierArriveOp : TT_AMDGPU_Op<"cluster_barrier_arrive"> {
   let summary = "Arrive at a cluster barrier";
   let description = [{
-    Signals that the cluster has arrived at a barrier, used to synchronizing CTAs within a cluster.
+    Signals that the current CTA has arrived at a barrier used to synchronize
+    CTAs within a cluster. This operation is a no-op for a single-CTA cluster.
 
     See ClusterBarrierWaitOp for how to wait on the arrived cluster barrier.
   }];
-  let hasVerifier = 1;
   let assemblyFormat = "attr-dict";
 }
 
@@ -1572,8 +1583,8 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
     Waits for all CTAs of the same cluster to have arrived at a cluster barrier.
     Arrive and wait operations must come in pairs. Waiting before arriving or arriving
     more than once without a corresponding wait will result in undefined behavior.
+    This operation is a no-op for a single-CTA cluster.
   }];
-  let hasVerifier = 1;
   let assemblyFormat = "attr-dict";
 }
 
