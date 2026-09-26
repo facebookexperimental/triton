@@ -301,9 +301,11 @@ fragments still pass through unchanged.
 Because LLVM cannot model the latency or hazards of an MFMA hidden in inline
 assembly, unproven persistent chains retain target-specific input padding and
 per-update result drains. On gfx950, the compiler may defer those drains for a
-proven persistent AGPR chain ending at `amd_mfma_commit`; after scheduling and
-register allocation it repairs source and EXEC hazards and drains outstanding
-results before physical AGPR reads or overwrites. Those waits and the
+proven persistent AGPR or VGPR chain ending at a matching `amd_mfma_commit`
+boundary. After scheduling and register allocation, it repairs source,
+accumulator, and EXEC hazards and inserts any required waits before
+physical-register reads or overwrites of outstanding results. Other supported
+targets retain conservative waits for persistent chains. Those waits and the
 inline-assembly representation are implementation details and should be
 included when comparing the two roles.
 
