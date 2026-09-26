@@ -1,5 +1,42 @@
 # AMD attention tutorials
 
+## PyTorch dense FlashAttention backward
+
+The packaged gfx950 BF16 backward kernels live in
+[`../ops/kernels/flash_attn/gfx950_bwd.py`](../ops/kernels/flash_attn/gfx950_bwd.py).
+Current PyTorch releases can opt into them through the FlashAttention provider
+registry:
+
+```python
+import triton.tlx.pytorch
+from torch.nn.attention import activate_flash_attention_impl
+
+activate_flash_attention_impl("TLX_GFX950_BWD")
+```
+
+Activation is process-global and replaces only
+`aten::_scaled_dot_product_flash_attention_backward`; PyTorch continues to run
+the forward kernel. The provider selects TLX only for correctness- and
+performance-validated dense BF16 gfx950 routes. Dropout, deterministic mode,
+unsupported layouts/shapes, and routes without a measured advantage call the
+CUDA kernel captured at activation. Use
+`torch.nn.attention.restore_flash_attention_impl()` to remove the override.
+The automatic set is an exact allow-list of D64, D128, and D256 signatures that
+won through the activated provider on MI350X; unmeasured shapes and known
+losing members of the same kernel families fall back. For short D128
+`(16, 27, 200, 128)`, the default split route improves forward plus backward by
+1.15x non-causal and 1.35x causal. The exact-D128 opt-in improves it by 1.34x
+and 1.39x, respectively. Both measured routes are eligible; unmeasured
+persistent experiments and register-allocation overrides fall back.
+The measured expansion also enables 13 dense D64 signatures from the long
+MHA/GQA and rectangular-GQA kernels, with forward-plus-backward speedups of
+1.10x--1.59x over PyTorch's CK/AITER path, plus three interleaved D128
+signatures: non-causal MHA at N=1024/2048 (1.12x/1.07x) and causal GQA8 at
+N=1024 (1.05x). Neighboring D128 shapes that did not clear the performance
+gate remain on the native provider. For causal rectangular attention, use
+PyTorch's `causal_lower_right(SQ, SKV)` bias; plain `is_causal=True` rejects
+unequal sequence lengths before reaching FlashAttention.
+
 ## Adaptive FlashAttention
 
 [`amd_fa_adaptive.py`](amd_fa_adaptive.py) implements adaptive and

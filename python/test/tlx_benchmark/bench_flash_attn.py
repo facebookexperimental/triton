@@ -50,7 +50,15 @@ REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
 
 def shapes(synthetic: bool = False, suites=None) -> list:
-    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
+    arch = driver.arch()
+    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(arch, suites)
+    # The shared synthetic list mirrors the original NVIDIA correctness cases,
+    # which are FP16. gfx950 FlashAttention is deliberately BF16-only, so keep
+    # the same small shapes while selecting the dtype accepted by its catalog
+    # entry instead of turning every synthetic case into an InvalidInput row.
+    if synthetic and arch == "gfx950":
+        entries = (entry._replace(dtype="bf16") for entry in entries)
+    return list(entries)
 
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:

@@ -4287,10 +4287,10 @@ def _tlx_gfx950_ragged_hstu_attn_bwd_one_col_block(  # noqa C901
     k_ptrs = K + (offs_n[:, None] * stride_kn + offs_qk_d[None, :])
     v_ptrs = V + (offs_n[:, None] * stride_vn + offs_v_d[None, :])
     mask_n = offs_n < seq_len
-    # LDS staging for q / dOut. The base vectors are copied from the TLX
-    # tutorial third_party/tlx/tutorials/amd_fa_bwd.py; they must match the tile
-    # shape exactly (a row bit past the tile makes the memdesc reinterpret
-    # verifier reject the layout), so this only covers BLOCK_M in {16, 32, 64}
+    # LDS staging for q / dOut. The base vectors are copied from the packaged
+    # third_party/tlx/ops/kernels/flash_attn/gfx950_bwd.py kernel; they must
+    # match the tile shape exactly (a row bit past the tile makes the memdesc
+    # reinterpret verifier reject the layout), so this only covers BLOCK_M in {16, 32, 64}
     # at head dim 128. _get_bw_configs is restricted to match.
     tl.static_assert(BLOCK_M == 16 or BLOCK_M == 32 or BLOCK_M == 64)
     tl.static_assert(BLOCK_D_Q == 128 and BLOCK_D_V == 128)

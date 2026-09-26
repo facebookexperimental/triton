@@ -1,18 +1,79 @@
 """TLX AMD tests -- CDNA4 (gfx950)."""
 
-from dataclasses import replace
+import contextlib
+from dataclasses import dataclass, replace
+import importlib
 import inspect
+import os
 import re
+import unittest
+from unittest import mock
 
 import pytest
 import torch
-from triton.language.extra.tlx.tutorials import amd_fa_bwd, amd_fa_varlen_bwd
-from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
-    ReferenceCase,
+from triton._internal_testing import is_hip_cdna4
+from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
+from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _select_d64_dispatch,
     fa_backward,
-    is_hip_cdna4,
 )
+
+
+def flash_attention_registry_available() -> bool:
+    """True when torch exposes the public conditional-provider APIs."""
+    try:
+        import torch.nn.attention as attention
+
+        return all(
+            hasattr(attention, name) for name in (
+                "activate_flash_attention_impl",
+                "current_flash_attention_impl",
+                "list_flash_attention_impls",
+                "register_flash_attention_impl",
+                "restore_flash_attention_impl",
+            )) and hasattr(torch.library, "get_kernel")
+    except ImportError:
+        return False
+
+
+def _gfx950_device_indices():
+    return [
+        index for index in range(torch.cuda.device_count())
+        if getattr(torch.cuda.get_device_properties(index), "gcnArchName", "").startswith("gfx950")
+    ]
+
+
+@contextlib.contextmanager
+def _activated_tlx_flash_attention_provider():
+    import torch.nn.attention as attention
+    from triton.tlx import pytorch as provider
+
+    previous = attention.current_flash_attention_impl()
+    attention.activate_flash_attention_impl(provider.PROVIDER_NAME)
+    try:
+        yield provider
+    finally:
+        attention.restore_flash_attention_impl()
+        if previous is not None:
+            attention.activate_flash_attention_impl(previous)
+
+
+@dataclass(frozen=True)
+class ReferenceCase:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    o: torch.Tensor
+    do: torch.Tensor
+    lse: torch.Tensor
+    sm_scale: float
+    causal: bool
+    grads: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+    @property
+    def kernel_args(self):
+        return (self.q, self.k, self.v, self.o, self.do, self.lse, self.sm_scale, self.causal)
 
 
 def _make_d64_aten_case(shape, *, causal, seed):
@@ -71,6 +132,86 @@ def _make_d64_aten_case(shape, *, causal, seed):
         causal,
         tuple(reference),
     )
+
+
+def _make_dense_reference_case(shape, causal, seed=0):
+    """Build dense MHA forward state and FP32 reference gradients by head."""
+    batch, heads, n_ctx, head_dim = shape
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    grad_out = torch.randn(shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+    grads = tuple(torch.empty(shape, device="cuda", dtype=torch.float32) for _ in range(3))
+    sm_scale = head_dim**-0.5
+    causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1) if causal else None
+
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            q_ref = q[batch_idx, head_idx].float().requires_grad_(True)
+            k_ref = k[batch_idx, head_idx].float().requires_grad_(True)
+            v_ref = v[batch_idx, head_idx].float().requires_grad_(True)
+            scores = q_ref @ k_ref.mT * sm_scale
+            if causal_mask is not None:
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            lse_ref = torch.logsumexp(scores, dim=-1)
+            out_ref = torch.softmax(scores, dim=-1) @ v_ref
+            reference = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out[batch_idx, head_idx].float())
+            with torch.no_grad():
+                out[batch_idx, head_idx].copy_(out_ref)
+                lse[batch_idx, head_idx].copy_(lse_ref)
+                for destination, source in zip(grads, reference, strict=True):
+                    destination[batch_idx, head_idx].copy_(source)
+
+    return ReferenceCase(q, k, v, out, grad_out, lse, sm_scale, causal, grads)
+
+
+def _make_dense_gqa_reference_case(shape, *, causal=False, seed=0, sm_scale=None):
+    """Build a small supported dense GQA reference case."""
+    assert amd_fa_bwd._is_supported_gqa_shape(shape)
+    batch, query_heads, kv_heads, n_ctx, head_dim = shape
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn((batch, query_heads, n_ctx, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, n_ctx, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, n_ctx, head_dim), generator=generator, device="cuda", dtype=torch.bfloat16)
+    grad_out = torch.randn(q.shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:-1], device="cuda", dtype=torch.float32)
+    dq = torch.empty_like(q, dtype=torch.float32)
+    dk = torch.zeros_like(k, dtype=torch.float32)
+    dv = torch.zeros_like(v, dtype=torch.float32)
+    sm_scale = head_dim**-0.5 if sm_scale is None else sm_scale
+    causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1) if causal else None
+    group_size = query_heads // kv_heads
+
+    for batch_idx in range(batch):
+        for query_head in range(query_heads):
+            kv_head = query_head // group_size
+            q_ref = q[batch_idx, query_head].float().requires_grad_(True)
+            k_ref = k[batch_idx, kv_head].float().requires_grad_(True)
+            v_ref = v[batch_idx, kv_head].float().requires_grad_(True)
+            scores = q_ref @ k_ref.mT * sm_scale
+            if causal_mask is not None:
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            lse_ref = torch.logsumexp(scores, dim=-1)
+            out_ref = torch.softmax(scores, dim=-1) @ v_ref
+            reference = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out[batch_idx, query_head].float())
+            with torch.no_grad():
+                out[batch_idx, query_head].copy_(out_ref)
+                lse[batch_idx, query_head].copy_(lse_ref)
+                dq[batch_idx, query_head].copy_(reference[0])
+                dk[batch_idx, kv_head].add_(reference[1])
+                dv[batch_idx, kv_head].add_(reference[2])
+
+    return ReferenceCase(q, k, v, out, grad_out, lse, sm_scale, causal, (dq, dk, dv))
+
+
+def _snr_db(actual, expected):
+    signal = torch.linalg.vector_norm(expected.float())
+    noise = torch.linalg.vector_norm(actual.float() - expected.float())
+    return 20.0 * torch.log10(signal / noise).item()
 
 
 def _assert_scratch_free(name, compiled):
@@ -191,6 +332,913 @@ def _make_varlen_d128_reference_case(
         expected_dk.to(torch.bfloat16),
         expected_dv.to(torch.bfloat16),
     )
+
+
+@unittest.skipUnless(
+    flash_attention_registry_available(),
+    "Need the public PyTorch FlashAttention provider registry",
+)
+class TestTLXFlashAttentionProvider(unittest.TestCase):
+
+    class _NativeKernel:
+
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def call_boxed(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return self.result
+
+    @staticmethod
+    def _wrapper_args(shape=(1, 1, 2, 4)):
+        query = torch.randn(shape)
+        key = torch.randn(shape)
+        value = torch.randn(shape)
+        out_storage = torch.randn((*shape[:-1], 2 * shape[-1]))
+        grad_storage = torch.randn_like(out_storage)
+        lse_storage = torch.randn((*shape[:-1], 2))
+        out = out_storage[..., ::2]
+        grad_out = grad_storage[..., ::2]
+        logsumexp = lse_storage[..., 0]
+        return (
+            grad_out,
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            None,
+            None,
+            shape[2],
+            shape[2],
+            0.0,
+            False,
+            torch.tensor(0, dtype=torch.int64),
+            torch.tensor(0, dtype=torch.int64),
+        )
+
+    @staticmethod
+    def _performance_tensors(q_shape, k_shape):
+        tensors = [mock.Mock(shape=q_shape) for _ in range(6)]
+        tensors[1].shape = k_shape
+        for tensor in tensors:
+            tensor.data_ptr.return_value = 0
+        return tensors
+
+    @staticmethod
+    def _d64_dispatch(q_shape, k_shape, causal):
+        return amd_fa_bwd._select_d64_dispatch(
+            q_shape,
+            k_shape,
+            causal,
+            arch="gfx950",
+            cu_count=256,
+            sm_scale=0.125,
+            bases_aligned_16=True,
+        )
+
+    def test_import_registers_without_activation(self):
+        import torch.nn.attention as attention
+
+        active = attention.current_flash_attention_impl()
+        provider = importlib.import_module("triton.tlx.pytorch")
+        with mock.patch.object(
+                attention,
+                "register_flash_attention_impl",
+                wraps=attention.register_flash_attention_impl,
+        ) as register:
+            provider = importlib.reload(provider)
+
+        register.assert_called_once_with(
+            provider.PROVIDER_NAME,
+            register_fn=provider.register_tlx_gfx950_flash_attention_backward,
+        )
+        self.assertIn(provider.PROVIDER_NAME, attention.list_flash_attention_impls())
+        self.assertEqual(attention.current_flash_attention_impl(), active)
+
+    def test_tlx_route_maps_arguments_without_hidden_copies(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args()
+        expected = tuple(torch.empty(0) for _ in range(3))
+        native = self._NativeKernel(result=None)
+        with (
+                mock.patch.object(provider, "_tlx_support_error", return_value=None),
+                mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()) as device_guard,
+                mock.patch.object(provider.gfx950_bwd, "fa_backward", return_value=expected) as tlx_backward,
+        ):
+            actual = provider._tlx_scaled_dot_product_flash_attention_backward(
+                native,
+                object(),
+                *args,
+                scale=None,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(native.calls, [])
+        device_guard.assert_called_once_with(args[1].device)
+        tlx_backward.assert_called_once()
+        call = tlx_backward.call_args.args
+        self.assertIs(call[0], args[1])
+        self.assertIs(call[1], args[2])
+        self.assertIs(call[2], args[3])
+        self.assertIs(call[3], args[4])
+        self.assertIs(call[4], args[0])
+        self.assertIs(call[5], args[5])
+        self.assertEqual(call[6], args[1].shape[-1]**-0.5)
+        self.assertIs(call[7], args[11])
+
+    def test_support_gate_runs_before_performance_gate(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args()
+        with (
+                mock.patch.object(
+                    provider.gfx950_bwd,
+                    "fa_backward_support_error",
+                    return_value="kernel contract rejected the call",
+                ) as support,
+                mock.patch.object(provider, "_is_performance_validated") as performance,
+        ):
+            error = provider._tlx_support_error(*args[:12], scale=0.5)
+
+        self.assertEqual(error, "kernel contract rejected the call")
+        support.assert_called_once_with(args[1], args[2], args[3], args[4], args[0], args[5], 0.5, args[11])
+        performance.assert_not_called()
+
+    def test_support_gate_rejects_unsupported_dispatch_contracts(self):
+        from triton.tlx import pytorch as provider
+
+        cases = []
+        args = list(self._wrapper_args())
+        args[10] = 0.1
+        cases.append(("dropout", args, False, "dropout_p must be zero"))
+        args = list(self._wrapper_args())
+        args[6] = torch.tensor([0, 2])
+        cases.append(("varlen", args, False, "only dense attention is supported"))
+        args = list(self._wrapper_args())
+        args[1] = args[1].to_sparse()
+        cases.append(("layout", args, False, "query must use strided layout"))
+        args = list(self._wrapper_args())
+        cases.append(("deterministic", args, True, "deterministic algorithms are enabled"))
+        args = list(self._wrapper_args())
+        args[1] = torch.randn(1, 2, 4)
+        cases.append(("rank", args, False, "query and key must be rank-4 BHSD tensors"))
+        args = list(self._wrapper_args())
+        args[8] += 1
+        cases.append(("sequence length", args, False, "max_q and max_k must match the dense sequence lengths"))
+
+        for name, args, deterministic, expected in cases:
+            with (
+                    self.subTest(case=name),
+                    mock.patch.object(torch, "are_deterministic_algorithms_enabled", return_value=deterministic),
+                    mock.patch.object(provider.gfx950_bwd, "fa_backward_support_error") as support,
+                    mock.patch.object(provider, "_is_performance_validated") as performance,
+            ):
+                self.assertEqual(provider._tlx_support_error(*args[:12], scale=None), expected)
+                support.assert_not_called()
+                performance.assert_not_called()
+
+        args = self._wrapper_args()
+        with (
+                mock.patch.object(provider.gfx950_bwd, "fa_backward_support_error", return_value=None),
+                mock.patch.object(provider, "_is_performance_validated", return_value=False),
+        ):
+            self.assertEqual(
+                provider._tlx_support_error(*args[:12], scale=None),
+                "shape is supported but not performance-validated for dispatcher use",
+            )
+
+    def test_unsupported_route_calls_captured_kernel_once(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args()
+        expected = tuple(torch.empty(0) for _ in range(3))
+        native = self._NativeKernel(expected)
+        keyset = object()
+        with (
+                mock.patch.object(provider, "_tlx_support_error", return_value="unsupported"),
+                mock.patch.object(provider.gfx950_bwd, "fa_backward") as tlx_backward,
+        ):
+            actual = provider._tlx_scaled_dot_product_flash_attention_backward(
+                native,
+                keyset,
+                *args,
+                scale=0.25,
+            )
+
+        self.assertIs(actual, expected)
+        tlx_backward.assert_not_called()
+        self.assertEqual(len(native.calls), 1)
+        fallback_args, fallback_kwargs = native.calls[0]
+        self.assertIs(fallback_args[0], keyset)
+        for actual_arg, expected_arg in zip(fallback_args[1:], args, strict=True):
+            self.assertIs(actual_arg, expected_arg)
+        self.assertEqual(fallback_kwargs, {"scale": 0.25})
+
+    def test_zero_head_dimension_uses_native_fallback(self):
+        from triton.tlx import pytorch as provider
+
+        args = self._wrapper_args(shape=(1, 1, 2, 0))
+        expected = tuple(torch.empty(0) for _ in range(3))
+        native = self._NativeKernel(expected)
+        keyset = object()
+        with mock.patch.object(provider.gfx950_bwd, "fa_backward") as tlx_backward:
+            actual = provider._tlx_scaled_dot_product_flash_attention_backward(
+                native,
+                keyset,
+                *args,
+                scale=None,
+            )
+
+        self.assertIs(actual, expected)
+        tlx_backward.assert_not_called()
+        self.assertEqual(len(native.calls), 1)
+
+    def test_registration_captures_kernel_at_each_activation(self):
+        from triton.tlx import pytorch as provider
+
+        first = object()
+        second = object()
+        libraries = [mock.Mock(), mock.Mock()]
+        with (
+                mock.patch.object(torch.library, "get_kernel", side_effect=(first, second)) as get_kernel,
+                mock.patch.object(torch.library, "Library", side_effect=libraries),
+        ):
+            first_handle = provider.register_tlx_gfx950_flash_attention_backward()
+            second_handle = provider.register_tlx_gfx950_flash_attention_backward()
+
+        self.assertEqual(get_kernel.call_count, 2)
+        for library, original in zip(libraries, (first, second), strict=True):
+            implementation = library.impl.call_args.args[1]
+            self.assertIs(implementation.args[0], original)
+            self.assertTrue(library.impl.call_args.kwargs["with_keyset"])
+        first_handle.remove()
+        second_handle.remove()
+        self.assertIsNone(first_handle.library)
+        self.assertIsNone(second_handle.library)
+
+    def test_only_measured_signatures_are_selected(self):
+        from triton.tlx import pytorch as provider
+
+        q_shape = (1, 16, 4096, 64)
+        k_shape = (1, 2, 4096, 64)
+        tensors = self._performance_tensors(q_shape, k_shape)
+        with mock.patch.object(
+                provider.gfx950_bwd,
+                "_select_d64_dispatch_for_device",
+                return_value=self._d64_dispatch(q_shape, k_shape, False),
+        ):
+            self.assertTrue(provider._is_performance_validated(*tensors, 0.125, False))
+            self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+
+        # A family match is not enough: every shape needs its own provider-path
+        # measurement and exact dispatch fingerprint.
+        tensors = self._performance_tensors((2, 32, 8192, 64), (2, 4, 8192, 64))
+        self.assertFalse(provider._is_performance_validated(*tensors, 0.125, False))
+
+        losing_d128 = (
+            ((16, 16, 4096, 128), (16, 16, 4096, 128), False),
+            ((16, 64, 2048, 128), (16, 8, 2048, 128), True),
+        )
+        for q_shape, k_shape, causal in losing_d128:
+            with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal):
+                tensors = self._performance_tensors(q_shape, k_shape)
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+
+    def test_expanded_measured_signatures_select_exact_dispatches(self):
+        from triton.tlx import pytorch as provider
+
+        d64_cases = (
+            ((2, 32, 16384, 64), (2, 32, 16384, 64), False),
+            ((2, 32, 16384, 64), (2, 4, 16384, 64), False),
+            ((2, 32, 16384, 64), (2, 32, 16384, 64), True),
+            ((2, 32, 16384, 64), (2, 4, 16384, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 4096, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 8192, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 12288, 64), True),
+            ((4, 48, 4096, 64), (4, 6, 16384, 64), True),
+            ((1, 8, 16384, 64), (1, 8, 16384, 64), True),
+            ((1, 8, 16640, 64), (1, 8, 16640, 64), True),
+            ((1, 4, 32768, 64), (1, 4, 32768, 64), True),
+            ((3, 3, 16384, 64), (3, 3, 16384, 64), True),
+            ((2, 8, 16384, 64), (2, 8, 16384, 64), True),
+        )
+        for q_shape, k_shape, causal in d64_cases:
+            tensors = self._performance_tensors(q_shape, k_shape)
+            with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal), mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=self._d64_dispatch(q_shape, k_shape, causal),
+            ):
+                self.assertTrue(provider._is_performance_validated(*tensors, 0.125, causal))
+
+        d128_cases = (
+            ((16, 16, 1024, 128), (16, 16, 1024, 128), False),
+            ((16, 16, 2048, 128), (16, 16, 2048, 128), False),
+            ((16, 64, 1024, 128), (16, 8, 1024, 128), True),
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for q_shape, k_shape, causal in d128_cases:
+                with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal):
+                    tensors = self._performance_tensors(q_shape, k_shape)
+                    self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+
+    def test_d64_signature_requires_measured_dispatch_config(self):
+        from triton.tlx import pytorch as provider
+
+        q_shape = (4, 48, 1024, 64)
+        k_shape = (4, 6, 1024, 64)
+        tensors = self._performance_tensors(q_shape, k_shape)
+        measured = self._d64_dispatch(q_shape, k_shape, True)
+        with mock.patch.object(
+                provider.gfx950_bwd,
+                "_select_d64_dispatch_for_device",
+                return_value=measured,
+        ):
+            self.assertTrue(provider._is_performance_validated(*tensors, 0.125, True))
+
+        mutations = (
+            {"family": "causal_m192"},
+            {"owner_rows": measured.owner_rows * 2},
+            {"key_rows": measured.key_rows * 2},
+            {"kv_splits": measured.kv_splits * 2},
+            {"selected_causal": not measured.selected_causal},
+            {"stat_mode": measured.stat_mode + 1},
+            {"dq_logical_n": measured.dq_logical_n * 2},
+            {"dq_use_xcd": not measured.dq_use_xcd},
+            {"dq_launches": ()},
+            {"gqa_grid_mode": None},
+            {"cyclic_query_split": not measured.cyclic_query_split},
+            {"dkdv_lifetime": None},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+        launch = measured.dq_launches[0]
+        launch_mutations = (
+            {"launch_tiles": launch.launch_tiles + 1},
+            {"skip_owner_tail": not launch.skip_owner_tail},
+            {"owner_pid_base": launch.owner_pid_base + 1},
+            {"launch_q_tiles": launch.launch_q_tiles + 1},
+            {"owner_fragments": launch.owner_fragments + 1},
+            {"grid_owner_m": launch.grid_owner_m + 1},
+        )
+        for mutation in launch_mutations:
+            with self.subTest(launch_mutation=mutation), mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=replace(measured, dq_launches=(replace(launch, **mutation), )),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+        with (
+                mock.patch.object(
+                    provider.gfx950_bwd,
+                    "_select_d64_dispatch_for_device",
+                    return_value=measured,
+                ),
+                mock.patch.object(provider.gfx950_bwd, "_d64_q3_register_class", return_value=None),
+        ):
+            self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+
+        with mock.patch.object(
+                provider.gfx950_bwd,
+                "_select_d64_dispatch_for_device",
+                return_value=object(),
+        ):
+            self.assertFalse(provider._is_performance_validated(*tensors, 0.125, True))
+
+    def test_short_d128_selects_only_measured_dispatches(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((16, 27, 200, 128), (16, 27, 200, 128))
+        route_options = {
+            amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+            amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+        }
+        for causal in (False, True):
+            with self.subTest(causal=causal, route="split"), mock.patch.dict(os.environ, route_options):
+                self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+            with self.subTest(causal=causal, route="exact"), mock.patch.dict(
+                    os.environ,
+                    route_options | {amd_fa_bwd._D128_EXACT_ENABLE_ENV: "1"},
+            ):
+                self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+            for option in (amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV, amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV):
+                with self.subTest(causal=causal, route=option), mock.patch.dict(
+                        os.environ,
+                        route_options | {option: "1"},
+                ):
+                    self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+            for option in (
+                    amd_fa_bwd._D128_SINK_INSTS_ENV,
+                    amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+                    amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+            ):
+                with self.subTest(causal=causal, route="exact", regalloc=option), mock.patch.dict(
+                        os.environ,
+                        route_options | {
+                            amd_fa_bwd._D128_EXACT_ENABLE_ENV: "1",
+                            option: "1",
+                        },
+                ):
+                    self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, causal))
+
+        with mock.patch.dict(os.environ, route_options):
+            measured = amd_fa_bwd._select_d128_dispatch((16, 27, 200, 128), False)
+        mutations = (
+            {"entry": object()},
+            {"block_m": measured.block_m * 2},
+            {"block_n": measured.block_n // 2},
+            {"num_warps": measured.num_warps // 2},
+            {"pipelined": not measured.pipelined},
+            {"rectangular": not measured.rectangular},
+            {"exact": not measured.exact},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    amd_fa_bwd,
+                    "_select_d128_dispatch",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+    def test_every_tensor_base_must_be_aligned(self):
+        from triton.tlx import pytorch as provider
+
+        names = ("query", "key", "value", "out", "grad_out", "logsumexp")
+        tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
+            for name, tensor in zip(names, tensors, strict=True):
+                with self.subTest(tensor=name):
+                    tensor.data_ptr.return_value = 2
+                    self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+                    tensor.data_ptr.return_value = 0
+
+    def test_d128_experimental_regalloc_options_are_not_selected(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
+        options = (
+            amd_fa_bwd._D128_SINK_INSTS_ENV,
+            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+            amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
+        for option in options:
+            with self.subTest(option=option), mock.patch.dict(os.environ, {option: "1"}, clear=True):
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+    def test_interleaved_d128_requires_measured_dispatch_config(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((16, 64, 1024, 128), (16, 8, 1024, 128))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            measured = amd_fa_bwd._select_d128_interleaved_dispatch()
+            self.assertTrue(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+        mutations = (
+            {"main_entry": object()},
+            {"block_m": measured.block_m * 2},
+            {"block_n": measured.block_n // 2},
+            {"num_warps": measured.num_warps // 2},
+            {"num_stages": measured.num_stages + 1},
+            {"matrix_instr_nonkdim": measured.matrix_instr_nonkdim * 2},
+            {"convert_entry": object()},
+            {"convert_block_m": measured.convert_block_m // 2},
+            {"convert_num_warps": measured.convert_num_warps // 2},
+            {"sink_insts_to_avoid_spills": not measured.sink_insts_to_avoid_spills},
+            {"regclass_priority_trumps_globalness": not measured.regclass_priority_trumps_globalness},
+            {"reverse_local_assignment": not measured.reverse_local_assignment},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    amd_fa_bwd,
+                    "_select_d128_interleaved_dispatch",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 128**-0.5, False))
+
+    def test_d256_forced_staged_route_is_not_selected(self):
+        from triton.tlx import pytorch as provider
+
+        tensors = self._performance_tensors((32, 1, 2600, 256), (32, 1, 2600, 256))
+        with mock.patch.dict(os.environ, {"TLX_FA_BWD_FORCE_STAGED": "1"}, clear=True):
+            self.assertTrue(provider._is_performance_validated(*tensors, 256**-0.5, False))
+            self.assertFalse(provider._is_performance_validated(*tensors, 256**-0.5, True))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            measured = amd_fa_bwd._select_d256_dispatch(False)
+        mutations = (
+            {"entry": object()},
+            {"num_warps": measured.num_warps * 2},
+            {"staged": not measured.staged},
+            {"pipelined": not measured.pipelined},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), mock.patch.object(
+                    amd_fa_bwd,
+                    "_select_d256_dispatch",
+                    return_value=replace(measured, **mutation),
+            ):
+                self.assertFalse(provider._is_performance_validated(*tensors, 256**-0.5, False))
+
+
+@unittest.skipUnless(is_hip_cdna4(), "Requires gfx950 hardware")
+class TestDenseFABackwardSupportGfx950(unittest.TestCase):
+
+    @staticmethod
+    def _aligned_support_args():
+        shape = (1, 1, 256, 64)
+        q = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+        out = torch.empty_like(q)
+        grad_out = torch.empty_like(q)
+        lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+        return [q, k, v, out, grad_out, lse]
+
+    def test_support_gate_rejects_nonfinite_scale(self):
+        args = self._aligned_support_args()
+        self.assertIsNone(amd_fa_bwd.fa_backward_support_error(*args, 0.125, False))
+        for scale in (float("inf"), float("nan")):
+            with self.subTest(scale=scale):
+                self.assertEqual(
+                    amd_fa_bwd.fa_backward_support_error(*args, scale, False),
+                    "sm_scale must be a finite number",
+                )
+
+    def test_support_gate_rejects_missing_backward_state(self):
+        args = self._aligned_support_args()
+        for index, expected in (
+            (3, "o must match q shape and device"),
+            (4, "do must match q shape and device"),
+            (5, "lse must be FP32 B,H,N on the same device"),
+        ):
+            missing = list(args)
+            missing[index] = None
+            with self.subTest(index=index):
+                self.assertEqual(
+                    amd_fa_bwd.fa_backward_support_error(*missing, 0.125, False),
+                    expected,
+                )
+
+    def test_d256_scratch_producer_covers_consumer(self):
+        shape = (32, 1, 2600, 256)
+        q = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.ones_like(q)
+        v = torch.zeros_like(q)
+        out = torch.zeros_like(q)
+        grad_out = torch.zeros_like(q)
+        lse = torch.zeros(shape[:-1], device="cuda", dtype=torch.float32)
+        scale = shape[-1]**-0.5
+
+        for causal in (False, True):
+            with self.subTest(causal=causal):
+                delta = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+                dq = torch.empty_like(q)
+                dk = torch.empty_like(k)
+                dv = torch.empty_like(v)
+                amd_fa_bwd._run_bwd_preprocess(out, grad_out, delta)
+                amd_fa_bwd._run_bwd_d256(
+                    q,
+                    k,
+                    v,
+                    grad_out,
+                    lse,
+                    delta,
+                    dq,
+                    dk,
+                    dv,
+                    scale,
+                    causal,
+                    poison_scratch=True,
+                )
+                self.assertTrue(torch.isfinite(dq).all().item())
+
+
+@unittest.skipUnless(
+    flash_attention_registry_available() and is_hip_cdna4(),
+    "Need the public PyTorch registry and AMD MI350X (gfx950)",
+)
+class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
+    @staticmethod
+    def _run_sdpa_grads(query, key, value, grad_out, *, causal, enable_gqa, attention_mask=None):
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        q, k, v = (tensor.detach().requires_grad_(True) for tensor in (query, key, value))
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                is_causal=causal,
+                enable_gqa=enable_gqa,
+            )
+        return torch.autograd.grad(out, (q, k, v), grad_out)
+
+    def _assert_sdpa_autograd_routes_to_tlx(
+        self,
+        query_shape,
+        key_shape,
+        *,
+        causal,
+        enable_gqa=False,
+        attention_mask=None,
+        seed,
+        max_relative_l2,
+    ):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        query = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        key = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        value = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        grad_out = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+
+        expected = self._run_sdpa_grads(
+            query,
+            key,
+            value,
+            grad_out,
+            causal=causal,
+            enable_gqa=enable_gqa,
+            attention_mask=attention_mask,
+        )
+        with _activated_tlx_flash_attention_provider(), mock.patch.object(
+                amd_fa_bwd,
+                "fa_backward",
+                wraps=amd_fa_bwd.fa_backward,
+        ) as tlx_backward:
+            actual = self._run_sdpa_grads(
+                query,
+                key,
+                value,
+                grad_out,
+                causal=causal,
+                enable_gqa=enable_gqa,
+                attention_mask=attention_mask,
+            )
+        tlx_backward.assert_called_once()
+        self.assertTrue(all(tensor.is_contiguous() for tensor in tlx_backward.call_args.args[:6]))
+        for result, reference in zip(actual, expected, strict=True):
+            relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+                reference.float())
+            self.assertLess(relative_l2.item(), max_relative_l2)
+
+    def _assert_misaligned_query_uses_native(self, query_shape, key_shape, *, causal, enable_gqa, seed):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        query_storage = torch.randn(
+            torch.Size(query_shape).numel() + 1,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        query = query_storage[1:].view(query_shape)
+        self.assertTrue(query.is_contiguous())
+        self.assertNotEqual(query.data_ptr() % 16, 0)
+        key = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        value = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+        grad_out = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+
+        expected = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        with _activated_tlx_flash_attention_provider(), mock.patch.object(
+                amd_fa_bwd,
+                "fa_backward",
+                wraps=amd_fa_bwd.fa_backward,
+        ) as tlx_backward:
+            actual = self._run_sdpa_grads(query, key, value, grad_out, causal=causal, enable_gqa=enable_gqa)
+        tlx_backward.assert_not_called()
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference)
+
+    def test_sdpa_autograd_routes_d64_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (1, 24, 4096, 64),
+            (1, 24, 4096, 64),
+            causal=True,
+            seed=3639,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_d64_noncausal_mha_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (1, 16, 4096, 64),
+            (1, 16, 4096, 64),
+            causal=False,
+            seed=3642,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_expanded_d64_mha_to_tlx(self):
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (3, 3, 16384, 64),
+            (3, 3, 16384, 64),
+            causal=True,
+            seed=3670,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_expanded_rectangular_d64_gqa_to_tlx(self):
+        from torch.nn.attention.bias import causal_lower_right
+
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (4, 48, 4096, 64),
+            (4, 6, 8192, 64),
+            causal=False,
+            enable_gqa=True,
+            attention_mask=causal_lower_right(4096, 8192),
+            seed=3671,
+            max_relative_l2=5e-3,
+        )
+
+    def test_sdpa_autograd_routes_d128_gqa_to_tlx(self):
+        for sequence_length in (1024, 2048, 4096):
+            with self.subTest(sequence_length=sequence_length):
+                self._assert_sdpa_autograd_routes_to_tlx(
+                    (16, 64, sequence_length, 128),
+                    (16, 8, sequence_length, 128),
+                    causal=False,
+                    enable_gqa=True,
+                    seed=3640 + sequence_length,
+                    max_relative_l2=1e-2,
+                )
+        self._assert_sdpa_autograd_routes_to_tlx(
+            (16, 64, 1024, 128),
+            (16, 8, 1024, 128),
+            causal=True,
+            enable_gqa=True,
+            seed=3672,
+            max_relative_l2=1e-2,
+        )
+
+    def test_sdpa_autograd_routes_expanded_d128_mha_to_tlx(self):
+        for sequence_length in (1024, 2048):
+            with self.subTest(sequence_length=sequence_length):
+                self._assert_sdpa_autograd_routes_to_tlx(
+                    (16, 16, sequence_length, 128),
+                    (16, 16, sequence_length, 128),
+                    causal=False,
+                    seed=3673 + sequence_length,
+                    max_relative_l2=1e-2,
+                )
+
+    def test_sdpa_autograd_routes_short_d128_to_tlx(self):
+        route_options = {
+            amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+            amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+            amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+            amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+        }
+        for exact in (False, True):
+            options = route_options | {amd_fa_bwd._D128_EXACT_ENABLE_ENV: str(int(exact))}
+            for causal in (False, True):
+                with self.subTest(exact=exact, causal=causal), mock.patch.dict(os.environ, options):
+                    self._assert_sdpa_autograd_routes_to_tlx(
+                        (16, 27, 200, 128),
+                        (16, 27, 200, 128),
+                        causal=causal,
+                        seed=3650 + 2 * int(exact) + int(causal),
+                        max_relative_l2=1e-2,
+                    )
+
+    def test_sdpa_autograd_routes_d256_to_tlx(self):
+        for causal in (False, True):
+            with self.subTest(causal=causal):
+                self._assert_sdpa_autograd_routes_to_tlx(
+                    (32, 1, 2600, 256),
+                    (32, 1, 2600, 256),
+                    causal=causal,
+                    seed=3641 + causal,
+                    max_relative_l2=1e-2,
+                )
+
+    def test_measured_causal_d64_shape_with_misaligned_base_uses_native(self):
+        self._assert_misaligned_query_uses_native(
+            (4, 48, 1024, 64),
+            (4, 6, 1024, 64),
+            causal=True,
+            enable_gqa=True,
+            seed=3643,
+        )
+
+    def test_measured_d128_shape_with_misaligned_base_uses_native(self):
+        self._assert_misaligned_query_uses_native(
+            (16, 64, 1024, 128),
+            (16, 8, 1024, 128),
+            causal=False,
+            enable_gqa=True,
+            seed=3644,
+        )
+
+    def test_unprofitable_shape_uses_native_fallback(self):
+        shape = (1, 8, 256, 64)
+        q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        grad_out = torch.randn_like(q)
+        state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, False, False)
+        out, lse, cum_q, cum_k, max_q, max_k, seed, offset, _ = state
+
+        def backward():
+            return torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+                grad_out,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                cum_q,
+                cum_k,
+                max_q,
+                max_k,
+                0.0,
+                False,
+                seed,
+                offset,
+            )
+
+        expected = backward()
+        with _activated_tlx_flash_attention_provider(), mock.patch.object(
+                amd_fa_bwd,
+                "fa_backward",
+                wraps=amd_fa_bwd.fa_backward,
+        ) as tlx_backward:
+            actual = backward()
+        tlx_backward.assert_not_called()
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference)
+
+
+@unittest.skipUnless(
+    flash_attention_registry_available(),
+    "Need the public PyTorch registry",
+)
+class TestTLXFlashAttentionProviderMultiGfx950(unittest.TestCase):
+    def test_direct_aten_backward_switches_to_query_device_and_restores_current_device(self):
+        gfx950_devices = _gfx950_device_indices()
+        if len(gfx950_devices) < 2:
+            self.skipTest("Requires at least two gfx950 GPUs")
+
+        original_device = torch.cuda.current_device()
+        previous_device, query_device = gfx950_devices[:2]
+        try:
+            torch.cuda.set_device(previous_device)
+            with torch.cuda.device(query_device):
+                shape = (1, 16, 4096, 64)
+                q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+                k = torch.randn_like(q)
+                v = torch.randn_like(q)
+                grad_out = torch.randn_like(q)
+                state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, False, False)
+                out, lse, cum_q, cum_k, max_q, max_k, seed, offset, _ = state
+
+            observed_devices = []
+
+            def fake_tlx_backward(query, key, value, *_args):
+                observed_devices.append(torch.cuda.current_device())
+                return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
+            self.assertEqual(torch.cuda.current_device(), previous_device)
+            with _activated_tlx_flash_attention_provider(), mock.patch.object(
+                    amd_fa_bwd,
+                    "fa_backward",
+                    side_effect=fake_tlx_backward,
+            ) as tlx_backward:
+                grads = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+                    grad_out,
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    cum_q,
+                    cum_k,
+                    max_q,
+                    max_k,
+                    0.0,
+                    False,
+                    seed,
+                    offset,
+                )
+                self.assertEqual(torch.cuda.current_device(), previous_device)
+
+            tlx_backward.assert_called_once()
+            self.assertEqual(observed_devices, [query_device])
+            self.assertTrue(all(grad.device.index == query_device for grad in grads))
+        finally:
+            torch.cuda.set_device(original_device)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1281,3 +2329,274 @@ def test_varlen_d128_split_codegen_is_scratch_free_gfx950():
             assert compiled.metadata.shared == expected_shared
     for compiled in kernels[0].device_caches[device][0].values():
         assert "buffer_atomic_pk_add_bf16" in compiled.asm["amdgcn"]
+
+
+# Dense backward contract tests live here rather than in the packaged kernel
+# module. Keep these broader than the PyTorch provider allow-list: they protect
+# the retained direct API and its explicit experimental dispatches.
+def test_dense_bwd_tutorial_compatibility_shim():
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd as tutorial_bwd
+    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+        ReferenceCase as TutorialReferenceCase,
+        is_hip_cdna4 as tutorial_is_hip_cdna4,
+        make_reference_case as tutorial_make_reference_case,
+    )
+
+    assert tutorial_bwd.fa_backward is amd_fa_bwd.fa_backward
+    assert tutorial_bwd.fa_backward_support_error is amd_fa_bwd.fa_backward_support_error
+    assert tutorial_bwd.SUPPORTED_SHAPES is amd_fa_bwd.SUPPORTED_SHAPES
+    assert tutorial_bwd.ReferenceCase is TutorialReferenceCase
+    assert tutorial_bwd.is_hip_cdna4 is tutorial_is_hip_cdna4 is is_hip_cdna4
+    assert tutorial_bwd.make_reference_case is tutorial_make_reference_case
+    assert {"ReferenceCase", "is_hip_cdna4", "make_reference_case"} <= set(tutorial_bwd.__all__)
+
+    q, k, v, out, grad_out, lse = (torch.empty(0) for _ in range(6))
+    case = TutorialReferenceCase(q, k, v, out, grad_out, lse, 0.125, True, (q, k, v))
+    for actual, expected in zip(case.kernel_args[:6], (q, k, v, out, grad_out, lse), strict=True):
+        assert actual is expected
+    assert case.kernel_args[6:] == (0.125, True)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("causal", [False, True])
+def test_dense_bwd_tutorial_make_reference_case_gfx950(causal):
+    from triton.language.extra.tlx.tutorials.amd_fa_bwd import make_reference_case
+
+    case = make_reference_case((1, 1, 8, 4), causal, seed=17)
+    assert case.q.shape == (1, 1, 8, 4)
+    assert case.o.dtype is torch.bfloat16
+    assert case.lse.dtype is torch.float32
+    assert len(case.grads) == 3
+    for grad in case.grads:
+        assert grad.shape == case.q.shape
+        assert torch.isfinite(grad).all()
+    assert case.kernel_args == (
+        case.q,
+        case.k,
+        case.v,
+        case.o,
+        case.do,
+        case.lse,
+        case.sm_scale,
+        causal,
+    )
+
+
+def test_dense_bwd_gqa_benchmark_shapes_match_hk_series():
+    assert amd_fa_bwd.GQA_BENCHMARK_SHAPES == {
+        (16, 64, 8, 1024, 128),
+        (16, 64, 8, 2048, 128),
+        (16, 64, 8, 4096, 128),
+        (16, 64, 8, 8192, 128),
+        (15, 64, 8, 16384, 128),
+    }
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 1, 1, 256, 128),
+        (2, 6, 3, 512, 128),
+        (1, 6, 2, 768, 128),
+        (1, 12, 3, 1024, 128),
+        (16, 64, 8, 4096, 128),
+        (1, 520, 8, 16384, 128),
+    ],
+)
+def test_dense_bwd_gqa_supported_shape_constraint(shape):
+    assert amd_fa_bwd._is_supported_gqa_shape(shape)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (0, 8, 1, 256, 128),
+        (1, 0, 1, 256, 128),
+        (1, 8, 0, 256, 128),
+        (1, 27, 8, 256, 128),
+        (1, 8, 1, 128, 128),
+        (1, 8, 1, 200, 128),
+        (1, 8, 1, 384, 128),
+        (1, 8, 1, 256, 256),
+    ],
+)
+def test_dense_bwd_gqa_unsupported_shape_constraint(shape):
+    assert not amd_fa_bwd._is_supported_gqa_shape(shape)
+
+
+def test_dense_bwd_d128_dispatches_cover_retained_topologies(monkeypatch):
+    shape = (16, 27, 200, 128)
+    route_envs = (
+        amd_fa_bwd._D128_EXACT_ENABLE_ENV,
+        amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV,
+        amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV,
+    )
+    for name in route_envs:
+        monkeypatch.setenv(name, "0")
+
+    full = amd_fa_bwd._select_d128_dispatch(shape, False)
+    causal = amd_fa_bwd._select_d128_dispatch(shape, True)
+    assert full.entry is causal.entry is amd_fa_bwd._attn_bwd_dkdv_d128_split_kernel
+    assert (full.pipelined, full.rectangular, full.block_m, full.block_n, full.num_warps) == (True, True, 32, 64, 4)
+    assert (causal.pipelined, causal.rectangular, causal.block_m, causal.block_n, causal.num_warps) == (
+        False,
+        False,
+        32,
+        32,
+        2,
+    )
+
+    monkeypatch.setenv(amd_fa_bwd._D128_EXACT_ENABLE_ENV, "1")
+    exact = amd_fa_bwd._select_d128_dispatch(shape, False)
+    assert exact.entry is amd_fa_bwd._attn_bwd_dkdv_dq_d128_combined_kernel
+    assert exact.exact and not exact.pipelined and exact.num_warps == 4
+
+    monkeypatch.setenv(amd_fa_bwd._D128_EXACT_ENABLE_ENV, "0")
+    monkeypatch.setenv(amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV, "1")
+    persistent = amd_fa_bwd._select_d128_dispatch(shape, False)
+    assert persistent.entry is amd_fa_bwd._attn_bwd_dkdv_dq_d128_combined_kernel
+    assert not persistent.exact and not persistent.pipelined and persistent.num_warps == 8
+
+    monkeypatch.setenv(amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV, "0")
+    monkeypatch.setenv(amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV, "1")
+    pipelined = amd_fa_bwd._select_d128_dispatch(shape, False)
+    assert pipelined.entry is amd_fa_bwd._attn_bwd_dkdv_dq_d128_combined_kernel
+    assert not pipelined.exact and pipelined.pipelined and pipelined.num_warps == 4
+
+    assert amd_fa_bwd._select_d128_dispatch((1, 1, 256, 128), False).entry is \
+        amd_fa_bwd._attn_bwd_dkdv_d128_split_kernel
+
+
+def test_dense_bwd_d128_route_constraints_and_regalloc_options(monkeypatch):
+    shape = (16, 27, 200, 128)
+    assert amd_fa_bwd._d128_persistent_short_supported(shape, False)
+    assert amd_fa_bwd._d128_persistent_short_supported(shape, True)
+    for unsupported in (
+        (1, 1, 128, 128),
+        (1, 1, 256, 128),
+        (1, 1, 260, 128),
+        (32, 1, 2600, 256),
+        (1, 1, 200, 64),
+    ):
+        assert not amd_fa_bwd._d128_persistent_short_supported(unsupported, False)
+
+    assert amd_fa_bwd._select_d128_dkdv_config(shape, True) == (32, 32, 2)
+    assert amd_fa_bwd._select_d128_dkdv_config(shape, False) == (32, 64, 4)
+    assert amd_fa_bwd._select_d128_dkdv_config((16, 27, 260, 128), True) == (64, 64, 4)
+    assert amd_fa_bwd._matrix_instr_nonkdim() == 16
+
+    regalloc_envs = (
+        amd_fa_bwd._D128_SINK_INSTS_ENV,
+        amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+        amd_fa_bwd._D128_REVERSE_LOCAL_ENV,
+    )
+    for name in regalloc_envs:
+        monkeypatch.setenv(name, "0")
+    assert not any(amd_fa_bwd._d128_regalloc_options().values())
+    monkeypatch.setenv(amd_fa_bwd._D128_SINK_INSTS_ENV, "1")
+    monkeypatch.setenv(amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV, "1")
+    assert amd_fa_bwd._d128_regalloc_options() == {
+        "sink_insts_to_avoid_spills": True,
+        "regclass_priority_trumps_globalness": True,
+        "reverse_local_assignment": False,
+    }
+
+
+def test_dense_bwd_d256_dispatches_cover_retained_topologies(monkeypatch):
+    monkeypatch.setenv("TLX_FA_BWD_FORCE_STAGED", "0")
+    full = amd_fa_bwd._select_d256_dispatch(False)
+    causal = amd_fa_bwd._select_d256_dispatch(True)
+    assert full.entry is causal.entry is amd_fa_bwd._attn_bwd_dkdv_d256_producer_kernel
+    assert (full.staged, full.pipelined, full.num_warps) == (False, True, 4)
+    assert (causal.staged, causal.pipelined, causal.num_warps) == (False, False, 4)
+
+    monkeypatch.setenv("TLX_FA_BWD_FORCE_STAGED", "1")
+    staged = amd_fa_bwd._select_d256_dispatch(True)
+    assert staged.entry is amd_fa_bwd._attn_bwd_dkdv_d256_producer_kernel
+    assert (staged.staged, staged.pipelined, staged.num_warps) == (True, False, 2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((1, 1, 1, 256, 128), id="group1"),
+        pytest.param((1, 1, 1, 512, 128), id="group1-two-kv-tiles"),
+        pytest.param((1, 2, 1, 256, 128), id="group2"),
+        pytest.param((2, 3, 1, 256, 128), id="group3-batch2"),
+        pytest.param((1, 4, 1, 256, 128), id="group4"),
+        pytest.param((1, 8, 1, 512, 128), id="group8-two-kv-tiles"),
+        pytest.param((2, 2, 2, 512, 128), id="mha-hkv2-batch2"),
+        pytest.param((1, 4, 2, 256, 128), id="group2-hkv2"),
+        pytest.param((2, 6, 3, 512, 128), id="group2-hkv3-batch2"),
+    ],
+)
+def test_dense_bwd_gqa_supported_shapes_end_to_end_gfx950(shape, causal):
+    case = _make_dense_gqa_reference_case(shape, causal=causal, seed=17)
+    actual_grads = fa_backward(*case.kernel_args)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("sm_scale", [0.0, -0.125], ids=["zero-scale", "negative-scale"])
+def test_dense_bwd_gqa_causal_scale_edges_gfx950(sm_scale):
+    case = _make_dense_gqa_reference_case((1, 2, 1, 256, 128), causal=True, seed=17, sm_scale=sm_scale)
+    actual_grads = fa_backward(*case.kernel_args)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        if torch.count_nonzero(expected).item() == 0:
+            assert torch.count_nonzero(actual).item() == 0
+        else:
+            assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("route", ["persistent", "pipelined"], ids=["persistent", "persistent-pipeline"])
+def test_dense_bwd_d128_experimental_routes_gfx950(causal, route, monkeypatch):
+    options = {
+        amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: str(int(route == "persistent")),
+        amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: str(int(route == "pipelined")),
+        amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+        amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+        amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+    }
+    with mock.patch.dict(os.environ, options):
+        case = _make_dense_reference_case((16, 27, 200, 128), causal, seed=19)
+        actual_grads = fa_backward(*case.kernel_args)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_dense_bwd_d128_causal_tail_is_repeatable_gfx950(monkeypatch):
+    options = {
+        amd_fa_bwd._D128_EXACT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_PERSISTENT_PIPE_ENABLE_ENV: "0",
+        amd_fa_bwd._D128_SINK_INSTS_ENV: "0",
+        amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV: "0",
+        amd_fa_bwd._D128_REVERSE_LOCAL_ENV: "0",
+    }
+    case = _make_dense_reference_case((16, 27, 200, 128), True, seed=21)
+    with mock.patch.dict(os.environ, options):
+        for _ in range(5):
+            actual_grads = fa_backward(*case.kernel_args)
+            for actual, expected in zip(actual_grads, case.grads, strict=True):
+                assert torch.isfinite(actual).all()
+                assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_dense_bwd_d256_end_to_end_gfx950(causal):
+    case = _make_dense_reference_case((32, 1, 2600, 256), causal, seed=23)
+    actual_grads = fa_backward(*case.kernel_args)
+    for actual, expected in zip(actual_grads, case.grads, strict=True):
+        assert torch.isfinite(actual).all()
+        assert _snr_db(actual, expected) >= 40.0

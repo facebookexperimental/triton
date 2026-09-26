@@ -31,7 +31,7 @@
 
 [Persistent Flash Attention fwd — XCD zig-zag, cross-attention / decode](third_party/tlx/tutorials/amd_fa_persistent.py)
 
-[Rotated 4-cluster Flash Attention fwd](third_party/tlx/tutorials/amd_fa_cluster.py)
+[Rotated 4-cluster Flash Attention fwd/bwd](third_party/tlx/ops/kernels/flash_attn/gfx950.py)
 
 [Fused addmm + GLU (Gated Linear Unit: out = x + x*y, x = A@B + bias)](third_party/tlx/tutorials/amd_addmm_glu.py)
 
