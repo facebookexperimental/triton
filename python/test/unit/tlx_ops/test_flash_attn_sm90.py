@@ -12,8 +12,7 @@ FWD_SHAPES = tuple(dict.fromkeys((*CORRECTNESS_SHAPES, *(shape._replace(dtype="b
 BWD_SHAPES = tuple(
     dict.fromkeys((
         *CORRECTNESS_SHAPES,
-        *(shape._replace(dtype="bf16") for shape in SYNTHETIC
-          if shape.head_dim == 64 and shape.batch == 1),
+        *(shape._replace(dtype="bf16") for shape in SYNTHETIC if shape.head_dim == 64 and shape.batch == 1),
     )))
 
 
@@ -131,26 +130,18 @@ def test_flash_attn_fwd_bm192(N_CTX):
 def test_flash_attn_fwd_launch_policy():
     from triton.tlx.ops.kernels.flash_attn.sm90 import _select_forward_policy
 
-    _, steady_unroll, target_workers = _select_forward_policy(
-        True, (4, 48, 1024, 128), torch.bfloat16, 128, 132
-    )
+    _, steady_unroll, target_workers = _select_forward_policy(True, (4, 48, 1024, 128), torch.bfloat16, 128, 132)
     assert (steady_unroll, target_workers) == (1, 132)
 
     shape = (4, 48, 2048, 64)
-    _, steady_unroll, target_workers = _select_forward_policy(
-        True, shape, torch.bfloat16, 128, 132
-    )
+    _, steady_unroll, target_workers = _select_forward_policy(True, shape, torch.bfloat16, 128, 132)
     assert (steady_unroll, target_workers) == (1, 132)
 
     for n_ctx in (1024, 2048, 4096, 8192):
-        _, steady_unroll, target_workers = _select_forward_policy(
-            False, (4, 48, n_ctx, 64), torch.bfloat16, 192, 132
-        )
+        _, steady_unroll, target_workers = _select_forward_policy(False, (4, 48, n_ctx, 64), torch.bfloat16, 192, 132)
         assert (steady_unroll, target_workers) == (1, 132)
 
-    _, steady_unroll, target_workers = _select_forward_policy(
-        True, (4, 48, 4096, 64), torch.bfloat16, 128, 132
-    )
+    _, steady_unroll, target_workers = _select_forward_policy(True, (4, 48, 4096, 64), torch.bfloat16, 128, 132)
     assert (steady_unroll, target_workers) == (2, 129)
 
 

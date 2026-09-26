@@ -32,9 +32,9 @@ from triton._internal_testing import is_blackwell, is_hopper  # noqa: E402
 import bench_bwd as bb  # noqa: E402
 import triton_bw_cross_attention as xa  # noqa: E402
 
-
-
 pytestmark = pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+
+
 def _reset_captured_globals(module):
     """Clear every Triton jit function's captured ``used_global_vals`` in ``module``.
 

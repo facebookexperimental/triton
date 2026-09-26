@@ -1066,11 +1066,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     )
     if not APPLY_MASK:
         valid_mask_trans = None
-    elif (
-        PEEL_CAUSAL_MASK
-        and not HAS_MAX_ATTN_LEN
-        and not HAS_CONTEXTUAL_SEQ_LEN
-    ):
+    elif (PEEL_CAUSAL_MASK and not HAS_MAX_ATTN_LEN and not HAS_CONTEXTUAL_SEQ_LEN):
         # Expose the fixed causal prefix as scalar control flow. The compiler
         # folds this branch while peeling the prefix. A K/V block overlapping
         # the target suffix must stay masked for every M tile; for a block wholly
@@ -2783,8 +2779,7 @@ def triton_hstu_attention_bwd(
     assert not _AUTOWS_CFG.dq_fp32 or (_AUTOWS_CFG.dq_reduce and enable_tma), (
         "dq_fp32 requires the dQ TMA reduce path (dq_reduce=True, enable_tma=True)")
     if _AUTOWS_CFG.dq_fp32:
-        assert dq.dtype == torch.float32, (
-            "dq_fp32=True requires a caller-provided FP32 dQ buffer")
+        assert dq.dtype == torch.float32, ("dq_fp32=True requires a caller-provided FP32 dQ buffer")
     if dout.shape[0] == 0:
         return torch.zeros_like(dq), torch.zeros_like(k), torch.zeros_like(v)
     if enable_tma:

@@ -43,9 +43,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -90,8 +90,8 @@ struct AssignStagePhase {
     bool hasStageLane() const { return stageLane >= 0; }
 
     bool operator==(const PhaseKey &other) const {
-      return partitionId == other.partitionId &&
-             semaphore == other.semaphore && stageLane == other.stageLane;
+      return partitionId == other.partitionId && semaphore == other.semaphore &&
+             stageLane == other.stageLane;
     }
 
     bool operator<(const PhaseKey &other) const {
@@ -114,14 +114,14 @@ struct AssignStagePhase {
   };
 
   struct State {
-    Value stage;                      // shared stage index (per buffer group)
+    Value stage; // shared stage index (per buffer group)
     std::map<StageKey, Value> localStages;
     std::map<PhaseKey, Value> phases; // multiphase bitmasks by PhaseKey
     Value token;                      // token used for stage propagation
   };
 
   SetVector<Value> groupSemaphores;
-  SetVector<int> allGroupPartitionIds;  // all partition IDs across all acquires
+  SetVector<int> allGroupPartitionIds; // all partition IDs across all acquires
   DenseMap<std::pair<Value, int>, SetVector<int>> sharedPhaseLanePartitionIds;
   DenseMap<Value, Value> initialPhases; // initial phase by semaphore
   DenseMap<std::pair<Operation *, Value>, int> tokToStagePosMap;
@@ -187,8 +187,7 @@ struct AssignStagePhase {
 
   PhaseKey getPhaseKey(int partitionId, Value semaphore,
                        int stageLane = -1) const {
-    auto sharedIt =
-        sharedPhaseLanePartitionIds.find({semaphore, stageLane});
+    auto sharedIt = sharedPhaseLanePartitionIds.find({semaphore, stageLane});
     if (sharedIt != sharedPhaseLanePartitionIds.end() &&
         sharedIt->second.contains(partitionId))
       partitionId = sharedIt->second.front();
@@ -197,8 +196,7 @@ struct AssignStagePhase {
   }
 
   SetVector<int> getPhasePartitionIds(PhaseKey key) const {
-    auto it =
-        sharedPhaseLanePartitionIds.find({key.semaphore, key.stageLane});
+    auto it = sharedPhaseLanePartitionIds.find({key.semaphore, key.stageLane});
     if (it != sharedPhaseLanePartitionIds.end())
       return it->second;
     SetVector<int> ids;
@@ -292,9 +290,10 @@ struct AssignStagePhase {
   // assign-stage-phase-and-lower-semaphores.md#proving-that-pipeline-stages-use-disjoint-buffer-stages
   // assign-stage-phase-and-lower-semaphores.md#proving-that-circular-acquires-use-partition-disjoint-buffer-stages
   template <typename GetOwner>
-  bool proveDisjointSlotOwnership(
-      ArrayRef<SemaphoreAcquireOp> candidateAcquires, StringRef proofName,
-      StringRef conflictMessage, GetOwner getOwner) {
+  bool
+  proveDisjointSlotOwnership(ArrayRef<SemaphoreAcquireOp> candidateAcquires,
+                             StringRef proofName, StringRef conflictMessage,
+                             GetOwner getOwner) {
     scf::ForOp loop = getSingleCandidateLoop(candidateAcquires);
     if (!loop) {
       candidateAcquires.front()->emitError()
@@ -326,8 +325,7 @@ struct AssignStagePhase {
       return false;
     }
 
-    int64_t modulus =
-        std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
+    int64_t modulus = std::gcd(static_cast<int64_t>(getDepth()), advanceCount);
     assert(modulus > 0 && "expected positive slot-class gcd");
 
     std::map<int64_t, std::set<int>> ownersBySlotClass;
@@ -337,8 +335,7 @@ struct AssignStagePhase {
         phaseLegalityFailure = true;
         return false;
       }
-      std::optional<int64_t> authoredOffset =
-          getAuthoredStageOffset(acquireOp);
+      std::optional<int64_t> authoredOffset = getAuthoredStageOffset(acquireOp);
       if (!authoredOffset) {
         acquireOp->emitError()
             << proofName << " requires constant authored stage offset";
@@ -457,8 +454,8 @@ struct AssignStagePhase {
         std::set<int> sortedPartitionIds;
         for (Operation *user : baseKey.semaphore.getDefiningOp()->getUsers()) {
           auto acquireOp = dyn_cast<SemaphoreAcquireOp>(user);
-          auto stageCluster = acquireOp ? getStageCluster(acquireOp)
-                                        : StageCluster{};
+          auto stageCluster =
+              acquireOp ? getStageCluster(acquireOp) : StageCluster{};
           if (!stageCluster || stageCluster->first != lane ||
               !hasPartition(acquireOp))
             continue;
@@ -491,11 +488,11 @@ struct AssignStagePhase {
     DenseMap<Value, SmallVector<SemaphoreAcquireOp>> baseAcquiresBySemaphore;
     for (Value sema : groupSemaphores) {
       auto create = sema.getDefiningOp<SemaphoreCreateOp>();
-      bool isCircular = create && llvm::any_of(create.getBuffers(), [](Value v) {
-                          Operation *def = v.getDefiningOp();
-                          return def && def->hasAttr(
-                                            kBufferCircularAttrName);
-                        });
+      bool isCircular =
+          create && llvm::any_of(create.getBuffers(), [](Value v) {
+            Operation *def = v.getDefiningOp();
+            return def && def->hasAttr(kBufferCircularAttrName);
+          });
       if (!isCircular)
         continue;
 
@@ -589,9 +586,10 @@ struct AssignStagePhase {
         return;
 
       auto sourceBefore = [&](unsigned order) {
-        auto previous = llvm::find_if(
-            llvm::reverse(advances),
-            [&](unsigned advance) { return eventUses[advance].order < order; });
+        auto previous =
+            llvm::find_if(llvm::reverse(advances), [&](unsigned advance) {
+              return eventUses[advance].order < order;
+            });
         if (previous == advances.rend())
           return std::make_pair(advances.back(), 1u);
         return std::make_pair(*previous, 0u);
@@ -601,14 +599,12 @@ struct AssignStagePhase {
       SmallVector<StageKey> localKeys;
       bool unsupportedEdge = false;
       for (auto [index, acquireOp] : llvm::enumerate(events)) {
-        auto [producer, distance] =
-            sourceBefore(eventUses[index].order);
+        auto [producer, distance] = sourceBefore(eventUses[index].order);
         if (!stageEdgeFitsSchedule(eventUses[producer], eventUses[index],
                                    distance)) {
           // A fresh acquire still has to update the canonical loop cursor;
           // replay cannot remove that canonical dependency.
-          if (distance != 0 ||
-              isFirstUseFreshWriteAfterAcquire(acquireOp)) {
+          if (distance != 0 || isFirstUseFreshWriteAfterAcquire(acquireOp)) {
             unsupportedEdge = true;
             continue;
           }
@@ -1632,9 +1628,9 @@ struct AssignStagePhase {
       if (matchPattern(offset, m_ConstantInt(&constant)) && constant.isZero())
         return baseStage;
       if (matchPattern(offset, m_ConstantInt(&constant)))
-        offset = createIntoStage(arith::ConstantIntOp{},
-                                 constant.getSExtValue(),
-                                 constant.getBitWidth());
+        offset =
+            createIntoStage(arith::ConstantIntOp{}, constant.getSExtValue(),
+                            constant.getBitWidth());
       auto rawStage = createIntoStage(arith::AddIOp{}, baseStage, offset);
       auto depth = createIntoStage(arith::ConstantIntOp{}, getDepth(), 32);
       auto remStage = createIntoStage(arith::RemSIOp{}, rawStage, depth);
@@ -1681,8 +1677,7 @@ struct AssignStagePhase {
           return createInto(stagePids, opTy,
                             std::forward<decltype(args)>(args)...);
         };
-        auto createIntoLocalStage = [&](StageKey key, auto opTy,
-                                        auto... args) {
+        auto createIntoLocalStage = [&](StageKey key, auto opTy, auto... args) {
           return createIntoAt(stagePids, key, opTy,
                               std::forward<decltype(args)>(args)...);
         };
@@ -1695,8 +1690,7 @@ struct AssignStagePhase {
           auto phaseIds = getPhasePartitionIds(key);
           bool sharedPhase = phaseIds.size() > 1;
           if (!key.hasStageLane() && !sharedPhase)
-            return createIntoPhase(opTy,
-                                   std::forward<decltype(args)>(args)...);
+            return createIntoPhase(opTy, std::forward<decltype(args)>(args)...);
 
           std::optional<SetVector<int>> keyPids(std::move(phaseIds));
 
@@ -1711,7 +1705,8 @@ struct AssignStagePhase {
                                        Value shiftAmount) {
           if (!key.hasStageLane())
             return;
-          phaseShiftUses.push_back(PhaseShiftUse{op, shiftAmount, key.stageLane});
+          phaseShiftUses.push_back(
+              PhaseShiftUse{op, shiftAmount, key.stageLane});
         };
 
         // Keep the scalar cursor unchanged.  When analysis found a backward
@@ -1738,8 +1733,8 @@ struct AssignStagePhase {
                 key, arith::CmpIOp{}, arith::CmpIPredicate::eq, localNext,
                 createIntoLocalStage(key, arith::ConstantIntOp{}, getDepth(),
                                      32));
-            auto localZero = createIntoLocalStage(
-                key, arith::ConstantIntOp{}, 0, 32);
+            auto localZero =
+                createIntoLocalStage(key, arith::ConstantIntOp{}, 0, 32);
             localStage = createIntoLocalStage(
                 key, arith::SelectOp{}, localWrapped, localZero, localNext);
           }
@@ -1749,9 +1744,9 @@ struct AssignStagePhase {
         Value authoredOffset =
             acquireOp.getPhase() ? Value() : acquireOp.getStage();
         Value acquireStage =
-            authoredOffset ? applyStageOffset(baseStage, authoredOffset,
-                                             createIntoStage)
-                           : baseStage;
+            authoredOffset
+                ? applyStageOffset(baseStage, authoredOffset, createIntoStage)
+                : baseStage;
         acquireOp.getStageMutable().assign(acquireStage);
         state.token = acquireOp.getToken();
         tokenLogicalStage[acquireOp.getToken()] = baseStage;
@@ -1774,8 +1769,8 @@ struct AssignStagePhase {
           recordPhaseShiftUse(phaseBit.getOperation(), key, acquireStage);
           phaseState =
               createIntoPhaseForKey(key, arith::XOrIOp{}, phaseState, phaseBit);
-          Value acquirePhase = createIntoPhaseForKey(
-              key, arith::ShRUIOp{}, phaseState, acquireStage);
+          Value acquirePhase = createIntoPhaseForKey(key, arith::ShRUIOp{},
+                                                     phaseState, acquireStage);
           recordPhaseShiftUse(acquirePhase.getDefiningOp(), key, acquireStage);
           acquirePhase = createIntoPhaseForKey(
               key, arith::AndIOp{}, acquirePhase,

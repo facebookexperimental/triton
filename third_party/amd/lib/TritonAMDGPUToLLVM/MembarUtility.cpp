@@ -1,9 +1,9 @@
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 

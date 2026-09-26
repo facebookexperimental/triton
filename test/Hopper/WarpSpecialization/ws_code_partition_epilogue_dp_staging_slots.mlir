@@ -440,5 +440,3 @@ module attributes {ttg.auto_tma_recipes = [], "ttg.cluster-dim-x" = 1 : i32, "tt
 #loc215 = loc("m_i1"(#loc214))
 #loc216 = loc("offsetkv_y"(#loc215))
 #loc217 = loc(callsite(#loc216 at #loc94))
-
-

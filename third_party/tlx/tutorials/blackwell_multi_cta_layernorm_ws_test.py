@@ -67,7 +67,6 @@ import triton.language.extra.tlx as tlx
 from torch._inductor.runtime.triton_compat import libdevice
 from triton._internal_testing import is_blackwell
 
-
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 NUM_SMS = (torch.cuda.get_device_properties(0).multi_processor_count if torch.cuda.is_available() else 0)

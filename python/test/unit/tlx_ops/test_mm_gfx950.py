@@ -258,9 +258,7 @@ def test_mm_input_offset_width_selection(monkeypatch):
 def test_mm_irregular_shape_policy():
     assert _gfx950._lds_plan_for_shape(677, 4096, 8192) == (256, 256, 4)
     assert _gfx950._strong_lds_plan(677, 4096, 8192) == (192, 256, 4)
-    common_square = _gfx950._register_plan_for_shape(
-        2041, 2041, 2048, torch.bfloat16
-    )
+    common_square = _gfx950._register_plan_for_shape(2041, 2041, 2048, torch.bfloat16)
     assert (
         common_square["BLOCK_M"],
         common_square["BLOCK_N"],
@@ -269,9 +267,7 @@ def test_mm_irregular_shape_policy():
         common_square["NUM_XCDS"],
         common_square["num_warps"],
     ) == (128, 128, 128, 16, 8, 8)
-    common_narrow = _gfx950._register_plan_for_shape(
-        2048, 256, 1024
-    )
+    common_narrow = _gfx950._register_plan_for_shape(2048, 256, 1024)
     assert (
         common_narrow["BLOCK_M"],
         common_narrow["BLOCK_N"],
@@ -281,9 +277,7 @@ def test_mm_irregular_shape_policy():
         common_narrow["num_warps"],
     ) == (64, 64, 256, 4, 8, 8)
     for m in (256, 257):
-        small_square = _gfx950._register_plan_for_shape(
-            m, 257, 4096, torch.float16
-        )
+        small_square = _gfx950._register_plan_for_shape(m, 257, 4096, torch.float16)
         assert (
             small_square["BLOCK_M"],
             small_square["BLOCK_N"],
@@ -296,9 +290,7 @@ def test_mm_irregular_shape_policy():
         (272, 3072, 4608): (64, 64, 256, 8, 2),
     }
     for shape, expected in expected_register_tiles.items():
-        plan = _gfx950._register_plan_for_shape(
-            *shape, dtype=torch.float16
-        )
+        plan = _gfx950._register_plan_for_shape(*shape, dtype=torch.float16)
         assert (
             plan["BLOCK_M"],
             plan["BLOCK_N"],
@@ -311,9 +303,7 @@ def test_mm_irregular_shape_policy():
     # one tuned plan, and same-shape cache hits reuse the returned object.
     with pytest.raises(TypeError):
         common_narrow["BLOCK_M"] = 1
-    assert _gfx950._register_plan_for_shape(
-        272, 3072, 4608, torch.float16
-    )["BLOCK_M"] == 64
+    assert _gfx950._register_plan_for_shape(272, 3072, 4608, torch.float16)["BLOCK_M"] == 64
 
     deep_k = _gfx950._intermediate_register_config(677, 2048, 4096)
     assert (
