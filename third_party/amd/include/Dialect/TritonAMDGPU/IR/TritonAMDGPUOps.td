@@ -850,8 +850,8 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
     logical tensor.
 
     Distributed MFMA and dot layouts determine storage roles and native
-    fragment widths. Source code does not provide physical register classes,
-    tuple sizes, or wait-state counts.
+    fragment widths for rank-two or rank-three tensors. Source code does not
+    provide physical register classes, tuple sizes, or wait-state counts.
 
     A boundary that carries a live dot operand hands its F32 results out in
     VGPRs, so its accumulators must already be VGPR-resident. Committing an
@@ -880,12 +880,13 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   let summary = "Execute source-scheduled independent native MFMA fragments";
   let description = [{
-    Computes the full per-wave Cartesian product of the native fragments in
-    `a` and `b`, replacing every corresponding fragment in `acc`. Native
-    instructions are emitted in K-major, N-major, M-minor order. This
-    round-robins each K slice over the independent output fragments before
-    returning to an accumulator dependency chain, while preserving one SSA
-    chain per output fragment.
+    By default, computes the full per-wave Cartesian product of the native
+    fragments in `a` and `b`, replacing every corresponding fragment in `acc`.
+    When `output_fragment` selects one output fragment, only that fragment is
+    updated and all others pass through. Native instructions are emitted in
+    K-major, N-major, M-minor order. This round-robins each K slice over the
+    independent output fragments before returning to an accumulator dependency
+    chain, while preserving one SSA chain per output fragment.
 
     On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
     `rhs` and selects an input to constrain to AGPRs; the other input uses
@@ -901,8 +902,12 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
     drain, so any AGPR accumulator request is rejected, including persistent
     `auto`: a persistent accumulator must request `vgpr`.
-    `initialize` starts the native accumulators from zero. Completion
-    of transient result fragments is represented separately by `mfma_commit`.
+    `initialize` starts the updated native accumulators from zero.
+    `output_fragment` selects one fragment in N-major, M-minor schedule order;
+    the default value `-1` updates the full grid, while a non-negative value
+    updates only the selected fragment and passes every other fragment through.
+    Completion of transient result fragments is represented separately by
+    `mfma_commit`.
 
     An AGPR-resident accumulator must not reach an `mfma_commit` that also
     carries a live dot operand: that boundary constrains its F32 results to
@@ -915,14 +920,19 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     a convergent-call attribute on the pinned compiler revision.
 
     The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
-    CDNA4. It accepts one or more K fragments per wave and the target's native
+    CDNA4. Operands and accumulator must have matching rank two or three.
+    Rank-three tensors have matching leading batch dimensions distributed
+    over waves, with exactly one batch repetition per wave. The fragment grid
+    and output_fragment index remain local to each wave's batch.
+    It accepts one or more K fragments per wave and the target's native
     instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
     16x16x32 on CDNA4.
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
       StrAttr:$resident_operand, StrAttr:$accumulator_role,
-      StrAttr:$accumulator_register_class, BoolAttr:$initialize);
+      StrAttr:$accumulator_register_class, BoolAttr:$initialize,
+      DefaultValuedAttr<I32Attr, "-1">:$output_fragment);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{

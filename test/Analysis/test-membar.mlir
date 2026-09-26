@@ -6,6 +6,7 @@
 #BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 #A_SHARED_T = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0, 1]}>
+#Q_PARITY_SHARED = #ttg.padded_shared<[512:+32] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [8, 0], [4, 0], [1, 0], [2, 0]], block = []}>
 #C = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
 #A_DOT = #ttg.dot_op<{opIdx = 0, parent = #C, kWidth = 2}>
 #B_DOT = #ttg.dot_op<{opIdx = 1, parent = #C, kWidth = 2}>
@@ -116,6 +117,617 @@ tt.func @constant_index_distinct_slices() {
   ttg.local_store %value, %slot1 : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
   tt.return
 }
+
+// Both ring views cover the same 16384-byte allocation. Slot 1 of the
+// two-stage view accesses [8192, 16384), while slot 2 of the four-stage view
+// accesses [8192, 12288). Their overlap requires a WAR barrier. Narrowing
+// each interval twice incorrectly produces disjoint ranges [12288, 16384)
+// and [10240, 11264), hiding this dependency.
+// CHECK-LABEL: constant_index_reinterpreted_overlap
+tt.func @constant_index_reinterpreted_overlap() {
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<64x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %four_stage = ttg.memdesc_reinterpret %alloc : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<4x64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %wide_slot1 = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %narrow_slot2 = ttg.memdesc_index %four_stage[%c2] : !ttg.memdesc<4x64x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.local_load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  %value = ttg.local_load %wide_slot1 : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  ttg.local_store %zeros, %narrow_slot2 : tensor<64x32xf16, #AL> -> !ttg.memdesc<64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// A +1 latch flips the pending tail slot relative to the next induction value.
+// Entry iv=1 reads slot 1, while its first header writes slot 0.
+// CHECK-LABEL: cf_stage_parity_alternating_odd_entry
+tt.func @cf_stage_parity_alternating_odd_entry(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %write_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// The entry conversion must also work for even initial induction values:
+// entry iv=0 reads slot 0 and the first header writes slot 1.
+// CHECK-LABEL: cf_stage_parity_alternating_even_entry
+tt.func @cf_stage_parity_alternating_even_entry(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c0 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %write_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// Reversed AND operands and either XOR order describe the same alternating
+// stages as remainder/subtraction. Keep only the publication barrier.
+// CHECK-LABEL: cf_stage_parity_bitwise_alternating
+tt.func @cf_stage_parity_bitwise_alternating(%ub: i32) {
+  %c1 = arith.constant 1 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.andi %c1, %iv : i32
+  %next = arith.xori %current, %c1 : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %tail_next = arith.xori %c1, %current : i32
+  %read_view = ttg.memdesc_index %alloc[%tail_next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %read_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// The left-hand XOR constant must retain the same-slot backedge WAR hazard.
+// Entry reads slot 0 while the first iteration writes slot 1, so the required
+// barrier comes from the backedge rather than an entry conflict.
+// CHECK-LABEL: cf_stage_parity_bitwise_same_slot_backedge
+tt.func @cf_stage_parity_bitwise_same_slot_backedge(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.andi %iv, %c1 : i32
+  %next = arith.xori %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%current] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %read_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %read_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// The previous iteration's next slot equals this iteration's current slot.
+// This is a real loop-carried WAR dependency, not distinct stage ownership.
+// CHECK-LABEL: cf_stage_parity_same_slot_backedge
+tt.func @cf_stage_parity_same_slot_backedge(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%current] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %read_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %read_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// Although the backedge alternates safely, the entry read of slot 0 conflicts
+// with the first header's write to slot 0. The entry dependency must survive.
+// CHECK-LABEL: cf_stage_parity_conflicting_entry
+tt.func @cf_stage_parity_conflicting_entry(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %write_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// A +2 latch preserves parity: consecutive next-slot accesses alias.
+// The +1-specific optimization must not discard this WAR dependency.
+// CHECK-LABEL: cf_stage_parity_even_step
+tt.func @cf_stage_parity_even_step(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %write_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c2 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// Without an explicit publication barrier, writing and reading the same slot
+// requires an inserted RAW barrier. Do not infer synchronization from parity.
+// CHECK-LABEL: cf_stage_parity_missing_body_barrier
+tt.func @cf_stage_parity_missing_body_barrier(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %tail_value = ttg.local_load %write_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// A bounded index unrelated to the induction value can select the next
+// header's destination. Sharing a ring allocation does not prove disjointness.
+// CHECK-LABEL: cf_stage_parity_unrelated_index
+tt.func @cf_stage_parity_unrelated_index(%ub: i32, %other: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %other_stage = arith.andi %other, %c1 : i32
+  %read_view = ttg.memdesc_index %alloc[%other_stage] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %read_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// A pending tail read escapes through the loop exit. An unknown trip count
+// prevents proving it disjoint from the later literal slot-0 write.
+// CHECK-LABEL: cf_stage_parity_exit_write
+tt.func @cf_stage_parity_exit_write(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %write_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  %exit_view = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: tt.return
+  ttg.local_store %zeros, %exit_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// Equal byte footprints do not imply equal stage geometry. The four-stage
+// tail's slot 1 [4096,8192) overlaps the two-stage next header's slot 0
+// [0,8192), despite their opposite numeric indices after a +1 latch.
+// CHECK-LABEL: cf_stage_parity_reinterpreted_parent
+tt.func @cf_stage_parity_reinterpreted_parent(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %four_stage = ttg.memdesc_reinterpret %alloc : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<4x64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %write_view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %read_view = ttg.memdesc_index %four_stage[%next] : !ttg.memdesc<4x64x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %write_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %read_view : !ttg.memdesc<64x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<64x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+
+// A full barrier before the write bounds wave skew but cannot publish that
+// write to the following consumer. A second RAW barrier is still required.
+// CHECK-LABEL: cf_stage_parity_barrier_before_write
+tt.func @cf_stage_parity_barrier_before_write(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.barrier local
+  ttg.local_store %zeros, %view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %tail_value = ttg.local_load %view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// The header's current-slot write aliases the previous body's next-slot
+// tail read. Header memory effects cannot be omitted from the loop proof.
+// CHECK-LABEL: cf_stage_parity_header_memory_effect
+tt.func @cf_stage_parity_header_memory_effect(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %current = arith.remsi %iv, %c2 : i32
+  %header_view = ttg.memdesc_index %alloc[%current] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: cf.br
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  ttg.local_store %zeros, %header_view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %next = arith.subi %c1, %current : i32
+  %view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// A signed <= test can execute the +1 latch at INT_MAX. It does not prove
+// the nonnegative, overflow-free IV required for signed-remainder stages.
+// CHECK-LABEL: cf_stage_parity_nonexclusive_bound
+tt.func @cf_stage_parity_nonexclusive_bound(%ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi sle, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
+// The loop swaps overlapping two-stage parents with physical base stages 1
+// and 0. At iv=1, next=0 of the first parent accesses physical stage 1;
+// at iv=2, next=1 of the second parent accesses that same physical stage.
+// Opposite index parity is insufficient when the parent descriptor changes.
+// CHECK-LABEL: cf_stage_parity_loop_carried_parent
+tt.func @cf_stage_parity_loop_carried_parent(%ub: i32) {
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %c3 = arith.constant 3 : i32
+  %zeros = arith.constant dense<0.0> : tensor<128x32xf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %ring1 = ttg.memdesc_subslice %alloc[1, 0, 0] : !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>
+  %ring0 = ttg.memdesc_subslice %alloc[0, 0, 0] : !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>
+  %entry_view = ttg.memdesc_index %alloc[%c3] : !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  cf.br ^header(%c1, %ring1, %ring0 : i32, !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>, !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>)
+^header(%iv: i32, %ring: !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>, %other_ring: !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %view = ttg.memdesc_index %ring[%next] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %view : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %view : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  cf.br ^header(%iv_next, %other_ring, %ring : i32, !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>, !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable, 4x128x32>)
+^exit:
+  tt.return
+}
+
+
+// Match the kernel's padded Q/dO ring: each tile spans 4288 bytes, with
+// stage 1 starting at byte 4352. The full allocation spans 8640 bytes;
+// dividing that footprint by two would give the wrong 4320-byte stride.
+// CHECK-LABEL: cf_stage_parity_padded_ring
+tt.func @cf_stage_parity_padded_ring(%ub: i32) {
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %zeros = arith.constant dense<0.0> : tensor<16x128xbf16, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable>
+  %entry_view = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %entry_value = ttg.local_load %entry_view : !ttg.memdesc<16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable> -> tensor<16x128xbf16, #AL>
+  cf.br ^header(%c1 : i32)
+^header(%iv: i32):
+  %continue = arith.cmpi slt, %iv, %ub : i32
+  // CHECK: cf.cond_br
+  cf.cond_br %continue, ^body, ^exit
+^body:
+  %current = arith.remsi %iv, %c2 : i32
+  %next = arith.subi %c1, %current : i32
+  %view = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<2x16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.local_store %zeros, %view : tensor<16x128xbf16, #AL> -> !ttg.memdesc<16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable>
+  ttg.barrier local
+  %tail_value = ttg.local_load %view : !ttg.memdesc<16x128xbf16, #Q_PARITY_SHARED, #ttg.shared_memory, mutable> -> tensor<16x128xbf16, #AL>
+  %iv_next = arith.addi %iv, %c1 : i32
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: cf.br
+  cf.br ^header(%iv_next : i32)
+^exit:
+  tt.return
+}
+
 
 // CHECK-LABEL: scratch
 tt.func @scratch(%arg: tensor<16x16xf16, #AL>) {

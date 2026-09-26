@@ -1013,9 +1013,13 @@ LogicalResult RegisterClassAnchorOp::verify() {
 }
 
 static LogicalResult
-verifyNativeMfmaInstrShape(Operation *op,
-                           mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
-                           const Twine &prefix) {
+verifyNativeMfmaLayout(Operation *op,
+                       mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
+                       const Twine &prefix) {
+  if (llvm::is_contained(mfma.getWarpsPerCTA(), 0u))
+    return op->emitOpError()
+           << prefix << "MFMA warpsPerCTA entries must be positive";
+
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
   bool isCDNA3Shape = instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
                       instrShape == ArrayRef<unsigned>({16, 16, 16});
@@ -1058,13 +1062,14 @@ LogicalResult MfmaCommitOp::verify() {
   bool hasMfmaResult = false;
   for (auto [index, input] : llvm::enumerate(getInputs())) {
     auto tensorTy = cast<RankedTensorType>(input.getType());
-    if (tensorTy.getRank() != 2)
-      return emitOpError() << "input " << index << " must be rank two";
+    if (tensorTy.getRank() != 2 && tensorTy.getRank() != 3)
+      return emitOpError() << "input " << index << " must be rank two or three";
 
     if (tensorTy.getElementType().isF32()) {
       auto mfma =
           dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
-      if (!mfma || !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
+      if (!mfma || mfma.getRank() != tensorTy.getRank() ||
+          !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
           !mfma.hasUnitTilesPerWarp())
         return emitOpError() << "input " << index
                              << " must use a unit-tile CDNA3/CDNA4 MFMA layout";
@@ -1073,8 +1078,8 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
-                                            "input " + Twine(index) + " ")))
+      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
+                                       "input " + Twine(index) + " ")))
         return failure();
       // SCF-to-CF turns a runtime loop's yielded accumulator into a loop-header
       // block argument used by the mutually exclusive body and exit blocks.
@@ -1095,10 +1100,12 @@ LogicalResult MfmaCommitOp::verify() {
 
     if (tensorTy.getElementType().isBF16() ||
         tensorTy.getElementType().isF16()) {
-      auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
+      auto dot =
+          dyn_cast_or_null<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
                       : ttg::AMDMfmaEncodingAttr();
-      if (!dot || !mfma || !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
+      if (!dot || !mfma || mfma.getRank() != tensorTy.getRank() ||
+          !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
           !llvm::is_contained({4u, 8u}, dot.getKWidth()))
         return emitOpError()
                << "input " << index
@@ -1109,8 +1116,8 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
-                                            "input " + Twine(index) + " ")))
+      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
+                                       "input " + Twine(index) + " ")))
         return failure();
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
@@ -1144,8 +1151,24 @@ LogicalResult MfmaCommitOp::verify() {
   return success();
 }
 
+static LogicalResult verifyWaveUniformExecution(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto predicate = dyn_cast<gpu::WarpPredicateOp>(parent);
+    if (!predicate)
+      continue;
+    if (!predicate.getWaveUniform().value_or(false))
+      return op->emitOpError(
+          "requires a wave-uniform enclosing ttg.warp_predicate");
+  }
+  return success();
+}
+
 LogicalResult ScheduledMfmaOp::verify() {
   namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyWaveUniformExecution(getOperation())))
+    return failure();
 
   FailureOr<unsigned> targetVersion = getScheduledMfmaVersion(getOperation());
   if (failed(targetVersion))
@@ -1155,8 +1178,11 @@ LogicalResult ScheduledMfmaOp::verify() {
   auto bTy = getB().getType();
   auto accTy = getAcc().getType();
   auto resultTy = getResult().getType();
-  if (aTy.getRank() != 2 || bTy.getRank() != 2 || accTy.getRank() != 2)
-    return emitOpError("requires rank-2 operands and accumulator");
+  int64_t rank = accTy.getRank();
+  if ((rank != 2 && rank != 3) || aTy.getRank() != rank ||
+      bTy.getRank() != rank)
+    return emitOpError(
+        "requires operands and accumulator of matching rank 2 or 3");
   Type aElemTy = aTy.getElementType();
   Type bElemTy = bTy.getElementType();
   if ((!aElemTy.isBF16() && !aElemTy.isF16()) || aElemTy != bElemTy ||
@@ -1165,14 +1191,20 @@ LogicalResult ScheduledMfmaOp::verify() {
         "requires matching BF16 or F16 operands and an F32 accumulator");
   if (resultTy != accTy)
     return emitOpError("result type must exactly match the accumulator type");
-  if (aTy.getShape()[0] != accTy.getShape()[0] ||
-      bTy.getShape()[1] != accTy.getShape()[1] ||
-      aTy.getShape()[1] != bTy.getShape()[0])
+  if (rank == 3 && (aTy.getShape()[0] != accTy.getShape()[0] ||
+                    bTy.getShape()[0] != accTy.getShape()[0]))
+    return emitOpError(
+        "operand and accumulator batch dimensions must match");
+  if (aTy.getShape()[rank - 2] != accTy.getShape()[rank - 2] ||
+      bTy.getShape()[rank - 1] != accTy.getShape()[rank - 1] ||
+      aTy.getShape()[rank - 1] != bTy.getShape()[rank - 2])
     return emitOpError(
         "operand and accumulator matrix shapes are inconsistent");
 
-  auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
-  if (!mfma || !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
+  auto mfma =
+      dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
+  if (!mfma || mfma.getRank() != rank ||
+      !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
       !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
     return emitOpError(
         "requires a CDNA3/CDNA4 F32 MFMA accumulator with unit tiles per wave");
@@ -1180,12 +1212,12 @@ LogicalResult ScheduledMfmaOp::verify() {
     return emitOpError() << "uses MFMA version " << mfma.getVersion()
                          << ", but the target requires version "
                          << *targetVersion;
-  if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma, /*prefix=*/"")))
+  if (failed(verifyNativeMfmaLayout(getOperation(), mfma, /*prefix=*/"")))
     return failure();
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
 
-  auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
-  auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
   if (!aDot || aDot.getOpIdx() != 0 ||
       !llvm::is_contained({4u, 8u}, aDot.getKWidth()) ||
       aDot.getParent() != mfma)
@@ -1203,9 +1235,12 @@ LogicalResult ScheduledMfmaOp::verify() {
       mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
   SmallVector<int64_t> bRep =
       mfma.getRepForOperand(bTy.getShape(), bDot.getKWidth(), 1);
+  // Rank-3 batches must be distributed over waves. With one batch per wave,
+  // the native fragment grid and output_fragment indexing remain identical
+  // to rank 2; the lowering does not need an additional batch loop.
   if (aRep[0] != 1 || bRep[0] != 1 || aRep[2] <= 0 || aRep[2] != bRep[1])
     return emitOpError(
-        "requires one batch and matching nonempty K fragments per wave");
+        "requires one batch per wave and matching nonempty K fragments");
 
   // The native input width per lane is four elements on CDNA3 and eight on
   // CDNA4. A smaller kWidth therefore needs enough logical K repetitions to
@@ -1225,10 +1260,18 @@ LogicalResult ScheduledMfmaOp::verify() {
 
   constexpr int64_t warpSize = 64;
   int64_t elementsPerFragment = instrShape[0] * instrShape[1] / warpSize;
-  int64_t expectedElements = aRep[1] * bRep[2] * elementsPerFragment;
+  int64_t numRepM = aRep[1];
+  int64_t numRepN = bRep[2];
+  int64_t expectedElements = numRepM * numRepN * elementsPerFragment;
   if (ttg::getTotalElemsPerThread(accTy) != expectedElements)
     return emitOpError(
         "accumulator ownership does not match the native MFMA grid");
+
+  int64_t outputFragment = getOutputFragmentAttr().getInt();
+  int64_t numOutputFragments = numRepM * numRepN;
+  if (outputFragment < -1 || outputFragment >= numOutputFragments)
+    return emitOpError() << "output_fragment must be -1 or in the range [0, "
+                         << numOutputFragments << "), got " << outputFragment;
 
   if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
       getResidentOperand() != "rhs")

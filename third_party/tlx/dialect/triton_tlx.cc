@@ -224,8 +224,8 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value a, Value b, Value acc,
               const std::string &residentOperand,
               const std::string &accumulatorRole,
-              const std::string &accumulatorRegisterClass,
-              bool initialize) -> Value {
+              const std::string &accumulatorRegisterClass, bool initialize,
+              int32_t outputFragment) -> Value {
              auto residentOperandAttr =
                  self.getBuilder().getStringAttr(residentOperand);
              auto accumulatorRoleAttr =
@@ -233,10 +233,12 @@ void init_triton_tlx_ir(py::module_ &m) {
              auto accumulatorRegisterClassAttr =
                  self.getBuilder().getStringAttr(accumulatorRegisterClass);
              auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
+             auto outputFragmentAttr =
+                 self.getBuilder().getI32IntegerAttr(outputFragment);
              return self.create<amdgpu::ScheduledMfmaOp>(
                  acc.getType(), a, b, acc, residentOperandAttr,
                  accumulatorRoleAttr, accumulatorRegisterClassAttr,
-                 initializeAttr);
+                 initializeAttr, outputFragmentAttr);
            })
       .def(
           "create_require_layout",

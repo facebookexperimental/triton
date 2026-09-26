@@ -694,7 +694,14 @@ struct BufferLoadOpConversion
 
     // Get the `other` value (if any)
     SmallVector<Value> otherElems;
-    if (llOther)
+    bool isOtherAllBitsZero = llOther && isZeroConst(op.getOther());
+    if (isOtherAllBitsZero) {
+      auto constantOp = op.getOther().getDefiningOp<arith::ConstantOp>();
+      if (auto denseAttr =
+              dyn_cast<DenseFPElementsAttr>(constantOp.getValueAttr()))
+        isOtherAllBitsZero = denseAttr.getSplatValue<APFloat>().isPosZero();
+    }
+    if (llOther && !isOtherAllBitsZero)
       otherElems =
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
 

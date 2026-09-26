@@ -115,12 +115,6 @@ def _accvgpr_write_may_write(instruction, registers):
     return not destination_registers or bool(destination_registers & registers)
 
 
-def _accvgpr_referenced_registers(instruction):
-    """Return every physical AGPR referenced by an instruction."""
-    _, operands = instruction
-    return {register for register in _amdgcn_registers(operands) if register[0] == "a"}
-
-
 def _advance_outstanding_mfma_results(outstanding, wait_states):
     """Advance and retire marked MFMA result-read hazards in place."""
     for register, remaining in tuple(outstanding.items()):
@@ -234,21 +228,26 @@ def _repair_scheduled_mfma_block(lines, incoming_results):
             marked_destination = _amdgcn_register_operand(mfma_operands[0])
             source_a_registers = _amdgcn_register_operand(mfma_operands[1])
             source_b_registers = _amdgcn_register_operand(mfma_operands[2])
-            if (not marked_destination or any(kind != "a" for kind, _ in marked_destination) or not source_a_registers
-                    or not source_b_registers):
+            if not marked_destination or not source_a_registers or not source_b_registers:
                 raise ValueError("cannot parse marked MFMA source registers")
+            destination_classes = {kind for kind, _ in marked_destination}
+            if len(destination_classes) != 1:
+                raise ValueError("marked MFMA destination must use one register class")
             source_registers = source_a_registers | source_b_registers
             if mfma_operands[3] != "0":
                 accumulator_registers = _amdgcn_register_operand(mfma_operands[3])
-                if (not accumulator_registers or accumulator_registers != marked_destination
-                        or any(kind != "a" for kind, _ in accumulator_registers)):
+                if not accumulator_registers:
                     raise ValueError("cannot parse marked MFMA accumulator registers")
+                if accumulator_registers != marked_destination:
+                    raise ValueError("marked MFMA srcC must be tied to its destination")
 
         if instruction is not None and outstanding_results:
             if marked_destination is None:
-                referenced_registers = _accvgpr_referenced_registers(instruction)
+                # Both a read and an overwrite of an outstanding result are
+                # hazardous, regardless of its physical register class.
+                referenced_registers = _amdgcn_registers(instruction[1])
             else:
-                referenced_registers = {register for register in source_registers if register[0] == "a"}
+                referenced_registers = set(source_registers)
                 if accumulator_registers is None:
                     referenced_registers.update(marked_destination)
             early_references = referenced_registers.intersection(outstanding_results)
@@ -274,16 +273,17 @@ def _repair_scheduled_mfma_block(lines, incoming_results):
                 3,
                 lambda previous: _accvgpr_write_may_write(previous, source_registers),
             )
-            accumulator_agpr_wait_states = (_wait_states_since(
+            accumulator_wait_states = (_wait_states_since(
                 history,
                 1,
-                lambda previous: _accvgpr_write_may_write(previous, accumulator_registers),
+                lambda previous: (_accvgpr_write_may_write(previous, accumulator_registers)
+                                  or _legacy_valu_may_write(previous, accumulator_registers)),
             ) if accumulator_registers else 1)
             exec_wait_states = _wait_states_since(history, 4, _valu_writes_exec)
             residual_wait_states = max(
                 2 - source_wait_states,
                 3 - source_agpr_wait_states,
-                1 - accumulator_agpr_wait_states,
+                1 - accumulator_wait_states,
                 4 - exec_wait_states,
                 0,
             )

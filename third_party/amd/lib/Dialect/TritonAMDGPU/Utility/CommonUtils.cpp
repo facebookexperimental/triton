@@ -9,37 +9,74 @@ bool hasMutuallyExclusiveSuccessorUses(Value value) {
   auto blockArgument = dyn_cast<BlockArgument>(value);
   if (!blockArgument)
     return false;
-  Operation *terminator = blockArgument.getOwner()->getTerminator();
-  // This is the exact shape produced when SCF-to-CF lowers a runtime loop.
-  // Do not generalize the exception to switches or other multiway CFGs.
-  if (!isa<cf::CondBranchOp>(terminator) || terminator->getNumSuccessors() != 2)
+  Block *header = blockArgument.getOwner();
+  auto branch = dyn_cast<cf::CondBranchOp>(header->getTerminator());
+  if (!branch || branch.getTrueDest() == branch.getFalseDest())
     return false;
 
-  llvm::DenseSet<Block *> successorBlocks;
-  for (unsigned index = 0; index < terminator->getNumSuccessors(); ++index)
-    successorBlocks.insert(terminator->getSuccessor(index));
-
-  llvm::DenseSet<Block *> usedSuccessors;
+  SmallVector<Block *, 2> consumers;
   for (OpOperand &use : value.getUses()) {
     Block *useBlock = use.getOwner()->getBlock();
-    if (!successorBlocks.contains(useBlock) ||
-        !usedSuccessors.insert(useBlock).second)
+    // Do not lift captures in nested regions to their enclosing CFG block.
+    if (useBlock == header || useBlock->getParent() != header->getParent() ||
+        llvm::is_contained(consumers, useBlock) || consumers.size() == 2)
       return false;
+    consumers.push_back(useBlock);
   }
-  if (usedSuccessors.size() != 2)
+  if (consumers.size() != 2)
     return false;
 
-  SmallVector<Block *> blocks(usedSuccessors.begin(), usedSuccessors.end());
-  Block *header = blockArgument.getOwner();
+  // SCF-to-CF may insert an unrelated diamond before the loop's accumulator
+  // update. Each arm must still reach its own unique consumer on every path,
+  // before any header re-entry. Only acyclic direct-branch prefixes are modeled.
+  auto allPathsReachConsumer = [header](Block *from, Block *consumer) {
+    llvm::SmallPtrSet<Block *, 16> active;
+    llvm::SmallPtrSet<Block *, 16> proven;
+    auto visit = [&](auto &&self, Block *block) -> bool {
+      if (block == consumer)
+        return true;
+      if (block == header || block->getParent() != header->getParent())
+        return false;
+      if (proven.contains(block))
+        return true;
+      if (!active.insert(block).second)
+        return false;
+      Operation *terminator = block->getTerminator();
+      if (!isa<cf::BranchOp, cf::CondBranchOp>(terminator))
+        return false;
+      for (Block *successor : terminator->getSuccessors()) {
+        if (!self(self, successor))
+          return false;
+      }
+      active.erase(block);
+      proven.insert(block);
+      return true;
+    };
+    return visit(visit, from);
+  };
+  auto matchesArms = [&](Block *first, Block *second) {
+    return allPathsReachConsumer(branch.getTrueDest(), first) &&
+           allPathsReachConsumer(branch.getFalseDest(), second);
+  };
+  if (!matchesArms(consumers[0], consumers[1]) &&
+      !matchesArms(consumers[1], consumers[0]))
+    return false;
+
   auto isReachableWithoutHeader = [header](Block *from, Block *to) {
+    if (from == header)
+      return false;
     llvm::SmallPtrSet<Block *, 16> excluded;
     excluded.insert(header);
     return from->isReachable(to, std::move(excluded));
   };
-  for (auto [index, lhs] : llvm::enumerate(blocks)) {
-    for (Block *rhs : ArrayRef(blocks).drop_front(index + 1)) {
-      if (isReachableWithoutHeader(lhs, rhs) ||
-          isReachableWithoutHeader(rhs, lhs))
+  if (isReachableWithoutHeader(consumers[0], consumers[1]) ||
+      isReachableWithoutHeader(consumers[1], consumers[0]))
+    return false;
+  // An inner cycle must not consume the same dynamic accumulator again. Start
+  // at successors so this tests a nonempty path, not reflexive reachability.
+  for (Block *consumer : consumers) {
+    for (Block *successor : consumer->getSuccessors()) {
+      if (isReachableWithoutHeader(successor, consumer))
         return false;
     }
   }

@@ -90,8 +90,13 @@ class ASTSource:
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         from .code_generator import ast_to_ttir
+        module = None
+        if pre_ast_lowering := codegen_fns.get("pre_ast_lowering"):
+            module = ir.builder(context).create_module()
+            module.context = context
+            pre_ast_lowering(module)
         module = ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
-                             module_map=module_map)
+                             module_map=module_map, module=module)
         if post_ast_lowering := codegen_fns.get("post_ast_lowering"):
             post_ast_lowering(module)
         return module

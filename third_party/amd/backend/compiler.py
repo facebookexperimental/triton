@@ -234,6 +234,15 @@ class HIPBackend(BaseBackend):
 
     def get_codegen_implementation(self, options):
 
+        def pre_ast_lowering(mod):
+            # Explicit TLX layouts can reach eager operation verification
+            # during AST generation, before the later TLX fixup pass.
+            builder = ir.builder(mod.context)
+            mod.set_attr("ttg.target", builder.get_string_attr(self.get_target_name(options)))
+            mod.set_attr("ttg.num-warps", builder.get_int32_attr(options.num_warps))
+            mod.set_attr("ttg.num-ctas", builder.get_int32_attr(options.num_ctas))
+            mod.set_attr("ttg.threads-per-warp", builder.get_int32_attr(options.warp_size))
+
         def post_ast_lowering(mod):
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
@@ -249,6 +258,7 @@ class HIPBackend(BaseBackend):
 
         return {
             "min_dot_size": get_min_dot_size(self.target),
+            "pre_ast_lowering": pre_ast_lowering,
             "post_ast_lowering": post_ast_lowering,
         }
 
