@@ -27,7 +27,7 @@ statistics are FP32.
 | `T289775012` | two `(5120, 4096, 8192)` GEMMs; output viewed as `[81920,256]` | two down GEMMs -> residual add -> weighted RMSNorm -> direct stores | OSS TLX now confirms `725.712 -> 699.984 us`; preserve post-add BF16 state, FP32 rstd, normalized BF16 output, and destination partitioning. |
 | `T289757910` | `(5120, 512, 8192)` | GEMM -> weighted RMSNorm D=512 -> SiLU | Promoted GEO-tuned TLX: `81.632 -> 48.452 us` versus frozen fused; accuracy passes and raw GEMM output is bit-exact. It still trails the historical `43.92 us` unfused result. |
 | `T289757930` | two `(5120, 1024, 2048)` GEMMs | GEMM -> weighted RMSNorm D=1024 -> SiLU | Preserve both raw GEMM outputs, both activated outputs, and rstd. |
-| `T289757870` | two `(5120, 16384, 4096)` packed gate/up GEMMs | two GEMMs -> split gate/up -> `SiLU(gate) * up` | Training ABI saves packed GEMM output; a direct-hidden-only route is a different contract. |
+| `T289757870` | packed `(5120, 16384, 4096)` gate/up GEMM | GEMM -> split gate/up -> `SiLU(gate) * up` | GEO-tuned OSS TLX now measures a `0.395 ms` four-run median (`2.16x` versus the frozen fused seed) while saving the packed GEMM output. FP32 accumulation and exact sigmoid are preserved. |
 | `T289914992` | two `(5120, 4096, 8192)` down GEMMs | materialized SwiGLU -> down GEMM -> residual add -> weighted RMSNorm -> direct stores | Full fusion must preserve hidden, post-add, rstd, and destination outputs. The materialized-SwiGLU hybrid is the current winning boundary. |
 | `T290058050` | two `(2097152, 256, 512)` GEMMs | `concat(SiLU(U), LayerNorm(X) * U)` -> GEMM + residual | Mean/rstd are already produced. Candidate removes each 2-GiB reconstructed activation while preserving its BF16 boundary. |
 | `T289757859` | two `(1310720, 16, 64)` GEMMs | skinny GEMM -> `[5120,16,256]` grouped layout | Write the destination layout directly. |
@@ -495,6 +495,34 @@ launch). Lower/higher register caps and a de-unrolled producer all regress.
 The GEO single-X-read full-K A-ring pattern is correct here but slower at
 `~1.78 ms`: with only one output-N tile, its extra normalizer task is not
 amortized by A reuse.
+
+## Current `T289757870` TLX prototype
+
+The promoted OSS kernel is in
+`third_party/tlx/tutorials/fwd_swiglu_gemm_saved_tlx.py`, with design and
+benchmark details in `fwd_swiglu_gemm_saved.md`. It preserves the training ABI:
+the packed BF16 projection and compact BF16 SwiGLU output are both returned.
+
+The GB200 schedule uses a `BM128/BN128/BK128` two-CTA MMA, three operand
+buffers, two FP32 TMEM buffers, two epilogue tasks, CLC tile scheduling, and a
+48 MiB persisting-L2 window for the reused 40 MiB A operand. Streaming B loads
+and output stores use `evict_first`; A loads use `evict_last`. The public
+wrapper clears its stream access-policy window after every launch.
+
+Across four official locked runs, fused latency is `0.392221`, `0.394003`,
+`0.396722`, and `0.402738 ms` (median `0.395362 ms`, `2.1604x` versus the
+frozen `0.854433 ms` fused seed). An independent GEO Supervisor run measured
+`0.399283 ms`; live compiled-unfused results span about `0.430-0.450 ms`.
+The saved projection is bit exact on seeds 42 and 123. The compact output has
+maximum absolute error `0.0078125` and `0.00390625`, respectively—one BF16
+step—without an accumulator precision change or approximate sigmoid.
+
+The largest wins were the TLX/TMA/TMEM rewrite, merging gate and up into one
+256-wide MMA, CLC scheduling, asymmetric L2 eviction hints, and the persisting
+L2 carve-out. NCU reports 86 registers/thread, no reported spill traffic, and
+about 191-193 MB DRAM reads after the cache changes. Four-CTA multicast,
+stream-K, `BK64` with five stages, removing the CTA-pair rendezvous, and static
+persistence all lose in controlled A/B tests.
 
 ## Tuning guidance by fusion family
 
