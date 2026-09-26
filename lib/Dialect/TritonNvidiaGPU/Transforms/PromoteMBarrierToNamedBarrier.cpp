@@ -192,6 +192,16 @@ bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
   return true;
 }
 
+// Null (unpredicated) counts as always-true, preserving the previous behavior
+// of rejecting only present predicates.
+bool isAlwaysTrue(Value pred) {
+  if (!pred)
+    return true;
+  auto constant = pred.getDefiningOp<arith::ConstantOp>();
+  auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : nullptr;
+  return value && !value.getValue().isZero();
+}
+
 void traceBarrierUses(Value value, Value index, BarrierCandidate &candidate) {
   if (!candidate.visitedValues.insert(value).second)
     return;
@@ -326,13 +336,15 @@ std::optional<unsigned> getParticipantCount(BarrierCandidate &candidate) {
 
   for (const auto &use : candidate.arrives) {
     ttng::ArriveBarrierOp arrive = use.op;
-    if (arrive.getPerThread() || arrive.isMulticast() || arrive.getPred() ||
+    if (arrive.getPerThread() || arrive.isMulticast() ||
+        !isAlwaysTrue(arrive.getPred()) ||
         !isWarpUniform(arrive))
       return std::nullopt;
   }
   for (const auto &use : candidate.waits) {
     ttng::WaitBarrierOp wait = use.op;
-    if (wait.getPred() || !wait.getDeps().empty() || !isWarpUniform(wait))
+    if (!isAlwaysTrue(wait.getPred()) || !wait.getDeps().empty() ||
+        !isWarpUniform(wait))
       return std::nullopt;
   }
 

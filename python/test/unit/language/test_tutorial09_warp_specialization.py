@@ -1958,6 +1958,7 @@ def test_hopper_matmul_tma_warp_specialize(
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = enable_pingpong
 
         dtype = torch.float16
         GROUP_SIZE_M = 8
@@ -2016,6 +2017,11 @@ def test_hopper_matmul_tma_warp_specialize(
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.warp_group_dot" in ttgir, "Expected Hopper MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        # A PingPong region needs expensive ops in two partitions, which only
+        # DATA_PARTITION_FACTOR == 2 produces; factor 1 yields a single
+        # partition with nothing to synchronize.
+        if enable_pingpong and DATA_PARTITION_FACTOR == 2:
+            assert "ttng.compiler_named_barrier_id" in ttgir, "Expected promoted PingPong barriers"
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
