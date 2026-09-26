@@ -1,4 +1,5 @@
 // RUN: triton-opt -split-input-file --tlx-propagate-layout %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-resolve-placeholder-layouts %s | FileCheck %s --check-prefix=LOWERED
 
 // -----
 
@@ -392,7 +393,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
       // CHECK: %[[WARP_GROUP_DOT_WAIT:.*]] = ttng.warp_group_dot_wait {{.*}} {pendings = 1 : i32} : tensor<128x256xf32, #mma>
       // CHECK: ttg.convert_layout %[[WARP_GROUP_DOT_WAIT]] : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked>
       %120 = ttng.warp_group_dot_wait %115#0 {pendings = 1 : i32} : tensor<128x256xf32, #mma>
-      %121 = tlx.release_layout %120 : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked>
+      %121 = tlx.release_layout %120 {relaxed = true} : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked>
       %122 = arith.muli %116, %c64_i32 : i32
       %123 = arith.subi %arg5, %122 : i32
       %124 = tt.splat %123 : i32 -> tensor<1x64xi32, #blocked2>
@@ -632,6 +633,13 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
   // CHECK-DAG: #[[$PINNED_DST:.*]] = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
   // CHECK-DAG: #[[$PINNED_USER:.*]] = #tlx.user_layout<#[[$PINNED_DST]]>
   // CHECK-LABEL: @pinned_require_layout_on_tensor
+  // LOWERED-NOT: #tlx.user_layout
+  // LOWERED-NOT: #tlx.no_verify_layout
+  // LOWERED-LABEL: @pinned_require_layout_on_tensor
+  // LOWERED-NOT: tlx.preserve_layout
+  // LOWERED: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #{{.*}}>
+  // LOWERED-NOT: tlx.preserve_layout
+  // LOWERED: tt.return
   // CHECK-NOT: ttg.convert_layout
   // CHECK: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #tlx.no_verify_layout<#[[$PINNED_USER]]>>
   tt.func public @pinned_require_layout_on_tensor(%arg0: tensor<64x64xf32, #pinned_src>) -> tensor<64x64xf32, #pinned_user> attributes {noinline = false} {

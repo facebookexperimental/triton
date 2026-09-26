@@ -29,6 +29,16 @@ namespace tlx {
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
+static bool hasCoordinateRematerializationAttr(Operation *op) {
+  return op->hasAttr("tlx.rematerialize_coordinates");
+}
+
+static void copyCoordinateRematerializationAttr(Operation *source,
+                                                Operation *target) {
+  if (Attribute attr = source->getAttr("tlx.rematerialize_coordinates"))
+    target->setAttr("tlx.rematerialize_coordinates", attr);
+}
+
 /// Check if an attribute is any of the dummy layout types
 static bool isDummyLayoutAttr(Attribute attr) {
   return isa<DummyRegisterLayoutAttr>(attr);
@@ -57,9 +67,8 @@ static NoVerifyLayoutAttr getNoVerifyLayoutFromType(Type type) {
 }
 
 /// Extract a user-layout wrapper on a *shared* (MemDescType) value, if present.
-/// Register (RankedTensorType) user layouts are intentionally left wrapped
-/// here: they must survive as anchors through remove-layout-conversions and are
-/// unwrapped later by tlx-finalize-user-layouts.
+/// Register pins are retired separately after their provenance has moved to
+/// explicit require-layout SSA boundaries.
 static UserLayoutAttr getUserLayoutFromType(Type type) {
   if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
     return dyn_cast_or_null<UserLayoutAttr>(memDescType.getEncoding());
@@ -68,6 +77,10 @@ static UserLayoutAttr getUserLayoutFromType(Type type) {
 }
 
 static bool containsNoVerifyLayout(Type type);
+static bool containsUserLayout(Type type);
+static bool containsUserLayout(Attribute attr);
+static LogicalResult
+repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes);
 
 static bool containsNoVerifyLayout(Attribute attr) {
   if (!attr)
@@ -222,14 +235,29 @@ collectValuesWithEncodings(ModuleOp moduleOp,
   });
 }
 
+// DenseElementsAttr stores its own shaped type. AttrTypeReplacer updates an
+// arith.constant result but does not rebuild that nested type, so wrapper
+// removal must realign the value attribute before the operation is verified.
+static void realignDenseConstantTypes(ModuleOp moduleOp) {
+  moduleOp->walk([&](arith::ConstantOp cst) {
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense)
+      return;
+    auto resultType = dyn_cast<ShapedType>(cst.getType());
+    if (resultType && dense.getType() != resultType)
+      cst.setValueAttr(dense.reshape(resultType));
+  });
+}
+
 static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
   // Strip #tlx.no_verify_layout everywhere it appears -- including nested
   // inside other encodings (e.g. slice<parent = ...>) and inside a user-layout
   // wrapper
   // (#tlx.user_layout<#tlx.no_verify_layout<L>> -> #tlx.user_layout<L>). The
   // no-verify marker only defers tensor verification through inlining; once
-  // inlining is done it is no longer needed. A user-layout marker is preserved
-  // (it is retired later by tlx-finalize-user-layouts).
+  // inlining is done it is no longer needed. User-layout markers are preserved
+  // for the next step, which retires them after pin provenance is on explicit
+  // SSA boundaries.
   mlir::AttrTypeReplacer replacer;
   replacer.addReplacement([](NoVerifyLayoutAttr wrapper) -> Attribute {
     return wrapper.getLayout();
@@ -243,6 +271,7 @@ static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
         for (BlockArgument arg : block.getArguments())
           arg.setType(replacer.replace(arg.getType()));
   });
+  realignDenseConstantTypes(moduleOp);
 
   bool residual = false;
   moduleOp.walk([&](Operation *op) {
@@ -252,13 +281,20 @@ static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
         op->emitError("unresolved TLX no-verify layout after placeholder "
                       "layout resolution");
       }
+    for (NamedAttribute attr : op->getAttrs())
+      if (containsNoVerifyLayout(attr.getValue())) {
+        residual = true;
+        op->emitError("unresolved TLX no-verify layout in operation attribute "
+                      "after placeholder layout resolution");
+        break;
+      }
   });
   return failure(residual);
 }
 
 /// Unwrap every user-pinned layout (#tlx.user_layout<...>) back
 /// to the concrete shared layout the user requested, and verify none remain.
-static LogicalResult unwrapUserLayouts(ModuleOp moduleOp) {
+static LogicalResult unwrapSharedUserLayouts(ModuleOp moduleOp) {
   DenseMap<Value, Attribute> valuesToUnwrap;
   collectValuesWithEncodings(
       moduleOp,
@@ -292,11 +328,74 @@ static LogicalResult unwrapUserLayouts(ModuleOp moduleOp) {
   return failure(foundResidual);
 }
 
+/// Retire register user-layout wrappers after TLX propagation has transferred
+/// true pin provenance to require-layout SSA boundaries. Applying the type
+/// replacement module-wide keeps operation results, region arguments, function
+/// signatures, and nested encoding attributes consistent in one verifier-safe
+/// step; derived wrapper propagation does not create additional anchors.
+static LogicalResult unwrapRegisterUserLayouts(ModuleOp moduleOp) {
+  SmallVector<::mlir::triton::ReshapeOp> wrappedReshapes;
+  moduleOp.walk([&](::mlir::triton::ReshapeOp reshape) {
+    if (containsUserLayout(reshape.getSrc().getType()) ||
+        containsUserLayout(reshape.getType()))
+      wrappedReshapes.push_back(reshape);
+  });
+
+  mlir::AttrTypeReplacer replacer;
+  replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
+    return getEffectiveEncoding(wrapper);
+  });
+
+  moduleOp->walk([&](Operation *op) {
+    replacer.replaceElementsIn(op, /*replaceAttrs=*/true, /*replaceLocs=*/false,
+                               /*replaceTypes=*/true);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          arg.setType(replacer.replace(arg.getType()));
+  });
+  realignDenseConstantTypes(moduleOp);
+
+  if (failed(repairUnwrappedReshapes(wrappedReshapes)))
+    return failure();
+
+  bool residual = false;
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes()) {
+      if (!containsUserLayout(type))
+        continue;
+      residual = true;
+      op->emitError("unresolved TLX register user layout after early pin "
+                    "lowering");
+    }
+    for (NamedAttribute attr : op->getAttrs())
+      if (containsUserLayout(attr.getValue())) {
+        residual = true;
+        op->emitError("unresolved TLX user layout in operation attribute "
+                      "after early pin lowering");
+        break;
+      }
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments()) {
+          if (!containsUserLayout(arg.getType()))
+            continue;
+          residual = true;
+          op->emitError("unresolved TLX register user layout on block "
+                        "argument after early pin lowering");
+        }
+  });
+  return failure(residual);
+}
+
 LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
   if (failed(unwrapNoVerifyLayouts(moduleOp)))
     return failure();
 
-  if (failed(unwrapUserLayouts(moduleOp)))
+  if (failed(unwrapSharedUserLayouts(moduleOp)))
+    return failure();
+
+  if (failed(unwrapRegisterUserLayouts(moduleOp)))
     return failure();
 
   // Collect all values that have dummy layouts
@@ -374,10 +473,9 @@ static bool containsUserLayout(Type type) {
   return found;
 }
 
-/// Unwrap user-pinned register layouts (#tlx.user_layout on a RankedTensorType)
-/// back to the concrete wrapped layout, and verify none remain. These are kept
-/// wrapped through the layout-optimization passes (they anchor via
-/// PinnedEncodingTrait) and retired here.
+/// Defensively unwrap any user-pinned register layouts that reach late
+/// finalization. The early resolver normally retires these after transferring
+/// provenance to explicit SSA boundaries.
 ///
 /// Uses an AttrTypeReplacer so the wrapper is stripped *everywhere* it appears,
 /// including nested inside other encodings (e.g. a reduce's
@@ -406,8 +504,8 @@ static Attribute deepUnwrapTlxWrappers(Attribute attr) {
 // keeps the reshape's previously inferred destination stable. Once wrappers
 // are removed below, the concrete reshape must satisfy Triton's normal layout
 // inference again. Preserve the destination expected by existing consumers
-// with an explicit layout conversion. The conversion may exchange data across
-// threads when downstream layout optimization selected a different ownership.
+// with a require-layout boundary. Early resolution leaves that boundary for
+// RLC to place safely; late finalization lowers it to an explicit conversion.
 static LogicalResult
 repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
   for (auto reshape : reshapes) {
@@ -440,9 +538,9 @@ repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
     reshape.getResult().setType(inferredDstTy);
     OpBuilder builder(reshape);
     builder.setInsertionPointAfter(reshape);
-    auto convert = ttg::ConvertLayoutOp::create(builder, reshape.getLoc(),
+    auto require = ttg::RequireLayoutOp::create(builder, reshape.getLoc(),
                                                 oldDstTy, reshape.getResult());
-    reshape.getResult().replaceAllUsesExcept(convert.getResult(), convert);
+    reshape.getResult().replaceAllUsesExcept(require.getResult(), require);
   }
   return success();
 }
@@ -452,14 +550,12 @@ static void lowerRequireLayouts(ModuleOp moduleOp) {
   moduleOp.walk([&](ttg::RequireLayoutOp op) { requireLayouts.push_back(op); });
 
   for (ttg::RequireLayoutOp op : requireLayouts) {
-    bool rematerializeCoordinates =
-        op->hasAttr("tlx.rematerialize_coordinates");
+    bool rematerializeCoordinates = hasCoordinateRematerializationAttr(op);
     if (op.getSrc().getType() == op.getType()) {
       if (rematerializeCoordinates) {
         if (auto sourceConvert =
                 op.getSrc().getDefiningOp<ttg::ConvertLayoutOp>()) {
-          sourceConvert->setAttr("tlx.rematerialize_coordinates",
-                                 UnitAttr::get(op.getContext()));
+          copyCoordinateRematerializationAttr(op, sourceConvert);
           op.getResult().replaceAllUsesWith(op.getSrc());
           op.erase();
           continue;
@@ -475,7 +571,26 @@ static void lowerRequireLayouts(ModuleOp moduleOp) {
     auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
                                                 op.getType(), op.getSrc());
     if (rematerializeCoordinates)
-      convert->setAttr("tlx.rematerialize_coordinates", builder.getUnitAttr());
+      copyCoordinateRematerializationAttr(op, convert);
+    op.getResult().replaceAllUsesWith(convert.getResult());
+    op.erase();
+  }
+}
+
+static void lowerReleaseLayouts(ModuleOp moduleOp) {
+  SmallVector<ttg::ReleaseLayoutOp> releaseLayouts;
+  moduleOp.walk([&](ttg::ReleaseLayoutOp op) { releaseLayouts.push_back(op); });
+
+  for (ttg::ReleaseLayoutOp op : releaseLayouts) {
+    if (op.getSrc().getType() == op.getType()) {
+      op.getResult().replaceAllUsesWith(op.getSrc());
+      op.erase();
+      continue;
+    }
+
+    OpBuilder builder(op);
+    auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
+                                                op.getType(), op.getSrc());
     op.getResult().replaceAllUsesWith(convert.getResult());
     op.erase();
   }
@@ -510,27 +625,18 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
           arg.setType(replacer.replace(arg.getType()));
   });
 
-  // A constant's `value` DenseElementsAttr carries its own (shaped) type, which
-  // AttrTypeReplacer does not rebuild; realign it with the unwrapped result
-  // type.
-  moduleOp->walk([&](arith::ConstantOp cst) {
-    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
-    if (!dense)
-      return;
-    auto resultType = dyn_cast<ShapedType>(cst.getType());
-    if (resultType && dense.getType() != resultType)
-      cst.setValueAttr(dense.reshape(resultType));
-  });
+  realignDenseConstantTypes(moduleOp);
 
   if (failed(repairUnwrappedReshapes(wrappedReshapes)))
     return failure();
 
   lowerRequireLayouts(moduleOp);
+  lowerReleaseLayouts(moduleOp);
 
   SmallVector<ttg::ConvertLayoutOp> identityConversions;
   moduleOp.walk([&](ttg::ConvertLayoutOp convert) {
     if (convert.getSrc().getType() == convert.getType() &&
-        !convert->hasAttr("tlx.rematerialize_coordinates"))
+        !hasCoordinateRematerializationAttr(convert))
       identityConversions.push_back(convert);
   });
   for (ttg::ConvertLayoutOp convert : identityConversions) {
