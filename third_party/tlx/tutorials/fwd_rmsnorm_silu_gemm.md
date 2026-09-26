@@ -5,49 +5,57 @@ This OSS benchmark reproduces `T289757910`: BF16
 512-element row and SiLU. The integrated benchmark preserves the raw BF16 GEMM
 output, the normalized/activated BF16 output, and FP32 rstd.
 
-The TLX candidate evaluates the GEMM once. It reuses each A tile across two
-N=256 FP32 TMEM accumulators. Two epilogue tasks unload the accumulator halves,
-save the raw BF16 GEMM output, exchange FP32 sum-of-squares partials through
-shared memory, then apply the common rstd, weight, and exact `tl.sigmoid` SiLU.
+The promoted TLX kernel evaluates the GEMM once. A two-CTA cluster splits the
+512 output columns into two N=256 tiles while each CTA walks the complete K
+dimension with an FP32 TMEM accumulator. The epilogue saves the raw BF16 GEMM
+output, exchanges FP32 sum-of-squares partials through distributed shared
+memory, computes the common rstd, and applies the weight and SiLU.
 
-## GB200 result
+## Promoted GB200 result
 
-The best schedule found is `BM64/BN256/BK64`, four A buffers, two B buffers per
-N group, two epilogue tasks, and eight default-task warps. On idle GPU 0 with
-locked clocks, `warmup=10`, `samples=50`, and five alternating repetitions:
+GEO selected `BM128/BN256/BK64`, a two-CTA N split, six A buffers, four B
+buffers, a four-deep TMA-store staging ring, separate one-warp A and B
+producers, a one-warp MMA task, and an eight-warp epilogue. On idle GPU 0 with
+locked 2062 MHz clocks, the authoritative profiler-device-time run measured:
 
 | Implementation | Best median |
 |---|---:|
-| OSS unfused cuBLAS + RMSNorm/SiLU | `102.368 us` |
-| integrated Triton seed | `126.816 us` |
-| `tlx.ops.mm` heuristic, GEMM only | `182.912 us` |
-| fused TLX | `134.976 us` |
+| frozen fused TLX | `81.632 us` |
+| promoted fused TLX | `48.452 us` |
+| `torch.compile` reference | `35.784 us` |
 
-The TLX candidate is `32.608 us` slower than unfused (`0.7584x`) and
-`8.160 us` slower than the integrated Triton seed. It is therefore not a
-promotion candidate.
+The promoted kernel is `1.686x` faster than the frozen fused denominator, but
+is still `10.3%` slower than the task's historical `43.92 us` unfused result
+and `35.4%` slower than the same-run `torch.compile` reference.
 
-Across seeds 0, 1, and 2, the saved BF16 GEMM output is bit exact. Maximum
-absolute error is `1.53e-5` for FP32 rstd and `2.44e-4` for the BF16 activated
-output. Reduction reassociation is allowed; GEMM accumulation remains FP32 and
-the exact sigmoid path is retained.
+The standalone OSS event-timed harness, which includes host dispatch gaps,
+measured best-of-five medians of `107.408 us` unfused and `104.640 us` fused
+under the same clock lock. The GEO numbers sum GPU kernel time and are the
+tuning contract; the event numbers represent end-to-end API latency.
 
-PTXAS reports 96 registers per thread, a 32-byte stack frame, 32 bytes of spill
-stores, and 68 bytes of spill loads. The kernel is not meaningfully constrained
-by register pressure. Its complete-row tile produces only 80 CTAs on a 152-SM
-GB200. Splitting N across a cluster restores CTA occupancy but loses to duplicated
-A traffic and cluster/reduction synchronization.
+Both the authoritative GEO check and the promoted-file check pass. The GEO
+contract uses unscaled A and reports a seed-42 maximum output error of one BF16
+step (`1.5625e-2`) within its `atol=rtol=1e-2` rule. In the standalone scaled
+seeds 0, 1, and 2, projection is bit exact and maximum absolute errors are
+`1.53e-5` for FP32 rstd and `2.44e-4` for BF16 output. The GEMM accumulator
+remains FP32. The only algorithmic approximation is the FP32 SiLU sigmoid
+implemented with approximate `exp2`/division; no accumulator precision was
+reduced.
+
+NCU reports 168 registers/thread, 230.79 KiB dynamic shared memory, 19.46%
+occupancy, and a 0.53-wave launch. The N split fixes the BM64 tensor-core
+throughput loss while preserving the full sequential K reduction. The staged
+TMA epilogue avoids the much slower direct store from the TMEM layout.
 
 Rejected short-run candidates include:
 
 | Candidate | Best median |
 |---|---:|
-| one serial epilogue task | `137.712 us` |
-| BM128 | `142.912 us` |
-| BK128 with A2/B1 buffering | `137.840 us` |
-| two-CTA N split | `190.512 us` |
-| four-CTA N split | `229.120 us` |
-| 96-register second epilogue cap | `136.224 us` |
+| four-CTA N split / BN128 | `65.9 us` |
+| BK128 | `55.3 us` |
+| BK32 | `64.4 us` |
+| four launch warps | `51.8 us` |
+| split-K 2 | `79.4 us`, rejected: changes projection low bits |
 
 Run the locked benchmark with:
 
@@ -59,10 +67,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python:third_party/tlx/tutorials \
   --warmup 10 --samples 50 --reps 5 --verification-seeds 0 1 2
 ```
 
-A fresh fbsource run of the official output/rstd-only benchmark measures
-`78.736 -> 118.960 us` (`0.6619x`); its earlier recorded result was
-`43.92 -> 114.21 us`. The OSS baseline is `23.632 us` slower than the current
-fbsource baseline, while the fused implementations are much closer. The OSS
-candidate deliberately exercises the stricter integrated ABI by also saving
-and checking raw `buf88`, so its `134.976 us` is not a like-for-like replacement
-for the official fused timing. Neither comparison currently yields a fused win.
+The prior fbsource output/rstd-only reproduction measured `78.736 -> 118.960
+us`; its original recorded result was `43.92 -> 114.21 us`. Those older runs
+used different harnesses and should not be mixed with GEO's profiler timing.
+The promoted kernel preserves the stricter integrated ABI, including raw
+`buf88`/projection, rather than optimizing only the final output and rstd.

@@ -25,7 +25,7 @@ statistics are FP32.
 | Task | Core shape | Operator and fusion boundary | Required outputs / constraints |
 |---|---|---|---|
 | `T289775012` | two `(5120, 4096, 8192)` GEMMs; output viewed as `[81920,256]` | two down GEMMs -> residual add -> weighted RMSNorm -> direct stores | OSS TLX now confirms `725.712 -> 699.984 us`; preserve post-add BF16 state, FP32 rstd, normalized BF16 output, and destination partitioning. |
-| `T289757910` | `(5120, 512, 8192)` | GEMM -> weighted RMSNorm D=512 -> SiLU | OSS TLX is correct but loses `102.368 -> 134.976 us`; integrated ABI saves raw GEMM output, normalized/SiLU output, and rstd. |
+| `T289757910` | `(5120, 512, 8192)` | GEMM -> weighted RMSNorm D=512 -> SiLU | Promoted GEO-tuned TLX: `81.632 -> 48.452 us` versus frozen fused; accuracy passes and raw GEMM output is bit-exact. It still trails the historical `43.92 us` unfused result. |
 | `T289757930` | two `(5120, 1024, 2048)` GEMMs | GEMM -> weighted RMSNorm D=1024 -> SiLU | Preserve both raw GEMM outputs, both activated outputs, and rstd. |
 | `T289757870` | two `(5120, 16384, 4096)` packed gate/up GEMMs | two GEMMs -> split gate/up -> `SiLU(gate) * up` | Training ABI saves packed GEMM output; a direct-hidden-only route is a different contract. |
 | `T289914992` | two `(5120, 4096, 8192)` down GEMMs | materialized SwiGLU -> down GEMM -> residual add -> weighted RMSNorm -> direct stores | Full fusion must preserve hidden, post-add, rstd, and destination outputs. The materialized-SwiGLU hybrid is the current winning boundary. |
@@ -370,31 +370,33 @@ Three-stage, BK128, BM64, two-task epilogue, narrower epilogue-subtile, and
 materialized-SwiGLU hybrid's narrow win. Matching fbsource full-forward
 validation remains before promotion.
 
-## Current `T289757910` D=512 GEMM/RMSNorm/SiLU prototype
+## Current `T289757910` D=512 GEMM/RMSNorm/SiLU kernel
 
-The OSS benchmark and TLX variants are in
+The OSS benchmark and promoted TLX kernel are in
 `third_party/tlx/tutorials/fwd_rmsnorm_silu_gemm.py` and
-`fwd_rmsnorm_silu_gemm_tlx.py`. The best correct TLX schedule uses
-`BM64/BN256/BK64`, four A buffers, two B buffers per N half, and parallel
-epilogues with an FP32 row-sum exchange. It preserves the raw BF16 GEMM output,
-activated BF16 output, FP32 rstd, exact sigmoid, and FP32 GEMM accumulation.
+`fwd_rmsnorm_silu_gemm_tlx.py`. GEO's best accuracy-passing schedule uses
+`BM128/BN256/BK64`, a two-CTA N split, six A buffers, four B buffers, separate
+A/B TMA producers, a one-warp MMA task, a four-deep TMA-store staging ring, and
+an eight-warp epilogue. The two CTAs exchange FP32 row-sum partials through
+distributed shared memory.
 
-Locked GB200 `10/50/5` best medians are `102.368 us` OSS unfused,
-`126.816 us` for the integrated Triton seed, and `134.976 us` TLX. TLX is
-31.9% slower than unfused and is not promotable. The saved GEMM output is bit
-exact across seeds 0/1/2; maximum rstd and activated-output errors are
-`1.53e-5` and `2.44e-4`.
+The authoritative locked GEO profiler run is `81.632 -> 48.452 us` versus the
+frozen fused denominator (`1.686x`), with a same-run `torch.compile` reference
+of `35.784 us`. It still trails the task's historical `43.92 us` unfused result
+by `4.53 us` (`10.3%`). A separate OSS event-timed `10/50/5` run, which includes
+host dispatch gaps, measured `107.408 -> 104.640 us` unfused-to-fused.
 
-A fresh fbsource run of the official output/rstd-only benchmark measures
-`78.736 -> 118.960 us` (`0.6619x`). Its unfused path is `23.632 us` faster than
-the OSS reproduction; the original fused seed is similar across environments.
-The OSS candidate is stricter because it also saves and checks raw `buf88`.
+The authoritative GEO accuracy check passes at `(5120,512,8192)` under its
+BF16 `atol=rtol=1e-2` contract, and the promoted file passes scaled-input seeds
+0/1/2. Projection is bit-exact; the local scaled cases have maximum rstd and
+activated-output errors of `1.53e-5` and `2.44e-4`. GEMM accumulation remains
+FP32. The promoted epilogue uses approximate FP32 `exp2`/division for SiLU;
+this is an algorithmic approximation, not a change in accumulator precision.
 
-PTXAS reports 96 registers/thread and negligible spills. The limiting shape
-property is complete-row ownership producing only 80 CTAs on 152 SMs. Two- and
-four-CTA N-split versions restore occupancy but regress to `190.512 us` and
-`229.120 us` because duplicated A traffic plus cluster reduction overhead
-dominates. BM128, BK128, a serial epilogue, and a lower register cap also lose.
+NCU reports 168 registers/thread, 230.79 KiB dynamic shared memory, 19.46%
+occupancy, and 0.53 waves. The promoted N split preserves the sequential FP32 K
+chain; split-K was rejected because it changed projection low bits. Remaining
+headroom is mainly the GEMM pipeline and epilogue tail, not a precision trade.
 
 ## Current `T289840347` D=512 TLX prototype
 

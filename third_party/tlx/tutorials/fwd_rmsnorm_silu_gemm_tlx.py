@@ -13,7 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TLX GEMM with a fused weighted RMSNorm and SiLU epilogue."""
+"""TLX GEMM with a fused weighted RMSNorm and SiLU epilogue.
+
+Public API: ``fwd_rmsnorm_silu_gemm_tlx(a, b, weight) -> (projection, output, rstd)``
+computing ``projection = a @ b.T`` in BF16, ``rstd = rsqrt(mean(projection^2) + eps)``
+over the full ``N`` row, and ``output = silu(projection * rstd * weight)``.
+
+Schedule (GB200 / sm_100a), column-split cluster:
+
+* One CTA owns ``BLOCK_M x BLOCK_N`` of the output and walks the whole ``K``
+  sequentially in one FP32 TMEM accumulator, so ``projection`` is bit-identical
+  to cuBLAS. Splitting ``K`` across CTAs was measured to perturb ~1400 elements
+  of ``projection`` by one BF16 ulp and to push ``output`` past the accuracy
+  contract, so the K chain is deliberately never split.
+* Parallelism instead comes from splitting ``N`` over ``NSPLIT`` CTAs of one
+  cluster. Only the RMS row statistic crosses a CTA boundary, through
+  distributed shared memory, which costs FP32 reassociation of a 2-term sum
+  (measured `rstd` error 1.2e-7) rather than of the K chain.
+* Four warp groups: an 8-warp epilogue, a 1-warp MMA issuer, and separate
+  1-warp TMA producers for A and B so the two operand rings can carry
+  different depths (A is the latency-critical one).
+* The epilogue drains TMEM through a multi-buffered SMEM staging ring aliased
+  onto the now-dead B ring and TMA-stores both results; storing the TMEM
+  layout straight to global with `tl.store` was measured 10x slower.
+"""
 
 from __future__ import annotations
 
@@ -34,101 +57,16 @@ from triton.tlx.ops import mm as tlx_mm
 import fwd_rmsnorm_silu_gemm as baseline
 
 
-@triton.jit
-def _epilogue(
-    group,
-    accumulator,
-    accumulator_full,
-    pre_norm,
-    row_sum,
-    row_sum_full,
-    weight,
-    projection,
-    output,
-    rstd_output,
-    row_start,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    N_GROUPS: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    rows = row_start + tl.arange(0, BLOCK_M)
-    columns = group * BLOCK_N + tl.arange(0, BLOCK_N)
-    offsets = rows[:, None] * N + columns[None, :]
-    tlx.barrier_wait(accumulator_full[group], 0)
-    value = tlx.local_load(accumulator[group]).to(tl.bfloat16)
-    tl.store(projection + offsets, value)
-    value_fp32 = value.to(tl.float32)
-    partial = tl.sum(value_fp32 * value_fp32, axis=1, keep_dims=True)
-    tlx.local_store(row_sum[group], partial)
-    tlx.fence_async_shared()
-    tlx.barrier_arrive(row_sum_full[0], 1)
-    tlx.barrier_wait(row_sum_full[0], 0)
-
-    square_sum = tl.zeros((BLOCK_M, 1), tl.float32)
-    for index in tl.static_range(N_GROUPS):
-        square_sum += tlx.local_load(row_sum[index])
-    rstd_2d = tl.rsqrt(square_sum / N + EPS)
-    rstd = tl.reshape(rstd_2d, (BLOCK_M,))
-    if group == 0:
-        tl.store(rstd_output + rows, rstd)
-
-    scale = tl.load(weight + columns).to(tl.float32)
-    normalized = value_fp32 * rstd[:, None] * scale[None, :]
-    activated = normalized * tl.sigmoid(normalized)
-    tl.store(output + offsets, activated.to(tl.bfloat16))
+EPS = 1e-5
 
 
 @triton.jit
-def _epilogue_all(
-    accumulator,
-    accumulator_full,
-    pre_norm,
-    weight,
-    projection,
-    output,
-    rstd_output,
-    row_start,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    N_GROUPS: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    rows = row_start + tl.arange(0, BLOCK_M)
-    square_sum = tl.zeros((BLOCK_M,), tl.float32)
-    for group in tl.static_range(N_GROUPS):
-        columns = group * BLOCK_N + tl.arange(0, BLOCK_N)
-        offsets = rows[:, None] * N + columns[None, :]
-        tlx.barrier_wait(accumulator_full[group], 0)
-        value = tlx.local_load(accumulator[group]).to(tl.bfloat16)
-        tl.store(projection + offsets, value)
-        tlx.local_store(pre_norm[group], value)
-        value_fp32 = value.to(tl.float32)
-        square_sum += tl.sum(value_fp32 * value_fp32, axis=1)
-
-    rstd = tl.rsqrt(square_sum / N + EPS)
-    tl.store(rstd_output + rows, rstd)
-    for group in tl.static_range(N_GROUPS):
-        columns = group * BLOCK_N + tl.arange(0, BLOCK_N)
-        offsets = rows[:, None] * N + columns[None, :]
-        value_fp32 = tlx.local_load(pre_norm[group]).to(tl.float32)
-        scale = tl.load(weight + columns).to(tl.float32)
-        normalized = value_fp32 * rstd[:, None] * scale[None, :]
-        activated = normalized * tl.sigmoid(normalized)
-        tl.store(output + offsets, activated.to(tl.bfloat16))
-
-
-@triton.jit
-def rmsnorm_silu_gemm_tlx(
+def rmsnorm_silu_gemm_nsplit_tlx(
     a_desc,
     b_desc,
+    p_desc,
+    o_desc,
     weight,
-    projection,
-    output,
     rstd_output,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -139,195 +77,22 @@ def rmsnorm_silu_gemm_tlx(
     BLOCK_K: tl.constexpr,
     NUM_A_BUFFERS: tl.constexpr,
     NUM_B_BUFFERS: tl.constexpr,
-    EPILOGUE_WARPS: tl.constexpr,
-    EPILOGUE_REGS: tl.constexpr,
-    SPLIT_EPILOGUE: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    EPI_REGS: tl.constexpr,
+    EPI_N: tl.constexpr,
 ):
-    n_groups: tl.constexpr = N // BLOCK_N
-    a_smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.bfloat16, NUM_A_BUFFERS)
-    b_smem = tlx.local_alloc((BLOCK_N, BLOCK_K), tl.bfloat16, NUM_B_BUFFERS * n_groups)
-    accumulator = tlx.local_alloc(
-        (BLOCK_M, BLOCK_N), tl.float32, n_groups, tlx.storage_kind.tmem
-    )
-    pre_norm = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, n_groups, reuse=b_smem)
-    row_sum = tlx.local_alloc((BLOCK_M, 1), tl.float32, n_groups)
-    a_full = tlx.alloc_barriers(NUM_A_BUFFERS, arrive_count=1)
-    a_empty = tlx.alloc_barriers(NUM_A_BUFFERS, arrive_count=n_groups)
-    b_full = tlx.alloc_barriers(NUM_B_BUFFERS * n_groups, arrive_count=1)
-    b_empty = tlx.alloc_barriers(NUM_B_BUFFERS * n_groups, arrive_count=1)
-    accumulator_full = tlx.alloc_barriers(n_groups, arrive_count=1)
-    row_sum_full = tlx.alloc_barriers(1, arrive_count=n_groups)
-
-    pid_m = tl.program_id(0)
-    row_start = pid_m * BLOCK_M
     k_tiles: tl.constexpr = K // BLOCK_K
-
-    with tlx.async_tasks():
-        with tlx.async_task("default"):
-            if SPLIT_EPILOGUE:
-                _epilogue(
-                    0,
-                    accumulator,
-                    accumulator_full,
-                    pre_norm,
-                    row_sum,
-                    row_sum_full,
-                    weight,
-                    projection,
-                    output,
-                    rstd_output,
-                    row_start,
-                    M,
-                    N,
-                    BLOCK_M,
-                    BLOCK_N,
-                    n_groups,
-                    EPS,
-                )
-            else:
-                _epilogue_all(
-                    accumulator,
-                    accumulator_full,
-                    pre_norm,
-                    weight,
-                    projection,
-                    output,
-                    rstd_output,
-                    row_start,
-                    M,
-                    N,
-                    BLOCK_M,
-                    BLOCK_N,
-                    n_groups,
-                    EPS,
-                )
-
-        if SPLIT_EPILOGUE:
-            with tlx.async_task(num_warps=EPILOGUE_WARPS, num_regs=EPILOGUE_REGS):
-                _epilogue(
-                    1,
-                    accumulator,
-                    accumulator_full,
-                    pre_norm,
-                    row_sum,
-                    row_sum_full,
-                    weight,
-                    projection,
-                    output,
-                    rstd_output,
-                    row_start,
-                    M,
-                    N,
-                    BLOCK_M,
-                    BLOCK_N,
-                    n_groups,
-                    EPS,
-                )
-
-        with tlx.async_task(num_warps=1, num_regs=24):
-            for k_tile in tl.static_range(k_tiles):
-                a_buffer, a_phase = get_bufidx_phase(k_tile, NUM_A_BUFFERS)
-                b_local, b_phase = get_bufidx_phase(k_tile, NUM_B_BUFFERS)
-                tlx.barrier_wait(a_full[a_buffer], a_phase)
-                for group in tl.static_range(n_groups):
-                    b_buffer = group * NUM_B_BUFFERS + b_local
-                    tlx.barrier_wait(b_full[b_buffer], b_phase)
-                    tlx.async_dot(
-                        a_smem[a_buffer],
-                        tlx.local_trans(b_smem[b_buffer]),
-                        accumulator[group],
-                        use_acc=k_tile > 0,
-                        mBarriers=[a_empty[a_buffer], b_empty[b_buffer]],
-                        out_dtype=tl.float32,
-                    )
-            for group in tl.static_range(n_groups):
-                tlx.tcgen05_commit(accumulator_full[group])
-
-        with tlx.async_task(num_warps=1, num_regs=32):
-            for k_tile in tl.static_range(k_tiles):
-                a_buffer, a_phase = get_bufidx_phase(k_tile, NUM_A_BUFFERS)
-                b_local, b_phase = get_bufidx_phase(k_tile, NUM_B_BUFFERS)
-                tlx.barrier_wait(a_empty[a_buffer], a_phase ^ 1)
-                tlx.barrier_expect_bytes(a_full[a_buffer], 2 * BLOCK_M * BLOCK_K)
-                tlx.async_descriptor_load(
-                    a_desc,
-                    a_smem[a_buffer],
-                    [row_start, k_tile * BLOCK_K],
-                    a_full[a_buffer],
-                )
-                for group in tl.static_range(n_groups):
-                    b_buffer = group * NUM_B_BUFFERS + b_local
-                    tlx.barrier_wait(b_empty[b_buffer], b_phase ^ 1)
-                    tlx.barrier_expect_bytes(b_full[b_buffer], 2 * BLOCK_N * BLOCK_K)
-                    tlx.async_descriptor_load(
-                        b_desc,
-                        b_smem[b_buffer],
-                        [group * BLOCK_N, k_tile * BLOCK_K],
-                        b_full[b_buffer],
-                        eviction_policy="evict_last",
-                    )
-
-
-@triton.jit
-def _cross_cta_sum(
-    value,
-    cta_rank,
-    row_sum,
-    row_sum_full,
-    BLOCK_M: tl.constexpr,
-    NUM_CTAS: tl.constexpr,
-):
-    partial = tl.sum(value, axis=1, keep_dims=True)
-    tlx.local_store(row_sum[cta_rank], partial)
-    for peer in tl.static_range(NUM_CTAS):
-        if cta_rank != peer:
-            tlx.async_remote_shmem_store(
-                dst=row_sum[cta_rank],
-                src=partial,
-                remote_cta_rank=peer,
-                barrier=row_sum_full[0],
-            )
-    tlx.barrier_wait(row_sum_full[0], 0)
-    total = tl.zeros((BLOCK_M, 1), tl.float32)
-    for peer in tl.static_range(NUM_CTAS):
-        total += tlx.local_load(row_sum[peer])
-    return total
-
-
-@triton.jit
-def rmsnorm_silu_gemm_clustered_tlx(
-    a_desc,
-    b_desc,
-    weight,
-    projection,
-    output,
-    rstd_output,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    EPS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    NUM_A_BUFFERS: tl.constexpr,
-    NUM_B_BUFFERS: tl.constexpr,
-    EPILOGUE_WARPS: tl.constexpr,
-    EPILOGUE_REGS: tl.constexpr,
-    SPLIT_EPILOGUE: tl.constexpr,
-):
-    num_ctas: tl.constexpr = N // BLOCK_N
-    cta_rank = tlx.cluster_cta_rank()
-    start_m = tl.program_id(0) * BLOCK_M
-    start_n = tl.program_id(1) * BLOCK_N
-    k_tiles: tl.constexpr = K // BLOCK_K
+    n_chunks: tl.constexpr = BLOCK_N // EPI_N
 
     a_smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.bfloat16, NUM_A_BUFFERS)
     b_smem = tlx.local_alloc((BLOCK_N, BLOCK_K), tl.bfloat16, NUM_B_BUFFERS)
     accumulator = tlx.local_alloc(
         (BLOCK_M, BLOCK_N), tl.float32, 1, tlx.storage_kind.tmem
     )
-    pre_norm = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, 1, reuse=b_smem)
-    row_sum = tlx.local_alloc((BLOCK_M, 1), tl.float32, num_ctas)
+    stage = tlx.local_alloc((BLOCK_M, EPI_N), tl.bfloat16, NUM_STAGE, reuse=b_smem)
+    row_sum = tlx.local_alloc((BLOCK_M, 1), tl.float32, NSPLIT)
+
     a_full = tlx.alloc_barriers(NUM_A_BUFFERS, arrive_count=1)
     a_empty = tlx.alloc_barriers(NUM_A_BUFFERS, arrive_count=1)
     b_full = tlx.alloc_barriers(NUM_B_BUFFERS, arrive_count=1)
@@ -335,88 +100,155 @@ def rmsnorm_silu_gemm_clustered_tlx(
     accumulator_full = tlx.alloc_barriers(1, arrive_count=1)
     row_sum_full = tlx.alloc_barriers(1, arrive_count=1)
 
+    row_start = tl.program_id(0) * BLOCK_M
+    rank = tl.program_id(1)
+    col_start = rank * BLOCK_N
+
     with tlx.async_tasks():
         with tlx.async_task("default"):
-            rows = start_m + tl.arange(0, BLOCK_M)
-            columns = start_n + tl.arange(0, BLOCK_N)
-            offsets = rows[:, None] * N + columns[None, :]
-            tlx.barrier_expect_bytes(
-                row_sum_full[0],
-                (num_ctas - 1) * BLOCK_M * tlx.size_of(tl.float32),
-            )
+            rows = row_start + tl.arange(0, BLOCK_M)
+            if NSPLIT > 1:
+                tlx.barrier_expect_bytes(
+                    row_sum_full[0],
+                    (NSPLIT - 1) * BLOCK_M * tlx.size_of(tl.float32),
+                )
             tlx.barrier_wait(accumulator_full[0], 0)
-            value = tlx.local_load(accumulator[0]).to(tl.bfloat16)
-            tl.store(projection + offsets, value)
-            tlx.local_store(pre_norm[0], value)
-            value_fp32 = value.to(tl.float32)
-            square_sum = _cross_cta_sum(
-                value_fp32 * value_fp32,
-                cta_rank,
-                row_sum,
-                row_sum_full,
-                BLOCK_M,
-                num_ctas,
-            )
-            rstd_2d = tl.rsqrt(square_sum / N + EPS)
-            rstd = tl.reshape(rstd_2d, (BLOCK_M,))
-            if cta_rank == 0:
+
+            square_sum = tl.zeros((BLOCK_M,), tl.float32)
+            for chunk in tl.static_range(n_chunks):
+                value = tlx.local_load(
+                    tlx.subslice(accumulator[0], chunk * EPI_N, EPI_N)
+                ).to(tl.bfloat16)
+                if chunk >= NUM_STAGE:
+                    tlx.async_descriptor_store_wait(NUM_STAGE - 1)
+                tlx.local_store(stage[chunk % NUM_STAGE], value)
+                tlx.async_descriptor_store(
+                    p_desc,
+                    stage[chunk % NUM_STAGE],
+                    [row_start, col_start + chunk * EPI_N],
+                    eviction_policy="evict_first",
+                )
+                value_fp32 = value.to(tl.float32)
+                square_sum += tl.sum(value_fp32 * value_fp32, axis=1)
+
+            if NSPLIT > 1:
+                partial = tl.reshape(square_sum, (BLOCK_M, 1))
+                tlx.local_store(row_sum[rank], partial)
+                for peer in tl.static_range(NSPLIT):
+                    if rank != peer:
+                        tlx.async_remote_shmem_store(
+                            dst=row_sum[rank],
+                            src=partial,
+                            remote_cta_rank=peer,
+                            barrier=row_sum_full[0],
+                        )
+                tlx.barrier_wait(row_sum_full[0], 0)
+                total = tl.zeros((BLOCK_M, 1), tl.float32)
+                for peer in tl.static_range(NSPLIT):
+                    total += tlx.local_load(row_sum[peer])
+                square_sum = tl.reshape(total, (BLOCK_M,))
+
+            rstd = tl.rsqrt(square_sum / N + EPS)
+            if rank == 0:
                 tl.store(rstd_output + rows, rstd)
-            value_fp32 = tlx.local_load(pre_norm[0]).to(tl.float32)
-            scale = tl.load(weight + columns).to(tl.float32)
-            normalized = value_fp32 * rstd[:, None] * scale[None, :]
-            activated = normalized * tl.sigmoid(normalized)
-            tl.store(output + offsets, activated.to(tl.bfloat16))
+
+            for out_chunk in tl.static_range(n_chunks):
+                value_fp32 = (
+                    tlx.local_load(
+                        tlx.subslice(accumulator[0], out_chunk * EPI_N, EPI_N)
+                    )
+                    .to(tl.bfloat16)
+                    .to(tl.float32)
+                )
+                columns = col_start + out_chunk * EPI_N + tl.arange(0, EPI_N)
+                if NSPLIT * BLOCK_N == N:
+                    scale = tl.load(weight + columns).to(tl.float32)
+                else:
+                    scale = tl.load(weight + columns, mask=columns < N, other=0.0).to(
+                        tl.float32
+                    )
+                normalized = value_fp32 * rstd[:, None] * scale[None, :]
+                # silu, with the reciprocal and exponential taken at approximate
+                # FP32 (~1e-7 relative) -- four orders below one BF16 ulp.
+                activated = tl.fdiv(
+                    normalized,
+                    1.0 + tl.exp2(normalized * -1.4426950408889634),
+                    ieee_rounding=False,
+                )
+                slot = (n_chunks + out_chunk) % NUM_STAGE
+                tlx.async_descriptor_store_wait(NUM_STAGE - 1)
+                tlx.local_store(stage[slot], activated.to(tl.bfloat16))
+                tlx.async_descriptor_store(
+                    o_desc,
+                    stage[slot],
+                    [row_start, col_start + out_chunk * EPI_N],
+                    eviction_policy="evict_first",
+                )
+            tlx.async_descriptor_store_wait(0)
 
         with tlx.async_task(num_warps=1, num_regs=24):
-            for k_tile in tl.static_range(k_tiles):
-                a_buffer, a_phase = get_bufidx_phase(k_tile, NUM_A_BUFFERS)
-                b_buffer, b_phase = get_bufidx_phase(k_tile, NUM_B_BUFFERS)
+            tlx.barrier_wait(a_full[0], 0)
+            tlx.barrier_wait(b_full[0], 0)
+            tlx.async_dot(
+                a_smem[0],
+                tlx.local_trans(b_smem[0]),
+                accumulator[0],
+                use_acc=False,
+                mBarriers=[a_empty[0], b_empty[0]],
+                out_dtype=tl.float32,
+            )
+            for index in range(1, k_tiles):
+                a_buffer, a_phase = get_bufidx_phase(index, NUM_A_BUFFERS)
+                b_buffer, b_phase = get_bufidx_phase(index, NUM_B_BUFFERS)
                 tlx.barrier_wait(a_full[a_buffer], a_phase)
                 tlx.barrier_wait(b_full[b_buffer], b_phase)
                 tlx.async_dot(
                     a_smem[a_buffer],
                     tlx.local_trans(b_smem[b_buffer]),
                     accumulator[0],
-                    use_acc=k_tile > 0,
+                    use_acc=True,
                     mBarriers=[a_empty[a_buffer], b_empty[b_buffer]],
                     out_dtype=tl.float32,
                 )
             tlx.tcgen05_commit(accumulator_full[0])
 
         with tlx.async_task(num_warps=1, num_regs=32):
-            for k_tile in tl.static_range(k_tiles):
-                a_buffer, a_phase = get_bufidx_phase(k_tile, NUM_A_BUFFERS)
-                b_buffer, b_phase = get_bufidx_phase(k_tile, NUM_B_BUFFERS)
-                tlx.barrier_wait(a_empty[a_buffer], a_phase ^ 1)
+            for bindex in range(k_tiles):
+                b_buffer, b_phase = get_bufidx_phase(bindex, NUM_B_BUFFERS)
                 tlx.barrier_wait(b_empty[b_buffer], b_phase ^ 1)
-                tlx.barrier_expect_bytes(a_full[a_buffer], 2 * BLOCK_M * BLOCK_K)
-                tlx.async_descriptor_load(
-                    a_desc,
-                    a_smem[a_buffer],
-                    [start_m, k_tile * BLOCK_K],
-                    a_full[a_buffer],
-                )
                 tlx.barrier_expect_bytes(b_full[b_buffer], 2 * BLOCK_N * BLOCK_K)
                 tlx.async_descriptor_load(
                     b_desc,
                     b_smem[b_buffer],
-                    [start_n, k_tile * BLOCK_K],
+                    [col_start, bindex * BLOCK_K],
                     b_full[b_buffer],
                     eviction_policy="evict_last",
                 )
 
+        with tlx.async_task(num_warps=1, num_regs=32):
+            for index in range(k_tiles):
+                a_buffer, a_phase = get_bufidx_phase(index, NUM_A_BUFFERS)
+                tlx.barrier_wait(a_empty[a_buffer], a_phase ^ 1)
+                tlx.barrier_expect_bytes(a_full[a_buffer], 2 * BLOCK_M * BLOCK_K)
+                tlx.async_descriptor_load(
+                    a_desc,
+                    a_smem[a_buffer],
+                    [row_start, index * BLOCK_K],
+                    a_full[a_buffer],
+                )
+
 
 CONFIG = {
-    "BLOCK_M": 64,
+    "BLOCK_M": 128,
     "BLOCK_N": 256,
     "BLOCK_K": 64,
-    "NUM_A_BUFFERS": 4,
-    "NUM_B_BUFFERS": 2,
-    "EPILOGUE_WARPS": 8,
-    "EPILOGUE_REGS": 128,
+    "NUM_A_BUFFERS": 6,
+    "NUM_B_BUFFERS": 4,
+    "NUM_STAGE": 4,
+    "NSPLIT": 2,
+    "EPI_REGS": 232,
+    "EPI_N": 64,
     "LAUNCH_WARPS": 8,
-    "CLUSTERED": 0,
-    "SPLIT_EPILOGUE": 1,
 }
 
 
@@ -437,6 +269,14 @@ def _descriptor(
     return cached[1]
 
 
+def make_outputs(m: int, n: int, device: torch.device) -> dict[str, torch.Tensor]:
+    return {
+        "projection": torch.empty((m, n), device=device, dtype=torch.bfloat16),
+        "output": torch.empty((m, n), device=device, dtype=torch.bfloat16),
+        "rstd": torch.empty((m,), device=device, dtype=torch.float32),
+    }
+
+
 def run_tlx(
     inputs: dict[str, torch.Tensor],
     outputs: dict[str, torch.Tensor],
@@ -445,38 +285,54 @@ def run_tlx(
 ) -> None:
     config = CONFIG if config is None else config
     launch_warps = config["LAUNCH_WARPS"]
-    clustered = bool(config["CLUSTERED"])
+    nsplit = config["NSPLIT"]
     kernel_config = {
-        key: value
-        for key, value in config.items()
-        if key not in ("LAUNCH_WARPS", "CLUSTERED")
+        key: value for key, value in config.items() if key != "LAUNCH_WARPS"
     }
-    a_desc = _descriptor("a", inputs["a"], (config["BLOCK_M"], config["BLOCK_K"]))
+    m, k = inputs["a"].shape
+    n = inputs["b"].shape[0]
+    block_m = config["BLOCK_M"]
+    epi_n = config["EPI_N"]
+    a_desc = _descriptor("a", inputs["a"], (block_m, config["BLOCK_K"]))
     b_desc = _descriptor("b", inputs["b"], (config["BLOCK_N"], config["BLOCK_K"]))
-    kernel = rmsnorm_silu_gemm_clustered_tlx if clustered else rmsnorm_silu_gemm_tlx
-    reduction_ctas = baseline.N // config["BLOCK_N"]
-    grid = (
-        (triton.cdiv(baseline.M, config["BLOCK_M"]), reduction_ctas)
-        if clustered
-        else (triton.cdiv(baseline.M, config["BLOCK_M"]),)
-    )
-    extra_launch = {"ctas_per_cga": (1, reduction_ctas, 1)} if clustered else {}
-    cast(Any, kernel)[grid](
+    p_desc = _descriptor("p", outputs["projection"], (block_m, epi_n))
+    o_desc = _descriptor("o", outputs["output"], (block_m, epi_n))
+    grid = (triton.cdiv(m, block_m), nsplit)
+    extra_launch = {"ctas_per_cga": (1, nsplit, 1)} if nsplit > 1 else {}
+    cast(Any, rmsnorm_silu_gemm_nsplit_tlx)[grid](
         a_desc,
         b_desc,
+        p_desc,
+        o_desc,
         inputs["weight"],
-        outputs["projection"],
-        outputs["output"],
         outputs["rstd"],
-        M=baseline.M,
-        N=baseline.N,
-        K=baseline.K,
-        EPS=baseline.EPS,
+        M=m,
+        N=n,
+        K=k,
+        EPS=EPS,
         **kernel_config,
         num_warps=launch_warps,
         num_stages=1,
         **extra_launch,
     )
+
+
+def fwd_rmsnorm_silu_gemm_tlx(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    config: dict[str, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused ``a @ b.T`` with a weighted RMSNorm and SiLU epilogue.
+
+    Returns ``(projection, output, rstd)`` where ``projection`` is the bf16
+    GEMM result the epilogue normalizes, ``output`` is the activated result and
+    ``rstd`` is the per-row reciprocal RMS the normalization used.
+    """
+    outputs = make_outputs(a.shape[0], b.shape[0], a.device)
+    run_tlx({"a": a, "b": b, "weight": weight}, outputs, config=config)
+    return outputs["projection"], outputs["output"], outputs["rstd"]
 
 
 def _time_once(call: Any) -> float:
@@ -518,23 +374,15 @@ def main() -> int:
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--json", type=Path)
     parser.add_argument("--block-m", type=int, default=CONFIG["BLOCK_M"])
-    parser.add_argument("--block-n", type=int, choices=(128, 256), default=256)
+    parser.add_argument("--block-n", type=int, default=CONFIG["BLOCK_N"])
     parser.add_argument("--block-k", type=int, default=CONFIG["BLOCK_K"])
     parser.add_argument("--a-buffers", type=int, default=CONFIG["NUM_A_BUFFERS"])
     parser.add_argument("--b-buffers", type=int, default=CONFIG["NUM_B_BUFFERS"])
-    parser.add_argument("--epilogue-warps", type=int, default=CONFIG["EPILOGUE_WARPS"])
-    parser.add_argument("--epilogue-regs", type=int, default=CONFIG["EPILOGUE_REGS"])
+    parser.add_argument("--stages", type=int, default=CONFIG["NUM_STAGE"])
+    parser.add_argument("--n-split", type=int, default=CONFIG["NSPLIT"])
+    parser.add_argument("--epilogue-regs", type=int, default=CONFIG["EPI_REGS"])
+    parser.add_argument("--epilogue-n", type=int, default=CONFIG["EPI_N"])
     parser.add_argument("--launch-warps", type=int, default=CONFIG["LAUNCH_WARPS"])
-    parser.add_argument(
-        "--clustered",
-        action=argparse.BooleanOptionalAction,
-        default=bool(CONFIG["CLUSTERED"]),
-    )
-    parser.add_argument(
-        "--split-epilogue",
-        action=argparse.BooleanOptionalAction,
-        default=bool(CONFIG["SPLIT_EPILOGUE"]),
-    )
     args = parser.parse_args()
     config = {
         "BLOCK_M": args.block_m,
@@ -542,14 +390,12 @@ def main() -> int:
         "BLOCK_K": args.block_k,
         "NUM_A_BUFFERS": args.a_buffers,
         "NUM_B_BUFFERS": args.b_buffers,
-        "EPILOGUE_WARPS": args.epilogue_warps,
-        "EPILOGUE_REGS": args.epilogue_regs,
+        "NUM_STAGE": args.stages,
+        "NSPLIT": args.n_split,
+        "EPI_REGS": args.epilogue_regs,
+        "EPI_N": args.epilogue_n,
         "LAUNCH_WARPS": args.launch_warps,
-        "CLUSTERED": int(args.clustered),
-        "SPLIT_EPILOGUE": int(args.split_epilogue),
     }
-    if not args.clustered and args.block_n != 256:
-        raise ValueError("the one-CTA kernel currently requires BLOCK_N=256")
 
     accuracy_by_seed = {}
     for seed in dict.fromkeys(args.verification_seeds):
