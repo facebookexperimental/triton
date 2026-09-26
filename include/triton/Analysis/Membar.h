@@ -32,7 +32,8 @@ struct AllocationSlice {
 public:
   // Create allocation slice from a value, collecting subslice offsets
   AllocationSlice(Value value, Interval<size_t> allocationInterval,
-                  Allocation::BufferId bufferId);
+                  Allocation::BufferId bufferId,
+                  Allocation *allocation = nullptr, Value stageBasis = {});
 
   // Builder for accesses that represent accesses to the whole
   // allocation (scratch buffers, ArriveBarrierOp, ..)
@@ -55,24 +56,50 @@ public:
 
   Allocation::BufferId getBufferId() const { return bufferId; }
 
+  // Transport a pending access into the counted loop's current-IV coordinates.
+  AllocationSlice enterStageLoop(Value induction, unsigned initialParity) const;
+  AllocationSlice advanceStageLoop(Value induction) const;
+  AllocationSlice forgetStageLoop() const;
+
   AllocationSlice translated(size_t offset,
                              bool invalidateBufferId = false) const {
-    AllocationSlice shifted = *this;
+    AllocationSlice shifted = invalidateBufferId ? forgetStageLoop() : *this;
     shifted.allocationInterval = Interval<size_t>(
-        allocationInterval.start() + offset, allocationInterval.end() + offset);
-    if (invalidateBufferId)
+        shifted.allocationInterval.start() + offset,
+        shifted.allocationInterval.end() + offset);
+    if (invalidateBufferId) {
       shifted.bufferId = Allocation::InvalidBufferId;
+      shifted.stage = {};
+    } else if (shifted.stage.parent) {
+      shifted.stage.parentInterval = Interval<size_t>(
+          shifted.stage.parentInterval.start() + offset,
+          shifted.stage.parentInterval.end() + offset);
+    }
     return shifted;
   }
 
   void print(raw_ostream &os) const;
 
 private:
+  // An empty basis denotes a literal stage. A nonempty basis denotes
+  // parity(basis) XOR parity. Only an eligible counted loop supplies a basis.
+  struct StageInfo {
+    Value parent;
+    Value basis;
+    Interval<size_t> parentInterval{0, 0};
+    size_t stride = 0;
+    unsigned parity = 0;
+  } stage;
+  using StageKey = std::tuple<const void *, const void *, Interval<size_t>,
+                              size_t, unsigned>;
+
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
-             llvm::ArrayRef<int64_t>>
+             llvm::ArrayRef<int64_t>, StageKey>
   asTuple() const {
     return {allocationInterval, bufferId, accessTy.getAsOpaquePointer(),
-            subsliceOffsets};
+            subsliceOffsets,
+            {stage.parent.getAsOpaquePointer(), stage.basis.getAsOpaquePointer(),
+             stage.parentInterval, stage.stride, stage.parity}};
   }
   // Offsets from subslice. Empty when offsets are unknown
   SmallVector<int64_t> subsliceOffsets;
@@ -102,6 +129,20 @@ struct BlockInfo {
       syncWriteSlices[slice.first].insert(slice.second.begin(),
                                           slice.second.end());
     return *this;
+  }
+
+  BlockInfo mapSlices(
+      const std::function<AllocationSlice(const AllocationSlice &)> &map) const {
+    BlockInfo result;
+    auto transfer = [&](const SliceMapT &source, SliceMapT &destination) {
+      for (const auto &[slice, ops] : source) {
+        auto &mappedOps = destination[map(slice)];
+        mappedOps.insert(ops.begin(), ops.end());
+      }
+    };
+    transfer(syncReadSlices, result.syncReadSlices);
+    transfer(syncWriteSlices, result.syncWriteSlices);
+    return result;
   }
 
   void dump() {
@@ -260,6 +301,21 @@ protected:
   virtual void update(Operation *operation, BlockInfo *blockInfo,
                       FuncBlockInfoMapT *funcBlockInfoMap,
                       OpBuilder *builder) = 0;
+
+  // A deliberately bounded CF loop: preheader -> header -> body -> header,
+  // with a signed exclusive test, constant nonnegative start and unit step.
+  struct StageLoop {
+    Block *entry;
+    Block *header;
+    Block *body;
+    Value induction;
+    unsigned initialParity;
+  };
+  SmallVector<StageLoop> stageLoops;
+  void discoverStageLoops(FunctionOpInterface function);
+  Value getStageBasis(Operation *operation) const;
+  BlockInfo transferStageLoops(const BlockInfo &info, Block *from,
+                              Block *to) const;
 
   Allocation *allocation = nullptr;
   MembarFilterFn filter = nullptr;

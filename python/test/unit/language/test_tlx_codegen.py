@@ -20,6 +20,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language._core import builtin as gluon_builtin
 import dataclasses
+import gzip
+import hashlib
 import importlib.util
 import re
 import sys
@@ -768,6 +770,49 @@ def test_raw_ttir_uses_target_warp_size(target, expected_warp_size):
     )
 
     assert module.get_int_attr("ttg.threads-per-warp") == expected_warp_size
+
+
+@triton.jit
+def _explicit_mfma_reduce_add(a, b):
+    return a + b
+
+
+@triton.jit
+def _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=VERSION, instr_shape=[16, 16, INSTR_K], transposed=True,
+        warps_per_cta=[2, 1, 4],
+    )
+    batch = tl.arange(0, 2)
+    rows = tl.arange(0, 16)
+    cols = tl.arange(0, 64)
+    offsets = batch[:, None, None] * 1024 + rows[None, :, None] * 64 + cols[None, None, :]
+    values = tlx.require_layout(tl.load(Input + offsets), mma, pin=False)
+    total = tl.reduce(values, 0, _explicit_mfma_reduce_add)
+    output_offsets = tlx.require_layout(rows[:, None] * 64 + cols[None, :], tlx.slice_layout(mma, 0), pin=False)
+    tl.store(Output + output_offsets, total)
+
+
+@pytest.mark.parametrize("target,version,instr_k", [(GFX942, 3, 16), (GFX950, 4, 32)])
+def test_explicit_mfma_reduction_uses_target_metadata_during_ast(target, version, instr_k):
+    backend = triton.compiler.compiler.make_backend(target)
+    options = backend.parse_options({"num_warps": 8})
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    source = ASTSource(
+        fn=_explicit_mfma_batch_reduce_kernel,
+        signature={"Input": "*fp32", "Output": "*fp32"},
+        constexprs={"VERSION": version, "INSTR_K": instr_k},
+    )
+    # tl.reduce verifies its explicit input layout before post_ast_lowering.
+    module = source.make_ir(target, options, backend.get_codegen_implementation(options),
+                            backend.get_module_map(), context)
+    assert module.get_int_attr("ttg.threads-per-warp") == 64
+    assert module.get_int_attr("ttg.num-warps") == 8
+    assert module.verify()
+    assert "tt.reduce" in str(module)
+    assert "#ttg.slice" in str(module)
 
 
 @triton.jit
@@ -1543,6 +1588,196 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
 
 
 @triton.jit
+def _amd_scheduled_mfma_split_commit_kernel(
+    a_ptr,
+    k_ptr,
+    p_ptr,
+    do_ptr,
+    v_ptr,
+    output_ptr,
+    REVERSE_COMMITS: tl.constexpr,
+    INTERVENING_MFMA: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 16)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 16 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    k = tlx.require_layout(
+        tl.load(k_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    p = tlx.require_layout(
+        tl.load(p_ptr + rows[:, None] * 16 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    do = tlx.require_layout(
+        tl.load(do_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    v_live = tlx.require_layout(
+        tl.load(v_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    v_live = tlx.amd_register_resident(
+        v_live,
+        register_class="agpr",
+        registers_per_group=4,
+    )
+    dk = tlx.zeros((32, 128), tl.float32, layout=mma)
+    dv = tlx.zeros((32, 128), tl.float32, layout=mma)
+    dk = tlx.amd_scheduled_mfma(
+        a,
+        k,
+        dk,
+        accumulator_role="persistent",
+        accumulator_register_class="agpr",
+        initialize=True,
+    )
+    dv = tlx.amd_scheduled_mfma(
+        p,
+        do,
+        dv,
+        accumulator_role="persistent",
+        accumulator_register_class="vgpr",
+        initialize=True,
+    )
+    if REVERSE_COMMITS:
+        dv, v_live = tlx.amd_mfma_commit(dv, preserve=v_live)
+        dk = tlx.amd_mfma_commit(dk)
+    else:
+        dk = tlx.amd_mfma_commit(dk)
+        if INTERVENING_MFMA:
+            dv = tlx.amd_scheduled_mfma(
+                p,
+                do,
+                dv,
+                accumulator_role="persistent",
+                accumulator_register_class="vgpr",
+            )
+        dv, v_live = tlx.amd_mfma_commit(dv, preserve=v_live)
+    output_offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 128 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_offsets, dk + dv)
+
+
+@triton.jit
+def _amd_scheduled_mfma_short_first_split_commit_kernel(
+    short_a_ptr,
+    short_b_ptr,
+    long_a_ptr,
+    long_b_ptr,
+    live_ptr,
+    short_output_ptr,
+    long_output_ptr,
+):
+    short_mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    short_dot0: tl.constexpr = tlx.dot_operand_layout(0, short_mma, k_width=8)
+    short_dot1: tl.constexpr = tlx.dot_operand_layout(1, short_mma, k_width=8)
+    short_rows = tl.arange(0, 16)
+    short_reduction = tl.arange(0, 32)
+    short_cols = tl.arange(0, 64)
+    short_a = tlx.require_layout(
+        tl.load(short_a_ptr + short_rows[:, None] * 32 + short_reduction[None, :]),
+        short_dot0,
+        pin=False,
+    )
+    short_b = tlx.require_layout(
+        tl.load(short_b_ptr + short_reduction[:, None] * 64 + short_cols[None, :]),
+        short_dot1,
+        pin=False,
+    )
+    short_result = tlx.zeros((16, 64), tl.float32, layout=short_mma)
+    short_result = tlx.amd_scheduled_mfma(
+        short_a,
+        short_b,
+        short_result,
+        accumulator_role="persistent",
+        accumulator_register_class="agpr",
+        initialize=True,
+    )
+
+    long_mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    long_dot0: tl.constexpr = tlx.dot_operand_layout(0, long_mma, k_width=8)
+    long_dot1: tl.constexpr = tlx.dot_operand_layout(1, long_mma, k_width=8)
+    long_rows = tl.arange(0, 32)
+    long_reduction = tl.arange(0, 16)
+    long_cols = tl.arange(0, 128)
+    long_a = tlx.require_layout(
+        tl.load(long_a_ptr + long_rows[:, None] * 16 + long_reduction[None, :]),
+        long_dot0,
+        pin=False,
+    )
+    long_b = tlx.require_layout(
+        tl.load(long_b_ptr + long_reduction[:, None] * 128 + long_cols[None, :]),
+        long_dot1,
+        pin=False,
+    )
+    live = tlx.require_layout(
+        tl.load(live_ptr + long_reduction[:, None] * 128 + long_cols[None, :]),
+        long_dot1,
+        pin=False,
+    )
+    live = tlx.amd_register_resident(
+        live,
+        register_class="agpr",
+        registers_per_group=4,
+    )
+    long_result = tlx.zeros((32, 128), tl.float32, layout=long_mma)
+    long_result = tlx.amd_scheduled_mfma(
+        long_a,
+        long_b,
+        long_result,
+        accumulator_role="persistent",
+        accumulator_register_class="vgpr",
+        initialize=True,
+    )
+
+    short_result = tlx.amd_mfma_commit(short_result)
+    long_result, live = tlx.amd_mfma_commit(long_result, preserve=live)
+    short_offsets = tlx.require_layout(
+        short_output_ptr + short_rows[:, None] * 64 + short_cols[None, :],
+        short_mma,
+        pin=False,
+    )
+    long_offsets = tlx.require_layout(
+        long_output_ptr + long_rows[:, None] * 128 + long_cols[None, :],
+        long_mma,
+        pin=False,
+    )
+    tl.store(short_offsets, short_result)
+    tl.store(long_offsets, long_result)
+
+
+@triton.jit
 def _load_then_restructure(base, offsets):
     value = tlx.buffer_load(base, offsets)
     value = tl.reshape(value, [4, 4, 16, 2, 2])
@@ -2092,6 +2327,129 @@ def test_scheduled_mfma_hazard_repair_allows_drained_result_reads(copy_instructi
     result = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
     assert result.count("s_nop 11") == 1
     assert copy_instruction in result
+
+
+def test_scheduled_mfma_hazard_repair_accepts_vgpr_result():
+    assembly = """kernel:
+; triton_amd_scheduled_mfma
+v_mfma_f32_32x32x16_bf16 v[0:15], v[32:35], a[0:3], 0
+v_add_f32_e32 v16, v0, v17
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert "s_nop 15\ns_nop 3\nv_add_f32_e32 v16, v0, v17" in repaired
+
+
+def test_scheduled_mfma_hazard_repair_accepts_tied_vgpr_accumulator():
+    assembly = """kernel:
+s_mov_b32 s0, 0
+s_mov_b32 s1, 0
+s_mov_b32 s2, 0
+v_mov_b32_e32 v0, 1
+; triton_amd_scheduled_mfma
+v_mfma_f32_16x16x32_f16 v[0:3], v[8:11], a[4:7], v[0:3]
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert "; triton_amd_scheduled_mfma\ns_nop 0\nv_mfma_f32_16x16x32_f16" in repaired
+
+
+def test_scheduled_mfma_hazard_repair_drains_vgpr_result_overwrite():
+    assembly = """kernel:
+s_nop 3
+; triton_amd_scheduled_mfma
+v_mfma_f32_32x32x16_bf16 v[0:15], v[32:35], a[0:3], 0
+v_add_f32_e32 v0, v16, v17
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert "s_nop 15\ns_nop 3\nv_add_f32_e32 v0, v16, v17" in repaired
+
+
+def test_scheduled_mfma_hazard_repair_allows_unrelated_vgpr_definition():
+    assembly = """kernel:
+s_nop 3
+; triton_amd_scheduled_mfma
+v_mfma_f32_32x32x16_bf16 v[0:15], v[32:35], a[0:3], 0
+v_add_f32_e32 v20, v16, v17
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert repaired == assembly
+
+
+def test_scheduled_mfma_hazard_repair_merges_mixed_results_through_diamond():
+    assembly = """kernel:
+s_cbranch_scc1 .LBB0_2
+.LBB0_1:
+s_nop 3
+; triton_amd_scheduled_mfma
+v_mfma_f32_16x16x32_f16 a[0:3], v[24:27], v[28:31], 0
+s_branch .LBB0_3
+.LBB0_2:
+s_nop 3
+; triton_amd_scheduled_mfma
+v_mfma_f32_32x32x16_f16 v[8:23], v[32:35], a[4:7], 0
+s_branch .LBB0_3
+.LBB0_3:
+v_accvgpr_read_b32 v24, a0
+v_mov_b32_e32 v8, v25
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert ".LBB0_3:\ns_nop 10\nv_accvgpr_read_b32 v24, a0\ns_nop 6\nv_mov_b32_e32 v8, v25" in repaired
+
+
+def test_scheduled_mfma_hazard_repair_propagates_mixed_results_through_loop_backedge():
+    assembly = """kernel:
+s_branch .LBB0_2
+.LBB0_1:
+v_accvgpr_read_b32 v24, a0
+v_mov_b32_e32 v8, v25
+.LBB0_2:
+s_nop 3
+; triton_amd_scheduled_mfma
+v_mfma_f32_16x16x32_f16 a[0:3], v[24:27], v[28:31], 0
+; triton_amd_scheduled_mfma
+v_mfma_f32_32x32x16_f16 v[8:23], v[32:35], a[4:7], 0
+s_branch .LBB0_1
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert ".LBB0_1:\ns_nop 9\nv_accvgpr_read_b32 v24, a0\ns_nop 7\nv_mov_b32_e32 v8, v25" in repaired
+
+
+@pytest.mark.parametrize(
+    ("destination", "accumulator"),
+    [
+        ("v[0:15]", "a[0:15]"),
+        ("a[0:15]", "v[0:15]"),
+    ],
+)
+def test_scheduled_mfma_hazard_repair_rejects_mixed_destination_accumulator_classes(destination, accumulator):
+    assembly = f"""kernel:
+; triton_amd_scheduled_mfma
+v_mfma_f32_32x32x16_bf16 {destination}, v[32:35], a[0:3], {accumulator}
+"""
+
+    with pytest.raises(ValueError, match="marked MFMA srcC must be tied to its destination"):
+        amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+
+def test_scheduled_mfma_hazard_repair_matches_agpr_parent():
+    fixture = Path(__file__).with_name("test_data") / "scheduled_mfma_agpr_parent.raw.amdgcn.gz"
+    raw_assembly = gzip.decompress(fixture.read_bytes())
+    assert hashlib.sha256(raw_assembly).hexdigest() == "c6103f4e74043a8dc89314bdfa16136b7835aebc7842703e6828b43a918dd0b8"
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(raw_assembly.decode(), "gfx950")
+
+    assert hashlib.sha256(repaired.encode()).hexdigest() == "fdf629dfd955cab83ca82a43e45233dd3cefcb4cca3dcb74222c2b1d6dde6923"
 
 
 def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
@@ -3212,6 +3570,112 @@ def test_amd_scheduled_mfma_persistent_acc_hazards_are_automatic_gfx950():
     assert llir.count('asm sideeffect "s_nop 11"') == 1
 
 
+def test_amd_scheduled_mfma_split_commit_defers_vgpr_chain_drain_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_split_commit_kernel,
+        signature={
+            "a_ptr": "*bf16",
+            "k_ptr": "*bf16",
+            "p_ptr": "*bf16",
+            "do_ptr": "*bf16",
+            "v_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "REVERSE_COMMITS": "constexpr",
+            "INTERVENING_MFMA": "constexpr",
+        },
+        constexprs={"REVERSE_COMMITS": False, "INTERVENING_MFMA": False},
+    )
+    llir = compiled.asm["llir"]
+    marker = "; triton_amd_scheduled_mfma\\0A"
+    mfmas = [line for line in llir.splitlines() if marker in line]
+    assert len(mfmas) == 2
+    assert '"=a,v,v"' in mfmas[0]
+    assert '"=&v,v,v"' in mfmas[1]
+    assert "s_nop 3\\0Av_mfma" not in mfmas[0]
+    assert "s_nop 3\\0Av_mfma" not in mfmas[1]
+
+    # The first full dK drain also covers the older dV result. The second
+    # side-effecting boundary keeps its tied VGPR/AGPR allocation constraints
+    # without emitting another native wait instruction.
+    assert llir.count('asm sideeffect "s_nop 15\\0As_nop 3"') == 1
+    assert 'asm sideeffect "s_nop 15\\0As_nop 3", "=a,0,~{memory}"' in llir
+    assert 'asm sideeffect "s_nop 5", "=v,=a,0,1,~{memory}"' not in llir
+    assert 'asm sideeffect "", "=v,=a,0,1,~{memory}"' in llir
+
+
+@pytest.mark.parametrize(
+    ("reverse_commits", "intervening_mfma"),
+    [
+        pytest.param(True, False, id="reversed"),
+        pytest.param(False, True, id="intervening-mfma"),
+    ],
+)
+def test_amd_scheduled_mfma_split_commit_requires_adjacent_full_drain_first_gfx950(
+    reverse_commits,
+    intervening_mfma,
+):
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_split_commit_kernel,
+        signature={
+            "a_ptr": "*bf16",
+            "k_ptr": "*bf16",
+            "p_ptr": "*bf16",
+            "do_ptr": "*bf16",
+            "v_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "REVERSE_COMMITS": "constexpr",
+            "INTERVENING_MFMA": "constexpr",
+        },
+        constexprs={
+            "REVERSE_COMMITS": reverse_commits,
+            "INTERVENING_MFMA": intervening_mfma,
+        },
+    )
+    llir = compiled.asm["llir"]
+    assert llir.count('asm sideeffect "s_nop 15\\0As_nop 3"') == 1
+    assert 'asm sideeffect "s_nop 15\\0As_nop 3", "=a,0,~{memory}"' in llir
+    assert 'asm sideeffect "s_nop 5", "=v,=a,0,1,~{memory}"' in llir
+    assert 'asm sideeffect "", "=v,=a,0,1,~{memory}"' not in llir
+
+
+def test_amd_scheduled_mfma_split_commit_rejects_short_first_drain_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_short_first_split_commit_kernel,
+        signature={
+            "short_a_ptr": "*bf16",
+            "short_b_ptr": "*bf16",
+            "long_a_ptr": "*bf16",
+            "long_b_ptr": "*bf16",
+            "live_ptr": "*bf16",
+            "short_output_ptr": "*fp32",
+            "long_output_ptr": "*fp32",
+        },
+        constexprs={},
+    )
+    llir = compiled.asm["llir"]
+    assert llir.count('asm sideeffect "s_nop 11"') == 1
+    assert 'asm sideeffect "s_nop 11", "=a,0,~{memory}"' in llir
+    assert 'asm sideeffect "s_nop 5", "=v,=a,0,1,~{memory}"' in llir
+    assert 'asm sideeffect "", "=v,=a,0,1,~{memory}"' not in llir
+
+
+def test_amd_scheduled_mfma_vgpr_results_only_commit_is_conservative_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_persistent_acc_kernel,
+        signature={
+            "a_ptr": "*bf16",
+            "b_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "USE_VGPR": "constexpr",
+            "COMMIT": "constexpr",
+        },
+        constexprs={"USE_VGPR": True, "COMMIT": True},
+    )
+    llir = compiled.asm["llir"]
+    assert "; triton_amd_scheduled_mfma\\0A" not in llir
+    assert 'asm sideeffect "s_nop 3\\0Av_mfma' in llir
+
+
 @triton.jit
 def _amd_scheduled_mfma_bypassed_commit_kernel(a_ptr, b_ptr, output_ptr, take_commit):
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -4102,6 +4566,7 @@ def test_varlen_d128_address_space_requires_i32_offsets():
         batch=1,
         q_heads=1,
         kv_heads=1,
+        dq_atomic_fp32=False,
     )
 
     with pytest.raises(ValueError, match="KV tensor size exceeds the signed 32-bit byte-offset range"):
@@ -4111,6 +4576,7 @@ def test_varlen_d128_address_space_requires_i32_offsets():
             batch=1,
             q_heads=1,
             kv_heads=1,
+            dq_atomic_fp32=False,
         )
     with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
         amd_fa_varlen_bwd._validate_i32_buffer_offsets(
@@ -4119,6 +4585,47 @@ def test_varlen_d128_address_space_requires_i32_offsets():
             batch=1,
             q_heads=1,
             kv_heads=1,
+            dq_atomic_fp32=False,
+        )
+
+    # FP32 dQ scratch reaches the same signed byte-offset limit at half as
+    # many elements as the BF16 path.
+    max_fp32_tokens = 2**22
+    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+        total_q=max_fp32_tokens - 15,
+        total_kv=1,
+        batch=1,
+        q_heads=1,
+        kv_heads=1,
+        dq_atomic_fp32=True,
+    )
+    with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
+        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+            total_q=max_fp32_tokens - 14,
+            total_kv=1,
+            batch=1,
+            q_heads=1,
+            kv_heads=1,
+            dq_atomic_fp32=True,
+        )
+    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+        total_q=max_fp32_tokens - 31,
+        total_kv=1,
+        batch=1,
+        q_heads=1,
+        kv_heads=1,
+        dq_atomic_fp32=True,
+        dq_pad_rows=32,
+    )
+    with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
+        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+            total_q=max_fp32_tokens - 30,
+            total_kv=1,
+            batch=1,
+            q_heads=1,
+            kv_heads=1,
+            dq_atomic_fp32=True,
+            dq_pad_rows=32,
         )
 
 
@@ -5177,3 +5684,154 @@ test_gfx1250_grouped_gemm_tdm_asymmetric_alias_compiles = _gfx1250_grouped.test_
 test_gfx1250_grouped_gemm_tdm_asymmetric_dedicated_c_compiles = _gfx1250_grouped.test_grouped_gemm_tdm_asymmetric_dedicated_c_compiles_gfx1250
 
 test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch_compiles = _gfx1250_grouped.test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250
+
+
+@triton.jit
+def _amd_scheduled_mfma_output_fragment_atomic_kernel(a_ptr, b_ptr, atomic_ptr, output_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    acc = tlx.zeros((16, 128), tl.float32, layout=mma)
+    acc = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="persistent",
+        initialize=True,
+        output_fragment=0,
+    )
+    tlx.amd_sched_barrier(0)
+    atomic_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), ()),
+        stride=((1, 0), ()),
+    )
+    atomic_offsets = tl.arange(0, 64).to(tl.int32)
+    atomic_offsets = tlx.require_layout(atomic_offsets, atomic_layout, pin=False)
+    atomic_value = tl.full((64, ), 1.0, tl.float32)
+    atomic_value = tlx.require_layout(atomic_value, atomic_layout, pin=False)
+    tlx.buffer_atomic_add(
+        atomic_ptr,
+        atomic_offsets,
+        atomic_value,
+        mask=atomic_offsets < 32,
+        sem="relaxed",
+    )
+    tlx.amd_sched_barrier(0)
+    acc = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="persistent",
+        initialize=True,
+        output_fragment=1,
+    )
+    acc = tlx.amd_mfma_commit(acc)
+    output_offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 128 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_output_fragment_validation_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    OUTPUT_FRAGMENT: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    acc = tlx.zeros((16, 128), tl.float32, layout=mma)
+    acc = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="transient",
+        output_fragment=OUTPUT_FRAGMENT,
+    )
+    output_offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 128 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_offsets, acc)
+
+
+def test_amd_scheduled_mfma_output_fragment_orders_atomic_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_output_fragment_atomic_kernel,
+        signature={
+            "a_ptr": "*bf16",
+            "b_ptr": "*bf16",
+            "atomic_ptr": "*fp32",
+            "output_ptr": "*fp32",
+        },
+        constexprs={},
+    )
+    ttir = compiled.asm["ttir"]
+    assert "output_fragment = 0 : i32" in ttir
+    assert "output_fragment = 1 : i32" in ttir
+    assert ttir.count("amdg.mfma_commit") == 1
+
+    mnemonic = "v_mfma_f32_16x16x32_bf16"
+    instructions = [
+        "mfma" if mnemonic in line else "atomic" for line in compiled.asm["amdgcn"].splitlines()
+        if mnemonic in line or "buffer_atomic_add_f32" in line
+    ]
+    assert instructions == ["mfma", "atomic", "mfma"]
+
+
+@pytest.mark.parametrize("output_fragment", [True, 0.0, "0", -1])
+def test_amd_scheduled_mfma_output_fragment_rejects_invalid_python_values(output_fragment):
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        with pytest.raises(CompilationError, match="output_fragment must be None or a non-negative constexpr integer"):
+            compile_for_gfx950(
+                _amd_scheduled_mfma_output_fragment_validation_kernel,
+                signature={
+                    "a_ptr": "*bf16",
+                    "b_ptr": "*bf16",
+                    "output_ptr": "*fp32",
+                    "OUTPUT_FRAGMENT": "constexpr",
+                },
+                constexprs={"OUTPUT_FRAGMENT": output_fragment},
+            )

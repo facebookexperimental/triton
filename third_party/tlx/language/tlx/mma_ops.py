@@ -139,6 +139,7 @@ def amd_scheduled_mfma(
     resident_operand: tl.constexpr = None,
     accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
+    output_fragment: tl.constexpr = None,
     _semantic=None,
 ):
     """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
@@ -147,12 +148,17 @@ def amd_scheduled_mfma(
     no accumulator-lifetime or register-class contract, this operation exposes
     independent native fragment chains in source order.
 
-    With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
-    The operation keeps one SSA chain per output fragment and creates updates
-    in K-major, N-major, M-minor order. LLVM may reschedule independent updates
-    on the transient intrinsic path. With ``initialize=True``, the first native
-    K update starts from zero and the result is ``a @ b``; the supplied
-    accumulator value is ignored.
+    With ``initialize=False``, each updated fragment computes its part of
+    ``acc + a @ b``. The operation keeps one SSA chain per output fragment and
+    creates updates in K-major, N-major, M-minor order. LLVM may reschedule
+    independent updates on the transient intrinsic path. With
+    ``initialize=True``, the first native K update of each selected fragment
+    starts from zero; only those fragments ignore their supplied accumulator
+    values.
+
+    ``output_fragment`` selects one native output fragment in N-major, M-minor
+    schedule order. The selected fragment is updated while all other fragments
+    pass through unchanged. ``None`` updates every output fragment.
 
     ``accumulator_role`` changes lowering, not the numerical operation.
     ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
@@ -173,15 +179,19 @@ def amd_scheduled_mfma(
     retain conservative waits.
 
     CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
-    ``accumulator_register_class="vgpr"``. The inputs must be matching rank-two
-    BF16 or F16 dot operands with ``kWidth`` 4 or 8, the accumulator must be
-    rank-two F32 with the corresponding unit-tile MFMA layout, and all active
-    lanes of a wave must execute the operation uniformly.
+    ``accumulator_register_class="vgpr"``. The inputs must be matching BF16 or
+    F16 dot operands with ``kWidth`` 4 or 8, and the accumulator must be F32
+    with the corresponding unit-tile MFMA layout. All tensors must have the
+    same rank, either two or three. Rank-three tensors have matching leading
+    batch dimensions distributed over waves, with one batch per wave;
+    ``output_fragment`` retains its per-wave meaning. All active lanes of a
+    wave must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
     accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
     initialize = tl._unwrap_if_constexpr(initialize)
+    output_fragment = tl._unwrap_if_constexpr(output_fragment)
     assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
     assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
     assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
@@ -191,8 +201,12 @@ def amd_scheduled_mfma(
     assert accumulator_register_class in (None, "agpr",
                                           "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    assert output_fragment is None or (isinstance(output_fragment, int) and not isinstance(output_fragment, bool)
+                                       and output_fragment >= 0), (
+                                           "output_fragment must be None or a non-negative constexpr integer")
     resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand]
     accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
+    output_fragment = -1 if output_fragment is None else output_fragment
     handle = _semantic.builder.create_amd_scheduled_mfma(
         a.handle,
         b.handle,
@@ -201,6 +215,7 @@ def amd_scheduled_mfma(
         accumulator_role,
         accumulator_class,
         initialize,
+        output_fragment,
     )
     return tl.tensor(handle, acc.type)
 
@@ -209,10 +224,10 @@ def amd_scheduled_mfma(
 def amd_mfma_commit(value, preserve=None, _semantic=None):
     """Apply an MFMA completion boundary and return every value unchanged.
 
-    ``value`` is one F32 MFMA-layout tensor or a nonempty tuple of independent
-    results. An optional BF16 or F16 dot-operand ``preserve`` is threaded
-    through the same boundary. To carry that dependency forward, consume its
-    returned copy. A single value is returned directly; tuples keep the same
+    ``value`` is one rank-two or rank-three F32 MFMA-layout tensor or a nonempty
+    tuple of independent results. An optional BF16 or F16 dot-operand
+    ``preserve`` is threaded through the same boundary. To carry that dependency
+    forward, consume its returned copy. A single value is returned directly; tuples keep the same
     arity; supplying ``preserve`` appends its returned copy to the result.
 
     With ``preserve``, F32 results cross the boundary in VGPRs and the preserved

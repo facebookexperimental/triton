@@ -368,6 +368,40 @@ def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
 
 
 @triton.jit
+def _amd_scheduled_mfma_wave_batch_kernel(
+    A, B, Out, M: tl.constexpr, INSTR_M: tl.constexpr, WARPS: tl.constexpr,
+    ROLE: tl.constexpr, INITIALIZE: tl.constexpr, FRAGMENT: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4, instr_shape=[INSTR_M, INSTR_M, 512 // INSTR_M],
+        transposed=True, warps_per_cta=WARPS,
+    )
+    lhs: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rhs: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    batch = tl.arange(0, 2)
+    m = tl.arange(0, M)
+    k = tl.arange(0, 32)
+    n = tl.arange(0, 128)
+    a = tl.load(A + batch[:, None, None] * M * 32 + m[None, :, None] * 32 + k[None, None, :])
+    b = tl.load(B + batch[:, None, None] * 32 * 128 + k[None, :, None] * 128 + n[None, None, :])
+    a = tlx.require_layout(a, lhs, pin=False)
+    b = tlx.require_layout(b, rhs, pin=False)
+    b = tlx.amd_register_resident(b, register_class="agpr", registers_per_group=4)
+    acc = tlx.zeros((2, M, 128), tl.float32, layout=mma) + 7.0
+    result = tlx.amd_scheduled_mfma(
+        a, b, acc, accumulator_role=ROLE, resident_operand=1,
+        initialize=INITIALIZE, output_fragment=FRAGMENT,
+    )
+    if ROLE == "transient":
+        result, _ = tlx.amd_mfma_commit(result, b)
+    else:
+        result = tlx.amd_mfma_commit(result)
+    offsets = batch[:, None, None] * M * 128 + m[None, :, None] * 128 + n[None, None, :]
+    offsets = tlx.require_layout(offsets, mma, pin=False)
+    tl.store(Out + offsets, result)
+
+
+@triton.jit
 def _amd_scheduled_mfma_chain_kernel(a_ptr, b_ptr, output_ptr, BANDS: tl.constexpr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -1653,6 +1687,31 @@ def test_amd_scheduled_mfma_correct_gfx950(k_width):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("m,instr_m,warps", [(16, 16, (2, 1, 4)), (64, 32, (2, 2, 2)), (64, 16, (2, 4, 1))])
+@pytest.mark.parametrize("role", ["transient", "persistent"])
+@pytest.mark.parametrize("initialize", [False, True])
+@pytest.mark.parametrize("fragment", [None, 1])
+def test_amd_scheduled_mfma_wave_batch_correct_gfx950(m, instr_m, warps, role, initialize, fragment):
+    torch.manual_seed(3605)
+    a = torch.randn((2, m, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((2, 32, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((2, m, 128), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_wave_batch_kernel[(1, )](
+        a, b, actual, m, instr_m, warps, role, initialize, fragment,
+        num_warps=8, matrix_instr_nonkdim=instr_m,
+    )
+    expected = a.float() @ b.float()
+    if not initialize:
+        expected += 7.0
+    if fragment is not None:
+        # A fragment spans one instruction tile across the waves along N.
+        width = instr_m * warps[2]
+        expected[:, :, :width] = 7.0
+        expected[:, :, 2 * width:] = 7.0
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_amd_scheduled_mfma_chain_correct_gfx950():
     torch.manual_seed(0)
     a = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
@@ -2550,3 +2609,181 @@ def test_masked_unaligned_vector_load_correctness_gfx950(device):
     expected[:valid_size] = x[1:1 + valid_size]
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
     assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
+@triton.jit
+def _amd_scheduled_mfma_output_fragment_kernel(
+    a_ptr,
+    b_ptr,
+    initial_ptr,
+    partial_output_ptr,
+    full_output_ptr,
+    INITIALIZE: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 32)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 32 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    initial = tlx.require_layout(
+        tl.load(initial_ptr + rows[:, None] * 32 + cols[None, :]),
+        mma,
+        pin=False,
+    )
+
+    partial = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        initial,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+        output_fragment=0,
+    )
+    partial = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        partial,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+        output_fragment=1,
+    )
+    partial = tlx.amd_mfma_commit(partial)
+
+    full = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        initial,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+    )
+    full = tlx.amd_mfma_commit(full)
+
+    output_offsets = tlx.require_layout(
+        rows[:, None] * 32 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(partial_output_ptr + output_offsets, partial)
+    tl.store(full_output_ptr + output_offsets, full)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("initialize", [False, True], ids=["update", "initialize"])
+def test_amd_scheduled_mfma_output_fragment_correct_gfx950(initialize):
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 32), device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn((16, 32), device="cuda", dtype=torch.float32)
+    partial = torch.empty_like(initial)
+    full = torch.empty_like(initial)
+    _amd_scheduled_mfma_output_fragment_kernel[(1, )](
+        a,
+        b,
+        initial,
+        partial,
+        full,
+        INITIALIZE=initialize,
+        num_warps=1,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a.float() @ b.float()
+    if not initialize:
+        expected += initial
+    torch.testing.assert_close(partial, expected, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(partial, full, atol=0.0, rtol=0.0)
+
+
+@triton.jit
+def _amd_scheduled_mfma_single_output_fragment_kernel(
+    a_ptr,
+    b_ptr,
+    initial_ptr,
+    output_ptr,
+    INITIALIZE: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 32)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 32 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    initial = tlx.require_layout(
+        tl.load(initial_ptr + rows[:, None] * 32 + cols[None, :]),
+        mma,
+        pin=False,
+    )
+    result = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        initial,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+        output_fragment=1,
+    )
+    result = tlx.amd_mfma_commit(result)
+    output_offsets = tlx.require_layout(
+        rows[:, None] * 32 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_ptr + output_offsets, result)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("initialize", [False, True], ids=["update", "initialize"])
+def test_amd_scheduled_mfma_single_output_fragment_mapping_gfx950(initialize):
+    torch.manual_seed(17)
+    a = torch.randn((32, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 32), device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn((32, 32), device="cuda", dtype=torch.float32)
+    actual = torch.empty_like(initial)
+    _amd_scheduled_mfma_single_output_fragment_kernel[(1, )](
+        a,
+        b,
+        initial,
+        actual,
+        INITIALIZE=initialize,
+        num_warps=1,
+        matrix_instr_nonkdim=16,
+    )
+
+    # N-major/M-minor selector 1 is (m=1, n=0), while this tile occupies
+    # M-major/N-minor packed storage slot 2. A direct selector-to-storage index
+    # would update the top-right tile instead.
+    expected = initial.clone()
+    selected = a.float()[16:32, :] @ b.float()[:, 0:16]
+    if not initialize:
+        selected += initial[16:32, 0:16]
+    expected[16:32, 0:16] = selected
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)

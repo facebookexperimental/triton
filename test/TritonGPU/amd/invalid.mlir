@@ -590,6 +590,117 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
+#scheduled_predicate_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_predicate_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_predicate_mma, kWidth = 8}>
+#scheduled_predicate_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_predicate_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_requires_wave_uniform_predicate(
+      %predicate: i1,
+      %a: tensor<16x32xbf16, #scheduled_predicate_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_predicate_rhs>,
+      %acc: tensor<16x16xf32, #scheduled_predicate_mma>)
+      -> tensor<16x16xf32, #scheduled_predicate_mma> {
+    %result = ttg.warp_predicate %predicate (%acc) {
+      // expected-error @+1 {{requires a wave-uniform enclosing ttg.warp_predicate}}
+      %updated = amdg.scheduled_mfma %a, %b, %acc
+          resident "none" accumulator "persistent"
+          register_class "agpr" initialize true
+          : tensor<16x32xbf16, #scheduled_predicate_lhs>,
+            tensor<32x16xbf16, #scheduled_predicate_rhs>,
+            tensor<16x16xf32, #scheduled_predicate_mma>
+            -> tensor<16x16xf32, #scheduled_predicate_mma>
+      ttg.predicate_yield %updated : tensor<16x16xf32, #scheduled_predicate_mma>
+    } : (i1, tensor<16x16xf32, #scheduled_predicate_mma>)
+        -> tensor<16x16xf32, #scheduled_predicate_mma>
+    tt.return %result : tensor<16x16xf32, #scheduled_predicate_mma>
+  }
+}
+
+// -----
+
+#scheduled_nested_predicate_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_nested_predicate_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_nested_predicate_mma, kWidth = 8}>
+#scheduled_nested_predicate_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_nested_predicate_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_requires_all_enclosing_predicates_wave_uniform(
+      %outer_predicate: i1,
+      %inner_predicate: i1,
+      %a: tensor<16x32xbf16, #scheduled_nested_predicate_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_nested_predicate_rhs>,
+      %acc: tensor<16x16xf32, #scheduled_nested_predicate_mma>)
+      -> tensor<16x16xf32, #scheduled_nested_predicate_mma> {
+    %outer = ttg.warp_predicate %outer_predicate (%acc) {
+      %inner = ttg.warp_predicate %inner_predicate (%acc) {
+        // expected-error @+1 {{requires a wave-uniform enclosing ttg.warp_predicate}}
+        %updated = amdg.scheduled_mfma %a, %b, %acc
+            resident "none" accumulator "persistent"
+            register_class "agpr" initialize true
+            : tensor<16x32xbf16, #scheduled_nested_predicate_lhs>,
+              tensor<32x16xbf16, #scheduled_nested_predicate_rhs>,
+              tensor<16x16xf32, #scheduled_nested_predicate_mma>
+              -> tensor<16x16xf32, #scheduled_nested_predicate_mma>
+        ttg.predicate_yield %updated : tensor<16x16xf32, #scheduled_nested_predicate_mma>
+      } {wave_uniform} : (i1, tensor<16x16xf32, #scheduled_nested_predicate_mma>)
+          -> tensor<16x16xf32, #scheduled_nested_predicate_mma>
+      ttg.predicate_yield %inner : tensor<16x16xf32, #scheduled_nested_predicate_mma>
+    } : (i1, tensor<16x16xf32, #scheduled_nested_predicate_mma>)
+        -> tensor<16x16xf32, #scheduled_nested_predicate_mma>
+    tt.return %outer : tensor<16x16xf32, #scheduled_nested_predicate_mma>
+  }
+}
+
+// -----
+
+#scheduled_fragment_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_fragment_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_fragment_mma, kWidth = 8}>
+#scheduled_fragment_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_fragment_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_output_fragment_below_sentinel(
+      %a: tensor<16x32xbf16, #scheduled_fragment_lhs>,
+      %b: tensor<32x32xbf16, #scheduled_fragment_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x32xf32, #scheduled_fragment_mma>
+    // expected-error @+1 {{output_fragment must be -1 or in the range [0, 2), got -2}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true {output_fragment = -2 : i32}
+        : tensor<16x32xbf16, #scheduled_fragment_lhs>,
+          tensor<32x32xbf16, #scheduled_fragment_rhs>,
+          tensor<16x32xf32, #scheduled_fragment_mma>
+          -> tensor<16x32xf32, #scheduled_fragment_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#scheduled_fragment_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_fragment_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_fragment_mma, kWidth = 8}>
+#scheduled_fragment_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_fragment_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_output_fragment_at_grid_size(
+      %a: tensor<16x32xbf16, #scheduled_fragment_lhs>,
+      %b: tensor<32x32xbf16, #scheduled_fragment_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x32xf32, #scheduled_fragment_mma>
+    // expected-error @+1 {{output_fragment must be -1 or in the range [0, 2), got 2}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true {output_fragment = 2 : i32}
+        : tensor<16x32xbf16, #scheduled_fragment_lhs>,
+          tensor<32x32xbf16, #scheduled_fragment_rhs>,
+          tensor<16x32xf32, #scheduled_fragment_mma>
+          -> tensor<16x32xf32, #scheduled_fragment_mma>
+    tt.return
+  }
+}
+
+// -----
+
 // Gather with an index layout that distributes values across lanes (invalid).
 // parent blocked: threadsPerWarp = [32, 1] → lanes map to dim 0.
 // slice dim 1 → 1D tensor where each lane holds a different value.
@@ -1246,6 +1357,456 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   tt.func @scaled_upcast_fp4_one_sided_encoding(%x: tensor<16x32xi8>, %s: tensor<16x64xi8, #enc>) {
     // expected-error @+1 {{scale and output must both have an encoding, or neither}}
     %u = amdg.scaled_upcast_fp4 %x scale %s {axis = 1 : i32} : tensor<16x32xi8>, tensor<16x64xi8, #enc> -> tensor<16x64xbf16>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_wave_batch_mismatch(%a: tensor<2x16x32xbf16, #lhs>, %b: tensor<1x32x128xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<2x16x128xf32, #mma>
+    // expected-error @+1 {{operand and accumulator batch dimensions must match}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x16x32xbf16, #lhs>, tensor<1x32x128xbf16, #rhs>, tensor<2x16x128xf32, #mma>
+          -> tensor<2x16x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_wave_batch_register_repetition(%a: tensor<4x16x32xbf16, #lhs>, %b: tensor<4x32x128xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<4x16x128xf32, #mma>
+    // expected-error @+1 {{requires one batch per wave and matching nonempty K fragments}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<4x16x32xbf16, #lhs>, tensor<4x32x128xbf16, #rhs>, tensor<4x16x128xf32, #mma>
+          -> tensor<4x16x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma2 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wave_commit_acc_layout_rank_mismatch(%acc: tensor<2x16x128xf32, #mma2>) {
+    // expected-error @+1 {{input 0 must use a unit-tile CDNA3/CDNA4 MFMA layout}}
+    %result = amdg.mfma_commit %acc : tensor<2x16x128xf32, #mma2>
+    tt.return
+  }
+}
+
+// -----
+
+#mma2 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#rhs2 = #ttg.dot_op<{opIdx = 1, parent = #mma2, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wave_commit_operand_layout_rank_mismatch(%acc: tensor<16x128xf32, #mma2>, %b: tensor<2x32x128xbf16, #rhs2>) {
+    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    %result, %preserved = amdg.mfma_commit %acc, %b : tensor<16x128xf32, #mma2>, tensor<2x32x128xbf16, #rhs2>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_wave_matrix_mismatch(%a: tensor<2x32x32xbf16, #lhs>, %b: tensor<2x32x128xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<2x16x128xf32, #mma>
+    // expected-error @+1 {{operand and accumulator matrix shapes are inconsistent}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x32x32xbf16, #lhs>, tensor<2x32x128xbf16, #rhs>, tensor<2x16x128xf32, #mma>
+          -> tensor<2x16x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma2 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs2 = #ttg.dot_op<{opIdx = 0, parent = #mma2, kWidth = 8}>
+#mma3 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#rhs3 = #ttg.dot_op<{opIdx = 1, parent = #mma3, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_wave_rank_mismatch(%a: tensor<16x32xbf16, #lhs2>, %b: tensor<2x32x128xbf16, #rhs3>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<2x16x128xf32, #mma3>
+    // expected-error @+1 {{requires operands and accumulator of matching rank 2 or 3}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<16x32xbf16, #lhs2>, tensor<2x32x128xbf16, #rhs3>, tensor<2x16x128xf32, #mma3>
+          -> tensor<2x16x128xf32, #mma3>
+    tt.return
+  }
+}
+
+// -----
+
+// Two consumers in one successor execute together, not as alternative uses.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_two_users_in_one_block(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^body, ^exit
+  ^body:
+    %other = arith.negf %acc : tensor<16x16xf32, #mma>
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  ^exit:
+    tt.return
+  }
+}
+
+// -----
+
+// The first arm flows into the other arm's consumer before another header
+// visit, so one dynamic value can be consumed on both paths.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_reconverging_consumers(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^body, ^exit
+  ^body:
+    %other = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.br ^exit
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A consumer can run again without revisiting the header. Distinct consumer
+// blocks alone do not establish one dynamic use of an accumulator value.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_consumer_self_cycle(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1, %again: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^body, ^exit
+  ^body:
+    %updated = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.cond_br %again, ^body, ^header(%updated : tensor<16x16xf32, #mma>)
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A body prefix can replace the header value without consuming it. Merely
+// finding one later consumer on some prefix path is insufficient.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_prefix_skipping_to_header(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1, %skip: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^prefix, ^exit
+  ^prefix:
+    cf.cond_br %skip, ^header(%initial : tensor<16x16xf32, #mma>), ^body
+  ^body:
+    %updated = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.br ^header(%updated : tensor<16x16xf32, #mma>)
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// The body-entry arm can reach either consumer. It is not an unconditional
+// prefix leading to the update separately from the header's exit arm.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_prefix_skipping_to_exit(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1, %skip: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^prefix, ^exit
+  ^prefix:
+    cf.cond_br %skip, ^exit, ^body
+  ^body:
+    %updated = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.br ^header(%updated : tensor<16x16xf32, #mma>)
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A third SSA use is a fork even when the exit commit is reached through a
+// different header successor from the two update-side consumers.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_three_use_fork(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^body, ^exit
+  ^body:
+    %first = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.br ^second_consumer
+  ^second_consumer:
+    %second = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.br ^header(%second : tensor<16x16xf32, #mma>)
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// An unrelated loop in the prefix can avoid the consumer indefinitely. The
+// accepted prefix must be acyclic, even though it does not itself use %acc.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_unrelated_prefix_cycle(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1, %spin: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^prefix, ^exit
+  ^prefix:
+    cf.cond_br %spin, ^prefix_cycle, ^body
+  ^prefix_cycle:
+    cf.cond_br %spin, ^prefix_cycle, ^body
+  ^body:
+    %updated = arith.negf %acc : tensor<16x16xf32, #mma>
+    cf.br ^header(%updated : tensor<16x16xf32, #mma>)
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A captured use in a nested region is outside the function's CFG. Reject it
+// without attempting cross-region block reachability or treating it as a
+// direct use in the containing body block.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_nested_region_capture(
+      %initial: tensor<16x16xf32, #mma>, %condition: i1, %owner: i1) {
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^header(%acc: tensor<16x16xf32, #mma>):
+    cf.cond_br %condition, ^body, ^exit
+  ^body:
+    scf.if %owner {
+      %other = arith.negf %acc : tensor<16x16xf32, #mma>
+      scf.yield
+    }
+    cf.br ^header(%initial : tensor<16x16xf32, #mma>)
+  ^exit:
+    // expected-error @+1 {{input 0 must be consumed only by this completion boundary}}
+    %committed = amdg.mfma_commit %acc : tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Missing encodings must produce a verifier diagnostic instead of a null-attribute cast.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_missing_acc_encoding_rank3(
+      %a: tensor<2x16x32xbf16, #lhs>,
+      %b: tensor<2x32x16xbf16, #rhs>,
+      %acc: tensor<2x16x16xf32>) {
+    // expected-error @+1 {{requires a CDNA3/CDNA4 F32 MFMA accumulator with unit tiles per wave}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x16xbf16, #rhs>, tensor<2x16x16xf32>
+          -> tensor<2x16x16xf32>
+    tt.return
+  }
+}
+
+// -----
+
+// Missing encodings must produce a verifier diagnostic instead of a null-attribute cast.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_missing_a_encoding_rank3(
+      %a: tensor<2x16x32xbf16>,
+      %b: tensor<2x32x16xbf16, #rhs>,
+      %acc: tensor<2x16x16xf32, #mma>) {
+    // expected-error @+1 {{operand A must use the matching opIdx=0, kWidth=4/8 dot layout}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x16x32xbf16>, tensor<2x32x16xbf16, #rhs>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Missing encodings must produce a verifier diagnostic instead of a null-attribute cast.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_missing_b_encoding_rank3(
+      %a: tensor<2x16x32xbf16, #lhs>,
+      %b: tensor<2x32x16xbf16>,
+      %acc: tensor<2x16x16xf32, #mma>) {
+    // expected-error @+1 {{operand B must use the matching opIdx=1, kWidth=4/8 dot layout}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x16xbf16>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A live dot dependency also requires an encoding, for both supported input types.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_missing_bf16_dependency_encoding_rank3(
+      %acc: tensor<2x16x16xf32, #mma>, %dependency: tensor<2x32x16xbf16>) {
+    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    %result, %preserved = amdg.mfma_commit %acc, %dependency
+        : tensor<2x16x16xf32, #mma>, tensor<2x32x16xbf16>
+    tt.return
+  }
+}
+
+// -----
+
+// A live dot dependency also requires an encoding, for both supported input types.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_missing_f16_dependency_encoding_rank3(
+      %acc: tensor<2x16x16xf32, #mma>, %dependency: tensor<2x32x16xf16>) {
+    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    %result, %preserved = amdg.mfma_commit %acc, %dependency
+        : tensor<2x16x16xf32, #mma>, tensor<2x32x16xf16>
+    tt.return
+  }
+}
+
+// -----
+
+// Missing encodings must produce a verifier diagnostic instead of a null-attribute cast.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_missing_acc_encoding_rank2(
+      %a: tensor<16x32xbf16, #lhs>,
+      %b: tensor<32x16xbf16, #rhs>,
+      %acc: tensor<16x16xf32>) {
+    // expected-error @+1 {{requires a CDNA3/CDNA4 F32 MFMA accumulator with unit tiles per wave}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>, tensor<16x16xf32>
+          -> tensor<16x16xf32>
+    tt.return
+  }
+}
+
+// -----
+
+// Missing encodings must produce a verifier diagnostic instead of a null-attribute cast.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_missing_a_encoding_rank2(
+      %a: tensor<16x32xbf16>,
+      %b: tensor<32x16xbf16, #rhs>,
+      %acc: tensor<16x16xf32, #mma>) {
+    // expected-error @+1 {{operand A must use the matching opIdx=0, kWidth=4/8 dot layout}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<16x32xbf16>, tensor<32x16xbf16, #rhs>, tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Missing encodings must produce a verifier diagnostic instead of a null-attribute cast.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_missing_b_encoding_rank2(
+      %a: tensor<16x32xbf16, #lhs>,
+      %b: tensor<32x16xbf16>,
+      %acc: tensor<16x16xf32, #mma>) {
+    // expected-error @+1 {{operand B must use the matching opIdx=1, kWidth=4/8 dot layout}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16>, tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// A live dot dependency also requires an encoding, for both supported input types.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_missing_bf16_dependency_encoding_rank2(
+      %acc: tensor<16x16xf32, #mma>, %dependency: tensor<32x16xbf16>) {
+    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    %result, %preserved = amdg.mfma_commit %acc, %dependency
+        : tensor<16x16xf32, #mma>, tensor<32x16xbf16>
+    tt.return
+  }
+}
+
+// -----
+
+// A live dot dependency also requires an encoding, for both supported input types.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_missing_f16_dependency_encoding_rank2(
+      %acc: tensor<16x16xf32, #mma>, %dependency: tensor<32x16xf16>) {
+    // expected-error @+1 {{input 1 must use a matching BF16 or F16 dot-operand layout with kWidth=4/8}}
+    %result, %preserved = amdg.mfma_commit %acc, %dependency
+        : tensor<16x16xf32, #mma>, tensor<32x16xf16>
     tt.return
   }
 }

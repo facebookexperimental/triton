@@ -1,12 +1,17 @@
 #include "triton/Analysis/Membar.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include <deque>
+#include <limits>
+#include <optional>
 
 namespace ttng = mlir::triton::nvidia_gpu;
 
@@ -45,9 +50,146 @@ static Interval<size_t> narrowIntervalForSubview(Value value,
   return Interval<size_t>(newStart, newStart + stride);
 }
 
+static bool isConstantInt(Value value, int64_t expected) {
+  APInt constant;
+  return matchPattern(value, m_ConstantInt(&constant)) && constant == expected;
+}
+
+// Recognize only parity of the induction value supplied by discoverStageLoops.
+// In particular, a scalar stage index unrelated to that value is not a proof
+// that different waves access the same stage.
+static std::optional<unsigned> getStageParity(Value value, Value induction,
+                                              unsigned depth = 0) {
+  if (!induction || depth > 3)
+    return std::nullopt;
+  if (auto rem = value.getDefiningOp<arith::RemSIOp>()) {
+    if (rem.getLhs() == induction && isConstantInt(rem.getRhs(), 2))
+      return 0;
+  }
+  if (auto bitAnd = value.getDefiningOp<arith::AndIOp>()) {
+    if ((bitAnd.getLhs() == induction && isConstantInt(bitAnd.getRhs(), 1)) ||
+        (bitAnd.getRhs() == induction && isConstantInt(bitAnd.getLhs(), 1)))
+      return 0;
+  }
+  Value complemented;
+  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    if (isConstantInt(sub.getLhs(), 1))
+      complemented = sub.getRhs();
+  } else if (auto bitXor = value.getDefiningOp<arith::XOrIOp>()) {
+    if (isConstantInt(bitXor.getLhs(), 1))
+      complemented = bitXor.getRhs();
+    else if (isConstantInt(bitXor.getRhs(), 1))
+      complemented = bitXor.getLhs();
+  }
+  if (complemented)
+    if (auto parity = getStageParity(complemented, induction, depth + 1))
+      return *parity ^ 1;
+  return std::nullopt;
+}
+
+// Limit symbolic slices to a direct, stable allocation dominating the header.
+// Descriptor block arguments, selects and reinterpretations are intentionally
+// not traced to an underlying allocation.
+static bool isStableStageParent(Value parent, Value induction) {
+  if (!parent || !induction)
+    return false;
+  auto argument = dyn_cast<BlockArgument>(induction);
+  auto alloc = parent.getDefiningOp<triton::gpu::LocalAllocOp>();
+  if (!argument || !alloc)
+    return false;
+  Block *header = argument.getOwner();
+  if (alloc->getBlock() == header ||
+      alloc->getBlock()->getParent() != header->getParent())
+    return false;
+  DominanceInfo dominance(header->getParentOp());
+  return dominance.dominates(alloc.getOperation(), &header->front());
+}
+
+struct StageGeometry {
+  Value parent;
+  Value index;
+  size_t stride;
+};
+
+static std::optional<StageGeometry>
+getStageGeometry(Value value, Interval<size_t> interval,
+                 Allocation::BufferId bufferId, Allocation *allocation) {
+  if (!allocation)
+    return std::nullopt;
+  triton::gpu::MemDescIndexOp index;
+  while (Operation *def = value.getDefiningOp()) {
+    if ((index = dyn_cast<triton::gpu::MemDescIndexOp>(def)))
+      break;
+    // These views stay within the indexed stage. Do not extend this to every
+    // MemDescViewTrait: reinterpretation can change the physical stage bounds.
+    if (!isa<triton::gpu::MemDescSubsliceOp,
+             triton::gpu::MemDescTransOp>(def))
+      return std::nullopt;
+    value = def->getOperand(0);
+  }
+  if (!index)
+    return std::nullopt;
+  auto alloc = index.getSrc().getDefiningOp<triton::gpu::LocalAllocOp>();
+  if (!alloc || !alloc.isSharedMemoryAlloc())
+    return std::nullopt;
+  auto parentType = alloc.getType();
+  auto stageType = index.getType();
+  auto encoding = parentType.getEncoding();
+  auto layout = dyn_cast<triton::gpu::LayoutEncodingTrait>(encoding);
+  if (!layout ||
+      isa<triton::gpu::PartitionedSharedEncodingAttr>(encoding) ||
+      parentType.getRank() != stageType.getRank() + 1 ||
+      layout.getRank() != stageType.getRank() ||
+      parentType.getShape().front() != 2 ||
+      parentType.getShape() != parentType.getAllocShape() ||
+      stageType.getShape() != stageType.getAllocShape() ||
+      parentType.getShape().drop_front() != stageType.getShape() ||
+      encoding != stageType.getEncoding())
+    return std::nullopt;
+
+  auto ids = allocation->getBufferIds(alloc.getResult());
+  if (ids.size() != 1 || ids.front() != bufferId ||
+      allocation->getAllocatedInterval(bufferId) != interval)
+    return std::nullopt;
+
+  // Match Allocation's footprint and MemDescIndex lowering's stage stride.
+  // Padding omits the gap after the last element, so interval.size()/2 is not
+  // necessarily the byte offset of stage 1.
+  unsigned bitWidth = getIntOrFloatOrPtrBitWidth(parentType.getElementType());
+  if (bitWidth < 8 || bitWidth % 8)
+    return std::nullopt;
+  int64_t parentElems = triton::gpu::getAllocationElems(
+      encoding, parentType.getAllocShape());
+  int64_t stageElems = triton::gpu::getAllocationElems(
+      encoding, stageType.getAllocShape());
+  if (parentElems <= 0 || stageElems <= 0 ||
+      stageElems >= std::numeric_limits<int32_t>::max() ||
+      parentElems % 2 || parentElems / 2 != stageElems)
+    return std::nullopt;
+  int64_t strideElems = stageElems;
+  int64_t extentElems = stageElems;
+  if (auto padded = triton::gpu::getPaddedEncoding(encoding)) {
+    parentElems = padded.getPaddedSize({parentElems});
+    extentElems = padded.getPaddedSize({stageElems});
+    // getPaddedSize(N+1)-1 includes the padding immediately before element N.
+    strideElems = padded.getPaddedSize({stageElems + 1}) - 1;
+  }
+  if (extentElems <= 0 || strideElems < extentElems ||
+      parentElems <= strideElems || parentElems - strideElems != extentElems)
+    return std::nullopt;
+  size_t bytesPerElement = bitWidth / 8;
+  size_t parentBytes = interval.end() - interval.start();
+  if (parentBytes % bytesPerElement ||
+      parentBytes / bytesPerElement != static_cast<uint64_t>(parentElems))
+    return std::nullopt;
+  return StageGeometry{alloc.getResult(), index.getIndex(),
+                       static_cast<size_t>(strideElems) * bytesPerElement};
+}
+
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
-                                 Allocation::BufferId bufferId)
+                                 Allocation::BufferId bufferId,
+                                 Allocation *allocation, Value stageBasis)
     : allocationInterval(narrowIntervalForSubview(value, allocationInterval)),
       bufferId(bufferId) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
@@ -63,11 +205,73 @@ AllocationSlice::AllocationSlice(Value value,
       subsliceOffsets = SmallVector<int64_t>(subslice.getOffsets());
     }
   }
+
+  auto geometry =
+      getStageGeometry(value, allocationInterval, bufferId, allocation);
+  if (!geometry)
+    return;
+  std::optional<unsigned> parity;
+  if (isConstantInt(geometry->index, 0))
+    parity = 0;
+  else if (isConstantInt(geometry->index, 1))
+    parity = 1;
+  else if (isStableStageParent(geometry->parent, stageBasis)) {
+    parity = getStageParity(geometry->index, stageBasis);
+    if (parity)
+      stage.basis = stageBasis;
+  }
+  if (!parity)
+    return;
+  stage.parent = geometry->parent;
+  stage.parentInterval = allocationInterval;
+  stage.stride = geometry->stride;
+  stage.parity = *parity;
+}
+
+AllocationSlice AllocationSlice::enterStageLoop(Value induction,
+                                                 unsigned initialParity) const {
+  auto result = forgetStageLoop();
+  if (!result.stage.parent ||
+      !isStableStageParent(result.stage.parent, induction))
+    return result;
+  result.stage.basis = induction;
+  result.stage.parity ^= initialParity;
+  // A lifted entry access now denotes either physical stage. Keeping its old
+  // constant interval would incorrectly prove later-iteration accesses disjoint.
+  result.allocationInterval = result.stage.parentInterval;
+  return result;
+}
+
+AllocationSlice AllocationSlice::advanceStageLoop(Value induction) const {
+  if (!stage.basis)
+    return *this;
+  if (stage.basis != induction)
+    return forgetStageLoop();
+  auto result = *this;
+  // old parity(iv) = new parity(iv) XOR 1 for the recognized +1 latch.
+  result.stage.parity ^= 1;
+  return result;
+}
+
+AllocationSlice AllocationSlice::forgetStageLoop() const {
+  auto result = *this;
+  if (stage.basis) {
+    result.allocationInterval = stage.parentInterval;
+    result.stage = {};
+  }
+  return result;
 }
 
 bool AllocationSlice::intersects(const AllocationSlice &other) const {
   // Disjoint intervals don't overlap
   if (!allocationInterval.intersects(other.allocationInterval))
+    return false;
+
+  if (stage.basis && stage.basis == other.stage.basis &&
+      stage.parent == other.stage.parent &&
+      stage.parentInterval == other.stage.parentInterval &&
+      stage.stride == other.stage.stride && bufferId == other.bufferId &&
+      stage.parity != other.stage.parity)
     return false;
 
   // If access types are unknown, assume intersection
@@ -127,6 +331,135 @@ void AllocationSlice::print(raw_ostream &os) const {
   }
 }
 
+static bool isFullCTABarrier(Operation *op) {
+  if (isa<gpu::BarrierOp>(op))
+    return true;
+  if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
+    return barrier.hasLocal();
+  return false;
+}
+
+void MembarOrFenceAnalysis::discoverStageLoops(FunctionOpInterface function) {
+  stageLoops.clear();
+  DominanceInfo dominance(function.getOperation());
+  for (Block &header : function.getBlocks()) {
+    auto branch = dyn_cast<cf::CondBranchOp>(header.getTerminator());
+    if (!branch || !llvm::hasSingleElement(header.without_terminator()))
+      continue;
+    auto compare = branch.getCondition().getDefiningOp<arith::CmpIOp>();
+    if (!compare || compare->getBlock() != &header ||
+        compare.getPredicate() != arith::CmpIPredicate::slt)
+      continue;
+    auto induction = dyn_cast<BlockArgument>(compare.getLhs());
+    if (!induction || induction.getOwner() != &header ||
+        !induction.getType().isInteger(32))
+      continue;
+
+    Block *body = branch.getTrueDest();
+    if (body == &header || branch.getFalseDest() == &header ||
+        branch.getFalseDest() == body || !body->getArguments().empty() ||
+        body->getSinglePredecessor() != &header)
+      continue;
+    auto latch = dyn_cast<cf::BranchOp>(body->getTerminator());
+    if (!latch || latch.getDest() != &header)
+      continue;
+    auto predecessors = llvm::to_vector(header.getPredecessors());
+    if (predecessors.size() != 2)
+      continue;
+    Block *entry = predecessors[0] == body ? predecessors[1] : predecessors[0];
+    if (entry == body || branch.getFalseDest() == entry)
+      continue;
+    auto entryBranch = dyn_cast<cf::BranchOp>(entry->getTerminator());
+    if (!entryBranch || entryBranch.getDest() != &header)
+      continue;
+
+    // A loop-invariant signed upper bound and +1 step ensure that each
+    // executing induction value is nonnegative and the increment cannot
+    // overflow: iv < ub <= INT_MAX implies iv <= INT_MAX-1.
+    Value upperBound = compare.getRhs();
+    if (upperBound.getParentBlock() == &header ||
+        upperBound.getParentBlock() == body ||
+        !dominance.dominates(upperBound, &header.front()))
+      continue;
+    unsigned argIndex = induction.getArgNumber();
+    APInt initial;
+    if (!matchPattern(entryBranch.getDestOperands()[argIndex],
+                      m_ConstantInt(&initial)) ||
+        initial.isNegative())
+      continue;
+    auto increment =
+        latch.getDestOperands()[argIndex].getDefiningOp<arith::AddIOp>();
+    if (!increment || increment->getBlock() != body ||
+        !((increment.getLhs() == induction &&
+           isConstantInt(increment.getRhs(), 1)) ||
+          (increment.getRhs() == induction &&
+           isConstantInt(increment.getLhs(), 1))))
+      continue;
+
+    // An unconditional full CTA barrier bounds inter-wave skew to one
+    // iteration. Arrival, partition, atomic and scheduling barriers do not
+    // establish this proof. Discover before inserting any new barriers.
+    bool hasBodyBarrier = false;
+    bool unsupported = false;
+    for (Operation &op : body->without_terminator()) {
+      if (op.getNumRegions() || isa<CallOpInterface>(&op)) {
+        unsupported = true;
+        break;
+      }
+      hasBodyBarrier |= isFullCTABarrier(&op);
+    }
+    if (unsupported || !hasBodyBarrier)
+      continue;
+
+    // Only accesses after this entry barrier can be lifted into the first
+    // iteration's coordinates. Nested control or calls after it are outside
+    // this bounded proof.
+    bool hasEntryBarrier = false;
+    for (Operation *op = entryBranch->getPrevNode(); op;
+         op = op->getPrevNode()) {
+      if (isFullCTABarrier(op)) {
+        hasEntryBarrier = true;
+        break;
+      }
+      if (op->getNumRegions() || isa<CallOpInterface>(op))
+        break;
+    }
+    if (!hasEntryBarrier)
+      continue;
+
+    stageLoops.push_back(
+        {entry, &header, body, induction, static_cast<unsigned>(initial[0])});
+  }
+}
+
+Value MembarOrFenceAnalysis::getStageBasis(Operation *operation) const {
+  for (const StageLoop &loop : stageLoops)
+    if (operation->getBlock() == loop.body)
+      return loop.induction;
+  return {};
+}
+
+BlockInfo MembarOrFenceAnalysis::transferStageLoops(const BlockInfo &info,
+                                                    Block *from,
+                                                    Block *to) const {
+  for (const StageLoop &loop : stageLoops) {
+    if (from == loop.entry && to == loop.header)
+      return info.mapSlices([&](const AllocationSlice &slice) {
+        return slice.enterStageLoop(loop.induction, loop.initialParity);
+      });
+    if (from == loop.body && to == loop.header)
+      return info.mapSlices([&](const AllocationSlice &slice) {
+        return slice.advanceStageLoop(loop.induction);
+      });
+    if (from == loop.header && to == loop.body)
+      return info;
+  }
+  // No symbolic coordinates escape the recognized edges. In particular the
+  // exit can contain either physical stage, including on a zero-trip path.
+  return info.mapSlices(
+      [](const AllocationSlice &slice) { return slice.forgetStageLoop(); });
+}
+
 void MembarOrFenceAnalysis::run(FuncBlockInfoMapT &funcBlockInfoMap) {
   FunctionOpInterface funcOp =
       dyn_cast<FunctionOpInterface>(allocation->getOperation());
@@ -137,6 +470,7 @@ void MembarOrFenceAnalysis::run(FuncBlockInfoMapT &funcBlockInfoMap) {
 void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
                                     FuncBlockInfoMapT *funcBlockInfoMap,
                                     OpBuilder *builder) {
+  discoverStageLoops(funcOp);
   // Initialize the blockList. Operations are organized into "virtual blocks",
   // which represent segments of straight-line code analyzed by each iteration
   // of the dataflow analysis. Virtual blocks abstract over both control flow
@@ -191,7 +525,9 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
     outputBlockInfoMap[block] = inputBlockInfo;
     // Update the successors
     for (VirtualBlock successor : successors) {
-      inputBlockInfoMap[successor].join(outputBlockInfoMap[block]);
+      auto transferred = transferStageLoops(outputBlockInfoMap[block],
+                                           block.first, successor.first);
+      inputBlockInfoMap[successor].join(transferred);
       blockList.emplace_back(successor);
     }
   }
@@ -406,6 +742,9 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
+  if (isa<CallOpInterface>(op))
+    *blockInfo = blockInfo->mapSlices(
+        [](const AllocationSlice &slice) { return slice.forgetStageLoop(); });
   auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op);
 
   // A later CTA-wide synchronization can also synchronize this wait, provided
@@ -473,8 +812,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                  allocation->getAllBufferIdsWithAliases(value)) {
               if (bufferId != Allocation::InvalidBufferId) {
                 auto interval = allocation->getAllocatedInterval(bufferId);
-                interval = narrowIntervalForSubview(value, interval);
-                auto slice = AllocationSlice(value, interval, bufferId);
+                auto slice = AllocationSlice(value, interval, bufferId,
+                                             allocation, getStageBasis(op));
 
                 if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
                   curBlockInfo.syncWriteSlices[slice].insert(op);

@@ -27,17 +27,47 @@ constexpr StringLiteral kMfmaRepairHazardsAfterRaAttr =
     "ttg.amdg.scheduled_mfma.repair_hazards_after_ra";
 constexpr StringLiteral kMfmaDeferResultDrainAttr =
     "ttg.amdg.scheduled_mfma.defer_result_drain";
+constexpr StringLiteral kMfmaCommitDrainCoveredAttr =
+    "ttg.amdg.mfma_commit.drain_covered";
 
-static bool usesPersistentAgprAccumulator(triton::amdgpu::ScheduledMfmaOp op) {
+// `auto` derives storage from the role alone, identically on every target.
+// Targets that cannot honor it reject it in the verifier.
+static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
+  StringRef storage = op.getAccumulatorRegisterClass();
+  if (storage != "auto")
+    return storage;
+  return op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
+}
+
+static std::optional<StringRef>
+getModeledPersistentAccumulatorClass(triton::amdgpu::ScheduledMfmaOp op) {
   auto accTy = op.getAcc().getType();
   auto mfma = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
   if (!mfma || mfma.getVersion() != 4)
-    return false;
+    return std::nullopt;
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
   bool hasModeledGfx950Shape = instrShape == ArrayRef<unsigned>({16, 16, 32}) ||
                                instrShape == ArrayRef<unsigned>({32, 32, 16});
-  return hasModeledGfx950Shape && op.getAccumulatorRole() == "persistent" &&
-         op.getAccumulatorRegisterClass() != "vgpr";
+  if (!hasModeledGfx950Shape || op.getAccumulatorRole() != "persistent")
+    return std::nullopt;
+  StringRef accumulatorClass = resolveAccumulatorStorage(op);
+  if (accumulatorClass != "agpr" && accumulatorClass != "vgpr")
+    return std::nullopt;
+  return accumulatorClass;
+}
+
+static bool commitEmitsAccumulatorClass(triton::amdgpu::MfmaCommitOp commit,
+                                        StringRef accumulatorClass) {
+  bool hasLiveDependency = false;
+  for (Value input : commit.getInputs()) {
+    Type elementType = cast<RankedTensorType>(input.getType()).getElementType();
+    if (elementType.isF32())
+      continue;
+    if (!elementType.isBF16() && !elementType.isF16())
+      return false;
+    hasLiveDependency = true;
+  }
+  return accumulatorClass == (hasLiveDependency ? "vgpr" : "agpr");
 }
 
 // Return true when every finite CFG path starting in `block` executes one of
@@ -148,22 +178,26 @@ blockArgumentHasOnlyChainInputs(BlockArgument argument,
 }
 
 // Persistent scheduled MFMAs use inline assembly, so LLVM cannot infer their
-// source and destination hazards. Prove that a persistent AGPR result remains
-// inside one linear accumulator chain until an explicit completion boundary.
+// source and destination hazards. Prove that a persistent result remains
+// inside one linear, register-class-stable accumulator chain until an explicit
+// completion boundary that emits the same class.
 // Eligible MFMAs are marked for exact post-RA input-hazard repair. A dataflow
 // fork fails closed and every control-flow path must reach a commit. The final
-// post-RA repair drains any physical AGPR access introduced while lowering a
-// proven CFG edge before it reads or overwrites the accumulator result.
-static bool hasLinearMfmaChainToCommit(Value root) {
+// post-RA repair drains any physical register access introduced while lowering
+// a proven CFG edge before it reads or overwrites the accumulator result.
+static bool hasLinearMfmaChainToCommit(
+    Value root, StringRef accumulatorClass,
+    llvm::DenseSet<Value> *provenCommitInputs = nullptr) {
   SmallVector<Value> worklist{root};
   llvm::DenseSet<Value> visited;
   llvm::DenseSet<Operation *> commits;
+  llvm::DenseSet<Value> commitInputs;
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     if (!visited.insert(value).second)
       continue;
-    // A destructive AGPR accumulator update is safe to defer only when no
-    // copy of the not-yet-drained result can escape to another consumer.
+    // A destructive accumulator update is safe to defer only when no copy of
+    // the not-yet-drained result can escape to another consumer.
     if (!value.hasOneUse() &&
         !triton::AMD::hasMutuallyExclusiveSuccessorUses(value))
       return false;
@@ -171,22 +205,19 @@ static bool hasLinearMfmaChainToCommit(Value root) {
     for (OpOperand &use : value.getUses()) {
       Operation *user = use.getOwner();
       if (auto next = dyn_cast<triton::amdgpu::ScheduledMfmaOp>(user)) {
-        if (next.getAcc() != value || !usesPersistentAgprAccumulator(next))
+        std::optional<StringRef> nextClass =
+            getModeledPersistentAccumulatorClass(next);
+        if (next.getAcc() != value || !nextClass ||
+            *nextClass != accumulatorClass)
           return false;
         worklist.push_back(next.getResult());
         continue;
       }
       if (auto commit = dyn_cast<triton::amdgpu::MfmaCommitOp>(user)) {
-        // A commit with a BF16 dot-operand dependency is a transient handoff
-        // with a shorter result-read delay, not the target-specific persistent
-        // epilogue drain required by a deferred accumulator chain.
-        if (llvm::any_of(commit.getInputs(), [](Value input) {
-              return !cast<RankedTensorType>(input.getType())
-                          .getElementType()
-                          .isF32();
-            }))
+        if (!commitEmitsAccumulatorClass(commit, accumulatorClass))
           return false;
         commits.insert(commit);
+        commitInputs.insert(value);
         continue;
       }
       if (auto branch = dyn_cast<BranchOpInterface>(user)) {
@@ -210,7 +241,11 @@ static bool hasLinearMfmaChainToCommit(Value root) {
                         argument, visited, root.getDefiningOp()->getBlock()))
       return false;
   }
-  return !commits.empty() && allPathsAfterRootReachCommit(root, commits);
+  if (commits.empty() || !allPathsAfterRootReachCommit(root, commits))
+    return false;
+  if (provenCommitInputs)
+    provenCommitInputs->insert(commitInputs.begin(), commitInputs.end());
+  return true;
 }
 
 static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
@@ -1011,6 +1046,100 @@ static FailureOr<int> getMfmaDrainWaitStates(ISAFamily isaFamily,
   return failure();
 }
 
+static FailureOr<int> getMfmaResultDrainWaitStates(Value value,
+                                                   ISAFamily isaFamily) {
+  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensorTy || !tensorTy.getElementType().isF32())
+    return failure();
+  auto mfma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
+      tensorTy.getEncoding());
+  if (!mfma)
+    return failure();
+  return getMfmaDrainWaitStates(isaFamily, mfma.getInstrShape());
+}
+
+static FailureOr<int>
+getMfmaCommitFullDrainWaitStates(triton::amdgpu::MfmaCommitOp op,
+                                 ISAFamily isaFamily) {
+  int maxWaitStates = 0;
+  bool sawMfmaResult = false;
+  for (Value input : op.getInputs()) {
+    auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
+    if (!tensorTy || !tensorTy.getElementType().isF32())
+      continue;
+    FailureOr<int> waitStates = getMfmaResultDrainWaitStates(input, isaFamily);
+    if (failed(waitStates))
+      return failure();
+    sawMfmaResult = true;
+    maxWaitStates = std::max(maxWaitStates, *waitStates);
+  }
+  if (!sawMfmaResult)
+    return failure();
+  return maxWaitStates;
+}
+
+static bool isAgprResidentDotOperand(Value value) {
+  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensorTy || (!tensorTy.getElementType().isBF16() &&
+                    !tensorTy.getElementType().isF16()))
+    return false;
+  auto dot = dyn_cast_or_null<triton::gpu::DotOperandEncodingAttr>(
+      tensorTy.getEncoding());
+  auto mfma = dot ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent())
+                  : triton::gpu::AMDMfmaEncodingAttr();
+  if (!dot || !mfma || mfma.getVersion() != 4 ||
+      !llvm::is_contained({4u, 8u}, dot.getKWidth()))
+    return false;
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  if (instrShape != ArrayRef<unsigned>({16, 16, 32}) &&
+      instrShape != ArrayRef<unsigned>({32, 32, 16}))
+    return false;
+  auto resident = value.getDefiningOp<triton::amdgpu::RegisterResidentOp>();
+  return resident && resident.getRegisterClass() == "agpr";
+}
+
+static bool doesPreviousCommitCoverDrain(
+    triton::amdgpu::MfmaCommitOp second, ISAFamily isaFamily,
+    const llvm::DenseSet<Value> &provenAgprCommitInputs,
+    const llvm::DenseSet<Value> &provenVgprCommitInputs) {
+  auto first =
+      dyn_cast_or_null<triton::amdgpu::MfmaCommitOp>(second->getPrevNode());
+  if (!first || first->getBlock() != second->getBlock())
+    return false;
+
+  for (Value input : first.getInputs()) {
+    auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
+    if (!tensorTy || !tensorTy.getElementType().isF32() ||
+        !provenAgprCommitInputs.contains(input))
+      return false;
+  }
+  FailureOr<int> firstMaxWaitStates =
+      getMfmaCommitFullDrainWaitStates(first, isaFamily);
+  if (failed(firstMaxWaitStates))
+    return false;
+
+  bool sawPreservedDotOperand = false;
+  for (Value input : second.getInputs()) {
+    auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
+    if (!tensorTy)
+      return false;
+    if (!tensorTy.getElementType().isF32()) {
+      if (!isAgprResidentDotOperand(input))
+        return false;
+      sawPreservedDotOperand = true;
+      continue;
+    }
+    if (!provenVgprCommitInputs.contains(input))
+      return false;
+  }
+  FailureOr<int> secondMaxWaitStates =
+      getMfmaCommitFullDrainWaitStates(second, isaFamily);
+  if (failed(secondMaxWaitStates))
+    return false;
+
+  return sawPreservedDotOperand && *firstMaxWaitStates >= *secondMaxWaitStates;
+}
+
 struct ScheduledMfmaAsmInfo {
   StringRef asmMnemonic;
   // `_1k`: the gfx90a+ bf16 set taking 4 bf16/lane instead of 2, declared as
@@ -1408,15 +1537,6 @@ static LogicalResult verifyMfmaVersionMatchesTarget(
   return success();
 }
 
-// `auto` derives storage from the role alone, identically on every target.
-// Targets that cannot honor it reject it in the verifier.
-static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
-  StringRef storage = op.getAccumulatorRegisterClass();
-  if (storage != "auto")
-    return storage;
-  return op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
-}
-
 // Return the first accumulator reaching this boundary that its producer pinned
 // into AGPRs, or null if none is provably AGPR-resident.
 static triton::amdgpu::ScheduledMfmaOp
@@ -1583,23 +1703,17 @@ public:
         targetInfo.getISAFamily() == ISAFamily::CDNA4 && hasLiveDependency;
     int waitStates = 6;
     if (!useGfx950LiveDependencyHandoff) {
-      waitStates = 0;
-      for (Value input : op.getInputs()) {
-        auto tensorTy = cast<RankedTensorType>(input.getType());
-        if (!tensorTy.getElementType().isF32())
-          continue;
-        auto mfma =
-            cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
-        FailureOr<int> drainWaitStates = getMfmaDrainWaitStates(
-            targetInfo.getISAFamily(), mfma.getInstrShape());
-        if (failed(drainWaitStates))
-          return rewriter.notifyMatchFailure(
-              op, "commit boundary carries an MFMA layout with no modeled "
-                  "result-read hazard requirement");
-        waitStates = std::max(waitStates, *drainWaitStates);
-      }
+      FailureOr<int> drainWaitStates =
+          getMfmaCommitFullDrainWaitStates(op, targetInfo.getISAFamily());
+      if (failed(drainWaitStates))
+        return rewriter.notifyMatchFailure(
+            op, "commit boundary carries an MFMA layout with no modeled "
+                "result-read hazard requirement");
+      waitStates = *drainWaitStates;
     }
-    std::string waitAsm = mfmaWaitStateAsm(waitStates);
+    std::string waitAsm = op->hasAttr(kMfmaCommitDrainCoveredAttr)
+                              ? std::string()
+                              : mfmaWaitStateAsm(waitStates);
 
     Type resultTy = outputTypes.front();
     if (outputTypes.size() != 1)
@@ -1695,6 +1809,7 @@ public:
     int64_t numRepN = bRep[2];
     int64_t numRepK = aRep[2] * aDot.getKWidth() / info.kBase;
     int64_t numRepKB = bRep[1] * bDot.getKWidth() / info.kBase;
+    int64_t outputFragment = op.getOutputFragmentAttr().getInt();
     if (failed(maybeA) || failed(maybeB) || numRepK <= 0 ||
         numRepK != numRepKB ||
         maybeA->size() != static_cast<size_t>(numRepM * numRepK) ||
@@ -1764,6 +1879,8 @@ public:
     for (int64_t k = 0; k < numRepK; ++k) {
       for (int64_t n = 0; n < numRepN; ++n) {
         for (int64_t m = 0; m < numRepM; ++m) {
+          if (outputFragment >= 0 && n * numRepM + m != outputFragment)
+            continue;
           int64_t accumulatorIndex = m * numRepN + n;
           Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
@@ -1826,7 +1943,8 @@ public:
               constraints += ",0";
             }
             // Inline assembly hides MFMA hazards from LLVM. For an
-            // automatically proven persistent AGPR chain, preserve a marker
+            // automatically proven persistent accumulator chain, preserve a
+            // marker
             // so the backend can inspect the final physical registers and add
             // only the residual wait after scheduling and register allocation.
             // Unproven chains retain the conservative pre-MFMA padding.
@@ -2065,20 +2183,41 @@ private:
 void mlir::triton::AMD::inferScheduledMfmaHazards(
     ModuleOp mod, const TargetInfo &targetInfo) {
   bool isModeledTarget = targetInfo.getArch() == "gfx950";
+  mod.walk([](triton::amdgpu::MfmaCommitOp op) {
+    op->removeAttr(kMfmaCommitDrainCoveredAttr);
+  });
+
+  llvm::DenseSet<Value> provenAgprCommitInputs;
+  llvm::DenseSet<Value> provenVgprCommitInputs;
   mod.walk([&](triton::amdgpu::ScheduledMfmaOp op) {
     // These are compiler-owned facts. Clear any attributes supplied by input
     // IR before recomputing them, so textual TTGIR cannot bypass this proof.
     op->removeAttr(kMfmaRepairHazardsAfterRaAttr);
     op->removeAttr(kMfmaDeferResultDrainAttr);
 
-    // "auto" selects AGPRs for persistent accumulators. Explicit VGPR chains
-    // retain conservative lowering because the post-RA repair is deliberately
-    // scoped to the tuned persistent-AGPR path.
-    if (!isModeledTarget || !usesPersistentAgprAccumulator(op) ||
-        !hasLinearMfmaChainToCommit(op.getResult()))
+    std::optional<StringRef> accumulatorClass =
+        getModeledPersistentAccumulatorClass(op);
+    llvm::DenseSet<Value> provenCommitInputs;
+    if (!isModeledTarget || !accumulatorClass ||
+        !hasLinearMfmaChainToCommit(op.getResult(), *accumulatorClass,
+                                    &provenCommitInputs))
       return;
     op->setAttr(kMfmaRepairHazardsAfterRaAttr, UnitAttr::get(mod.getContext()));
     op->setAttr(kMfmaDeferResultDrainAttr, UnitAttr::get(mod.getContext()));
+    llvm::DenseSet<Value> &classCommitInputs = *accumulatorClass == "agpr"
+                                                   ? provenAgprCommitInputs
+                                                   : provenVgprCommitInputs;
+    classCommitInputs.insert(provenCommitInputs.begin(),
+                             provenCommitInputs.end());
+  });
+
+  if (!isModeledTarget)
+    return;
+  mod.walk([&](triton::amdgpu::MfmaCommitOp op) {
+    if (doesPreviousCommitCoverDrain(op, targetInfo.getISAFamily(),
+                                     provenAgprCommitInputs,
+                                     provenVgprCommitInputs))
+      op->setAttr(kMfmaCommitDrainCoveredAttr, UnitAttr::get(mod.getContext()));
   });
 }
 

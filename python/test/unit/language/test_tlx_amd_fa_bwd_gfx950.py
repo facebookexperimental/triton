@@ -1,6 +1,7 @@
 """TLX AMD tests -- CDNA4 (gfx950)."""
 
 from dataclasses import replace
+import ast
 import inspect
 import re
 
@@ -93,6 +94,37 @@ def _assert_scratch_free(name, compiled):
         "scratch_loads": 0,
         "scratch_stores": 0,
     }, (name, resources)
+
+
+def _assert_fp32_dq_wave8_pipeline(compiled):
+    ttgir = compiled.asm["ttgir"]
+    # The public route must load both full statistics planes once into shared
+    # memory, then read BM16 slices instead of refetching statistics per tile.
+    assert len(re.findall(r"ttg\.local_alloc[^\n]*!ttg\.memdesc<2x512xf32,", ttgir)) == 1
+    cache_loads = [line for line in ttgir.splitlines()
+                   if "amdg.buffer_load_to_local" in line and "-> <512xf32," in line]
+    assert len(cache_loads) == 2
+    assert all("mask =" in line and "other =" in line for line in cache_loads)
+    assert len(re.findall(r"ttg\.memdesc_dynamic_subslice[^\n]*!ttg\.memdesc<16xf32,", ttgir)) >= 2
+
+    # Follow the store's layout alias rather than depending on SSA numbering.
+    # Its low three register bits are eight consecutive BF16 D elements; the
+    # warp bits retain the native D32/N32 ownership of the accumulator.
+    store_layouts = []
+    for line in ttgir.splitlines():
+        match = re.fullmatch(
+            r"(#\w+) = #ttg\.linear<\{register = (\[.*\]), lane = (\[.*\]), "
+            r"warp = (\[.*\]), block = \[\]\}>", line)
+        if match and ast.literal_eval(match[2])[:3] == [[0, 1], [0, 2], [0, 4]]:
+            if ast.literal_eval(match[4]) == [[0, 32], [32, 0]]:
+                store_layouts.append(match[1])
+    assert len(store_layouts) == 1
+    store_type = f"tensor<64x128xbf16, {store_layouts[0]}>"
+    assert sum("amdg.buffer_store" in line and store_type in line for line in ttgir.splitlines()) == 4
+    assembly = compiled.asm["amdgcn"]
+    assert "buffer_atomic_add_f32" in assembly
+    assert "buffer_atomic_pk_add_bf16" not in assembly
+    _assert_scratch_free(compiled.name, compiled)
 
 
 def _capture_kernel_with_constexprs(monkeypatch, module, name, **constexprs):
@@ -490,6 +522,68 @@ def test_varlen_d128_kernel_block_selection(group_size, kv_splits, expected):
     assert amd_fa_varlen_bwd._select_varlen_kernel_blocks(group_size, kv_splits) == expected
 
 
+def test_varlen_d128_fp32_dq_padding_falls_back_at_i32_boundary():
+    batch = 1024
+    q_heads = 3
+    elements_per_row = q_heads * amd_fa_varlen_bwd._HEAD_DIM
+    max_fp32_rows = amd_fa_varlen_bwd._I32_BUFFER_FP32_ELEMENTS // elements_per_row
+    total_q = max_fp32_rows - batch * (amd_fa_varlen_bwd._BLOCK_M - 1)
+    padded_bm16_elements = (total_q + batch * (amd_fa_varlen_bwd._BLOCK_M - 1)) * elements_per_row
+    padded_bm32_elements = (total_q + batch * (amd_fa_varlen_bwd._WIDE_BLOCK_M - 1)) * elements_per_row
+
+    assert padded_bm16_elements <= amd_fa_varlen_bwd._I32_BUFFER_FP32_ELEMENTS
+    assert amd_fa_varlen_bwd._I32_BUFFER_FP32_ELEMENTS < padded_bm32_elements
+    assert padded_bm32_elements <= amd_fa_varlen_bwd._I32_BUFFER_BF16_ELEMENTS
+
+    fp32_pad_rows = amd_fa_varlen_bwd._select_varlen_dq_pad_rows(
+        total_q=total_q,
+        batch=batch,
+        q_heads=q_heads,
+        block_m=amd_fa_varlen_bwd._WIDE_BLOCK_M,
+        block_n=amd_fa_varlen_bwd._WIDE_BLOCK_N,
+        dq_atomic_fp32=True,
+    )
+    bf16_pad_rows = amd_fa_varlen_bwd._select_varlen_dq_pad_rows(
+        total_q=total_q,
+        batch=batch,
+        q_heads=q_heads,
+        block_m=amd_fa_varlen_bwd._WIDE_BLOCK_M,
+        block_n=amd_fa_varlen_bwd._WIDE_BLOCK_N,
+        dq_atomic_fp32=False,
+    )
+
+    assert fp32_pad_rows == amd_fa_varlen_bwd._BLOCK_M
+    assert bf16_pad_rows == amd_fa_varlen_bwd._WIDE_BLOCK_M
+    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+        total_q=total_q,
+        total_kv=1,
+        batch=batch,
+        q_heads=q_heads,
+        kv_heads=1,
+        dq_atomic_fp32=True,
+        dq_pad_rows=fp32_pad_rows,
+    )
+    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+        total_q=total_q,
+        total_kv=1,
+        batch=batch,
+        q_heads=q_heads,
+        kv_heads=1,
+        dq_atomic_fp32=False,
+        dq_pad_rows=bf16_pad_rows,
+    )
+    with pytest.raises(ValueError, match="padded dQ size"):
+        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+            total_q=total_q,
+            total_kv=1,
+            batch=batch,
+            q_heads=q_heads,
+            kv_heads=1,
+            dq_atomic_fp32=True,
+            dq_pad_rows=amd_fa_varlen_bwd._WIDE_BLOCK_M,
+        )
+
+
 def test_varlen_d128_kv_partial_workspace_shapes():
     k = torch.empty((257, 2, 128), device="meta", dtype=torch.bfloat16)
     max_size_k = torch.empty((2**20, 1, 128), device="meta", dtype=torch.bfloat16)
@@ -792,6 +886,67 @@ def test_varlen_d128_prefix_register_class_tuning_gfx950(monkeypatch, register_c
         compiled.asm["ttir"],
     )
     assert prefix_hints == ([] if expected_class is None else [(expected_class, "4")])
+
+
+@pytest.mark.parametrize("dq_atomic_fp32", (False, True), ids=("bf16-dq", "fp32-dq"))
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "kv_splits"),
+    (pytest.param(12, 4, 3, id="gqa3"), pytest.param(64, 8, 4, id="gqa8")),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, kv_heads, kv_splits,
+                                                         dq_atomic_fp32):
+    q_lengths, kv_lengths = _make_seeded_extend_attention_lengths(batch=19, max_context=12331, seed=42)
+    total_q, total_kv = sum(q_lengths), sum(kv_lengths)
+    assert (total_q, total_kv, max(q_lengths), max(kv_lengths)) == (50754, 100696, 5662, 10414)
+    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, *torch.tensor(kv_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    # The two-argument plan preserves the host-known count needed by the
+    # rolling-owner route; the metadata-supplied plan selects a different core.
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+    assert plan.wide_task_count is not None and plan.wide_task_count > 0
+
+    # Q=0 gives uniform attention, so V=1 has O=1 and LSE=log(KV length).
+    # Zero dO makes all three gradients exactly zero without materializing
+    # the large prefix-attention matrices needed by a dense reference.
+    q = torch.zeros((total_q, q_heads, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.ones((total_kv, kv_heads, 128), dtype=torch.bfloat16, device="cuda")
+    v = torch.ones_like(k)
+    out = torch.ones_like(q)
+    do = torch.zeros_like(q)
+    lse = torch.empty((q_heads, total_q), dtype=torch.float32, device="cuda")
+    q_start = 0
+    for q_length, kv_length in zip(q_lengths, kv_lengths, strict=True):
+        lse[:, q_start:q_start + q_length].fill_(kv_length)
+        q_start += q_length
+    lse.log_()
+
+    preprocess_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_preprocess_dynamic_owner_queue")
+    rolling_launches = {
+        splits: _capture_kernel_with_constexprs(
+            monkeypatch, amd_fa_varlen_bwd, f"_varlen_bwd_interleaved_bm32_rolling_fp32_queue_s{splits}")
+        for splits in (3, 4)
+    }
+    generic_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_bm32_kernel")
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q, k, v, out, do, lse, plan, 128**-0.5, dq_atomic_fp32=dq_atomic_fp32)
+    torch.cuda.synchronize()
+
+    assert len(preprocess_launches) == len(rolling_launches[kv_splits]) == 1
+    assert all(not launches for splits, launches in rolling_launches.items() if splits != kv_splits)
+    assert not generic_launches
+    preprocess_kwargs, _ = preprocess_launches[0]
+    assert preprocess_kwargs["ZERO_DQ"] is True and preprocess_kwargs["PACK_STATS"] is True
+    core_kwargs, compiled = rolling_launches[kv_splits][0]
+    assert core_kwargs["KV_SPLITS"] == kv_splits
+    atomic = "buffer_atomic_add_f32" if dq_atomic_fp32 else "buffer_atomic_pk_add_bf16"
+    assert atomic in compiled.asm["amdgcn"]
+    for name, result, source in zip(("dq", "dk", "dv"), actual, (q, k, v), strict=True):
+        assert result.shape == source.shape and result.device == source.device, name
+        assert result.dtype is torch.bfloat16, name
+        assert torch.count_nonzero(result).item() == 0, name
 
 
 @pytest.mark.parametrize("metadata", ("legacy", "missing_sequence", "missing_start", "default_k96"))
@@ -1211,6 +1366,293 @@ def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
         assert "amdg.rematerialized_range 0 to 16 identity 33" not in ttir
         assert "arith.cmpi sle" not in ttir
         assert "buffer_atomic_pk_add_bf16" in interleaved.asm["amdgcn"]
+
+
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths", "q_heads", "kv_heads", "causal", "wide_split"),
+    (
+        pytest.param([17], [129], 2, 2, False, False, id="noncausal-mha"),
+        pytest.param([33], [257], 3, 1, False, False, id="noncausal-gqa"),
+        pytest.param([5460], [17], 3, 1, False, True, id="noncausal-gqa3-split"),
+        pytest.param([17], [17], 2, 2, True, False, id="causal-mha"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_atomics_generic_paths_gfx950(
+    q_lengths,
+    kv_lengths,
+    q_heads,
+    kv_heads,
+    causal,
+    wide_split,
+):
+    generic_core = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
+    wide_core = amd_fa_varlen_bwd._varlen_bwd_interleaved_bm32_kernel
+    exact_core = amd_fa_varlen_bwd._varlen_bwd_interleaved_bm16_bn256_exact_kernel
+    generic_core.device_caches.clear()
+    wide_core.device_caches.clear()
+    exact_core.device_caches.clear()
+
+    case = _make_varlen_d128_reference_case(
+        q_lengths,
+        kv_lengths,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        seed=2399 + q_heads,
+        causal=causal,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=causal,
+        dq_atomic_fp32=True,
+    )
+    torch.cuda.synchronize()
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert result.dtype is torch.bfloat16, name
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    device = torch.cuda.current_device()
+    selected_core = wide_core if wide_split else generic_core
+    unused_core = generic_core if wide_split else wide_core
+    compiled_objects = tuple(selected_core.device_caches[device][0].values())
+    assert compiled_objects
+    assert not unused_core.device_caches.get(device)
+    assert not exact_core.device_caches.get(device)
+    atomic_assembly = "\n".join(compiled.asm["amdgcn"] for compiled in compiled_objects)
+    assert "buffer_atomic_add_f32" in atomic_assembly
+    assert "buffer_atomic_pk_add_bf16" not in atomic_assembly
+
+
+@pytest.mark.parametrize("max_q", (300, 400))
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_atomics_gfx950(monkeypatch, max_q):
+    kernels = (
+        amd_fa_varlen_bwd._varlen_bwd_preprocess,
+        amd_fa_varlen_bwd._varlen_bwd_interleaved_bm16_bn256_exact_kernel,
+        amd_fa_varlen_bwd._varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel,
+        amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel,
+        amd_fa_varlen_bwd._varlen_mha_dq_convert_coalesced_kernel,
+    )
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+    preprocess_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_preprocess")
+    exact_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_bm16_bn256_exact_kernel")
+    exact_convert_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel")
+    generic_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_kernel")
+    generic_convert_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_mha_dq_convert_coalesced_kernel")
+
+    # Match the public route's batch/maxima while keeping the reference small.
+    # Exercise short/partial BM16 tiles, both sides of Q256, and KV tails.
+    # Q400 also exercises aligned runtime totals; Q300 keeps unaligned totals.
+    last_q = 10 if max_q == 400 else 1
+    q_lengths = [max_q, 1, 15, 16, 17, 255, 256, 257, max_q - 1, *([1] * 758), last_q]
+    kv_lengths = [3200, 1, 127, 128, 129, 255, 256, 257, 257, *([1] * 759)]
+    case = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=4, kv_heads=4, seed=2417)
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        dq_atomic_fp32=True,
+    )
+    torch.cuda.synchronize()
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert result.dtype is torch.bfloat16, name
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    assert len(preprocess_launches) == len(exact_launches) == len(exact_convert_launches) == 1
+    assert generic_launches == generic_convert_launches == []
+    wide_task_count = plan.task_counts[amd_fa_varlen_bwd._WIDE_KV_TASK_COUNT.value].item()
+    assert wide_task_count == 782
+    wide_q_starts = plan.wide_q_start[:wide_task_count].tolist()
+    assert wide_q_starts.count(0) == 13
+    assert wide_q_starts.count(max_q) == 1
+    preprocess_kwargs, _ = preprocess_launches[0]
+    exact_kwargs, compiled = exact_launches[0]
+    assert preprocess_kwargs["PACK_STATS_MHA16"] is True
+    assert preprocess_kwargs["PACK_STATS"] is False
+    assert exact_kwargs["HQ"] == exact_kwargs["HKV"] == 4
+    assert exact_kwargs["BLOCK_M"] == 16 and exact_kwargs["BLOCK_N"] == 256
+    assert exact_kwargs["reverse_local_assignment"] is True
+    assert exact_kwargs["enable_sched_group_barrier_scheduler"] is False
+    assert exact_kwargs["llvm_fn_attrs"] == (("amdgpu-sched-strategy", "max-ilp"), )
+    assert not ({
+        "sink_insts_to_avoid_spills",
+        "regclass_priority_trumps_globalness",
+        "disable_unclustered_high_rp_reschedule",
+    } & exact_kwargs.keys())
+    assembly = compiled.asm["amdgcn"]
+    assert "buffer_atomic_add_f32" in assembly
+    assert "buffer_atomic_pk_add_bf16" not in assembly
+    _assert_fp32_dq_wave8_pipeline(compiled)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_wave8_state_graph_replay_gfx950(monkeypatch):
+    q_lengths = [400, 17, *([1] * 766)]
+    kv_lengths = [3200, 257, *([1] * 766)]
+    original = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=4, kv_heads=4, seed=2431)
+    changed = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=4, kv_heads=4, seed=2437)
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = original
+    original_inputs = tuple(tensor.clone() for tensor in original[:6])
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q, cu_kv, q.shape[0], k.shape[0], max(q_lengths), max(kv_lengths))
+    preprocess = amd_fa_varlen_bwd._varlen_bwd_preprocess
+    exact_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_bm16_bn256_exact_kernel")
+
+    class PoisonedPreprocess:
+
+        def __getitem__(self, grid):
+
+            def launch(o, do, delta, cu_q, dq_acc, total_q_padded, task_counts, **kwargs):
+                assert kwargs["ZERO_DQ"] and kwargs["PACK_STATS_MHA16"]
+                assert delta.dtype is dq_acc.dtype is torch.float32
+                # Graph replay reuses these allocations. Both the first call
+                # and every replay must initialize statistics and dQ scratch.
+                delta.fill_(float("nan"))
+                dq_acc.fill_(float("nan"))
+                return preprocess[grid](o, do, delta, cu_q, dq_acc, total_q_padded, task_counts, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_bwd_preprocess", PoisonedPreprocess())
+
+    def backward():
+        return amd_fa_varlen_bwd.fa_varlen_backward(
+            q, k, v, out, do, lse, plan, scale, dq_atomic_fp32=True)
+
+    def check(actual, reference):
+        for name, result, target in zip(("dq", "dk", "dv"), actual, reference, strict=True):
+            assert result.dtype is torch.bfloat16, name
+            assert torch.isfinite(result).all(), name
+            relative_l2 = torch.linalg.vector_norm(result.float() - target.float()) / torch.linalg.vector_norm(
+                target.float())
+            assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        first = backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    check(first, expected)
+    assert len(exact_launches) == 1
+    _assert_fp32_dq_wave8_pipeline(exact_launches[0][1])
+    with torch.cuda.stream(stream):
+        repeated = backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    check(repeated, expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = backward()
+    output_pointers = tuple(tensor.data_ptr() for tensor in actual)
+    # Fresh forward output/LSE accompany the changed Q/K/V/dO. The replayed
+    # launch keeps its input pointers, plan, scratch and output allocations.
+    for inputs, reference in ((original_inputs, expected), (changed[:6], changed[-1]),
+                              (changed[:6], changed[-1]), (original_inputs, expected)):
+        for target, replacement in zip(original[:6], inputs, strict=True):
+            target.copy_(replacement)
+        for result in actual:
+            result.fill_(float("nan"))
+        graph.replay()
+        check(actual, reference)
+        assert tuple(tensor.data_ptr() for tensor in actual) == output_pointers
+
+
+@pytest.mark.parametrize(
+    ("max_q", "shifted_input"),
+    (
+        pytest.param(401, None, id="q-above-cache-domain"),
+        pytest.param(300, "q", id="misaligned-q"),
+        pytest.param(300, "k", id="misaligned-k"),
+        pytest.param(300, "v", id="misaligned-v"),
+        pytest.param(300, "do", id="misaligned-do"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_wave8_fallback_gfx950(monkeypatch, max_q, shifted_input):
+    q_lengths = [max_q, 17, *([1] * 766)]
+    kv_lengths = [3200, 257, *([1] * 766)]
+    case = list(_make_varlen_d128_reference_case(
+        q_lengths, kv_lengths, q_heads=4, kv_heads=4, seed=2441))
+    if shifted_input is not None:
+        index = {"q": 0, "k": 1, "v": 2, "do": 4}[shifted_input]
+        tensor = case[index]
+        storage = torch.empty(tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device)
+        shifted = storage[1:].view(tensor.shape)
+        shifted.copy_(tensor)
+        assert shifted.is_contiguous() and shifted.data_ptr() % 16 != 0
+        case[index] = shifted
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q, cu_kv, q.shape[0], k.shape[0], max(q_lengths), max(kv_lengths))
+
+    class UnsupportedExactKernel:
+
+        def __getitem__(self, grid):
+            # Fail at dispatch, before an unsafe direct-to-LDS launch can run.
+            pytest.fail("The WAVE8 core must fall back outside its input domain")
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_bwd_interleaved_bm16_bn256_exact_kernel",
+                        UnsupportedExactKernel())
+    generic_launches = _capture_kernel_with_constexprs(
+        monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_kernel")
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q, k, v, out, do, lse, plan, scale, dq_atomic_fp32=True)
+    torch.cuda.synchronize()
+
+    assert generic_launches
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert result.dtype is torch.bfloat16, name
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
