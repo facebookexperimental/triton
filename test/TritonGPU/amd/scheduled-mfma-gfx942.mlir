@@ -220,3 +220,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+// -----
+
+// Rank-three batches remain wave-local on CDNA3 as well.
+// CHECK-LABEL: llvm.func @wave_batched_transient_gfx942
+// CHECK: rocdl.mfma.f32.16x16x16bf16.1k
+// CHECK: llvm.inline_asm has_side_effects{{.*}}s_nop 10
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @wave_batched_transient_gfx942(%a: tensor<2x16x16xbf16, #lhs>, %b: tensor<2x16x16xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<2x16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x16x16xbf16, #lhs>, tensor<2x16x16xbf16, #rhs>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    %committed, %preserved = amdg.mfma_commit %result, %b
+        : tensor<2x16x16xf32, #mma>, tensor<2x16x16xbf16, #rhs>
+    tt.return
+  }
+}

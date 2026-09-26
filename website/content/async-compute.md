@@ -246,12 +246,14 @@ acc = tlx.amd_scheduled_mfma(
     resident_operand=None,
     accumulator_register_class=None,
     initialize=False,
+    output_fragment=None,
 )
 ```
 
-With `initialize=False`, the operation computes the native-fragment equivalent
-of `acc + a @ b`. It keeps one SSA chain per output fragment and creates
-updates in K-major, N-major, M-minor order:
+With `initialize=False` and `output_fragment=None`, the operation computes the
+native-fragment equivalent of `acc + a @ b`. This all-fragment form keeps one
+SSA chain per output fragment and creates updates in K-major, N-major, M-minor
+order:
 
 ```python
 for k in native_k_fragments:
@@ -260,14 +262,20 @@ for k in native_k_fragments:
             acc[m, n] = mfma(a[m, k], b[k, n], acc[m, n])
 ```
 
+With `output_fragment=i`, the operation updates only fragment `i`, selected in
+N-major, M-minor order. Every other accumulator fragment passes through
+unchanged.
+
 This source order round-robins a K slice over independent accumulators before
 returning to the same dependency chain. LLVM may still reschedule independent
 instructions on the transient intrinsic path.
 
-`a` and `b` must be matching rank-two BF16 or F16 tensors with dot-operand
-layouts using `kWidth=4` or `8`. `acc` must be rank-two F32 with the
-corresponding unit-tile MFMA layout. Matrix shapes and per-wave native
-fragments must match.
+`a` and `b` must be matching BF16 or F16 tensors with dot-operand layouts using
+`kWidth=4` or `8`. `acc` must be F32 with the corresponding unit-tile MFMA
+layout. All tensors must have matching rank two or three. Rank-three tensors
+have matching leading batch dimensions distributed over waves, with one batch
+repetition per wave. Matrix shapes and per-wave native fragments must match;
+`output_fragment` keeps its per-wave meaning within each batch.
 
 | Argument | Meaning |
 |----------|---------|
@@ -277,14 +285,18 @@ fragments must match.
 | `resident_operand=0` / `1` | On the persistent path, select `a` / `b` for AGPR placement; the other source uses VGPRs. |
 | `accumulator_register_class=None` | `auto`: persistent work uses AGPR; transient placement is left to LLVM. |
 | `accumulator_register_class="vgpr"` / `"agpr"` | Select the persistent accumulator class explicitly. |
-| `initialize=True` | Start each output chain's first native K update from zero, ignoring the supplied accumulator. |
+| `initialize=True` | Start each selected output chain's first native K update from zero, ignoring that fragment of the supplied accumulator. |
+| `output_fragment=None` | Update every native output fragment. |
+| `output_fragment=i` | Update only fragment `i`, selected in N-major, M-minor order; unselected accumulator fragments pass through unchanged. |
 
 `resident_operand` and an explicit accumulator class impose hard class
 constraints only on the current persistent lowering. The transient intrinsic
 path leaves physical placement to LLVM; use `amd_register_resident` separately
 when a transient source needs an explicit allocation point. Set
 `initialize=True` only for the first band of a multi-band accumulation, or the
-earlier accumulated value will be discarded.
+earlier accumulated value will be discarded. When `output_fragment` selects
+one fragment, initialization applies only to that fragment; unselected
+fragments still pass through unchanged.
 
 Because LLVM cannot model the latency or hazards of an MFMA hidden in inline
 assembly, unproven persistent chains retain target-specific input padding and
