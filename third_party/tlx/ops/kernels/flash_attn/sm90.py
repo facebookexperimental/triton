@@ -252,7 +252,6 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
     SERIALIZE_QK: tl.constexpr = CAUSAL or HEAD_DIM == 128
     USE_SCHEDULER_BARRIER: tl.constexpr = USE_BM192
     USE_K_AHEAD: tl.constexpr = not CAUSAL and HEAD_DIM == 64 and not USE_BM192
-    PRODUCER_REGISTERS: tl.constexpr = 32 if USE_BM192 else None
     CONSUMER_REGISTERS: tl.constexpr = 160 if USE_BM192 else _FWD_CONSUMER_REGISTERS
 
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
