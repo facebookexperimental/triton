@@ -11,7 +11,7 @@ BENCH_MODULES = sorted(p.stem for p in _HERE.glob("bench_*.py"))
 
 
 @pytest.mark.parametrize("module_name", BENCH_MODULES)
-def test_op_perf(module_name, pytestconfig):
+def test_op_perf(module_name, pytestconfig, governor):
     bench = importlib.import_module(module_name)
     if not bench.supported():
         pytest.skip(f"{bench.OP} has no implementation for this device")
@@ -27,6 +27,7 @@ def test_op_perf(module_name, pytestconfig):
         cold_compile_mode=pytestconfig.getoption("--cold-compile"),
         latency_mode=pytestconfig.getoption("--latency-measure-mode"),
         directions=("fwd", ) if fwd_only else ("bwd", ) if bwd_only else None,
+        governor=governor,
     )
     if not results:
         pytest.skip(f"{bench.OP} has no cases matching the current filters")

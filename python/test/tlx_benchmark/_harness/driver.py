@@ -78,9 +78,9 @@ class Prepared:
 #: selected, which architecture is recorded in each case, which device's
 #: clocks are captured, what the artifact is named -- has to agree with it.
 #:
-#: Set once by `select`, from `main`'s `--device`. Absent that (the pytest
-#: entry point, which does no selection) it falls back to the first device,
-#: matching what torch will call `cuda:0`. It cannot be derived from
+#: Set once by `select`, from `main`'s `--device` or the pytest `governor`
+#: fixture. Absent that it falls back to the first device, matching what torch
+#: will call `cuda:0`. It cannot be derived from
 #: `list_devices()[0]` unconditionally: `main` may pin GPU N and set the
 #: visibility variable, and `nvidia-smi` enumerates physical devices regardless
 #: of that, so on a heterogeneous host GPU 0's arch is simply the wrong answer.
