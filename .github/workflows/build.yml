@@ -1,0 +1,23 @@
+name: Build Triton wheel
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: build-wheel-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/wheels_fb.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      pythons: '["cp312"]'
+      arches: '["x86_64"]'
+      max_jobs: 16
+      upload_s3: true
