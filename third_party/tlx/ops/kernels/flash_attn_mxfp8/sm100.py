@@ -6,16 +6,20 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+
 try:
     from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
 except ImportError:
     MXTensor = None
     ScaleCalculationMode = None
 
+_HAS_MXFP8_QUANTIZATION = MXTensor is not None and ScaleCalculationMode is not None
+
 from triton.language.extra.cuda.inline_ptx_lib import _fma_f32x2, _mul_f32x2, _sub_f32x2
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.language.extra.tlx.mxfp8_utils import (
     _cvt_e4m3x4_f32,
+    _fused_amax_to_e8m0,
     _to_mxfp8_32x32_block,
     _to_mxfp8_block_with_block_amax,
 )
@@ -1382,15 +1386,9 @@ def _mxf8_bwd_host_descriptor_pre_hook(nargs):
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
     nargs["desc_q"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
-    if isinstance(nargs.get("desc_q_dk"), TensorDescriptor):
-        nargs["desc_q_dk"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     nargs["desc_k"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
-    if isinstance(nargs.get("desc_k_dq"), TensorDescriptor):
-        nargs["desc_k_dq"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
     nargs["desc_v"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
     nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
-    if isinstance(nargs.get("desc_do_dv"), TensorDescriptor):
-        nargs["desc_do_dv"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM]
     # dQ is reduced to GMEM in fixed-width column chunks. Keep this descriptor
     # independent of the dK/dV epilogue subtile factor.
     nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, DQ_REDUCE_NCOL]
@@ -1750,12 +1748,9 @@ _DPT_SEPARABLE_LAYOUT = tlx.layout(
 @triton.jit  # pragma: no cover
 def _attn_bwd_mxf8_ws(
     desc_q,
-    desc_q_dk,
     desc_k,
-    desc_k_dq,
     desc_v,
     desc_do,
-    desc_do_dv,
     desc_dq,
     desc_dk,
     desc_dv,
@@ -2121,12 +2116,12 @@ def _attn_bwd_mxf8_ws(
 
     # ===== SMEM allocations =====
     k_smem = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
-    k_dq_smem = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k_dq), NUM_BUFFERS_KV)
+    k_dq_smem = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
     v_smem = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
     q_smem = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
     q_dk_smem = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
     do_smem = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
-    do_dv_smem = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do_dv), NUM_BUFFERS_DO)
+    do_dv_smem = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
     # dK consumes dS^T while dQ consumes dS. MXFP8 quantization depends on the
     # reduction axis, so we keep separate internal encodings for the two GEMMs.
     ds_tiles_smem = tlx.local_alloc((BLOCK_N1, BLOCK_M1), p_dtype, NUM_BUFFERS_DS)
@@ -2829,7 +2824,7 @@ def _attn_bwd_mxf8_ws(
                     (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
                 )
                 tlx.async_descriptor_load(
-                    desc_do_dv,
+                    desc_do,
                     do_dv_smem[do_buf_id],
                     [off_z, off_h, curr_m, 0],
                     do_dv_fulls[do_buf_id],
@@ -2856,7 +2851,7 @@ def _attn_bwd_mxf8_ws(
                     (K_BYTES * BLOCK_N1 * HEAD_DIM) + SCALE_BYTES,
                 )
                 tlx.async_descriptor_load(
-                    desc_k_dq,
+                    desc_k,
                     k_dq_smem[kv_buf_id],
                     [off_z, off_h, start_n, 0],
                     k_dq_fulls[kv_buf_id],
@@ -2927,7 +2922,7 @@ def _attn_bwd_mxf8_ws(
                         (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
                     )
                     tlx.async_descriptor_load(
-                        desc_do_dv,
+                        desc_do,
                         do_dv_smem[do_buf_id],
                         [off_z, off_h, curr_m, 0],
                         do_dv_fulls[do_buf_id],
@@ -2960,7 +2955,7 @@ def _attn_bwd_mxf8_ws(
                     # prev_blk_idx is the global ring-buffer position; q_dk
                     # addresses must stay local to the current (z, h, pid) tile.
                     tlx.async_descriptor_load(
-                        desc_q_dk,
+                        desc_q,
                         q_dk_smem[prev_q_buf_id],
                         [off_z, off_h, prev_m, 0],
                         q_dk_fulls[prev_q_buf_id],
@@ -2982,7 +2977,7 @@ def _attn_bwd_mxf8_ws(
                     (Q_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
                 )
                 tlx.async_descriptor_load(
-                    desc_q_dk,
+                    desc_q,
                     q_dk_smem[last_q_buf_id],
                     [off_z, off_h, last_m, 0],
                     q_dk_fulls[last_q_buf_id],
@@ -3003,11 +2998,8 @@ def _attn_bwd_mxf8_ws(
 
 def attention_bwd(
     do,
-    do_dv,
     q,
-    q_dk,
     k,
-    k_dq,
     v,
     o,
     M,
@@ -3024,19 +3016,19 @@ def attention_bwd(
 ):
     """MXFP8 attention backward.
 
-    Operates on dense [Z, H, N_CTX, HEAD_DIM] tensors. Q / K / V are FP8 E4M3
-    with E8M0 block scales pre-quantized in TMA-preshuffled 5D layout
-    (matches the forward kernel's scale convention).
+    Operates on dense [Z, H, N_CTX, HEAD_DIM] tensors. Q, K, and dO are
+    quantized with 32x32 blocks, so each tensor uses one FP8 E4M3 payload in
+    both GEMM orientations. Their normal and reduction-axis-swapped E8M0
+    scales remain distinct TMA-preshuffled tensors. V keeps its original
+    orientation-specific MXFP8 encoding.
 
-    Backward uses dO in two incompatible GEMM orientations:
-      - MMA 2 consumes dO^T, so `do` / `do_scale` must be quantized in the
-        original [N_CTX, HEAD_DIM] layout.
-      - MMA 3 consumes dO directly, so `do_dv` / `do_dv_scale` must be
-        quantized with the reduction axis (N_CTX) as the blocked dimension.
-      - MMA 4 consumes Q directly, so `q_dk` / `q_dk_scale` must use the same
-        reduction-axis-swapped encoding.
-      - MMA 5 consumes K directly, so `k_dq` / `k_dq_scale` must also use the
-        reduction-axis-swapped encoding.
+    The separate Q/Q_dK, K/K_dQ, and dO/dO_dV descriptors intentionally alias
+    the same global payloads while preserving independent pipeline lifetimes:
+      - MMA 1 uses Q/K with normal scales.
+      - MMA 2 uses dO with normal scales.
+      - MMA 3 reuses dO with its reduction-axis-swapped scales.
+      - MMA 4 reuses Q with its reduction-axis-swapped scales.
+      - MMA 5 reuses K with its reduction-axis-swapped scales.
 
     Returns (dQ, dK, dV) with dQ in FP32, dK / dV in BF16.
 
@@ -3044,8 +3036,7 @@ def attention_bwd(
     from query blocks at or below the diagonal). Assumes N_CTX is a multiple of
     128.
     """
-    assert (q.shape == q_dk.shape == k.shape == k_dq.shape == v.shape ==
-            do.shape), "Q, Q_dK, K, K_dQ, V, dO must have the same shape"
+    assert q.shape == k.shape == v.shape == do.shape, "Q, K, V, dO must have the same shape"
     Z, H, N_CTX, HEAD_DIM = q.shape
     assert HEAD_DIM == 128, "this kernel only supports HEAD_DIM = 128"
     assert N_CTX % 128 == 0, "N_CTX must be a multiple of 128 (BLOCK_M1)"
@@ -3078,12 +3069,9 @@ def attention_bwd(
     desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, HEAD_DIM, 1]
 
     desc_q = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-    desc_q_dk = TensorDescriptor(q_dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_k = TensorDescriptor(k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-    desc_k_dq = TensorDescriptor(k_dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_v = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-    desc_do_dv = TensorDescriptor(do_dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_dq = TensorDescriptor(dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
     desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
@@ -3120,12 +3108,9 @@ def attention_bwd(
 
     _attn_bwd_mxf8_ws[grid](
         desc_q,
-        desc_q_dk,
         desc_k,
-        desc_k_dq,
         desc_v,
         desc_do,
-        desc_do_dv,
         desc_dq,
         desc_dk,
         desc_dv,
@@ -3181,6 +3166,78 @@ def swizzled_to_tma_preshuffled(swizzled_scales, M, K, block_size, batch):
     return tma_format
 
 
+@triton.jit
+def _mxfp8_32x32_qdata_dual_scale_kernel(
+    input_ptr,
+    data_ptr,
+    normal_scale_ptr,
+    swapped_scale_ptr,
+):
+    """Quantize one 32x128 tile and write both hardware scale layouts."""
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * 32 + tl.arange(0, 32)
+    offs_n = tl.arange(0, 128)
+    input_block = tl.load(input_ptr + offs_m[:, None] * 128 + offs_n[None, :]).to(tl.float32)
+    input_32x32 = tl.reshape(input_block, (1, 32, 4, 32))
+    partial_amax = tl.max(tl.abs(input_32x32), axis=1)
+    block_amax = tl.max(partial_amax, axis=2)
+    scale_u32, quant_scale = _fused_amax_to_e8m0(block_amax, 1.0 / 448.0)
+    block_scale = scale_u32.to(tl.uint8)
+    data = tl.reshape(
+        (input_32x32 * quant_scale[:, None, :, None]).to(tl.float8e4nv),
+        (32, 128),
+    )
+    tl.store(data_ptr + offs_m[:, None] * 128 + offs_n[None, :], data)
+
+    # Normal orientation: (M, 4) scales in blocked [M/128, 1, 32, 16].
+    row_normal = offs_m[:, None]
+    col_normal = tl.arange(0, 4)[None, :]
+    row_in_128 = row_normal % 128
+    normal_offset = ((row_normal // 128) * 32 + row_in_128 % 32) * 16 + (
+        row_in_128 // 32 * 4 + col_normal
+    )
+    normal_scale = tl.reshape(tl.broadcast_to(block_scale[:, None, :], (1, 32, 4)), (32, 4))
+    tl.store(normal_scale_ptr + normal_offset, normal_scale)
+
+    # Swapped orientation: expand each block scale over its 32 transposed rows.
+    block_scale = tl.reshape(block_scale, (4,))
+    swapped_scale = tl.reshape(tl.broadcast_to(block_scale[:, None], (4, 32)), (128,))
+    row_swapped = tl.arange(0, 128)
+    col_swapped = pid_m
+    row_in_128 = row_swapped % 128
+    swapped_offset = (
+        (col_swapped // 4) * 32 + row_in_128 % 32
+    ) * 16 + (row_in_128 // 32 * 4 + col_swapped % 4)
+    tl.store(swapped_scale_ptr + swapped_offset, swapped_scale)
+
+
+def _quantize_mxfp8_32x32_operand(ref):
+    """Quantize once and emit scale layouts for both GEMM orientations."""
+    Z, H, N_CTX, HEAD_DIM = ref.shape
+    M = Z * H * N_CTX
+    if HEAD_DIM != 128 or M % 128 != 0:
+        raise RuntimeError("32x32 MXFP8 quantization requires HEAD_DIM=128 and rows divisible by 128")
+    flat = ref.reshape(M, HEAD_DIM).contiguous()
+
+    data = torch.empty_like(flat, dtype=torch.float8_e4m3fn)
+    normal_scale = torch.empty((M // 128, 1, 32, 16), dtype=torch.uint8, device=ref.device)
+    swapped_scale = torch.empty((1, M // 128, 32, 16), dtype=torch.uint8, device=ref.device)
+    _mxfp8_32x32_qdata_dual_scale_kernel[(M // 32,)](
+        flat,
+        data,
+        normal_scale,
+        swapped_scale,
+        num_warps=1,
+    )
+    return (
+        data.reshape_as(ref),
+        swizzled_to_tma_preshuffled(
+            normal_scale.view(torch.float8_e8m0fnu), N_CTX, HEAD_DIM, 32, Z * H
+        ),
+        swizzled_to_tma_preshuffled(
+            swapped_scale.view(torch.float8_e8m0fnu), HEAD_DIM, N_CTX, 32, Z * H
+        ),
+    )
 
 
 def _quantize_mxfp8_operand(ref, transpose_for_reduction=False):
@@ -3257,8 +3314,8 @@ class _MXFP8Attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, sm_scale, causal):
-        q_fp8, q_scale = _quantize_mxfp8_operand(q)
-        k_fp8, k_scale = _quantize_mxfp8_operand(k)
+        q_fp8, q_scale, q_scale_dk = _quantize_mxfp8_32x32_operand(q)
+        k_fp8, k_scale, k_scale_dq = _quantize_mxfp8_32x32_operand(k)
         v_fp8, v_scale = _quantize_mxfp8_operand(v, transpose_for_reduction=True)
         o, m_tensor = _forward_prequantized_with_lse(
             q_fp8,
@@ -3270,28 +3327,43 @@ class _MXFP8Attention(torch.autograd.Function):
             sm_scale,
             causal,
         )
-        ctx.save_for_backward(q, k, v, q_fp8, k_fp8, o, m_tensor, q_scale, k_scale)
+        ctx.save_for_backward(
+            v,
+            q_fp8,
+            k_fp8,
+            o,
+            m_tensor,
+            q_scale,
+            q_scale_dk,
+            k_scale,
+            k_scale_dq,
+        )
+        ctx.input_dtype = q.dtype
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, q_fp8, k_fp8, o, m_tensor, q_scale, k_scale = ctx.saved_tensors
-        q_dk, q_scale_dk = _quantize_mxfp8_operand(q, transpose_for_reduction=True)
-        k_dq, k_scale_dq = _quantize_mxfp8_operand(k, transpose_for_reduction=True)
+        (
+            v,
+            q_fp8,
+            k_fp8,
+            o,
+            m_tensor,
+            q_scale,
+            q_scale_dk,
+            k_scale,
+            k_scale_dq,
+        ) = ctx.saved_tensors
         v_bwd, v_scale_bwd = _quantize_mxfp8_operand(v)
         do_bf16 = do.to(torch.bfloat16).contiguous()
-        do_fp8, do_scale = _quantize_mxfp8_operand(do_bf16)
-        do_fp8_dv, do_scale_dv = _quantize_mxfp8_operand(do_bf16, transpose_for_reduction=True)
+        do_fp8, do_scale, do_scale_dv = _quantize_mxfp8_32x32_operand(do_bf16)
 
         dq, dk, dv = attention_bwd(
             do_fp8,
-            do_fp8_dv,
             q_fp8,
-            q_dk,
             k_fp8,
-            k_dq,
             v_bwd,
             o,
             m_tensor,
@@ -3306,7 +3378,13 @@ class _MXFP8Attention(torch.autograd.Function):
             do_bf16=do_bf16,
             causal=ctx.causal,
         )
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None
+        return (
+            dq.to(ctx.input_dtype),
+            dk.to(ctx.input_dtype),
+            dv.to(ctx.input_dtype),
+            None,
+            None,
+        )
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
