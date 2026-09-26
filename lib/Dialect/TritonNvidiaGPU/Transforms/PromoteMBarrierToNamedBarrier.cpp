@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "mlir/IR/Matchers.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 
 namespace ttg = mlir::triton::gpu;
@@ -108,7 +109,7 @@ bool isWarpUniform(Operation *op) {
   for (Operation *parent = op->getParentOp();
        parent && parent != partition->getParentOp();
        parent = parent->getParentOp()) {
-    // Only a loop is entered by every warp in the partition. Anything else --
+    // Only a loop is entered by every warp in the partition; anything else --
     // scf.if, scf.while, scf.index_switch, an unstructured cf.cond_br region --
     // may run for a subset, and a promoted named barrier would then wait on
     // warps that never arrive. Allow-list rather than deny-list: a deny-list
@@ -396,7 +397,6 @@ void eraseBarrierStorage(BarrierCandidate &candidate) {
   // them and a later dead slot is never reached.
   llvm::MapVector<ttg::WarpSpecializePartitionsOp, llvm::SmallDenseSet<Value>>
       capturedByPartitions;
-
   for (auto [partitions, captured] : candidate.captures)
     capturedByPartitions[partitions].insert(captured);
 
@@ -426,6 +426,32 @@ void eraseBarrierStorage(BarrierCandidate &candidate) {
 
   if (candidate.alloc.use_empty())
     candidate.alloc.erase();
+}
+
+// Loop depth is partition-relative: only scf.for loops between the op and its
+// warp-specialize partition count. A loop around the whole warp_specialize op
+// is invisible here, so such a candidate can tie with a genuinely unnested one.
+unsigned getLoopDepth(const BarrierCandidate &candidate) {
+  auto depth = [](Operation *op) {
+    unsigned result = 0;
+    Region *partition = getWarpSpecializePartition(op);
+    if (!partition)
+      return result;
+    for (Operation *parent = op->getParentOp();
+         parent && parent != partition->getParentOp();
+         parent = parent->getParentOp()) {
+      if (isa<scf::ForOp>(parent))
+        ++result;
+    }
+    return result;
+  };
+
+  unsigned result = 0;
+  for (const auto &use : candidate.arrives)
+    result = std::max(result, depth(use.op));
+  for (const auto &use : candidate.waits)
+    result = std::max(result, depth(use.op));
+  return result;
 }
 
 Value createSelectedNamedBarrierId(OpBuilder &builder, Location loc,
@@ -495,24 +521,49 @@ public:
     if (failed(tryEnsureWarpSpecializeBarrierIds(module, allocator)))
       return;
 
-    SmallVector<ttg::LocalAllocOp> allocs;
-    module.walk([&](ttg::LocalAllocOp alloc) {
-      if (getBarrierCount(alloc))
-        allocs.push_back(alloc);
-    });
+    struct RankedCandidate {
+      BarrierCandidate candidate;
+      unsigned numThreads;
+      unsigned loopDepth;
+      unsigned ordinal;
+    };
 
-    for (ttg::LocalAllocOp alloc : allocs) {
-      unsigned numBarriers = *getBarrierCount(alloc);
-      BarrierCandidate candidate(alloc, numBarriers);
+    SmallVector<RankedCandidate, 0> candidates;
+    unsigned ordinal = 0;
+    module.walk([&](ttg::LocalAllocOp alloc) {
+      std::optional<unsigned> numBarriers = getBarrierCount(alloc);
+      if (!numBarriers)
+        return;
+      BarrierCandidate candidate(alloc, *numBarriers);
       traceBarrierUses(alloc.getResult(), Value(), candidate);
       std::optional<unsigned> numThreads = getParticipantCount(candidate);
       if (!numThreads)
-        continue;
+        return;
+      unsigned loopDepth = getLoopDepth(candidate);
+      candidates.push_back(
+          {std::move(candidate), *numThreads, loopDepth, ordinal++});
+    });
+
+    llvm::stable_sort(candidates, [](const RankedCandidate &lhs,
+                                     const RankedCandidate &rhs) {
+      if (lhs.loopDepth != rhs.loopDepth)
+        return lhs.loopDepth > rhs.loopDepth;
+      if (lhs.candidate.numBarriers != rhs.candidate.numBarriers)
+        return lhs.candidate.numBarriers < rhs.candidate.numBarriers;
+      return lhs.ordinal < rhs.ordinal;
+    });
+
+    // Candidates are validated before any promotion runs and promoted later in
+    // ranked order. This is safe because each candidate's recorded IR hangs off
+    // its own alloc, so one candidate's cleanup cannot erase IR another
+    // recorded; shared partition ops only lose capture operands, which cleanup
+    // resolves by value rather than by stored index.
+    for (RankedCandidate &ranked : candidates) {
       std::optional<SmallVector<int32_t>> ids =
-          allocator.allocate(numBarriers);
+          allocator.allocate(ranked.candidate.numBarriers);
       if (!ids)
         continue;
-      promoteBarrier(candidate, *ids, *numThreads);
+      promoteBarrier(ranked.candidate, *ids, ranked.numThreads);
     }
   }
 };
