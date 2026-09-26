@@ -788,6 +788,65 @@ def test_tutorial09_matmul_tma_warp_specialize(
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("promote", [False, True])
+def test_blackwell_autows_mbarrier_promotion(promote):
+    M, N, K = 256, 128, 256
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 256, 128, 64
+    dtype = torch.float16
+
+    torch.manual_seed(42)
+    A = torch.randn((M, K), dtype=dtype, device="cuda")
+    B = torch.randn((N, K), dtype=dtype, device="cuda")
+    C = torch.empty((M, N), dtype=dtype, device="cuda")
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+    a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
+    grid = (1, )
+
+    matmul_kernel_tma_ws.device_caches.clear()
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = promote
+        triton.knobs.compilation.always_compile = True
+        kernel = matmul_kernel_tma_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+            A_COL_MAJOR=False,
+            B_COL_MAJOR=False,
+            DATA_PARTITION_FACTOR=2,
+            SEPARATE_EPILOGUE_STORE=False,
+            num_stages=3,
+            num_warps=4,
+            generate_subtiled_region=True,
+        )
+
+    ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+    ttgir = kernel.asm["ttgir"]
+    if promote:
+        assert ttgir.count("ttng.compiler_named_barrier_id") == 4, f"TTGIR {ttgir}"
+        assert ttgir.count("ttng.arrive_barrier_named") == 2, f"TTGIR {ttgir}"
+        assert ttgir.count("ttng.wait_barrier_named") == 2, f"TTGIR {ttgir}"
+        assert ttgir.count("ttng.init_barrier") == 30, f"TTGIR {ttgir}"
+    else:
+        assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+        assert ttgir.count("ttng.init_barrier") == 34, f"TTGIR {ttgir}"
+
+
 # ============================================================================
 # Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop based)
 # Tests both Flatten=True and Flatten=False
