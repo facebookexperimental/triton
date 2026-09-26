@@ -113,6 +113,11 @@ static scf::ExecuteRegionOp getPipelineStage(Operation *op) {
   return isPipelineStage(exec) ? exec : nullptr;
 }
 
+static scf::ExecuteRegionOp getFlatPipelineStage(Operation *op) {
+  auto exec = getPipelineStage(op);
+  return exec && exec->hasAttr("triton.warp_pipeline.flat") ? exec : nullptr;
+}
+
 // Validate the body of a `pipelined_for` loop.  After WarpPipeliner the body
 // must consist of: a sequence of pipeline-stage execute_regions, optional
 // pre-existing barrier/wait ops between (or before/after) those stages, and
@@ -655,18 +660,25 @@ static void processUnrolledPipelineRegions(ModuleOp m,
     if (!allocation)
       return;
 
-    // NOTE: We only iterate the function's top-level blocks; flat-pipeline
-    // execute_regions inside nested non-loop regions (e.g. scf.if bodies)
-    // are not collected.  WarpPipeliner's flat-pipeline frontend has the
-    // same scope, so the two stay in sync.
-    for (Block &block : funcOp.getBody()) {
+    // Flat pipelines can be nested in an enclosing persistent loop when their
+    // original owner loop was fully unrolled. The explicit flat attribute
+    // distinguishes those stages from stages owned by a pipelined_for loop.
+    SmallVector<Block *> blocks;
+    funcOp.walk([&](Block *block) { blocks.push_back(block); });
+    for (Block *block : blocks) {
       // Collect contiguous sequences of flat warp-pipeline execute_regions,
       // splitting at any non-ignorable, non-pipeline op.
       SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
       SmallVector<scf::ExecuteRegionOp> current;
 
-      for (auto &op : block) {
-        if (auto exec = getPipelineStage(&op)) {
+      bool isFunctionBody = block->getParentOp() == funcOp;
+      for (auto &op : *block) {
+        auto exec = getPipelineStage(&op);
+        // Before flat stages were explicitly tagged, the frontend only
+        // produced them in the function body. Keep accepting that legacy
+        // form there; nested stages must carry the flat tag so stages owned
+        // by pipelined_for are not converted twice.
+        if (exec && (isFunctionBody || getFlatPipelineStage(&op))) {
           current.push_back(exec);
           continue;
         }
