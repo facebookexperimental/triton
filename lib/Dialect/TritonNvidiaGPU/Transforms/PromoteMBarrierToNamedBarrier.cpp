@@ -272,22 +272,56 @@ bool coversEverySlot(const RangeT &uses, unsigned numBarriers) {
 // every slot as long as the index stays in range -- which holds since it
 // already indexes the same N-slot mbarrier allocation.
 template <typename RangeT>
-bool hasValidSlotSelection(const RangeT &uses, unsigned numBarriers) {
+bool mapUsesToSlots(const RangeT &uses, unsigned numBarriers,
+                    SmallVectorImpl<Operation *> &slotOps) {
+  slotOps.assign(numBarriers, nullptr);
   if (uses.size() == 1 && uses.front().index) {
     APInt value;
-    if (!matchPattern(uses.front().index, m_ConstantInt(&value)))
+    if (!matchPattern(uses.front().index, m_ConstantInt(&value))) {
+      auto op = uses.front().op;
+      llvm::fill(slotOps, op.getOperation());
       return true;
+    }
   }
-  return coversEverySlot(uses, numBarriers);
+
+  for (const auto &use : uses) {
+    std::optional<unsigned> slot = getStaticSlot(use.index, numBarriers);
+    if (!slot)
+      return false;
+    auto typedOp = use.op;
+    Operation *op = typedOp.getOperation();
+    if (slotOps[*slot] &&
+        getWarpSpecializePartition(slotOps[*slot]) !=
+            getWarpSpecializePartition(op))
+      return false;
+    slotOps[*slot] = op;
+  }
+  return llvm::all_of(slotOps, [](Operation *op) { return op != nullptr; });
+}
+
+// An arrive with no matching wait is only safe as a priming arrive: with no
+// enclosing loop between it and its partition it executes exactly once, so
+// its single extra arrival matches the mbarrier phase it pre-completes. A
+// loop-nested unmatched arrive would contribute a trip-count-dependent number
+// of extra arrivals and over-release the named barrier.
+static bool isPrimingArrive(Operation *arrive) {
+  Region *partition = getWarpSpecializePartition(arrive);
+  if (!partition)
+    return false;
+  for (Operation *parent = arrive->getParentOp();
+       parent && parent != partition->getParentOp();
+       parent = parent->getParentOp()) {
+    if (isa<scf::ForOp, scf::WhileOp>(parent))
+      return false;
+  }
+  return true;
 }
 
 std::optional<unsigned> getParticipantCount(BarrierCandidate &candidate) {
   if (candidate.hasUnknownUse ||
       !coversEverySlot(candidate.inits, candidate.numBarriers) ||
       (!candidate.invalidations.empty() &&
-       !coversEverySlot(candidate.invalidations, candidate.numBarriers)) ||
-      !hasValidSlotSelection(candidate.arrives, candidate.numBarriers) ||
-      !hasValidSlotSelection(candidate.waits, candidate.numBarriers))
+       !coversEverySlot(candidate.invalidations, candidate.numBarriers)))
     return std::nullopt;
 
   for (const auto &use : candidate.arrives) {
@@ -302,28 +336,38 @@ std::optional<unsigned> getParticipantCount(BarrierCandidate &candidate) {
       return std::nullopt;
   }
 
-  Region *arrivePartition = getWarpSpecializePartition(candidate.arrives[0].op);
-  Region *waitPartition = getWarpSpecializePartition(candidate.waits[0].op);
+  SmallVector<Operation *> arrivesBySlot;
+  SmallVector<Operation *> waitsBySlot;
   // Arrives and waits must live in different warp-specialize partitions. This
   // also rejects the both-nullptr case: a barrier used entirely outside any
   // partition has no warp-group structure to size the named barrier from.
-  if (arrivePartition == waitPartition)
-    return std::nullopt;
-  if (llvm::any_of(candidate.arrives, [arrivePartition](const auto &use) {
-        return getWarpSpecializePartition(use.op) != arrivePartition;
-      }) ||
-      llvm::any_of(candidate.waits, [waitPartition](const auto &use) {
-        return getWarpSpecializePartition(use.op) != waitPartition;
-      }))
+  if (!mapUsesToSlots(candidate.arrives, candidate.numBarriers,
+                      arrivesBySlot) ||
+      !mapUsesToSlots(candidate.waits, candidate.numBarriers, waitsBySlot))
     return std::nullopt;
 
-  if (llvm::any_of(candidate.arrives, [&](const auto &use) {
-        return !haveMatchingLoopNests(use.op, candidate.waits.front().op);
-      }) ||
-      llvm::any_of(candidate.waits, [&](const auto &use) {
-        return !haveMatchingLoopNests(candidate.arrives.front().op, use.op);
-      }))
-    return std::nullopt;
+  auto isCompatiblePair = [&](const auto &arriveUse, const auto &waitUse) {
+    auto arriveSlot = getStaticSlot(arriveUse.index, candidate.numBarriers);
+    auto waitSlot = getStaticSlot(waitUse.index, candidate.numBarriers);
+    return (!arriveSlot || !waitSlot || arriveSlot == waitSlot) &&
+           haveMatchingLoopNests(arriveUse.op, waitUse.op);
+  };
+
+  for (const auto &waitUse : candidate.waits) {
+    if (llvm::none_of(candidate.arrives, [&](const auto &arriveUse) {
+          return isCompatiblePair(arriveUse, waitUse);
+        }))
+      return std::nullopt;
+  }
+
+  for (const auto &arriveUse : candidate.arrives) {
+    bool hasMatchingWait =
+        llvm::any_of(candidate.waits, [&](const auto &waitUse) {
+          return isCompatiblePair(arriveUse, waitUse);
+        });
+    if (!hasMatchingWait && !isPrimingArrive(arriveUse.op))
+      return std::nullopt;
+  }
 
   SmallVector<uint32_t> initCounts(candidate.numBarriers);
   for (const auto &use : candidate.inits) {
@@ -362,11 +406,18 @@ std::optional<unsigned> getParticipantCount(BarrierCandidate &candidate) {
 
   unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(
       candidate.alloc->getParentOfType<ModuleOp>());
-  unsigned numThreads =
-      (ttg::lookupNumWarps(candidate.arrives[0].op) +
-       ttg::lookupNumWarps(candidate.waits[0].op)) * threadsPerWarp;
-  if (numThreads == 0)
-    return std::nullopt;
+  unsigned numThreads = 0;
+  for (auto [arrive, wait] : llvm::zip(arrivesBySlot, waitsBySlot)) {
+    if (getWarpSpecializePartition(arrive) == getWarpSpecializePartition(wait))
+      return std::nullopt;
+    unsigned slotThreads =
+        (ttg::lookupNumWarps(arrive) + ttg::lookupNumWarps(wait)) *
+        threadsPerWarp;
+    if (slotThreads == 0 ||
+        (numThreads != 0 && slotThreads != numThreads))
+      return std::nullopt;
+    numThreads = slotThreads;
+  }
   return numThreads;
 }
 
