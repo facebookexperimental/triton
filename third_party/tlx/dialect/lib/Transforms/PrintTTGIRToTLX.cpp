@@ -601,8 +601,8 @@ static bool canNameExternSignature(Operation *op) {
 
 // tlx.warp_predicate takes its region as a separate @triton.jit function, so
 // each ttg.warp_predicate gets a module-scope body emitted for it, named here.
-static thread_local DenseMap<Operation *, std::string>
-    *warpPredicateBodyNames = nullptr;
+static thread_local DenseMap<Operation *, std::string> *warpPredicateBodyNames =
+    nullptr;
 
 // Values a region uses but does not define, which the body function has to
 // receive as arguments.
