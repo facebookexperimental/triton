@@ -505,11 +505,18 @@ def _launch_gfx950_addmm_norm(
     return output
 
 
-def _eligible(match: Match, expected_shape: tuple[int, int, int]) -> bool:
-    if config.triton.tlx_mode not in ("allow", "force"):
-        return False
-    if not current_target().is_gfx950:
-        return False
+def _has_supported_semantics(
+    match: Match,
+    expected_shape: tuple[int, int, int],
+    *,
+    requires_norm_bias: bool,
+) -> bool:
+    """Check properties that are not completely constrained by the pattern.
+
+    The registered patterns fix addmm's default alpha/beta, the normalization
+    dimension, and epsilon. This check owns the remaining custom-op contract:
+    concrete shapes, dtypes, devices, broadcasting, and physical layouts.
+    """
     addmm = next(
         (
             node
@@ -520,19 +527,35 @@ def _eligible(match: Match, expected_shape: tuple[int, int, int]) -> bool:
     )
     if addmm is None or len(addmm.users) != 1:
         return False
+
     tensor_names = ["x", "weight", "gemm_bias", "scale"]
-    if "norm_bias" in match.kwargs:
+    if requires_norm_bias:
         tensor_names.append("norm_bias")
-    tensors = [
-        match.kwargs[name].meta.get("val")
-        for name in tensor_names
-    ]
+    if any(name not in match.kwargs for name in tensor_names):
+        return False
+    try:
+        tensors = [match.kwargs[name].meta.get("val") for name in tensor_names]
+    except AttributeError:
+        return False
     if not all(isinstance(value, torch.Tensor) for value in tensors):
         return False
+
     x, weight, gemm_bias, scale, *optional_norm_bias = tensors
+    if any(value.layout != torch.strided for value in tensors):
+        return False
+    if any(value.dtype != torch.bfloat16 for value in tensors):
+        return False
+    if x.device.type != "cuda":
+        return False
+    if any(value.device != x.device for value in tensors[1:]):
+        return False
+
+    vector_inputs = [gemm_bias, scale, *optional_norm_bias]
     if x.ndim != 2 or weight.ndim != 2:
         return False
-    vector_inputs = [gemm_bias, scale, *optional_norm_bias]
+    # torch.addmm accepts broadcastable inputs, but the fused epilogue only
+    # implements a contiguous vector bias. Norm parameters have the same exact
+    # one-dimensional contract; no broadcasting is performed by the kernels.
     if any(value.ndim != 1 for value in vector_inputs):
         return False
     try:
@@ -544,23 +567,36 @@ def _eligible(match: Match, expected_shape: tuple[int, int, int]) -> bool:
         x_strides = tuple(int(stride) for stride in x.stride())
         weight_strides = tuple(int(stride) for stride in weight.stride())
         vector_strides = [int(value.stride(0)) for value in vector_inputs]
-    except (TypeError, ValueError):
+    except (IndexError, TypeError, ValueError):
         return False
-    return bool(
-        (m, k, n) == expected_shape
-        and x.dtype == torch.bfloat16
-        and weight.dtype == x.dtype
-        and gemm_bias.dtype == x.dtype
-        and scale.dtype == x.dtype
-        and all(value.dtype == x.dtype for value in optional_norm_bias)
-        and all(value.device == x.device for value in tensors)
-        and k == weight_k
-        and all(size == n for size in vector_sizes)
-        and x_strides == (k, 1)
-        and weight_strides == (1, k)
-        and all(stride == 1 for stride in vector_strides)
-        and n % _GEMM_BLOCK_N == 0
-        and k % _BLOCK_K == 0
+
+    if (m, k, n) != expected_shape or weight_k != k:
+        return False
+    if any(size != n for size in vector_sizes):
+        return False
+    if x_strides != (k, 1) or weight_strides != (1, k):
+        return False
+    if any(stride != 1 for stride in vector_strides):
+        return False
+    if n % _GEMM_BLOCK_N != 0 or k % _BLOCK_K != 0:
+        return False
+    return True
+
+
+def _eligible(
+    match: Match,
+    expected_shape: tuple[int, int, int],
+    *,
+    requires_norm_bias: bool,
+) -> bool:
+    if config.triton.tlx_mode not in ("allow", "force"):
+        return False
+    if not current_target().is_gfx950:
+        return False
+    return _has_supported_semantics(
+        match,
+        expected_shape,
+        requires_norm_bias=requires_norm_bias,
     )
 
 

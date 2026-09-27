@@ -133,7 +133,7 @@ def _fake_gfx950_addmm_rmsnorm(
 
 
 def _eligible_rmsnorm(match: Match) -> bool:
-    return _eligible(match, _SHAPE)
+    return _eligible(match, _SHAPE, requires_norm_bias=False)
 
 
 @functools.cache

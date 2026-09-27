@@ -8,6 +8,7 @@ Usage:
 
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from torch._dynamo.testing import CompileCounterWithBackend
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import run_and_get_code
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -109,6 +111,152 @@ GEMM_NORM_TEST_CASES = [
     ("layernorm", (2032, 2560, 2560)),
     ("rmsnorm", (677, 8192, 4096)),
 ]
+
+
+class TestGfx950GemmNormEligibility(TestCase):
+
+    @staticmethod
+    def _fake_cuda_tensor(
+        shape: tuple[int, ...],
+        *,
+        stride: tuple[int, ...] | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        with FakeTensorMode():
+            if stride is None:
+                return torch.empty(shape, device="cuda", dtype=dtype)
+            return torch.empty_strided(
+                shape,
+                stride,
+                device="cuda",
+                dtype=dtype,
+            )
+
+    @staticmethod
+    def _make_match(
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        overrides: dict[str, torch.Tensor] | None = None,
+        addmm_users: int = 1,
+    ):
+        m, k, n = 3, 64, 128
+        values = {
+            "x": TestGfx950GemmNormEligibility._fake_cuda_tensor(
+                (m, k),
+                stride=(k, 1),
+                dtype=dtype,
+            ),
+            "weight": TestGfx950GemmNormEligibility._fake_cuda_tensor(
+                (k, n),
+                stride=(1, k),
+                dtype=dtype,
+            ),
+            "gemm_bias": TestGfx950GemmNormEligibility._fake_cuda_tensor(
+                (n, ),
+                dtype=dtype,
+            ),
+            "scale": TestGfx950GemmNormEligibility._fake_cuda_tensor(
+                (n, ),
+                dtype=dtype,
+            ),
+            "norm_bias": TestGfx950GemmNormEligibility._fake_cuda_tensor(
+                (n, ),
+                dtype=dtype,
+            ),
+        }
+        values.update(overrides or {})
+        addmm = SimpleNamespace(
+            op="call_function",
+            target=torch.ops.aten.addmm.default,
+            users=[object() for _ in range(addmm_users)],
+        )
+        return SimpleNamespace(
+            nodes=[addmm],
+            kwargs={name: SimpleNamespace(meta={"val": value})
+                    for name, value in values.items()},
+        )
+
+    def test_gfx950_addmm_norm_semantic_eligibility(self):
+        from triton.language.extra.tlx.inductor.gemm_norm_gfx950 import (  # @manual
+            _has_supported_semantics, )
+
+        shape = (3, 64, 128)
+        self.assertTrue(_has_supported_semantics(
+            self._make_match(),
+            shape,
+            requires_norm_bias=True,
+        ))
+
+        rms_match = self._make_match()
+        del rms_match.kwargs["norm_bias"]
+        self.assertTrue(_has_supported_semantics(
+            rms_match,
+            shape,
+            requires_norm_bias=False,
+        ))
+        self.assertFalse(_has_supported_semantics(
+            rms_match,
+            shape,
+            requires_norm_bias=True,
+        ))
+
+        n = shape[2]
+        unsupported_matches = {
+            "broadcast gemm bias":
+            self._make_match(overrides={
+                "gemm_bias": self._fake_cuda_tensor(
+                    (1, n),
+                    dtype=torch.bfloat16,
+                ),
+            }),
+            "fp16 operands":
+            self._make_match(dtype=torch.float16),
+            "different devices":
+            self._make_match(overrides={
+                "scale": torch.empty((n, ), dtype=torch.bfloat16),
+            }),
+            "non-row-major x":
+            self._make_match(
+                overrides={
+                    "x": self._fake_cuda_tensor(
+                        (shape[0], shape[1]),
+                        stride=(1, shape[0]),
+                        dtype=torch.bfloat16,
+                    ),
+                }),
+            "non-transposed weight":
+            self._make_match(overrides={
+                "weight": self._fake_cuda_tensor(
+                    (shape[1], n),
+                    dtype=torch.bfloat16,
+                ),
+            }),
+            "noncontiguous scale":
+            self._make_match(overrides={
+                "scale": self._fake_cuda_tensor(
+                    (n, ),
+                    stride=(2, ),
+                    dtype=torch.bfloat16,
+                ),
+            }),
+            "noncontiguous norm bias":
+            self._make_match(overrides={
+                "norm_bias": self._fake_cuda_tensor(
+                    (n, ),
+                    stride=(2, ),
+                    dtype=torch.bfloat16,
+                ),
+            }),
+            "multiple addmm users":
+            self._make_match(addmm_users=2),
+        }
+        for name, match in unsupported_matches.items():
+            with self.subTest(name=name):
+                self.assertFalse(_has_supported_semantics(
+                    match,
+                    shape,
+                    requires_norm_bias=True,
+                ))
 
 
 def _normalize(
@@ -494,6 +642,79 @@ class TestTorchTLXEpilogueFusion(TestCase):
         )
         self.assertNotIn(f"torch.ops.torch_tlx.gfx950_addmm_{norm_kind}", "\n".join(allow_code),
                          "The opaque custom-op fallback is not emitted")
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX GEMM + normalization kernels",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_layernorm_partial_stats_are_bitwise_repeatable(self):
+        """A fixed partial-stat plan must be bitwise stable across launches."""
+        from triton.language.extra.tlx.inductor.gemm_layernorm_gfx950 import (  # @manual
+            _FOCUSED_PLANS, _fused_gfx950_addmm_layernorm,
+        )
+        from triton.language.extra.tlx.inductor.gemm_norm_gfx950 import (  # @manual
+            _EPILOGUE_STATS, )
+
+        m, k, n = 2032, 2560, 2560
+        dtype = torch.bfloat16
+        x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype).t()
+        gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+
+        def fixed_partial_stats(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            gemm_bias: torch.Tensor,
+            scale: torch.Tensor,
+            norm_bias: torch.Tensor,
+        ) -> torch.Tensor:
+            return _fused_gfx950_addmm_layernorm(
+                x,
+                weight,
+                gemm_bias,
+                scale,
+                norm_bias,
+                1.0e-5,
+                gemm_plan=_FOCUSED_PLANS[0],
+                norm_impl=_EPILOGUE_STATS,
+                norm_num_warps=8,
+            )
+
+        expected = torch.nn.functional.layer_norm(
+            torch.addmm(gemm_bias, x, weight),
+            (n, ),
+            scale,
+            norm_bias,
+            1.0e-5,
+        )
+        with (
+                torch.no_grad(),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            compiled = torch.compile(fixed_partial_stats, fullgraph=True)
+            first, code = run_and_get_code(
+                compiled,
+                x,
+                weight,
+                gemm_bias,
+                scale,
+                norm_bias,
+            )
+            repeated = [compiled(x, weight, gemm_bias, scale, norm_bias) for _ in range(4)]
+
+        torch.testing.assert_close(first, expected, atol=3e-2, rtol=3e-2)
+        for output in repeated:
+            self.assertTrue(torch.equal(output, first))
+        generated_code = "\n".join(code)
+        self.assertIn("_register_kernel_impl", generated_code)
+        self.assertIn("tlx_gfx950_apply_norm", generated_code)
 
     @unittest.skipIf(
         not is_gfx950(),
