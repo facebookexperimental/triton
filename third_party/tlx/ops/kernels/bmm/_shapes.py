@@ -36,8 +36,23 @@ GFX950_1 = FocusSuite(
     ),
 )
 
-FOCUS_SUITES = (GFX950_1, )
-DEFAULT_SUITES = {"gfx950": ("gfx950_1", )}
+GFX950_2 = FocusSuite(
+    name="gfx950_2",
+    op="bmm",
+    shapes=(
+        BMMShape(3072, 128, 128, 64, (8192, 64, 1), (8192, 128, 1), "fp16"),
+        BMMShape(3072, 240, 128, 128, (30720, 128, 1), (16384, 128, 1), "fp16"),
+    ),
+)
+
+GFX950_ALL = FocusSuite(
+    name="gfx950_all",
+    op="bmm",
+    includes=("gfx950_1", "gfx950_2"),
+)
+
+FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL)
+DEFAULT_SUITES = {"gfx950": ("gfx950_all", )}
 FOCUS = FocusRegistry("bmm", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 

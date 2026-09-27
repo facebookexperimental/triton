@@ -36,15 +36,15 @@ def shapes(synthetic: bool = False, suites=None) -> list:
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:
     return [
-        Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
+        Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry.dtype]).removeprefix("torch."), shape=tuple(entry[:-1]),
              label=label(*entry)) for entry in shapes(synthetic, suites)
     ]
 
 
 def prepare(case: Case, space: str) -> Prepared:
-    m, n, k, a_strides, b_strides = case.shape
+    m, n, k, a_strides, b_strides, bias_strides = case.shape
     dtype = getattr(torch, case.dtype)
-    bias, a, b = inputs([m, n, k, a_strides, b_strides, case.dtype], dtype)
+    bias, a, b = inputs([m, n, k, a_strides, b_strides, bias_strides, case.dtype], dtype)
 
     tlx_fn = lambda: gfx950_torch.addmm(bias, a, b, mode="force")  # noqa: E731
     ref_fn = lambda: gfx950_torch.ref(bias, a, b)  # noqa: E731
