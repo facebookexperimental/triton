@@ -54,6 +54,16 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
             if not valid:
                 return {"success": False, "diagnostics": diagnostic}
 
+    phase = _target_setting(target, "TLX_AGENT_TUNING_PHASE", "search_space")
+    oracle_cases: dict[str, Any] = {}
+    if phase == "heuristic":
+        oracle_path = Path(_target_setting(target, "TLX_AGENT_FULL_SPACE_ORACLE"))
+        try:
+            payload = json.loads(oracle_path.read_text())
+            oracle_cases = {case["case_id"]: case for case in payload["cases"]}
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            return {"success": False, "diagnostics": f"could not load full-space oracle: {error}"}
+
     directory = tempfile.TemporaryDirectory(prefix="tlx-agent-mm-tuning-")
     source_path = Path(directory.name) / "candidate.py"
     source_path.write_text(kernel_source)
@@ -71,7 +81,8 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
             "module": module,
             "op": op,
             "device": str(target.get("device") or "cuda"),
-            "phase": _target_setting(target, "TLX_AGENT_TUNING_PHASE", "search_space"),
+            "phase": phase,
+            "oracle_cases": oracle_cases,
             "stable_cv_max": float(target.get("evaluation_policy", {}).get("stable_cv_max", 0.03)),
             "records": {},
         },
@@ -83,7 +94,12 @@ def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     try:
         expected = torch.matmul(a, b)
         tolerance = 8e-3 if a.dtype == torch.bfloat16 else 1e-3
-        spaces = ("heuristic", "full") if artifact["phase"] == "search_space" else ("heuristic", )
+        if artifact["phase"] == "search_space":
+            spaces = ("heuristic", "full")
+        elif artifact["phase"] == "full":
+            spaces = ("full", )
+        else:
+            spaces = ("heuristic", )
         for space in spaces:
             actual = artifact["op"](a, b, space=space)
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=tolerance)
@@ -94,22 +110,34 @@ def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
 
 def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) -> dict[str, Any]:
     a, b = _inputs(case, artifact["device"])
-    full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
-    full_tuners: dict[str, Any] = {}
-    with _record_tuners(full_tuners):
-        full()
-    torch.cuda.synchronize()
-    full_samples = _measure(full, repetitions)
-    config_rows = _config_rows(full_tuners)
+    if artifact["phase"] == "heuristic":
+        oracle = artifact["oracle_cases"].get(case["case_id"])
+        if oracle is None or oracle.get("timing") is None:
+            raise RuntimeError(f"full-space oracle has no timing for {case['case_id']}")
+        full_samples = [float(value) for value in oracle["timing"]["samples_us"]]
+        oracle_metrics = oracle["verification"].get("metrics", {})
+        config_rows = list(oracle_metrics.get("top_full_configs", []))
+        full_config_count = int(oracle_metrics.get("full_config_count", 0))
+        full_best_config = str(oracle_metrics.get("full_best_config", ""))
+    else:
+        full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
+        full_tuners: dict[str, Any] = {}
+        with _record_tuners(full_tuners):
+            full()
+        torch.cuda.synchronize()
+        full_samples = _measure(full, repetitions)
+        config_rows = _config_rows(full_tuners)
+        full_config_count = sum(len(getattr(tuner, "configs", ())) for tuner in full_tuners.values())
+        full_best_config = _best_configs(full_tuners)
     full_median = statistics.median(full_samples)
 
     metrics: dict[str, Any] = {
-        "full_config_count": sum(len(getattr(tuner, "configs", ())) for tuner in full_tuners.values()),
-        "full_best_config": _best_configs(full_tuners),
+        "full_config_count": full_config_count,
+        "full_best_config": full_best_config,
         "full_median_us": full_median,
         "top_full_configs": config_rows[:8],
     }
-    if artifact["phase"] == "search_space":
+    if artifact["phase"] in {"search_space", "full"}:
         samples = full_samples
     else:
         heuristic_tuners: dict[str, Any] = {}

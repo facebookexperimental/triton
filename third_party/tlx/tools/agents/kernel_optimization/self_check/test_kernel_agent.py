@@ -1021,9 +1021,12 @@ class ScoringTest(unittest.TestCase):
             kernel.write_text(source)
             optimizer = Mock()
             optimizer.optimize.return_value = optimization_result
+            oracle_harness = Mock()
+            oracle_harness.evaluate.return_value = performance
             with (
                 patch.object(tuning_module, "production_cases", return_value=cases),
                 patch.object(tuning_module, "_validate_device_arch"),
+                patch.object(tuning_module, "SubprocessHarness", return_value=oracle_harness),
                 patch.object(tuning_module, "KernelOptimizer", return_value=optimizer),
             ):
                 exit_code, result = tuning_module.run_tuning(
@@ -1049,6 +1052,10 @@ class ScoringTest(unittest.TestCase):
             self.assertEqual(
                 request.target.environment["TLX_AGENT_EDITABLE_SYMBOLS"],
                 "heuristic_config",
+            )
+            self.assertEqual(
+                request.target.environment["TLX_AGENT_FULL_SPACE_ORACLE"],
+                str((root / "out/full_space_oracle.json").resolve()),
             )
             self.assertEqual((root / "out/best_kernel.py").read_text(), candidate)
 
@@ -1727,6 +1734,43 @@ class HarnessTest(unittest.TestCase):
             with self.subTest(arch=arch):
                 op = _install_candidate(candidate, arch)
                 self.assertEqual(op(a, b, space="full"), (marker, "full"))
+
+    def test_mm_heuristic_benchmark_reuses_full_space_oracle(self) -> None:
+        import torch
+
+        from ..decision_maker.tuning_harnesses import mm
+
+        spaces = []
+        artifact = {
+            "op": lambda _a, _b, *, space: spaces.append(space),
+            "phase": "heuristic",
+            "device": "cpu",
+            "oracle_cases": {
+                "a": {
+                    "case_id": "a",
+                    "verification": {
+                        "metrics": {
+                            "full_config_count": 16,
+                            "full_best_config": "best",
+                            "top_full_configs": [],
+                        }
+                    },
+                    "timing": {"samples_us": [10.0, 10.0]},
+                }
+            },
+            "stable_cv_max": 0.03,
+            "records": {},
+        }
+        tensor = torch.empty((1, 1))
+        with (
+            patch.object(mm, "_inputs", return_value=(tensor, tensor)),
+            patch.object(mm.torch.cuda, "synchronize"),
+            patch.object(mm, "_measure", return_value=[10.0, 10.0]),
+        ):
+            result = mm.benchmark(artifact, {"case_id": "a"}, 10)
+
+        self.assertEqual(spaces, ["heuristic"])
+        self.assertEqual(result["metrics"]["full_space_parity"], 1.0)
 
     def test_benchmark_metrics_are_attached_to_verification(self) -> None:
         harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
