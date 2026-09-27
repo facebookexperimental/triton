@@ -1982,6 +1982,11 @@ def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, 
     plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, *metadata)
     if supply_metadata:
         assert plan.wide_task_count is None
+        if dq_atomic_fp32 and shifted_input is None:
+            valid_count = int(plan.task_counts[amd_fa_varlen_bwd._WIDE_KV_TASK_COUNT.value].item())
+            assert 0 < valid_count < plan.wide_q_len.numel() <= 512
+            # Invalid capacity entries must not enter the descending-Q sort.
+            plan.wide_q_len[valid_count:].fill_(plan.max_q)
     else:
         assert plan.wide_task_count is not None and plan.wide_task_count > 0
 
@@ -2096,6 +2101,7 @@ def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, 
         assert preprocess_kwargs["PACK_STATS_MHA16"] is True and preprocess_kwargs["PACK_STATS"] is False
         assert preprocess_kwargs["DQ_PAD_ROWS"] == convert_kwargs["DQ_PAD_ROWS"] == 16
         assert core_kwargs["CHUNKED_Q"] is True
+        assert core_kwargs["SORT_TASKS"] is True
         assert core_kwargs["Q_SPLITS"] == expected_query_splits
         assert (core_kwargs["HQ"], core_kwargs["HKV"], core_kwargs["BLOCK_M"], core_kwargs["BLOCK_N"]) == (
             q_heads, kv_heads, 16, 256)
@@ -2750,6 +2756,7 @@ def test_varlen_d128_fp32_dq_atomics_gfx950(monkeypatch, max_q, q_heads, kv_head
     assert exact_kwargs["reverse_local_assignment"] is True
     assert exact_kwargs["enable_sched_group_barrier_scheduler"] is False
     assert exact_kwargs["llvm_fn_attrs"] == (("amdgpu-sched-strategy", "max-ilp"), )
+    assert exact_kwargs["SORT_TASKS"] is False
     assert not ({
         "sink_insts_to_avoid_spills",
         "regclass_priority_trumps_globalness",

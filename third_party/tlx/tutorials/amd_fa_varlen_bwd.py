@@ -2046,6 +2046,7 @@ def _store_dq_pending_slot(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     MMA_MD: tl.constexpr,
+    MASK_ROWS: tl.constexpr = True,
 ):
     """Publish one native accumulator register from every participating wave."""
     tl.static_assert(BLOCK_M == 16 and D == 128)
@@ -2058,7 +2059,10 @@ def _store_dq_pending_slot(
     value1, value3 = tl.split(tl.reshape(value_odd, (BLOCK_M, D // 8, 2), can_reorder=False))
     local_m = tlx.rematerialized_range(0, BLOCK_M, 180, placement=step)
     offs_d = COLUMN_START + tlx.rematerialized_range(0, D // 2, 181, placement=step)
-    valid = tl.broadcast_to((step * BLOCK_M + local_m < q_len)[:, None], (BLOCK_M, D // 2))
+    if MASK_ROWS:
+        valid = tl.broadcast_to((step * BLOCK_M + local_m < q_len)[:, None], (BLOCK_M, D // 2))
+    else:
+        valid = tl.full((BLOCK_M, D // 2), True, tl.int1)
     valid = tlx.require_layout(valid, MMA_MD, pin=False)
     d_swizzled = (((offs_d & 1) << 6)
                   | ((offs_d & 2) << 6)
@@ -2116,6 +2120,7 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
     PLAN_ERROR_INDEX: tl.constexpr,
     CHUNKED_Q: tl.constexpr = False,
     Q_SPLITS: tl.constexpr = 1,
+    SORT_TASKS: tl.constexpr = False,
 ):
     """Cached FP32 dQ schedule with optional chunking and query-split owners."""
     tl.static_assert(BLOCK_M == 16)
@@ -2129,7 +2134,17 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
     task = tl.program_id(1)
     if task >= tl.load(TaskCounts + TASK_COUNT_INDEX):
         return
-    task = (task // 2) + (task % 2) * tl.cdiv(tl.load(TaskCounts + TASK_COUNT_INDEX), 2)
+    if SORT_TASKS:
+        tl.static_assert(CHUNKED_Q)
+        # Exact prefix plans need at most ceil(100696 / 256) + 19 entries.
+        indices = tl.arange(0, 512)
+        lengths = tl.load(QLen + indices, indices < tl.load(TaskCounts + TASK_COUNT_INDEX), other=-1)
+        keys = lengths * 512 + (511 - indices)
+        ordered_keys = tl.sort(keys, descending=True)
+        selected_key = tl.sum(tl.where(indices == task, ordered_keys, 0), 0)
+        task = 511 - (selected_key & 511)
+    else:
+        task = (task // 2) + (task % 2) * tl.cdiv(tl.load(TaskCounts + TASK_COUNT_INDEX), 2)
     kv_global_start = tl.load(KVGlobalStart + task).to(tl.int64)
     kv_valid_rows = tl.load(KVValidRows + task).to(tl.int32)
     q_start = tl.load(QStart + task).to(tl.int64)
@@ -2710,7 +2725,11 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                         )
                         scores64 = score64 * qk_scale64 - lse64
                         n64_rows = n64_index * (BLOCK_N // 4) + tl.arange(0, BLOCK_N // 4)
-                        valid64 = (n64_rows[:, None] < kv_valid_rows) & (offs_m[None, :] < q_len)
+                        if CHUNKED_Q:
+                            # Padded Q/dO and statistics are zero: dS is exactly zero.
+                            valid64 = tl.broadcast_to(n64_rows[:, None] < kv_valid_rows, (BLOCK_N // 4, BLOCK_M))
+                        else:
+                            valid64 = (n64_rows[:, None] < kv_valid_rows) & (offs_m[None, :] < q_len)
                         valid64 = tlx.require_layout(valid64, mma_nm, pin=False)
                         neg_inf64 = tlx.require_layout(
                             tl.full((BLOCK_N // 4, BLOCK_M), float("-inf"), dtype=tl.float32),
@@ -2777,16 +2796,17 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     # ring slot.
                     q_nd64 = tlx.local_load(q_view, layout=q_op1_nd64, relaxed=True)
                     if bridge_phase == 1:
+                        # The preceding tile is full because a following tile exists.
                         pending_base = (q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
                         tlx.amd_sched_barrier(0)
                         _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 0, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md)
+                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                         _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 4, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md)
+                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                         _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 8, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md)
+                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                         _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 12, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md)
+                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
 
                     # One barrier makes every dS slice visible in its dK/dQ consumer
                     # ownerships and also retires current Q/dO LDS readers before the
@@ -2895,16 +2915,16 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                             tlx.amd_sched_barrier(0)
                             if n64_index == 0:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 0, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                             elif n64_index == 1:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 4, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                             elif n64_index == 2:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 8, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                             else:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 12, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
                         if n64_index < 3:
                             ds_nd64 = ds_next_nd64
 
@@ -3635,6 +3655,7 @@ def _varlen_dkdv_reduce_kernel(
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FLATTEN_HEADS: tl.constexpr = False,
 ):
     tl.static_assert(KV_SPLITS > 1)
     tl.static_assert(KV_SPLITS <= 4)
@@ -3644,14 +3665,19 @@ def _varlen_dkdv_reduce_kernel(
     kv_head = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D)
-    valid = tl.broadcast_to((offs_n < TOTAL_KV)[:, None], (BLOCK_N, D))
-    partial_base = ((offs_n[:, None] * HKV + kv_head) * KV_SPLITS) * D + offs_d[None, :]
+    if FLATTEN_HEADS:
+        valid = tl.broadcast_to((offs_n < TOTAL_KV * HKV)[:, None], (BLOCK_N, D))
+        token_head = offs_n
+    else:
+        valid = tl.broadcast_to((offs_n < TOTAL_KV)[:, None], (BLOCK_N, D))
+        token_head = offs_n * HKV + kv_head
+    partial_base = (token_head[:, None] * KV_SPLITS) * D + offs_d[None, :]
     dk = tl.zeros((BLOCK_N, D), tl.float32)
     dv = tl.zeros((BLOCK_N, D), tl.float32)
     for split in tl.static_range(0, KV_SPLITS):
         dk += tl.load(DK_PART + partial_base + split * D, mask=valid, other=0.0).to(tl.float32)
         dv += tl.load(DV_PART + partial_base + split * D, mask=valid, other=0.0).to(tl.float32)
-    output_offsets = (offs_n[:, None] * HKV + kv_head) * D + offs_d[None, :]
+    output_offsets = token_head[:, None] * D + offs_d[None, :]
     # Match the FP32 load layout so the BF16 stores do not introduce a
     # whole-tile cross-warp conversion through LDS.
     output_offsets = tl.max_contiguous(output_offsets, [1, 4])
@@ -5601,12 +5627,13 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             PLAN_ERROR_INDEX=plan_error_index,
             CHUNKED_Q=chunked_prefix_fp32_case,
             Q_SPLITS=query_splits,
+            SORT_TASKS=chunked_prefix_fp32_case and plan.wide_kv_start.numel() <= 512,
             num_warps=4,
             num_stages=1,
             matrix_instr_nonkdim=16,
             reverse_local_assignment=True,
             enable_sched_group_barrier_scheduler=False,
-            llvm_fn_attrs=(("amdgpu-sched-strategy", "max-ilp"), ),
+            llvm_fn_attrs=() if chunked_prefix_fp32_case else (("amdgpu-sched-strategy", "max-ilp"), ),
         )
     elif (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N):
         wide_core = _varlen_bwd_interleaved_bm32_kernel
@@ -5726,7 +5753,10 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             )
     reduction_splits = query_splits if chunked_prefix_fp32_case else kv_splits
     if reduction_splits > 1 and not rolling_fp32_case:
-        _varlen_dkdv_reduce_kernel[(triton.cdiv(total_kv, _BLOCK_M), kv_heads)](
+        reduce_block_n = 64 if chunked_prefix_fp32_case else _BLOCK_M
+        reduce_grid = ((triton.cdiv(total_kv * kv_heads, reduce_block_n), 1) if chunked_prefix_fp32_case else
+                       (triton.cdiv(total_kv, reduce_block_n), kv_heads))
+        _varlen_dkdv_reduce_kernel[reduce_grid](
             dk_part,
             dv_part,
             dk,
@@ -5737,7 +5767,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             HKV=kv_heads,
             D=head_dim,
             KV_SPLITS=reduction_splits,
-            BLOCK_N=_BLOCK_M,
+            BLOCK_N=reduce_block_n,
+            FLATTEN_HEADS=chunked_prefix_fp32_case,
             num_warps=4,
         )
     if use_dq_aux:
