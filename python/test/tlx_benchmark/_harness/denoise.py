@@ -197,16 +197,10 @@ def _num(text: str) -> Optional[float]:
 
 
 def gpu_uuid(device: int = 0) -> Optional[str]:
-    try:
-        import torch
-
-        raw = torch.cuda.get_device_properties(device).uuid
-    except Exception:
-        return None
-    # torch returns a ``_CUuuid`` whose str() is the bare hyphenated UUID;
-    # NVML and nvidia-smi both prefix it with "GPU-".
-    text = str(raw).strip()
-    return text if text.startswith("GPU-") else f"GPU-{text}"
+    # `device` is a physical index (see `driver.device_index`). Asking torch for
+    # it breaks once the visibility variable pins GPU N: torch then sees one
+    # device, the lookup fails, and every helper silently falls back to GPU 0.
+    return _smi(["-i", str(device), "--query-gpu=uuid", "--format=csv,noheader"]) or None
 
 
 def gpu_state(uuid: Optional[str] = None, device: int = 0) -> GpuState:

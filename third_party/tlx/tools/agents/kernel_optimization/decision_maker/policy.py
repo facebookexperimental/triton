@@ -92,7 +92,9 @@ def evaluated_decision(
     cases: tuple[InputCase, ...],
     *,
     best_speedup: float,
+    best_performance: PerformanceSummary | None = None,
     profiler_diagnostics: str = "",
+    target: KernelTarget | None = None,
 ) -> Decision:
     """Return the authoritative action for a completed experiment."""
 
@@ -110,19 +112,54 @@ def evaluated_decision(
         raise ValueError(
             f"experiment kind {submission.experiment_kind.value!r} cannot be evaluated"
         )
-    if (
-        not profiler_diagnostics
-        and is_promotable(performance, budget, cases)
-        and performance.aggregate_speedup > best_speedup
+    parity_policy = _is_full_space_parity_policy(target)
+    parity_improved = False
+    if parity_policy:
+        candidate_score = _full_space_parity_score(performance, cases, target)
+        incumbent_score = (
+            _full_space_parity_score(best_performance, cases, target)
+            if best_performance is not None
+            else None
+        )
+        parity_improved = candidate_score is not None and (
+            incumbent_score is None or candidate_score > incumbent_score
+        )
+    promotable = is_promotable(performance, budget, cases, target)
+    if not profiler_diagnostics and (
+        (parity_policy and parity_improved and promotable)
+        or (
+            not parity_policy
+            and promotable
+            and performance.aggregate_speedup > best_speedup
+        )
     ):
         return Decision(
             status=DecisionStatus.PROMOTE,
-            rationale="correct and exceeded speedup threshold",
+            rationale=(
+                "met full-space parity targets"
+                if parity_policy
+                else "correct and exceeded speedup threshold"
+            ),
+            evaluation=performance,
+        )
+    if (
+        not profiler_diagnostics
+        and parity_improved
+        and bool((target.evaluation_policy if target is not None else {}).get("progressive"))
+        and (
+            best_performance is None
+            or not is_promotable(best_performance, budget, cases, target)
+        )
+    ):
+        return Decision(
+            status=DecisionStatus.PROMOTE,
+            rationale="improved full-space parity objective; continue refinement",
             evaluation=performance,
         )
     rationale = (
         profiler_diagnostics
         or _verification_diagnostics(performance)
+        or _promotion_failure_diagnostics(performance, budget, cases, target)
         or f"speedup below {budget.min_speedup:.4f}x threshold"
     )
     return Decision(
@@ -210,9 +247,11 @@ def is_promotable(
     summary: PerformanceSummary,
     budget: OptimizationBudget,
     cases: tuple[InputCase, ...] | None = None,
+    target: KernelTarget | None = None,
 ) -> bool:
     case_by_id = {case.case_id: case for case in cases or ()}
-    if summary.aggregate_speedup < budget.min_speedup:
+    parity_policy = _is_full_space_parity_policy(target)
+    if not parity_policy and summary.aggregate_speedup < budget.min_speedup:
         return False
     for evaluation in summary.cases:
         protected = case_by_id.get(evaluation.case_id)
@@ -221,12 +260,196 @@ def is_promotable(
             if is_protected:
                 return False
             continue
-        if (
-            evaluation.timing is None
-            or evaluation.timing.coefficient_of_variation > budget.max_cv
-        ):
+        if evaluation.timing is None:
             return False
-    return True
+        # Full-space parity carries its own explicit stability classification.
+        # Applying the generic whole-suite CV gate as well makes noisy shapes
+        # reject a decision tree even though the policy deliberately excludes
+        # those shapes from its parity aggregate.
+        if not parity_policy and evaluation.timing.coefficient_of_variation > budget.max_cv:
+            return False
+    return _passes_evaluation_policy(summary, tuple(cases or ()), target)
+
+
+def _is_full_space_parity_policy(target: KernelTarget | None) -> bool:
+    return target is not None and target.evaluation_policy.get("kind") == "full_space_parity"
+
+
+def _full_space_parity_score(
+    summary: PerformanceSummary | None,
+    cases: tuple[InputCase, ...],
+    target: KernelTarget | None,
+) -> tuple[float, float, float] | None:
+    """Rank incomplete decision trees by their distance from the parity gates."""
+    if summary is None or not _is_full_space_parity_policy(target):
+        return None
+    assert target is not None
+    policy = target.evaluation_policy
+    per_case_min = float(policy.get("per_case_min", 0.95))
+    aggregate_min = float(policy.get("aggregate_min", 0.98))
+    max_configs = int(policy.get("max_heuristic_configs", 1))
+    minimum_full_configs = policy.get("minimum_full_config_count")
+    case_by_id = {case.case_id: case for case in cases}
+    stable_parities: list[tuple[float, float]] = []
+    full_config_counts: list[int] = []
+    for evaluation in summary.cases:
+        case = case_by_id.get(evaluation.case_id)
+        if not evaluation.verification.passed and (case is None or case.protected):
+            return None
+        if not evaluation.verification.passed:
+            continue
+        if evaluation.timing is None:
+            return None
+        metrics = evaluation.verification.metrics
+        config_count = metrics.get("heuristic_config_count")
+        parity = metrics.get("full_space_parity")
+        if config_count is None or int(config_count) > max_configs or parity is None:
+            return None
+        full_config_counts.append(int(metrics.get("full_config_count", 0)))
+        parity = float(parity)
+        if not math.isfinite(parity) or parity <= 0:
+            return None
+        if bool(metrics.get("parity_stable", True)):
+            weight = case.weight if case is not None else 1.0
+            stable_parities.append((parity, float(weight)))
+    if (
+        minimum_full_configs is not None
+        and (not full_config_counts or max(full_config_counts) < int(minimum_full_configs))
+    ):
+        return None
+    if not stable_parities:
+        return None
+    total_weight = sum(weight for _, weight in stable_parities)
+    aggregate = math.exp(
+        sum(weight * math.log(parity) for parity, weight in stable_parities)
+        / total_weight
+    )
+    minimum = min(parity for parity, _ in stable_parities)
+    gate_progress = min(minimum / per_case_min, aggregate / aggregate_min)
+    return gate_progress, minimum, aggregate
+
+
+def is_acceptable_winner(
+    candidate: PerformanceSummary,
+    baseline: PerformanceSummary,
+    budget: OptimizationBudget,
+    cases: tuple[InputCase, ...],
+    target: KernelTarget | None,
+) -> bool:
+    """Accept a strict winner or a measurable progressive parity improvement."""
+    if is_promotable(candidate, budget, cases, target):
+        return True
+    if (
+        target is None
+        or not _is_full_space_parity_policy(target)
+        or not target.evaluation_policy.get("progressive")
+    ):
+        return False
+    candidate_score = _full_space_parity_score(candidate, cases, target)
+    baseline_score = _full_space_parity_score(baseline, cases, target)
+    return candidate_score is not None and baseline_score is not None and candidate_score > baseline_score
+
+
+def _promotion_failure_diagnostics(
+    summary: PerformanceSummary,
+    budget: OptimizationBudget,
+    cases: tuple[InputCase, ...],
+    target: KernelTarget | None,
+) -> str:
+    if _is_full_space_parity_policy(target):
+        assert target is not None
+        policy = target.evaluation_policy
+        per_case_min = float(policy.get("per_case_min", 0.95))
+        aggregate_min = float(policy.get("aggregate_min", 0.98))
+        weights = {case.case_id: case.weight for case in cases}
+        stable: list[tuple[str, float, float]] = []
+        for evaluation in summary.cases:
+            metrics = evaluation.verification.metrics
+            parity = metrics.get("full_space_parity")
+            if parity is not None and bool(metrics.get("parity_stable", True)):
+                stable.append(
+                    (
+                        evaluation.case_id,
+                        float(parity),
+                        float(weights.get(evaluation.case_id, 1.0)),
+                    )
+                )
+        if not stable:
+            return "no stable full-space parity measurements"
+        worst_case, minimum, _ = min(stable, key=lambda item: item[1])
+        if minimum < per_case_min:
+            return (
+                f"stable full-space parity {minimum:.4f} for {worst_case} is below "
+                f"the {per_case_min:.4f} threshold"
+            )
+        total_weight = sum(weight for _, _, weight in stable)
+        aggregate = math.exp(
+            sum(weight * math.log(parity) for _, parity, weight in stable)
+            / total_weight
+        )
+        if aggregate < aggregate_min:
+            return (
+                f"aggregate full-space parity {aggregate:.4f} is below "
+                f"the {aggregate_min:.4f} threshold"
+            )
+        return "candidate did not improve the full-space parity objective"
+    noisy = [
+        evaluation.case_id
+        for evaluation in summary.cases
+        if evaluation.verification.passed
+        and evaluation.timing is not None
+        and evaluation.timing.coefficient_of_variation > budget.max_cv
+    ]
+    if noisy:
+        return f"timing CV exceeds {budget.max_cv:.4f} for {noisy[0]}"
+    return ""
+
+
+def _passes_evaluation_policy(
+    summary: PerformanceSummary,
+    cases: tuple[InputCase, ...],
+    target: KernelTarget | None,
+) -> bool:
+    policy = dict(target.evaluation_policy) if target is not None else {}
+    minimum_full_configs = policy.get("minimum_full_config_count")
+    if minimum_full_configs is not None:
+        counts = [
+            int(evaluation.verification.metrics.get("full_config_count", 0))
+            for evaluation in summary.cases
+            if evaluation.verification.passed
+        ]
+        if not counts or max(counts) < int(minimum_full_configs):
+            return False
+    if policy.get("kind") != "full_space_parity":
+        return True
+
+    per_case_min = float(policy.get("per_case_min", 0.95))
+    aggregate_min = float(policy.get("aggregate_min", 0.98))
+    max_configs = int(policy.get("max_heuristic_configs", 1))
+    weights = {case.case_id: case.weight for case in cases}
+    weighted_logs = 0.0
+    total_weight = 0.0
+    for evaluation in summary.cases:
+        metrics = evaluation.verification.metrics
+        parity = metrics.get("full_space_parity")
+        config_count = metrics.get("heuristic_config_count")
+        stable = bool(metrics.get("parity_stable", True))
+        if config_count is None or int(config_count) > max_configs:
+            return False
+        if parity is None:
+            return False
+        parity = float(parity)
+        if not math.isfinite(parity) or parity <= 0:
+            return False
+        if stable and parity < per_case_min:
+            return False
+        if stable:
+            weight = float(weights.get(evaluation.case_id, 1.0))
+            weighted_logs += weight * math.log(parity)
+            total_weight += weight
+    if total_weight == 0:
+        return False
+    return math.exp(weighted_logs / total_weight) >= aggregate_min
 
 
 def is_correct_and_stable(
