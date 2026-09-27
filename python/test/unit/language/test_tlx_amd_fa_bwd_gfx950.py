@@ -1948,6 +1948,7 @@ def test_varlen_d128_prefix_register_class_tuning_gfx950(monkeypatch, register_c
         pytest.param(12, 4, 3, True, True, None, id="gqa3-fp32-metadata"),
         pytest.param(64, 8, 4, True, True, None, id="gqa8-fp32-metadata"),
         pytest.param(12, 4, 3, True, False, "q", id="gqa3-fp32-misaligned-q"),
+        pytest.param(64, 8, 4, True, False, "q", id="gqa8-fp32-misaligned-q"),
         pytest.param(12, 4, 3, True, False, "k", id="gqa3-fp32-misaligned-k"),
         pytest.param(12, 4, 3, True, False, "v", id="gqa3-fp32-misaligned-v"),
         pytest.param(12, 4, 3, True, False, "do", id="gqa3-fp32-misaligned-do"),
@@ -1966,8 +1967,8 @@ def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, 
     if check_reference:
         # Genuine exact-family offsets: the first three sequences end in
         # 1/15/16 rows after two full Q512 chunks, with KV tails 1/255/full.
-        # Owner zero must accumulate a second nonzero chunk. The fourth
-        # sequence leaves every query owner except owner zero empty.
+        # Owner zero must accumulate a second nonzero chunk. For H12's
+        # two-owner route, the fourth sequence leaves owner one empty.
         q_lengths = [1025, 1039, 1040, 321, 5662, *([3086] * 13), 1549]
         kv_lengths = [1281, 1279, 1280, 513, 10414, *([6248] * 7), *([6247] * 6), 4711]
     total_q, total_kv = sum(q_lengths), sum(kv_lengths)
@@ -2030,13 +2031,25 @@ def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, 
     else:
         assert all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, do))
     chunked = dq_atomic_fp32 and shifted_input is None
-    expected_query_splits = 2 if chunked else 1
+    direct_prefix = chunked and (q_heads, kv_heads) == (64, 8)
+    expected_query_splits = 2 if chunked and not direct_prefix else 1
+    empty_like = torch.empty_like
+    direct_outputs = []
+
+    def capture_final_outputs(tensor, *args, **kwargs):
+        buffer = empty_like(tensor, *args, **kwargs)
+        if direct_prefix and tensor is k:
+            buffer.fill_(float("nan"))
+            direct_outputs.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(torch, "empty_like", capture_final_outputs)
     allocate_partials = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials
     partial_workspaces = []
 
     def capture_partials(k, splits):
         buffers = allocate_partials(k, splits)
-        if chunked:
+        if chunked and not direct_prefix:
             # Missing stores, including empty owners, must not inherit zeros.
             for buffer in buffers:
                 if buffer is not None:
@@ -2072,26 +2085,33 @@ def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, 
     if shifted_input is None:
         assert not fallback_launches
     if chunked:
-        assert len(partial_workspaces) == 1
-        splits, dk_partial, dv_partial = partial_workspaces[0]
-        assert splits == expected_query_splits
-        for buffer in (dk_partial, dv_partial):
-            assert buffer is not None and buffer.dtype is torch.float32
-            assert buffer.shape == (total_kv, kv_heads, expected_query_splits, 128)
         assert len(preprocess_launches) == len(shared_launches) == len(convert_launches) == 1
-        assert len(reduce_launches) == 1
-        reduce_kwargs, _ = reduce_launches[0]
-        assert reduce_kwargs["KV_SPLITS"] == expected_query_splits
-        # NaN poisoning makes these exact-zero checks require an explicit
-        # store for every empty query owner, including each sequence's KV tail.
-        kv_start = 0
-        for q_length, kv_length in zip(checked_q_lengths, checked_kv_lengths, strict=True):
-            query_chunks = (q_length + 511) // 512
-            if query_chunks < expected_query_splits:
-                for buffer in (dk_partial, dv_partial):
-                    empty = buffer[kv_start:kv_start + kv_length, :, query_chunks:]
-                    assert torch.count_nonzero(empty).item() == 0, (q_length, query_chunks)
-            kv_start += kv_length
+        if direct_prefix:
+            assert not partial_workspaces
+            assert not reduce_launches
+            assert len(direct_outputs) == 2
+            assert actual[1] is direct_outputs[0]
+            assert actual[2] is direct_outputs[1]
+        else:
+            assert len(partial_workspaces) == 1
+            splits, dk_partial, dv_partial = partial_workspaces[0]
+            assert splits == expected_query_splits
+            for buffer in (dk_partial, dv_partial):
+                assert buffer is not None and buffer.dtype is torch.float32
+                assert buffer.shape == (total_kv, kv_heads, expected_query_splits, 128)
+            assert len(reduce_launches) == 1
+            reduce_kwargs, _ = reduce_launches[0]
+            assert reduce_kwargs["KV_SPLITS"] == expected_query_splits
+            # NaN poisoning makes these exact-zero checks require an explicit
+            # store for every empty query owner, including each sequence's KV tail.
+            kv_start = 0
+            for q_length, kv_length in zip(checked_q_lengths, checked_kv_lengths, strict=True):
+                query_chunks = (q_length + 511) // 512
+                if query_chunks < expected_query_splits:
+                    for buffer in (dk_partial, dv_partial):
+                        empty = buffer[kv_start:kv_start + kv_length, :, query_chunks:]
+                        assert torch.count_nonzero(empty).item() == 0, (q_length, query_chunks)
+                kv_start += kv_length
         assert not legacy_preprocess_launches
         assert all(not launches for launches in rolling_launches.values())
         preprocess_kwargs, _ = preprocess_launches[0]

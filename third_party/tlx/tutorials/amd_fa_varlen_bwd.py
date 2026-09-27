@@ -5482,13 +5482,14 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
     768, four KV heads, four or twelve Q heads, max-Q 300/400 and max-KV 3200
     caches query statistics and preserves wave ownership in its dK stores.
     GQA accumulates all mapped query heads' dK/dV contributions in FP32 before
-    the final BF16 stores. The aligned batch-19 prefix cases with
+    the final BF16 stores. With FP32 dQ, the aligned batch-19 prefix cases with
     (total_q, total_kv, max_q, max_kv) = (50754, 100696, 5662, 10414) and
     (Q heads, KV heads) = (12, 4) or (64, 8) refresh the same statistics cache
-    in 512-row query chunks assigned across two owners, then reduce their FP32
-    dK/dV partials. Other configurations retain their existing routes, except
-    that misaligned inputs bypass wide aligned copies through the generic
-    BM16 kernel in both dQ accumulation modes.
+    in 512-row query chunks. The (12, 4) case assigns chunks across two owners
+    and reduces their FP32 dK/dV partials; the (64, 8) case uses one owner
+    to accumulate all chunks and store BF16 dK/dV directly. Other configurations
+    retain their existing routes, except that misaligned inputs bypass wide
+    aligned copies through the generic BM16 kernel in both dQ accumulation modes.
     """
     _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal, dq_atomic_fp32)
     plan_error_index = _CAUSAL_PLAN_ERROR if causal else _PLAN_ERROR
@@ -5519,8 +5520,10 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
                          and q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16
                          and _select_varlen_kernel_blocks(group_size, kv_splits) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
                          and k.numel() <= _I32_BUFFER_FP32_ELEMENTS)
-    query_splits = 2 if chunked_prefix_fp32_case else 1
-    if chunked_prefix_fp32_case:
+    query_splits = 2 if chunked_prefix_fp32_case and heads == 12 else 1
+    if chunked_prefix_fp32_case and heads == 64:
+        dk_part, dv_part = None, None
+    elif chunked_prefix_fp32_case:
         dk_part, dv_part = _allocate_varlen_dkdv_partials(k, query_splits)
         if dk_part is None:
             raise ValueError("query-split FP32 partials exceed the signed 32-bit byte-offset range")
