@@ -152,6 +152,8 @@ def run_tuning(
     final_source = heuristic_result.best_kernel
     output_dir.joinpath("best_kernel.py").write_text(final_source)
     summary = _parity_summary(heuristic_result.final, cases)
+    recall_before = _recall_summary(heuristic_result.baseline)
+    recall_after = _recall_summary(heuristic_result.final)
     summary.update({
         "success": passed,
         "task": "tuning",
@@ -163,6 +165,8 @@ def run_tuning(
         "heuristic_speedup": heuristic_result.final.aggregate_speedup,
         "best_kernel": str(output_dir / "best_kernel.py"),
         "full_space_oracle": str(oracle_path),
+        "recall_before": recall_before,
+        "recall_after": recall_after,
         "result": str(output_dir / "result.json"),
     })
     output_dir.joinpath("summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -242,6 +246,28 @@ def _parity_summary(
         "minimum_stable_shape_parity": min((parity for parity, _ in stable_parities), default=0.0),
         "maximum_heuristic_config_count": max_config_count,
     }
+
+
+def _recall_summary(performance: PerformanceSummary) -> dict[str, int | float]:
+    matches = 0
+    for evaluation in performance.cases:
+        metrics = evaluation.verification.metrics
+        heuristic = _config_signature(metrics.get("heuristic_config"))
+        full = _config_signature(metrics.get("full_best_config"))
+        matches += bool(heuristic and heuristic == full)
+    total = len(performance.cases)
+    return {
+        "matched_shapes": matches,
+        "total_shapes": total,
+        "rate": matches / total if total else 0.0,
+    }
+
+
+def _config_signature(config: Any) -> tuple[str, ...]:
+    if not config:
+        return ()
+    specification = str(config).split(": ", 1)[-1]
+    return tuple(sorted(specification.split()))
 
 
 def _maximum_full_config_count(performance: PerformanceSummary) -> int:

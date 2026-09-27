@@ -55,6 +55,7 @@ from ..decision_maker.policy import (
 from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
 from ..decision_maker.tuning import (
     _parity_summary,
+    _recall_summary,
     _tuning_symbols,
     infer_kernel_path,
     production_cases,
@@ -977,6 +978,39 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(decision.status, DecisionStatus.PROMOTE)
         self.assertIn("continue refinement", decision.rationale)
 
+    def test_tuning_reports_exact_config_recall(self) -> None:
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="match",
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_best_config": "kernel: BLOCK_M=64 GROUP_M=4",
+                            "heuristic_config": "GROUP_M=4 BLOCK_M=64",
+                        },
+                    ),
+                    timing=TimingSamples((1.0, )),
+                ),
+                CaseEvaluation(
+                    case_id="miss",
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_best_config": "kernel: BLOCK_M=128 GROUP_M=4",
+                            "heuristic_config": "BLOCK_M=128 GROUP_M=8",
+                        },
+                    ),
+                    timing=TimingSamples((1.0, )),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            _recall_summary(performance),
+            {"matched_shapes": 1, "total_shapes": 2, "rate": 0.5},
+        )
+
     def test_tuning_edits_only_the_heuristic(self) -> None:
         source = (
             "def _configs():\n"
@@ -995,6 +1029,8 @@ class ScoringTest(unittest.TestCase):
                         True,
                         metrics={
                             "full_config_count": 16,
+                            "full_best_config": "kernel: VALUE=1",
+                            "heuristic_config": "VALUE=1",
                             "full_space_parity": 1.0,
                             "heuristic_config_count": 1,
                             "parity_stable": True,
@@ -1057,6 +1093,11 @@ class ScoringTest(unittest.TestCase):
                 request.target.environment["TLX_AGENT_FULL_SPACE_ORACLE"],
                 str((root / "out/full_space_oracle.json").resolve()),
             )
+            self.assertEqual(
+                result["summary"]["recall_before"],
+                {"matched_shapes": 1, "total_shapes": 1, "rate": 1.0},
+            )
+            self.assertEqual(result["summary"]["recall_after"], result["summary"]["recall_before"])
             self.assertEqual((root / "out/best_kernel.py").read_text(), candidate)
 
     def test_tuning_rejects_an_unreasonably_small_full_space(self) -> None:

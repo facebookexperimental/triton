@@ -152,6 +152,8 @@ def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) 
         metrics.update({
             "full_space_parity":
             full_median / heuristic_median,
+            "heuristic_config":
+            _selected_heuristic_config(artifact, a, b),
             "heuristic_config_count":
             max(
                 1,
@@ -211,6 +213,19 @@ def _format_config(config) -> str:
         return ""
     kwargs = " ".join(f"{key}={value}" for key, value in config.kwargs.items())
     return f"{kwargs} num_warps={config.num_warps} num_stages={config.num_stages}"
+
+
+def _selected_heuristic_config(artifact: Mapping[str, Any], a, b) -> str:
+    module = artifact.get("module")
+    if module is None:
+        return ""
+    shape = (a.shape[0], b.shape[1], a.shape[1])
+    precheck = getattr(module, "_precheck_local_split_u", None)
+    if precheck is not None and precheck(a, b, None):
+        plan = module._MEASURED_LOCAL_SPLIT_U_PLANS[shape]
+        return _format_config(module._local_split_u_config(plan))
+    configs = module.heuristic_config(*shape)
+    return _format_config(configs[0]) if len(configs) == 1 else ""
 
 
 def _best_configs(tuners: Mapping[str, Any]) -> str:
