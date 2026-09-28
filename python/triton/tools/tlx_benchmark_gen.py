@@ -9,12 +9,44 @@ _generate_standalone_test() reads this JSON and produces a generic _test_standal
 that works for any kernel — no hardcoded attention-specific inputs.
 """
 
+import dataclasses
 import json
 import logging
 import os
 import tempfile
 
 log = logging.getLogger(__name__)
+
+# Option fields that name the target or the debug setup rather than tune the
+# launch. Replaying `arch` pins the dump's GPU onto whatever box reruns it.
+_NON_LAUNCH_OPTIONS = frozenset({"arch", "backend_name", "extern_libs", "instrumentation_mode"})
+
+
+def _launch_options(options):
+    """The launch-tuning options that differ from this backend's defaults.
+
+    num_warps, num_stages, matrix_instr_nonkdim and friends are compile options,
+    not kernel arguments, so nothing in `args` records them -- yet replaying a
+    kernel without them silently benchmarks a differently-compiled kernel (on
+    gfx942 the production GEMM drops 442 -> 304 TFLOPS). Diffing against the
+    dataclass defaults keeps this backend-agnostic: every field of the options
+    dataclass is accepted back as a launch kwarg.
+    """
+    if options is None or not dataclasses.is_dataclass(options):
+        return {}
+    captured = {}
+    for field in dataclasses.fields(options):
+        if field.name in _NON_LAUNCH_OPTIONS:
+            continue
+        value = getattr(options, field.name, None)
+        # Non-scalars are target capability lists (fp8 dtypes, dot precisions),
+        # not tuning knobs, and are not JSON round-trippable as kwargs.
+        if not isinstance(value, (bool, int, float, str)):
+            continue
+        if field.default is not dataclasses.MISSING and value == field.default:
+            continue
+        captured[field.name] = value
+    return captured
 
 
 def _ensure_dump_dir():
@@ -147,7 +179,7 @@ def _dtype_str(dtype):
     return str(dtype).replace("torch.", "")
 
 
-def capture_kernel_args(bound_args, signature, constexprs, _params=None):
+def capture_kernel_args(bound_args, signature, constexprs, _params=None, options=None):
     """Serialize kernel call argument metadata to *_kernel_args.json*.
 
     Parameters
@@ -162,6 +194,9 @@ def capture_kernel_args(bound_args, signature, constexprs, _params=None):
         Mapping from path-tuples ``(index,)`` to constexpr values.
     params : list
         The ``JITFunction.params`` list (used for positional ordering).
+    options : Any
+        The backend options object for this compile, used to record the launch
+        tuning (num_warps, num_stages, ...) that the argument list cannot carry.
     """
     import torch
 
@@ -236,6 +271,7 @@ def capture_kernel_args(bound_args, signature, constexprs, _params=None):
     meta = {
         "args": args_list,
         "constexprs": constexpr_map,
+        "launch_options": _launch_options(options),
     }
 
     json_path = os.path.join(dump_dir, "_kernel_args.json")
@@ -361,6 +397,10 @@ def generate_standalone_test(dump_dir, kernel_name, _source_origin=None, _metada
         "    args_meta = meta['args']",
         "    constexprs = meta.get('constexprs', {})",
         "    grid_vals = meta.get('grid', [1, 1, 1])",
+        "    # num_warps/num_stages/... are not kernel arguments, so without these",
+        "    # the generated kernel recompiles at the backend defaults and the",
+        "    # timing below describes a different kernel than the source ran.",
+        "    launch_opts = meta.get('launch_options', {})",
         "",
         "    # Allocator for Triton scratch memory",
         "    triton.set_allocator(lambda s, a, _: torch.empty(s, dtype=torch.int8, device=DEVICE))",
@@ -455,11 +495,11 @@ def generate_standalone_test(dump_dir, kernel_name, _source_origin=None, _metada
         "    grid = tuple(grid_vals)",
         "",
         '    print(f"--- TLX kernel ---", flush=True)',
-        "    " + kernel_name + "[grid](*kernel_args)",
+        "    " + kernel_name + "[grid](*kernel_args, **launch_opts)",
         "    torch.cuda.synchronize()",
         "",
         "    ms_tlx = triton.testing.do_bench(",
-        "        lambda: " + kernel_name + "[grid](*kernel_args),",
+        "        lambda: " + kernel_name + "[grid](*kernel_args, **launch_opts),",
         "        warmup=100, rep=500)",
         "    tflops_tlx = flops / ms_tlx / 1e9 if flops and ms_tlx else 0",
         "    if flops:",
