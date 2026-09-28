@@ -310,6 +310,48 @@ def is_linux_os(os_id):
     return False
 
 
+OAI_LLVM_RELEASE_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
+
+
+def load_llvm_info(base_dir: Optional[str] = None) -> dict:
+    # cmake/llvm-info.json is OAI's pin and stays untouched so upstream
+    # cherry-picks apply cleanly. cmake/meta-llvm-info.json, when present,
+    # names the Meta LLVM fork build and must sit on OAI's pin.
+    cmake_dir = os.path.join(base_dir or get_base_dir(), "cmake")
+    with open(os.path.join(cmake_dir, "llvm-info.json"), "r") as llvm_info_file:
+        oai_info = json.load(llvm_info_file)
+    meta_path = os.path.join(cmake_dir, "meta-llvm-info.json")
+    if not os.path.exists(meta_path):
+        return {**oai_info, "release_base_url": OAI_LLVM_RELEASE_BASE_URL}
+    with open(meta_path, "r") as meta_info_file:
+        meta_info = json.load(meta_info_file)
+    if meta_info["based_on_oai_llvm_hash"] != oai_info["llvm_hash"]:
+        raise RuntimeError(f"cmake/meta-llvm-info.json is based on OAI LLVM {meta_info['based_on_oai_llvm_hash'][:12]} "
+                           f"but cmake/llvm-info.json pins {oai_info['llvm_hash'][:12]}; "
+                           "rebuild the Meta LLVM on the new OAI pin")
+    return meta_info
+
+
+def llvm_package_for_suffix(system_suffix: str, base_dir: Optional[str] = None) -> Package:
+    llvm_info = load_llvm_info(base_dir)
+    sha256sums = llvm_info["sha256sum"]
+    if system_suffix not in sha256sums:
+        raise RuntimeError(f"LLVM pre-compiled image is not available for {system_suffix} "
+                           f"(published: {', '.join(sorted(sha256sums))}); set LLVM_SYSPATH to a local LLVM build")
+    name = f"llvm-{llvm_info['llvm_hash'][:8]}-{system_suffix}-{llvm_info['build_number']}"
+    return Package(
+        "llvm",
+        name,
+        f"{llvm_info['release_base_url'].rstrip('/')}/{name}.tar.gz",
+        "LLVM_INCLUDE_DIRS",
+        "LLVM_LIBRARY_DIR",
+        "LLVM_SYSPATH",
+        # Stable symlink that doesn't include the revision.
+        sym_name=f"llvm-{system_suffix}",
+        sha256sum=sha256sums[system_suffix],
+    )
+
+
 def get_llvm_package_info(helper_args: BuildHelperArgs):
     system = platform.system()
     try:
@@ -347,26 +389,13 @@ def get_llvm_package_info(helper_args: BuildHelperArgs):
             f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
         )
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
-    llvm_info_path = os.path.join(get_base_dir(), "cmake", "llvm-info.json")
-    with open(llvm_info_path, "r") as llvm_info_file:
-        llvm_info = json.load(llvm_info_file)
-    rev = llvm_info["llvm_hash"][:8]
-    build_number = llvm_info["build_number"]
-    name = f"llvm-{rev}-{system_suffix}-{build_number}"
-    # Create a stable symlink that doesn't include revision
-    sym_name = f"llvm-{system_suffix}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
-    sha256sum = llvm_info["sha256sum"][system_suffix]
-    return Package(
-        "llvm",
-        name,
-        url,
-        "LLVM_INCLUDE_DIRS",
-        "LLVM_LIBRARY_DIR",
-        "LLVM_SYSPATH",
-        sym_name=sym_name,
-        sha256sum=sha256sum,
-    )
+    try:
+        return llvm_package_for_suffix(system_suffix)
+    except RuntimeError as error:
+        if helper_args.llvm_syspath is None:
+            raise
+        print(f"{error}. Proceeding with LLVM_SYSPATH={helper_args.llvm_syspath}.")
+        return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
 
 
 def _get_syspath_override(package_syspath_var_name: str, helper_args: BuildHelperArgs) -> Optional[str]:
