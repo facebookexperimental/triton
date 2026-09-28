@@ -515,6 +515,7 @@ def test_varlen_d128_kv_partial_workspace_shapes():
         pytest.param([7, 31, 65], [33, 257, 7], 2, 2, (0, 0), id="mha-mixed-full-tail"),
         pytest.param([1, 17], [1, 127], 2, 2, (0, 0), id="mha-all-tail"),
         pytest.param([16, 32], [128, 256], 2, 2, (0, 0), id="mha-all-full"),
+        pytest.param([17, 17, 17], [257, 257, 257], 2, 2, (0, 0), id="mha-uniform-interleaved"),
         pytest.param([1, 17], [1, 96], 4, 4, (0, 0), id="mha-k96-all-tail"),
         pytest.param([1, 17, 33], [96, 224, 128], 4, 4, (0, 0), id="mha-tail-96"),
         pytest.param([1, 17, 33], [97, 225, 128], 4, 4, (0, 0), id="mha-tail-97"),
@@ -1210,7 +1211,8 @@ def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
         assert "amdg.rematerialized_range 0 to 128 identity 32" not in ttir
         assert "amdg.rematerialized_range 0 to 16 identity 33" not in ttir
         assert "arith.cmpi sle" not in ttir
-        assert "buffer_atomic_pk_add_bf16" in interleaved.asm["amdgcn"]
+        assert "buffer_atomic_add_f32" in interleaved.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in interleaved.asm["amdgcn"]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1245,7 +1247,8 @@ def test_varlen_d128_causal_codegen_is_scratch_free_gfx950():
         assert ttir.count("arith.cmpi sle") == 1
         assert "arith.select" in ttir
         assert re.search(r"tt\.addptr %V, %\w+ : !tt\.ptr<bf16>, i64", ttir)
-        assert "buffer_atomic_pk_add_bf16" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_add_f32" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in compiled.asm["amdgcn"]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1280,4 +1283,5 @@ def test_varlen_d128_split_codegen_is_scratch_free_gfx950():
             assert compiled.metadata.num_warps == 4
             assert compiled.metadata.shared == expected_shared
     for compiled in kernels[0].device_caches[device][0].values():
-        assert "buffer_atomic_pk_add_bf16" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_add_f32" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in compiled.asm["amdgcn"]
