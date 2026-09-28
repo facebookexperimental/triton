@@ -1,68 +1,259 @@
 #!/usr/bin/env bash
-# Hook this FBTriton checkout into an existing PyTorch virtual environment.
+# Select a built local PyTorch checkout for TorchTLX, or restore the environment default.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO="$(pwd -P)"
-PY=""
+PY="$(command -v python3 || true)"
 
 usage() {
-  echo "usage: $0 --python /path/to/pytorch/.venv/bin/python"
+  echo "usage: $0 /path/to/local/pytorch"
+  echo "       $0 --reset"
 }
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --python)
-      PY="${2:?--python requires an interpreter}"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "unknown argument: $1" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-done
-
-if [ -z "$PY" ]; then
-  echo "--python is required" >&2
+if [ "$#" -ne 1 ]; then
   usage >&2
   exit 2
 fi
-if [ ! -x "$PY" ]; then
-  echo "not an executable Python interpreter: $PY" >&2
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  usage
+  exit 0
+fi
+if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+  echo "python3 is not available; activate the target virtualenv first" >&2
   exit 2
 fi
 PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")"
 
 log() { echo "[torchtlx-setup] $*"; }
 
-log "validating user-built PyTorch"
-"$PY" - <<'PY'
+ENV_PATHS_OUTPUT="$("$PY" - <<'PY'
+import pathlib
+import sys
+import sysconfig
+
+if sys.prefix == sys.base_prefix:
+    raise SystemExit(
+        "refusing to modify a non-virtualenv Python installation; "
+        "activate the target virtualenv first"
+    )
+purelib = pathlib.Path(sysconfig.get_path("purelib"))
+print(purelib / "torchtlx_local_pytorch.pth")
+print(purelib / "_torchtlx_local_pytorch.py")
+PY
+)"
+readarray -t ENV_PATHS <<<"$ENV_PATHS_OUTPUT"
+PTH_PATH="${ENV_PATHS[0]}"
+BOOTSTRAP_PATH="${ENV_PATHS[1]}"
+
+reset_environment() {
+  "$PY" - "$PTH_PATH" "$BOOTSTRAP_PATH" <<'PY'
+import pathlib
+import sys
+
+for value in sys.argv[1:]:
+    pathlib.Path(value).unlink(missing_ok=True)
+PY
+  log "removed the local PyTorch overlay"
+  "$PY" - <<'PY'
+import pathlib
+import torch
+
+print(f"torch={torch.__version__}")
+print(f"torch_path={pathlib.Path(torch.__file__).resolve()}")
+PY
+  log "restored the virtualenv's default torch"
+}
+
+if [ "$1" = "--reset" ]; then
+  reset_environment
+  exit 0
+fi
+
+PYTORCH_REPO="$(cd "$1" 2>/dev/null && pwd -P)" || {
+  echo "not a PyTorch checkout directory: $1" >&2
+  exit 2
+}
+if [ ! -f "$PYTORCH_REPO/torch/__init__.py" ]; then
+  echo "not a PyTorch checkout: $PYTORCH_REPO/torch/__init__.py is missing" >&2
+  exit 2
+fi
+if [ ! -f "$PYTORCH_REPO/build/CMakeCache.txt" ]; then
+  echo "PyTorch is not built: $PYTORCH_REPO/build/CMakeCache.txt is missing" >&2
+  exit 1
+fi
+if ! compgen -G "$PYTORCH_REPO/build/torch/_C*.so" >/dev/null; then
+  echo "PyTorch is not built: $PYTORCH_REPO/build/torch/_C*.so is missing" >&2
+  exit 1
+fi
+if [ ! -f "$REPO/python/triton/_C/libtriton.so" ]; then
+  echo "FBTriton is not built: $REPO/python/triton/_C/libtriton.so is missing" >&2
+  exit 1
+fi
+
+BUILD_INFO_OUTPUT="$("$PY" - "$PYTORCH_REPO/build/CMakeCache.txt" <<'PY'
+import pathlib
+import sys
+
+cache = pathlib.Path(sys.argv[1]).read_text().splitlines()
+
+
+def value(name):
+    prefix = f"{name}:"
+    for line in cache:
+        if line.startswith(prefix):
+            return line.split("=", 1)[1]
+    return ""
+
+
+print(value("PYTHON_EXECUTABLE"))
+print(value("CUDA_TOOLKIT_ROOT_DIR"))
+PY
+)"
+readarray -t BUILD_INFO <<<"$BUILD_INFO_OUTPUT"
+BUILD_PY="${BUILD_INFO[0]}"
+CUDA_ROOT="${BUILD_INFO[1]}"
+if [ -z "$BUILD_PY" ] || [ ! -x "$BUILD_PY" ]; then
+  echo "PyTorch build does not name a usable PYTHON_EXECUTABLE" >&2
+  exit 1
+fi
+
+BUILD_PURELIB="$($BUILD_PY - <<'PY'
+import sysconfig
+
+print(sysconfig.get_path("purelib"))
+PY
+)"
+
+EDITABLE_MODULE="$($PY - "$BUILD_PURELIB" "$PYTORCH_REPO" <<'PY'
+import pathlib
+import re
+import sys
+
+purelib = pathlib.Path(sys.argv[1])
+checkout = pathlib.Path(sys.argv[2]).resolve()
+for path in sorted(purelib.glob("*.pth")):
+    text = path.read_text()
+    if str(checkout) not in text:
+        continue
+    for line in text.splitlines():
+        match = re.match(r"\s*import\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+        if match and "torch" in match.group(1).lower():
+            module = match.group(1)
+            if (purelib / f"{module}.py").is_file():
+                print(module)
+                raise SystemExit
+raise SystemExit(
+    "the PyTorch build is not installed editable in its build Python; "
+    "complete the checkout's normal build/install first"
+)
+PY
+)"
+
+NVJITLINK=""
+if [ -n "$CUDA_ROOT" ] && [ -e "$CUDA_ROOT/lib64/libnvJitLink.so" ]; then
+  NVJITLINK="$(readlink -f "$CUDA_ROOT/lib64/libnvJitLink.so")"
+fi
+
+BACKUP_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$BACKUP_DIR"; }
+trap cleanup EXIT
+HAD_PTH=0
+HAD_BOOTSTRAP=0
+if [ -f "$PTH_PATH" ]; then
+  cp "$PTH_PATH" "$BACKUP_DIR/original.pth"
+  HAD_PTH=1
+fi
+if [ -f "$BOOTSTRAP_PATH" ]; then
+  cp "$BOOTSTRAP_PATH" "$BACKUP_DIR/original.py"
+  HAD_BOOTSTRAP=1
+fi
+
+restore_previous_overlay() {
+  if [ "$HAD_PTH" -eq 1 ]; then
+    cp "$BACKUP_DIR/original.pth" "$PTH_PATH"
+  else
+    rm -f "$PTH_PATH"
+  fi
+  if [ "$HAD_BOOTSTRAP" -eq 1 ]; then
+    cp "$BACKUP_DIR/original.py" "$BOOTSTRAP_PATH"
+  else
+    rm -f "$BOOTSTRAP_PATH"
+  fi
+}
+
+"$PY" - \
+  "$PTH_PATH" \
+  "$BOOTSTRAP_PATH" \
+  "$BUILD_PURELIB" \
+  "$EDITABLE_MODULE" \
+  "$REPO/python" \
+  "$NVJITLINK" <<'PY'
+import os
+import pathlib
+import sys
+
+pth_path = pathlib.Path(sys.argv[1])
+bootstrap_path = pathlib.Path(sys.argv[2])
+build_purelib = sys.argv[3]
+editable_module = sys.argv[4]
+fbtriton_python = sys.argv[5]
+nvjitlink = sys.argv[6]
+
+source = f'''# Generated by scripts/setup_torchtlx_env.sh.
+import ctypes
+import sys
+
+_build_purelib = {build_purelib!r}
+_fbtriton_python = {fbtriton_python!r}
+_nvjitlink = {nvjitlink!r}
+
+if _nvjitlink:
+    ctypes.CDLL(_nvjitlink, mode=ctypes.RTLD_GLOBAL)
+sys.path.insert(0, _build_purelib)
+try:
+    __import__({editable_module!r})
+finally:
+    sys.path.remove(_build_purelib)
+sys.path.insert(0, _fbtriton_python)
+'''
+
+
+def replace(path, text):
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text)
+    temporary.replace(path)
+
+
+replace(bootstrap_path, source)
+replace(pth_path, "import _torchtlx_local_pytorch\n")
+PY
+
+log "validating local PyTorch and FBTriton"
+if ! "$PY" - "$PYTORCH_REPO" "$REPO" <<'PY'
 import ast
 import pathlib
 import sys
 
 import torch
+import triton
 from torch._inductor import config
+from triton._C.libtriton import ir  # noqa: F401
 
-if sys.prefix == sys.base_prefix:
-    raise SystemExit("refusing to modify a non-virtualenv Python installation")
+pytorch_repo = pathlib.Path(sys.argv[1]).resolve()
+fbtriton_repo = pathlib.Path(sys.argv[2]).resolve()
+torch_path = pathlib.Path(torch.__file__).resolve()
+triton_path = pathlib.Path(triton.__file__).resolve()
+if pytorch_repo not in torch_path.parents:
+    raise SystemExit(f"local PyTorch checkout is shadowed by {torch_path}")
+if fbtriton_repo not in triton_path.parents:
+    raise SystemExit(f"FBTriton checkout is shadowed by {triton_path}")
 if not hasattr(config.triton, "tlx_mode"):
     raise SystemExit(
         "incompatible PyTorch: torch._inductor.config.triton.tlx_mode is missing"
     )
 
-custom_op_path = (
-    pathlib.Path(torch.__file__).resolve().parent
-    / "_inductor"
-    / "kernel"
-    / "custom_op.py"
-)
+custom_op_path = torch_path.parent / "_inductor" / "kernel" / "custom_op.py"
 module = ast.parse(custom_op_path.read_text(), filename=str(custom_op_path))
 registration = next(
     (
@@ -74,9 +265,7 @@ registration = next(
     None,
 )
 if registration is None:
-    raise SystemExit(
-        "incompatible PyTorch: register_custom_op_autotuning is missing"
-    )
+    raise SystemExit("incompatible PyTorch: register_custom_op_autotuning is missing")
 parameters = {
     argument.arg
     for argument in (*registration.args.args, *registration.args.kwonlyargs)
@@ -87,100 +276,21 @@ if "include_fallback" not in parameters:
         "register_custom_op_autotuning(include_fallback=...) is required"
     )
 
+import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
 print(f"torch={torch.__version__}")
-print(f"torch_path={pathlib.Path(torch.__file__).resolve()}")
+print(f"torch_path={torch_path}")
 print(f"torch_git={torch.version.git_version}")
-PY
-
-if [ ! -f "$REPO/python/triton/_C/libtriton.so" ]; then
-  echo "FBTriton is not built: $REPO/python/triton/_C/libtriton.so is missing" >&2
-  echo "build FBTriton with $PY before running this hook" >&2
-  exit 1
-fi
-
-# Resolve the environment's platform-independent library directory instead of
-# assuming the first global site-packages entry is the virtual environment.
-PTH_PATH="$($PY - <<'PY'
-import pathlib
-import sysconfig
-
-print(pathlib.Path(sysconfig.get_path("purelib")) / "fbtriton_checkout.pth")
-PY
-)"
-
-# Validate the complete integration before changing the environment. Explicitly
-# prepending the checkout here prevents an older .pth hook from shadowing it.
-if ! "$PY" - "$REPO" <<'PY'
-import pathlib
-import sys
-
-repo = pathlib.Path(sys.argv[1]).resolve()
-sys.path.insert(0, str(repo / "python"))
-
-import torch
-import triton
-from torch._inductor import config
-from triton._C.libtriton import ir  # noqa: F401
-
-triton_path = pathlib.Path(triton.__file__).resolve()
-if repo not in triton_path.parents:
-    raise SystemExit(f"FBTriton checkout is shadowed by {triton_path}")
-if not hasattr(config.triton, "tlx_mode"):
-    raise SystemExit(
-        "incompatible PyTorch: torch._inductor.config.triton.tlx_mode is missing"
-    )
-
-import triton.language.extra.tlx.inductor.registry  # noqa: F401
-PY
-then
-  echo "TorchTLX integration validation failed for $PY" >&2
-  echo "ensure FBTriton is built with that same Python interpreter" >&2
-  exit 1
-fi
-
-# Prepend this checkout in new Python processes. The atomic replacement leaves
-# an existing hook intact if writing the new one fails.
-"$PY" - "$REPO/python" "$PTH_PATH" <<'PY'
-import os
-import pathlib
-import sys
-
-source = pathlib.Path(sys.argv[1]).resolve()
-pth_path = pathlib.Path(sys.argv[2])
-temporary = pth_path.with_name(f".{pth_path.name}.{os.getpid()}.tmp")
-temporary.write_text(f"import sys; sys.path.insert(0, {str(source)!r})\n")
-temporary.replace(pth_path)
-PY
-log "hooked FBTriton through $PTH_PATH"
-
-"$PY" - <<PY
-import pathlib
-
-import torch
-import triton
-from torch._inductor import config
-
-repo = pathlib.Path("$REPO").resolve()
-triton_path = pathlib.Path(triton.__file__).resolve()
-if repo not in triton_path.parents:
-    raise SystemExit(f"FBTriton checkout is shadowed by {triton_path}")
-if not hasattr(config.triton, "tlx_mode"):
-    raise SystemExit("incompatible PyTorch: torch._inductor.config.triton.tlx_mode is missing")
-
-import triton.language.extra.tlx.inductor.registry  # noqa: F401
-
 print(f"triton_path={triton_path}")
 print("TorchTLX registry=compatible")
 PY
-
-log "ready"
-ACTIVE_PY="$(command -v python3 || true)"
-if [ -z "$ACTIVE_PY" ] || [ "$(dirname "$ACTIVE_PY")" != "$(dirname "$PY")" ]; then
-  log "the current shell still resolves python3 to ${ACTIVE_PY:-<not found>}"
-  if [ -f "$(dirname "$PY")/activate" ]; then
-    log "activate the configured environment before using python3:"
-    log "source $(dirname "$PY")/activate"
-  fi
+then
+  restore_previous_overlay
+  echo "TorchTLX integration validation failed; restored the previous environment" >&2
+  exit 1
 fi
-log "run directly:"
-log "$PY python/test/torchtlx_benchmark/run_torchtlx_fusions.py --list"
+
+log "selected local PyTorch checkout $PYTORCH_REPO"
+log "overlay=$PTH_PATH"
+log "reset with: $0 --reset"
+log "run: python3 python/test/torchtlx_benchmark/run_torchtlx_fusions.py --list"
