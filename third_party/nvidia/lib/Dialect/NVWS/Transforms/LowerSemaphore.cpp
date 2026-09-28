@@ -102,8 +102,8 @@ void setIsAsync(triton::nvidia_gpu::MMAv5OpInterface mmaOp,
 }
 
 // CONTRACT: pending_count is AUTHORED by the producing pass and REQUIRED here.
-// LowerSemaphore uses it verbatim; folded circular semaphore IR is intentionally
-// not re-derived from the post-fold physical release stream here.
+// LowerSemaphore uses it verbatim; folded circular semaphore IR is
+// intentionally not re-derived from the post-fold physical release stream here.
 FailureOr<int> getPendingCount(SemaphoreCreateOp op) {
   auto authored = op.getPendingCountAttr();
   if (!authored)
@@ -178,8 +178,8 @@ FailureOr<Value> rematerializeStageBefore(Value stage,
   return mapping.lookupOrDefault(stage);
 }
 
-LogicalResult lowerTMALoad(SemaphoreReleaseOp op,
-                           PatternRewriter &rewriter, Value mbars) {
+LogicalResult lowerTMALoad(SemaphoreReleaseOp op, PatternRewriter &rewriter,
+                           Value mbars) {
   auto kinds = castAsyncOpAttrs(op.getAsyncOps());
   if (!llvm::any_of(kinds,
                     [](AsyncOp kind) { return kind == AsyncOp::TMALoad; }))
@@ -272,9 +272,10 @@ void rewriteAcquire(SemaphoreAcquireOp op, PatternRewriter &rewriter,
   assignStageCluster(waitOp, partitionWsTagIds, stageCluster, rewriter);
 }
 
-LogicalResult rewriteRelease(
-    SemaphoreCreateOp semaOp, SemaphoreReleaseOp op, PatternRewriter &rewriter,
-    Value mbars, const llvm::DenseMap<Operation *, bool> &hasAsyncPeerBySema) {
+LogicalResult
+rewriteRelease(SemaphoreCreateOp semaOp, SemaphoreReleaseOp op,
+               PatternRewriter &rewriter, Value mbars,
+               const llvm::DenseMap<Operation *, bool> &hasAsyncPeerBySema) {
   auto loc = op.getLoc();
   auto asyncKinds = castAsyncOpAttrs(op.getAsyncOps());
   // CONTRACT: arrive_count is authored by the producing pass and required.
@@ -337,8 +338,8 @@ LogicalResult rewriteRelease(
         return op.emitError("arrive_count > 1 is only lowerable for "
                             "none/wgmma async kinds");
       if (asyncKind != AsyncOp::TMALoad)
-        arriveOp = TCGen5CommitOp::create(rewriter, loc, mbar, Value(),
-                                          ValueRange{});
+        arriveOp =
+            TCGen5CommitOp::create(rewriter, loc, mbar, Value(), ValueRange{});
       break;
     case AsyncOp::CpAsync:
     default:
@@ -439,8 +440,8 @@ DenseSet<MMAv5OpInterface> getAsyncMMAv5Consumers(Value semaphore) {
 // into the matching loop's warp group. Semaphore cleanup remains unpartitioned,
 // so a tagged user before the loop is semantically live through that loop even
 // though its current lexical position precedes it.
-void addWarpSpecializationCleanupAnchors(
-    SemaphoreCreateOp op, SetVector<Operation *> &users) {
+void addWarpSpecializationCleanupAnchors(SemaphoreCreateOp op,
+                                         SetVector<Operation *> &users) {
   Block *block = op->getBlock();
   DenseSet<int> movedUserTags;
   for (Operation *user : users) {

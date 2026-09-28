@@ -27,6 +27,7 @@ def _validate_common_descriptor(
         assert shape_dim > 0, "shape must be positive"
     assert strides[-1] == 1, "Last dimension must be contiguous"
     assert isinstance(layout, NVMMASharedLayout), "Layout must be NVMMASharedLayout"
+    assert layout.rank == len(block_shape), "layout rank must match block shape rank"
     assert padding == "zero" or padding == "nan", "Illegal value for padding"
     if padding == "nan":
         assert (
