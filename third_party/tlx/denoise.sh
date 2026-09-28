@@ -50,7 +50,7 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     POWER_CAP=$(awk -v d="$DESIRED_POWER" -v m="$MAX_POWER" 'BEGIN {print (d < m ? d : m)}')
 
     echo "Locking GPU $CUDA_VISIBLE_DEVICES power cap to $POWER_CAP W"
-    echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK Hz"
+    echo "Locking GPU $CUDA_VISIBLE_DEVICES frequency cap to $MAX_SM_CLOCK MHz"
 
     # Lock GPU clocks
     (
@@ -119,9 +119,11 @@ fi
 if [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
     echo "Binding CPU and memory to NUMA node $NUMA_NODE"
     numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "$@"
+    BENCHMARK_STATUS=$?
 else
     echo "Warning: Could not determine a valid GPU-local NUMA node; running without NUMA binding" >&2
     "$@"
+    BENCHMARK_STATUS=$?
 fi
 
 # Unlock GPU clock
@@ -136,3 +138,5 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
         sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetpoweroverdrive
     ) >/dev/null
 fi
+
+exit "$BENCHMARK_STATUS"

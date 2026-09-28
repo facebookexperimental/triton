@@ -38,7 +38,22 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_num_sms, tma_inner_dim
+from torch._inductor.utils import get_num_sms
+
+try:
+    from torch._inductor.utils import tma_inner_dim
+except ImportError:
+
+    def tma_inner_dim(strides) -> int | None:
+        """Compatibility fallback for PyTorch versions predating this helper."""
+        from torch._inductor.virtualized import V
+
+        inner = [
+            i
+            for i, stride in enumerate(strides)
+            if V.graph.sizevars.statically_known_equals(stride, 1)
+        ]
+        return inner[0] if len(inner) == 1 else None
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -3174,3 +3189,13 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 
 
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
+
+
+# Register shape-specialized semantic fusion replacements.  Imports are kept at
+# the end because these modules define Torch custom ops and consult Inductor's
+# post-grad pattern registry during registration.
+from .sm100_01_matmul_addcmul import register_sm100_01_pattern
+from .sm100_02_matmul_sigmoid_mul import register_sm100_02_pattern
+
+register_sm100_01_pattern()
+register_sm100_02_pattern()

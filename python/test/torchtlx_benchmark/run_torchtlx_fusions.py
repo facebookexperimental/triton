@@ -4,6 +4,7 @@
 import argparse
 import importlib
 import json
+import os
 import pathlib
 import statistics
 import subprocess
@@ -11,6 +12,8 @@ import sys
 import tempfile
 
 _HERE = pathlib.Path(__file__).resolve().parent
+_DENOISE = _HERE.parents[2] / "third_party" / "tlx" / "denoise.sh"
+_DENOISED_ENV = "TORCHTLX_BENCHMARK_DENOISED"
 sys.path.insert(0, str(_HERE.parent))
 
 
@@ -51,6 +54,7 @@ def parse_args(cases):
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--rep", type=int, default=500)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--no-denoise", action="store_true")
     parser.add_argument("--variant", choices=("baseline", "candidate"), help=argparse.SUPPRESS)
     parser.add_argument("--result-json", help=argparse.SUPPRESS)
 
@@ -64,17 +68,110 @@ def parse_args(cases):
     return args
 
 
-def compile_variant(case, config, inputs):
+def select_nvidia_gpu(env: dict[str, str]) -> None:
+    if env.get("CUDA_VISIBLE_DEVICES"):
+        return
+    try:
+        query = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return
+    if query.returncode:
+        return
+    devices = []
+    for line in query.stdout.splitlines():
+        try:
+            index, memory_used = (int(value.strip()) for value in line.split(","))
+        except ValueError:
+            continue
+        devices.append((memory_used, index))
+    if devices:
+        env["CUDA_VISIBLE_DEVICES"] = str(min(devices)[1])
+
+
+def maybe_run_denoised(args) -> None:
+    if args.list or args.no_denoise or os.environ.get(_DENOISED_ENV):
+        return
+    if not _DENOISE.is_file():
+        raise FileNotFoundError(f"benchmark denoiser not found: {_DENOISE}")
+
+    env = os.environ.copy()
+    select_nvidia_gpu(env)
+    env[_DENOISED_ENV] = "1"
+    command = [_DENOISE, sys.executable, pathlib.Path(__file__).resolve(), *sys.argv[1:]]
+    raise SystemExit(subprocess.run(command, env=env).returncode)
+
+
+def validate_candidate_code(case, source_files) -> None:
+    generated_code = "\n".join(source_files)
+    markers = getattr(case, "CANDIDATE_CODE_MARKERS", ())
+    marker_groups = getattr(case, "CANDIDATE_CODE_MARKER_GROUPS", ())
+    forbidden_markers = getattr(case, "CANDIDATE_FORBIDDEN_CODE_MARKERS", ())
+    missing = [marker for marker in markers if marker not in generated_code]
+    if missing:
+        raise RuntimeError("candidate implementation was not generated; missing code markers: " + ", ".join(missing))
+    missing_groups = [group for group in marker_groups if not any(marker in generated_code for marker in group)]
+    if missing_groups:
+        formatted = [" or ".join(group) for group in missing_groups]
+        raise RuntimeError("candidate implementation was not generated; missing one of: " + ", ".join(formatted))
+    present_forbidden = [marker for marker in forbidden_markers if marker in generated_code]
+    if present_forbidden:
+        raise RuntimeError("candidate remained opaque to Inductor; found code markers: " + ", ".join(present_forbidden))
+
+
+def compile_variant(case, config, inputs, variant):
     torch._dynamo.reset()
     with torch._inductor.config.patch(config):
         compiled = torch.compile(case.model, fullgraph=True)
-        output = compiled(*inputs)
+        has_code_markers = any(
+            getattr(case, name, ()) for name in (
+                "CANDIDATE_CODE_MARKERS",
+                "CANDIDATE_CODE_MARKER_GROUPS",
+                "CANDIDATE_FORBIDDEN_CODE_MARKERS",
+            ))
+        if variant == "candidate" and has_code_markers:
+            output, source_files = run_and_get_code(compiled, *inputs)
+            validate_candidate_code(case, source_files)
+        else:
+            output = compiled(*inputs)
     torch.cuda.synchronize()
     return compiled, output
 
 
 def bench_us(fn, warmup: int, rep: int) -> float:
-    return float(triton.testing.do_bench(fn, warmup=warmup, rep=rep)) * 1000.0
+    return float(triton.testing.do_bench(
+        fn,
+        warmup=warmup,
+        rep=rep,
+        return_mode="median",
+    )) * 1000.0
+
+
+def error_stats(actual, expected) -> tuple[float, float]:
+    actual_leaves, actual_spec = torch.utils._pytree.tree_flatten(actual)
+    expected_leaves, expected_spec = torch.utils._pytree.tree_flatten(expected)
+    if actual_spec != expected_spec:
+        raise ValueError(f"output structure mismatch: {actual_spec} != {expected_spec}")
+
+    max_abs = 0.0
+    abs_sum = 0.0
+    numel = 0
+    for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves):
+        if not torch.is_tensor(actual_leaf) or not torch.is_tensor(expected_leaf):
+            raise TypeError("benchmark outputs must contain only tensors")
+        diff = (actual_leaf.float() - expected_leaf.float()).abs()
+        if diff.numel():
+            max_abs = max(max_abs, diff.max().item())
+            abs_sum += diff.sum().item()
+            numel += diff.numel()
+    return max_abs, abs_sum / numel if numel else 0.0
 
 
 def run_variant(case, variant: str, args) -> dict[str, object]:
@@ -92,10 +189,10 @@ def run_variant(case, variant: str, args) -> dict[str, object]:
 
     inputs = case.make_inputs()
     eager = case.model(*inputs)
-    compiled, output = compile_variant(case, config, inputs)
+    compiled, output = compile_variant(case, config, inputs, variant)
     torch.testing.assert_close(output, eager, atol=case.ATOL, rtol=case.RTOL)
-    diff = (output.float() - eager.float()).abs()
-    print(f"correctness_vs_eager max_abs={diff.max().item():.6f} mean_abs={diff.mean().item():.6f}")
+    max_abs, mean_abs = error_stats(output, eager)
+    print(f"correctness_vs_eager max_abs={max_abs:.6f} mean_abs={mean_abs:.6f}")
 
     samples = []
     for sample in range(args.samples):
@@ -147,6 +244,7 @@ def main() -> None:
         for listed_case in cases.values():
             print(f"{listed_case.NAME}: {listed_case.problem()}")
         return
+    maybe_run_denoised(args)
     load_runtime(case)
     if args.variant:
         result = run_variant(case, args.variant, args)
