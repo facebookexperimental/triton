@@ -109,11 +109,11 @@ def test_mm_small_square_register_plan(m):
     )
 
 
-def test_mm_register_fallback_for_row_major_b(monkeypatch):
+def test_mm_register_fallback_for_strided_b(monkeypatch):
     from triton.tlx.ops.kernels.mm.gfx950 import mm
 
     a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
-    b = torch.randn((128, 32), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 64), device="cuda", dtype=torch.float16)[:, ::2]
     expected = torch.empty((64, 32), device="cuda", dtype=torch.float16)
 
     def launch_register_plan(actual_a, actual_b, *, config, out, _validated):
