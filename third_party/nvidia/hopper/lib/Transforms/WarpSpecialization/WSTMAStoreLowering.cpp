@@ -9,9 +9,9 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
-#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <optional>
@@ -303,7 +303,6 @@ static bool sameMemDescValue(Value lhs, Value rhs) {
   return true;
 }
 
-
 // Only a distinct local allocation proves two memory descriptors cannot
 // overlap. A block argument does not: two memdesc arguments of the same
 // function, or two loop iter args, may both be views of one allocation.
@@ -547,8 +546,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     if (!whileOp)
       return;
 
-    auto rotateBy =
-        waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
+    auto rotateBy = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
     if (!rotateBy || rotateBy.getInt() <= 0)
       return;
     waitOp->setAttr(kPlannedPendingCount,

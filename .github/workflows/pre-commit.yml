@@ -10,9 +10,9 @@ on:
         type: boolean
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
 
 jobs:
   pre-commit:

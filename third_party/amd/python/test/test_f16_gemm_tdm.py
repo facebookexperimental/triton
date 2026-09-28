@@ -6,9 +6,9 @@ import triton.language as tl
 from triton._internal_testing import is_hip_gfx1250
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
-
 pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+
+
 def supports_tensor_descriptor():
     # AMD GPUs with tensor ops support
     return is_hip_gfx1250() and hasattr(tl, "make_tensor_descriptor")

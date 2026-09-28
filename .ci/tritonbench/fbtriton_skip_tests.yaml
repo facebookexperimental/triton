@@ -70,6 +70,9 @@ ragged_attention:
   devices:
     - cuda
     - b200
+  backends: hstu_triton_autows_clc
+  disabled_devices:
+    - b200
 # rms_norm subprocess segfaults on hip (exit code 11)
 rms_norm:
   report: true

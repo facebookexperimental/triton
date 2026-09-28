@@ -36,9 +36,10 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, gpu::MemDescType memTy,
 
 // Return the complete per-message footprint, including vectorization beyond
 // the base instruction atom.
-FailureOr<LinearLayout>
-getTMemLdStMessageLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                         int numRegsPerMessage);
+FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
+                                                 TMemAccessAtom atom,
+                                                 bool unpacked,
+                                                 int numRegsPerMessage);
 
 // Return the physical tensor-memory word addresses touched by each warp when
 // lowering a tmem_load or tmem_store with these types.

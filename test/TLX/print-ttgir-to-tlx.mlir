@@ -1892,3 +1892,80 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// AMD's WarpPipeliner materializes each `with tlx.warp_pipeline_stage(...)`
+// block as an scf.execute_region carrying the stage label and priority. Without
+// a mapping the region-bearing op falls to the generic printer, which emits the
+// whole stage body as inert `#` comments.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def warp_pipeline_stages(
+  // CHECK: with tlx.warp_pipeline_stage("mfma", priority=0):
+  // The stage body is real code, not commented out, and its yield assigns the
+  // region result so later stages can name it.
+  // CHECK: [[R:[a-z0-9_]+]] = arg0 * arg0
+  // CHECK: [[OUT:[a-z0-9_]+]] = [[R]]
+  // CHECK: with tlx.warp_pipeline_stage("mem", priority=1):
+  // CHECK: [[OUT]] + arg0
+  tt.func public @warp_pipeline_stages(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    %s = scf.execute_region -> tensor<256xf32, #blocked> {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield %m : tensor<256xf32, #blocked>
+    } {triton.warp_pipeline.priority = 0 : i32, triton.warp_pipeline.stage = "mfma"}
+    scf.execute_region {
+      %a = arith.addf %s, %x : tensor<256xf32, #blocked>
+      scf.yield
+    } {triton.warp_pipeline.priority = 1 : i32, triton.warp_pipeline.stage = "mem"}
+    tt.return
+  }
+}
+
+// -----
+
+// A stage without an explicit priority: the pipeliner only attaches the
+// attribute when the kwarg was given, so the emitted call must omit it rather
+// than invent the frontend's -1 default.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: def warp_pipeline_stage_without_priority(
+  // CHECK: with tlx.warp_pipeline_stage("mfma"):
+  // CHECK-NOT: priority=
+  tt.func public @warp_pipeline_stage_without_priority(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    scf.execute_region {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield
+    } {triton.warp_pipeline.stage = "mfma"}
+    tt.return
+  }
+
+  // A stage tag of the wrong type is not ours. It must reach the generic path
+  // too, and crucially that path still surfaces the region body as comments --
+  // swallowing it would be the very bug this diff exists to fix.
+  // CHECK-LABEL: def wrong_typed_stage_tag(
+  // CHECK-NOT: tlx.warp_pipeline_stage
+  // CHECK: # {{[a-z0-9_]+}} = {{[a-z0-9_]+}} * {{[a-z0-9_]+}}
+  tt.func public @wrong_typed_stage_tag(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    scf.execute_region {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield
+    } {triton.warp_pipeline.stage = 42 : i32}
+    tt.return
+  }
+
+  // Only a tagged region is a pipeline stage. An untagged scf.execute_region
+  // has no TLX spelling, so it must stay on the generic path -- pinning that
+  // catches a regression in the gating condition.
+  // CHECK-LABEL: def untagged_execute_region_is_not_a_stage(
+  // CHECK-NOT: tlx.warp_pipeline_stage
+  tt.func public @untagged_execute_region_is_not_a_stage(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
+    scf.execute_region {
+      %m = arith.mulf %x, %x : tensor<256xf32, #blocked>
+      scf.yield
+    }
+    tt.return
+  }
+}
