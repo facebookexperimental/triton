@@ -121,9 +121,10 @@ def _evaluate_cases(
         verification = _normalize_verification(harness.verify(artifact, case))
         case_result = _base_case_result(case, verification)
         if verification["passed"]:
-            case_result["timing"] = _normalize_timing(
-                harness.benchmark(artifact, case, repetitions)
-            )
+            benchmark_raw = harness.benchmark(artifact, case, repetitions)
+            case_result["timing"] = _normalize_timing(benchmark_raw)
+            if isinstance(benchmark_raw, Mapping):
+                verification["metrics"].update(dict(benchmark_raw.get("metrics", {})))
             case_result["profile"] = _profile_case(
                 harness,
                 artifact,

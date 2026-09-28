@@ -524,6 +524,17 @@ def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypa
     assert denoise._amd_numa_node(7) is None
 
 
+def test_gpu_uuid_reads_the_physical_index_not_torchs(monkeypatch):
+    from _harness import denoise
+
+    # nvidia-smi numbers physical GPUs whatever the visibility variable says;
+    # with GPU 4 pinned, torch knows it only as device 0.
+    monkeypatch.setattr(denoise, "_smi", lambda args: "GPU-physical-4" if args[:2] == ["-i", "4"] else None)
+
+    assert denoise.gpu_uuid(4) == "GPU-physical-4"
+    assert denoise.gpu_uuid(5) is None
+
+
 def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
     import _harness.denoise as denoise_mod
     from _harness.denoise import NVIDIA, Device
@@ -711,9 +722,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     expected = {
         "triton.tlx.ops.kernels.addmm._shapes": {
             "gfx942": ("gfx942_1", ),
-            "gfx950": ("gfx950_1", ),
+            "gfx950": ("gfx950_all", ),
         },
-        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
@@ -743,6 +754,12 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
     assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+    addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
+    assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
+
+    bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
+    assert bmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
 def test_focus_suite_selection_rejects_unknown_names():
