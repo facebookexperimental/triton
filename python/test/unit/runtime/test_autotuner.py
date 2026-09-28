@@ -45,15 +45,9 @@ def test_entropy_warmup_sample_budget(probe_ms, expected):
         (100, 0.001, 1000, 0.027, 10000),
     ],
 )
-def test_entropy_repeat_uses_wall_clock_denominator(
-    rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms, expected
-):
-    assert (
-        _autotuner._entropy_repeat_count(
-            rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms
-        )
-        == expected
-    )
+def test_entropy_repeat_uses_wall_clock_denominator(rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms,
+                                                    expected):
+    assert (_autotuner._entropy_repeat_count(rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms) == expected)
 
 
 def test_entropy_sampling_syncs_tail_on_early_convergence(monkeypatch):
@@ -85,12 +79,9 @@ def test_entropy_sampling_syncs_tail_on_early_convergence(monkeypatch):
     class FakeTorch:
         cuda = FakeCuda
 
-    monkeypatch.setattr(
-        _autotuner._EntropyCriterion, "is_finished",
-        lambda self: self.total_samples >= 20)
+    monkeypatch.setattr(_autotuner._EntropyCriterion, "is_finished", lambda self: self.total_samples >= 20)
 
-    counter, avg_ms, launched = _autotuner._entropy_sampling(
-        lambda: None, lambda: None, FakeTorch)
+    counter, avg_ms, launched = _autotuner._entropy_sampling(lambda: None, lambda: None, FakeTorch)
 
     assert counter == 20
     assert launched == 50

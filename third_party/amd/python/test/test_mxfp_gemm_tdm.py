@@ -21,7 +21,6 @@ import pytest
 from triton.tools.mxfp import MXScaleTensor, MXFP4Tensor
 from triton._internal_testing import is_hip_gfx1250
 
-
 pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 # ============================================================================
 # Constants

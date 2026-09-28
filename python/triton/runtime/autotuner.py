@@ -215,7 +215,8 @@ def _entropy_repeat_count(
     return 100
 
 
-def _entropy_sampling(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
+def _entropy_sampling(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299,
+                      max_samples=10000):
     """Adaptive sampling using entropy convergence. Returns (n_samples, avg_ms, n_launched). n_launched counts all issued launches, including any trailing batch whose measurements were skipped after early convergence."""
     crit = _EntropyCriterion(
         max_angle=0.048,

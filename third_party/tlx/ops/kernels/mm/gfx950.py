@@ -23,8 +23,8 @@ _BLOCK_K = 64
 _NUM_CU = 256
 _MIN_KTILES_PER_SPLIT = 16
 
-def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds,
-                         num_warps, num_stages):
+
+def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds, num_warps, num_stages):
     return MappingProxyType({
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
@@ -39,18 +39,12 @@ def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds,
     })
 
 
-_SMALL_SQUARE_REGISTER_CONFIG = _fixed_register_plan(
-    32, 16, 256, 4, 1, 2, 2
-)
-_MT64X64_BK256_REGISTER_CONFIG = _fixed_register_plan(
-    64, 64, 256, 4, 8, 8, 2
-)
+_SMALL_SQUARE_REGISTER_CONFIG = _fixed_register_plan(32, 16, 256, 4, 1, 2, 2)
+_MT64X64_BK256_REGISTER_CONFIG = _fixed_register_plan(64, 64, 256, 4, 8, 8, 2)
 
 _TUNED_SHAPE_CONFIGS = {
     (2048, 256, 1024): _MT64X64_BK256_REGISTER_CONFIG,
-    (2041, 2041, 2048): _fixed_register_plan(
-        128, 128, 128, 16, 8, 8, 2
-    ),
+    (2041, 2041, 2048): _fixed_register_plan(128, 128, 128, 16, 8, 8, 2),
 }
 
 _FP16_TUNED_SHAPE_CONFIGS = {

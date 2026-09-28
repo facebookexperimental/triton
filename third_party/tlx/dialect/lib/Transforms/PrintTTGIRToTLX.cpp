@@ -602,8 +602,8 @@ static bool canNameExternSignature(Operation *op) {
 
 // tlx.warp_predicate takes its region as a separate @triton.jit function, so
 // each ttg.warp_predicate gets a module-scope body emitted for it, named here.
-static thread_local DenseMap<Operation *, std::string>
-    *warpPredicateBodyNames = nullptr;
+static thread_local DenseMap<Operation *, std::string> *warpPredicateBodyNames =
+    nullptr;
 
 // Values a region uses but does not define, which the body function has to
 // receive as arguments.
@@ -2634,7 +2634,8 @@ void printSimplifiedOp(
   if (auto clamp = dyn_cast<tt::ClampFOp>(op)) {
     os << getValueName(op->getResult(0), argSubstitutionMap) << " = tl.clamp(";
     for (unsigned i = 0; i < 3; ++i)
-      os << (i ? ", " : "") << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << (i ? ", " : "")
+         << getValueName(op->getOperand(i), argSubstitutionMap);
     if (clamp.getPropagateNan() == tt::PropagateNan::ALL)
       os << ", propagate_nan=tl.PropagateNan.ALL";
     os << ")";

@@ -59,6 +59,8 @@ def _disp_scalar_mix(x_ptr, out_ptr, fscale, iadd, N, BLOCK: tl.constexpr):
 @triton.jit
 def _disp_nop():
     pass
+
+
 def test_dispatcher_core_add_numerics():
     N = 4096
     x = torch.randn(N, device="cuda")
@@ -68,6 +70,8 @@ def test_dispatcher_core_add_numerics():
     with force_dispatcher():
         _disp_add[grid](x, y, out, N, BLOCK=256)
     torch.testing.assert_close(out, x + y)
+
+
 def test_dispatcher_core_uses_default_profile_allocator(fresh_knobs):
     from triton.runtime import _allocation
 
@@ -92,6 +96,8 @@ def test_dispatcher_core_uses_default_profile_allocator(fresh_knobs):
         _allocation.set_profile_allocator(previous_profile_allocator)
 
     torch.testing.assert_close(out, x + y)
+
+
 def test_dispatcher_core_mixed_scalar_args():
     N = 2048
     x = torch.randn(N, device="cuda")
@@ -100,10 +106,14 @@ def test_dispatcher_core_mixed_scalar_args():
     with force_dispatcher():
         _disp_scalar_mix[grid](x, out, 2.5, 3, N, BLOCK=128)
     torch.testing.assert_close(out, x * 2.5 + 3)
+
+
 def test_dispatcher_core_nop():
     with force_dispatcher():
         _disp_nop[(1, )]()
     torch.cuda.synchronize()
+
+
 def test_dispatcher_core_empty_grid():
     N = 1024
     x = torch.randn(N, device="cuda")
@@ -113,6 +123,8 @@ def test_dispatcher_core_empty_grid():
         _disp_add[(0, )](x, y, out, N, BLOCK=256)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, torch.zeros(N, device="cuda"))
+
+
 def test_dispatcher_built_and_converged_path():
     """Directly verify a dispatcher is created (proves the dispatcher path is
     active, not a launchKernel fallback) and that calling it launches correctly
@@ -147,6 +159,8 @@ def _disp_pid_write(out_ptr, GX: tl.constexpr, GY: tl.constexpr):
     pid_z = tl.program_id(2)
     offset = pid_x + GX * (pid_y + GY * pid_z)
     tl.store(out_ptr + offset, offset)
+
+
 def test_dispatcher_core_multidim_cluster():
     """An explicit multi-dimensional cluster (ctas_per_cga, which forces
     cluster_dims=(x,y,z) and num_ctas==1) must launch correctly through the
