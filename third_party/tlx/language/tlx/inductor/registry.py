@@ -3189,3 +3189,13 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 
 
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
+
+
+# Register shape-specialized semantic fusion replacements.  Imports are kept at
+# the end because these modules define Torch custom ops and consult Inductor's
+# post-grad pattern registry during registration.
+from .sm100_01_matmul_addcmul import register_sm100_01_pattern
+from .sm100_02_matmul_sigmoid_mul import register_sm100_02_pattern
+
+register_sm100_01_pattern()
+register_sm100_02_pattern()

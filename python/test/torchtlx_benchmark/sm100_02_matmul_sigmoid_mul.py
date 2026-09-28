@@ -8,11 +8,25 @@ if TYPE_CHECKING:
     import torch
 
 NAME = "sm100_02_matmul_sigmoid_mul"
-CANDIDATE_NAME = "torchtlx_fused"
-BASELINE_CONFIG: dict[str, object] = {"triton.tlx_mode": None}
-CANDIDATE_CONFIG: dict[str, object] = {"triton.tlx_mode": "force"}
-ATOL = 2.0e-2
-RTOL = 2.0e-2
+CANDIDATE_NAME = "matmul_sigmoid_mul"
+CANDIDATE_CODE_MARKERS = ("matmul_sigmoid_mul_kernel", )
+CANDIDATE_FORBIDDEN_CODE_MARKERS = ("torch.ops.torch_tlx.sm100_02_fused_kernel.default", )
+_COMMON_CONFIG: dict[str, object] = {
+    "force_disable_caches": True,
+    "max_autotune": True,
+    "max_autotune_gemm_backends": "ATEN,TRITON",
+    "enable_caching_generated_triton_templates": False,
+}
+BASELINE_CONFIG: dict[str, object] = {
+    **_COMMON_CONFIG,
+    "triton.tlx_mode": None,
+}
+CANDIDATE_CONFIG: dict[str, object] = {
+    **_COMMON_CONFIG,
+    "triton.tlx_mode": "allow",
+}
+ATOL = 1.0e-2
+RTOL = 1.0e-2
 
 # Production shape reported for the Blackwell GEO kernel.
 M = 3836160
@@ -22,15 +36,11 @@ DTYPE = "bf16"
 
 
 def add_arguments(parser) -> None:
-    parser.add_argument("--m", type=int, default=M)
-    parser.add_argument("--k", type=int, default=K)
-    parser.add_argument("--n", type=int, default=N)
-    parser.add_argument("--dtype", choices=("fp16", "bf16"), default=DTYPE)
+    pass
 
 
 def configure(args) -> None:
-    global M, K, N, DTYPE
-    M, K, N, DTYPE = args.m, args.k, args.n, args.dtype
+    pass
 
 
 def problem() -> str:
@@ -38,8 +48,10 @@ def problem() -> str:
 
 
 def model(x: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    sigmoid = torch.sigmoid(x @ weight)
-    return 2.0 * x * sigmoid, sigmoid
+    accumulator = x.float() @ weight.float()
+    sigmoid = torch.sigmoid(accumulator)
+    output = (2.0 * x.float() * sigmoid).to(torch.bfloat16)
+    return output, sigmoid.to(torch.bfloat16)
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:

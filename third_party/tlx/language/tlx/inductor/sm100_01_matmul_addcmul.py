@@ -12,6 +12,7 @@ import torch
 import triton  # @manual=//triton:triton
 import triton.language as tl  # @manual=//triton:triton
 import triton.language.extra.tlx as tlx  # @manual=//triton:triton
+from torch.library import triton_op, wrap_triton
 from triton.tools.tensor_descriptor import TensorDescriptor  # @manual=//triton:triton
 
 # Proton is deliberately disabled in the TorchInductor integration.  Importing
@@ -1495,7 +1496,7 @@ def matmul_addcmul_epi_prefetch(  # noqa: C901
                 buffer_type="global",
             )
             proton.start("proton", data="trace", backend="instrumentation", mode=mode)
-        matmul_addcmul_kernel.fn[grid](
+        wrap_triton(matmul_addcmul_kernel.fn)[grid](
             a_desc,
             b_desc,
             c_desc,
@@ -1512,6 +1513,7 @@ def matmul_addcmul_epi_prefetch(  # noqa: C901
             NUM_SMS=NUM_SMS,
             FUSE_ADDCMUL=True,
             ENABLE_PROTON=enable_proton,
+            PROTON_ITER=10,
             ctas_per_cga=ctas_per_cga,
             **config,
         )
@@ -1623,14 +1625,21 @@ _FIXED_PRODUCTION_CONFIG = {
 }
 
 
-@torch.library.custom_op("torch_tlx::sm100_01_fused_kernel", mutates_args=())
-def sm100_01_fused_kernel(
+def _sm100_01_fused_kernel_impl(
     s: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     multiplier: torch.Tensor,
     residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch.compiler.is_compiling():
+        return _inductor_sm100_01_fused_impl(
+            s,
+            weight,
+            bias,
+            multiplier,
+            residual,
+        )
     return matmul_addcmul_epi_prefetch(
         s,
         weight,
@@ -1641,20 +1650,106 @@ def sm100_01_fused_kernel(
     )
 
 
-@sm100_01_fused_kernel.register_fake
-def _fake_sm100_01_fused_kernel(
+sm100_01_fused_kernel = triton_op(
+    "torch_tlx::sm100_01_fused_kernel",
+    mutates_args={},
+)(_sm100_01_fused_kernel_impl)
+
+
+_SM100_01_TRACEABLE_KERNEL = triton.autotune(
+    configs=[
+        triton.Config(
+            {},
+            num_warps=4,
+            num_stages=1,
+            ctas_per_cga=(2, 1, 1),
+        )
+    ],
+    key=[],
+)(matmul_addcmul_kernel.fn)
+
+
+def _inductor_sm100_01_fused_impl(
     s: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     multiplier: torch.Tensor,
     residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del bias, multiplier, residual
-    shape = (s.shape[0], weight.shape[0])
-    return (
-        torch.empty(shape, device=s.device, dtype=torch.bfloat16),
-        torch.empty(shape, device=s.device, dtype=torch.bfloat16),
+    """Visible HOP form used by the late Inductor subgraph replacement.
+
+    ``wrap_triton`` captures host TMA descriptors through Dynamo, but the
+    subgraph autotuner traces decompositions with ``make_fx`` after AOT.  Pass
+    the equivalent stable-descriptor metadata directly to its Triton HOP.
+    """
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        create_tma_stable_metadata,
+        kernel_side_table,
+        triton_kernel_wrapper_mutation,
     )
+
+    m, k = s.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), device=s.device, dtype=s.dtype)
+    linear = torch.empty((m, n), device=s.device, dtype=s.dtype)
+    # SPLIT_K=1 specializes every workspace access away.  Keep a distinct,
+    # minimally sized descriptor backing so AOT functionalization does not
+    # split the aliased c_desc/workspace_desc and return the stale clone.
+    workspace = torch.empty((128, 32), device=s.device, dtype=s.dtype)
+    num_sms = _get_num_sms()
+    config = {
+        "M": m,
+        "N": n,
+        "K": k,
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 64,
+        "NUM_SMEM_BUFFERS": 6,
+        "NUM_TMEM_BUFFERS": 3,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 4,
+        "NUM_CTAS": 2,
+        "SPLIT_K": 1,
+        "NUM_SMS": num_sms,
+        "A_ROW_MAJOR": True,
+        "B_ROW_MAJOR": False,
+        "USE_WARP_BARRIER": False,
+        "FUSE_ADDCMUL": True,
+        "ENABLE_PROTON": False,
+        "PROTON_ITER": 10,
+        "ctas_per_cga": (2, 1, 1),
+    }
+    num_pid_m = triton.cdiv(m, config["BLOCK_SIZE_M"])
+    num_pid_m = triton.cdiv(num_pid_m, config["NUM_CTAS"]) * config["NUM_CTAS"]
+    num_pid_n = triton.cdiv(n, config["BLOCK_SIZE_N"])
+    total_tiles = num_pid_m * num_pid_n
+    triton_kernel_wrapper_mutation(
+        kernel_idx=kernel_side_table.add_kernel(_SM100_01_TRACEABLE_KERNEL),
+        constant_args_idx=kernel_side_table.add_constant_args(config),
+        grid=[(min(num_sms, total_tiles), 1, 1)],
+        tma_descriptor_metadata={
+            "a_desc": create_tma_stable_metadata([128, 64]),
+            "b_desc": create_tma_stable_metadata([64, 64]),
+            "c_desc": create_tma_stable_metadata([128, 32]),
+            "workspace_desc": create_tma_stable_metadata([128, 32]),
+            "x0_desc": create_tma_stable_metadata([128, 32]),
+            "li_desc": create_tma_stable_metadata([128, 32]),
+            "m_desc": create_tma_stable_metadata([128, 32]),
+        },
+        kwargs={
+            "a_desc": s,
+            "b_desc": weight,
+            "c_desc": out,
+            "workspace_desc": workspace,
+            "b2_ptr": bias,
+            "x0_desc": multiplier,
+            "li_desc": residual,
+            "m_desc": linear,
+        },
+        launch_kwargs=("ctas_per_cga",),
+    )
+    return out, linear
 
 
 def _aten_sm100_01(
@@ -1707,7 +1802,13 @@ def _fused_sm100_01(
     multiplier: torch.Tensor,
     residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return sm100_01_fused_kernel(s, weight, bias, multiplier, residual)
+    return _inductor_sm100_01_fused_impl(
+        s,
+        weight,
+        bias,
+        multiplier,
+        residual,
+    )
 
 
 def _eligible_sm100_01(match) -> bool:

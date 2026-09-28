@@ -109,17 +109,49 @@ def maybe_run_denoised(args) -> None:
     raise SystemExit(subprocess.run(command, env=env).returncode)
 
 
-def compile_variant(case, config, inputs):
+def validate_candidate_code(case, source_files) -> None:
+    generated_code = "\n".join(source_files)
+    markers = getattr(case, "CANDIDATE_CODE_MARKERS", ())
+    marker_groups = getattr(case, "CANDIDATE_CODE_MARKER_GROUPS", ())
+    forbidden_markers = getattr(case, "CANDIDATE_FORBIDDEN_CODE_MARKERS", ())
+    missing = [marker for marker in markers if marker not in generated_code]
+    if missing:
+        raise RuntimeError("candidate implementation was not generated; missing code markers: " + ", ".join(missing))
+    missing_groups = [group for group in marker_groups if not any(marker in generated_code for marker in group)]
+    if missing_groups:
+        formatted = [" or ".join(group) for group in missing_groups]
+        raise RuntimeError("candidate implementation was not generated; missing one of: " + ", ".join(formatted))
+    present_forbidden = [marker for marker in forbidden_markers if marker in generated_code]
+    if present_forbidden:
+        raise RuntimeError("candidate remained opaque to Inductor; found code markers: " + ", ".join(present_forbidden))
+
+
+def compile_variant(case, config, inputs, variant):
     torch._dynamo.reset()
     with torch._inductor.config.patch(config):
         compiled = torch.compile(case.model, fullgraph=True)
-        output = compiled(*inputs)
+        has_code_markers = any(
+            getattr(case, name, ()) for name in (
+                "CANDIDATE_CODE_MARKERS",
+                "CANDIDATE_CODE_MARKER_GROUPS",
+                "CANDIDATE_FORBIDDEN_CODE_MARKERS",
+            ))
+        if variant == "candidate" and has_code_markers:
+            output, source_files = run_and_get_code(compiled, *inputs)
+            validate_candidate_code(case, source_files)
+        else:
+            output = compiled(*inputs)
     torch.cuda.synchronize()
     return compiled, output
 
 
 def bench_us(fn, warmup: int, rep: int) -> float:
-    return float(triton.testing.do_bench(fn, warmup=warmup, rep=rep)) * 1000.0
+    return float(triton.testing.do_bench(
+        fn,
+        warmup=warmup,
+        rep=rep,
+        return_mode="median",
+    )) * 1000.0
 
 
 def error_stats(actual, expected) -> tuple[float, float]:
@@ -157,7 +189,7 @@ def run_variant(case, variant: str, args) -> dict[str, object]:
 
     inputs = case.make_inputs()
     eager = case.model(*inputs)
-    compiled, output = compile_variant(case, config, inputs)
+    compiled, output = compile_variant(case, config, inputs, variant)
     torch.testing.assert_close(output, eager, atol=case.ATOL, rtol=case.RTOL)
     max_abs, mean_abs = error_stats(output, eager)
     print(f"correctness_vs_eager max_abs={max_abs:.6f} mean_abs={mean_abs:.6f}")

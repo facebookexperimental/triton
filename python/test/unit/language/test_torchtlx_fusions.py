@@ -107,6 +107,60 @@ FUSION_TEST_SHAPES = [
 @instantiate_parametrized_tests
 class TestTorchTLXEpilogueFusion(TestCase):
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Need a CUDA device")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_multi_output_semantic_subgraph_modes(self):
+        """Semantic subgraphs support tuple outputs and honor TLX mode."""
+        from torch._inductor.kernel.custom_op import CustomOpConfig
+        from triton.language.extra.tlx.inductor import (
+            register_tlx_subgraph_autotuning, )
+
+        @torch.library.custom_op("tlx_test::multi_output_semantic_subgraph", mutates_args=())
+        def semantic_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return x + 1.0, x * 2.0
+
+        @semantic_op.register_fake
+        def _(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch.empty_like(x), torch.empty_like(x)
+
+        def aten_impl(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return x + 1.0, x * 2.0
+
+        def tlx_impl(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return x + 2.0, x * 3.0
+
+        register_tlx_subgraph_autotuning(
+            semantic_op,
+            name="tlx_test_multi_output_semantic_subgraph",
+            tlx_configs=[CustomOpConfig(tlx_impl)],
+            aten_impl=aten_impl,
+        )
+
+        x = torch.randn(128, device=GPU_TYPE)
+
+        def run(mode):
+            torch._dynamo.reset()
+
+            def fn(value):
+                return semantic_op(value)
+
+            with config.patch({
+                    "triton.tlx_mode": mode,
+                    "force_disable_caches": True,
+            }):
+                return torch.compile(fn, fullgraph=True)(x)
+
+        off_output = run(None)
+        torch.testing.assert_close(off_output, aten_impl(x))
+
+        allow_output = run("allow")
+        allow_matches_aten = all(torch.equal(actual, expected) for actual, expected in zip(allow_output, aten_impl(x)))
+        allow_matches_tlx = all(torch.equal(actual, expected) for actual, expected in zip(allow_output, tlx_impl(x)))
+        self.assertTrue(allow_matches_aten or allow_matches_tlx)
+
+        force_output = run("force")
+        torch.testing.assert_close(force_output, tlx_impl(x))
+
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
         "Need Blackwell with device-side TMA support in Triton",

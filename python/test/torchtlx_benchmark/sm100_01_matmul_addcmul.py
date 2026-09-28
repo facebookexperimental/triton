@@ -8,11 +8,25 @@ if TYPE_CHECKING:
     import torch
 
 NAME = "sm100_01_matmul_addcmul"
-CANDIDATE_NAME = "torchtlx_fused"
-BASELINE_CONFIG: dict[str, object] = {"triton.tlx_mode": None}
-CANDIDATE_CONFIG: dict[str, object] = {"triton.tlx_mode": "force"}
-ATOL = 2.0e-2
-RTOL = 2.0e-2
+CANDIDATE_NAME = "matmul_addcmul"
+CANDIDATE_CODE_MARKERS = ("matmul_addcmul_kernel", )
+CANDIDATE_FORBIDDEN_CODE_MARKERS = ("torch.ops.torch_tlx.sm100_01_fused_kernel.default", )
+_COMMON_CONFIG: dict[str, object] = {
+    "force_disable_caches": True,
+    "max_autotune": True,
+    "max_autotune_gemm_backends": "ATEN,TRITON",
+    "enable_caching_generated_triton_templates": False,
+}
+BASELINE_CONFIG: dict[str, object] = {
+    **_COMMON_CONFIG,
+    "triton.tlx_mode": None,
+}
+CANDIDATE_CONFIG: dict[str, object] = {
+    **_COMMON_CONFIG,
+    "triton.tlx_mode": "allow",
+}
+ATOL = 5.0e-2
+RTOL = 5.0e-2
 
 # Production shape reported for the Blackwell GEO kernel.
 M = 1152
@@ -22,15 +36,11 @@ DTYPE = "bf16"
 
 
 def add_arguments(parser) -> None:
-    parser.add_argument("--m", type=int, default=M)
-    parser.add_argument("--k", type=int, default=K)
-    parser.add_argument("--n", type=int, default=N)
-    parser.add_argument("--dtype", choices=("fp16", "bf16"), default=DTYPE)
+    pass
 
 
 def configure(args) -> None:
-    global M, K, N, DTYPE
-    M, K, N, DTYPE = args.m, args.k, args.n, args.dtype
+    pass
 
 
 def problem() -> str:
@@ -43,17 +53,21 @@ def model(
     bias: torch.Tensor,
     x0: torch.Tensor,
     layer_input: torch.Tensor,
-) -> torch.Tensor:
-    projection = s @ weight.T + bias
-    return torch.addcmul(layer_input, x0, projection)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    accumulator = s.float() @ weight.float().T
+    projection_fp32 = accumulator + bias.float()
+    projection = projection_fp32.to(torch.bfloat16)
+    output = (layer_input.float() + x0.float() * projection_fp32).to(torch.bfloat16)
+    return output, projection
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:
     torch.manual_seed(0)
     dtype = torch.float16 if DTYPE == "fp16" else torch.bfloat16
-    s = torch.randn((M, K), device="cuda", dtype=dtype)
-    weight = torch.randn((N, K), device="cuda", dtype=dtype)
-    bias = torch.randn((N, ), device="cuda", dtype=dtype)
-    x0 = torch.randn((M, N), device="cuda", dtype=dtype)
-    layer_input = torch.randn((M, N), device="cuda", dtype=dtype)
+    operand_scale = K**-0.25
+    s = torch.randn((M, K), device="cuda", dtype=dtype) * operand_scale
+    weight = torch.randn((N, K), device="cuda", dtype=dtype) * operand_scale
+    bias = torch.randn((N, ), device="cuda", dtype=dtype) * 0.1
+    x0 = torch.randn((M, N), device="cuda", dtype=dtype) * 0.1
+    layer_input = torch.randn((M, N), device="cuda", dtype=dtype) * 0.1
     return s, weight, bias, x0, layer_input

@@ -17,5 +17,11 @@
 #                 vendor-wise: append_tlx -> _append_tlx_{nvidia,amd} and
 #                 append_tlx_flex -> _append_tlx_flex_{nvidia,amd}.
 #   choices.py    TLXInductorChoices; fusion.py  force-fusion policy;
+#   subgraph.py   mode-aware semantic custom-op autotuning, including
+#                 multi-output subgraphs.
 #   codegen.py    async-TMA store codegen; reduce_k.py  split-K reducer;
 #   tlx_config.py env knobs.
+
+from .subgraph import register_tlx_subgraph_autotuning
+
+__all__ = ["register_tlx_subgraph_autotuning"]

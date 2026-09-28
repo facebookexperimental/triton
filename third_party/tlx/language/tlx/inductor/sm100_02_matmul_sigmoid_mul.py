@@ -37,6 +37,7 @@ import torch
 import triton  # @manual=//triton:triton
 import triton.language as tl  # @manual=//triton:triton
 import triton.language.extra.tlx as tlx  # @manual=//triton:triton
+from torch.library import triton_op, wrap_triton
 from triton.tools.tensor_descriptor import TensorDescriptor  # @manual=//triton:triton
 
 
@@ -298,6 +299,7 @@ def matmul_sigmoid_mul_kernel(  # noqa: C901
     INTERLEAVE_EPILOGUE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     USE_CLC: tl.constexpr,
+    REUSE_A_DESC_FOR_X: tl.constexpr = False,
 ) -> None:
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     SLICE_SIZE: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
@@ -804,13 +806,22 @@ def matmul_sigmoid_mul_kernel(  # noqa: C901
                 tlx.barrier_expect_bytes(
                     x_full_bars[0], DSIZE * BLOCK_SIZE_M * BLOCK_SIZE_N
                 )
-                tlx.async_descriptor_load(
-                    x_desc,
-                    buffers_X[0],
-                    [offs_am, offs_bn_full],
-                    x_full_bars[0],
-                    eviction_policy="evict_first",
-                )
+                if REUSE_A_DESC_FOR_X:
+                    tlx.async_descriptor_load(
+                        a_desc,
+                        buffers_X[0],
+                        [offs_am, offs_bn_full],
+                        x_full_bars[0],
+                        eviction_policy="evict_first",
+                    )
+                else:
+                    tlx.async_descriptor_load(
+                        x_desc,
+                        buffers_X[0],
+                        [offs_am, offs_bn_full],
+                        x_full_bars[0],
+                        eviction_policy="evict_first",
+                    )
                 x_phase = x_phase ^ 1
 
                 if USE_CLC:
@@ -829,10 +840,7 @@ def alloc_fn(size: int, alignment: int, _):
     return torch.empty(size, dtype=torch.int8, device="cuda")
 
 
-@torch.library.custom_op(
-    "torch_tlx::sm100_02_fused_kernel", mutates_args=()
-)
-def mm_sigmoid_mul_mul__returns_sigmoid(
+def _sm100_02_fused_kernel_impl(
     x: torch.Tensor, w: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused matrix multiplication, sigmoid, and multiply: out = 2 * x * sigmoid(x @ w). Also returns sigmoid.
@@ -845,6 +853,9 @@ def mm_sigmoid_mul_mul__returns_sigmoid(
         out: [M, N] bfloat16 — gated SE output.
         s:   [M, N] bfloat16 — saved sigmoid(x @ w) for backward.
     """
+    if torch.compiler.is_compiling():
+        return _inductor_sm100_02_fused_impl(x, w)
+
     assert x.shape[1] == w.shape[0], "Incompatible dimensions"
     assert w.shape[0] == w.shape[1], "Weight must be square (K == N)"
     assert x.is_contiguous(), "x must be contiguous"
@@ -862,11 +873,42 @@ def mm_sigmoid_mul_mul__returns_sigmoid(
     dummy_block = [1, 1]
     a_desc = TensorDescriptor(x, x.shape, x.stride(), dummy_block)
     b_desc = TensorDescriptor(w, w.shape, w.stride(), dummy_block)
-    # x is reused as the gate operand; same tensor, separate descriptor for the
-    # epilogue load (block shape differs from a_desc's BLOCK_M_SPLIT × BLOCK_K).
-    x_desc = TensorDescriptor(x, x.shape, x.stride(), dummy_block)
+    # The production config has K=N=BLOCK_K=BLOCK_N, so a_desc also describes
+    # the epilogue x tile.  A distinct minimal backing avoids presenting two
+    # aliased mutable descriptor arguments to AOT functionalization.
+    x_desc_base = torch.empty((128, 128), device=x.device, dtype=x.dtype)
+    x_desc = TensorDescriptor(
+        x_desc_base,
+        x_desc_base.shape,
+        x_desc_base.stride(),
+        dummy_block,
+    )
     c_desc = TensorDescriptor(out, out.shape, out.stride(), dummy_block)
     s_desc = TensorDescriptor(s, s.shape, s.stride(), dummy_block)
+
+    config = {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 1,
+        "NUM_CTAS": 1,
+        "INTERLEAVE_EPILOGUE": 0,
+        "USE_CLC": True,
+        "REUSE_A_DESC_FOR_X": True,
+    }
+    hook_args = {
+        "a_desc": a_desc,
+        "b_desc": b_desc,
+        "x_desc": x_desc,
+        "c_desc": c_desc,
+        "s_desc": s_desc,
+        **config,
+    }
+    matmul_tma_set_block_size_hook(hook_args)
 
     def grid(META):
         NUM_CTAS = META["NUM_CTAS"]
@@ -881,7 +923,7 @@ def mm_sigmoid_mul_mul__returns_sigmoid(
             return (total_tiles,)
         return (min(NUM_SMS, total_tiles),)
 
-    matmul_sigmoid_mul_kernel[grid](
+    wrap_triton(matmul_sigmoid_mul_kernel.fn)[grid](
         a_desc,
         b_desc,
         x_desc,
@@ -891,17 +933,90 @@ def mm_sigmoid_mul_mul__returns_sigmoid(
         N,
         K,
         NUM_SMS=NUM_SMS,
+        num_warps=8,
+        num_stages=1,
+        **config,
     )
     return out, s
 
 
-@mm_sigmoid_mul_mul__returns_sigmoid.register_fake
-def _(x: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    M, K = x.shape
-    _, N = w.shape
-    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    s = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    return out, s
+mm_sigmoid_mul_mul__returns_sigmoid = triton_op(
+    "torch_tlx::sm100_02_fused_kernel",
+    mutates_args={},
+)(_sm100_02_fused_kernel_impl)
+
+
+_SM100_02_TRACEABLE_KERNEL = triton.autotune(
+    configs=[triton.Config({}, num_warps=8, num_stages=1)],
+    key=[],
+)(matmul_sigmoid_mul_kernel.fn)
+
+
+def _inductor_sm100_02_fused_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Visible HOP form used by the late Inductor subgraph replacement.
+
+    ``wrap_triton`` captures host TMA descriptors through Dynamo, but the
+    subgraph autotuner traces decompositions with ``make_fx`` after AOT.  Pass
+    the equivalent stable-descriptor metadata directly to its Triton HOP.
+    """
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        create_tma_stable_metadata,
+        kernel_side_table,
+        triton_kernel_wrapper_mutation,
+    )
+
+    m, k = x.shape
+    n = weight.shape[1]
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    sigmoid = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    x_descriptor_placeholder = torch.empty(
+        (128, 128), device=x.device, dtype=x.dtype
+    )
+    num_sms = _get_num_sms()
+    config = {
+        "M": m,
+        "N": n,
+        "K": k,
+        "NUM_SMS": num_sms,
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 1,
+        "NUM_SMEM_BUFFERS": 2,
+        "NUM_TMEM_BUFFERS": 2,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 1,
+        "NUM_CTAS": 1,
+        "INTERLEAVE_EPILOGUE": 0,
+        "USE_CLC": True,
+        "REUSE_A_DESC_FOR_X": True,
+    }
+    num_pid_m = triton.cdiv(m, config["BLOCK_SIZE_M"])
+    num_pid_n = triton.cdiv(n, config["BLOCK_SIZE_N"])
+    total_tiles = num_pid_m * num_pid_n
+    triton_kernel_wrapper_mutation(
+        kernel_idx=kernel_side_table.add_kernel(_SM100_02_TRACEABLE_KERNEL),
+        constant_args_idx=kernel_side_table.add_constant_args(config),
+        grid=[(total_tiles, 1, 1)],
+        tma_descriptor_metadata={
+            "a_desc": create_tma_stable_metadata([128, 128]),
+            "b_desc": create_tma_stable_metadata([128, 128]),
+            "x_desc": create_tma_stable_metadata([128, 128]),
+            "c_desc": create_tma_stable_metadata([128, 128]),
+            "s_desc": create_tma_stable_metadata([128, 128]),
+        },
+        kwargs={
+            "a_desc": x,
+            "b_desc": weight,
+            "x_desc": x_descriptor_placeholder,
+            "c_desc": out,
+            "s_desc": sigmoid,
+        },
+    )
+    return out, sigmoid
 
 
 def _aten_sm100_02(
@@ -938,7 +1053,7 @@ def _fused_sm100_02(
     x: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return mm_sigmoid_mul_mul__returns_sigmoid(x, weight)
+    return _inductor_sm100_02_fused_impl(x, weight)
 
 
 def _eligible_sm100_02(match) -> bool:
