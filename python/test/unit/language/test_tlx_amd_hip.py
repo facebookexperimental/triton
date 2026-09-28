@@ -17,7 +17,7 @@ from triton._internal_testing import is_hip
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.backends.compiler import GPUTarget
 from triton.runtime.jit import MockTensor
-from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
+from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
 from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
     _bmm_register_staged,
     _MT144X256_MI16_KERNEL_SPEC,
