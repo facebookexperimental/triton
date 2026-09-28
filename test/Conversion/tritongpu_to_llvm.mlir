@@ -2957,6 +2957,26 @@ tt.func private @arith_constant_array() {
 
 // -----
 
+// A rank-2 dense constant is stored row-major, so element (i, j) must be read
+// from flat index i * 4 + j (row stride = number of columns), not i + 2 * j.
+#blocked = #ttg.blocked<{sizePerThread = [2, 4], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK: llvm.mlir.global internal constant @tensor_constant_0([0 : i32, 1 : i32, 2 : i32, 3 : i32, 4 : i32, 5 : i32, 6 : i32, 7 : i32]) {addr_space = 0 : i32} : !llvm.array<8 x i32>
+
+// CHECK-LABEL: @arith_constant_array_2d
+tt.func private @arith_constant_array_2d() {
+  %0 = arith.constant dense<[[0, 1, 2, 3], [4, 5, 6, 7]]> : tensor<2x4xi32, #blocked>
+  // CHECK: [[ROW_STRIDE:%.*]] = llvm.mlir.constant(4 : i32) : i32
+  // CHECK: [[ROW_OFF:%.*]] = llvm.mul %{{.*}}, [[ROW_STRIDE]] : i32
+  // CHECK: [[INDEX:%.*]] = llvm.add [[ROW_OFF]], %{{.*}} : i32
+  // CHECK: [[ADDR:%.*]] = llvm.mlir.addressof @tensor_constant_0
+  // CHECK: llvm.getelementptr [[ADDR]][[[INDEX]]]
+  tt.return
+}
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {

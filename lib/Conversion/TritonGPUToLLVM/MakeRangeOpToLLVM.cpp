@@ -98,9 +98,12 @@ public:
                                         {kLane, laneId},
                                         {kWarp, warpId},
                                         {kBlock, blockId}});
-      Value index =
-          LLVM::linearize(b, loc, to_vector(make_second_range(indices)),
-                          convertType<unsigned>(tensorTy.getShape()));
+      // DenseElementsAttr storage is row-major; the orderless linearize
+      // overload treats dim 0 as fastest-varying.
+      Value index = LLVM::linearize(
+          b, loc, to_vector(make_second_range(indices)),
+          convertType<unsigned>(tensorTy.getShape()),
+          ttg::getMatrixOrder(tensorTy.getRank(), /*rowMajor=*/true));
       Value addr = tb.address_of(global);
       addr = tb.gep(ptr_ty(ctx), tensorTy.getElementType(), addr, index);
       llValues.push_back(tb.load(tensorTy.getElementType(), addr));
