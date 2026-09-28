@@ -4092,31 +4092,34 @@ def test_d64_direct_launch_uses_dispatch_ownership(monkeypatch):
 
 
 def test_varlen_d128_address_space_requires_i32_offsets():
-    # One D128 BF16 head fits at most 2**30 elements in the signed i32
-    # byte-offset range used by AMD buffer instructions.
-    max_tokens = 2**23
+    max_bf16_tokens = 2**23
+    max_fp32_tokens = 2**22
 
     amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-        total_q=max_tokens - 15,
-        total_kv=max_tokens,
-        batch=1,
+        total_kv=max_bf16_tokens,
+        max_q=max_fp32_tokens - 31,
         q_heads=1,
         kv_heads=1,
     )
 
     with pytest.raises(ValueError, match="KV tensor size exceeds the signed 32-bit byte-offset range"):
         amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-            total_q=1,
-            total_kv=max_tokens + 1,
-            batch=1,
+            total_kv=max_bf16_tokens + 1,
+            max_q=1,
             q_heads=1,
             kv_heads=1,
         )
-    with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
+    with pytest.raises(ValueError, match="Q tensor size exceeds the signed 32-bit byte-offset range"):
         amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-            total_q=max_tokens - 14,
             total_kv=1,
-            batch=1,
+            max_q=max_fp32_tokens - 31,
+            q_heads=3,
+            kv_heads=1,
+        )
+    with pytest.raises(ValueError, match="dQ sequence size exceeds the signed 32-bit byte-offset range"):
+        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+            total_kv=1,
+            max_q=max_fp32_tokens - 30,
             q_heads=1,
             kv_heads=1,
         )
