@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import statistics
@@ -224,7 +225,15 @@ def _selected_heuristic_config(artifact: Mapping[str, Any], a, b) -> str:
     if precheck is not None and precheck(a, b, None):
         plan = module._MEASURED_LOCAL_SPLIT_U_PLANS[shape]
         return _format_config(module._local_split_u_config(plan))
-    configs = module.heuristic_config(*shape)
+    heuristic = module.heuristic_config
+    if "dtype" in inspect.signature(heuristic).parameters:
+        path, plan = heuristic(*shape, a.dtype, a.element_size(), a.stride(), b.stride())
+        if path != "register":
+            return ""
+        plan = dict(plan)
+        configs = [triton.Config(plan, num_warps=plan.pop("num_warps"), num_stages=plan.pop("num_stages"))]
+    else:
+        configs = heuristic(*shape)
     return _format_config(configs[0]) if len(configs) == 1 else ""
 
 
