@@ -507,6 +507,7 @@ static DenseMap<Value, std::string> buildValueNameCache(Operation *rootOp) {
 }
 
 std::string getElementTypeName(Type type);
+static void printPythonStringLiteral(StringRef s, llvm::raw_ostream &os);
 
 // Casts that change a value's element type. These are user-visible in TLX --
 // the kernel wrote `x.to(dtype)` -- unlike the width/index casts below.
@@ -1175,6 +1176,12 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
                    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
                    DenseMap<Value, Value> *argSubstitutionMap);
 
+void printSimplifiedOp(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap, unsigned indent,
+    const DenseMap<Value, Value> *argSubstitutionMap);
+
 // Print scf.for in Python range syntax
 void printForOp(Operation *op, llvm::raw_ostream &os,
                 const llvm::StringMap<StringRef> &opNameMap,
@@ -1342,6 +1349,54 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
       os << "else:\n";
       os << elseStr;
     }
+  }
+}
+
+// AMD's WarpPipeliner tags the region with a string stage label. A tag of any
+// other type is not one of ours: gating on the type here rather than on
+// hasAttr sends it to the generic path, which still surfaces the region body.
+// Shared by both traversals -- they drifted once already, which is how the
+// CF printer ended up re-emitting hoisted bodies.
+static bool isWarpPipelineStage(Operation *op) {
+  return op->getName().getStringRef() == "scf.execute_region" &&
+         op->getAttrOfType<StringAttr>("triton.warp_pipeline.stage");
+}
+
+// AMD's WarpPipeliner materializes each `with tlx.warp_pipeline_stage(...)`
+// block as an scf.execute_region tagged with the stage label and priority.
+void printWarpPipelineStage(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  // isWarpPipelineStage gates the dispatch on the attribute's type, so this
+  // is non-null.
+  auto stage = op->getAttrOfType<StringAttr>("triton.warp_pipeline.stage");
+
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "with tlx.warp_pipeline_stage(";
+  printPythonStringLiteral(stage.getValue(), os);
+  // The frontend defaults priority to -1 when the kwarg is omitted; the
+  // pipeliner only attaches the attribute when one was actually given.
+  if (auto priority =
+          op->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority"))
+    os << ", priority=" << priority.getInt();
+  os << "):\n";
+
+  SmallVector<Value> stageResults(op->getResults());
+  std::string bodyStr;
+  llvm::raw_string_ostream bodyOs(bodyStr);
+  printRegion(op->getRegion(0), bodyOs, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap, stageResults);
+  bodyOs.flush();
+  if (bodyStr.empty()) {
+    for (unsigned i = 0; i < indent + 1; ++i)
+      os << "  ";
+    os << "pass\n";
+  } else {
+    os << bodyStr;
   }
 }
 
@@ -3141,6 +3196,12 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       continue;
     }
 
+    if (isWarpPipelineStage(&op)) {
+      printWarpPipelineStage(&op, os, opNameMap, allocInfoMap, skippedOps,
+                             indent, argSubstitutionMap);
+      continue;
+    }
+
     // Special handling for scf.while - preserve condition/body and carries.
     if (op.getName().getStringRef() == "scf.while") {
       printWhileOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
@@ -3319,6 +3380,11 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+    if (isWarpPipelineStage(&op)) {
+      printWarpPipelineStage(&op, os, opNameMap, allocInfoMap, skippedOps,
+                             indent, argSubstitutionMap);
       continue;
     }
     if (isInlinableMapElementwise(&op)) {
