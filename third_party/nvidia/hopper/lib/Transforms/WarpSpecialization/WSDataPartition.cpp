@@ -1736,21 +1736,29 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       coordVal = storeOp.getIndices()[dim];
       shape = getShape(storeOp.getSrc());
     }
-    auto newCoordVal = coordVal;
+    // The shifted coordinate is set on the cloned descriptor op only. It must
+    // not be recorded in `mappings`: the same scalar (e.g. pid_m * BLOCK_M) is
+    // often also the base of a pointer-offset computation in this partition,
+    // and that path is already shifted by the sliced tt.make_range. Remapping
+    // it would shift those pointer rows twice.
+    Value newCoordVal = mappings.lookupOrDefault(coordVal);
     if (offset) {
-      if (auto *defOp = coordVal.getDefiningOp())
+      if (auto *defOp = newCoordVal.getDefiningOp())
         builder.setInsertionPointAfter(defOp);
       else
         builder.setInsertionPoint(op);
       Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
       newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          op->getLoc(), coordVal, offsetVal);
-      mappings.map(coordVal, newCoordVal);
-      reverseMappings.map(newCoordVal, coordVal);
+          op->getLoc(), newCoordVal, offsetVal);
     }
 
     newOp = cloneAndSetResultType(op);
+    if (auto newLoad = dyn_cast<DescriptorLoadOp>(newOp))
+      newLoad.getIndicesMutable()[dim].assign(newCoordVal);
+    else
+      cast<DescriptorStoreOp>(newOp).getIndicesMutable()[dim].assign(
+          newCoordVal);
     if (isa<DescriptorLoadOp>(op)) {
       // map load result
       auto v = op->getResult(0);
