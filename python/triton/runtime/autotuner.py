@@ -1132,9 +1132,9 @@ class Config:
     :ivar pre_hook: a function that will be called before the kernel is called. Parameters of this
                     function are args.
     :ivar ir_override: filename of a user-defined IR (*.{ttgir|llir|ptx|amdgcn}).
-    :ivar ctas_per_cga: number of CTAs per Cooperative Grid Array (cluster) for CUDA Thread Block Clusters. SM90+ only.
-        Unlike cluster_dims which spawns new CTAs, ctas_per_cga regroups existing grid CTAs into clusters.
-        This matches CUDA's cuLaunchKernelEx CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION semantics.
+    :ivar ctas_per_cga: number of CTAs per cluster, with one independent program per CTA.
+        Groups existing grid CTAs into clusters; each grid dimension must be divisible by its cluster dimension.
+        Supported on NVIDIA SM90+ and AMD gfx1250. AMD currently supports x-axis clusters only and requires num_ctas=1.
     :type ctas_per_cga: tuple[int, int, int]
     :ivar preferred_ctas_per_cga: preferred number of CTAs per cluster. Unlike ctas_per_cga which is
         required, this is a hint: the driver may use a smaller cluster if resources are constrained.
