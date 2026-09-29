@@ -631,7 +631,7 @@ class TestTLXTemplates(TestCase):
             base_get_configs.assert_called_once()
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
-    def test_tlx_blackwell_template_is_arch_gated(self):
+    def test_tlx_nvidia_only_appends_blackwell_template_to_blackwell_mm(self):
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
 
         existing_template = object()

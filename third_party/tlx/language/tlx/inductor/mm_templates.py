@@ -224,7 +224,7 @@ def _append_tlx_amd(templates, op_name):
 
 
 def _append_tlx_blackwell(templates, op_name):
-    if op_name != "mm":
+    if op_name != "mm" or not current_target().is_blackwell:
         return templates
     templates.append(blackwell_gemm_ws_template)
     return templates
