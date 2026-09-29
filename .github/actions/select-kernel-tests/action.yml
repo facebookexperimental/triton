@@ -1,0 +1,34 @@
+name: Select kernel-affected tests
+description: >
+  Diff the PR against its base and map kernel-only changes to affected tests
+  via .github/scripts/kernel_test_selection.py. Writes the affected test list
+  to /tmp/affected.txt for later steps. Anything that is not a kernel-only
+  change (or any error) fails open to a full run.
+outputs:
+  kernel_only:
+    description: "'true' when the PR touches only TLX kernels, tests, and ignored files"
+    value: ${{ steps.select.outputs.kernel_only }}
+  correctness_mode:
+    description: "How to run test_correctness.py: 'all', 'skip', or 'filtered'"
+    value: ${{ steps.select.outputs.correctness_mode }}
+  correctness_k:
+    description: "-k expression selecting affected correctness tests when mode is 'filtered'"
+    value: ${{ steps.select.outputs.correctness_k }}
+  run_tritonbench:
+    description: "'false' when no TritonBench source references the changed kernels"
+    value: ${{ steps.select.outputs.run_tritonbench }}
+runs:
+  using: composite
+  steps:
+    - name: Compute kernel-affected tests
+      id: select
+      shell: bash
+      run: |
+        git fetch --deepen=150 --quiet || true
+        if git rev-parse -q --verify HEAD^2 >/dev/null; then
+          git diff --name-only HEAD^1 HEAD > /tmp/changed.txt || echo "__FULL_RUN__" > /tmp/changed.txt
+        else
+          git fetch origin "${{ github.base_ref }}" --depth=150 --quiet || true
+          git diff --name-only "FETCH_HEAD...HEAD" > /tmp/changed.txt 2>/dev/null || echo "__FULL_RUN__" > /tmp/changed.txt
+        fi
+        python3 .github/scripts/kernel_test_selection.py --changed-files /tmp/changed.txt --affected-out /tmp/affected.txt || echo "kernel_only=false" >> "$GITHUB_OUTPUT"

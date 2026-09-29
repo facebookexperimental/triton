@@ -176,8 +176,13 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
       - name: Run TritonBench
         id: tritonbench
+        if: ${{ steps.select.outputs.run_tritonbench != 'false' }}
         env:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
           TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
@@ -251,6 +256,10 @@ jobs:
           . "${SETUP_SCRIPT}"
           uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/rocm7.2
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
@@ -274,6 +283,11 @@ jobs:
           done
           FILES=("${TLX_FILES[@]}")
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
+            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -Fxf /tmp/affected.txt || true)
+            echo "kernel-only PR: ${#FILES[@]} TLX core file(s) touch the changed kernel(s)"
+            [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
+          fi
           echo "mi350 collects:" "${FILES[@]}"
           pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
@@ -282,6 +296,18 @@ jobs:
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
+            MODE="${{ steps.select.outputs.correctness_mode }}"
+            if [ "$MODE" = "skip" ]; then
+              echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"
+              exit 0
+            fi
+            if [ "$MODE" = "filtered" ]; then
+              echo "kernel-only PR: correctness filter: ${{ steps.select.outputs.correctness_k }}"
+              pytest third_party/tlx/tutorials/testing/test_correctness.py -k "${{ steps.select.outputs.correctness_k }}" -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
+              exit 0
+            fi
+          fi
           pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
       - name: Run host-default TLX L2 perf
         id: run_perf_tests
@@ -471,6 +497,10 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
         timeout-minutes: 50
@@ -478,6 +508,10 @@ jobs:
           set -eux
           . "${SETUP_SCRIPT}"
           uv pip install pytest expecttest
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
+            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
+            exit 0
+          fi
           pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
