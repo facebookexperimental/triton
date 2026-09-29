@@ -548,10 +548,10 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       for (auto &[desc, storeChannels] : channelsByDesc) {
         if (storeChannels.size() < 2)
           continue;
-        llvm::sort(storeChannels,
-                   [&](const StoreChannel &a, const StoreChannel &b) {
-                     return opOrder[a.first] < opOrder[b.first];
-                   });
+        llvm::stable_sort(storeChannels,
+                          [&](const StoreChannel &a, const StoreChannel &b) {
+                            return opOrder[a.first] < opOrder[b.first];
+                          });
 
         Operation *prevSrcOp = nullptr;
         for (auto &[store, channel] : storeChannels) {
@@ -2300,7 +2300,7 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
   return waitOp;
 }
 
-void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
+LogicalResult replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
   // Collapse every reuse group: rewrite each non-representative channel's
   // allocation onto the representative's allocation and erase it. We iterate
   // config->groups directly -- the source of truth for what must be collapsed
@@ -2415,7 +2415,7 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
           }
         }
 
-        // If all representatives fail, emit error and crash
+        // If all representatives fail, report the error and fail the pass.
         if (!reinter) {
           channel->getAllocOp()->emitError(
               "Failed to allocate TMEM buffer: out of bounds. "
@@ -2424,8 +2424,7 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
               << channel->uniqID << ", offset: " << offset;
           repCh->getAllocOp()->emitRemark(
               "Representative channel that caused the failure");
-          llvm_unreachable(
-              "TMEM allocation out of bounds - no SMEM fallback available");
+          return failure();
         }
 
         LLVM_DEBUG({
@@ -2447,6 +2446,7 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
       channel->defunct = true;
     }
   }
+  return success();
 }
 
 // Lower producers for channels. Here channels are grouped in
@@ -6251,7 +6251,8 @@ LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
 
   foldLocalLoads(funcOp);
   cleanupTmemTokens(funcOp);
-  replaceBufferReuse(funcOp, &config);
+  if (failed(replaceBufferReuse(funcOp, &config)))
+    return failure();
 
   // Realize allocation.reuseTarget annotations from the memory planner:
   // rewrite TMA staging allocs into memdesc_reinterpret views of their
