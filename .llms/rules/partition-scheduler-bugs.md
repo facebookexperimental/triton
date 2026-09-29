@@ -283,6 +283,13 @@
 - **Lit test**: `ws_data_partition_reduce_partitioned_dim.mlir` — column sum combine; argmax (multi-result combiner, sliced index operand, `y - colmax` stays partitioned); `tt.trans` with an `axis=1` combined reduce and an `axis=0` remapped reduce; `inner_tree` ordering remark skip.
 - **Open**: reduction epilogues at DP=2 with `EPILOGUE_SUBTILE=2` then fail in `WSCodePartition` ("N-buffer reuse group: producer and consumer orderings are inconsistent"). This is independent of this fix: a row reduction (no combine) hits the same error on the unfixed build.
 
+### 39. Data partitioning fails the pass on a tile too small to split (2026-09-29, fixed)
+- **Symptom**: every meta-WS GEMM with BLOCK_M=64, BLOCK_N=128 and `data_partition_factor=2` fails `NVGPUWSDataPartition` (`PassManager::run failed`, "Partition not available: 32 64" under `-debug-only=nvgpu-ws-data-partition`), even with a plain store epilogue and any dtype. BLOCK_M=64 at `data_partition_factor=1` compiles fine.
+- **Root cause** (`WSDataPartition.cpp`, `computePartitionScheme`): a slice is only tried along M when it keeps at least 64 rows and along N when it keeps at least 128 columns. A 64x128 tile at factor 2 has neither, so `partitionDim` is empty and the function returned false, which `doDataPartition` turns into a pass failure. This is separate from #38: no reduction is involved.
+- **Fix**: an empty `partitionDim` emits a remark and sets `skipPartitioning`, so DP stays at 1, like the TMEM `blockM` bail in `partitionIsCompatible`. The compiled kernel is bitwise identical to the factor-1 kernel.
+- **Lit test**: `ws_data_partition_small_tile.mlir` — a 64x128 `warp_group_dot` at `num-warp-groups=3` gets the remark and stays whole.
+- **Open**: BLOCK_M=64, BLOCK_N=256 at factor 2 takes a real N partition (64x256 into two 64x128). It works with `EPILOGUE_SUBTILE=1` but still fails with `EPILOGUE_SUBTILE=2`. The subtile `reshape` to 64x2x128 moves the partitioned dim onto the size-2 axis, and the `tt.split` that removes that axis cannot be sliced ("partition not possible"). Supporting it would mean giving split result `p` to partition `p` whole, instead of slicing every op; that has not been done.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

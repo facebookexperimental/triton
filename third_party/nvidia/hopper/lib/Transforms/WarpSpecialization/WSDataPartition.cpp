@@ -1293,9 +1293,18 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
       partitionSize.push_back(sliceSizeN);
     }
 
+    // A tile too small to slice (e.g. BLOCK_M=64, BLOCK_N=128 at factor 2)
+    // keeps factor 1, like the TMEM blockM bail in partitionIsCompatible.
     if (partitionDim.empty()) {
-      LDBG("Partition not available: " << sliceSizeM << " " << sliceSizeN);
-      return false;
+      op->emitRemark() << "skipping data partitioning: a " << shapePerCTA[0]
+                       << "x" << shapePerCTA[1]
+                       << " accumulator is too small to split "
+                       << partitionScheme.numPartitions << " ways";
+      unsigned numPartitions = partitionScheme.numPartitions;
+      partitionScheme = DataPartitionScheme();
+      partitionScheme.numPartitions = numPartitions;
+      partitionScheme.skipPartitioning = true;
+      return true;
     }
 
     bool success = false;
