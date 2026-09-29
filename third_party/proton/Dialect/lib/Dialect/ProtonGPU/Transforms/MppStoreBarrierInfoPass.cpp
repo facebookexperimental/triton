@@ -688,13 +688,16 @@ private:
 
   void walkBlockForStores(Block &block, SmallVectorImpl<CircularStoreOp> &stack,
                           SmallVectorImpl<StoreWithBarrierInfo> &results,
-                          DenseMap<int, CircularStoreOp> &endMap) {
+                          DenseMap<unsigned, CircularStoreOp> &staticEndMap,
+                          DenseMap<Value, CircularStoreOp> &dynamicEndMap) {
     for (Operation &op : block) {
       if (auto store = dyn_cast<CircularStoreOp>(&op)) {
         if (store.getIsStart())
           stack.push_back(store);
-        else
-          endMap[store.getScopeId()] = store;
+        else if (auto scopeId = store.getScopeId())
+          staticEndMap[*scopeId] = store;
+        else if (Value dynamicScopeId = store.getDynamicScopeId())
+          dynamicEndMap[dynamicScopeId] = store;
         continue;
       }
 
@@ -731,7 +734,7 @@ private:
 
       for (Region &r : op.getRegions())
         for (Block &b : r)
-          walkBlockForStores(b, stack, results, endMap);
+          walkBlockForStores(b, stack, results, staticEndMap, dynamicEndMap);
     }
   }
 
@@ -787,10 +790,12 @@ private:
   LogicalResult processFunction(FuncOp func, OpBuilder &builder) {
     SmallVector<CircularStoreOp, 8> stack;
     SmallVector<StoreWithBarrierInfo, 8> stores;
-    DenseMap<int, CircularStoreOp> endMap;
+    DenseMap<unsigned, CircularStoreOp> staticEndMap;
+    // Pair dynamic scopes only when both stores reference the same SSA event.
+    DenseMap<Value, CircularStoreOp> dynamicEndMap;
 
     for (Block &block : func.getBody())
-      walkBlockForStores(block, stack, stores, endMap);
+      walkBlockForStores(block, stack, stores, staticEndMap, dynamicEndMap);
 
     auto replaceCounter = [](CircularStoreOp store, Value newVal) {
       if (auto rcOp = store.getCounter().getDefiningOp<ReadCounterOp>()) {
@@ -801,7 +806,11 @@ private:
     };
 
     for (auto &si : stores) {
-      auto endStore = endMap.lookup(si.startStore.getScopeId());
+      CircularStoreOp endStore;
+      if (auto scopeId = si.startStore.getScopeId())
+        endStore = staticEndMap.lookup(*scopeId);
+      else if (Value dynamicScopeId = si.startStore.getDynamicScopeId())
+        endStore = dynamicEndMap.lookup(dynamicScopeId);
       if (!endStore)
         continue;
 
