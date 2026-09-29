@@ -2488,7 +2488,6 @@ static FailureOr<unsigned> encodeWaitcnt(llvm::AMDGPU::IsaVersion isaVersion,
   return failure();
 }
 
-
 struct MemoryCounterWaitOpConversion
     : public ConvertOpToLLVMPattern<amdgpu::MemoryCounterWaitOp> {
   MemoryCounterWaitOpConversion(const LLVMTypeConverter &converter,
