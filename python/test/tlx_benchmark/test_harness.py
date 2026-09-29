@@ -728,7 +728,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.flash_attn._shapes": {
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
-            "gfx950": ("gfx950_1", ),
+            "gfx950": ("gfx950_all", ),
         },
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {"sm100": ("sm100_1", )},
         "triton.tlx.ops.kernels.hstu_attn._shapes": {
@@ -761,6 +761,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
 
     bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
     assert bmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+    flash_attn = importlib.import_module("triton.tlx.ops.kernels.flash_attn._shapes").FOCUS
+    assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
 def test_focus_suite_selection_rejects_unknown_names():
@@ -834,6 +837,22 @@ def test_flash_attn_gfx950_has_runnable_focus_and_synthetic_shapes(monkeypatch):
     assert focus
     assert synthetic
     assert all(shape.dtype == "bf16" for shape in (*focus, *synthetic))
+
+
+def test_flash_attn_forward_only_shapes_have_no_backward_case(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_flash_attn")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+
+    forward_only = {entry[:5] for entry in bench.FORWARD_ONLY}
+    directions = {}
+    for case in bench.cases():
+        directions.setdefault(case.shape, set()).add(case.direction)
+    selected = forward_only & directions.keys()
+    assert selected
+    assert all(directions[shape] == {"fwd"} for shape in selected)
+    assert any(dirs == {"fwd", "bwd"} for dirs in directions.values())
 
 
 def test_space_resolves_to_each_ops_own_default():
