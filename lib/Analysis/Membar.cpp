@@ -121,8 +121,7 @@ getStageGeometry(Value value, Interval<size_t> interval,
       break;
     // These views stay within the indexed stage. Do not extend this to every
     // MemDescViewTrait: reinterpretation can change the physical stage bounds.
-    if (!isa<triton::gpu::MemDescSubsliceOp,
-             triton::gpu::MemDescTransOp>(def))
+    if (!isa<triton::gpu::MemDescSubsliceOp, triton::gpu::MemDescTransOp>(def))
       return std::nullopt;
     value = def->getOperand(0);
   }
@@ -135,8 +134,7 @@ getStageGeometry(Value value, Interval<size_t> interval,
   auto stageType = index.getType();
   auto encoding = parentType.getEncoding();
   auto layout = dyn_cast<triton::gpu::LayoutEncodingTrait>(encoding);
-  if (!layout ||
-      isa<triton::gpu::PartitionedSharedEncodingAttr>(encoding) ||
+  if (!layout || isa<triton::gpu::PartitionedSharedEncodingAttr>(encoding) ||
       parentType.getRank() != stageType.getRank() + 1 ||
       layout.getRank() != stageType.getRank() ||
       parentType.getShape().front() != 2 ||
@@ -157,13 +155,13 @@ getStageGeometry(Value value, Interval<size_t> interval,
   unsigned bitWidth = getIntOrFloatOrPtrBitWidth(parentType.getElementType());
   if (bitWidth < 8 || bitWidth % 8)
     return std::nullopt;
-  int64_t parentElems = triton::gpu::getAllocationElems(
-      encoding, parentType.getAllocShape());
-  int64_t stageElems = triton::gpu::getAllocationElems(
-      encoding, stageType.getAllocShape());
+  int64_t parentElems =
+      triton::gpu::getAllocationElems(encoding, parentType.getAllocShape());
+  int64_t stageElems =
+      triton::gpu::getAllocationElems(encoding, stageType.getAllocShape());
   if (parentElems <= 0 || stageElems <= 0 ||
-      stageElems >= std::numeric_limits<int32_t>::max() ||
-      parentElems % 2 || parentElems / 2 != stageElems)
+      stageElems >= std::numeric_limits<int32_t>::max() || parentElems % 2 ||
+      parentElems / 2 != stageElems)
     return std::nullopt;
   int64_t strideElems = stageElems;
   int64_t extentElems = stageElems;
@@ -228,7 +226,7 @@ AllocationSlice::AllocationSlice(Value value,
 }
 
 AllocationSlice AllocationSlice::enterStageLoop(Value induction,
-                                                 unsigned initialParity) const {
+                                                unsigned initialParity) const {
   auto result = forgetStageLoop();
   if (!result.stage.parent ||
       !isStableStageParent(result.stage.parent, induction))
@@ -236,7 +234,8 @@ AllocationSlice AllocationSlice::enterStageLoop(Value induction,
   result.stage.basis = induction;
   result.stage.parity ^= initialParity;
   // A lifted entry access now denotes either physical stage. Keeping its old
-  // constant interval would incorrectly prove later-iteration accesses disjoint.
+  // constant interval would incorrectly prove later-iteration accesses
+  // disjoint.
   result.allocationInterval = result.stage.parentInterval;
   return result;
 }
@@ -438,8 +437,8 @@ Value MembarOrFenceAnalysis::getStageBasis(Operation *operation) const {
   return {};
 }
 
-BlockInfo MembarOrFenceAnalysis::transferEdge(const BlockInfo &info, Block *from,
-                                            Block *to) const {
+BlockInfo MembarOrFenceAnalysis::transferEdge(const BlockInfo &info,
+                                              Block *from, Block *to) const {
   for (const StageLoop &loop : stageLoops) {
     if (from == loop.entry && to == loop.header)
       return info.mapSlices([&](const AllocationSlice &slice) {
@@ -459,7 +458,7 @@ BlockInfo MembarOrFenceAnalysis::transferEdge(const BlockInfo &info, Block *from
 }
 
 void MembarOrFenceAnalysis::run(FunctionOpInterface function,
-                               FuncMapT &funcMap) {
+                                FuncMapT &funcMap) {
   // Discover the qualifying barriers before the analysis inserts new ones.
   discoverStageLoops(function);
   triton::PostOrderFunctionAnalysis<BlockInfo>::run(function, funcMap);

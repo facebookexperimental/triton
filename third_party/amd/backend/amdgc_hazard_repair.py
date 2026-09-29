@@ -263,27 +263,33 @@ def _repair_scheduled_mfma_block(lines, incoming_results):
                 _advance_outstanding_mfma_results(outstanding_results, residual_wait_states)
 
         if marked_destination is not None:
+            # Legacy VALU writes need two wait states before any VGPR input,
+            # including srcC. AGPR accumulator writes have a separate rule.
+            legacy_valu_inputs = source_registers | {
+                register
+                for register in accumulator_registers or ()
+                if register[0] == "v"
+            }
             source_wait_states = _wait_states_since(
                 history,
                 2,
-                lambda previous: _legacy_valu_may_write(previous, source_registers),
+                lambda previous: _legacy_valu_may_write(previous, legacy_valu_inputs),
             )
             source_agpr_wait_states = _wait_states_since(
                 history,
                 3,
                 lambda previous: _accvgpr_write_may_write(previous, source_registers),
             )
-            accumulator_wait_states = (_wait_states_since(
+            accumulator_agpr_wait_states = (_wait_states_since(
                 history,
                 1,
-                lambda previous: (_accvgpr_write_may_write(previous, accumulator_registers)
-                                  or _legacy_valu_may_write(previous, accumulator_registers)),
+                lambda previous: _accvgpr_write_may_write(previous, accumulator_registers),
             ) if accumulator_registers else 1)
             exec_wait_states = _wait_states_since(history, 4, _valu_writes_exec)
             residual_wait_states = max(
                 2 - source_wait_states,
                 3 - source_agpr_wait_states,
-                1 - accumulator_wait_states,
+                1 - accumulator_agpr_wait_states,
                 4 - exec_wait_states,
                 0,
             )

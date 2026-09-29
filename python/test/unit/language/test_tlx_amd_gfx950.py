@@ -369,12 +369,21 @@ def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
 
 @triton.jit
 def _amd_scheduled_mfma_wave_batch_kernel(
-    A, B, Out, M: tl.constexpr, INSTR_M: tl.constexpr, WARPS: tl.constexpr,
-    ROLE: tl.constexpr, INITIALIZE: tl.constexpr, FRAGMENT: tl.constexpr,
+    A,
+    B,
+    Out,
+    M: tl.constexpr,
+    INSTR_M: tl.constexpr,
+    WARPS: tl.constexpr,
+    ROLE: tl.constexpr,
+    INITIALIZE: tl.constexpr,
+    FRAGMENT: tl.constexpr,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
-        version=4, instr_shape=[INSTR_M, INSTR_M, 512 // INSTR_M],
-        transposed=True, warps_per_cta=WARPS,
+        version=4,
+        instr_shape=[INSTR_M, INSTR_M, 512 // INSTR_M],
+        transposed=True,
+        warps_per_cta=WARPS,
     )
     lhs: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
     rhs: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
@@ -389,8 +398,13 @@ def _amd_scheduled_mfma_wave_batch_kernel(
     b = tlx.amd_register_resident(b, register_class="agpr", registers_per_group=4)
     acc = tlx.zeros((2, M, 128), tl.float32, layout=mma) + 7.0
     result = tlx.amd_scheduled_mfma(
-        a, b, acc, accumulator_role=ROLE, resident_operand=1,
-        initialize=INITIALIZE, output_fragment=FRAGMENT,
+        a,
+        b,
+        acc,
+        accumulator_role=ROLE,
+        resident_operand=1,
+        initialize=INITIALIZE,
+        output_fragment=FRAGMENT,
     )
     if ROLE == "transient":
         result, _ = tlx.amd_mfma_commit(result, b)
@@ -1717,8 +1731,17 @@ def test_amd_scheduled_mfma_wave_batch_correct_gfx950(m, instr_m, warps, role, i
     b = torch.randn((2, 32, 128), device="cuda", dtype=torch.bfloat16)
     actual = torch.empty((2, m, 128), device="cuda", dtype=torch.float32)
     _amd_scheduled_mfma_wave_batch_kernel[(1, )](
-        a, b, actual, m, instr_m, warps, role, initialize, fragment,
-        num_warps=8, matrix_instr_nonkdim=instr_m,
+        a,
+        b,
+        actual,
+        m,
+        instr_m,
+        warps,
+        role,
+        initialize,
+        fragment,
+        num_warps=8,
+        matrix_instr_nonkdim=instr_m,
     )
     expected = a.float() @ b.float()
     if not initialize:

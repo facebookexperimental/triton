@@ -6,8 +6,18 @@ causal self-attention MHA; long non-causal split-GQA uses masked BN256/BM32
 phases and forms dQ as two native BM16 accumulator chains.  Split workgroups
 preserve FP32 dK/dV partials through their final reduction.  Independent KV
 owners combine dQ contributions with BF16 accumulation and atomics by default;
-``dq_atomic_fp32=True`` uses FP32 accumulation and atomics instead.  Both paths
-return BF16 dQ/dK/dV tensors, with dQ converted to packed THD order.
+``dq_atomic_fp32=True`` enables FP32 accumulation, using FP32 atomics on most
+routes. The exact aligned H12/Hkv4 prefix GQA case described by
+:func:`fa_varlen_backward` can instead materialize BF16 dS and form dQ with
+FP32 GEMM accumulation. Each KV256 partial is scaled before joining the FP32
+total, which is converted to BF16 once. All routes return BF16 dQ/dK/dV tensors
+in packed THD order.
+
+That eager H12 route uses about 11.974 GiB of temporary dS workspace instead of
+the atomic route's 0.292 GiB dQ accumulator, excluding other live tensors.
+Capture on the current stream of Q's device or an OutOfMemoryError from the
+optional dS allocation retains the FP32-atomic route. Other allocation,
+capture-query, device-context, and kernel errors propagate.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
 :func:`fa_varlen_backward` on the same CUDA stream. When token metadata is
@@ -106,6 +116,9 @@ class VarlenBackwardPlan:
     dq_tail_k96: bool = False
     # Exact host-known count used only by the legacy rolling-owner candidate.
     wide_task_count: int | None = None
+    # Optional compact dS metadata for exact-prefix legacy-prepared plans.
+    packed_ds_prefix: torch.Tensor | None = None
+    packed_ds_head_elements: int | None = None
 
 
 @triton.jit
@@ -309,6 +322,15 @@ def prepare_varlen_backward(
         wide_kv_capacity = (batch * triton.cdiv(max_seqlen_k, _WIDE_BLOCK_N)
                             if kv_uniform else triton.cdiv(total_kv, _WIDE_BLOCK_N) + batch)
     device = cu_seqlens_q.device
+    packed_ds_prefix = None
+    packed_ds_head_elements = None
+    if legacy_path and batch == 19 and (total_q, total_kv, max_seqlen_q, max_seqlen_k) == (50754, 100696, 5662, 10414):
+        packed_prefix = [0]
+        for q_length, k_length in zip(q_lengths, k_lengths):
+            rectangle = triton.cdiv(q_length, 16) * 16 * triton.cdiv(k_length, 256) * 256
+            packed_prefix.append(packed_prefix[-1] + rectangle)
+        packed_ds_head_elements = packed_prefix[-1]
+        packed_ds_prefix = torch.tensor(packed_prefix, dtype=torch.int64, device=device)
     q_block_sequence = torch.empty(q_capacity, dtype=torch.int32, device=device)
     q_block_start = torch.empty_like(q_block_sequence)
     full_kv_block_sequence = torch.empty(full_kv_capacity, dtype=torch.int32, device=device)
@@ -384,6 +406,8 @@ def prepare_varlen_backward(
         dq_full_kv_start=dq_full_kv_start,
         dq_tail_k96=dq_tail_k96,
         wide_task_count=wide_task_count,
+        packed_ds_prefix=packed_ds_prefix,
+        packed_ds_head_elements=packed_ds_head_elements,
     )
 
 
@@ -711,8 +735,8 @@ def _store_dq_tail_final_preloaded(
     output_offsets = (rows[:, None] * HQ * D + store_d[None, :]).to(tl.int32)
     output_offsets = tlx.require_layout(output_offsets, store_layout, pin=False)
     output_mask = tlx.require_layout(tl.broadcast_to((rows < q_len)[:, None], (BLOCK_M, D)), store_layout, pin=False)
-    tlx.buffer_store(combined.to(DQ_OUTPUT.dtype.element_ty), tl.multiple_of(DQ_OUTPUT + output_base, 16), output_offsets,
-                     mask=output_mask)
+    tlx.buffer_store(combined.to(DQ_OUTPUT.dtype.element_ty), tl.multiple_of(DQ_OUTPUT + output_base, 16),
+                     output_offsets, mask=output_mask)
 
 
 @triton.jit
@@ -772,8 +796,8 @@ def _store_dq_tail_final(
     output_offsets = (rows[:, None] * HQ * D + store_d[None, :]).to(tl.int32)
     output_offsets = tlx.require_layout(output_offsets, store_layout, pin=False)
     output_mask = tlx.require_layout(tl.broadcast_to((rows < q_len)[:, None], (BLOCK_M, D)), store_layout, pin=False)
-    tlx.buffer_store(combined.to(DQ_OUTPUT.dtype.element_ty), tl.multiple_of(DQ_OUTPUT + output_base, 16), output_offsets,
-                     mask=output_mask)
+    tlx.buffer_store(combined.to(DQ_OUTPUT.dtype.element_ty), tl.multiple_of(DQ_OUTPUT + output_base, 16),
+                     output_offsets, mask=output_mask)
 
 
 @triton.jit
@@ -1928,6 +1952,7 @@ def _store_dq_pending_d64(
     dq_base,
     q_len,
     step,
+    placement,
     COLUMN_START: tl.constexpr,
     SM_SCALE: tl.constexpr,
     D: tl.constexpr,
@@ -1940,8 +1965,8 @@ def _store_dq_pending_d64(
     fragment = tlx.require_layout(dq, MMA_MD, pin=False)
     scale = tlx.require_layout(tl.full((BLOCK_M, D // 2), SM_SCALE, tl.float32), MMA_MD, pin=False)
     fragment *= scale
-    local_m = tlx.rematerialized_range(0, BLOCK_M, 90 + COLUMN_START, placement=step)
-    offs_d = COLUMN_START + tlx.rematerialized_range(0, D // 2, 91 + COLUMN_START, placement=step)
+    local_m = tlx.rematerialized_range(0, BLOCK_M, 90 + COLUMN_START, placement=placement)
+    offs_d = COLUMN_START + tlx.rematerialized_range(0, D // 2, 91 + COLUMN_START, placement=placement)
     valid = tl.broadcast_to((step * BLOCK_M + local_m < q_len)[:, None], (BLOCK_M, D // 2))
     valid = tlx.require_layout(valid, MMA_MD, pin=False)
     d_swizzled = (((offs_d & 1) << 6)
@@ -1954,7 +1979,12 @@ def _store_dq_pending_d64(
     offsets = tl.max_contiguous(native_offsets.to(tl.int32), [1, 1])
     offsets = tlx.require_layout(offsets, MMA_MD, pin=False)
     tlx.buffer_atomic_add(
-        DQ_ACC + dq_base, offsets, fragment, mask=valid, sem="relaxed", contiguity=1,
+        DQ_ACC + dq_base,
+        offsets,
+        fragment,
+        mask=valid,
+        sem="relaxed",
+        contiguity=1,
     )
 
 
@@ -2012,15 +2042,11 @@ def _store_dv_aligned_fragment(
     fragment_n: tl.constexpr = 128
     fragment_d: tl.constexpr = 32
     dv = tlx.require_layout(dv.to(DV.dtype.element_ty), MMA_ND, pin=False)
-    rotated_n = ROTATED_ROW_BASE + tlx.rematerialized_range(
-        0, fragment_n, 700 + ROTATED_ROW_BASE + COLUMN_BASE)
+    rotated_n = ROTATED_ROW_BASE + tlx.rematerialized_range(0, fragment_n, 700 + ROTATED_ROW_BASE + COLUMN_BASE)
     # Invert the score->[4,1] operand bit rotation.  n'[7,6,5,4]
     # corresponds to logical n[7,5,4,6].
-    logical_n = ((rotated_n & 0x8f)
-                 | ((rotated_n & 0x10) << 2)
-                 | ((rotated_n & 0x60) >> 1))
-    store_d = COLUMN_BASE + tlx.rematerialized_range(
-        0, fragment_d, 701 + ROTATED_ROW_BASE + COLUMN_BASE)
+    logical_n = ((rotated_n & 0x8f) | ((rotated_n & 0x10) << 2) | ((rotated_n & 0x60) >> 1))
+    store_d = COLUMN_BASE + tlx.rematerialized_range(0, fragment_d, 701 + ROTATED_ROW_BASE + COLUMN_BASE)
     output_offsets = (logical_n[:, None] * HKV * D + store_d[None, :]).to(tl.int32)
     output_offsets = tlx.require_layout(output_offsets, MMA_ND, pin=False)
     output_mask = tlx.require_layout(
@@ -2031,6 +2057,31 @@ def _store_dv_aligned_fragment(
     # Ordinary store keeps the MFMA producer visible to OptimizeEpilogue and
     # avoids an LDS layout-conversion bridge.
     tl.store(DV + output_offsets, dv, mask=output_mask)
+
+
+@triton.jit
+def _prepare_dq_pending_column0_offset(
+    step,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    MMA_MD: tl.constexpr,
+):
+    """Prepare the first native dQ offset while the final dP slices issue."""
+    tl.static_assert(BLOCK_M == 16 and D == 128)
+    local_m = tlx.rematerialized_range(0, BLOCK_M, 180, placement=step)
+    offs_d = tlx.rematerialized_range(0, D // 2, 181, placement=step)
+    d_swizzled = (((offs_d & 1) << 6)
+                  | ((offs_d & 2) << 6)
+                  | ((offs_d & 4) << 3)
+                  | ((offs_d & 8) >> 3)
+                  | ((offs_d & 48) << 5)
+                  | ((offs_d & 64) << 2))
+    native_offsets = step * BLOCK_M * D + ((local_m[:, None] << 1) | d_swizzled[None, :])
+    offsets = tl.max_contiguous(native_offsets.to(tl.int32), [1, 1])
+    offsets = tlx.require_layout(offsets, MMA_MD, pin=False)
+    offset_even, _ = tl.split(tl.reshape(offsets, (BLOCK_M, D // 4, 2), can_reorder=False))
+    offset0, _ = tl.split(tl.reshape(offset_even, (BLOCK_M, D // 8, 2), can_reorder=False))
+    return tlx.amd_register_class_anchor(offset0, register_class="vgpr")
 
 
 @triton.jit
@@ -2047,6 +2098,7 @@ def _store_dq_pending_slot(
     BLOCK_M: tl.constexpr,
     MMA_MD: tl.constexpr,
     MASK_ROWS: tl.constexpr = True,
+    prepared_offset0=None,
 ):
     """Publish one native accumulator register from every participating wave."""
     tl.static_assert(BLOCK_M == 16 and D == 128)
@@ -2087,8 +2139,16 @@ def _store_dq_pending_slot(
         value, offset, lane_valid = value2, offset2, valid2
     else:
         value, offset, lane_valid = value3, offset3, valid3
+    if prepared_offset0 is not None:
+        tl.static_assert(COLUMN_START == 0 and not MASK_ROWS)
+        offset = prepared_offset0 + ROW_START * 16
     tlx.buffer_atomic_add(
-        DQ_ACC + dq_base, offset, value, mask=lane_valid, sem="relaxed", contiguity=1,
+        DQ_ACC + dq_base,
+        offset,
+        value,
+        mask=lane_valid,
+        sem="relaxed",
+        contiguity=1,
     )
 
 
@@ -2129,6 +2189,12 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
     tl.static_assert((HKV == 4 and (HQ == 4 or HQ == 12)) or (CHUNKED_Q and HKV == 8 and HQ == 64))
     tl.static_assert(not CHUNKED_Q or HQ != HKV)
     tl.static_assert(Q_SPLITS == 1 or (CHUNKED_Q and Q_SPLITS == 2))
+    FIRST_HEAD_PREFETCH: tl.constexpr = HQ == 12 and HKV == 4 and not CHUNKED_Q
+    # Masks name allowed scheduling classes. Clear the ALU umbrella bit
+    # so VALU is selected independently: bar MFMA+VALU or only MFMA.
+    # These compiler fences neither synchronize memory nor await dP results.
+    SCHED_ALLOW_EXCEPT_MFMA_VALU: tl.constexpr = 0xFF4
+    SCHED_ALLOW_EXCEPT_MFMA: tl.constexpr = 0xFF6
     if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
         return
     task = tl.program_id(1)
@@ -2150,7 +2216,7 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
     q_start = tl.load(QStart + task).to(tl.int64)
     head_rotation = (q_start.to(tl.uint32) >> 2) % HKV
     kv_head = ((tl.program_id(0).to(tl.uint32) + head_rotation) % HKV).to(tl.int32)
-    q_head = kv_head
+    q_head = kv_head * (HQ // HKV) if FIRST_HEAD_PREFETCH else kv_head
     q_scratch_start = tl.load(DQScratchStart + task).to(tl.int64)
     q_len = tl.load(QLen + task).to(tl.int32)
 
@@ -2184,6 +2250,8 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
         shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
         stride=((8, 16, 32, 64, 1024, 512, 128, 256), (1, 2, 4)),
     )
+    # Keep the zero-fill value constant across the conditional head startup.
+    qdo_zero = tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=qdo_async_layout)
     stats_cache_rows: tl.constexpr = 512
     # Each lane owns two rows; four warps cover the cache once.
     stats_async_layout: tl.constexpr = tlx.layout(
@@ -2377,7 +2445,8 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
     # async/MFMA ownership but do not pin it through the loop-carried dot chain.
     # Fixed output ownership below continues to use the pin=True default.
     k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_raw_async_layout, pin=False)
-    k_load_mask = tlx.require_layout(tl.broadcast_to(k_n < kv_valid_rows, k_offsets.shape), k_raw_async_layout, pin=False)
+    k_load_mask = tlx.require_layout(tl.broadcast_to(k_n < kv_valid_rows, k_offsets.shape), k_raw_async_layout,
+                                     pin=False)
     k_token = tlx.buffer_load_to_local(
         tlx.local_view(k_raw_buffer, 0),
         k_ptr,
@@ -2386,15 +2455,17 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
         other=tlx.zeros((BLOCK_N, D // 8, 8), tl.bfloat16, layout=k_raw_async_layout),
     )
     tlx.async_load_commit_group([k_token])
-    if HQ == HKV:
+    if HQ == HKV or FIRST_HEAD_PREFETCH:
         first_m = tl.arange(0, BLOCK_M)
         first_ptrs = first_m[:, None] * HQ * D + offs_d[None, :]
         first_mask = first_m[:, None] < q_len
         first_offsets = tlx.require_layout(first_ptrs.to(tl.int32), qdo_async_layout, pin=False)
-        first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout, pin=False)
-        qdo_zero = tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=qdo_async_layout)
-        first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), q_ptr, first_offsets, mask=first_load_mask, other=qdo_zero)
-        first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), do_ptr, first_offsets, mask=first_load_mask, other=qdo_zero)
+        first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout,
+                                             pin=False)
+        first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), q_ptr, first_offsets,
+                                                 mask=first_load_mask, other=qdo_zero)
+        first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), do_ptr, first_offsets,
+                                                  mask=first_load_mask, other=qdo_zero)
         # Preserve preprocessing's FP32 bits: head-major LSE-log2 and Delta planes.
         # Zero every padded cache row, including the final Q16 consumer tail.
         stats_rows = tl.arange(0, stats_cache_rows)
@@ -2402,10 +2473,10 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
         stats_mask = tlx.require_layout(stats_rows < q_len, stats_async_layout, pin=False)
         stats_zero = tlx.zeros((stats_cache_rows, ), tl.float32, layout=stats_async_layout)
         stats_base = q_head.to(tl.int64) * 2 * TOTAL_Q + q_start
-        lse_cache_token = tlx.buffer_load_to_local(
-            lse_cache, Delta + stats_base, stats_offsets, mask=stats_mask, other=stats_zero)
-        delta_cache_token = tlx.buffer_load_to_local(
-            delta_cache, Delta + stats_base + TOTAL_Q, stats_offsets, mask=stats_mask, other=stats_zero)
+        lse_cache_token = tlx.buffer_load_to_local(lse_cache, Delta + stats_base, stats_offsets, mask=stats_mask,
+                                                   other=stats_zero)
+        delta_cache_token = tlx.buffer_load_to_local(delta_cache, Delta + stats_base + TOTAL_Q, stats_offsets,
+                                                     mask=stats_mask, other=stats_zero)
         tlx.async_load_commit_group([first_q_token, first_do_token, lse_cache_token, delta_cache_token])
 
     # V stays resident for the full query walk. Mask the KV tail before
@@ -2418,70 +2489,38 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
 
     kv_wait = tlx.async_load_wait_group(0)
     # Keep all sixteen native N64xD32 QK operands resident across the loop.
-    k_00 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_00 = tlx.amd_register_resident(
-        k_00, register_class="agpr", registers_per_group=4)
-    k_01 = tlx.local_load(tlx.local_slice(k_buffer, [0, 32], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_01 = tlx.amd_register_resident(
-        k_01, register_class="agpr", registers_per_group=4)
-    k_02 = tlx.local_load(tlx.local_slice(k_buffer, [0, 64], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_02 = tlx.amd_register_resident(
-        k_02, register_class="agpr", registers_per_group=4)
-    k_03 = tlx.local_load(tlx.local_slice(k_buffer, [0, 96], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_03 = tlx.amd_register_resident(
-        k_03, register_class="agpr", registers_per_group=4)
-    k_10 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_10 = tlx.amd_register_resident(
-        k_10, register_class="agpr", registers_per_group=4)
-    k_11 = tlx.local_load(tlx.local_slice(k_buffer, [64, 32], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_11 = tlx.amd_register_resident(
-        k_11, register_class="agpr", registers_per_group=4)
-    k_12 = tlx.local_load(tlx.local_slice(k_buffer, [64, 64], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_12 = tlx.amd_register_resident(
-        k_12, register_class="agpr", registers_per_group=4)
-    k_13 = tlx.local_load(tlx.local_slice(k_buffer, [64, 96], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_13 = tlx.amd_register_resident(
-        k_13, register_class="agpr", registers_per_group=4)
-    k_20 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_20 = tlx.amd_register_resident(
-        k_20, register_class="agpr", registers_per_group=4)
-    k_21 = tlx.local_load(tlx.local_slice(k_buffer, [128, 32], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_21 = tlx.amd_register_resident(
-        k_21, register_class="agpr", registers_per_group=4)
-    k_22 = tlx.local_load(tlx.local_slice(k_buffer, [128, 64], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_22 = tlx.amd_register_resident(
-        k_22, register_class="agpr", registers_per_group=4)
-    k_23 = tlx.local_load(tlx.local_slice(k_buffer, [128, 96], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_23 = tlx.amd_register_resident(
-        k_23, register_class="agpr", registers_per_group=4)
-    k_30 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_30 = tlx.amd_register_resident(
-        k_30, register_class="agpr", registers_per_group=4)
-    k_31 = tlx.local_load(tlx.local_slice(k_buffer, [192, 32], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_31 = tlx.amd_register_resident(
-        k_31, register_class="agpr", registers_per_group=4)
-    k_32 = tlx.local_load(tlx.local_slice(k_buffer, [192, 64], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_32 = tlx.amd_register_resident(
-        k_32, register_class="agpr", registers_per_group=4)
-    k_33 = tlx.local_load(tlx.local_slice(k_buffer, [192, 96], [64, 32]),
-                          token=kv_wait, layout=k_op0_nm, relaxed=True)
-    k_33 = tlx.amd_register_resident(
-        k_33, register_class="agpr", registers_per_group=4)
+    k_00 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_00 = tlx.amd_register_resident(k_00, register_class="agpr", registers_per_group=4)
+    k_01 = tlx.local_load(tlx.local_slice(k_buffer, [0, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_01 = tlx.amd_register_resident(k_01, register_class="agpr", registers_per_group=4)
+    k_02 = tlx.local_load(tlx.local_slice(k_buffer, [0, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_02 = tlx.amd_register_resident(k_02, register_class="agpr", registers_per_group=4)
+    k_03 = tlx.local_load(tlx.local_slice(k_buffer, [0, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_03 = tlx.amd_register_resident(k_03, register_class="agpr", registers_per_group=4)
+    k_10 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_10 = tlx.amd_register_resident(k_10, register_class="agpr", registers_per_group=4)
+    k_11 = tlx.local_load(tlx.local_slice(k_buffer, [64, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_11 = tlx.amd_register_resident(k_11, register_class="agpr", registers_per_group=4)
+    k_12 = tlx.local_load(tlx.local_slice(k_buffer, [64, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_12 = tlx.amd_register_resident(k_12, register_class="agpr", registers_per_group=4)
+    k_13 = tlx.local_load(tlx.local_slice(k_buffer, [64, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_13 = tlx.amd_register_resident(k_13, register_class="agpr", registers_per_group=4)
+    k_20 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_20 = tlx.amd_register_resident(k_20, register_class="agpr", registers_per_group=4)
+    k_21 = tlx.local_load(tlx.local_slice(k_buffer, [128, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_21 = tlx.amd_register_resident(k_21, register_class="agpr", registers_per_group=4)
+    k_22 = tlx.local_load(tlx.local_slice(k_buffer, [128, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_22 = tlx.amd_register_resident(k_22, register_class="agpr", registers_per_group=4)
+    k_23 = tlx.local_load(tlx.local_slice(k_buffer, [128, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_23 = tlx.amd_register_resident(k_23, register_class="agpr", registers_per_group=4)
+    k_30 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_30 = tlx.amd_register_resident(k_30, register_class="agpr", registers_per_group=4)
+    k_31 = tlx.local_load(tlx.local_slice(k_buffer, [192, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_31 = tlx.amd_register_resident(k_31, register_class="agpr", registers_per_group=4)
+    k_32 = tlx.local_load(tlx.local_slice(k_buffer, [192, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_32 = tlx.amd_register_resident(k_32, register_class="agpr", registers_per_group=4)
+    k_33 = tlx.local_load(tlx.local_slice(k_buffer, [192, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_33 = tlx.amd_register_resident(k_33, register_class="agpr", registers_per_group=4)
 
     # Keep dK as four independent [2,2] N64xD128 chains.  Align dV with the
     # score/dP [4,1] wave topology and split it into eight native N128xD32
@@ -2525,26 +2564,35 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                 q_tensor_base = (q_start * HQ + q_head.to(tl.int64)) * D
                 q_ptr = tl.multiple_of(Q + q_tensor_base, 16)
                 do_ptr = tl.multiple_of(DO + q_tensor_base, 16)
-                first_m = tl.arange(0, BLOCK_M)
-                first_ptrs = first_m[:, None] * HQ * D + offs_d[None, :]
-                first_mask = first_m[:, None] < q_len
-                first_offsets = tlx.require_layout(first_ptrs.to(tl.int32), qdo_async_layout, pin=False)
-                first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout, pin=False)
-                qdo_zero = tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=qdo_async_layout)
-                first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), q_ptr, first_offsets, mask=first_load_mask, other=qdo_zero)
-                first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), do_ptr, first_offsets, mask=first_load_mask, other=qdo_zero)
-                # Preserve preprocessing's FP32 bits: head-major LSE-log2 and Delta planes.
-                # Zero every padded cache row, including the final Q16 consumer tail.
-                stats_rows = tl.arange(0, stats_cache_rows)
-                stats_offsets = tlx.require_layout(stats_rows.to(tl.int32), stats_async_layout, pin=False)
-                stats_mask = tlx.require_layout(stats_rows < q_len, stats_async_layout, pin=False)
-                stats_zero = tlx.zeros((stats_cache_rows, ), tl.float32, layout=stats_async_layout)
-                stats_base = q_head.to(tl.int64) * 2 * TOTAL_Q + q_start
-                lse_cache_token = tlx.buffer_load_to_local(
-                    lse_cache, Delta + stats_base, stats_offsets, mask=stats_mask, other=stats_zero)
-                delta_cache_token = tlx.buffer_load_to_local(
-                    delta_cache, Delta + stats_base + TOTAL_Q, stats_offsets, mask=stats_mask, other=stats_zero)
-                tlx.async_load_commit_group([first_q_token, first_do_token, lse_cache_token, delta_cache_token])
+                # Head zero was issued before K/V initialization; later heads refill here.
+                if not FIRST_HEAD_PREFETCH or group_head != 0:
+                    if FIRST_HEAD_PREFETCH:
+                        first_m = tlx.rematerialized_range(0, BLOCK_M, 600, placement=group_head)
+                        first_d = tlx.rematerialized_range(0, D, 601, placement=group_head)
+                    else:
+                        first_m = tl.arange(0, BLOCK_M)
+                        first_d = offs_d
+                    first_ptrs = first_m[:, None] * HQ * D + first_d[None, :]
+                    first_mask = first_m[:, None] < q_len
+                    first_offsets = tlx.require_layout(first_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+                    first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape),
+                                                         qdo_async_layout, pin=False)
+                    first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), q_ptr, first_offsets,
+                                                             mask=first_load_mask, other=qdo_zero)
+                    first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), do_ptr, first_offsets,
+                                                              mask=first_load_mask, other=qdo_zero)
+                    # Preserve preprocessing's FP32 bits: head-major LSE-log2 and Delta planes.
+                    # Zero every padded cache row, including the final Q16 consumer tail.
+                    stats_rows = tl.arange(0, stats_cache_rows)
+                    stats_offsets = tlx.require_layout(stats_rows.to(tl.int32), stats_async_layout, pin=False)
+                    stats_mask = tlx.require_layout(stats_rows < q_len, stats_async_layout, pin=False)
+                    stats_zero = tlx.zeros((stats_cache_rows, ), tl.float32, layout=stats_async_layout)
+                    stats_base = q_head.to(tl.int64) * 2 * TOTAL_Q + q_start
+                    lse_cache_token = tlx.buffer_load_to_local(lse_cache, Delta + stats_base, stats_offsets,
+                                                               mask=stats_mask, other=stats_zero)
+                    delta_cache_token = tlx.buffer_load_to_local(delta_cache, Delta + stats_base + TOTAL_Q,
+                                                                 stats_offsets, mask=stats_mask, other=stats_zero)
+                    tlx.async_load_commit_group([first_q_token, first_do_token, lse_cache_token, delta_cache_token])
                 first_ready = tlx.async_load_wait_group(0)
                 tl.debug_barrier()
             else:
@@ -2556,18 +2604,14 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
             first_do_view = tlx.local_view(do_buffers, 0)
             # Keep Q in the four native D32 operands consumed by QK.  This avoids
             # forming a whole D128 loop-carried value that LLVM later has to split.
-            q_t0 = tlx.local_load(
-                tlx.local_trans(tlx.local_slice(first_q_view, [0, 0], [BLOCK_M, 32])),
-                token=first_ready, layout=qt_op1_nm, relaxed=True)
-            q_t1 = tlx.local_load(
-                tlx.local_trans(tlx.local_slice(first_q_view, [0, 32], [BLOCK_M, 32])),
-                token=first_ready, layout=qt_op1_nm, relaxed=True)
-            q_t2 = tlx.local_load(
-                tlx.local_trans(tlx.local_slice(first_q_view, [0, 64], [BLOCK_M, 32])),
-                token=first_ready, layout=qt_op1_nm, relaxed=True)
-            q_t3 = tlx.local_load(
-                tlx.local_trans(tlx.local_slice(first_q_view, [0, 96], [BLOCK_M, 32])),
-                token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t0 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 0], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t1 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 32], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t2 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 64], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t3 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 96], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
             do_t = tlx.local_load(tlx.local_trans(first_do_view), token=first_ready, layout=dot_op1_nm)
             lse = tlx.local_load(tlx.local_slice(lse_cache, [0], [BLOCK_M]), token=first_ready)
             delta = tlx.local_load(tlx.local_slice(delta_cache, [0], [BLOCK_M]), token=first_ready)
@@ -2643,52 +2687,47 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     k_31 = tlx.require_layout(k_31, k_op0_nm, pin=False)
                     k_32 = tlx.require_layout(k_32, k_op0_nm, pin=False)
                     k_33 = tlx.require_layout(k_33, k_op0_nm, pin=False)
-                    score_0 = tlx.amd_scheduled_mfma(
-                        k_00, q_t0, score_0, resident_operand=0,
-                        accumulator_role="transient", initialize=True)
+                    score_0 = tlx.amd_scheduled_mfma(k_00, q_t0, score_0, resident_operand=0,
+                                                     accumulator_role="transient", initialize=True)
                     tlx.amd_sched_barrier(0x6 if bridge_phase == 1 else 0)
-                    score_0 = tlx.amd_scheduled_mfma(
-                        k_01, q_t1, score_0, resident_operand=0, accumulator_role="transient")
-                    score_0 = tlx.amd_scheduled_mfma(
-                        k_02, q_t2, score_0, resident_operand=0, accumulator_role="transient")
+                    score_0 = tlx.amd_scheduled_mfma(k_01, q_t1, score_0, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_0 = tlx.amd_scheduled_mfma(k_02, q_t2, score_0, resident_operand=0,
+                                                     accumulator_role="transient")
                     tlx.amd_sched_barrier(0x6 if bridge_phase == 1 else 0)
-                    score_0 = tlx.amd_scheduled_mfma(
-                        k_03, q_t3, score_0, resident_operand=0, accumulator_role="transient")
-                    score_1 = tlx.amd_scheduled_mfma(
-                        k_10, q_t0, score_1, resident_operand=0,
-                        accumulator_role="transient", initialize=True)
+                    score_0 = tlx.amd_scheduled_mfma(k_03, q_t3, score_0, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_1 = tlx.amd_scheduled_mfma(k_10, q_t0, score_1, resident_operand=0,
+                                                     accumulator_role="transient", initialize=True)
                     tlx.amd_sched_barrier(0x6 if bridge_phase == 1 else 0)
-                    score_1 = tlx.amd_scheduled_mfma(
-                        k_11, q_t1, score_1, resident_operand=0, accumulator_role="transient")
-                    score_1 = tlx.amd_scheduled_mfma(
-                        k_12, q_t2, score_1, resident_operand=0, accumulator_role="transient")
+                    score_1 = tlx.amd_scheduled_mfma(k_11, q_t1, score_1, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_1 = tlx.amd_scheduled_mfma(k_12, q_t2, score_1, resident_operand=0,
+                                                     accumulator_role="transient")
                     tlx.amd_sched_barrier(0x6 if bridge_phase == 1 else 0)
-                    score_1 = tlx.amd_scheduled_mfma(
-                        k_13, q_t3, score_1, resident_operand=0, accumulator_role="transient")
+                    score_1 = tlx.amd_scheduled_mfma(k_13, q_t3, score_1, resident_operand=0,
+                                                     accumulator_role="transient")
                     # Keep the eight cross-backedge fragments as QK M1..M8; without
                     # this boundary LLVM may issue the first in-phase fragment at M8.
                     tlx.amd_sched_barrier(0x6 if bridge_phase == 1 else 0)
-                    score_2 = tlx.amd_scheduled_mfma(
-                        k_20, q_t0, score_2, resident_operand=0,
-                        accumulator_role="transient", initialize=True)
-                    score_2 = tlx.amd_scheduled_mfma(
-                        k_21, q_t1, score_2, resident_operand=0, accumulator_role="transient")
-                    score_2 = tlx.amd_scheduled_mfma(
-                        k_22, q_t2, score_2, resident_operand=0, accumulator_role="transient")
-                    score_2 = tlx.amd_scheduled_mfma(
-                        k_23, q_t3, score_2, resident_operand=0, accumulator_role="transient")
-                    score_3 = tlx.amd_scheduled_mfma(
-                        k_30, q_t0, score_3, resident_operand=0,
-                        accumulator_role="transient", initialize=True)
-                    score_3 = tlx.amd_scheduled_mfma(
-                        k_31, q_t1, score_3, resident_operand=0, accumulator_role="transient")
-                    score_3 = tlx.amd_scheduled_mfma(
-                        k_32, q_t2, score_3, resident_operand=0, accumulator_role="transient")
-                    score_3 = tlx.amd_scheduled_mfma(
-                        k_33, q_t3, score_3, resident_operand=0, accumulator_role="transient")
+                    score_2 = tlx.amd_scheduled_mfma(k_20, q_t0, score_2, resident_operand=0,
+                                                     accumulator_role="transient", initialize=True)
+                    score_2 = tlx.amd_scheduled_mfma(k_21, q_t1, score_2, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_2 = tlx.amd_scheduled_mfma(k_22, q_t2, score_2, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_2 = tlx.amd_scheduled_mfma(k_23, q_t3, score_2, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_3 = tlx.amd_scheduled_mfma(k_30, q_t0, score_3, resident_operand=0,
+                                                     accumulator_role="transient", initialize=True)
+                    score_3 = tlx.amd_scheduled_mfma(k_31, q_t1, score_3, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_3 = tlx.amd_scheduled_mfma(k_32, q_t2, score_3, resident_operand=0,
+                                                     accumulator_role="transient")
+                    score_3 = tlx.amd_scheduled_mfma(k_33, q_t3, score_3, resident_operand=0,
+                                                     accumulator_role="transient")
                     if bridge_phase == 0:
-                        v_nm = tlx.amd_register_resident(
-                            v_nm, register_class="agpr", registers_per_group=4)
+                        v_nm = tlx.amd_register_resident(v_nm, register_class="agpr", registers_per_group=4)
 
                     # dV uses the score-aligned [4,1] topology.  Consume one D32 dO
                     # operand per native output column while adjacent P64 fragments
@@ -2700,6 +2739,8 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     do_nd_3 = tlx.extract_slice(do_nd, [BLOCK_M, 32], [0, 96])
                     p_pair_first = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
 
+                    # The unrolled loop assigns this at index 1 before use at index 3.
+                    first_p128 = None
                     # Process each completed score fragment independently.  Only one
                     # BF16 N64 P value crosses into the following N64 step; no N256
                     # score/P/dP value is formed.
@@ -2736,16 +2777,39 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                             mma_nm,
                             pin=False,
                         )
-                        p64 = tlx.require_layout(tl.math.exp2(tl.where(valid64, scores64, neg_inf64)), mma_nm, pin=False)
+                        p64 = tlx.require_layout(tl.math.exp2(tl.where(valid64, scores64, neg_inf64)), mma_nm,
+                                                 pin=False)
                         dpt_acc64 = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
                         dpt64 = tl.dot(v_nm64, do_t, acc=dpt_acc64, out_dtype=dpt_acc64.dtype)
+                        if HQ == HKV and bridge_phase == 1 and n64_index == 2:
+                            # Keep MFMA issue and offset VALU on opposite sides;
+                            # the offset calculation does not read the dP result.
+                            tlx.amd_sched_barrier(SCHED_ALLOW_EXCEPT_MFMA_VALU)
+                            pending_offset0 = _prepare_dq_pending_column0_offset(m_block - 1, D, BLOCK_M, mma_md)
+                        if HQ == HKV and bridge_phase == 1 and n64_index == 3:
+                            # Permit every scheduling class except MFMA. Keep the
+                            # final dP issue before dV without consuming its result.
+                            tlx.amd_sched_barrier(SCHED_ALLOW_EXCEPT_MFMA)
+                            dv_00 = tlx.amd_scheduled_mfma(first_p128, do_nd_0, dv_00, accumulator_role="persistent",
+                                                           accumulator_register_class="vgpr",
+                                                           initialize=(HQ == HKV and bridge_phase == 0))
+                            dv_01 = tlx.amd_scheduled_mfma(first_p128, do_nd_1, dv_01, accumulator_role="persistent",
+                                                           accumulator_register_class="vgpr",
+                                                           initialize=(HQ == HKV and bridge_phase == 0))
+                            dv_02 = tlx.amd_scheduled_mfma(first_p128, do_nd_2, dv_02, accumulator_role="persistent",
+                                                           accumulator_register_class="vgpr",
+                                                           initialize=(HQ == HKV and bridge_phase == 0))
+                            dv_03 = tlx.amd_scheduled_mfma(first_p128, do_nd_3, dv_03, accumulator_role="persistent",
+                                                           accumulator_register_class="vgpr",
+                                                           initialize=(HQ == HKV and bridge_phase == 0))
                         delta64 = tlx.require_layout(
                             tl.broadcast_to(delta[None, :], (BLOCK_N // 4, BLOCK_M)),
                             mma_nm,
                             pin=False,
                         )
                         ds64 = p64 * (dpt64 - delta64)
-                        ds64_shared = tlx.local_slice(current_ds, [n64_index * (BLOCK_N // 4), 0], [BLOCK_N // 4, BLOCK_M])
+                        ds64_shared = tlx.local_slice(current_ds, [n64_index * (BLOCK_N // 4), 0],
+                                                      [BLOCK_N // 4, BLOCK_M])
                         tlx.local_store(ds64_shared, ds64.to(tl.bfloat16))
 
                         if n64_index == 0 or n64_index == 2:
@@ -2764,31 +2828,35 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                             p128 = p128.to(tl.bfloat16)
                             p128 = tlx.require_layout(p128, pt_op0_nd, pin=False)
                             if n64_index == 1:
-                                dv_00 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_0, dv_00,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
-                                dv_01 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_1, dv_01,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
-                                dv_02 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_2, dv_02,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
-                                dv_03 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_3, dv_03,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
+                                if HQ == HKV and bridge_phase == 1:
+                                    # Retain the first half until all dP slices issue.
+                                    first_p128 = p128
+                                else:
+                                    dv_00 = tlx.amd_scheduled_mfma(p128, do_nd_0, dv_00, accumulator_role="persistent",
+                                                                   accumulator_register_class="vgpr",
+                                                                   initialize=(HQ == HKV and bridge_phase == 0))
+                                    dv_01 = tlx.amd_scheduled_mfma(p128, do_nd_1, dv_01, accumulator_role="persistent",
+                                                                   accumulator_register_class="vgpr",
+                                                                   initialize=(HQ == HKV and bridge_phase == 0))
+                                    dv_02 = tlx.amd_scheduled_mfma(p128, do_nd_2, dv_02, accumulator_role="persistent",
+                                                                   accumulator_register_class="vgpr",
+                                                                   initialize=(HQ == HKV and bridge_phase == 0))
+                                    dv_03 = tlx.amd_scheduled_mfma(p128, do_nd_3, dv_03, accumulator_role="persistent",
+                                                                   accumulator_register_class="vgpr",
+                                                                   initialize=(HQ == HKV and bridge_phase == 0))
                             else:
-                                dv_10 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_0, dv_10,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
-                                dv_11 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_1, dv_11,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
-                                dv_12 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_2, dv_12,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
-                                dv_13 = tlx.amd_scheduled_mfma(
-                                    p128, do_nd_3, dv_13,
-                                    accumulator_role="persistent", accumulator_register_class="vgpr", initialize=(HQ == HKV and bridge_phase == 0))
+                                dv_10 = tlx.amd_scheduled_mfma(p128, do_nd_0, dv_10, accumulator_role="persistent",
+                                                               accumulator_register_class="vgpr",
+                                                               initialize=(HQ == HKV and bridge_phase == 0))
+                                dv_11 = tlx.amd_scheduled_mfma(p128, do_nd_1, dv_11, accumulator_role="persistent",
+                                                               accumulator_register_class="vgpr",
+                                                               initialize=(HQ == HKV and bridge_phase == 0))
+                                dv_12 = tlx.amd_scheduled_mfma(p128, do_nd_2, dv_12, accumulator_role="persistent",
+                                                               accumulator_register_class="vgpr",
+                                                               initialize=(HQ == HKV and bridge_phase == 0))
+                                dv_13 = tlx.amd_scheduled_mfma(p128, do_nd_3, dv_13, accumulator_role="persistent",
+                                                               accumulator_register_class="vgpr",
+                                                               initialize=(HQ == HKV and bridge_phase == 0))
 
                     # Load the alternate Q/dO consumer ownership after the N64 score
                     # temporaries die but before the handoff barrier.  The barrier then
@@ -2796,17 +2864,23 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     # ring slot.
                     q_nd64 = tlx.local_load(q_view, layout=q_op1_nd64, relaxed=True)
                     if bridge_phase == 1:
-                        # The preceding tile is full because a following tile exists.
+                        # Entering m_block proves the preceding MHA tile is full;
+                        # only these steady stores omit row masks. The final
+                        # pending tile keeps its tail mask in the drain below.
                         pending_base = (q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
                         tlx.amd_sched_barrier(0)
-                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 0, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
-                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 4, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
-                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 8, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
-                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 12, 0,
-                                               SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
+                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 0, 0, SM_SCALE,
+                                               D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV and not CHUNKED_Q),
+                                               prepared_offset0=pending_offset0 if HQ == HKV else None)
+                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 4, 0, SM_SCALE,
+                                               D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV and not CHUNKED_Q),
+                                               prepared_offset0=pending_offset0 if HQ == HKV else None)
+                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 8, 0, SM_SCALE,
+                                               D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV and not CHUNKED_Q),
+                                               prepared_offset0=pending_offset0 if HQ == HKV else None)
+                        _store_dq_pending_slot(pending_dq_a, DQ_ACC, pending_base, q_len, m_block - 1, 12, 0, SM_SCALE,
+                                               D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV and not CHUNKED_Q),
+                                               prepared_offset0=pending_offset0 if HQ == HKV else None)
 
                     # One barrier makes every dS slice visible in its dK/dQ consumer
                     # ownerships and also retires current Q/dO LDS readers before the
@@ -2853,83 +2927,85 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     next_dq_b = tlx.zeros((BLOCK_M, D // 2), tl.float32, layout=mma_md)
                     for n64_index in tl.static_range(0, 4):
                         if n64_index < 3:
-                            ds64_next_shared = tlx.local_slice(current_ds, [(n64_index + 1) * (BLOCK_N // 4), 0], [BLOCK_N // 4, BLOCK_M])
+                            ds64_next_shared = tlx.local_slice(current_ds, [(n64_index + 1) * (BLOCK_N // 4), 0],
+                                                               [BLOCK_N // 4, BLOCK_M])
                             ds_next_nd64 = tlx.local_load(ds64_next_shared, layout=dst_op0_nd64, relaxed=True)
                         if n64_index == 0:
-                            dk_n0 = tlx.amd_scheduled_mfma(
-                                ds_nd64, q_nd64, dk_n0, accumulator_role="persistent", accumulator_register_class="agpr", initialize=(HQ == HKV and bridge_phase == 0), output_fragment=0)
+                            dk_n0 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n0, accumulator_role="persistent",
+                                                           accumulator_register_class="agpr",
+                                                           initialize=(HQ == HKV
+                                                                       and bridge_phase == 0), output_fragment=0)
                             tlx.amd_sched_barrier(0)
-                            dq_k_a0 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [0, 0], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_b0 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [0, D // 2], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_a1 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [32, 0], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_b1 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [32, D // 2], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
+                            dq_k_a0 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [32, D // 2]), token=kv_wait,
+                                                     layout=k_op1_md, relaxed=True)
+                            dq_k_b0 = tlx.local_load(tlx.local_slice(k_buffer, [0, D // 2], [32, D // 2]),
+                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
+                            dq_k_a1 = tlx.local_load(tlx.local_slice(k_buffer, [32, 0], [32, D // 2]), token=kv_wait,
+                                                     layout=k_op1_md, relaxed=True)
+                            dq_k_b1 = tlx.local_load(tlx.local_slice(k_buffer, [32, D // 2], [32, D // 2]),
+                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
                             tlx.amd_sched_barrier(0)
-                            dk_n0 = tlx.amd_scheduled_mfma(
-                                ds_nd64, q_nd64, dk_n0, accumulator_role="persistent", accumulator_register_class="agpr", initialize=(HQ == HKV and bridge_phase == 0), output_fragment=1)
+                            dk_n0 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n0, accumulator_role="persistent",
+                                                           accumulator_register_class="agpr",
+                                                           initialize=(HQ == HKV
+                                                                       and bridge_phase == 0), output_fragment=1)
                         elif n64_index == 1:
-                            dk_n1 = tlx.amd_scheduled_mfma(
-                                ds_nd64, q_nd64, dk_n1, accumulator_role="persistent", accumulator_register_class="agpr", initialize=(HQ == HKV and bridge_phase == 0), output_fragment=0)
+                            dk_n1 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n1, accumulator_role="persistent",
+                                                           accumulator_register_class="agpr",
+                                                           initialize=(HQ == HKV
+                                                                       and bridge_phase == 0), output_fragment=0)
                             tlx.amd_sched_barrier(0)
-                            dq_k_a2 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [64, 0], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_b2 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [64, D // 2], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_a3 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [96, 0], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_b3 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [96, D // 2], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
+                            dq_k_a2 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [32, D // 2]), token=kv_wait,
+                                                     layout=k_op1_md, relaxed=True)
+                            dq_k_b2 = tlx.local_load(tlx.local_slice(k_buffer, [64, D // 2], [32, D // 2]),
+                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
+                            dq_k_a3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, D // 2]), token=kv_wait,
+                                                     layout=k_op1_md, relaxed=True)
+                            dq_k_b3 = tlx.local_load(tlx.local_slice(k_buffer, [96, D // 2], [32, D // 2]),
+                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
                             tlx.amd_sched_barrier(0)
-                            dk_n1 = tlx.amd_scheduled_mfma(
-                                ds_nd64, q_nd64, dk_n1, accumulator_role="persistent", accumulator_register_class="agpr", initialize=(HQ == HKV and bridge_phase == 0), output_fragment=1)
+                            dk_n1 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n1, accumulator_role="persistent",
+                                                           accumulator_register_class="agpr",
+                                                           initialize=(HQ == HKV
+                                                                       and bridge_phase == 0), output_fragment=1)
                         elif n64_index == 2:
-                            dk_n2 = tlx.amd_scheduled_mfma(
-                                ds_nd64, q_nd64, dk_n2, accumulator_role="persistent", accumulator_register_class="agpr", initialize=(HQ == HKV and bridge_phase == 0))
-                            dq_k_a4 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [128, 0], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_b4 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [128, D // 2], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_a5 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [160, 0], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
-                            dq_k_b5 = tlx.local_load(
-                                tlx.local_slice(k_buffer, [160, D // 2], [32, D // 2]),
-                                token=kv_wait, layout=k_op1_md, relaxed=True)
+                            dk_n2 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n2, accumulator_role="persistent",
+                                                           accumulator_register_class="agpr",
+                                                           initialize=(HQ == HKV and bridge_phase == 0))
+                            dq_k_a4 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [32, D // 2]), token=kv_wait,
+                                                     layout=k_op1_md, relaxed=True)
+                            dq_k_b4 = tlx.local_load(tlx.local_slice(k_buffer, [128, D // 2], [32, D // 2]),
+                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
+                            dq_k_a5 = tlx.local_load(tlx.local_slice(k_buffer, [160, 0], [32, D // 2]), token=kv_wait,
+                                                     layout=k_op1_md, relaxed=True)
+                            dq_k_b5 = tlx.local_load(tlx.local_slice(k_buffer, [160, D // 2], [32, D // 2]),
+                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
                         else:
-                            dk_n3 = tlx.amd_scheduled_mfma(
-                                ds_nd64, q_nd64, dk_n3, accumulator_role="persistent", accumulator_register_class="agpr", initialize=(HQ == HKV and bridge_phase == 0))
+                            dk_n3 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n3, accumulator_role="persistent",
+                                                           accumulator_register_class="agpr",
+                                                           initialize=(HQ == HKV and bridge_phase == 0))
                         if bridge_phase == 1:
                             tlx.amd_sched_barrier(0)
                             if n64_index == 0:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 0, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV
+                                                                                                and not CHUNKED_Q))
                             elif n64_index == 1:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 4, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV
+                                                                                                and not CHUNKED_Q))
                             elif n64_index == 2:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 8, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV
+                                                                                                and not CHUNKED_Q))
                             else:
                                 _store_dq_pending_slot(pending_dq_b, DQ_ACC, pending_base, q_len, m_block - 1, 12, 64,
-                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=not CHUNKED_Q)
+                                                       SM_SCALE, D, BLOCK_M, mma_md, MASK_ROWS=(HQ != HKV
+                                                                                                and not CHUNKED_Q))
                         if n64_index < 3:
                             ds_nd64 = ds_next_nd64
 
-                    current_ds_full = tlx.local_load(
-                        tlx.local_trans(current_ds), layout=ds_op0_md, relaxed=True)
+                    current_ds_full = tlx.local_load(tlx.local_trans(current_ds), layout=ds_op0_md, relaxed=True)
                     ds0 = tlx.extract_slice(current_ds_full, [BLOCK_M, 32], [0, 0])
                     ds1 = tlx.extract_slice(current_ds_full, [BLOCK_M, 32], [0, 32])
                     ds2 = tlx.extract_slice(current_ds_full, [BLOCK_M, 32], [0, 64])
@@ -2954,87 +3030,72 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     # Run the two dQ output halves separately.  Tail K arrives as the
                     # first half frees registers; native next-QK fragments then replace
                     # complete K bands during the second half.
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds0, dq_k_a0, next_dq_a, resident_operand=1,
-                        accumulator_role="transient", initialize=True)
+                    next_dq_a = tlx.amd_scheduled_mfma(ds0, dq_k_a0, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient", initialize=True)
                     tlx.amd_sched_barrier(0)
-                    next_q_t0 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(next_q_view, [0, 0], [BLOCK_M, 32])),
-                        token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                    next_q_t0 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 0], [BLOCK_M, 32])),
+                                               token=qdo_wait, layout=qt_op1_nm, relaxed=True)
                     tlx.amd_sched_barrier(0)
-                    dq_k_a6 = tlx.local_load(
-                        tlx.local_slice(k_buffer, [192, 0], [32, D // 2]),
-                        token=kv_wait, layout=k_op1_md, relaxed=True)
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds1, dq_k_a1, next_dq_a, resident_operand=1, accumulator_role="transient")
-                    dq_k_b6 = tlx.local_load(
-                        tlx.local_slice(k_buffer, [192, D // 2], [32, D // 2]),
-                        token=kv_wait, layout=k_op1_md, relaxed=True)
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds2, dq_k_a2, next_dq_a, resident_operand=1, accumulator_role="transient")
+                    dq_k_a6 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [32, D // 2]), token=kv_wait,
+                                             layout=k_op1_md, relaxed=True)
+                    next_dq_a = tlx.amd_scheduled_mfma(ds1, dq_k_a1, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
+                    dq_k_b6 = tlx.local_load(tlx.local_slice(k_buffer, [192, D // 2], [32, D // 2]), token=kv_wait,
+                                             layout=k_op1_md, relaxed=True)
+                    next_dq_a = tlx.amd_scheduled_mfma(ds2, dq_k_a2, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
                     tlx.amd_sched_barrier(0)
-                    next_q_t1 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(next_q_view, [0, 32], [BLOCK_M, 32])),
-                        token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                    next_q_t1 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 32], [BLOCK_M, 32])),
+                                               token=qdo_wait, layout=qt_op1_nm, relaxed=True)
                     tlx.amd_sched_barrier(0)
-                    dq_k_a7 = tlx.local_load(
-                        tlx.local_slice(k_buffer, [224, 0], [32, D // 2]),
-                        token=kv_wait, layout=k_op1_md, relaxed=True)
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds3, dq_k_a3, next_dq_a, resident_operand=1, accumulator_role="transient")
-                    dq_k_b7 = tlx.local_load(
-                        tlx.local_slice(k_buffer, [224, D // 2], [32, D // 2]),
-                        token=kv_wait, layout=k_op1_md, relaxed=True)
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds4, dq_k_a4, next_dq_a, resident_operand=1, accumulator_role="transient")
+                    dq_k_a7 = tlx.local_load(tlx.local_slice(k_buffer, [224, 0], [32, D // 2]), token=kv_wait,
+                                             layout=k_op1_md, relaxed=True)
+                    next_dq_a = tlx.amd_scheduled_mfma(ds3, dq_k_a3, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
+                    dq_k_b7 = tlx.local_load(tlx.local_slice(k_buffer, [224, D // 2], [32, D // 2]), token=kv_wait,
+                                             layout=k_op1_md, relaxed=True)
+                    next_dq_a = tlx.amd_scheduled_mfma(ds4, dq_k_a4, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
                     tlx.amd_sched_barrier(0)
-                    next_q_t2 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])),
-                        token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                    next_q_t2 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])),
+                                               token=qdo_wait, layout=qt_op1_nm, relaxed=True)
                     tlx.amd_sched_barrier(0)
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds5, dq_k_a5, next_dq_a, resident_operand=1, accumulator_role="transient")
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds6, dq_k_a6, next_dq_a, resident_operand=1, accumulator_role="transient")
+                    next_dq_a = tlx.amd_scheduled_mfma(ds5, dq_k_a5, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_dq_a = tlx.amd_scheduled_mfma(ds6, dq_k_a6, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
                     tlx.amd_sched_barrier(0)
-                    next_q_t3 = tlx.local_load(
-                        tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])),
-                        token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                    next_q_t3 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])),
+                                               token=qdo_wait, layout=qt_op1_nm, relaxed=True)
                     tlx.amd_sched_barrier(0)
-                    next_dq_a = tlx.amd_scheduled_mfma(
-                        ds7, dq_k_a7, next_dq_a, resident_operand=1, accumulator_role="transient")
+                    next_dq_a = tlx.amd_scheduled_mfma(ds7, dq_k_a7, next_dq_a, resident_operand=1,
+                                                       accumulator_role="transient")
 
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds0, dq_k_b0, next_dq_b, resident_operand=1,
-                        accumulator_role="transient", initialize=True)
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds1, dq_k_b1, next_dq_b, resident_operand=1, accumulator_role="transient")
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds2, dq_k_b2, next_dq_b, resident_operand=1, accumulator_role="transient")
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds3, dq_k_b3, next_dq_b, resident_operand=1, accumulator_role="transient")
-                    next_do_t = tlx.local_load(
-                        tlx.local_trans(next_do_view), token=qdo_wait,
-                        layout=dot_op1_nm, relaxed=True)
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds4, dq_k_b4, next_dq_b, resident_operand=1, accumulator_role="transient")
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds5, dq_k_b5, next_dq_b, resident_operand=1, accumulator_role="transient")
-                    next_lse = tlx.local_load(
-                        tlx.local_slice(lse_cache, [next_stats_m], [BLOCK_M]),
-                        token=qdo_wait, relaxed=True)
-                    next_delta = tlx.local_load(
-                        tlx.local_slice(delta_cache, [next_stats_m], [BLOCK_M]),
-                        token=qdo_wait, relaxed=True)
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds6, dq_k_b6, next_dq_b, resident_operand=1, accumulator_role="transient")
-                    next_dq_b = tlx.amd_scheduled_mfma(
-                        ds7, dq_k_b7, next_dq_b, resident_operand=1, accumulator_role="transient")
+                    next_dq_b = tlx.amd_scheduled_mfma(ds0, dq_k_b0, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient", initialize=True)
+                    next_dq_b = tlx.amd_scheduled_mfma(ds1, dq_k_b1, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_dq_b = tlx.amd_scheduled_mfma(ds2, dq_k_b2, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_dq_b = tlx.amd_scheduled_mfma(ds3, dq_k_b3, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_do_t = tlx.local_load(tlx.local_trans(next_do_view), token=qdo_wait, layout=dot_op1_nm,
+                                               relaxed=True)
+                    next_dq_b = tlx.amd_scheduled_mfma(ds4, dq_k_b4, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_dq_b = tlx.amd_scheduled_mfma(ds5, dq_k_b5, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_lse = tlx.local_load(tlx.local_slice(lse_cache, [next_stats_m], [BLOCK_M]), token=qdo_wait,
+                                              relaxed=True)
+                    next_delta = tlx.local_load(tlx.local_slice(delta_cache, [next_stats_m], [BLOCK_M]), token=qdo_wait,
+                                                relaxed=True)
+                    next_dq_b = tlx.amd_scheduled_mfma(ds6, dq_k_b6, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
+                    next_dq_b = tlx.amd_scheduled_mfma(ds7, dq_k_b7, next_dq_b, resident_operand=1,
+                                                       accumulator_role="transient")
 
-                    pending_dq_a = tlx.amd_register_resident(
-                        next_dq_a, register_class="vgpr", registers_per_group=4)
-                    pending_dq_b = tlx.amd_register_resident(
-                        next_dq_b, register_class="vgpr", registers_per_group=4)
+                    pending_dq_a = tlx.amd_register_resident(next_dq_a, register_class="vgpr", registers_per_group=4)
+                    pending_dq_b = tlx.amd_register_resident(next_dq_b, register_class="vgpr", registers_per_group=4)
                     q_t0 = next_q_t0
                     q_t1 = next_q_t1
                     q_t2 = next_q_t2
@@ -3044,8 +3105,7 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     delta = next_delta
 
             if HQ == HKV:
-                dk_n0, dk_n1, dk_n2, dk_n3 = tlx.amd_mfma_commit(
-                    (dk_n0, dk_n1, dk_n2, dk_n3))
+                dk_n0, dk_n1, dk_n2, dk_n3 = tlx.amd_mfma_commit((dk_n0, dk_n1, dk_n2, dk_n3))
                 (
                     dv_00,
                     dv_01,
@@ -3056,18 +3116,37 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     dv_12,
                     dv_13,
                     _v_nm,
-                ) = tlx.amd_mfma_commit(
-                    (dv_00, dv_01, dv_02, dv_03, dv_10, dv_11, dv_12, dv_13), preserve=v_nm)
+                ) = tlx.amd_mfma_commit((dv_00, dv_01, dv_02, dv_03, dv_10, dv_11, dv_12, dv_13), preserve=v_nm)
 
             # The last carried tile has no following phase to cover publication.
             pending_base = (q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D
+            # Keep final dQ coordinates inside the runtime Derived GQA head loop.
+            dq_coordinate_placement = (group_head if HQ == 12 and HKV == 4 and not CHUNKED_Q else num_m_blocks - 1)
             _store_dq_pending_d64(
-                pending_dq_a, DQ_ACC, pending_base, q_len, num_m_blocks - 1, 0,
-                SM_SCALE, D, BLOCK_M, mma_md,
+                pending_dq_a,
+                DQ_ACC,
+                pending_base,
+                q_len,
+                num_m_blocks - 1,
+                dq_coordinate_placement,
+                0,
+                SM_SCALE,
+                D,
+                BLOCK_M,
+                mma_md,
             )
             _store_dq_pending_d64(
-                pending_dq_b, DQ_ACC, pending_base, q_len, num_m_blocks - 1, 64,
-                SM_SCALE, D, BLOCK_M, mma_md,
+                pending_dq_b,
+                DQ_ACC,
+                pending_base,
+                q_len,
+                num_m_blocks - 1,
+                dq_coordinate_placement,
+                64,
+                SM_SCALE,
+                D,
+                BLOCK_M,
+                mma_md,
             )
 
             if HQ != HKV:
@@ -3077,8 +3156,7 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                 tl.debug_barrier()
 
     if HQ != HKV:
-        dk_n0, dk_n1, dk_n2, dk_n3 = tlx.amd_mfma_commit(
-            (dk_n0, dk_n1, dk_n2, dk_n3))
+        dk_n0, dk_n1, dk_n2, dk_n3 = tlx.amd_mfma_commit((dk_n0, dk_n1, dk_n2, dk_n3))
         (
             dv_00,
             dv_01,
@@ -3089,26 +3167,21 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
             dv_12,
             dv_13,
             _v_nm,
-        ) = tlx.amd_mfma_commit(
-            (dv_00, dv_01, dv_02, dv_03, dv_10, dv_11, dv_12, dv_13), preserve=v_nm)
+        ) = tlx.amd_mfma_commit((dv_00, dv_01, dv_02, dv_03, dv_10, dv_11, dv_12, dv_13), preserve=v_nm)
 
     tlx.async_load_wait_group(0)
     _store_dv_aligned_fragment(dv_00, dv_ptr, kv_valid_rows, 0, 0, HKV * Q_SPLITS, D, mma_nd)
     _store_dv_aligned_fragment(dv_01, dv_ptr, kv_valid_rows, 0, 32, HKV * Q_SPLITS, D, mma_nd)
-    _store_dk_n64_native_wave8_fragment(
-        dk_n0, dk_ptr, kv_valid_rows, 0, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dk_n64_native_wave8_fragment(dk_n0, dk_ptr, kv_valid_rows, 0, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
     _store_dv_aligned_fragment(dv_02, dv_ptr, kv_valid_rows, 0, 64, HKV * Q_SPLITS, D, mma_nd)
     _store_dv_aligned_fragment(dv_03, dv_ptr, kv_valid_rows, 0, 96, HKV * Q_SPLITS, D, mma_nd)
-    _store_dk_n64_native_wave8_fragment(
-        dk_n1, dk_ptr, kv_valid_rows, 64, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dk_n64_native_wave8_fragment(dk_n1, dk_ptr, kv_valid_rows, 64, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
     _store_dv_aligned_fragment(dv_10, dv_ptr, kv_valid_rows, 128, 0, HKV * Q_SPLITS, D, mma_nd)
     _store_dv_aligned_fragment(dv_11, dv_ptr, kv_valid_rows, 128, 32, HKV * Q_SPLITS, D, mma_nd)
-    _store_dk_n64_native_wave8_fragment(
-        dk_n2, dk_ptr, kv_valid_rows, 128, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dk_n64_native_wave8_fragment(dk_n2, dk_ptr, kv_valid_rows, 128, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
     _store_dv_aligned_fragment(dv_12, dv_ptr, kv_valid_rows, 128, 64, HKV * Q_SPLITS, D, mma_nd)
     _store_dv_aligned_fragment(dv_13, dv_ptr, kv_valid_rows, 128, 96, HKV * Q_SPLITS, D, mma_nd)
-    _store_dk_n64_native_wave8_fragment(
-        dk_n3, dk_ptr, kv_valid_rows, 192, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dk_n64_native_wave8_fragment(dk_n3, dk_ptr, kv_valid_rows, 192, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
 
 
 @triton.jit
@@ -5468,6 +5541,31 @@ def _varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4(
             state = KV_SPLITS * tl.atomic_add(OWNER_NEXT, 1, sem="relaxed", scope="gpu")
 
 
+_PREFIX_H12_DS_CAP = ((10414 + 255) // 256) * 256
+
+
+def _try_allocate_prefix_h12_ds(q, total_q_padded, *, eligible_h12, torch_api):
+    """Return dS scratch, or None to retain the existing route.
+
+    For eligible H12, None selects the old FP32-atomic route. For ineligible
+    calls the caller keeps its ordinary dispatch. Only the optional eager dS
+    allocation's OutOfMemoryError is recovered; old scratch/kernel failures
+    remain outside this helper. No memory query, retry or warmup is performed.
+    """
+    if not eligible_h12:
+        return None
+    device = q.device
+    with torch_api.cuda.device(device):
+        if torch_api.cuda.is_current_stream_capturing():
+            return None
+        shape = (q.shape[1], total_q_padded, _PREFIX_H12_DS_CAP)
+        dtype = torch_api.bfloat16
+        try:
+            return torch_api.empty(shape, dtype=dtype, device=device)
+        except torch_api.cuda.OutOfMemoryError:
+            return None
+
+
 def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_atomic_fp32: bool = False):
     """Run packed BF16 D128 backward using a prepared immutable-offset plan.
 
@@ -5477,18 +5575,43 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
     remain dense, as in TritonBench's ``v_storage[:, 0]`` view.
 
     dQ accumulation and atomics use BF16 by default. Set
-    ``dq_atomic_fp32=True`` to use FP32 accumulation and atomics; dQ, dK, and dV
-    are still returned as BF16 tensors. The aligned noncausal route for batch
-    768, four KV heads, four or twelve Q heads, max-Q 300/400 and max-KV 3200
+    ``dq_atomic_fp32=True`` to enable FP32 accumulation; most routes use FP32
+    atomics, and dQ, dK, and dV are still returned as BF16 tensors. The aligned
+    noncausal route for batch 768, four KV heads, four or twelve Q heads,
+    max-Q 300/400 and max-KV 3200
     caches query statistics and preserves wave ownership in its dK stores.
     GQA accumulates all mapped query heads' dK/dV contributions in FP32 before
     the final BF16 stores. With FP32 dQ, the aligned batch-19 prefix cases with
     (total_q, total_kv, max_q, max_kv) = (50754, 100696, 5662, 10414) and
     (Q heads, KV heads) = (12, 4) or (64, 8) refresh the same statistics cache
-    in 512-row query chunks. The (12, 4) case assigns chunks across two owners
-    and reduces their FP32 dK/dV partials; the (64, 8) case uses one owner
-    to accumulate all chunks and store BF16 dK/dV directly. Other configurations
-    retain their existing routes, except that misaligned inputs bypass wide
+    in 512-row query chunks. The (64, 8) case and the (12, 4) materialized-dS
+    route use one owner to accumulate all chunks in FP32 and store BF16 dK/dV
+    directly. The (12, 4) atomic fallback keeps two owners and reduces their
+    FP32 dK/dV partials.
+
+    Both exact prefix cases require 16-byte aligned Q/K/V/dO bases. In eager
+    execution they can materialize BF16 dS, then compute dQ as GEMM partials
+    in FP32. Each KV256 partial is scaled before FP32 accumulation, with one
+    final BF16 conversion. The (12, 4) dS route uses one query owner and stores
+    final BF16 dK/dV without allocating FP32 partials. Its optional fixed-pitch
+    dS workspace is about 11.974 GiB; its atomic fallback uses a 0.292 GiB dQ
+    accumulator plus the two-owner FP32 dK/dV partials. These sizes exclude
+    other live tensors.
+
+    The (64, 8) dS route uses a compact workspace sized from Q16-padded query
+    lengths and KV256-padded key lengths. It requires the compact dS metadata
+    attached by legacy two-argument plan preparation for this exact prefix
+    shape. Device-metadata plans and older plans missing those fields retain
+    the existing FP32-atomic route.
+
+    For either optional dS route, capture on the current stream of Q's device,
+    or ``torch.cuda.OutOfMemoryError`` from only the optional dS allocation,
+    selects the existing FP32-atomic route. H12 then allocates its two-owner
+    FP32 dK/dV partials; H64 keeps one owner. The capture query runs under Q's
+    device context and restores the caller's device. Other allocation,
+    capture-query, device-context, and kernel errors propagate without retry.
+
+    Other configurations retain their existing routes, except that misaligned inputs bypass wide
     aligned copies through the generic BM16 kernel in both dQ accumulation modes.
     """
     _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal, dq_atomic_fp32)
@@ -5496,14 +5619,11 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
     total_q, heads, head_dim = q.shape
     total_kv, kv_heads, _ = k.shape
     group_size = heads // kv_heads
-    chunked_prefix_fp32_case = (
-        dq_atomic_fp32
-        and not causal
-        and plan.batch == 19
-        and (total_q, total_kv, plan.max_q, getattr(plan, "max_kv", None)) == (50754, 100696, 5662, 10414)
-        and (heads, kv_heads, head_dim) in ((12, 4, 128), (64, 8, 128))
-        and all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, do))
-    )
+    chunked_prefix_fp32_case = (dq_atomic_fp32 and not causal and plan.batch == 19
+                                and (total_q, total_kv, plan.max_q, getattr(plan, "max_kv",
+                                                                            None)) == (50754, 100696, 5662, 10414)
+                                and (heads, kv_heads, head_dim) in ((12, 4, 128), (64, 8, 128))
+                                and all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, do)))
     # Each query owner computes every mapped Q head for its assigned chunks.
     # Select BM16 scratch and avoid the prefix rolling workspace up front.
     kv_splits = 1 if chunked_prefix_fp32_case else _select_varlen_kv_splits(plan.max_q, group_size)
@@ -5520,13 +5640,15 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
                          and q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16
                          and _select_varlen_kernel_blocks(group_size, kv_splits) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
                          and k.numel() <= _I32_BUFFER_FP32_ELEMENTS)
+    h12_ds_handoff = chunked_prefix_fp32_case and heads == 12
+    packed_ds_prefix = getattr(plan, "packed_ds_prefix", None)
+    packed_ds_head_elements = getattr(plan, "packed_ds_head_elements", None)
+    h64_ds_handoff = (chunked_prefix_fp32_case and heads == 64 and packed_ds_prefix is not None
+                      and packed_ds_head_elements is not None)
     query_splits = 2 if chunked_prefix_fp32_case and heads == 12 else 1
-    if chunked_prefix_fp32_case and heads == 64:
+    if chunked_prefix_fp32_case:
+        # H12 needs two-owner partials only if optional dS cannot be used.
         dk_part, dv_part = None, None
-    elif chunked_prefix_fp32_case:
-        dk_part, dv_part = _allocate_varlen_dkdv_partials(k, query_splits)
-        if dk_part is None:
-            raise ValueError("query-split FP32 partials exceed the signed 32-bit byte-offset range")
     elif rolling_fp32_case:
         # These compact FP32 buffers replace the three- or four-slot partials.
         # Their public-launch locals keep the established positional plumbing.
@@ -5548,50 +5670,58 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
     pad_dq_to_bm32 = dq_pad_rows == _WIDE_BLOCK_M
     total_q_padded = total_q + plan.batch * (dq_pad_rows - 1)
     use_dq_aux = group_size == 1 or (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N)
-    dk_target = dk if dk_part is None else dk_part
-    dv_target = dv if dv_part is None else dv_part
-    exact_fp32_case = chunked_prefix_fp32_case or (
-        dq_atomic_fp32
-        and not causal
-        and (heads, kv_heads) in ((4, 4), (12, 4))
-        and kv_splits == 1
-        and plan.batch == 768
-        and head_dim == 128
-        and plan.max_q in (300, 400)
-        and plan.max_kv == 3200
-        and all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, do))
-    )
+    exact_fp32_case = chunked_prefix_fp32_case or (dq_atomic_fp32 and not causal and (heads, kv_heads) in (
+        (4, 4), (12, 4)) and kv_splits == 1 and plan.batch == 768 and head_dim == 128 and plan.max_q in (300, 400)
+                                                   and plan.max_kv == 3200 and all(tensor.data_ptr() % 16 == 0
+                                                                                   for tensor in (q, k, v, do)))
     use_dq_aux = use_dq_aux or exact_fp32_case
     pack_stats = pad_dq_to_bm32 and 2 * heads * total_q_padded <= _I32_BUFFER_FP32_ELEMENTS
     pack_stats_mha16 = exact_fp32_case and 2 * heads * total_q <= _I32_BUFFER_FP32_ELEMENTS
-    delta_shape = ((heads, 2 * total_q) if pack_stats_mha16 else
-                   (heads, 2 * total_q_padded) if pack_stats else (total_q, heads))
+    delta_shape = ((heads, 2 * total_q) if pack_stats_mha16 else (heads, 2 * total_q_padded) if pack_stats else
+                   (total_q, heads))
     delta = torch.empty(delta_shape, dtype=torch.float32, device=q.device)
     allocate_dq_acc = torch.empty if use_dq_aux else torch.zeros
     dq_acc_dtype = torch.float32 if dq_atomic_fp32 else torch.bfloat16
-    dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=dq_acc_dtype, device=q.device)
+    dq_acc = None
+    if h12_ds_handoff:
+        dq_acc = _try_allocate_prefix_h12_ds(q, total_q_padded, eligible_h12=h12_ds_handoff, torch_api=torch)
+        h12_ds_handoff = dq_acc is not None
+    if h64_ds_handoff:
+        dq_acc = _try_allocate_prefix_h64_packed_ds(q, packed_ds_head_elements, torch_api=torch)
+        h64_ds_handoff = dq_acc is not None
+    if not (h12_ds_handoff or h64_ds_handoff):
+        dq_acc = allocate_dq_acc((heads, total_q_padded, head_dim), dtype=dq_acc_dtype, device=q.device)
+    if chunked_prefix_fp32_case and heads == 12:
+        if h12_ds_handoff:
+            query_splits = 1
+        else:
+            dk_part, dv_part = _allocate_varlen_dkdv_partials(k, query_splits)
+            if dk_part is None:
+                raise ValueError("query-split FP32 partials exceed the signed 32-bit byte-offset range")
+    dk_target = dk if dk_part is None else dk_part
+    dv_target = dv if dv_part is None else dv_part
 
     owner_tasks = plan.wide_task_count if rolling_fp32_case and plan.wide_task_count is not None else 0
     owner_groups = kv_heads * owner_tasks
     owner_workers = min(256, owner_groups)
     owner_next = torch.empty((1, ), dtype=torch.int32, device=q.device) if rolling_fp32_case else None
     preprocess_fn = _varlen_bwd_preprocess_dynamic_owner_queue if rolling_fp32_case else _varlen_bwd_preprocess
-    preprocess_extra = ({"OWNER_NEXT": owner_next, "INITIAL_OWNER": owner_workers} if rolling_fp32_case else
-                        {"PACK_STATS_MHA16": pack_stats_mha16})
+    preprocess_extra = ({"OWNER_NEXT": owner_next, "INITIAL_OWNER": owner_workers}
+                        if rolling_fp32_case else {"PACK_STATS_MHA16": pack_stats_mha16})
 
     preprocess_fn[(triton.cdiv(plan.max_q, 64), plan.batch * heads)](
         o,
         do,
         delta,
         plan.cu_seqlens_q,
-        dq_acc,
+        dq if h12_ds_handoff or h64_ds_handoff else dq_acc,
         total_q_padded,
         plan.task_counts,
         PLAN_ERROR_INDEX=plan_error_index,
         HEADS=heads,
         D=head_dim,
         BLOCK_M=64,
-        ZERO_DQ=use_dq_aux,
+        ZERO_DQ=use_dq_aux and not (h12_ds_handoff or h64_ds_handoff),
         DQ_PAD_ROWS=dq_pad_rows,
         LSE=lse if pack_stats or pack_stats_mha16 else None,
         TOTAL_Q=total_q if pack_stats or pack_stats_mha16 else None,
@@ -5603,7 +5733,13 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
     if exact_fp32_case:
         exact_grid = ((kv_heads, plan.wide_kv_start.numel(), query_splits) if query_splits > 1 else
                       (kv_heads, plan.wide_kv_start.numel()))
-        _varlen_bwd_interleaved_bm16_bn256_fp32_kernel[exact_grid](
+        exact_core = (_prefix_h64_packed_ds_producer if h64_ds_handoff else
+                      _prefix_h12_ds_producer if h12_ds_handoff else _varlen_bwd_interleaved_bm16_bn256_fp32_kernel)
+        exact_extra = {"CuKV": plan.cu_seqlens_k, "DS_CAP": 10496} if h12_ds_handoff else {}
+        if h64_ds_handoff:
+            exact_extra.update(CuKV=plan.cu_seqlens_k, DS_PREFIX=packed_ds_prefix,
+                               DS_HEAD_ELEMENTS=packed_ds_head_elements, DS_CAP=10496)
+        exact_core[exact_grid](
             q,
             k,
             v,
@@ -5624,13 +5760,14 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             HQ=heads,
             HKV=kv_heads,
             D=head_dim,
-            BLOCK_M=_BLOCK_M,
-            BLOCK_N=_WIDE_BLOCK_N,
+            BLOCK_M=16 if h12_ds_handoff else _BLOCK_M,
+            BLOCK_N=256 if h12_ds_handoff else _WIDE_BLOCK_N,
             TASK_COUNT_INDEX=_WIDE_KV_TASK_COUNT,
             PLAN_ERROR_INDEX=plan_error_index,
             CHUNKED_Q=chunked_prefix_fp32_case,
             Q_SPLITS=query_splits,
             SORT_TASKS=chunked_prefix_fp32_case and plan.wide_kv_start.numel() <= 512,
+            **exact_extra,
             num_warps=4,
             num_stages=1,
             matrix_instr_nonkdim=16,
@@ -5774,7 +5911,41 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             FLATTEN_HEADS=chunked_prefix_fp32_case,
             num_warps=4,
         )
-    if use_dq_aux:
+    if h64_ds_handoff:
+        _prefix_h64_packed_ds_dq_consumer[(triton.cdiv(plan.max_q, 128), heads, plan.batch)](
+            dq_acc,
+            k,
+            plan.cu_seqlens_q,
+            plan.cu_seqlens_k,
+            plan.task_counts,
+            dq,
+            TOTAL_Q_PADDED=total_q_padded,
+            DS_PREFIX=packed_ds_prefix,
+            DS_HEAD_ELEMENTS=packed_ds_head_elements,
+            SM_SCALE=sm_scale,
+            DS_CAP=10496,
+            PLAN_ERROR_INDEX=plan_error_index,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+            enable_fp_fusion=False,
+        )
+    elif h12_ds_handoff:
+        _prefix_h12_ds_dq_consumer[(triton.cdiv(plan.max_q, 128), heads, plan.batch)](
+            dq_acc,
+            k,
+            plan.cu_seqlens_q,
+            plan.cu_seqlens_k,
+            plan.task_counts,
+            dq,
+            TOTAL_Q_PADDED=total_q_padded,
+            SM_SCALE=sm_scale,
+            DS_CAP=10496,
+            PLAN_ERROR_INDEX=plan_error_index,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+            enable_fp_fusion=False,
+        )
+    elif use_dq_aux:
         dq_sequence = plan.dq_full_kv_sequence if finalize_tail_dq else plan.q_block_sequence
         dq_start = plan.dq_full_kv_start if finalize_tail_dq else plan.q_block_start
         if dq_sequence is not None and dq_start is not None and dq_sequence.numel():
@@ -5814,3 +5985,891 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             matrix_instr_nonkdim=16,
         )
     return dq, dk, dv
+
+
+@triton.jit
+def _prefix_h12_ds_producer(Q, K, V, DO, Delta, KVGlobalStart, QStart, DQScratchStart, QLen, KVValidRows, DS_WORKSPACE,
+                            DK, DV, TaskCounts, CuKV, SM_SCALE: tl.constexpr, TOTAL_Q, TOTAL_Q_PADDED, HQ: tl.constexpr,
+                            HKV: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                            TASK_COUNT_INDEX: tl.constexpr, PLAN_ERROR_INDEX: tl.constexpr,
+                            CHUNKED_Q: tl.constexpr = False, Q_SPLITS: tl.constexpr = 1,
+                            SORT_TASKS: tl.constexpr = False, DS_CAP: tl.constexpr = 10496):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    _prefix_ds_producer_body(
+        Q=Q,
+        K=K,
+        V=V,
+        DO=DO,
+        Delta=Delta,
+        KVGlobalStart=KVGlobalStart,
+        QStart=QStart,
+        DQScratchStart=DQScratchStart,
+        QLen=QLen,
+        KVValidRows=KVValidRows,
+        DS_WORKSPACE=DS_WORKSPACE,
+        DK=DK,
+        DV=DV,
+        TaskCounts=TaskCounts,
+        CuKV=CuKV,
+        SM_SCALE=SM_SCALE,
+        TOTAL_Q=TOTAL_Q,
+        TOTAL_Q_PADDED=TOTAL_Q_PADDED,
+        HQ=HQ,
+        HKV=HKV,
+        D=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        TASK_COUNT_INDEX=TASK_COUNT_INDEX,
+        CHUNKED_Q=CHUNKED_Q,
+        Q_SPLITS=Q_SPLITS,
+        SORT_TASKS=SORT_TASKS,
+        DS_CAP=DS_CAP,
+        DS_PREFIX=None,
+        DS_HEAD_ELEMENTS=0,
+        PACKED_DS=False,
+    )
+
+
+@triton.jit
+def _prefix_h12_ds_dq_consumer(
+    DS,
+    K,
+    CuQ,
+    CuKV,
+    TaskCounts,
+    DQ,
+    TOTAL_Q_PADDED,
+    SM_SCALE: tl.constexpr,
+    DS_CAP: tl.constexpr = 10496,
+    PLAN_ERROR_INDEX: tl.constexpr = 4,
+):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    _prefix_ds_dq_consumer_body(
+        DS=DS,
+        K=K,
+        CuQ=CuQ,
+        CuKV=CuKV,
+        DQ=DQ,
+        TOTAL_Q_PADDED=TOTAL_Q_PADDED,
+        SM_SCALE=SM_SCALE,
+        DS_CAP=DS_CAP,
+        DS_PREFIX=None,
+        DS_HEAD_ELEMENTS=0,
+        HQ=12,
+        HKV=4,
+        PACKED_DS=False,
+    )
+
+
+def _try_allocate_prefix_h64_packed_ds(q, head_elements, *, torch_api):
+    """Match the existing optional-allocation policy using the exact plan size."""
+    device = q.device
+    with torch_api.cuda.device(device):
+        if torch_api.cuda.is_current_stream_capturing():
+            return None
+        try:
+            return torch_api.empty((q.shape[1], head_elements), dtype=torch_api.bfloat16, device=device)
+        except torch_api.cuda.OutOfMemoryError:
+            return None
+
+
+@triton.jit
+def _prefix_h64_packed_ds_producer(Q, K, V, DO, Delta, KVGlobalStart, QStart, DQScratchStart, QLen, KVValidRows,
+                                   DS_WORKSPACE, DK, DV, TaskCounts, CuKV, DS_PREFIX, DS_HEAD_ELEMENTS,
+                                   SM_SCALE: tl.constexpr, TOTAL_Q, TOTAL_Q_PADDED, HQ: tl.constexpr, HKV: tl.constexpr,
+                                   D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                                   TASK_COUNT_INDEX: tl.constexpr, PLAN_ERROR_INDEX: tl.constexpr,
+                                   CHUNKED_Q: tl.constexpr = False, Q_SPLITS: tl.constexpr = 1,
+                                   SORT_TASKS: tl.constexpr = False, DS_CAP: tl.constexpr = 10496):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    _prefix_ds_producer_body(
+        Q=Q,
+        K=K,
+        V=V,
+        DO=DO,
+        Delta=Delta,
+        KVGlobalStart=KVGlobalStart,
+        QStart=QStart,
+        DQScratchStart=DQScratchStart,
+        QLen=QLen,
+        KVValidRows=KVValidRows,
+        DS_WORKSPACE=DS_WORKSPACE,
+        DK=DK,
+        DV=DV,
+        TaskCounts=TaskCounts,
+        CuKV=CuKV,
+        DS_PREFIX=DS_PREFIX,
+        DS_HEAD_ELEMENTS=DS_HEAD_ELEMENTS,
+        SM_SCALE=SM_SCALE,
+        TOTAL_Q=TOTAL_Q,
+        TOTAL_Q_PADDED=TOTAL_Q_PADDED,
+        HQ=HQ,
+        HKV=HKV,
+        D=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        TASK_COUNT_INDEX=TASK_COUNT_INDEX,
+        CHUNKED_Q=CHUNKED_Q,
+        Q_SPLITS=Q_SPLITS,
+        SORT_TASKS=SORT_TASKS,
+        DS_CAP=DS_CAP,
+        PACKED_DS=True,
+    )
+
+
+@triton.jit
+def _prefix_h64_packed_ds_dq_consumer(
+    DS,
+    K,
+    CuQ,
+    CuKV,
+    TaskCounts,
+    DQ,
+    TOTAL_Q_PADDED,
+    DS_PREFIX,
+    DS_HEAD_ELEMENTS,
+    SM_SCALE: tl.constexpr,
+    DS_CAP: tl.constexpr = 10496,
+    PLAN_ERROR_INDEX: tl.constexpr = 4,
+):
+    if tl.load(TaskCounts + PLAN_ERROR_INDEX) != 0:
+        return
+    _prefix_ds_dq_consumer_body(
+        DS=DS,
+        K=K,
+        CuQ=CuQ,
+        CuKV=CuKV,
+        DQ=DQ,
+        TOTAL_Q_PADDED=TOTAL_Q_PADDED,
+        DS_PREFIX=DS_PREFIX,
+        DS_HEAD_ELEMENTS=DS_HEAD_ELEMENTS,
+        SM_SCALE=SM_SCALE,
+        DS_CAP=DS_CAP,
+        HQ=64,
+        HKV=8,
+        PACKED_DS=True,
+    )
+
+
+@triton.jit
+def _prefix_ds_producer_body(Q, K, V, DO, Delta, KVGlobalStart, QStart, DQScratchStart, QLen, KVValidRows, DS_WORKSPACE,
+                             DK, DV, TaskCounts, CuKV, DS_PREFIX, DS_HEAD_ELEMENTS, SM_SCALE: tl.constexpr, TOTAL_Q,
+                             TOTAL_Q_PADDED, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, TASK_COUNT_INDEX: tl.constexpr,
+                             CHUNKED_Q: tl.constexpr = False, Q_SPLITS: tl.constexpr = 1,
+                             SORT_TASKS: tl.constexpr = False, DS_CAP: tl.constexpr = 10496,
+                             PACKED_DS: tl.constexpr = False):
+    """Materialize fixed or packed BF16 dS with Q16/N256 tiles.
+
+    One query owner stores BF16 dK/dV; two owners store FP32 partials.
+    """
+    tl.static_assert(D == 128)
+    if PACKED_DS:
+        tl.static_assert(HQ == 64 and HKV == 8 and Q_SPLITS == 1)
+    else:
+        tl.static_assert(HQ == 12 and HKV == 4 and (Q_SPLITS == 1 or Q_SPLITS == 2))
+    tl.static_assert(BLOCK_M == 16 and BLOCK_N == 256)
+    tl.static_assert(CHUNKED_Q and DS_CAP == 10496)
+    task = tl.program_id(1)
+    if task >= tl.load(TaskCounts + TASK_COUNT_INDEX):
+        return
+    if SORT_TASKS:
+        indices = tl.arange(0, 512)
+        lengths = tl.load(QLen + indices, indices < tl.load(TaskCounts + TASK_COUNT_INDEX), other=-1)
+        keys = lengths * 512 + (511 - indices)
+        ordered_keys = tl.sort(keys, descending=True)
+        selected_key = tl.sum(tl.where(indices == task, ordered_keys, 0), 0)
+        task = 511 - (selected_key & 511)
+    else:
+        task = task // 2 + task % 2 * tl.cdiv(tl.load(TaskCounts + TASK_COUNT_INDEX), 2)
+    kv_global_start = tl.load(KVGlobalStart + task).to(tl.int64)
+    kv_valid_rows = tl.load(KVValidRows + task).to(tl.int32)
+    q_start = tl.load(QStart + task).to(tl.int64)
+    head_rotation = (q_start.to(tl.uint32) >> 2) % HKV
+    kv_head = ((tl.program_id(0).to(tl.uint32) + head_rotation) % HKV).to(tl.int32)
+    q_scratch_start = tl.load(DQScratchStart + task).to(tl.int64)
+    ds_sequence = (q_scratch_start - q_start).to(tl.int32) // (BLOCK_M - 1)
+    ds_sequence_kv_start = tl.load(CuKV + ds_sequence).to(tl.int64)
+    ds_local_kv_start = (kv_global_start - ds_sequence_kv_start).to(tl.int32)
+    if PACKED_DS:
+        ds_sequence_kv_end = tl.load(CuKV + ds_sequence + 1).to(tl.int64)
+        ds_pitch = tl.multiple_of(tl.cdiv((ds_sequence_kv_end - ds_sequence_kv_start).to(tl.int32), 256) * 256, 256)
+        ds_sequence_base = tl.multiple_of(tl.load(DS_PREFIX + ds_sequence).to(tl.int64), 4096)
+        ds_head_elements = tl.multiple_of(DS_HEAD_ELEMENTS.to(tl.int64), 4096)
+    q_len = tl.load(QLen + task).to(tl.int32)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    kv_tensor_base = (kv_global_start * HKV + kv_head.to(tl.int64)) * D
+    k_ptr = tl.multiple_of(K + kv_tensor_base, 16)
+    v_ptr = tl.multiple_of(V + kv_tensor_base, 16)
+    if Q_SPLITS == 1:
+        tl.static_assert(DK.dtype.element_ty == tl.bfloat16 and DV.dtype.element_ty == tl.bfloat16)
+    else:
+        tl.static_assert(DK.dtype.element_ty == tl.float32 and DV.dtype.element_ty == tl.float32)
+    if PACKED_DS:
+        q_split = 0
+    else:
+        q_split = tl.program_id(2)
+    kv_output_base = ((kv_global_start * HKV + kv_head.to(tl.int64)) * Q_SPLITS + q_split) * D
+    dk_ptr = tl.multiple_of(DK + kv_output_base, 16)
+    dv_ptr = tl.multiple_of(DV + kv_output_base, 16)
+    key_ptrs = offs_n[:, None] * HKV * D + offs_d[None, :]
+    key_mask = offs_n[:, None] < kv_valid_rows
+    qdo_async_layout: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+                                                stride=((8, 16, 32, 64, 1024, 512, 128, 256), (1, 2, 4)))
+    stats_cache_rows: tl.constexpr = 512
+    stats_async_layout: tl.constexpr = tlx.layout(shape=((64, 4), (2, )), stride=((1, 64), (256, )))
+    stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16], [32], [64], [128], [256]], block_bases=[], alignment=16)
+    qdo_smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [8, 0], [4, 0], [1, 0], [2, 0]],
+        [BLOCK_M, D])
+    k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [1, 0, 0], [2, 0, 0],
+                      [4, 0, 0], [8, 0, 0], [16, 0, 0], [32, 0, 0], [64, 0, 0], [128, 0, 0]], block_bases=[],
+        alignment=16)
+    k_tiled_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 64], [1, 0], [2, 0], [4, 0], [8, 64], [0, 16], [0, 32],
+                      [16, 0], [32, 0], [64, 0], [128, 0]], block_bases=[], alignment=16)
+    k_raw_async_layout: tl.constexpr = tlx.layout(shape=((64, 4), (8, 8, 2)), stride=((8, 512), (1, 2048, 16384)))
+    ds_smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(128, 16)],
+        [[0, 1], [0, 2], [1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8], [16, 0], [32, 0], [64, 0], [128, 0]],
+        [BLOCK_N, BLOCK_M])
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                               warps_per_cta=[4, 1])
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
+                                               warps_per_cta=[4, 1])
+    mma_nd64: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
+                                                 warps_per_cta=[2, 2])
+    Q_STAGES: tl.constexpr = 2
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    qt_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    dot_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    pt_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=8)
+    p_preswap_nd: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+                                            stride=((16, 32, 64, 128, 4, 8, 512, 1024), (1, 2, 256)))
+    do_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=8)
+    dst_op0_nd64: tl.constexpr = tlx.dot_operand_layout(0, mma_nd64, k_width=8)
+    q_op1_nd64: tl.constexpr = tlx.dot_operand_layout(1, mma_nd64, k_width=8)
+    k_raw_buffer = tlx.local_alloc((BLOCK_N, D // 8, 8), tl.bfloat16, 1, layout=k_raw_smem_layout)
+    k_buffer = tlx.local_reinterpret(tlx.local_view(k_raw_buffer, 0), tl.bfloat16, [BLOCK_N, D],
+                                     layout=k_tiled_smem_layout)
+    q_buffers = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, Q_STAGES, layout=qdo_smem_layout)
+    do_buffers = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    stats_cache = tlx.local_alloc((stats_cache_rows, ), tl.float32, 2, layout=stats_smem_layout)
+    lse_cache = tlx.local_view(stats_cache, 0)
+    delta_cache = tlx.local_view(stats_cache, 1)
+    ds_buffers = tlx.local_alloc((BLOCK_N, BLOCK_M), tl.bfloat16, 2, layout=ds_smem_layout)
+    raw_n = tl.arange(0, BLOCK_N)
+    raw_dg = tl.arange(0, D // 8)
+    raw_v = tl.arange(0, 8)
+    k_phys = raw_n[:, None, None] * D + raw_dg[None, :, None] * 8
+    k_d_base = k_phys & 8 | (k_phys >> 9 & 3) << 4 | ((k_phys >> 4 ^ k_phys >> 8) & 1) << 6
+    k_n = k_phys >> 5 & 7 | (k_phys >> 8 & 1) << 3 | (k_phys >> 11 & 15) << 4
+    k_offsets = k_n * HKV * D + k_d_base + raw_v[None, None, :]
+    k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
+    k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
+    k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_raw_async_layout, pin=False)
+    k_load_mask = tlx.require_layout(tl.broadcast_to(k_n < kv_valid_rows, k_offsets.shape), k_raw_async_layout,
+                                     pin=False)
+    k_token = tlx.buffer_load_to_local(tlx.local_view(k_raw_buffer, 0), k_ptr, k_offsets, mask=k_load_mask,
+                                       other=tlx.zeros((BLOCK_N, D // 8, 8), tl.bfloat16, layout=k_raw_async_layout))
+    tlx.async_load_commit_group([k_token])
+    v_offsets = tlx.require_layout(key_ptrs.to(tl.int32), v_op0_nm, pin=False)
+    v_load_mask = tlx.require_layout(tl.broadcast_to(key_mask, v_offsets.shape), v_op0_nm, pin=False)
+    v_zero = tlx.zeros((BLOCK_N, D), tl.bfloat16, layout=v_op0_nm)
+    v_nm = tlx.buffer_load(v_ptr, v_offsets, mask=v_load_mask, other=v_zero)
+    v_nm = tlx.require_layout(v_nm, v_op0_nm, pin=False)
+    kv_wait = tlx.async_load_wait_group(0)
+    k_00 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_00 = tlx.amd_register_resident(k_00, register_class='agpr', registers_per_group=4)
+    k_01 = tlx.local_load(tlx.local_slice(k_buffer, [0, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_01 = tlx.amd_register_resident(k_01, register_class='agpr', registers_per_group=4)
+    k_02 = tlx.local_load(tlx.local_slice(k_buffer, [0, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_02 = tlx.amd_register_resident(k_02, register_class='agpr', registers_per_group=4)
+    k_03 = tlx.local_load(tlx.local_slice(k_buffer, [0, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_03 = tlx.amd_register_resident(k_03, register_class='agpr', registers_per_group=4)
+    k_10 = tlx.local_load(tlx.local_slice(k_buffer, [64, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_10 = tlx.amd_register_resident(k_10, register_class='agpr', registers_per_group=4)
+    k_11 = tlx.local_load(tlx.local_slice(k_buffer, [64, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_11 = tlx.amd_register_resident(k_11, register_class='agpr', registers_per_group=4)
+    k_12 = tlx.local_load(tlx.local_slice(k_buffer, [64, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_12 = tlx.amd_register_resident(k_12, register_class='agpr', registers_per_group=4)
+    k_13 = tlx.local_load(tlx.local_slice(k_buffer, [64, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_13 = tlx.amd_register_resident(k_13, register_class='agpr', registers_per_group=4)
+    k_20 = tlx.local_load(tlx.local_slice(k_buffer, [128, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_20 = tlx.amd_register_resident(k_20, register_class='agpr', registers_per_group=4)
+    k_21 = tlx.local_load(tlx.local_slice(k_buffer, [128, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_21 = tlx.amd_register_resident(k_21, register_class='agpr', registers_per_group=4)
+    k_22 = tlx.local_load(tlx.local_slice(k_buffer, [128, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_22 = tlx.amd_register_resident(k_22, register_class='agpr', registers_per_group=4)
+    k_23 = tlx.local_load(tlx.local_slice(k_buffer, [128, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_23 = tlx.amd_register_resident(k_23, register_class='agpr', registers_per_group=4)
+    k_30 = tlx.local_load(tlx.local_slice(k_buffer, [192, 0], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_30 = tlx.amd_register_resident(k_30, register_class='agpr', registers_per_group=4)
+    k_31 = tlx.local_load(tlx.local_slice(k_buffer, [192, 32], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_31 = tlx.amd_register_resident(k_31, register_class='agpr', registers_per_group=4)
+    k_32 = tlx.local_load(tlx.local_slice(k_buffer, [192, 64], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_32 = tlx.amd_register_resident(k_32, register_class='agpr', registers_per_group=4)
+    k_33 = tlx.local_load(tlx.local_slice(k_buffer, [192, 96], [64, 32]), token=kv_wait, layout=k_op0_nm, relaxed=True)
+    k_33 = tlx.amd_register_resident(k_33, register_class='agpr', registers_per_group=4)
+    dk_n0 = tlx.zeros((BLOCK_N // 4, D), tl.float32, layout=mma_nd64)
+    dk_n1 = tlx.zeros((BLOCK_N // 4, D), tl.float32, layout=mma_nd64)
+    dk_n2 = tlx.zeros((BLOCK_N // 4, D), tl.float32, layout=mma_nd64)
+    dk_n3 = tlx.zeros((BLOCK_N // 4, D), tl.float32, layout=mma_nd64)
+    dv_00 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_01 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_02 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_03 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_10 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_11 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_12 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    dv_13 = tlx.zeros((BLOCK_N // 2, 32), tl.float32, layout=mma_nd)
+    log2e: tl.constexpr = 1.4426950408889634
+    sequence_q_start = q_start
+    sequence_q_len = q_len
+    sequence_dq_start = q_scratch_start
+    query_chunks = tl.cdiv(sequence_q_len, stats_cache_rows)
+    for group_head in tl.range(0, HQ // HKV, num_stages=1, loop_unroll_factor=1):
+        for chunk_index in tl.range(q_split, query_chunks, Q_SPLITS, num_stages=1, loop_unroll_factor=1):
+            chunk_start = chunk_index * stats_cache_rows
+            q_start = sequence_q_start + chunk_start
+            q_len = tl.minimum(stats_cache_rows, sequence_q_len - chunk_start)
+            q_scratch_start = sequence_dq_start + chunk_start
+            num_m_blocks = tl.cdiv(q_len, BLOCK_M)
+            q_head = kv_head * (HQ // HKV) + group_head
+            q_tensor_base = (q_start * HQ + q_head.to(tl.int64)) * D
+            q_ptr = tl.multiple_of(Q + q_tensor_base, 16)
+            do_ptr = tl.multiple_of(DO + q_tensor_base, 16)
+            first_m = tl.arange(0, BLOCK_M)
+            first_ptrs = first_m[:, None] * HQ * D + offs_d[None, :]
+            first_mask = first_m[:, None] < q_len
+            first_offsets = tlx.require_layout(first_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+            first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout,
+                                                 pin=False)
+            qdo_zero = tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=qdo_async_layout)
+            first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), q_ptr, first_offsets,
+                                                     mask=first_load_mask, other=qdo_zero)
+            first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), do_ptr, first_offsets,
+                                                      mask=first_load_mask, other=qdo_zero)
+            stats_rows = tl.arange(0, stats_cache_rows)
+            stats_offsets = tlx.require_layout(stats_rows.to(tl.int32), stats_async_layout, pin=False)
+            stats_mask = tlx.require_layout(stats_rows < q_len, stats_async_layout, pin=False)
+            stats_zero = tlx.zeros((stats_cache_rows, ), tl.float32, layout=stats_async_layout)
+            stats_base = q_head.to(tl.int64) * 2 * TOTAL_Q + q_start
+            lse_cache_token = tlx.buffer_load_to_local(lse_cache, Delta + stats_base, stats_offsets, mask=stats_mask,
+                                                       other=stats_zero)
+            delta_cache_token = tlx.buffer_load_to_local(delta_cache, Delta + stats_base + TOTAL_Q, stats_offsets,
+                                                         mask=stats_mask, other=stats_zero)
+            tlx.async_load_commit_group([first_q_token, first_do_token, lse_cache_token, delta_cache_token])
+            first_ready = tlx.async_load_wait_group(0)
+            tl.debug_barrier()
+            first_q_view = tlx.local_view(q_buffers, 0)
+            first_do_view = tlx.local_view(do_buffers, 0)
+            q_t0 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 0], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t1 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 32], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t2 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 64], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            q_t3 = tlx.local_load(tlx.local_trans(tlx.local_slice(first_q_view, [0, 96], [BLOCK_M, 32])),
+                                  token=first_ready, layout=qt_op1_nm, relaxed=True)
+            do_t = tlx.local_load(tlx.local_trans(first_do_view), token=first_ready, layout=dot_op1_nm)
+            lse = tlx.local_load(tlx.local_slice(lse_cache, [0], [BLOCK_M]), token=first_ready)
+            delta = tlx.local_load(tlx.local_slice(delta_cache, [0], [BLOCK_M]), token=first_ready)
+            for bridge_phase in tl.static_range(0, 2):
+                if bridge_phase == 0:
+                    block_begin = 0
+                    block_end = 1
+                else:
+                    block_begin = 1
+                    block_end = num_m_blocks
+                for m_block in tl.range(block_begin, block_end, num_stages=1, loop_unroll_factor=1):
+                    current_slot = m_block % 2
+                    next_slot = 1 - current_slot
+                    if bridge_phase == 0:
+                        next_block = tl.minimum(m_block + 1, num_m_blocks - 1)
+                        next_m = next_block * BLOCK_M + tl.arange(0, BLOCK_M)
+                        next_ptrs = next_m[:, None] * HQ * D + offs_d[None, :]
+                        next_mask = next_m[:, None] < q_len
+                        next_offsets = tlx.require_layout(next_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+                        next_load_mask = tlx.require_layout(tl.broadcast_to(next_mask, next_offsets.shape),
+                                                            qdo_async_layout, pin=False)
+                        next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), q_ptr,
+                                                                next_offsets, mask=next_load_mask, other=qdo_zero)
+                        next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_slot), do_ptr,
+                                                                 next_offsets, mask=next_load_mask, other=qdo_zero)
+                        tlx.async_load_commit_group([next_q_token, next_do_token])
+                    do_slot = current_slot
+                    q_view = tlx.local_view(q_buffers, current_slot)
+                    do_view = tlx.local_view(do_buffers, do_slot)
+                    offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+                    current_ds_slot = m_block % 2
+                    current_ds = tlx.local_view(ds_buffers, current_ds_slot)
+                    score_0 = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
+                    score_1 = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
+                    score_2 = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
+                    score_3 = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
+                    k_00 = tlx.require_layout(k_00, k_op0_nm, pin=False)
+                    k_01 = tlx.require_layout(k_01, k_op0_nm, pin=False)
+                    k_02 = tlx.require_layout(k_02, k_op0_nm, pin=False)
+                    k_03 = tlx.require_layout(k_03, k_op0_nm, pin=False)
+                    k_10 = tlx.require_layout(k_10, k_op0_nm, pin=False)
+                    k_11 = tlx.require_layout(k_11, k_op0_nm, pin=False)
+                    k_12 = tlx.require_layout(k_12, k_op0_nm, pin=False)
+                    k_13 = tlx.require_layout(k_13, k_op0_nm, pin=False)
+                    k_20 = tlx.require_layout(k_20, k_op0_nm, pin=False)
+                    k_21 = tlx.require_layout(k_21, k_op0_nm, pin=False)
+                    k_22 = tlx.require_layout(k_22, k_op0_nm, pin=False)
+                    k_23 = tlx.require_layout(k_23, k_op0_nm, pin=False)
+                    k_30 = tlx.require_layout(k_30, k_op0_nm, pin=False)
+                    k_31 = tlx.require_layout(k_31, k_op0_nm, pin=False)
+                    k_32 = tlx.require_layout(k_32, k_op0_nm, pin=False)
+                    k_33 = tlx.require_layout(k_33, k_op0_nm, pin=False)
+                    score_0 = tlx.amd_scheduled_mfma(k_00, q_t0, score_0, resident_operand=0,
+                                                     accumulator_role='transient', initialize=True)
+                    tlx.amd_sched_barrier(6 if bridge_phase == 1 else 0)
+                    score_0 = tlx.amd_scheduled_mfma(k_01, q_t1, score_0, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_0 = tlx.amd_scheduled_mfma(k_02, q_t2, score_0, resident_operand=0,
+                                                     accumulator_role='transient')
+                    tlx.amd_sched_barrier(6 if bridge_phase == 1 else 0)
+                    score_0 = tlx.amd_scheduled_mfma(k_03, q_t3, score_0, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_1 = tlx.amd_scheduled_mfma(k_10, q_t0, score_1, resident_operand=0,
+                                                     accumulator_role='transient', initialize=True)
+                    tlx.amd_sched_barrier(6 if bridge_phase == 1 else 0)
+                    score_1 = tlx.amd_scheduled_mfma(k_11, q_t1, score_1, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_1 = tlx.amd_scheduled_mfma(k_12, q_t2, score_1, resident_operand=0,
+                                                     accumulator_role='transient')
+                    tlx.amd_sched_barrier(6 if bridge_phase == 1 else 0)
+                    score_1 = tlx.amd_scheduled_mfma(k_13, q_t3, score_1, resident_operand=0,
+                                                     accumulator_role='transient')
+                    tlx.amd_sched_barrier(6 if bridge_phase == 1 else 0)
+                    score_2 = tlx.amd_scheduled_mfma(k_20, q_t0, score_2, resident_operand=0,
+                                                     accumulator_role='transient', initialize=True)
+                    score_2 = tlx.amd_scheduled_mfma(k_21, q_t1, score_2, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_2 = tlx.amd_scheduled_mfma(k_22, q_t2, score_2, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_2 = tlx.amd_scheduled_mfma(k_23, q_t3, score_2, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_3 = tlx.amd_scheduled_mfma(k_30, q_t0, score_3, resident_operand=0,
+                                                     accumulator_role='transient', initialize=True)
+                    score_3 = tlx.amd_scheduled_mfma(k_31, q_t1, score_3, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_3 = tlx.amd_scheduled_mfma(k_32, q_t2, score_3, resident_operand=0,
+                                                     accumulator_role='transient')
+                    score_3 = tlx.amd_scheduled_mfma(k_33, q_t3, score_3, resident_operand=0,
+                                                     accumulator_role='transient')
+                    if bridge_phase == 0:
+                        v_nm = tlx.amd_register_resident(v_nm, register_class='agpr', registers_per_group=4)
+                    do_nd = tlx.local_load(do_view, layout=do_op1_nd, relaxed=True)
+                    do_nd_0 = tlx.extract_slice(do_nd, [BLOCK_M, 32], [0, 0])
+                    do_nd_1 = tlx.extract_slice(do_nd, [BLOCK_M, 32], [0, 32])
+                    do_nd_2 = tlx.extract_slice(do_nd, [BLOCK_M, 32], [0, 64])
+                    do_nd_3 = tlx.extract_slice(do_nd, [BLOCK_M, 32], [0, 96])
+                    p_pair_first = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
+                    # Each all-ones halfword preserves one BF16 bit pattern;
+                    # a zero halfword gives exact positive zero, even for NaN/Inf.
+                    ds_q_mask = tlx.require_layout(
+                        tl.broadcast_to(
+                            tl.where(offs_m[None, :] < q_len, 65535, 0).to(tl.uint16), (BLOCK_N // 4, BLOCK_M)), mma_nm,
+                        pin=False)
+                    for n64_index in tl.static_range(0, 4):
+                        v_nm64 = tlx.extract_slice(v_nm, [BLOCK_N // 4, D], [n64_index * (BLOCK_N // 4), 0])
+                        if n64_index == 0:
+                            score64 = score_0
+                        elif n64_index == 1:
+                            score64 = score_1
+                        elif n64_index == 2:
+                            score64 = score_2
+                        else:
+                            score64 = score_3
+                        dpt_acc64 = tlx.zeros((BLOCK_N // 4, BLOCK_M), tl.float32, layout=mma_nm)
+                        dpt64 = tl.dot(v_nm64, do_t, acc=dpt_acc64, out_dtype=dpt_acc64.dtype)
+                        lse64 = tlx.require_layout(tl.broadcast_to(lse[None, :], (BLOCK_N // 4, BLOCK_M)), mma_nm,
+                                                   pin=False)
+                        qk_scale64 = tlx.require_layout(
+                            tl.full((BLOCK_N // 4, BLOCK_M), SM_SCALE * log2e, dtype=tl.float32), mma_nm, pin=False)
+                        scores64 = score64 * qk_scale64 - lse64
+                        n64_rows = n64_index * (BLOCK_N // 4) + tl.arange(0, BLOCK_N // 4)
+                        p64 = tlx.require_layout(tl.math.exp2(scores64), mma_nm, pin=False)
+                        delta64 = tlx.require_layout(tl.broadcast_to(delta[None, :], (BLOCK_N // 4, BLOCK_M)), mma_nm,
+                                                     pin=False)
+                        ds64 = p64 * (dpt64 - delta64)
+                        ds64_shared = tlx.local_slice(current_ds, [n64_index * (BLOCK_N // 4), 0],
+                                                      [BLOCK_N // 4, BLOCK_M])
+                        ds64_bf16 = ds64.to(tl.bfloat16)
+                        tlx.local_store(ds64_shared, ds64_bf16)
+                        ds_kv_mask = tlx.require_layout(
+                            tl.broadcast_to(
+                                tl.where(n64_rows[:, None] < kv_valid_rows, 65535, 0).to(tl.uint16),
+                                (BLOCK_N // 4, BLOCK_M)), mma_nm, pin=False)
+                        ds_publish = tl.inline_asm_elementwise(
+                            "v_and_b32 $0, $1, $2;\n v_and_b32 $0, $0, $3;",
+                            constraints="=&v,v,v,v",
+                            args=[ds64_bf16, ds_q_mask, ds_kv_mask],
+                            dtype=tl.bfloat16,
+                            is_pure=True,
+                            pack=2,
+                        )
+                        ds_local_q = tl.arange(0, BLOCK_M)
+                        ds_offsets = n64_rows[:, None] * BLOCK_M + ds_local_q[None, :]
+                        ds_offsets = tlx.require_layout(ds_offsets.to(tl.int32), mma_nm, pin=False)
+                        if PACKED_DS:
+                            ds_tile_base = q_head.to(tl.int64) * ds_head_elements + ds_sequence_base + (
+                                chunk_start.to(tl.int64) + m_block.to(tl.int64) * BLOCK_M) * ds_pitch.to(
+                                    tl.int64) + ds_local_kv_start.to(tl.int64) * BLOCK_M
+                        else:
+                            ds_tile_base = (q_head.to(tl.int64) * TOTAL_Q_PADDED.to(tl.int64) + q_scratch_start +
+                                            m_block.to(tl.int64) * BLOCK_M) * DS_CAP + ds_local_kv_start.to(
+                                                tl.int64) * BLOCK_M
+                        tlx.buffer_store(ds_publish, DS_WORKSPACE + ds_tile_base, ds_offsets,
+                                         cache=".cs" if PACKED_DS else "")
+                        if n64_index == 0 or n64_index == 2:
+                            p_pair_first = p64
+                        else:
+                            p128 = tl.cat(p_pair_first, p64, dim=0)
+                            p128 = tl.reshape(p128, (2, 2, 2, 16, BLOCK_M))
+                            p128 = tl.permute(p128, (1, 2, 0, 3, 4))
+                            p128 = tl.reshape(p128, (BLOCK_N // 2, BLOCK_M))
+                            p128 = tlx.require_layout(p128, p_preswap_nd, pin=False)
+                            p128 = p128.to(tl.bfloat16)
+                            p128 = tlx.require_layout(p128, pt_op0_nd, pin=False)
+                            if n64_index == 1:
+                                dv_00 = tlx.amd_scheduled_mfma(p128, do_nd_0, dv_00, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                                dv_01 = tlx.amd_scheduled_mfma(p128, do_nd_1, dv_01, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                                dv_02 = tlx.amd_scheduled_mfma(p128, do_nd_2, dv_02, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                                dv_03 = tlx.amd_scheduled_mfma(p128, do_nd_3, dv_03, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                            else:
+                                dv_10 = tlx.amd_scheduled_mfma(p128, do_nd_0, dv_10, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                                dv_11 = tlx.amd_scheduled_mfma(p128, do_nd_1, dv_11, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                                if Q_SPLITS == 1 and bridge_phase == 1:
+                                    q_nd64 = tlx.local_load(q_view, layout=q_op1_nd64, relaxed=True)
+                                dv_12 = tlx.amd_scheduled_mfma(p128, do_nd_2, dv_12, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                                dv_13 = tlx.amd_scheduled_mfma(p128, do_nd_3, dv_13, accumulator_role='persistent',
+                                                               accumulator_register_class='vgpr')
+                    if Q_SPLITS != 1 or bridge_phase == 0:
+                        q_nd64 = tlx.local_load(q_view, layout=q_op1_nd64, relaxed=True)
+                    if bridge_phase == 1:
+                        tlx.amd_sched_barrier(0)
+                    qdo_wait = tlx.async_load_wait_group(0)
+                    tl.debug_barrier()
+                    refill_block = tl.minimum(m_block + 2, num_m_blocks - 1)
+                    refill_m = refill_block * BLOCK_M + tl.arange(0, BLOCK_M)
+                    refill_ptrs = refill_m[:, None] * HQ * D + offs_d[None, :]
+                    refill_mask = refill_m[:, None] < q_len
+                    refill_offsets = tlx.require_layout(refill_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+                    refill_load_mask = tlx.require_layout(tl.broadcast_to(refill_mask, refill_offsets.shape),
+                                                          qdo_async_layout, pin=False)
+                    refill_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, current_slot), q_ptr,
+                                                              refill_offsets, mask=refill_load_mask, other=qdo_zero)
+                    tlx.amd_sched_barrier(6)
+                    ds64_shared = tlx.local_slice(current_ds, [0, 0], [BLOCK_N // 4, BLOCK_M])
+                    ds_nd64 = tlx.local_load(ds64_shared, layout=dst_op0_nd64, relaxed=True)
+                    tlx.amd_sched_barrier(6)
+                    refill_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, current_slot), do_ptr,
+                                                               refill_offsets, mask=refill_load_mask, other=qdo_zero)
+                    tlx.async_load_commit_group([refill_q_token, refill_do_token])
+                    next_q_view = tlx.local_view(q_buffers, next_slot)
+                    next_do_view = tlx.local_view(do_buffers, next_slot)
+                    next_stats_m = tl.minimum(m_block + 1, num_m_blocks - 1) * BLOCK_M
+                    for n64_index in tl.static_range(0, 4):
+                        if n64_index < 3:
+                            ds64_next_shared = tlx.local_slice(current_ds, [(n64_index + 1) * (BLOCK_N // 4), 0],
+                                                               [BLOCK_N // 4, BLOCK_M])
+                            ds_next_nd64 = tlx.local_load(ds64_next_shared, layout=dst_op0_nd64, relaxed=True)
+                        if n64_index == 0:
+                            dk_n0 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n0, accumulator_role='persistent',
+                                                           accumulator_register_class='agpr', output_fragment=0)
+                            tlx.amd_sched_barrier(0)
+                            tlx.amd_sched_barrier(0)
+                            dk_n0 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n0, accumulator_role='persistent',
+                                                           accumulator_register_class='agpr', output_fragment=1)
+                        elif n64_index == 1:
+                            dk_n1 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n1, accumulator_role='persistent',
+                                                           accumulator_register_class='agpr', output_fragment=0)
+                            tlx.amd_sched_barrier(0)
+                            tlx.amd_sched_barrier(0)
+                            dk_n1 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n1, accumulator_role='persistent',
+                                                           accumulator_register_class='agpr', output_fragment=1)
+                        elif n64_index == 2:
+                            dk_n2 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n2, accumulator_role='persistent',
+                                                           accumulator_register_class='agpr')
+                        else:
+                            dk_n3 = tlx.amd_scheduled_mfma(ds_nd64, q_nd64, dk_n3, accumulator_role='persistent',
+                                                           accumulator_register_class='agpr')
+                        if bridge_phase == 1:
+                            tlx.amd_sched_barrier(0)
+                            if n64_index == 0:
+                                tlx.amd_sched_barrier(0)
+                                next_q_t0 = tlx.local_load(
+                                    tlx.local_trans(tlx.local_slice(next_q_view, [0, 0], [BLOCK_M, 32])),
+                                    token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                                tlx.amd_sched_barrier(0)
+                            elif n64_index == 1:
+                                tlx.amd_sched_barrier(0)
+                                next_q_t1 = tlx.local_load(
+                                    tlx.local_trans(tlx.local_slice(next_q_view, [0, 32], [BLOCK_M, 32])),
+                                    token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                                tlx.amd_sched_barrier(0)
+                            elif n64_index == 2:
+                                tlx.amd_sched_barrier(0)
+                                next_q_t2 = tlx.local_load(
+                                    tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])),
+                                    token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                                next_lse = tlx.local_load(tlx.local_slice(lse_cache, [next_stats_m], [BLOCK_M]),
+                                                          token=qdo_wait, relaxed=True)
+                                tlx.amd_sched_barrier(0)
+                            elif n64_index == 3:
+                                tlx.amd_sched_barrier(0)
+                                next_q_t3 = tlx.local_load(
+                                    tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])),
+                                    token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                                tlx.amd_sched_barrier(0)
+                        if n64_index < 3:
+                            ds_nd64 = ds_next_nd64
+                    if bridge_phase == 0:
+                        tlx.amd_sched_barrier(0)
+                        next_q_t0 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 0], [BLOCK_M, 32])),
+                                                   token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                        tlx.amd_sched_barrier(0)
+                        tlx.amd_sched_barrier(0)
+                        next_q_t1 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 32], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
+                        tlx.amd_sched_barrier(0)
+                        tlx.amd_sched_barrier(0)
+                        next_q_t2 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
+                        tlx.amd_sched_barrier(0)
+                        tlx.amd_sched_barrier(0)
+                        next_q_t3 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
+                        tlx.amd_sched_barrier(0)
+                    next_do_t = tlx.local_load(tlx.local_trans(next_do_view), token=qdo_wait, layout=dot_op1_nm,
+                                               relaxed=True)
+                    if bridge_phase == 0:
+                        next_lse = tlx.local_load(tlx.local_slice(lse_cache, [next_stats_m], [BLOCK_M]), token=qdo_wait,
+                                                  relaxed=True)
+                    next_delta = tlx.local_load(tlx.local_slice(delta_cache, [next_stats_m], [BLOCK_M]), token=qdo_wait,
+                                                relaxed=True)
+                    q_t0 = next_q_t0
+                    q_t1 = next_q_t1
+                    q_t2 = next_q_t2
+                    q_t3 = next_q_t3
+                    do_t = next_do_t
+                    lse = next_lse
+                    delta = next_delta
+            tlx.async_load_wait_group(0)
+            tl.debug_barrier()
+    dk_n0, dk_n1, dk_n2, dk_n3 = tlx.amd_mfma_commit((dk_n0, dk_n1, dk_n2, dk_n3))
+    dv_00, dv_01, dv_02, dv_03, dv_10, dv_11, dv_12, dv_13, _v_nm = tlx.amd_mfma_commit(
+        (dv_00, dv_01, dv_02, dv_03, dv_10, dv_11, dv_12, dv_13), preserve=v_nm)
+    tlx.async_load_wait_group(0)
+    _store_dv_aligned_fragment(dv_00, dv_ptr, kv_valid_rows, 0, 0, HKV * Q_SPLITS, D, mma_nd)
+    _store_dv_aligned_fragment(dv_01, dv_ptr, kv_valid_rows, 0, 32, HKV * Q_SPLITS, D, mma_nd)
+    _store_dk_n64_native_wave8_fragment(dk_n0, dk_ptr, kv_valid_rows, 0, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dv_aligned_fragment(dv_02, dv_ptr, kv_valid_rows, 0, 64, HKV * Q_SPLITS, D, mma_nd)
+    _store_dv_aligned_fragment(dv_03, dv_ptr, kv_valid_rows, 0, 96, HKV * Q_SPLITS, D, mma_nd)
+    _store_dk_n64_native_wave8_fragment(dk_n1, dk_ptr, kv_valid_rows, 64, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dv_aligned_fragment(dv_10, dv_ptr, kv_valid_rows, 128, 0, HKV * Q_SPLITS, D, mma_nd)
+    _store_dv_aligned_fragment(dv_11, dv_ptr, kv_valid_rows, 128, 32, HKV * Q_SPLITS, D, mma_nd)
+    _store_dk_n64_native_wave8_fragment(dk_n2, dk_ptr, kv_valid_rows, 128, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+    _store_dv_aligned_fragment(dv_12, dv_ptr, kv_valid_rows, 128, 64, HKV * Q_SPLITS, D, mma_nd)
+    _store_dv_aligned_fragment(dv_13, dv_ptr, kv_valid_rows, 128, 96, HKV * Q_SPLITS, D, mma_nd)
+    _store_dk_n64_native_wave8_fragment(dk_n3, dk_ptr, kv_valid_rows, 192, SM_SCALE, HKV * Q_SPLITS, D, mma_nd64)
+
+
+@triton.jit
+def _prefix_ds_load_stage(
+    DS,
+    K,
+    DS_BUFFERS,
+    K_BUFFERS,
+    DS_BASE,
+    K_BASE,
+    M0,
+    Q_LEN,
+    KV_LEN,
+    N0,
+    SLOT: tl.constexpr,
+    DS_CAP,
+    DS_Q16_PADDED: tl.constexpr = False,
+    HKV: tl.constexpr = 4,
+):
+    """Load one Q128 dS/K band at the supplied pitch, bounding Q16 tails."""
+    BQ: tl.constexpr = 128
+    # A physical LDS vector contains eight consecutive BF16 values.
+    COPY_WARPS: tl.constexpr = 4
+    copy_layout: tl.constexpr = tlx.layout(shape=((64, COPY_WARPS), (8, BQ // (8 * COPY_WARPS))),
+                                           stride=((8, 512), (1, 512 * COPY_WARPS)))
+    raw = tl.arange(0, BQ * 64)
+    ds_n = raw // BQ
+    ds_m = (raw % BQ) ^ ((ds_n & 7) << 3)
+    ds_offsets = (ds_m // 16) * (16 * DS_CAP) + (N0 + ds_n) * 16 + (ds_m % 16)
+    ds_offsets = tl.max_contiguous(tl.multiple_of(ds_offsets, 8), 8)
+    ds_offsets = tlx.require_layout(ds_offsets.to(tl.int32), copy_layout, pin=False)
+    if not DS_Q16_PADDED:
+        ds_mask = tl.max_constancy(N0 + ds_n < KV_LEN, 128)
+    else:
+        # The materialized-dS producer writes zeros through the final Q16 block.
+        # Read only that allocation: Q16 bounds keep every physical Q8 vector uniform.
+        q_allocated = tl.cdiv(Q_LEN, 16) * 16
+        ds_mask = tl.max_constancy((M0 + ds_m < q_allocated) & (N0 + ds_n < KV_LEN), 8)
+    ds_mask = tlx.require_layout(ds_mask, copy_layout, pin=False)
+    zero = tlx.zeros((BQ * 64, ), tl.bfloat16, layout=copy_layout)
+    ds_token = tlx.buffer_load_to_local(tlx.local_view(DS_BUFFERS, SLOT), DS + DS_BASE, ds_offsets, mask=ds_mask,
+                                        other=zero, cache_modifier=".cs")
+    k_copy_layout: tl.constexpr = tlx.layout(shape=((64, COPY_WARPS), (8, 16 // COPY_WARPS)),
+                                             stride=((8, 512), (1, 512 * COPY_WARPS)))
+    k_raw = tl.arange(0, 8192)
+    k_zero = tlx.zeros((8192, ), tl.bfloat16, layout=k_copy_layout)
+    k_n = k_raw >> 7
+    k_d = (k_raw & 127) ^ ((k_n & 7) << 3)
+    k_offsets = (N0 + k_n) * (HKV * 128) + k_d
+    k_offsets = tl.max_contiguous(tl.multiple_of(k_offsets, 8), 8)
+    k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_copy_layout, pin=False)
+    k_mask = tlx.require_layout(tl.max_constancy(N0 + k_n < KV_LEN, 128), k_copy_layout, pin=False)
+    k_token = tlx.buffer_load_to_local(tlx.local_view(K_BUFFERS, SLOT), K + K_BASE, k_offsets, mask=k_mask,
+                                       other=k_zero)
+    tlx.async_load_commit_group([ds_token, k_token])
+
+
+@triton.jit
+def _prefix_ds_dq_body(
+    DS,
+    K,
+    DS_BUFFERS,
+    K_BUFFERS,
+    DS_BASE,
+    K_BASE,
+    M0,
+    Q_LEN,
+    KV_LEN,
+    SM_SCALE: tl.constexpr,
+    DS_CAP,
+    DS_Q16_PADDED: tl.constexpr = False,
+    HKV: tl.constexpr = 4,
+):
+    """Accumulate Q128 dQ at the supplied pitch with full or Q16-padded reads."""
+    BQ: tl.constexpr = 128
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2])
+    a_layout: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    b_layout: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    # Physical contiguous dimension is M for dS, D for K; XOR rotates banks.
+    a_shared: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [8, 1], [16, 2], [32, 4], [0, 8],
+                      [0, 16], [0, 32]], block_bases=[], alignment=16)
+    b_shared: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 8], [2, 16], [4, 32], [8, 0],
+                      [16, 0], [32, 0]], block_bases=[], alignment=16)
+    _prefix_ds_load_stage(DS, K, DS_BUFFERS, K_BUFFERS, DS_BASE, K_BASE, M0, Q_LEN, KV_LEN, 0, 0, DS_CAP, DS_Q16_PADDED,
+                          HKV)
+    _prefix_ds_load_stage(DS, K, DS_BUFFERS, K_BUFFERS, DS_BASE, K_BASE, M0, Q_LEN, KV_LEN, 64, 1, DS_CAP,
+                          DS_Q16_PADDED, HKV)
+    total = tlx.zeros((BQ, 128), tl.float32, layout=mma)
+    for tile in tl.range(0, tl.cdiv(KV_LEN, 256), num_stages=1, loop_unroll_factor=1):
+        partial = tlx.zeros((BQ, 128), tl.float32, layout=mma)
+        for band in tl.static_range(0, 4):
+            ready = tlx.async_load_wait_group(1)
+            tl.debug_barrier()
+            a_view = tlx.local_reinterpret(tlx.local_view(DS_BUFFERS, band % 2), tl.bfloat16, [BQ, 64], layout=a_shared)
+            b_view = tlx.local_reinterpret(tlx.local_view(K_BUFFERS, band % 2), tl.bfloat16, [64, 128], layout=b_shared)
+            a = tlx.local_load(a_view, token=ready, layout=a_layout, relaxed=True)
+            b = tlx.local_load(b_view, token=ready, layout=b_layout, relaxed=True)
+            # Every wave finishes reading this slot before its next async copy.
+            tl.debug_barrier()
+            _prefix_ds_load_stage(DS, K, DS_BUFFERS, K_BUFFERS, DS_BASE, K_BASE, M0, Q_LEN, KV_LEN,
+                                  tile * 256 + (band + 2) * 64, band % 2, DS_CAP, DS_Q16_PADDED, HKV)
+            a0 = tlx.extract_slice(a, [BQ, 32], [0, 0])
+            a1 = tlx.extract_slice(a, [BQ, 32], [0, 32])
+            b0 = tlx.extract_slice(b, [32, 128], [0, 0])
+            b1 = tlx.extract_slice(b, [32, 128], [32, 0])
+            partial = tl.dot(a0, b0, acc=partial, out_dtype=tl.float32)
+            partial = tl.dot(a1, b1, acc=partial, out_dtype=tl.float32)
+        scale = tlx.require_layout(tl.full((BQ, 128), SM_SCALE, tl.float32), mma, pin=False)
+        scaled = partial * scale
+        total = total + scaled
+    tlx.async_load_wait_group(0)
+    tl.debug_barrier()
+    return total
+
+
+@triton.jit
+def _prefix_ds_dq_consumer_body(
+    DS,
+    K,
+    CuQ,
+    CuKV,
+    DQ,
+    TOTAL_Q_PADDED,
+    DS_PREFIX,
+    DS_HEAD_ELEMENTS,
+    SM_SCALE: tl.constexpr,
+    DS_CAP: tl.constexpr = 10496,
+    HQ: tl.constexpr = 12,
+    HKV: tl.constexpr = 4,
+    PACKED_DS: tl.constexpr = False,
+):
+    BQ: tl.constexpr = 128
+    DQ_PAD_ROWS: tl.constexpr = 16 - 1
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    q_start = tl.load(CuQ + batch).to(tl.int64)
+    q_end = tl.load(CuQ + batch + 1).to(tl.int64)
+    q_len = (q_end - q_start).to(tl.int32)
+    m0 = tl.program_id(0) * 128
+    if m0 >= q_len:
+        return
+    kv_start = tl.load(CuKV + batch).to(tl.int64)
+    kv_end = tl.load(CuKV + batch + 1).to(tl.int64)
+    kv_len = (kv_end - kv_start).to(tl.int32)
+    scratch = q_start + batch.to(tl.int64) * DQ_PAD_ROWS
+    if PACKED_DS:
+        ds_sequence_base = tl.multiple_of(tl.load(DS_PREFIX + batch).to(tl.int64), 4096)
+        ds_pitch = tl.multiple_of(tl.cdiv(kv_len, 256) * 256, 256)
+        ds_head_elements = tl.multiple_of(DS_HEAD_ELEMENTS.to(tl.int64), 4096)
+        ds_base = head.to(tl.int64) * ds_head_elements + ds_sequence_base + m0.to(tl.int64) * ds_pitch.to(tl.int64)
+    else:
+        ds_pitch = DS_CAP
+        ds_base = (head.to(tl.int64) * TOTAL_Q_PADDED.to(tl.int64) + scratch + m0.to(tl.int64)) * DS_CAP
+    k_base = (kv_start * HKV + (head // (HQ // HKV)).to(tl.int64)) * 128
+    raw_shared: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024], [2048], [4096]],
+        block_bases=[], alignment=16)
+    ds_buffers = tlx.local_alloc((BQ * 64, ), tl.bfloat16, 2, layout=raw_shared)
+    k_buffers = tlx.local_alloc((8192, ), tl.bfloat16, 2, layout=raw_shared)
+    # Each CTA takes one complete, uniform body. BQ128 geometry stays fixed;
+    # the partial specialization reads only the producer's initialized Q16 rows.
+    if m0 + 128 <= q_len:
+        total = _prefix_ds_dq_body(DS, K, ds_buffers, k_buffers, ds_base, k_base, m0, q_len, kv_len, SM_SCALE, ds_pitch,
+                                   False, HKV)
+    else:
+        total = _prefix_ds_dq_body(DS, K, ds_buffers, k_buffers, ds_base, k_base, m0, q_len, kv_len, SM_SCALE, ds_pitch,
+                                   True, HKV)
+    store_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                                     warps_per_cta=[2, 2])
+    rows = m0 + tl.arange(0, BQ)
+    dims = tl.arange(0, 128)
+    offsets = rows[:, None] * (HQ * 128) + dims[None, :]
+    offsets = tlx.require_layout(offsets.to(tl.int32), store_layout, pin=False)
+    valid = tlx.require_layout(tl.broadcast_to(rows[:, None] < q_len, (BQ, 128)), store_layout, pin=False)
+    base = (q_start * HQ + head.to(tl.int64)) * 128
+    tlx.buffer_store(total.to(tl.bfloat16), DQ + base, offsets, mask=valid)

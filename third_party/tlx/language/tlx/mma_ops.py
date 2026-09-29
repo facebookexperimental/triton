@@ -183,7 +183,10 @@ def amd_scheduled_mfma(
     CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
     ``accumulator_register_class="vgpr"``. The inputs must be matching BF16 or
     F16 dot operands with ``kWidth`` 4 or 8, and the accumulator must be F32
-    with the corresponding unit-tile MFMA layout. All tensors must have the
+    with the corresponding unit-tile MFMA layout. The logical K dimension must
+    be a positive multiple of both the native instruction K and the dot-operand
+    layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile span two
+    native K fragments. All tensors must have the
     same rank, either two or three. Rank-three tensors have matching leading
     batch dimensions distributed over waves, with one batch per wave;
     ``output_fragment`` retains its per-wave meaning. All active lanes of a

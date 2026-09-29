@@ -3,7 +3,9 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -57,6 +59,56 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
   return true;
 }
 
+// A deliberately narrow reuse rule. Equal concrete tensor types select
+// equal shared swizzles, and equal allocation intervals select the same base.
+// Warp-local, injective layouts therefore give both conversions the same
+// disjoint per-wave byte partitions. The leading wave fence in scratch lowering
+// orders the previous reads before the next writes without rendezvousing waves.
+bool filterWarpLocalScratchReuse(Operation *op1, Operation *op2,
+                                 Allocation *allocation) {
+  auto first = dyn_cast<triton::gpu::ConvertLayoutOp>(op1);
+  auto second = dyn_cast<triton::gpu::ConvertLayoutOp>(op2);
+  if (!first || !second || op1 == op2 || op1->getBlock() != op2->getBlock() ||
+      !op1->isBeforeInBlock(op2))
+    return false;
+  auto srcTy = cast<RankedTensorType>(first.getSrc().getType());
+  auto dstTy = cast<RankedTensorType>(first.getType());
+  if (!srcTy.getEncoding() || !dstTy.getEncoding() ||
+      srcTy != second.getSrc().getType() || dstTy != second.getType())
+    return false;
+
+  auto firstId = allocation->getBufferId(op1);
+  auto secondId = allocation->getBufferId(op2);
+  if (firstId == Allocation::InvalidBufferId ||
+      secondId == Allocation::InvalidBufferId)
+    return false;
+  auto interval = allocation->getAllocatedInterval(firstId);
+  if (interval != allocation->getAllocatedInterval(secondId))
+    return false;
+
+  // Restrict this first rule to one complete, non-broadcast scratch image.
+  // Partial/repeated scratch images need their physical wave partition proved
+  // separately; different bases cannot be accepted on logical layout alone.
+  auto elemTy = srcTy.getElementType();
+  if (!elemTy.isIntOrFloat())
+    return false;
+  unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+  if ((bitwidth != 8 && bitwidth != 16 && bitwidth != 32 && bitwidth != 64) ||
+      interval.size() != srcTy.getNumElements() * (bitwidth / 8))
+    return false;
+  auto srcLayout = triton::gpu::toLinearLayout(srcTy);
+  auto dstLayout = triton::gpu::toLinearLayout(dstTy);
+  if (srcLayout.isModular() || dstLayout.isModular() ||
+      !srcLayout.isInjective() || !dstLayout.isInjective())
+    return false;
+  // Equal types can select different lowerings through forceWarpShuffle.
+  // Both operations must actually use the shared-memory scratch image.
+  if (!mlir::cvtNeedsSharedMemory(first) || !mlir::cvtNeedsSharedMemory(second))
+    return false;
+  auto warp = StringAttr::get(op1->getContext(), "warp");
+  return mlir::isCvtDimSync(srcLayout, dstLayout, warp);
+}
+
 bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
   auto isLDSMemoryBarrierOp = [](Operation *op) {
     return llvm::isa<triton::amdgpu::InitBarrierOp,
@@ -73,7 +125,8 @@ bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
                   bool op2IsRead, Allocation *allocation) {
   return (filterAsyncLocalLoadsDependencies(op1, op2, op1IsRead, op2IsRead,
                                             allocation) ||
-          filterLDSMemoryBarriersDependencies(op1, op2));
+          filterLDSMemoryBarriersDependencies(op1, op2) ||
+          filterWarpLocalScratchReuse(op1, op2, allocation));
 }
 
 namespace {

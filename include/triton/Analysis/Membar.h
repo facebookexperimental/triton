@@ -67,16 +67,16 @@ public:
   AllocationSlice translated(size_t offset,
                              bool invalidateBufferId = false) const {
     AllocationSlice shifted = invalidateBufferId ? forgetStageLoop() : *this;
-    shifted.allocationInterval = Interval<size_t>(
-        shifted.allocationInterval.start() + offset,
-        shifted.allocationInterval.end() + offset);
+    shifted.allocationInterval =
+        Interval<size_t>(shifted.allocationInterval.start() + offset,
+                         shifted.allocationInterval.end() + offset);
     if (invalidateBufferId) {
       shifted.bufferId = Allocation::InvalidBufferId;
       shifted.stage = {};
     } else if (shifted.stage.parent) {
-      shifted.stage.parentInterval = Interval<size_t>(
-          shifted.stage.parentInterval.start() + offset,
-          shifted.stage.parentInterval.end() + offset);
+      shifted.stage.parentInterval =
+          Interval<size_t>(shifted.stage.parentInterval.start() + offset,
+                           shifted.stage.parentInterval.end() + offset);
     }
     return shifted;
   }
@@ -99,10 +99,13 @@ private:
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
              llvm::ArrayRef<int64_t>, StageKey>
   asTuple() const {
-    return {allocationInterval, bufferId, accessTy.getAsOpaquePointer(),
+    return {allocationInterval,
+            bufferId,
+            accessTy.getAsOpaquePointer(),
             subsliceOffsets,
-            {stage.parent.getAsOpaquePointer(), stage.basis.getAsOpaquePointer(),
-             stage.parentInterval, stage.stride, stage.parity}};
+            {stage.parent.getAsOpaquePointer(),
+             stage.basis.getAsOpaquePointer(), stage.parentInterval,
+             stage.stride, stage.parity}};
   }
   // Offsets from subslice. Empty when offsets are unknown
   SmallVector<int64_t> subsliceOffsets;
@@ -134,8 +137,9 @@ struct BlockInfo {
     return *this;
   }
 
-  BlockInfo mapSlices(
-      const std::function<AllocationSlice(const AllocationSlice &)> &map) const {
+  BlockInfo
+  mapSlices(const std::function<AllocationSlice(const AllocationSlice &)> &map)
+      const {
     BlockInfo result;
     auto transfer = [&](const SliceMapT &source, SliceMapT &destination) {
       for (const auto &[slice, ops] : source) {

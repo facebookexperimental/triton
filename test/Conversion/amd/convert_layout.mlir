@@ -216,3 +216,189 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_same_partition
+  // Each exchange orders its preceding reads before new scratch writes, then
+  // orders those writes before the reads. Counting fences alone misses a fence
+  // moved after the first write, which would leave a cross-exchange WAR hazard.
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-NOT: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.load {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.load {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_same_partition(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>) {
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#cross = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [32, 0]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [0, 64]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_reject_interwave
+  // Two cross-wave producer/consumer barriers and one scratch reuse barrier.
+  // CHECK: rocdl.s.barrier
+  // CHECK: rocdl.s.barrier
+  // CHECK: rocdl.s.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_reject_interwave(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #cross>) {
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #cross>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #cross>
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #cross>
+    tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #cross>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+#other = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [2, 0], [1, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_reject_different_layout
+  // Both are intra-wave, but equality of their physical partitions is not
+  // inferred from that fact alone. Different tensor encodings stay conservative.
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_reject_different_layout(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>, %other_out: tensor<64x128x!tt.ptr<bf16>, #other>) {
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #other>
+    tt.store %other_out, %y : tensor<64x128x!tt.ptr<bf16>, #other>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_reject_cross_block
+  // No cross-block proof is claimed, even for an unconditional edge.
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_reject_cross_block(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>) {
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    cf.br ^next
+  ^next:
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_reject_backedge
+  // A self dependency from the backedge remains a CTA dependency.
+  // CHECK: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_reject_backedge(%a: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>, %again: i1) {
+    cf.br ^loop
+  ^loop:
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    cf.cond_br %again, ^loop, ^exit
+  ^exit:
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_same_partition_fp32
+  // FP32 also admits a complete scratch image: 64 * 64 * 4 = 16 KiB.
+  // Check both fences around each exchange and the absence of a CTA barrier.
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-NOT: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.load {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.store {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK-COUNT-4: llvm.load {{.*}}!llvm.ptr<3>
+  // CHECK-NOT: rocdl.s.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_same_partition_fp32(%a: tensor<64x64xf32, #src>, %b: tensor<64x64xf32, #src>, %out: tensor<64x64x!tt.ptr<f32>, #dst>) {
+    %x = ttg.convert_layout %a : tensor<64x64xf32, #src> -> tensor<64x64xf32, #dst>
+    tt.store %out, %x : tensor<64x64x!tt.ptr<f32>, #dst>
+    %y = ttg.convert_layout %b : tensor<64x64xf32, #src> -> tensor<64x64xf32, #dst>
+    tt.store %out, %y : tensor<64x64x!tt.ptr<f32>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64], [0, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64], [0, 0]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @warp_local_scratch_reuse_reject_broadcast
+  // A zero register basis repeats every element. The exchanges remain wave-local
+  // and reuse the same full 16 KiB interval, but the layouts are non-injective.
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: rocdl.s.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.amdgcn.wave.barrier
+  // CHECK: llvm.return
+  tt.func @warp_local_scratch_reuse_reject_broadcast(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>) {
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #dst>
+    tt.return
+  }
+}

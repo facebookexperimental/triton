@@ -384,3 +384,34 @@ tt.func @lone_sched_fence_still_needs_barrier(%A: !tt.ptr<f16>) {
 }
 
 }
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // Differently sized live buffers put the identical conversions at overlapping
+  // but unequal scratch intervals. Do not infer physical wave ownership from
+  // logical tensor types when the scratch bases differ.
+  // CHECK-LABEL: @warp_local_scratch_reuse_reject_different_interval
+  // CHECK: ttg.local_alloc{{.*}}allocation.offset = 0
+  // CHECK: ttg.convert_layout{{.*}}allocation.offset = 24576
+  // CHECK: ttg.local_dealloc
+  // CHECK: ttg.local_alloc{{.*}}allocation.offset = 0
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: {{.*}}ttg.convert_layout{{.*}}allocation.offset = 16384
+  // CHECK: tt.return
+  tt.func @warp_local_scratch_reuse_reject_different_interval(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>) {
+    %large = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable>
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    ttg.local_dealloc %large : !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xbf16, #shared, #smem, mutable>
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #dst>
+    ttg.local_dealloc %small : !ttg.memdesc<2x64x64xbf16, #shared, #smem, mutable>
+    tt.return
+  }
+}

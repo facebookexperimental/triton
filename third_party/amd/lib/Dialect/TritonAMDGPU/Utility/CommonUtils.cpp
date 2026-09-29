@@ -1,34 +1,21 @@
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 namespace mlir::triton::AMD {
 bool hasMutuallyExclusiveSuccessorUses(Value value) {
-  auto blockArgument = dyn_cast<BlockArgument>(value);
-  if (!blockArgument)
-    return false;
-  Block *header = blockArgument.getOwner();
+  Block *header = value.getParentBlock();
   auto branch = dyn_cast<cf::CondBranchOp>(header->getTerminator());
   if (!branch || branch.getTrueDest() == branch.getFalseDest())
     return false;
 
-  SmallVector<Block *, 2> consumers;
-  for (OpOperand &use : value.getUses()) {
-    Block *useBlock = use.getOwner()->getBlock();
-    // Do not lift captures in nested regions to their enclosing CFG block.
-    if (useBlock == header || useBlock->getParent() != header->getParent() ||
-        llvm::is_contained(consumers, useBlock) || consumers.size() == 2)
-      return false;
-    consumers.push_back(useBlock);
-  }
-  if (consumers.size() != 2)
-    return false;
-
   // SCF-to-CF may insert an unrelated diamond before the loop's accumulator
   // update. Each arm must still reach its own unique consumer on every path,
-  // before any header re-entry. Only acyclic direct-branch prefixes are modeled.
+  // before any header re-entry. Only acyclic direct-branch prefixes are
+  // modeled.
   auto allPathsReachConsumer = [header](Block *from, Block *consumer) {
     llvm::SmallPtrSet<Block *, 16> active;
     llvm::SmallPtrSet<Block *, 16> proven;
@@ -54,6 +41,64 @@ bool hasMutuallyExclusiveSuccessorUses(Value value) {
     };
     return visit(visit, from);
   };
+  auto isReachableWithoutHeader = [header](Block *from, Block *to) {
+    if (from == header)
+      return false;
+    llvm::SmallPtrSet<Block *, 16> excluded;
+    excluded.insert(header);
+    return from->isReachable(to, std::move(excluded));
+  };
+  // CFG simplification may fold a bypass block into a forwarded header
+  // operand. This use occurs on the edge, so the other consumer may still
+  // reach the forwarded destination as a common join.
+  if (value.hasNUses(2)) {
+    OpOperand *forwardedUse = nullptr;
+    Block *consumer = nullptr;
+    for (OpOperand &use : value.getUses()) {
+      if (use.getOwner() == branch.getOperation()) {
+        if (forwardedUse)
+          return false;
+        forwardedUse = &use;
+      } else {
+        consumer = use.getOwner()->getBlock();
+      }
+    }
+    if (forwardedUse) {
+      if (!consumer || consumer == header ||
+          consumer->getParent() != header->getParent())
+        return false;
+      std::optional<BlockArgument> successorArgument =
+          cast<BranchOpInterface>(branch.getOperation())
+              .getSuccessorBlockArgument(forwardedUse->getOperandNumber());
+      if (!successorArgument)
+        return false;
+      Block *forwarded = successorArgument->getOwner();
+      Block *opposite = forwarded == branch.getTrueDest()
+                            ? branch.getFalseDest()
+                            : branch.getTrueDest();
+      if (!allPathsReachConsumer(opposite, consumer) ||
+          isReachableWithoutHeader(forwarded, consumer))
+        return false;
+      for (Block *successor : consumer->getSuccessors()) {
+        if (isReachableWithoutHeader(successor, consumer))
+          return false;
+      }
+      return true;
+    }
+  }
+
+  SmallVector<Block *, 2> consumers;
+  for (OpOperand &use : value.getUses()) {
+    Block *useBlock = use.getOwner()->getBlock();
+    // Do not lift captures in nested regions to their enclosing CFG block.
+    if (useBlock == header || useBlock->getParent() != header->getParent() ||
+        llvm::is_contained(consumers, useBlock) || consumers.size() == 2)
+      return false;
+    consumers.push_back(useBlock);
+  }
+  if (consumers.size() != 2)
+    return false;
+
   auto matchesArms = [&](Block *first, Block *second) {
     return allPathsReachConsumer(branch.getTrueDest(), first) &&
            allPathsReachConsumer(branch.getFalseDest(), second);
@@ -62,13 +107,6 @@ bool hasMutuallyExclusiveSuccessorUses(Value value) {
       !matchesArms(consumers[1], consumers[0]))
     return false;
 
-  auto isReachableWithoutHeader = [header](Block *from, Block *to) {
-    if (from == header)
-      return false;
-    llvm::SmallPtrSet<Block *, 16> excluded;
-    excluded.insert(header);
-    return from->isReachable(to, std::move(excluded));
-  };
   if (isReachableWithoutHeader(consumers[0], consumers[1]) ||
       isReachableWithoutHeader(consumers[1], consumers[0]))
     return false;

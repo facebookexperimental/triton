@@ -928,7 +928,9 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     and output_fragment index remain local to each wave's batch.
     It accepts one or more K fragments per wave and the target's native
     instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
-    16x16x32 on CDNA4.
+    16x16x32 on CDNA4. The logical K dimension must be a positive multiple
+    of both the native instruction K and the dot-operand layout's K tile.
+    On CDNA3, kWidth=8 makes the operand tile span two native K fragments.
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,

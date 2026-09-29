@@ -781,7 +781,9 @@ def _explicit_mfma_reduce_add(a, b):
 @triton.jit
 def _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
-        version=VERSION, instr_shape=[16, 16, INSTR_K], transposed=True,
+        version=VERSION,
+        instr_shape=[16, 16, INSTR_K],
+        transposed=True,
         warps_per_cta=[2, 1, 4],
     )
     batch = tl.arange(0, 2)
@@ -807,8 +809,8 @@ def test_explicit_mfma_reduction_uses_target_metadata_during_ast(target, version
         constexprs={"VERSION": version, "INSTR_K": instr_k},
     )
     # tl.reduce verifies its explicit input layout before post_ast_lowering.
-    module = source.make_ir(target, options, backend.get_codegen_implementation(options),
-                            backend.get_module_map(), context)
+    module = source.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                            context)
     assert module.get_int_attr("ttg.threads-per-warp") == 64
     assert module.get_int_attr("ttg.num-warps") == 8
     assert module.verify()
@@ -2340,6 +2342,11 @@ def test_amd_regalloc_codegen_options_are_cache_keyed():
         ),
         (
             "s_mov_b32 s0, 0\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0\n"
+            "v_accvgpr_write_b32 a0, v20\ns_nop 0",
+            None,
+        ),
+        (
+            "s_mov_b32 s0, 0\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0\n"
             "v_swap_b32 v20, v0",
             "s_nop 1",
         ),
@@ -2559,19 +2566,43 @@ v_add_f32_e32 v16, v0, v17
     assert "s_nop 15\ns_nop 3\nv_add_f32_e32 v16, v0, v17" in repaired
 
 
-def test_scheduled_mfma_hazard_repair_accepts_tied_vgpr_accumulator():
-    assembly = """kernel:
-s_mov_b32 s0, 0
-s_mov_b32 s1, 0
-s_mov_b32 s2, 0
+@pytest.mark.parametrize(
+    "existing_wait,expected_wait",
+    [
+        pytest.param("", "s_nop 1\n", id="zero-wait-states"),
+        pytest.param("s_nop 0\n", "s_nop 0\n", id="one-wait-state"),
+        pytest.param("s_nop 1\n", "", id="two-wait-states"),
+    ],
+)
+def test_scheduled_mfma_hazard_repair_delays_tied_vgpr_accumulator(existing_wait, expected_wait):
+    # Legacy VALU writes need two wait states before every explicit MFMA VGPR
+    # use, including srcC (LLVM GCNHazardRecognizer::checkMAIHazards90A).
+    marker = "; triton_amd_scheduled_mfma\n"
+    assembly = f"""kernel:
+s_nop 3
 v_mov_b32_e32 v0, 1
-; triton_amd_scheduled_mfma
-v_mfma_f32_16x16x32_f16 v[0:3], v[8:11], a[4:7], v[0:3]
+{existing_wait}{marker}v_mfma_f32_16x16x32_f16 v[0:3], v[8:11], a[4:7], v[0:3]
 """
 
     repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
 
-    assert "; triton_amd_scheduled_mfma\ns_nop 0\nv_mfma_f32_16x16x32_f16" in repaired
+    assert repaired == assembly.replace(marker, marker + expected_wait)
+
+
+@pytest.mark.parametrize("register_class", ["v", "a"])
+def test_scheduled_mfma_hazard_repair_allows_full_accumulator_forwarding(register_class):
+    accumulator = f"{register_class}[0:3]"
+    assembly = f"""kernel:
+s_nop 3
+; triton_amd_scheduled_mfma
+v_mfma_f32_16x16x32_f16 {accumulator}, v[8:11], a[4:7], 0
+; triton_amd_scheduled_mfma
+v_mfma_f32_16x16x32_f16 {accumulator}, v[8:11], a[4:7], {accumulator}
+"""
+
+    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
+
+    assert repaired == assembly
 
 
 def test_scheduled_mfma_hazard_repair_drains_vgpr_result_overwrite():
@@ -2663,11 +2694,13 @@ v_mfma_f32_32x32x16_bf16 {destination}, v[32:35], a[0:3], {accumulator}
 def test_scheduled_mfma_hazard_repair_matches_agpr_parent():
     fixture = Path(__file__).with_name("test_data") / "scheduled_mfma_agpr_parent.raw.amdgcn.gz"
     raw_assembly = gzip.decompress(fixture.read_bytes())
-    assert hashlib.sha256(raw_assembly).hexdigest() == "c6103f4e74043a8dc89314bdfa16136b7835aebc7842703e6828b43a918dd0b8"
+    assert hashlib.sha256(
+        raw_assembly).hexdigest() == "c6103f4e74043a8dc89314bdfa16136b7835aebc7842703e6828b43a918dd0b8"
 
     repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(raw_assembly.decode(), "gfx950")
 
-    assert hashlib.sha256(repaired.encode()).hexdigest() == "fdf629dfd955cab83ca82a43e45233dd3cefcb4cca3dcb74222c2b1d6dde6923"
+    assert hashlib.sha256(
+        repaired.encode()).hexdigest() == "fdf629dfd955cab83ca82a43e45233dd3cefcb4cca3dcb74222c2b1d6dde6923"
 
 
 def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
@@ -3690,7 +3723,9 @@ def test_amd_scheduled_mfma_32x32_compiles_gfx942(elem_ty, persistent):
 @triton.jit
 def _amd_scheduled_mfma_zero_batch_warps_kernel():
     mma: tl.constexpr = tlx.amd_mfma_layout(
-        version=4, instr_shape=[16, 16, 32], transposed=True,
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
         warps_per_cta=[0, 1, 1],
     )
     lhs: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
@@ -3704,8 +3739,10 @@ def _amd_scheduled_mfma_zero_batch_warps_kernel():
 def test_amd_scheduled_mfma_zero_batch_warps_rejected():
     # Build the layout through the DSL to exercise unchecked attribute builders,
     # which do not run the textual parser's attribute validation.
+    # Use one warp so earlier layout checks do not mask the MFMA zero-warp check.
+    source = ASTSource(fn=_amd_scheduled_mfma_zero_batch_warps_kernel, signature={}, constexprs={})
     with pytest.raises(RuntimeError, match="MFMA warpsPerCTA entries must be positive"):
-        compile_for_gfx950(_amd_scheduled_mfma_zero_batch_warps_kernel, signature={}, constexprs={})
+        triton_compile(source, target=GFX950, options={"num_warps": 1})
 
 
 def test_amd_scheduled_mfma_rejects_target_version_mismatch():
@@ -6117,7 +6154,8 @@ def test_amd_scheduled_mfma_output_fragment_orders_atomic_gfx950():
 
     mnemonic = "v_mfma_f32_16x16x32_bf16"
     instructions = [
-        "mfma" if mnemonic in line else "atomic" for line in compiled.asm["amdgcn"].splitlines()
+        "mfma" if mnemonic in line else "atomic"
+        for line in compiled.asm["amdgcn"].splitlines()
         if mnemonic in line or "buffer_atomic_add_f32" in line
     ]
     assert instructions == ["mfma", "atomic", "mfma"]

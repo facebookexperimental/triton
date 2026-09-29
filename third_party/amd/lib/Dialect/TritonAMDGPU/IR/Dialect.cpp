@@ -1038,6 +1038,12 @@ verifyNativeMfmaLayout(Operation *op,
     return op->emitOpError()
            << prefix << "MFMA warpsPerCTA entries must be positive";
 
+  // The textual parser may supply extra unit entries for rank-two layouts.
+  if (mfma.getTilesPerWarp().size() < mfma.getRank())
+    return op->emitOpError()
+           << prefix << "MFMA tilesPerWarp must have at least "
+           << mfma.getRank() << " entries";
+
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
   bool isCDNA3Shape = instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
                       instrShape == ArrayRef<unsigned>({16, 16, 16});
@@ -1097,7 +1103,7 @@ LogicalResult MfmaCommitOp::verify() {
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
       if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
-                                       "input " + Twine(index) + " ")))
+                                        "input " + Twine(index) + " ")))
         return failure();
       // SCF-to-CF turns a runtime loop's yielded accumulator into a loop-header
       // block argument used by the mutually exclusive body and exit blocks.
@@ -1135,7 +1141,7 @@ LogicalResult MfmaCommitOp::verify() {
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
       if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
-                                       "input " + Twine(index) + " ")))
+                                        "input " + Twine(index) + " ")))
         return failure();
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
@@ -1211,16 +1217,14 @@ LogicalResult ScheduledMfmaOp::verify() {
     return emitOpError("result type must exactly match the accumulator type");
   if (rank == 3 && (aTy.getShape()[0] != accTy.getShape()[0] ||
                     bTy.getShape()[0] != accTy.getShape()[0]))
-    return emitOpError(
-        "operand and accumulator batch dimensions must match");
+    return emitOpError("operand and accumulator batch dimensions must match");
   if (aTy.getShape()[rank - 2] != accTy.getShape()[rank - 2] ||
       bTy.getShape()[rank - 1] != accTy.getShape()[rank - 1] ||
       aTy.getShape()[rank - 1] != bTy.getShape()[rank - 2])
     return emitOpError(
         "operand and accumulator matrix shapes are inconsistent");
 
-  auto mfma =
-      dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
+  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
   if (!mfma || mfma.getRank() != rank ||
       !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
       !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
@@ -1248,6 +1252,16 @@ LogicalResult ScheduledMfmaOp::verify() {
         "operand B must use the matching opIdx=1, kWidth=4/8 dot layout");
   if (aDot.getKWidth() != bDot.getKWidth())
     return emitOpError("operand dot layouts must use the same kWidth");
+
+  // A smaller logical K is replicated across the operand layout's tile.
+  // Scheduled MFMA has no compensation for the resulting repeated products.
+  // On CDNA3, kWidth=8 makes that tile span two native K fragments.
+  int64_t kDim = aTy.getShape()[rank - 1];
+  int64_t kGranularity = std::max<int64_t>(
+      instrShape[2], mfma.getInstrShapeForOperand(aDot.getKWidth(), 0)[1]);
+  if (kDim < kGranularity || kDim % kGranularity != 0)
+    return emitOpError(
+        "operand K dimension must contain complete native MFMA fragments");
 
   SmallVector<int64_t> aRep =
       mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
