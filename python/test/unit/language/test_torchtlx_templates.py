@@ -294,22 +294,30 @@ class TestLocalBufferRetention(TestCase):
             with config.patch({"triton.tlx_mode": "force"}):
                 self.assertIsNone(LocalBufferRetention.plan_for(node_schedule))
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for(node_schedule)
+                plans = LocalBufferRetention.plans_for(node_schedule)
 
+        self.assertEqual(len(plans), 2)
+        plan = plans[0]
         self.assertIsNotNone(plan)
         self.assertEqual(plan.reduction_numel, 4096)
-        self.assertEqual(plan.reduction_block, 2048)
-        self.assertEqual(plan.num_warps, 4)
-        self.assertEqual(plan.backend_options, (("waves_per_eu", 4), ))
         self.assertEqual(
-            plan.triton_config,
-            {
-                "XBLOCK": 1,
-                "R0_BLOCK": 2048,
-                "num_warps": 4,
-                "num_stages": 1,
-                "waves_per_eu": 4,
-            },
+            [candidate.triton_config for candidate in plans],
+            [
+                {
+                    "XBLOCK": 1,
+                    "R0_BLOCK": 2048,
+                    "num_warps": 4,
+                    "num_stages": 1,
+                    "waves_per_eu": 4,
+                },
+                {
+                    "XBLOCK": 1,
+                    "R0_BLOCK": 4096,
+                    "num_warps": 8,
+                    "num_stages": 1,
+                    "waves_per_eu": 2,
+                },
+            ],
         )
         self.assertEqual(plan.total_bytes, 8192)
         self.assertEqual(len(plan.buffers), 1)
@@ -449,8 +457,8 @@ class TestLocalBufferRetention(TestCase):
     def test_rejects_local_buffer_overflow(self):
         i, r = sympy.symbols("i r", integer=True)
         dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
-        access = MemoryDep("workspace", 16384 * i + r, (i, r), (128, 16384))
-        first_reduction = self._scheduler_node("first_reduction", is_reduction=True, rnumel=16384)
+        access = MemoryDep("workspace", 65536 * i + r, (i, r), (128, 65536))
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True, rnumel=65536)
         producer = self._scheduler_node("producer", writes=(access, ))
         consumer = self._scheduler_node(
             "consumer",
@@ -459,11 +467,11 @@ class TestLocalBufferRetention(TestCase):
         )
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float32
-        graph.get_numel.return_value = dynamic_rows * 16384
+        graph.get_numel.return_value = dynamic_rows * 65536
 
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for([
+                plans = LocalBufferRetention.plans_for([
                     first_reduction,
                     producer,
                     DisableReduction,
@@ -471,7 +479,7 @@ class TestLocalBufferRetention(TestCase):
                     consumer,
                 ])
 
-        self.assertIsNone(plan)
+        self.assertEqual(plans, ())
 
     def test_rejects_nonmatching_access(self):
         i, r = sympy.symbols("i r", integer=True)
