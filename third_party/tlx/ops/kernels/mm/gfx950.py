@@ -61,6 +61,8 @@ def _register_kernel_impl(  # noqa: TR001
     b_ptr,
     bias_ptr,
     c_ptr,
+    row_sum_ptr,
+    row_sum_sq_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -78,6 +80,8 @@ def _register_kernel_impl(  # noqa: TR001
     GROUP_M: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    WRITE_STATS: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int32)
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
@@ -142,8 +146,23 @@ def _register_kernel_impl(  # noqa: TR001
             eviction_policy="evict_last",
         )
         acc += bias.to(tl.float32)
+    value = acc.to(c_ptr.dtype.element_ty)
+    if WRITE_STATS:
+        value_fp32 = tl.where(mask, value.to(tl.float32), 0.0)
+        stats_offsets = rows * grid_n + pid_n
+        if not IS_RMS_NORM:
+            tl.store(
+                row_sum_ptr + stats_offsets,
+                tl.sum(value_fp32, axis=1),
+                mask=rows < M,
+            )
+        tl.store(
+            row_sum_sq_ptr + stats_offsets,
+            tl.sum(value_fp32 * value_fp32, axis=1),
+            mask=rows < M,
+        )
     output_offsets = idx_m * stride_cm + idx_n * stride_cn
-    tl.store(c_ptr + output_offsets, acc, mask=mask)
+    tl.store(c_ptr + output_offsets, value, mask=mask)
 
 
 def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False):
@@ -171,6 +190,8 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
         b,
         bias_ptr,
         out,
+        out,
+        out,
         m,
         n,
         k,
@@ -183,6 +204,8 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
         out.stride(0),
         out.stride(1),
         ADD_BIAS=bias is not None,
+        WRITE_STATS=False,
+        IS_RMS_NORM=False,
         **config,
         **launch_options,
     )
@@ -536,6 +559,8 @@ def _launch_register(a, b, bias=None, config=None, out=None):
         b,
         bias_ptr,
         out,
+        out,
+        out,
         M,
         N,
         K,
@@ -552,6 +577,8 @@ def _launch_register(a, b, bias=None, config=None, out=None):
     _register_kernel[grid](
         *args,
         ADD_BIAS=bias is not None,
+        WRITE_STATS=False,
+        IS_RMS_NORM=False,
         **launch_options,
     )
     return out
@@ -761,6 +788,8 @@ def a16w16_8wave(
     bias_ptr,
     c_ptr,
     workspace_ptr,
+    row_sum_ptr,
+    row_sum_sq_ptr,
     M,
     N,
     K,
@@ -790,6 +819,8 @@ def a16w16_8wave(
     HAS_N_TAIL: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
+    WRITE_STATS: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Exact partitions use KS; uneven partitions
@@ -1205,8 +1236,49 @@ def a16w16_8wave(
                 other=0.0,
             ).to(tl.float32)
 
-        # Direct store to C.
         et = c_ptr.dtype.element_ty
+        c_tl = acc_tl.to(et)
+        c_bl = acc_bl.to(et)
+        c_tr = acc_tr.to(et)
+        c_br = acc_br.to(et)
+        if WRITE_STATS:
+            top_left = tl.where(m_top & n_left, c_tl.to(tl.float32), 0.0)
+            bot_left = tl.where(m_bot & n_left, c_bl.to(tl.float32), 0.0)
+            top_right = tl.where(m_top & n_right, c_tr.to(tl.float32), 0.0)
+            bot_right = tl.where(m_bot & n_right, c_br.to(tl.float32), 0.0)
+            top_sum_sq = tl.sum(top_left * top_left, axis=1) + tl.sum(
+                top_right * top_right,
+                axis=1,
+            )
+            bot_sum_sq = tl.sum(bot_left * bot_left, axis=1) + tl.sum(
+                bot_right * bot_right,
+                axis=1,
+            )
+            top_stats_offsets = offs_cm_top * num_pid_n + pid_n
+            bot_stats_offsets = offs_cm_bot * num_pid_n + pid_n
+            if not IS_RMS_NORM:
+                tl.store(
+                    row_sum_ptr + top_stats_offsets,
+                    tl.sum(top_left, axis=1) + tl.sum(top_right, axis=1),
+                    mask=offs_cm_top < M,
+                )
+                tl.store(
+                    row_sum_ptr + bot_stats_offsets,
+                    tl.sum(bot_left, axis=1) + tl.sum(bot_right, axis=1),
+                    mask=offs_cm_bot < M,
+                )
+            tl.store(
+                row_sum_sq_ptr + top_stats_offsets,
+                top_sum_sq,
+                mask=offs_cm_top < M,
+            )
+            tl.store(
+                row_sum_sq_ptr + bot_stats_offsets,
+                bot_sum_sq,
+                mask=offs_cm_bot < M,
+            )
+
+        # Direct store to C.
         if TOP_M == 128 and BOTTOM_M == 128 and HALF_N == 128:
             # Stop the wide epilogue-store layout from propagating backward
             # through the extracted tile function. Split-K and the 128 tile keep
@@ -1222,21 +1294,24 @@ def a16w16_8wave(
             # _C_STORE_SIMD_LAYOUT is derived for the 128x128 quadrant, so it only
             # applies to the 256x256 tile; a smaller tile (64x64 quadrant) uses a
             # plain store.
-            L: tl.constexpr = _C_STORE_SIMD_LAYOUT
-            c_tl = tlx.require_layout(acc_tl.to(et), L)
+            L: tl.constexpr = tlx.layout(
+                shape=((16, 4, 8), (8, 4)),
+                stride=((8, 128, 512), (1, 4096)),
+            )
+            c_tl = tlx.require_layout(c_tl, L)
             # Static guard (no device code): the pin must survive coalesce /
             # remove-layout-conversions / AMD optimize-epilogue so the store stays
             # a wide dwordx4. Fails compilation if a future change drops the pin.
             tlx.assert_same_layout(c_tl, L)
             tl.store(c_ptr + c_top_left, c_tl, mask=m_top & n_left)
-            tl.store(c_ptr + c_bot_left, tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
-            tl.store(c_ptr + c_top_right, tlx.require_layout(acc_tr.to(et), L), mask=m_top & n_right)
-            tl.store(c_ptr + c_bot_right, tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
+            tl.store(c_ptr + c_bot_left, tlx.require_layout(c_bl, L), mask=m_bot & n_left)
+            tl.store(c_ptr + c_top_right, tlx.require_layout(c_tr, L), mask=m_top & n_right)
+            tl.store(c_ptr + c_bot_right, tlx.require_layout(c_br, L), mask=m_bot & n_right)
         else:
-            tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left)
-            tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left)
-            tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right)
-            tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right)
+            tl.store(c_ptr + c_top_left, c_tl, mask=m_top & n_left)
+            tl.store(c_ptr + c_bot_left, c_bl, mask=m_bot & n_left)
+            tl.store(c_ptr + c_top_right, c_tr, mask=m_top & n_right)
+            tl.store(c_ptr + c_bot_right, c_br, mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
@@ -1758,6 +1833,8 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         bias_ptr,
         c,
         workspace,
+        c,
+        c,
         M,
         N,
         K,
@@ -1787,6 +1864,8 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         HAS_N_TAIL=N % BN != 0,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        WRITE_STATS=False,
+        IS_RMS_NORM=False,
         num_warps=4 if BM == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,

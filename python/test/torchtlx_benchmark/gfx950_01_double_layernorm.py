@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 NAME = "gfx950_01_double_layernorm"
 CANDIDATE_NAME = "local_buffer_retention"
+CANDIDATE_CODE_MARKERS = ("tlx.local_alloc", "tlx.local_load")
 BASELINE_CONFIG: dict[str, object] = {"triton.tlx_mode": None}
 # Retention is offered as a MultiKernel choice; the default value 0 would
 # compile the candidate into the baseline and make the A/B meaningless.
