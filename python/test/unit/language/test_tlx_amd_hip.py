@@ -144,6 +144,57 @@ def amd_fa_cluster_long_bf16_codegen_gfx950():
     return compiled
 
 
+@pytest.fixture
+def amd_fa_cluster_vector_combine_codegen_gfx950(fresh_triton_cache):
+    batch, heads, n_ctx, head_dim = 1, 64, 4096, 128
+    tensor = MockTensor(torch.bfloat16, (batch, heads, n_ctx, head_dim))
+    strides = (heads * n_ctx * head_dim, n_ctx * head_dim, head_dim, 1)
+    args = (tensor, tensor, tensor, tensor, *strides, *strides, *strides, *strides, batch)
+    common = {
+        "H": heads,
+        "N_CTX": n_ctx,
+        "sm_scale": 1.0 / head_dim**0.5,
+        "BLOCK_M": 256,
+        "BLOCK_N": 32,
+        "BUF_DEPTH": 2,
+        "HEAD_DIM": head_dim,
+        "USE_DIRECT_LOAD": False,
+        "IS_CAUSAL": False,
+        "STATIC_STRIDE_KN": head_dim,
+        "grid": (n_ctx // 256, heads, batch),
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "enable_sched_group_barrier_scheduler": False,
+        "llvm_fn_attrs": "",
+    }
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        baseline = _amd_fa_cluster_module._attn_fwd_cluster_pipeline.warmup(*args, disable_vector_combine=False,
+                                                                            **common)
+        disabled = _amd_fa_cluster_module._attn_fwd_cluster_pipeline.warmup(*args, disable_vector_combine=True,
+                                                                            **common)
+    return baseline, disabled
+
+
+def test_amd_fa_cluster_vector_combine_opt_out_reduces_transfers_gfx950(amd_fa_cluster_vector_combine_codegen_gfx950):
+    baseline, disabled = amd_fa_cluster_vector_combine_codegen_gfx950
+    baseline_asm = baseline.asm["amdgcn"]
+    disabled_asm = disabled.asm["amdgcn"]
+
+    def transfer_count(amdgcn):
+        return amdgcn.count("v_accvgpr_read_b32") + amdgcn.count("v_accvgpr_write_b32")
+
+    def instruction_count(amdgcn):
+        return len(re.findall(r"^\s+[a-z].*", amdgcn, flags=re.MULTILINE))
+
+    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 32
+    assert instruction_count(disabled_asm) < instruction_count(baseline_asm)
+    assert baseline.metadata.disable_vector_combine is False
+    assert disabled.metadata.disable_vector_combine is True
+
+
 def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     a = MockTensor(torch.uint8, (m, k // 2))
