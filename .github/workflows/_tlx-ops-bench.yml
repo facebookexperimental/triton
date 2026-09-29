@@ -25,9 +25,18 @@ on:
         required: true
         type: string
       sha:
-        description: "Commit the wheel was built from; the suite is checked out at it"
+        description: "Commit the wheel was built from"
         required: true
         type: string
+      suite_sha:
+        description: "Commit the suite is checked out at; differs from sha only when backfilling"
+        required: true
+        type: string
+      file_issues:
+        description: "File and close nightly issues; off when backfilling an old wheel"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -48,7 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha }}
+          ref: ${{ inputs.suite_sha }}
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -144,7 +153,7 @@ jobs:
 
   report:
     needs: bench
-    if: always() && needs.bench.outputs.failures != '' && needs.bench.outputs.failures != '[]'
+    if: always() && inputs.file_issues && needs.bench.outputs.failures != '' && needs.bench.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -172,7 +181,7 @@ jobs:
 
   reconcile:
     needs: bench
-    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
+    if: always() && inputs.file_issues && (needs.bench.result == 'success' || needs.bench.result == 'failure')
     permissions:
       contents: read
       issues: write

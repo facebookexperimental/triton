@@ -18,6 +18,10 @@ on:
         description: "Commit that version was built from (required when version is set)"
         required: false
         default: ""
+      suite_sha:
+        description: "Backfill: run the suite from this main commit instead of sha, and file no issues"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -43,6 +47,7 @@ jobs:
     outputs:
       version: ${{ steps.pick.outputs.version }}
       sha: ${{ steps.pick.outputs.sha }}
+      suite_sha: ${{ steps.pick.outputs.suite_sha }}
       wheel_url: ${{ steps.pick.outputs.wheel_url }}
     steps:
       - name: Checkout main
@@ -58,6 +63,7 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SHA: ${{ inputs.sha }}
+          INPUT_SUITE_SHA: ${{ inputs.suite_sha }}
         run: |
           set -euo pipefail
           if [[ -n "${INPUT_VERSION}" ]]; then
@@ -92,10 +98,14 @@ jobs:
           [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SHA}"; exit 1; }
           [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || { echo "not a nightly version: ${VERSION}"; exit 1; }
           git merge-base --is-ancestor "${SHA}" origin/main || { echo "${SHA} is not on main"; exit 1; }
+          SUITE_SHA="${INPUT_SUITE_SHA:-${SHA}}"
+          [[ "${SUITE_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SUITE_SHA}"; exit 1; }
+          git merge-base --is-ancestor "${SUITE_SHA}" origin/main || { echo "${SUITE_SHA} is not on main"; exit 1; }
           echo "Benching ${WHEEL_URL} (${SHA})"
           {
             echo "version=${VERSION}"
             echo "sha=${SHA}"
+            echo "suite_sha=${SUITE_SHA}"
             echo "wheel_url=${WHEEL_URL}"
           } >> "$GITHUB_OUTPUT"
 
@@ -114,6 +124,8 @@ jobs:
       torch_index: https://download.pytorch.org/whl/cu130
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
+      suite_sha: ${{ needs.resolve.outputs.suite_sha }}
+      file_issues: ${{ inputs.suite_sha == '' }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
 
   h100:
@@ -131,6 +143,8 @@ jobs:
       torch_index: https://download.pytorch.org/whl/cu130
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
+      suite_sha: ${{ needs.resolve.outputs.suite_sha }}
+      file_issues: ${{ inputs.suite_sha == '' }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
 
   mi350:
@@ -148,6 +162,8 @@ jobs:
       torch_index: https://download.pytorch.org/whl/rocm7.2
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
+      suite_sha: ${{ needs.resolve.outputs.suite_sha }}
+      file_issues: ${{ inputs.suite_sha == '' }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
 
   prune:
