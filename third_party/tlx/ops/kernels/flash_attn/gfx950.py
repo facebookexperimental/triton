@@ -1439,7 +1439,8 @@ def _attn_inner_pipelined(
     PRESERVE_ALIGNED_CAUSAL_ACC_LAYOUT: tl.constexpr = (EXPLICIT_PV_LAYOUT and not MASK_STEPS and IS_CAUSAL
                                                         and q.shape[0] == 256 and BLOCK_N == 64)
     if (EXPLICIT_PV_LAYOUT32 or EXPLICIT_PV_LAYOUT) and not PRESERVE_ALIGNED_CAUSAL_ACC_LAYOUT:
-        state = SoftmaxState(tlx.release_layout(state.acc), state.l_i, state.m_i)
+        # Keep the handoff removable when an outer branch selects the same MFMA carrier.
+        state = SoftmaxState(tlx.release_layout(state.acc, relaxed=True), state.l_i, state.m_i)
 
     return state
 
@@ -1616,7 +1617,8 @@ def _attn_inner_full2_lazy(
     )
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), token=wait, relaxed=True)
     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
-    return SoftmaxState(tlx.release_layout(acc), state.l_i, state.m_i)
+    # A hard release here forces a 128 KiB relayout when this path joins an MFMA path.
+    return SoftmaxState(tlx.release_layout(acc, relaxed=True), state.l_i, state.m_i)
 
 
 @triton.jit
