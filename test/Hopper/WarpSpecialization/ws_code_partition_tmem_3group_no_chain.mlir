@@ -1,4 +1,4 @@
-// RUN: not --crash triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" 2>&1 | FileCheck %s
+// RUN: not triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" 2>&1 | FileCheck %s
 //
 // A TMEM reuse group with >= 3 buffers must have a unique dependency-chain
 // order over the shared slot, or code partitioning must reject it at compile
@@ -9,7 +9,7 @@
 // orderReuseGroupChain finds no unique order. Without the guard this would fall
 // to the same-block path and emit a WAR making dq wait on dk's release - but dk
 // runs after dq in the same partition -> deadlock. The guard turns it into a
-// compile-time error instead.
+// recoverable compile-time error (pass failure, not an abort) instead.
 //
 // CHECK: TMEM reuse group with >= 3 buffers has no unique dependency-chain order
 // CHECK-SAME: buffer.id=8

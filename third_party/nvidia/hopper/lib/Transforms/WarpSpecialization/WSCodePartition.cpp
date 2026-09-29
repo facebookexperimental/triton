@@ -489,36 +489,44 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     // createBuffer inserts local_store ops in producer order, but TMA store
     // consumers execute in descriptor_store order. Preserve that order for
     // stores to the same descriptor so buffer reuse and wait rotation see the
-    // same sequence on both sides of the channel.
+    // same sequence on both sides of the channel. With early TMA store
+    // lowering the consumer is already an async_tma_copy_local_to_global.
     auto restoreDescriptorStoreProducerOrder = [&]() {
       DenseMap<Operation *, unsigned> opOrder;
       unsigned order = 0;
       for (Operation &op : *block)
         opOrder[&op] = order++;
 
-      auto getDescriptorStore = [](Operation *op) -> tt::DescriptorStoreOp {
+      auto getStoreDesc = [](Operation *op) -> Value {
         if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
-          return store;
+          return store.getDesc();
+        if (auto copy = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op))
+          return copy.getDesc();
+        return nullptr;
+      };
+      auto getDescriptorStore = [&](Operation *op) -> Operation * {
+        if (getStoreDesc(op))
+          return op;
         for (Operation *user : op->getUsers()) {
-          if (auto store = dyn_cast<tt::DescriptorStoreOp>(user))
-            return store;
+          if (getStoreDesc(user))
+            return user;
         }
         return nullptr;
       };
 
-      using StoreChannel = std::pair<tt::DescriptorStoreOp, Channel *>;
+      using StoreChannel = std::pair<Operation *, Channel *>;
       llvm::MapVector<Value, SmallVector<StoreChannel>> channelsByDesc;
       for (auto *channel : channels) {
         Operation *dstOp = channel->getDstOp();
         if (!epilogOps.contains(dstOp))
           continue;
-        auto store = getDescriptorStore(dstOp);
+        Operation *store = getDescriptorStore(dstOp);
         if (!store || store->getBlock() != block)
           continue;
         Operation *srcOp = channel->getSrcOp();
         if (!srcOp || srcOp->getBlock() != block)
           continue;
-        channelsByDesc[store.getDesc()].push_back({store, channel});
+        channelsByDesc[getStoreDesc(store)].push_back({store, channel});
       }
 
       auto canMoveAfter = [](Operation *op, Operation *insertAfter) {
@@ -2444,7 +2452,7 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
 // Lower producers for channels. Here channels are grouped in
 // "channelsGroupedByConsumers". tokenMap tracks the set of tokens for each
 // channel.
-void insertAsyncComm(
+LogicalResult insertAsyncComm(
     triton::FuncOp funcOp,
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -2741,7 +2749,7 @@ void insertAsyncComm(
           << "'). Its producer most likely lives inside a ttng.subtiled_region "
              "whose shared per-tile buffer position was consumed by another "
              "channel; this subtiled-region channel topology is not supported.";
-      llvm_unreachable("insertAsyncComm: null producer for channel");
+      return failure();
     }
     auto producerBlock = frontSrcOp->getBlock();
     Operation *headProducer = nullptr;
@@ -2771,7 +2779,7 @@ void insertAsyncComm(
           << "'). Its consumer most likely lives inside a ttng.subtiled_region "
              "whose shared per-tile buffer position was consumed by another "
              "channel; this subtiled-region channel topology is not supported.";
-      llvm_unreachable("insertAsyncComm: null consumer for channel");
+      return failure();
     }
     auto consumerBlock = frontDstOp->getBlock();
     Operation *headConsumer = nullptr;
@@ -3276,7 +3284,7 @@ void insertAsyncComm(
               }
             }
             os << " ]";
-            llvm::report_fatal_error(llvm::Twine(
+            funcOp.emitError(llvm::Twine(
                 "TMEM reuse group with >= 3 buffers has no unique "
                 "dependency-chain order: the shared TMEM slot's producers and "
                 "consumers are not totally ordered, so a correct reuse barrier "
@@ -3285,6 +3293,7 @@ void insertAsyncComm(
                 "e.g. ensure dk reads dsT before dq overwrites the shared "
                 "slot." +
                 detail));
+            return failure();
           }
           if (verifyReuseGroupCrossPartition(group)) {
             // A5: cross-partition dependency-chain reuse (e.g. FA-bwd
@@ -3373,7 +3382,7 @@ void insertAsyncComm(
                 auto *curConsumer = ordered[i]->getDstOp();
                 if (prevConsumer->getBlock() == curConsumer->getBlock() &&
                     !appearsBefore(prevConsumer, curConsumer)) {
-                  llvm::report_fatal_error(
+                  curConsumer->emitError(
                       "N-buffer reuse group: producer and consumer orderings "
                       "are "
                       "inconsistent. Producer order has channel " +
@@ -3382,6 +3391,7 @@ void insertAsyncComm(
                       ", but consumer order is reversed. This would cause a "
                       "deadlock in the intra-iteration reuse dependency "
                       "chain.");
+                  return failure();
                 }
               }
               // Find masterChannel's position in the ordered list.
@@ -4316,13 +4326,15 @@ void insertAsyncComm(
             auto cbIt =
                 earlyTokenIt->second.consumerBarriers.find(earlyToken.first);
             if (cbIt != earlyTokenIt->second.consumerBarriers.end()) {
-              if (elidedCompletionArrival.contains(earlyChannelForReuseSync))
-                llvm::report_fatal_error(
+              if (elidedCompletionArrival.contains(earlyChannelForReuseSync)) {
+                funcOp.emitError(
                     llvm::Twine(
                         "intra-iteration reuse sync would wait on channel ") +
                     llvm::Twine(earlyChannelForReuseSync->uniqID) +
                     "'s consumer barrier, but its completion arrival was "
                     "elided by the whole-TMEM-overwrite proof");
+                return failure();
+              }
               Value cbar =
                   getBarrierForPipelineStage(builder, cbIt->second, bufferIdx);
               Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
@@ -4386,13 +4398,15 @@ void insertAsyncComm(
             auto wcbIt =
                 wrapTokenIt->second.consumerBarriers.find(wrapToken.first);
             if (wcbIt != wrapTokenIt->second.consumerBarriers.end()) {
-              if (elidedCompletionArrival.contains(wrapCh))
-                llvm::report_fatal_error(
+              if (elidedCompletionArrival.contains(wrapCh)) {
+                funcOp.emitError(
                     llvm::Twine(
                         "wrap-around reuse sync would wait on channel ") +
                     llvm::Twine(wrapCh->uniqID) +
                     "'s consumer barrier, but its completion arrival was "
                     "elided by the whole-TMEM-overwrite proof");
+                return failure();
+              }
               Value cbar =
                   getBarrierForPipelineStage(builder, wcbIt->second, bufferIdx);
               Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
@@ -4959,6 +4973,7 @@ void insertAsyncComm(
     for (auto &token : commChannel.second.tokens)
       removeTokenfNotUsed(token.second);
   }
+  return success();
 }
 
 void foldLocalLoads(triton::FuncOp funcOp) {
@@ -5776,7 +5791,7 @@ static void lowerMultiTaskSubtiledRegions(triton::FuncOp funcOp) {
 
 } // namespace
 
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAllocChannels(channelsOrigin, funcOp);
@@ -5785,7 +5800,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     channels.push_back(c.get());
   }
   if (channels.empty()) {
-    return;
+    return success();
   }
   SmallVector<Channel *> orderedChannels;
   orderedChannels = channels;
@@ -5968,7 +5983,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     if (group->channels.empty())
       continue;
     if (group->channels[0]->getNumBuffers() > 1 && !verifyReuseGroup1(group))
-      llvm::report_fatal_error(
+      return funcOp.emitError(
           "SMEM circular reuse group is ill-formed: a multi-buffered reuse "
           "group requires all producers/consumers of its logical buffers to be "
           "in the same basic block");
@@ -6216,9 +6231,10 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
 
   // Step 8: add async communication ops (ProducerAcquire etc). Also lower
   // TMA loads.
-  insertAsyncComm(funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
-                  barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels,
-                  &config);
+  if (failed(insertAsyncComm(
+          funcOp, channelsGroupedByConsumers, orderedChannels, tokenMap,
+          barrierAllocMap, bufferMap, copyOpMap, regionsWithChannels, &config)))
+    return failure();
   LLVM_DEBUG({
     LDBG("\n\nwith SyncOps");
     funcOp.dump();
@@ -6254,6 +6270,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSCODEPARTITION
@@ -6288,7 +6305,10 @@ public:
         signalPassFailure();
         return;
       }
-      doCodePartition(funcOp, numBuffers);
+      if (failed(doCodePartition(funcOp, numBuffers))) {
+        signalPassFailure();
+        return;
+      }
     }
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
