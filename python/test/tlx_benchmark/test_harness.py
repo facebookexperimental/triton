@@ -524,6 +524,17 @@ def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypa
     assert denoise._amd_numa_node(7) is None
 
 
+def test_gpu_uuid_reads_the_physical_index_not_torchs(monkeypatch):
+    from _harness import denoise
+
+    # nvidia-smi numbers physical GPUs whatever the visibility variable says;
+    # with GPU 4 pinned, torch knows it only as device 0.
+    monkeypatch.setattr(denoise, "_smi", lambda args: "GPU-physical-4" if args[:2] == ["-i", "4"] else None)
+
+    assert denoise.gpu_uuid(4) == "GPU-physical-4"
+    assert denoise.gpu_uuid(5) is None
+
+
 def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
     import _harness.denoise as denoise_mod
     from _harness.denoise import NVIDIA, Device
@@ -611,7 +622,8 @@ def test_a_missing_extra_key_renders_as_absent_not_as_a_crash():
     result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]), extra={})
     # The data row, not the dashed separator: the cell itself must be a dash.
     row = report.table([result], (("Mtok/s", "mtokens_per_s"), )).splitlines()[2]
-    assert row.endswith("-  ok")
+    # ... <extra cell>  <status>  <best config>
+    assert row.split()[-3:] == ["-", "ok", "-"]
 
 
 # --------------------------------------------------------------------------
@@ -710,12 +722,13 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     expected = {
         "triton.tlx.ops.kernels.addmm._shapes": {
             "gfx942": ("gfx942_1", ),
-            "gfx950": ("gfx950_1", ),
+            "gfx950": ("gfx950_all", ),
         },
-        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
+            "gfx950": ("gfx950_1", ),
         },
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {"sm100": ("sm100_1", )},
         "triton.tlx.ops.kernels.hstu_attn._shapes": {
@@ -738,8 +751,16 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         assert all(pattern.fullmatch(suite.name) for suite in registry.suites)
 
     mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
-    assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx950_2")
+    assert mm.suite("gfx942_2").includes == ("gfx950_2", )
+    assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
+    assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+    addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
+    assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
+
+    bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
+    assert bmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
 def test_focus_suite_selection_rejects_unknown_names():
@@ -802,6 +823,19 @@ def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
         assert case.key.count("/") >= 3
 
 
+def test_flash_attn_gfx950_has_runnable_focus_and_synthetic_shapes(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_flash_attn")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+
+    focus = bench.shapes()
+    synthetic = bench.shapes(synthetic=True)
+    assert focus
+    assert synthetic
+    assert all(shape.dtype == "bf16" for shape in (*focus, *synthetic))
+
+
 def test_space_resolves_to_each_ops_own_default():
     import importlib
 
@@ -862,6 +896,53 @@ def test_suite_shape_listing_shows_typed_shapes():
     bench = type("Bench", (), {"SHAPE_SUITES": FocusRegistry("mm", (suite, ), {"sm100": ("baseline", )})})
 
     assert driver.suite_shape_listing(bench, "baseline") == "baseline (2 shapes)\n(1, 2)\n(3, 4)"
+
+
+# --------------------------------------------------------------------------
+# driver: the best-config column
+# --------------------------------------------------------------------------
+
+
+def test_a_config_is_abbreviated_whichever_tile_spelling_a_kernel_uses():
+    from _harness import driver
+
+    config = triton.Config({"BLOCK_M": 128, "BLOCK_SIZE_N": 256, "SPLIT_K": 2}, num_warps=8, num_stages=3)
+    assert driver._fmt_config(config) == "BM=128 BN=256 SPLIT_K=2 w8 s3"
+
+
+def test_every_autotuned_kernel_a_case_launches_is_recorded(monkeypatch):
+    """The column is the harness's, not an op's: whatever ran is what is named."""
+    import types
+
+    from triton.runtime.autotuner import Autotuner
+
+    from _harness import driver
+
+    stub = lambda self, *a, **k: None  # noqa: E731
+    monkeypatch.setattr(Autotuner, "run", stub)
+
+    def attn_fwd():
+        pass
+
+    def attn_bwd():
+        pass
+
+    captured: dict = {}
+    with driver._record_configs(captured):
+        for fn, warps in ((attn_fwd, 4), (attn_bwd, 8)):
+            Autotuner.run(
+                types.SimpleNamespace(base_fn=fn, best_config=triton.Config({"BLOCK_M": 64}, num_warps=warps,
+                                                                            num_stages=2)))
+    assert Autotuner.run is stub, "the patch must not outlive the launch"
+    assert driver._render_configs(captured) == "attn_fwd: BM=64 w4 s2 | attn_bwd: BM=64 w8 s2"
+
+
+def test_an_op_whose_kernels_are_not_autotuned_reports_no_config():
+    from _harness import driver, report
+
+    assert driver._render_configs({}) is None
+    result = Result(case=_case(), status=Status.OK, tlx=summarize([1.0]))
+    assert report.table([result]).splitlines()[2].endswith("-")
 
 
 # --------------------------------------------------------------------------

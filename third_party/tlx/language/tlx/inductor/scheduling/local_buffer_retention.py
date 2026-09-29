@@ -26,7 +26,7 @@ from torch._inductor.codegen.triton import (
     triton_type,
 )
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, Reduction
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 from torch._inductor.utils import get_dtype_size, IndentedBuffer
 from torch._inductor.virtualized import V
@@ -234,6 +234,7 @@ class LocalBufferRetention:
             return None
 
         reductions: list[SchedulerNode] = []
+        reduction_output_names: OrderedSet[str] = OrderedSet()
         for scheduled_node in scheduled_nodes:
             for node in scheduled_node.get_nodes():
                 if not node.is_reduction():
@@ -245,6 +246,12 @@ class LocalBufferRetention:
                 if node.has_strict_reduction():
                     return None
                 reductions.append(node)
+                if isinstance(node.node.data, Reduction):
+                    reduction_output_names.update(
+                        dep.name
+                        for dep in node.read_writes.writes
+                        if isinstance(dep, MemoryDep) and dep.mode is None
+                    )
 
         if not reductions:
             return None
@@ -276,6 +283,10 @@ class LocalBufferRetention:
         used_bytes = 0
 
         for name in sorted(writes.keys() & reads.keys()):
+            # TritonKernel.store_reduction() bypasses store(), so this subclass
+            # cannot redirect reduction outputs to LDS yet.
+            if name in reduction_output_names:
+                continue
             write_phases = sorted(writes[name])
             read_phases = sorted(reads[name])
             for store_phase in write_phases:

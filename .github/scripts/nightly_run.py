@@ -72,7 +72,7 @@ def emit(**kv):
 
 def base_version():
     m = re.search(r'^TRITON_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"', open("setup.py").read(), re.M)
-    return m.group(1) if m else "3.8.0"
+    return m.group(1) if m else "3.9.0"
 
 
 def main():

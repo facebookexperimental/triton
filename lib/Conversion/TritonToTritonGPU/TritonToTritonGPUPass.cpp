@@ -675,8 +675,13 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
 // tensors in for Triton object specific tracing operations in which case we
 // would need to fill in the OpConversionPattern
 void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
-                            RewritePatternSet &patterns) {
+                         RewritePatternSet &patterns,
+                         TritonGPUConversionTarget &target) {
   MLIRContext *context = patterns.getContext();
+  target.addDynamicallyLegalOp<triton::amdgpu::AssumeUniformOp>(
+      [&typeConverter](triton::amdgpu::AssumeUniformOp op) {
+        return typeConverter.isLegal(op.getOperation());
+      });
   patterns.add<GenericOpPattern<triton::gpu::WarpVoteOp>>(typeConverter,
                                                           context);
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
@@ -948,15 +953,18 @@ public:
     FuncArgRenamer renamer;
     populateFunctionTypeConversions(typeConverter, renamer, patterns);
     populateTritonPatterns(typeConverter, patterns, numCTAs);
-    populateTLXPatterns(typeConverter, patterns);
+    populateTLXPatterns(typeConverter, patterns, target);
     // TODO: can we use
     //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
     populateSCFPatterns(typeConverter, patterns);
     populateCFPatterns(typeConverter, patterns);
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
-    if (failed(applyPartialConversion(op, target, std::move(patterns))))
-    return signalPassFailure();
+    ConversionConfig config;
+    config.allowPatternRollback = false;
+    if (failed(
+            applyPartialConversion(op, target, std::move(patterns), config)))
+      return signalPassFailure();
   }
 
   void runOnOperation() override {

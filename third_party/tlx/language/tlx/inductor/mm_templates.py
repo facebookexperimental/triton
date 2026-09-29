@@ -4,7 +4,7 @@ from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
 
-from ..hw.target import is_rocm
+from ..hw.target import current_target, is_rocm
 
 # TLX kernel .jinja templates ship alongside this module (packaged as buck
 # resources of the triton beta python library), so load them from here rather
@@ -163,13 +163,15 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 )
 
 
-def append_tlx(templates, op_name="mm"):
+def append_tlx(templates, op_name, kernel_inputs):
     # Import registry to trigger heuristic registration via decorators
     from . import registry  # noqa: F401
 
     if is_rocm():
         return _append_tlx_amd(templates, op_name)
-    return _append_tlx_nvidia(templates, op_name)
+    if current_target().is_blackwell:
+        return _append_tlx_blackwell(templates, op_name)
+    return templates
 
 
 def _append_tlx_amd(templates, op_name):
@@ -221,9 +223,7 @@ def _append_tlx_amd(templates, op_name):
     return templates
 
 
-def _append_tlx_nvidia(templates, op_name):
-    # This helper runs for every NVIDIA target, but only plain mm is eligible
-    # for its Blackwell-specific TLX template. Other operations keep their choices.
+def _append_tlx_blackwell(templates, op_name):
     if op_name != "mm":
         return templates
     templates.append(blackwell_gemm_ws_template)

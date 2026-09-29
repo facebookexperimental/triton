@@ -103,7 +103,7 @@ class TLXInductorChoices(InductorChoices):
 
         templates = list(templates)
         kwarg_overrides = kwarg_overrides or {}
-        append_tlx(templates, op_name)
+        append_tlx(templates, op_name, kernel_inputs)
 
         input_tensors = kernel_inputs.nodes()
         if len(input_tensors) < 2:

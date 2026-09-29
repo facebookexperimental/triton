@@ -577,7 +577,8 @@ def async_dot_scaled(
     Inputs
     ------
     A : tlx.buffered_tensor
-        Tile of matrix A, resident in shared memory (SMEM).
+        Tile of matrix A, resident in shared memory (SMEM) or tensor memory
+        (TMEM).
 
     B : tlx.buffered_tensor
         Tile of matrix B, resident in shared memory.
@@ -587,19 +588,21 @@ def async_dot_scaled(
         and output when `use_acc=True`.
 
     A_scale : tlx.buffered_tensor
-        Per-tile or per-subgroup scaling factors for operand A. Typically encoded
-        as FP8 (E8M0) and stored in SMEM or TMEM. The storage type is automatically
-        detected from the tensor's storage attribute.
+        Per-block scaling factors for operand A, stored in SMEM or TMEM. MXFP4
+        uses E8M0 scales over 32 values. NVFP4 uses block-16 scales, commonly
+        E4M3FN; integer block-16 scales select the UE5M3 encoding. Lowering
+        infers the scale kind and vector size from the tensor's element type and
+        shape.
 
     A_format : str
-        FP8 format string for operand A (e.g., "e4m3", "e5m2"). Determines how
-        the hardware interprets and scales FP8 inputs during MMA.
+        Element format string for operand A: "e2m1" for packed FP4, or "e4m3"
+        and "e5m2" for FP8.
 
     B_scale : tlx.buffered_tensor
         Scaling factors for operand B, same semantics as A_scale.
 
     B_format : str
-        FP8 format string for operand B.
+        Element format string for operand B, with the same options as A_format.
 
     use_acc : tl.constexpr | tl.tensor, optional
         If True, performs an accumulate (D = A@B + D).

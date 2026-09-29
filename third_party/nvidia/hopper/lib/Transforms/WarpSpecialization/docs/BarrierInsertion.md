@@ -140,6 +140,13 @@ inner MMA flips a barrier whose accumulation counter advances only once per
 outer transaction; a skipped persistent iteration can expose the phase skew as
 a deadlock on the next valid tile.
 
+If the same outer-produced operand is consumed by multiple sequential sibling
+loops, the final sibling may have zero iterations. In that case an inline
+completion on its last MMA cannot provide the outer-cadence EMPTY transition.
+AutoWS instead emits one `tcgen5.commit` after the final sibling loop. The
+commit follows all MMAs issued by any nonempty sibling and executes even when
+the final sibling is empty.
+
 ## Path for gen5 as Producer (`producerBarrier` set)
 
 When the **producer** is gen5, `desyncTCGen5MMAOp()` is called with

@@ -137,6 +137,27 @@
             use_acc=False,
         )</code></pre>
 <p><strong>Note:</strong> Multibuffering is automatically cancelled for scale buffers since TMEM scales don't support multibuffering. 3D allocations (1×M×K) are automatically flattened to 2D (M×K).</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.tmem_shift(buffer)</code> <strong>[sm100]</strong></div></div>
+<p>Shift a mutable tensor-memory buffer in place with Blackwell <code>tcgen05.shift.down</code> instructions. Within each 32-row TMEM group, destination row <code>r</code> receives the previous contents of source row <code>r + 1</code> for <code>r</code> in 0 through 30; destination row 31 retains its previous contents.</p>
+<p>The instruction completes asynchronously. Call <code>tlx.tcgen05_commit</code> with an mbarrier after the shift, then wait on that barrier before loading or otherwise consuming the buffer. The buffer must be a mutable rank-2 TMEM allocation using the standard tensor-memory encoding. It must occupy exactly 128 physical TMEM rows, and its physical column count must be a multiple of 8. The compiler emits one shift instruction per 32-byte column segment.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>buffer</code>: Mutable rank-2 tensor-memory buffer to shift in place</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">    buffers = tlx.local_alloc(
+        (128, 16),
+        tl.float32,
+        tl.constexpr(1),
+        tlx.storage_kind.tmem,
+    )
+    buffer = tlx.local_view(buffers, 0)
+    barriers = tlx.alloc_barriers(tl.constexpr(1))
+    barrier = tlx.local_view(barriers, 0)
+
+    tlx.local_store(buffer, values)
+    tlx.tmem_shift(buffer)
+    tlx.tcgen05_commit(barrier)
+    tlx.barrier_wait(barrier, tl.constexpr(0))
+    shifted = tlx.local_load(buffer)</code></pre>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot_wait(pendings, acc)</code> <strong>[sm90+]</strong></div></div>
 <p>Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.</p>
 <p>Example:</p>

@@ -557,7 +557,7 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
     data to multiple CTAs in the cluster.
   }];
   let arguments = (ins LLVM_AnyPointer:$ptr, I1:$mask, LLVM_Type:$falseVal,
-      Optional<I16>:$multicastMask,
+      Optional<I32>:$multicastMask,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "::mlir::triton::CacheModifier::NONE">:$cache,
       DefaultValuedAttr<BoolAttr, "false">:$forceNoAlias);
@@ -712,7 +712,7 @@ def InThreadTransposeOp : TT_AMDGPU_Op<"in_thread_transpose", [Pure]> {
 //===----------------------------------------------------------------------===//
 
 def LocalLoadPackedTransposedOp
-    : TT_AMDGPU_Op<"local_load_packed_tranposed", [LocalLoadTrait]> {
+    : TT_AMDGPU_Op<"local_load_packed_transposed", [LocalLoadTrait]> {
   let summary = "Load a transposed packed tensor from shared memory into a "
                 "distributed tensor";
   let description = [{

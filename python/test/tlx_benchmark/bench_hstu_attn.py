@@ -68,7 +68,7 @@ def prepare(case: Case, space: str) -> Prepared:
     tokens = int(offsets[-1])
 
     tlx_fwd = lambda: tlx_hstu_attn(  # noqa: E731
-        q, k, v, offsets, max_seq_len, attn_scale, alpha=alpha, causal=causal, arch=driver.arch(), space=space)
+        q, k, v, offsets, max_seq_len, attn_scale, alpha=alpha, causal=causal, space=space)
     ref_fwd = lambda: triton_hstu_mha(  # noqa: E731
         max_seq_len, alpha, q, k, v, offsets, attn_scale)
     # `tokens` is what a ragged batch actually carried, which the label's

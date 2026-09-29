@@ -6,12 +6,10 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32,
                    "ttg.threads-per-warp" = 64 : i32} {
   // The first address is base + one f16, so axis analysis can only guarantee
-  // 2-byte alignment. gfx950 may still use the four contiguous elements owned
-  // by each thread; older targets retain scalar contiguity.
+  // 2-byte alignment. gfx942 and gfx950 may still use the four contiguous
+  // elements owned by each thread.
   // GFX942-LABEL: @plain_unaligned_load
-  // GFX942: amdg.buffer_load
-  // GFX942-NOT: contiguity
-  // GFX942: tt.return
+  // GFX942: amdg.buffer_load {{.*}} {contiguity = 4 : i32}
   // GFX950-LABEL: @plain_unaligned_load
   // GFX950: amdg.buffer_load {{.*}} {contiguity = 4 : i32}
   tt.func @plain_unaligned_load(
@@ -63,9 +61,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32,
                    "ttg.threads-per-warp" = 64 : i32} {
   // An aligned mask permits one predicate for all four loaded elements.
   // GFX942-LABEL: @aligned_mask_unaligned_load
-  // GFX942: amdg.buffer_load
-  // GFX942-NOT: contiguity
-  // GFX942: tt.return
+  // GFX942: amdg.buffer_load {{.*}} {contiguity = 4 : i32}
   // GFX950-LABEL: @aligned_mask_unaligned_load
   // GFX950: amdg.buffer_load {{.*}} {contiguity = 4 : i32}
   tt.func @aligned_mask_unaligned_load(

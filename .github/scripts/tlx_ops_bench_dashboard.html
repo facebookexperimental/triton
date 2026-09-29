@@ -1,0 +1,844 @@
+<!doctype html>
+<!-- Rendered by .github/scripts/tlx_ops_bench_dashboard.py render; edit that script's template, not the output. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tlx.ops nightly performance</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface-1: #fcfcfb; --text-primary: #0b0b0b; --text-secondary: #52514e;
+  --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --good-text: #006300;
+  --banner: var(--surface-1);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767; --good-text: #0ca30c; --banner: var(--surface-1);
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767; --good-text: #0ca30c; --banner: var(--surface-1);
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.viz-root { background: var(--page); color: var(--text-primary); min-height: 100vh;
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1120px; margin: 0 auto; padding: 24px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 2px; }
+.sub { color: var(--text-secondary); margin: 0; }
+a { color: var(--series-1); }
+.banner { background: var(--banner); border: 1px solid var(--ring); border-radius: 8px; padding: 8px 12px; margin: 16px 0;
+  color: var(--text-secondary); }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+label.ctl { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+select, button { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 4px 8px; }
+button { cursor: pointer; }
+.spacer { flex: 1; }
+.tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 12px; }
+.tile .k { color: var(--text-secondary); font-size: 12px; }
+.tile .v { font-size: 26px; font-weight: 600; }
+.card { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card .sub { font-size: 12px; margin-bottom: 8px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 4px 0 8px; }
+.legend button { border: none; background: none; padding: 2px 4px; color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+.legend button[aria-pressed="false"] { opacity: 0.4; }
+.key { width: 16px; height: 2px; display: inline-block; border-radius: 1px; }
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+svg .direct { fill: var(--text-secondary); font-size: 12px; }
+.chart { position: relative; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--ring);
+  border-radius: 6px; padding: 8px 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); font-size: 12px; display: none; min-width: 180px; z-index: 5; }
+.tip .h { color: var(--text-secondary); margin-bottom: 4px; }
+.tip .r { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.tip .r b { font-variant-numeric: tabular-nums; }
+.tip .nm { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--text-secondary); font-weight: 600; cursor: pointer; user-select: none; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.st { display: inline-flex; gap: 4px; align-items: center; font-weight: 600; white-space: nowrap; }
+.st i { font-style: normal; display: inline-block; width: 16px; height: 16px; border-radius: 50%; color: #fff;
+  font-size: 11px; line-height: 16px; text-align: center; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chips button[aria-pressed="true"] { border-color: var(--text-primary); }
+.more { margin-top: 8px; }
+.note { color: var(--muted); font-size: 12px; }
+.fold summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; }
+.fold summary::-webkit-details-marker { display: none; }
+.fold summary::before { content: "▸"; color: var(--muted); font-size: 12px; transition: transform 0.15s; }
+.fold[open] summary::before { transform: rotate(90deg); }
+.fold summary h2 { margin: 0; }
+.fold[open] summary { margin-bottom: 6px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 12px; }
+.kv dt { color: var(--text-secondary); }
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.step { margin: 12px 0; }
+.step h3 { font-size: 13px; margin: 0 0 4px; }
+.step p { margin: 0 0 6px; color: var(--text-secondary); font-size: 13px; }
+.code { position: relative; }
+.code pre { background: var(--page); border: 1px solid var(--ring); border-radius: 6px; padding: 10px 12px; margin: 0;
+  overflow-x: auto; white-space: pre; }
+.code button { position: absolute; top: 6px; right: 6px; font-size: 12px; padding: 2px 8px; }
+.inputs { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0 10px; padding: 6px 10px;
+  background: var(--page); border: 1px solid var(--ring); border-radius: 6px; font-size: 13px; }
+.inputs .fixed { color: var(--muted); font-size: 12px; }
+@media (max-width: 800px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<main>
+  <h1>tlx.ops nightly performance</h1>
+  <p class="sub">TLX kernels raced against each op's reference on the fbtriton nightly wheel. A case under 0.9× is PIP.
+    <a href="../">FBTriton site</a></p>
+  <div class="banner" id="banner"></div>
+
+  <div class="row" role="group" aria-label="Filters">
+    <label class="ctl">Nights <select id="range"><option value="7">Last 7</option><option value="14">Last 14</option>
+      <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
+    <label class="ctl">Platform <select id="platform"></select></label>
+    <label class="ctl">Op <select id="op"></select></label>
+    <label class="ctl">Direction <select id="dir"><option value="all">fwd + bwd</option><option value="fwd">fwd</option>
+      <option value="bwd">bwd</option></select></label>
+    <label class="ctl">Dtype <select id="dtype"></select></label>
+    <label class="ctl">Group by <select id="group"></select></label>
+    <span class="spacer"></span>
+    <button id="theme" type="button">Toggle theme</button>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section class="card">
+    <h2 id="trend-title"></h2>
+    <p class="sub" id="trend-sub"></p>
+    <div class="inputs-slot"></div>
+    <div class="legend" id="trend-legend"></div>
+    <div class="chart" id="trend"><div class="tip"></div></div>
+  </section>
+
+  <section class="card">
+    <h2 id="dist-title"></h2>
+    <p class="sub" id="dist-sub"></p>
+    <div class="inputs-slot"></div>
+    <div class="chart" id="dist"><div class="tip"></div></div>
+  </section>
+
+  <section class="card">
+    <h2 id="summary-title"></h2>
+    <div class="inputs-slot"></div>
+    <div id="summary"></div>
+  </section>
+
+  <section class="card">
+    <h2 id="table-title"></h2>
+    <div class="inputs-slot"></div>
+    <div class="row" style="margin: 8px 0"><div class="chips" id="chips"></div></div>
+    <div id="table"></div>
+  </section>
+
+  <details class="card fold">
+    <summary><h2>Version info</h2></summary>
+    <p class="sub" id="ver-sub"></p>
+    <dl class="kv" id="ver-kv"></dl>
+    <div id="ver-ops"></div>
+  </details>
+
+  <details class="card fold">
+    <summary><h2>Run it yourself</h2></summary>
+    <p class="sub" id="howto-sub"></p>
+    <div id="howto"></div>
+  </details>
+</main>
+</div>
+<script>
+(() => {
+  const FLOOR = 0.9;
+  const PLATFORMS = [["b200", "B200"], ["h100", "H100"], ["mi350", "MI350"]];
+
+  const RAW = /*__DATA__*/null;
+  const STATUS_OF = {o: "ok", n: "noisy", p: "pip", e: "error"};
+  // Expand the compact data (see page_data() in tlx_ops_bench_dashboard.py) into per-night case lists.
+  function decode(raw) {
+    const platforms = {};
+    let date = null;
+    for (const [name, p] of Object.entries((raw && raw.platforms) || {})) {
+      const describe = (op, i) => {
+        const [params, d, dt] = p.ops[op].cases[i];
+        return {p: params, l: Object.entries(params).map(([k, v]) => `${k}=${v}`).join(" "), d, dt};
+      };
+      const history = p.nights.map((night) => ({date: night.date, ops: Object.fromEntries(Object.keys(p.ops).map((op) =>
+        [op, {cases: (night.ops[op] || []).flatMap((cell, i) => (cell
+          ? [{...describe(op, i), s: STATUS_OF[cell[0]], x: cell[1], t: cell[2], r: cell[3], n: cell[4] || ""}] : []))}]))}));
+      const last = history[history.length - 1];
+      platforms[name] = {...p, history, latest: Object.fromEntries(Object.entries(p.ops).map(([op, o]) =>
+        [op, {ref: o.ref, space: o.space, cold: o.cold, cases: last.ops[op].cases}]))};
+      if (!date || last.date > date) date = last.date;
+    }
+    return {platforms, date, repo: (raw && raw.repo) || "facebookexperimental/triton", tag: (raw && raw.tag) || "tlx-ops-bench"};
+  }
+  const DATA = decode(RAW);
+  const BENCH = {
+    mm: "bench_mm.py", addmm: "bench_addmm.py", flash_attn: "bench_flash_attn.py", flash_attn_mxfp8: "bench_flash_attn_mxfp8.py",
+    hstu_attn_dev: "bench_hstu_attn.py", kimi_delta_attention: "bench_kda.py", kda_paged_prefill: "bench_kda_prefill.py",
+    kda_recurrent_decode: "bench_kda_decode.py",
+  };
+  const REPO = `https://github.com/${DATA.repo}`;
+  const [OWNER, NAME] = DATA.repo.split("/");
+  const STATUS = {
+    ok: {label: "ok", icon: "✓", color: "var(--good)"},
+    noisy: {label: "noisy", icon: "~", color: "var(--warning)"},
+    pip: {label: "PIP", icon: "▼", color: "var(--serious)"},
+    error: {label: "ERROR", icon: "✕", color: "var(--critical)"},
+  };
+  const state = {platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
+                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50};
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, attrs = {}, text) => {
+    const n = document.createElementNS(tag === "svg" || attrs.svg ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml", tag);
+    for (const [k, v] of Object.entries(attrs)) if (k !== "svg") n.setAttribute(k, v);
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const s = (tag, attrs) => el(tag, {...attrs, svg: true});
+  const fmt = (v, d = 3, suf = "") => (v === null || v === undefined ? "–" : v.toFixed(d) + suf);
+  const fmtDate = (d) => `${d.slice(4, 6)}/${d.slice(6)}`;
+  const geomean = (xs) => { xs = xs.filter((x) => x > 0); return xs.length ? Math.exp(xs.reduce((a, x) => a + Math.log(x), 0) / xs.length) : null; };
+
+  const plat = () => DATA.platforms[state.platform];
+  // Color follows the op, never its rank: fixed by the op's position among ops with a reference.
+  const speedupOps = () => Object.keys(plat().latest).filter((n) => plat().latest[n].ref);
+  // Input filters only exist with one op selected: each op has its own parameters.
+  const matches = (c) => (state.dir === "all" || c.d === state.dir) && (state.dtype === "all" || c.dt === state.dtype)
+    && (state.op === "all" || Object.entries(state.inputs).every(([k, v]) => c.p[k] === v));
+  // Geomeans over the cases the direction and dtype filters keep; errored cases have no trustworthy timing.
+  function aggOf(cases) {
+    const kept = cases.filter(matches), timed = kept.filter((c) => c.s !== "error");
+    return {n: kept.length, speedup: geomean(timed.filter((c) => c.x).map((c) => c.x)), tflops: geomean(timed.map((c) => c.t))};
+  }
+  const sliceName = () => [state.dir !== "all" ? state.dir : "", state.dtype !== "all" ? state.dtype : "",
+    ...(state.op === "all" ? [] : Object.entries(state.inputs).map(([k, v]) => `${k}=${v}`))].filter(Boolean).join(" · ");
+  const colorOf = (op) => `var(--series-${speedupOps().indexOf(op) + 1})`;
+
+  // ---- group by: the trend, the latest-night bars and the summary table split the slice by one key.
+  const OTHER = "other", MAX_GROUPS = 8;
+  const groupLabel = (g = state.group) => ({op: "op", none: "op", dir: "direction", dtype: "dtype"})[g] || g.slice(3);
+  const byValue = (a, b) => (isNaN(a) || isNaN(b) ? String(a).localeCompare(String(b)) : a - b);
+  const scopeOps = () => (state.op === "all" ? Object.keys(plat().latest) : [state.op]);
+  function groupOptions() {
+    if (state.op === "all") return ["op", "dir", "dtype"];
+    const cases = plat().latest[state.op].cases;
+    const keys = [...new Set(cases.flatMap((c) => Object.keys(c.p)))].filter((k) => new Set(cases.map((c) => c.p[k])).size > 1);
+    return ["none", "dir", "dtype", ...keys.map((k) => `in.${k}`)];
+  }
+  function groupOf(c, op) {
+    const g = state.group;
+    return g === "op" || g === "none" ? op : g === "dir" ? c.d : g === "dtype" ? c.dt : c.p[g.slice(3)];
+  }
+  // Groups in a fixed order (ops in catalog order, values sorted), from the unfiltered latest night, so a group keeps
+  // its color while the filters change. Past MAX_GROUPS the smallest share one "other" series.
+  function groupList(withoutRef = false) {
+    const L = plat().latest;
+    if (state.group === "op" || state.group === "none") return state.op !== "all" ? [state.op] : withoutRef ? Object.keys(L) : speedupOps();
+    const all = [...new Set(scopeOps().flatMap((op) => L[op].cases.map((c) => groupOf(c, op))))].filter((v) => v !== undefined).sort(byValue);
+    if (all.length <= MAX_GROUPS) return all;
+    const size = (v) => scopeOps().reduce((n, op) => n + L[op].cases.filter((c) => groupOf(c, op) === v).length, 0);
+    const keep = new Set([...all].sort((a, b) => size(b) - size(a)).slice(0, MAX_GROUPS - 1));
+    return [...all.filter((v) => keep.has(v)), OTHER];
+  }
+  // One night's cases in group g (filters are applied by aggOf / matches, not here).
+  function groupCases(ops, g, groups) {
+    return scopeOps().flatMap((op) => (ops[op] ? ops[op].cases : []).filter((c) => {
+      const v = groupOf(c, op);
+      return g === OTHER ? !groups.includes(v) : v === g;
+    }));
+  }
+  const groupName = (g) => (g === OTHER ? "other" : state.group.startsWith("in.") ? `${state.group.slice(3)}=${g}` : g);
+  const colorOfGroup = (g, groups) => (g === OTHER ? "var(--muted)"
+    : state.group === "op" || state.group === "none" ? colorOf(g) : `var(--series-${groups.indexOf(g) + 1})`);
+
+  function statusBadge(st) {
+    const m = STATUS[st];
+    const span = el("span", {class: "st"});
+    const i = el("i", {"aria-hidden": "true"}, m.icon);
+    i.style.background = m.color;
+    span.append(i, document.createTextNode(m.label));
+    return span;
+  }
+
+  function banner() {
+    const b = $("banner");
+    b.textContent = "";
+    const link = (href, text) => { const a = el("a", {href}, text); return a; };
+    const p = plat();
+    b.append(document.createTextNode(`Latest: fbtriton ${p.version} on ${state.platform.toUpperCase()}. Produced by the `),
+             link(`${REPO}/actions/workflows/nightly-tlx-ops-bench.yml`, "Nightly TLX.ops Bench"),
+             document.createTextNode(" workflow; per-night summaries are on the "),
+             link(`${REPO}/releases/tag/${DATA.tag}`, DATA.tag), document.createTextNode(" release."));
+  }
+
+  function controls() {
+    const ps = $("platform");
+    ps.textContent = "";
+    for (const [k, v] of PLATFORMS) {
+      const o = el("option", {value: k}, DATA.platforms[k] ? v : `${v} (no data)`);
+      if (!DATA.platforms[k]) o.disabled = true;
+      ps.append(o);
+    }
+    ps.value = state.platform;
+    const os = $("op");
+    os.textContent = "";
+    os.append(el("option", {value: "all"}, "All ops"));
+    for (const n of Object.keys(plat().latest)) os.append(el("option", {value: n}, n));
+    os.value = state.op;
+    const dts = [...new Set(Object.values(plat().latest).flatMap((o) => o.cases.map((c) => c.dt)))].sort();
+    if (state.dtype !== "all" && !dts.includes(state.dtype)) state.dtype = "all";
+    const ds = $("dtype");
+    ds.textContent = "";
+    ds.append(el("option", {value: "all"}, "all"));
+    for (const d of dts) ds.append(el("option", {value: d}, d));
+    ds.value = state.dtype;
+    $("dir").value = state.dir;
+    const opts = groupOptions();
+    if (!opts.includes(state.group)) state.group = opts[0];
+    const gs = $("group");
+    gs.textContent = "";
+    for (const g of opts) gs.append(el("option", {value: g}, g === "none" ? "none" : groupLabel(g)));
+    gs.value = state.group;
+  }
+
+  function latestCases() {
+    const L = plat().latest;
+    return (state.op === "all" ? Object.keys(L) : [state.op]).flatMap((n) => L[n].cases.filter(matches).map((c) => ({...c, op: n})));
+  }
+
+  function inputBar() {
+    const bar = el("div", {class: "inputs", role: "group", "aria-label": "Input filters"});
+    const cases = plat().latest[state.op].cases;
+    const keys = [...new Set(cases.flatMap((c) => Object.keys(c.p)))];
+    const values = (k) => [...new Set(cases.map((c) => c.p[k]))].sort((a, b) => (isNaN(a) || isNaN(b) ? a.localeCompare(b) : a - b));
+    const varying = keys.filter((k) => values(k).length > 1);
+    bar.append(el("span", {class: "ctl"}, "Inputs"));
+    for (const k of varying) {
+      const lab = el("label", {class: "ctl"}, k + " ");
+      const sel = el("select");
+      sel.append(el("option", {value: ""}, "all"));
+      for (const v of values(k)) sel.append(el("option", {value: v}, v));
+      sel.value = state.inputs[k] ?? "";
+      sel.onchange = () => { if (sel.value) state.inputs[k] = sel.value; else delete state.inputs[k]; state.rows = 50; render(); };
+      lab.append(sel);
+      bar.append(lab);
+    }
+    const fixed = keys.filter((k) => !varying.includes(k));
+    if (fixed.length) bar.append(el("span", {class: "fixed"}, "fixed: " + fixed.map((k) => `${k}=${values(k)[0]}`).join(" ")));
+    if (Object.keys(state.inputs).length) {
+      const b = el("button", {type: "button"}, "Clear");
+      b.onclick = () => { state.inputs = {}; render(); };
+      bar.append(el("span", {class: "spacer"}), b);
+    }
+    return bar;
+  }
+
+  // Every chart and table carries the same input controls, so the slice is visible next to the numbers it shapes.
+  function inputs() {
+    for (const slot of document.querySelectorAll(".inputs-slot")) {
+      slot.textContent = "";
+      if (state.op !== "all") slot.append(inputBar());
+    }
+  }
+
+  function tiles() {
+    const cs = latestCases();
+    const count = (st) => cs.filter((c) => c.s === st).length;
+    const sp = state.op === "all" ? geomean(cs.filter((c) => c.s !== "error" && c.x).map((c) => c.x))
+                                  : aggOf(plat().latest[state.op].cases).speedup;
+    const t = $("tiles");
+    t.textContent = "";
+    const add = (k, v, st) => {
+      const d = el("div", {class: "tile"});
+      const kk = el("div", {class: "k"});
+      if (st) kk.append(statusBadge(st)); else kk.textContent = k;
+      d.append(kk, el("div", {class: "v"}, v));
+      t.append(d);
+    };
+    add("Cases (latest night)", String(cs.length));
+    for (const st of Object.keys(STATUS)) add("", String(count(st)), st);
+    add("Geomean speedup", sp ? sp.toFixed(3) + "×" : "–");
+    // Night-over-night change, for a single op (the all-ops figure mixes ops of very different size).
+    const H = plat().history;
+    if (state.op !== "all" && sp && H.length > 1) {
+      const prev = aggOf(H[H.length - 2].ops[state.op].cases).speedup;
+      if (prev) {
+        const pct = (sp / prev - 1) * 100;
+        const d = el("div", {class: "k"}, `${pct >= 0 ? "▲" : "▼"} ${Math.abs(pct).toFixed(1)}% vs previous night`);
+        d.style.color = pct >= 0 ? "var(--good-text)" : "var(--critical)";
+        t.lastChild.append(d);
+      }
+    }
+  }
+
+  // ---- trend: one line per op, crosshair tooltip listing every series at the hovered night.
+  function trend() {
+    const box = $("trend"), tip = box.querySelector(".tip");
+    box.querySelectorAll("svg, .note").forEach((n) => n.remove());
+    const H = plat().history.slice(-state.range);
+    const single = state.op !== "all";
+    const byTflops = single && !plat().latest[state.op].ref;
+    const metric = byTflops ? "tflops" : "speedup";
+    // Per-night aggregates for each group of this slice; a group with nothing in the slice has no line.
+    const groups = groupList();
+    const val = (n, g) => aggOf(groupCases(n.ops, g, groups))[metric];
+    const ops = groups.filter((g) => H.some((n) => val(n, g)));
+    const by = state.group === "op" || state.group === "none" ? "" : `, by ${groupLabel()}`;
+    $("trend-title").textContent = (byTflops ? `${state.op}: TLX TFLOP/s per night` : "Geomean speedup per night") + by;
+    $("trend-sub").textContent = byTflops ? "This op has no reference, so throughput is the number to track."
+                                          : "Solid line: parity with the reference. Dashed line: the 0.9× PIP floor.";
+    const legend = $("trend-legend");
+    legend.textContent = "";
+    if (ops.length > 1) {
+      for (const op of ops) {
+        const b = el("button", {type: "button", "aria-pressed": String(!state.hidden.has(op))});
+        const k = el("span", {class: "key"}); k.style.background = colorOfGroup(op, groups);
+        b.append(k, document.createTextNode(groupName(op)));
+        b.onclick = () => { state.hidden.has(op) ? state.hidden.delete(op) : state.hidden.add(op); render(); };
+        legend.append(b);
+      }
+    }
+    const shown = ops.filter((o) => !state.hidden.has(o));
+    if (!shown.length) {
+      box.prepend(el("p", {class: "note"}, ops.length ? "Every series is hidden; click one in the legend." : `No cases match ${sliceName()}.`));
+      return;
+    }
+    const W = 1040, Hh = 260, m = {l: 48, r: 150, t: 12, b: 28};
+    const vals = shown.flatMap((o) => H.map((n) => val(n, o))).filter((v) => v);
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    if (!byTflops) { lo = Math.min(lo, 0.8); hi = Math.max(hi, 1.05); }
+    // Round tick values: snap the step to 1, 2, 2.5 or 5 times a power of ten.
+    const raw = (hi - lo) / 4 || 1, mag = 10 ** Math.floor(Math.log10(raw));
+    const step = mag * [1, 2, 2.5, 5, 10].find((f) => f * mag >= raw);
+    lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+    const x = (i) => m.l + (W - m.l - m.r) * (i / Math.max(H.length - 1, 1));
+    const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / (hi - lo);
+    const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label": $("trend-title").textContent});
+    for (let v = lo; v <= hi + step / 2; v += step) {
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
+      svg.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? v.toFixed(0) : v.toFixed(2) + "×"));
+    }
+    if (!byTflops) {
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1.5}));
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(FLOOR), y2: y(FLOOR), stroke: "var(--critical)", "stroke-width": 1, "stroke-dasharray": "4 4"}));
+    }
+    // Date labels counted back from the latest night, so the newest one is always labelled.
+    const every = Math.ceil(H.length / 8);
+    H.forEach((n, i) => { if ((H.length - 1 - i) % every === 0)
+      svg.append(el("text", {svg: 1, x: x(i), y: Hh - 8, "text-anchor": "middle"}, fmtDate(n.date))); });
+    const ends = [];
+    for (const op of shown) {
+      const pts = H.map((n, i) => [i, val(n, op)]).filter(([, v]) => v);
+      svg.append(s("polyline", {points: pts.map(([i, v]) => `${x(i)},${y(v)}`).join(" "), fill: "none",
+                                stroke: colorOfGroup(op, groups), "stroke-width": 2, "stroke-linejoin": "round"}));
+      const [li, lv] = pts[pts.length - 1];
+      svg.append(s("circle", {cx: x(li), cy: y(lv), r: 4, fill: colorOfGroup(op, groups),
+                              stroke: "var(--surface-1)", "stroke-width": 2}));
+      ends.push({op, y: y(lv), v: lv});
+    }
+    // Direct labels at the line ends, nudged apart so they never collide.
+    ends.sort((a, b) => a.y - b.y);
+    for (let k = 1; k < ends.length; k++) ends[k].y = Math.max(ends[k].y, ends[k - 1].y + 15);
+    // ...then back up from the bottom, so a crowded stack stays inside the plot instead of spilling onto the dates.
+    for (let k = ends.length - 1; k >= 0; k--) ends[k].y = Math.min(ends[k].y, k === ends.length - 1 ? Hh - m.b : ends[k + 1].y - 15);
+    for (const e of ends)
+      svg.append(el("text", {svg: 1, class: "direct", x: W - m.r + 10, y: e.y + 4},
+                    `${groupName(e.op)}  ${byTflops ? e.v.toFixed(0) : e.v.toFixed(3) + "×"}`));
+    const hair = s("line", {y1: m.t, y2: Hh - m.b, stroke: "var(--muted)", "stroke-width": 1, visibility: "hidden"});
+    svg.append(hair);
+    const hit = s("rect", {x: m.l, y: 0, width: W - m.l - m.r, height: Hh, fill: "transparent", tabindex: 0});
+    svg.append(hit);
+    const show = (i) => {
+      hair.setAttribute("x1", x(i)); hair.setAttribute("x2", x(i)); hair.setAttribute("visibility", "visible");
+      const n = H[i];
+      tip.textContent = "";
+      tip.append(el("div", {class: "h"}, `${n.date.slice(0, 4)}-${n.date.slice(4, 6)}-${n.date.slice(6)}`));
+      for (const op of shown) {
+        const r = el("div", {class: "r"});
+        const nm = el("span", {class: "nm"}); const k = el("span", {class: "key"});
+        k.style.background = colorOfGroup(op, groups);
+        nm.append(k, document.createTextNode(groupName(op)));
+        const v = val(n, op);
+        r.append(el("b", {}, byTflops ? fmt(v, 0, " TF/s") : fmt(v, 3, "×")), nm);
+        tip.append(r);
+      }
+      const bb = svg.getBoundingClientRect(), px = x(i) / W * bb.width;
+      tip.style.display = "block";
+      tip.style.left = (px + 14 + tip.offsetWidth > bb.width ? px - tip.offsetWidth - 14 : px + 14) + "px";
+      tip.style.top = "20px";
+    };
+    let cur = H.length - 1;
+    hit.addEventListener("pointermove", (ev) => {
+      const bb = svg.getBoundingClientRect(), vx = (ev.clientX - bb.left) / bb.width * W;
+      cur = Math.max(0, Math.min(H.length - 1, Math.round((vx - m.l) / (W - m.l - m.r) * (H.length - 1))));
+      show(cur);
+    });
+    hit.addEventListener("focus", () => show(cur));
+    hit.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowLeft") cur = Math.max(0, cur - 1);
+      else if (ev.key === "ArrowRight") cur = Math.min(H.length - 1, cur + 1); else return;
+      show(cur); ev.preventDefault();
+    });
+    const hide = () => { tip.style.display = "none"; hair.setAttribute("visibility", "hidden"); };
+    hit.addEventListener("pointerleave", hide); hit.addEventListener("blur", hide);
+    box.prepend(svg);
+  }
+
+  // ---- latest night: per-op bars (all ops) or per-case dots sorted by speedup (one op).
+  function dist() {
+    const box = $("dist"), tip = box.querySelector(".tip");
+    box.querySelectorAll("svg, .note").forEach((n) => n.remove());
+    const L = plat().latest;
+    const W = 1040;
+    const svg = s("svg", {role: "img"});
+    const place = (ev, nodes) => {
+      tip.textContent = ""; nodes.forEach((n) => tip.append(n));
+      const bb = box.getBoundingClientRect();
+      tip.style.display = "block";
+      let lx = ev.clientX - bb.left + 14; if (lx + tip.offsetWidth > bb.width) lx -= tip.offsetWidth + 28;
+      tip.style.left = lx + "px"; tip.style.top = (ev.clientY - bb.top + 14) + "px";
+    };
+    const hide = () => { tip.style.display = "none"; };
+    const single = state.op !== "all", grouped = !single || state.group !== "none";
+    const noRef = single && !L[state.op].ref;
+    if (grouped) {
+      // Bars: one per group, the same groups and colors as the trend.
+      const metric = noRef ? "tflops" : "speedup";
+      const groups = groupList(), agg = Object.fromEntries(groups.map((g) => [g, aggOf(groupCases(L, g, groups))]));
+      const bars = groups.filter((g) => agg[g][metric]);
+      $("dist-title").textContent = single ? `${state.op}: latest night by ${groupLabel()}, then every case`
+                                           : `Latest night: geomean speedup by ${groupLabel()}`;
+      $("dist-sub").textContent = noRef ? "No reference, so bars show TLX TFLOP/s."
+        : !single && state.group === "op" ? "Ops without a reference have no speedup and are listed in the table below." : "";
+      if (!bars.length) { box.prepend(el("p", {class: "note"}, `No timed cases match ${sliceName()}.`)); if (!single) return; }
+      else {
+        const bsvg = s("svg", {role: "img", "aria-label": $("dist-title").textContent});
+        const rowH = 34, m = {l: 170, r: 80, t: noRef ? 8 : 22, b: 24}, Hh = m.t + m.b + rowH * bars.length;
+        const vmax = Math.max(noRef ? 0 : 1.2, ...bars.map((g) => agg[g][metric])) * 1.05;
+        const x = (v) => m.l + (W - m.l - m.r) * v / vmax;
+        bsvg.setAttribute("viewBox", `0 0 ${W} ${Hh}`);
+        const tickStep = noRef ? 10 ** Math.floor(Math.log10(vmax / 2)) * ([1, 2, 5].find((f) => f * 10 ** Math.floor(Math.log10(vmax / 2)) * 4 >= vmax) || 10) : 0.5;
+        for (let v = 0; v <= vmax; v += tickStep) {
+          bsvg.append(s("line", {x1: x(v), x2: x(v), y1: m.t, y2: Hh - m.b, stroke: "var(--grid)"}));
+          bsvg.append(el("text", {svg: 1, x: x(v), y: Hh - 6, "text-anchor": "middle"}, noRef ? String(Math.round(v)) : v + "×"));
+        }
+        bars.forEach((g, k) => {
+          const v = agg[g][metric], y0 = m.t + k * rowH + 6, h = rowH - 12;
+          bsvg.append(el("text", {svg: 1, class: "direct", x: m.l - 10, y: y0 + h / 2 + 4, "text-anchor": "end"}, groupName(g)));
+          const bar = s("rect", {x: x(0), y: y0, width: Math.max(0, x(v) - x(0)), height: h, rx: 4, fill: colorOfGroup(g, groups), tabindex: 0});
+          const info = (ev) => place(ev, [el("div", {class: "h"}, groupName(g)), el("div", {}, (noRef ? `${v.toFixed(0)} TF/s` : `${v.toFixed(3)}×`)
+            + ` geomean over ${groupCases(L, g, groups).filter((c) => matches(c) && c.s !== "error").length} measured cases`)]);
+          bar.addEventListener("pointermove", info); bar.addEventListener("pointerleave", hide);
+          bsvg.append(bar);
+          bsvg.append(el("text", {svg: 1, class: "direct", x: x(v) + 8, y: y0 + h / 2 + 4}, noRef ? v.toFixed(0) : v.toFixed(3) + "×"));
+        });
+        if (!noRef) {
+          bsvg.append(s("line", {x1: x(FLOOR), x2: x(FLOOR), y1: m.t, y2: Hh - m.b, stroke: "var(--critical)", "stroke-dasharray": "4 4"}));
+          bsvg.append(el("text", {svg: 1, x: x(FLOOR), y: m.t - 8, "text-anchor": "middle"}, "0.9× floor"));
+        }
+        box.prepend(bsvg);
+      }
+      if (!single) return;
+    }
+    {
+      const cs = L[state.op].cases.filter(matches).filter((c) => c.x);
+      const errs = L[state.op].cases.filter((c) => matches(c) && !c.x).length;
+      if (!L[state.op].cases.some(matches)) {
+        if (!grouped) { $("dist-title").textContent = `${state.op}: every case, latest night`; $("dist-sub").textContent = ""; }
+        box.prepend(el("p", {class: "note"}, `${state.op} has no ${sliceName()} cases.`));
+        return;
+      }
+      if (!grouped) $("dist-title").textContent = `${state.op}: every case, latest night`;
+      if (!L[state.op].ref) {
+        if (!grouped) $("dist-sub").textContent = "No reference, so no speedup: see TLX TFLOP/s per case in the table.";
+        box.append(el("p", {class: "note"}, `${L[state.op].cases.filter(matches).length} cases; per-case TFLOP/s are in the table.`));
+        return;
+      }
+      const dotsNote = `Dots: every case, sorted by speedup; color and icon give the status.${errs ? ` ${errs} errored case(s) have no speedup and appear only in the table.` : ""}`;
+      $("dist-sub").textContent = grouped ? `${$("dist-sub").textContent} ${dotsNote}`.trim() : dotsNote.replace("Dots: every case, sorted", "Sorted");
+      cs.sort((a, b) => a.x - b.x);
+      const Hh = 240, m = {l: 48, r: 16, t: 12, b: 20};
+      const hi = Math.max(1.2, ...cs.map((c) => c.x)) * 1.05;
+      const x = (k) => m.l + (W - m.l - m.r) * (cs.length === 1 ? 0.5 : k / (cs.length - 1));
+      const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / hi;
+      svg.setAttribute("viewBox", `0 0 ${W} ${Hh}`);
+      for (const v of [0, 0.5, 1, 1.5, 2].filter((v) => v <= hi)) {
+        svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)"}));
+        svg.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, v + "×"));
+      }
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(FLOOR), y2: y(FLOOR), stroke: "var(--critical)", "stroke-dasharray": "4 4"}));
+      const r = cs.length > 150 ? 3 : 5;
+      cs.forEach((c, k) => {
+        const g = s("g", {tabindex: 0});
+        g.append(s("circle", {cx: x(k), cy: y(c.x), r, fill: STATUS[c.s].color, stroke: "var(--surface-1)", "stroke-width": 1.5}));
+        // Hit area wider than the dot.
+        g.append(s("rect", {x: x(k) - Math.max(6, (W - m.l - m.r) / cs.length / 2), y: m.t, width: Math.max(12, (W - m.l - m.r) / cs.length),
+                            height: Hh - m.t - m.b, fill: "transparent"}));
+        const info = (ev) => {
+          const head = el("div", {class: "h"}); head.append(statusBadge(c.s), document.createTextNode(` ${c.d} · ${c.dt}`));
+          place(ev, [head, el("div", {}, c.l), el("div", {}, `${c.x.toFixed(3)}× · TLX ${fmt(c.t, 0)} vs ref ${fmt(c.r, 0)} TF/s`)]
+            .concat(c.n ? [el("div", {class: "note"}, c.n)] : []));
+        };
+        g.addEventListener("pointermove", info); g.addEventListener("pointerleave", hide);
+        svg.append(g);
+      });
+    }
+    box.insertBefore(svg, box.querySelector(".tip"));
+  }
+
+  // ---- table: the accessible view of everything above.
+  function sortableTable(box, cols, rows, sortKey, redraw) {
+    const {key, dir} = state[sortKey];
+    if (key && cols.some(([k]) => k === key))
+      rows = [...rows].sort((a, b) => ((a[key] ?? -Infinity) > (b[key] ?? -Infinity) ? 1 : -1) * dir);
+    const tb = el("table");
+    const hr = el("tr");
+    for (const [k, name, num] of cols) {
+      const th = el("th", num ? {class: "num"} : {}, name + (key === k ? (dir > 0 ? " ▲" : " ▼") : ""));
+      th.onclick = () => { state[sortKey] = {key: k, dir: state[sortKey].key === k ? -state[sortKey].dir : 1}; redraw(); };
+      hr.append(th);
+    }
+    tb.append(hr);
+    for (const r of rows.slice(0, sortKey === "sort" ? state.rows : rows.length)) {
+      const tr = el("tr");
+      for (const [k, , num] of cols) {
+        const td = el("td", num ? {class: "num"} : {});
+        const v = r[k];
+        if (k === "s") td.append(statusBadge(v));
+        else if (k === "speedup" || k === "x") td.textContent = fmt(v, 3, "×");
+        else if (k === "tflops" || k === "t" || k === "r") td.textContent = fmt(v, 0);
+        else td.textContent = String(v ?? "–");
+        tr.append(td);
+      }
+      tb.append(tr);
+    }
+    box.textContent = "";
+    box.append(tb);
+    if (!rows.length) box.append(el("p", {class: "note"}, "No cases match these filters."));
+    return rows.length;
+  }
+
+  function table() {
+    const L = plat().latest;
+    const opNames = state.op === "all" ? Object.keys(L) : [state.op];
+    const slice = sliceName() ? ` · ${sliceName()}` : "";
+
+    $("summary-title").textContent = `Latest night by ${groupLabel()}${slice}`;
+    const byOp = state.group === "op" || state.group === "none";
+    const groups = groupList(true);
+    const sumRows = groups.map((g) => {
+      const cases = groupCases(L, g, groups), kept = cases.filter(matches), a = aggOf(cases);
+      const c = (st) => kept.filter((x) => x.s === st).length;
+      return {op: groupName(g), ref: byOp ? L[g].ref || "–" : "", n: kept.length, ok: c("ok"), noisy: c("noisy"), pip: c("pip"),
+              error: c("error"), tflops: a.tflops, speedup: a.speedup};
+    }).filter((r) => r.n);
+    sortableTable($("summary"), [["op", groupLabel()], ...(byOp ? [["ref", "reference"]] : []), ["n", "cases", 1], ["ok", "ok", 1],
+      ["noisy", "noisy", 1], ["pip", "PIP", 1], ["error", "ERROR", 1], ["tflops", "TLX TF/s", 1], ["speedup", "speedup", 1]],
+      sumRows, "sortSum", table);
+
+    $("table-title").textContent = `${state.op === "all" ? "All ops" : state.op}: cases, latest night${slice}`;
+    const chips = $("chips");
+    chips.textContent = "";
+    for (const st of Object.keys(STATUS)) {
+      const b = el("button", {type: "button", "aria-pressed": String(state.statuses.has(st))});
+      b.append(statusBadge(st));
+      b.onclick = () => { state.statuses.has(st) ? state.statuses.delete(st) : state.statuses.add(st); state.rows = 50; table(); };
+      chips.append(b);
+    }
+    const cols = [["l", "input"], ["d", "dir"], ["dt", "dtype"], ["s", "status"], ["x", "speedup", 1], ["t", "TLX TF/s", 1],
+                  ["r", "ref TF/s", 1], ["n", "notes"]];
+    if (state.op === "all") cols.unshift(["op", "op"]);
+    const rows = opNames.flatMap((op) => L[op].cases.filter((c) => matches(c) && state.statuses.has(c.s)).map((c) => ({...c, op})));
+    const n = sortableTable($("table"), cols, rows, "sort", table);
+    if (n > state.rows) {
+      const b = el("button", {type: "button", class: "more"}, `Show more (${n - state.rows} hidden)`);
+      b.onclick = () => { state.rows += 100; table(); };
+      $("table").append(b);
+    }
+  }
+
+  if (!state.platform) {
+    $("banner").textContent = "No nightly results published yet.";
+    document.querySelectorAll("main > :not(h1, .sub, .banner)").forEach((n) => { n.hidden = true; });
+    return;
+  }
+
+  // The view lives in the URL hash, so a link reopens exactly what the sender saw.
+  const params = new URLSearchParams(location.hash.slice(1));
+  if (DATA.platforms[params.get("platform")]) state.platform = params.get("platform");
+  if (params.get("op") && DATA.platforms[state.platform].latest[params.get("op")]) state.op = params.get("op");
+  if (["7", "14", "30", "60"].includes(params.get("nights"))) state.range = Number(params.get("nights"));
+  if (["fwd", "bwd"].includes(params.get("dir"))) state.dir = params.get("dir");
+  if (params.get("dtype")) state.dtype = params.get("dtype");
+  state.group = params.get("group") || (state.op === "all" ? "op" : "none");  // controls() falls back if not offered
+  for (const [k, v] of params) if (k.startsWith("in.") && state.op !== "all") state.inputs[k.slice(3)] = v;  // controls() drops a dtype this platform lacks
+  if (["light", "dark"].includes(params.get("theme"))) document.documentElement.dataset.theme = params.get("theme");
+  $("range").value = String(state.range);
+  const saveHash = () => {
+    const p = new URLSearchParams();
+    if (state.platform !== "b200") p.set("platform", state.platform);
+    if (state.op !== "all") p.set("op", state.op);
+    if (state.range !== 30) p.set("nights", state.range);
+    if (state.dir !== "all") p.set("dir", state.dir);
+    if (state.dtype !== "all") p.set("dtype", state.dtype);
+    if (state.group !== (state.op === "all" ? "op" : "none")) p.set("group", state.group);
+    if (state.op !== "all") for (const [k, v] of Object.entries(state.inputs)) p.set(`in.${k}`, v);
+    if (document.documentElement.dataset.theme) p.set("theme", document.documentElement.dataset.theme);
+    history.replaceState(null, "", p.toString() ? "#" + p : location.pathname);
+  };
+
+  // ---- version info: what the latest night ran on.
+  function versions() {
+    const p = plat();
+    $("ver-sub").textContent = `Latest night (${DATA.date.slice(0, 4)}-${DATA.date.slice(4, 6)}-${DATA.date.slice(6)}) on `
+      + `${state.platform.toUpperCase()}.`;
+    const kv = $("ver-kv");
+    kv.textContent = "";
+    const rows = [
+      ["fbtriton nightly", p.version],
+      ["triton.__version__", p.triton],
+      ["Commit", null],
+      ["PyTorch", p.torch],
+      ["GPU runtime", p.runtime || "–"],
+      ["Driver", p.driver || "–"],
+      ["GPU", p.gpu || state.platform.toUpperCase()],
+      ["Governing", (p.governed || []).join(" · ") || "none recorded"],
+      ["Timing", p.timing ? `${p.timing.latency_mode}, ${p.timing.replicates} replicate(s), ≥500 samples per case` : "–"],
+      ["Gate", `PIP below ${FLOOR}× speedup; noisy above 3% CV (reported, never failing)`],
+    ];
+    for (const [k, v] of rows) {
+      kv.append(el("dt", {}, k));
+      const dd = el("dd");
+      if (v === null) {
+        const a = el("a", {href: `${REPO}/commit/${p.sha}`});
+        a.append(el("code", {}, p.sha.slice(0, 12)));
+        dd.append(a);
+      } else dd.textContent = v;
+      kv.append(dd);
+    }
+    const tb = el("table");
+    const hr = el("tr");
+    for (const h of ["op", "bench script", "reference", "autotune space", "cold compile timed"]) hr.append(el("th", {}, h));
+    tb.append(hr);
+    for (const [op, o] of Object.entries(p.latest)) {
+      const script = BENCH[op] || "–", space = o.space || "–", cold = o.cold;
+      const tr = el("tr");
+      const c = el("td"); c.append(el("code", {}, script));
+      tr.append(el("td", {}, op), c, el("td", {}, o.ref || "none (TFLOP/s only)"), el("td", {}, space),
+                el("td", {}, {all: "every case", first: "first case per direction", none: "not timed"}[cold] || "–"));
+      tb.append(tr);
+    }
+    const box = $("ver-ops");
+    box.textContent = "";
+    box.append(tb);
+  }
+
+  // ---- how to run it: the same commands the nightly job runs, filled in for the current filters.
+  function copyable(text) {
+    const wrap = el("div", {class: "code"});
+    const pre = el("pre", {}, text);
+    const b = el("button", {type: "button"}, "Copy");
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(text); }
+      catch {  // file:// pages may not get the async clipboard
+        const r = document.createRange(); r.selectNodeContents(pre);
+        const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); document.execCommand("copy"); sel.removeAllRanges();
+      }
+      b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1200);
+    };
+    wrap.append(pre, b);
+    return wrap;
+  }
+
+  function howto() {
+    const p = plat();
+    const amd = state.platform === "mi350";
+    const op = state.op !== "all" ? state.op : Object.keys(p.latest)[0];
+    const script = BENCH[op] || "bench_<op>.py";
+    // Direction has a CLI flag; dtype does not, so the dtype filter only narrows what the page shows.
+    const dirFlag = state.dir === "all" ? "" : ` --${state.dir}-only`;
+    const pageOnly = [state.dtype !== "all" ? "dtype" : "", state.op !== "all" && Object.keys(state.inputs).length ? "input" : ""]
+      .filter(Boolean).join(" and ");
+    $("howto-sub").textContent = `Commands for ${state.platform.toUpperCase()}${state.op !== "all" ? ` and ${op}` : ""}; `
+      + "change the filters above and they follow. Step 3b is exactly what the nightly job runs."
+      + (pageOnly ? ` The ${pageOnly} filters only narrow this page; the scripts run every shape in the op's suites.` : "");
+    const steps = [
+      ["1. Install the nightly wheel", "A clean Python 3.13 venv. torch pulls in its own Triton, which ships the same triton "
+        + "package, so remove it before installing fbtriton.",
+        `uv venv --python 3.13 .venv-bench && source .venv-bench/bin/activate
+uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/${amd ? "rocm7.2" : "cu130"}
+uv pip uninstall triton pytorch-triton pytorch-triton-rocm
+uv pip install --pre --no-deps fbtriton==${p.version} \\
+  --index-url https://${OWNER}.github.io/${NAME}/nightly/simple/
+uv pip install pytest numpy torchao`],
+      ["2. Check out the suite at the wheel's commit", "The bench scripts must match the wheel: shape suites and kernels move together.",
+        `git clone ${REPO}.git fbtriton && cd fbtriton
+git checkout ${p.sha}`],
+      [`3a. One op: ${op}`, "Picks the least-used GPU and locks its clocks itself (needs passwordless sudo; otherwise it says "
+        + "what it skipped). Exits 1 if any case is PIP or ERROR.",
+        `python python/test/tlx_benchmark/${script}${dirFlag}
+python python/test/tlx_benchmark/${script} --head 5${dirFlag || " --fwd-only"}   # quick look
+python python/test/tlx_benchmark/${script} --list-suites         # shape suites for this op`],
+      ["3b. Every op, as the nightly job runs it", "Ops with no kernel for this GPU are skipped. TorchTLX benches need Meta's "
+        + "patched PyTorch and run in the *-torchtlx-test jobs instead.",
+        `python -m pytest python/test/tlx_benchmark/test_ops_perf.py -k "not torchtlx" -v -s${dirFlag} \\
+  --junitxml=tlx-ops-bench.xml
+# --gpu N pins a GPU; --head N, --fwd-only and --bwd-only work here too`],
+      ["4. Results", "Tables print to the terminal. One JSON artifact per op is what this page is built from.",
+        `ls /tmp/tlx_benchmark/            # <op>.<arch>.json
+python .github/scripts/tlx_ops_bench_dashboard.py summarize /tmp/tlx_benchmark \\
+  --platform ${state.platform} --version ${p.version} --sha ${p.sha.slice(0, 8)} --out rel/${DATA.date}.${state.platform}.json
+python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # preview the page`],
+    ];
+    const box = $("howto");
+    box.textContent = "";
+    for (const [title, note, cmd] of steps) {
+      const d = el("div", {class: "step"});
+      d.append(el("h3", {}, title), el("p", {}, note), copyable(cmd));
+      box.append(d);
+    }
+  }
+
+  function render() { banner(); controls(); inputs(); tiles(); trend(); dist(); table(); versions(); howto(); saveHash(); }
+  $("platform").onchange = (e) => { state.platform = e.target.value; state.op = "all"; state.inputs = {}; state.group = "op"; state.hidden.clear(); render(); };
+  $("range").onchange = (e) => { state.range = Number(e.target.value); render(); };
+  $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
+  $("dtype").onchange = (e) => { state.dtype = e.target.value; state.rows = 50; render(); };
+  $("group").onchange = (e) => { state.group = e.target.value; state.hidden.clear(); state.sortSum = {key: null, dir: 1}; render(); };
+  $("op").onchange = (e) => {
+    state.op = e.target.value;
+    state.inputs = {};
+    state.group = state.op === "all" ? "op" : "none";
+    state.hidden.clear();
+    state.rows = 50; state.sort = {key: null, dir: 1}; render(); };
+  $("theme").onclick = () => {
+    const r = document.documentElement;
+    const dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    r.dataset.theme = dark ? "light" : "dark";
+    saveHash();
+  };
+  window.addEventListener("resize", () => { trend(); dist(); });
+  render();
+})();
+</script>
+</body>
+</html>

@@ -43,13 +43,14 @@ The flag drives a special path through three phases:
 
 ### Phase 3.5: TMA Staging Fusion
 
-TMA staging WSBuffers are merged by descriptor and originating load (via
-`fuseEpilogueWSBuffers`). If the originating load cannot be traced, as with
+TMA staging WSBuffers are merged by descriptor, originating load, and producer
+basic block (via `fuseEpilogueWSBuffers`). If the originating load cannot be traced, as with
 Hopper register accumulators, the producer task is used instead. For example,
 the 4 same-task subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all
 share one `bufferId`, as do the dk and dv subtile stagings (each per their own
 descriptor). Different data-partition tasks targeting the same descriptor stay
-in distinct buffers.
+in distinct buffers. Sibling loops also stay distinct because each
+multi-buffered staging ring must rotate from one loop-local accumulation counter.
 
 The shared `bufferId` is honored by `doCodePartition` downstream: the
 subtile allocs are physically merged into one `local_alloc` of shape

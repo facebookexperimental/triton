@@ -674,12 +674,16 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-warps" = 4 : i32} {
 // CHECK-LABEL: @warpgroup_dot_wait_1_input
 tt.func @warpgroup_dot_wait_1_input(%arg0: tensor<128xf32, #blocked>) {
   // CHECK: nvg.wgmma_wait_group
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
   ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32} : tensor<128xf32, #blocked>
   tt.return
 }
 
 tt.func @warpgroup_dot_wait_2_inputs(%arg0: tensor<128xf32, #blocked>, %arg1: tensor<128xf32, #blocked>) {
   // CHECK: nvg.wgmma_wait_group
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
   ttng.warp_group_dot_wait %arg0, %arg1 {pendings = 0 : i32} : tensor<128xf32, #blocked>, tensor<128xf32, #blocked>
   tt.return
 }
@@ -709,4 +713,29 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     ttg.local_store %a, %view : tensor<128x128xf16, #mma> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     tt.return
   }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
+
+module attributes {"ttg.target" = "cuda:90", "ttg.num-warps" = 8 : i32} {
+
+// CHECK-LABEL: @warpgroup_dot_wait_synchronizes_warpgroups
+tt.func @warpgroup_dot_wait_synchronizes_warpgroups(%arg0: tensor<256xf32, #blocked>) {
+  // CHECK: nvg.wgmma_wait_group
+  // CHECK-NEXT: nvvm.barrier
+  ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32} : tensor<256xf32, #blocked>
+  tt.return
+}
+
+// CHECK-LABEL: @warpgroup_dot_wait_local_does_not_synchronize_warpgroups
+tt.func @warpgroup_dot_wait_local_does_not_synchronize_warpgroups(%arg0: tensor<256xf32, #blocked>) {
+  // CHECK: nvg.wgmma_wait_group
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
+  ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32, warpGroupLocal} : tensor<256xf32, #blocked>
+  tt.return
+}
+
 }

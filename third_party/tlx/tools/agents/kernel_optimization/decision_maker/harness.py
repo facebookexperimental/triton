@@ -245,6 +245,15 @@ class StandaloneHarness:
             if verification.passed:
                 benchmark_raw = harness.benchmark(artifact, dict(case_dict), benchmark_repetitions)  # type: ignore[arg-type]
                 timing_norm = _normalize_timing(benchmark_raw)
+                if isinstance(benchmark_raw, Mapping):
+                    verification = VerificationResult(
+                        passed=verification.passed,
+                        diagnostics=verification.diagnostics,
+                        metrics={
+                            **verification.metrics,
+                            **dict(benchmark_raw.get("metrics", {})),
+                        },
+                    )
                 timing = TimingSamples(
                     samples_us=tuple(float(s) for s in timing_norm["samples_us"]),
                     warmup_count=int(timing_norm.get("warmup_count", 0)),

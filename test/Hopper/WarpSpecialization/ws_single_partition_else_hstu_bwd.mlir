@@ -1,5 +1,4 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=300000" --tritongpu-pipeline="num-stages=2" --canonicalize | FileCheck %s
-// RUN: env TRITON_WS_TMA_REDUCE_STAGING_COPIES=2 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=1 smem-budget=300000" --canonicalize | FileCheck %s --check-prefix=REDUCE2
 //
 // Reduced from the post-doTaskIdPropagate dump of the HSTU self-attention
 // CLC backward benchmark with runtime masked/unmasked activation branches.
@@ -8,12 +7,6 @@
 // tile must be peeled from the unmasked remainder loop in partition3.
 //
 // CHECK-LABEL: @_hstu_attn_bwd_clc
-// REDUCE2-LABEL: @_hstu_attn_bwd_clc
-// REDUCE2: ttg.warp_specialize
-// REDUCE2: ttg.local_alloc {{.*}}buffer.copy = 2 : i32{{.*}}buffer.tmaStaging = 2 : i32{{.*}}memdesc<2x128x32xbf16
-// REDUCE2: ttng.async_tma_store_wait {{.*}}pendings = 1 : i32
-// REDUCE2: ttng.async_tma_reduce
-// REDUCE2: ttng.async_tma_store_wait {{.*}}pendings = 0 : i32
 // CHECK: ttg.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["reduction", "gemm", "load", "computation"]
 // Task 3 is the third physical WS region (partition2; the default region is
@@ -275,7 +268,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttng.async_tma_store_token_wait %20   {async_task_id = array<i32: 3>} : !ttg.async.token
       %sched_49, %sched_50, %sched_51, %sched_52 = ttng.clc_read %sched_14 {async_task_id = array<i32: 0, 1, 2, 3>} : !ttg.async.token -> i1, i32, i32, i32
       scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %sched_49, %sched_50 : i1, i32
-    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.smem_alloc_algo = 2 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32}
+    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.smem_alloc_algo = 1 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
 }

@@ -69,7 +69,7 @@ def prepare(case: Case, space: str) -> Prepared:
     # The op returns a TritonBench-compatible `(output, None)` pair; the index
     # is free and keeps the closure returning something differentiable.
     tlx_fwd = lambda: tlx_kda(  # noqa: E731
-        q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, arch=driver.arch(), space=space)[0]
+        q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens, space=space)[0]
 
     flop_count = flops(*case.shape, case.direction)
     extra = {"chunks": (B * T) // CHUNK, "chunk": CHUNK}

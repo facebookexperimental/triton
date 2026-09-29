@@ -100,7 +100,6 @@ def prepare(case: Case, space: str) -> Prepared:
         scale=1.0,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
-        arch=driver.arch(),
     )
     return Prepared(
         tlx_fn=tlx_fn,

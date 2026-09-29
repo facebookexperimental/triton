@@ -51,6 +51,10 @@ def _fmt_extra(result, key: str) -> str:
     return f"{value:.3g}" if isinstance(value, float) else str(value)
 
 
+def _fmt_config(result) -> str:
+    return result.best_config or "-"
+
+
 def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str:
     """The common columns, then whichever op-specific ones the op asked for.
 
@@ -64,8 +68,8 @@ def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str
     heads = "".join(f" {head:>{w}}" for (head, _), w in zip(extra_columns, extra_widths))
     lines = [
         f"{'input':<{width}} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
-        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}{heads}  status",
-        "-" * (width + 84 + sum(w + 1 for w in extra_widths)),
+        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}{heads}  status  best config",
+        "-" * (width + 97 + sum(w + 1 for w in extra_widths)),
     ]
     for r in results:
         cells = "".join(f" {_fmt_extra(r, key):>{w}}" for (_, key), w in zip(extra_columns, extra_widths))
@@ -77,7 +81,7 @@ def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str
                      f"{_fmt_cv(r):>6} "
                      f"{_tf(_stat(r.tlx, 'p50'))} "
                      f"{_tf(_stat(r.tlx, 'p95'))} "
-                     f"{_tf(_stat(r.tlx, 'p99'))}{cells}  {_MARK[r.status]}")
+                     f"{_tf(_stat(r.tlx, 'p99'))}{cells}  {_MARK[r.status]:<6}  {_fmt_config(r)}")
     return "\n".join(lines)
 
 

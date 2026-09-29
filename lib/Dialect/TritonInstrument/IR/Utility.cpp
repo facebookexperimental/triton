@@ -407,7 +407,7 @@ AuxDataMap::ThreadLayout getThreadLayout(ModuleOp module,
       layout.numBaseThreads = std::max<int>(
           layout.numBaseThreads, wsOp.getPartitionRegions().size() + 1);
     hasTMA |= hooks.isTMAOp(op);
-    hasTC |= isa<MMAv5OpInterface, TCGen5CommitOp, TMEMCopyOp>(op);
+    hasTC |= isa<MMAv5OpInterface, TCGen5CommitOp, TMEMCopyOp, TMEMShiftOp>(op);
     hasCLC |= hooks.isCLCOp(op);
   });
 

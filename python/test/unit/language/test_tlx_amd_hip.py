@@ -17,7 +17,7 @@ from triton._internal_testing import is_hip
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.backends.compiler import GPUTarget
 from triton.runtime.jit import MockTensor
-from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
+from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
 from triton.language.extra.tlx.tutorials.amd_bmm_shared_a import (
     _bmm_register_staged,
     _MT144X256_MI16_KERNEL_SPEC,
@@ -83,7 +83,7 @@ def _compile_register_staged_bmm_gfx950(m, n, k, kernel_spec):
             BATCH_GROUP=8,
             GMN=tiles_per_batch,
             NT=tiles_per_batch,
-            grid=(tiles_per_batch,),
+            grid=(tiles_per_batch, ),
             num_warps=warps_per_cta[0] * warps_per_cta[1],
             num_stages=1,
             matrix_instr_nonkdim=instr_shape[0],
@@ -92,15 +92,9 @@ def _compile_register_staged_bmm_gfx950(m, n, k, kernel_spec):
 
 def test_shared_a_bmm_tuned_dispatches_keep_wide_unaligned_loads_gfx950():
     compiled = [
-        _compile_register_staged_bmm_gfx950(
-            40, 256, 1956, _MT64X256_MI32_KERNEL_SPEC
-        ),
-        _compile_register_staged_bmm_gfx950(
-            262, 256, 294, _MT144X256_MI16_KERNEL_SPEC
-        ),
-        _compile_register_staged_bmm_gfx950(
-            448, 160, 931, _MT224X160_MI16_KERNEL_SPEC
-        ),
+        _compile_register_staged_bmm_gfx950(40, 256, 1956, _MT64X256_MI32_KERNEL_SPEC),
+        _compile_register_staged_bmm_gfx950(262, 256, 294, _MT144X256_MI16_KERNEL_SPEC),
+        _compile_register_staged_bmm_gfx950(448, 160, 931, _MT224X160_MI16_KERNEL_SPEC),
     ]
     amdgcn = "\n".join(kernel.asm["amdgcn"] for kernel in compiled)
 
@@ -514,7 +508,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "v_mov_b32_dpp" not in amdgcn
     assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
-    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
@@ -546,7 +540,7 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert ttgir.count("scf.for") == 1
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
-    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
@@ -599,7 +593,7 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     # the copy across the next existing barrier shortens DMA latency hiding and
     # regresses both measured benchmark shapes.
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 66
-    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 43
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert ".private_segment_fixed_size: 0" in amdgcn

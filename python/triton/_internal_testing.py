@@ -96,7 +96,12 @@ def is_hip_cdna4():
 
 def is_hip_rdna3():
     target = get_current_target()
-    return target is not None and target.backend == 'hip' and 'gfx11' in target.arch
+    return target is not None and target.backend == 'hip' and ('gfx110' in target.arch or 'gfx115' in target.arch)
+
+
+def is_hip_rdna4m():
+    target = get_current_target()
+    return target is not None and target.backend == 'hip' and 'gfx117' in target.arch
 
 
 def is_hip_rdna4():
@@ -119,7 +124,7 @@ def is_hip_cdna():
 
 
 def is_hip_rdna():
-    return is_hip_rdna3() or is_hip_rdna4()
+    return is_hip_rdna3() or is_hip_rdna4m() or is_hip_rdna4()
 
 
 def get_hip_lds_size():
@@ -252,15 +257,15 @@ def unwrap_tensor(t: Union[torch.Tensor, triton.runtime.jit.TensorWrapper]) -> t
 
 
 def swizzle_scale_to_5d(scale, outer_chunks, k_chunks):
-    """Convert raw E8M0 scales to swizzled 5D format for TMA/async_dot_scaled.
+    """Convert raw block scales to the swizzled 5D TMA layout.
 
     Applies the cuBLAS block scaling layout within each 128x4 block.
     dest[row%32 * 16 + row//32 * 4 + col] = src[row, col]
 
     Args:
-        scale: Raw scale tensor of shape (batch, rows, K//32) in uint8.
+        scale: Raw scale tensor of shape (batch, rows, scale_cols).
         outer_chunks: Number of 128-row chunks (rows // 128).
-        k_chunks: Number of 4-column chunks (K // 32 // 4).
+        k_chunks: Number of 4-column scale chunks (ceil(scale_cols / 4)).
 
     Returns:
         Swizzled 5D tensor of shape (batch, outer_chunks, k_chunks, 2, 256).

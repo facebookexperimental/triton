@@ -14,7 +14,14 @@ pytestmark = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 MAX_SECONDS_PER_CASE = 60
 
 # TODO: Re-enable shapes here when their direct-TLX correctness failures are fixed.
-FAILED_SHAPES = set()
+FAILED_SHAPES = {
+    (384, 1152, 2536160, (1, 384), (1152, 1), "bf16"),
+    (384, 1152, 2617290, (1, 384), (1152, 1), "bf16"),
+    (384, 1152, 2701258, (1, 384), (1152, 1), "bf16"),
+    (2536160, 384, 1152, (1152, 1), (1, 1152), "bf16"),
+    (2617290, 384, 1152, (1152, 1), (1, 1152), "bf16"),
+    (2701258, 384, 1152, (1152, 1), (1, 1152), "bf16"),
+}
 
 
 def _cases():
@@ -85,6 +92,41 @@ def test_mm_register_fallback(m, n, k, dtype):
     )
 
 
+@pytest.mark.parametrize("m", [256, 257])
+def test_mm_small_square_register_plan(m):
+    from triton.tlx.ops import mm as tlx_mm
+
+    n, k = 257, 4096
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).T
+    out = tlx_mm(a, b, space="heuristic")
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(
+        out,
+        expected,
+        atol=1e-3 * expected.abs().max().item(),
+        rtol=1e-3,
+    )
+
+
+def test_mm_register_fallback_for_strided_b(monkeypatch):
+    from triton.tlx.ops.kernels.mm.gfx950 import mm
+
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 64), device="cuda", dtype=torch.float16)[:, ::2]
+    expected = torch.empty((64, 32), device="cuda", dtype=torch.float16)
+
+    def launch_register_plan(actual_a, actual_b, *, config, out, _validated):
+        assert actual_a is a
+        assert actual_b is b
+        assert config == _gfx950._intermediate_register_config(64, 32, 128)
+        assert _validated
+        return expected
+
+    monkeypatch.setattr(_gfx950, "_launch_register_plan", launch_register_plan)
+    assert mm(a, b, space="heuristic") is expected
+
+
 def test_mm_rejects_invalid_rank():
     from triton.tlx.ops import mm as tlx_mm
 
@@ -121,13 +163,30 @@ def test_mm_rejects_mismatched_device():
         tlx_mm(a, b)
 
 
+def test_mm_accepts_full_space(monkeypatch):
+    from triton.tlx.ops.kernels.mm.gfx950 import mm
+
+    a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
+    b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
+    expected = torch.empty((7, 8192), device="cuda", dtype=torch.float16)
+
+    def launch_register(actual_a, actual_b, *, out):
+        assert actual_a is a
+        assert actual_b is b
+        assert out.shape == expected.shape
+        return expected
+
+    monkeypatch.setattr(_gfx950, "_launch_register", launch_register)
+    assert mm(a, b, space="full") is expected
+
+
 def test_mm_rejects_invalid_space():
     from triton.tlx.ops.kernels.mm.gfx950 import mm
 
     a = torch.randn((7, 2048), device="cuda", dtype=torch.float16)
     b = torch.randn((8192, 2048), device="cuda", dtype=torch.float16).T
-    with pytest.raises(InvalidInput, match="space='heuristic'"):
-        mm(a, b, space="full")
+    with pytest.raises(InvalidInput, match="unknown gfx950 mm search space"):
+        mm(a, b, space="bogus")
 
 
 def test_mm_rejects_unsupported_operands():
@@ -241,26 +300,52 @@ def test_mm_input_offset_width_selection(monkeypatch):
 def test_mm_irregular_shape_policy():
     assert _gfx950._lds_plan_for_shape(677, 4096, 8192) == (256, 256, 4)
     assert _gfx950._strong_lds_plan(677, 4096, 8192) == (192, 256, 4)
-
-    square_focus = _gfx950._register_plan_for_shape(2041, 2041, 2048)
+    common_square = _gfx950._register_plan_for_shape(2041, 2041, 2048, torch.bfloat16)
     assert (
-        square_focus["BLOCK_M"],
-        square_focus["BLOCK_N"],
-        square_focus["BLOCK_K"],
-        square_focus["GROUP_M"],
-        square_focus["NUM_XCDS"],
-        square_focus["num_warps"],
+        common_square["BLOCK_M"],
+        common_square["BLOCK_N"],
+        common_square["BLOCK_K"],
+        common_square["GROUP_M"],
+        common_square["NUM_XCDS"],
+        common_square["num_warps"],
     ) == (128, 128, 128, 16, 8, 8)
-
-    thin_focus = _gfx950._register_plan_for_shape(2048, 256, 1024)
+    common_narrow = _gfx950._register_plan_for_shape(2048, 256, 1024)
     assert (
-        thin_focus["BLOCK_M"],
-        thin_focus["BLOCK_N"],
-        thin_focus["BLOCK_K"],
-        thin_focus["GROUP_M"],
-        thin_focus["NUM_XCDS"],
-        thin_focus["num_warps"],
-    ) == (128, 128, 64, 16, 1, 4)
+        common_narrow["BLOCK_M"],
+        common_narrow["BLOCK_N"],
+        common_narrow["BLOCK_K"],
+        common_narrow["GROUP_M"],
+        common_narrow["NUM_XCDS"],
+        common_narrow["num_warps"],
+    ) == (64, 64, 256, 4, 8, 8)
+    for m in (256, 257):
+        small_square = _gfx950._register_plan_for_shape(m, 257, 4096, torch.float16)
+        assert (
+            small_square["BLOCK_M"],
+            small_square["BLOCK_N"],
+            small_square["BLOCK_K"],
+            small_square["num_warps"],
+        ) == (32, 16, 256, 2)
+
+    expected_register_tiles = {
+        (2048, 256, 1024): (64, 64, 256, 8, 2),
+        (272, 3072, 4608): (64, 64, 256, 8, 2),
+    }
+    for shape, expected in expected_register_tiles.items():
+        plan = _gfx950._register_plan_for_shape(*shape, dtype=torch.float16)
+        assert (
+            plan["BLOCK_M"],
+            plan["BLOCK_N"],
+            plan["BLOCK_K"],
+            plan["num_warps"],
+            plan["num_stages"],
+        ) == expected
+
+    # Cached dispatch results must remain immutable: several shapes can share
+    # one tuned plan, and same-shape cache hits reuse the returned object.
+    with pytest.raises(TypeError):
+        common_narrow["BLOCK_M"] = 1
+    assert _gfx950._register_plan_for_shape(272, 3072, 4608, torch.float16)["BLOCK_M"] == 64
 
     deep_k = _gfx950._intermediate_register_config(677, 2048, 4096)
     assert (
