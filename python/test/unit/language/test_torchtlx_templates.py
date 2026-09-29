@@ -1666,6 +1666,65 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(
         not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_refill_wait_prevents_lds_race(self):
+        """Every wave must read an LDS slot before the leading wave refills it."""
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        batch, M, K, N = 7, 1024, 128, 384
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        # Citrine C3: create the inputs directly on the GPU.
+        a = torch.randn(batch, M, K, device=GPU_TYPE, dtype=dtype)
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=dtype)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        heuristic = _tlx_registry.Gfx950BMMWarpPipeConfigHeuristic
+        get_configs = heuristic._get_template_configs_impl
+
+        def _race_config_only(instance, kernel_inputs, op_name):
+            for template_kwargs in get_configs(instance, kernel_inputs, op_name):
+                config_key = tuple(template_kwargs[name] for name in (
+                    "BLOCK_M",
+                    "BLOCK_N",
+                    "BLOCK_K",
+                    "GROUP_M",
+                    "num_warps",
+                    "NUM_BUFFERS",
+                ))
+                if config_key == (128, 128, 32, 8, 8, 3):
+                    yield template_kwargs
+
+        with (
+                mock.patch.object(
+                    heuristic,
+                    "_get_template_configs_impl",
+                    _race_config_only,
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            compiled = torch.compile(bmm)
+            actual, code = run_and_get_code(compiled, a, b)
+            expected = torch.bmm(a.float(), b.float()).to(dtype)
+            torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+            for launch in range(100):
+                with self.subTest(launch=launch):
+                    torch.testing.assert_close(compiled(a, b), expected, atol=2e-2, rtol=2e-2)
+
+        self.assertIn("tlx.async_load", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX shared-A bmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
