@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 import triton.language.extra.tlx as tlx
-from triton.language.extra.tlx.tutorials.amd_fa_cluster import _sum_rows_chain4 as _cluster_sum_rows_chain4
+from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
