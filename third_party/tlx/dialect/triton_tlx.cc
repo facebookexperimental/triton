@@ -299,6 +299,38 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
+      .def(
+          "create_packed_arith",
+          [](TritonOpBuilder &self, Type resultElementType,
+             const std::string &operation, std::vector<Value> operands,
+             std::optional<Value> reference) -> Value {
+            auto kind = ttng::symbolizePackedArithOpKind(operation);
+            if (!kind)
+              throw std::runtime_error("unknown packed arithmetic operation");
+            if (operands.empty())
+              throw std::runtime_error("packed arithmetic requires operands");
+
+            RankedTensorType resultType;
+            if (reference) {
+              auto referenceType = cast<RankedTensorType>(reference->getType());
+              resultType = RankedTensorType::get(referenceType.getShape(),
+                                                 resultElementType,
+                                                 referenceType.getEncoding());
+            } else {
+              auto operandType =
+                  cast<RankedTensorType>(operands.front().getType());
+              auto inferred = ttg::inferFp4ToFpResultType(
+                  operandType, resultElementType, operandType.getRank() - 1,
+                  self.getLastLoc());
+              if (failed(inferred))
+                throw std::runtime_error("cannot infer packed FP4 layout");
+              resultType = *inferred;
+            }
+            return self.create<ttng::PackedArithOp>(resultType, *kind,
+                                                    operands);
+          },
+          py::arg("resultElementType"), py::arg("operation"),
+          py::arg("operands"), py::arg("reference").none())
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
