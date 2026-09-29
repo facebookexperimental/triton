@@ -127,7 +127,7 @@ struct ConvertTritonGPUToLLVM
     if (failed(mlir::triton::nvidia_gpu::runCrossCTAMBarrierInitSyncInsertion(
             allocation, computeCapability)))
       return signalPassFailure();
-    ModuleMembarAnalysis membarPass(&allocation, canSkipBarSync);
+    ModuleMembarAnalysis membarPass(allocation, canSkipBarSync);
     membarPass.run();
     if (failed(maybeInsertClusterSync(mod))) {
       return signalPassFailure();

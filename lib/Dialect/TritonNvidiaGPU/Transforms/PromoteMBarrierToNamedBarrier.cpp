@@ -126,16 +126,17 @@ bool sameLoopBound(Value lhs, Value rhs,
 
   Operation *lhsDef = lhs.getDefiningOp();
   Operation *rhsDef = rhs.getDefiningOp();
-  if (!lhsDef || !rhsDef || lhsDef->getNumRegions() || rhsDef->getNumRegions() ||
-      !isMemoryEffectFree(lhsDef) || !isMemoryEffectFree(rhsDef) ||
+  if (!lhsDef || !rhsDef || lhsDef->getNumRegions() ||
+      rhsDef->getNumRegions() || !isMemoryEffectFree(lhsDef) ||
+      !isMemoryEffectFree(rhsDef) ||
       cast<OpResult>(lhs).getResultNumber() !=
           cast<OpResult>(rhs).getResultNumber())
     return false;
   return OperationEquivalence::isEquivalentTo(
       lhsDef, rhsDef,
       [&](Value lhsOperand, Value rhsOperand) {
-        return success(sameLoopBound(lhsOperand, rhsOperand, inductionVars,
-                                     depth + 1));
+        return success(
+            sameLoopBound(lhsOperand, rhsOperand, inductionVars, depth + 1));
       },
       /*markEquivalent=*/nullptr, OperationEquivalence::IgnoreLocations);
 }
@@ -280,10 +281,10 @@ void eraseBarrierStorage(BarrierCandidate &candidate) {
     for (unsigned idx = 0; idx < partitions->getNumOperands(); ++idx) {
       if (!capturedValues.contains(partitions->getOperand(idx)))
         continue;
-      bool unused = llvm::all_of(partitions.getPartitionRegions(),
-                                 [idx](Region &region) {
-                                   return region.getArgument(idx).use_empty();
-                                 });
+      bool unused =
+          llvm::all_of(partitions.getPartitionRegions(), [idx](Region &region) {
+            return region.getArgument(idx).use_empty();
+          });
       if (unused)
         toRemove.set(idx);
     }

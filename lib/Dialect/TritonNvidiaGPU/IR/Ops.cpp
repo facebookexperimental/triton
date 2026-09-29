@@ -482,9 +482,7 @@ LogicalResult AsyncSharedStoreOp::verify() {
   unsigned bitwidth = getIntOrFloatOrPtrBitWidth(srcTy.getElementType());
 
   auto regLayout = toLinearLayout(srcTy);
-  auto sharedLayout = isPaddedEncoding(dstTy.getEncoding())
-                          ? paddedLinearLayout(dstTy)
-                          : toLinearLayout(dstTy);
+  auto sharedLayout = toLinearLayoutIgnoringPadding(dstTy);
   auto cvt = regLayout.invertAndCompose(sharedLayout);
   std::optional<int> maybeMaxVecElems;
   if (isPaddedEncoding(dstTy.getEncoding()))
@@ -799,10 +797,12 @@ static LogicalResult verifyTMABarrierLayout(Operation *op, Value barrier) {
 }
 
 static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
-                                       Attribute enc) {
-  auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(enc);
+                                       MemDescType memDesc) {
+  auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(memDesc.getEncoding());
   if (!nvmma)
     return op->emitOpError("TMA descriptor must have NVMMA shared layout");
+  if (nvmma.getRank() != memDesc.getRank())
+    return op->emitOpError("TMA shared memory and layout ranks must match");
   auto descBlockEnc = desc.getSharedLayout();
   // If the descriptor has no encoding yet (e.g., before
   // optimize-descriptor-encoding pass), skip the match check.
@@ -834,7 +834,7 @@ static LogicalResult verifyAsyncTMALoadOp(Operation *op,
     return failure();
   if (!resultType.getMutableMemory())
     return op->emitOpError("cannot store into immutable memory");
-  if (failed(verifyTMAEncoding(op, desc, resultType.getEncoding())))
+  if (failed(verifyTMAEncoding(op, desc, resultType)))
     return failure();
   auto block = StringAttr::get(op->getContext(), "block");
   uint32_t barrierMask =
@@ -867,7 +867,7 @@ static LogicalResult verifyAsyncTMAStoreOp(Operation *op,
       if (component >= size)
         return op->emitOpError(
             "source subview may have an origin in another CTA");
-  return verifyTMAEncoding(op, desc.getType(), srcEnc);
+  return verifyTMAEncoding(op, desc.getType(), srcType);
 }
 
 static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,

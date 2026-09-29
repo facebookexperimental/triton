@@ -5,6 +5,8 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
@@ -654,7 +656,15 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
     // Skip encodings without modular layout support.
     if (!npotCvtSafe(srcTy, dstTy))
       continue;
-    if (cvtNeedsSharedMemory(srcTy, dstTy)) {
+    // Leave force_shuffle absent so this detached op models the default path.
+    OperationState state(op->getLoc(), ConvertLayoutOp::getOperationName());
+    state.addOperands(operand);
+    state.addTypes(dstTy);
+    Operation *hypotheticalOp = Operation::create(state);
+    auto cvt = cast<ConvertLayoutOp>(hypotheticalOp);
+    bool needsSharedMemory = cvtNeedsSharedMemory(cvt);
+    hypotheticalOp->destroy();
+    if (needsSharedMemory) {
       unsigned elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
       cost += elems * getElementBitWidth(srcTy) / 8;
     }
@@ -2430,7 +2440,7 @@ public:
         // Skip encodings without modular layout support.
         if (!npotCvtSafe(srcTy, dstTy))
           return;
-        if (!cvtNeedsSharedMemory(srcTy, dstTy))
+        if (!cvtNeedsSharedMemory(cvt))
           return;
         candidates.push_back(cvt);
       });

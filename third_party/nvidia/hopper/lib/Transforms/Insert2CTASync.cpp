@@ -187,7 +187,6 @@ static SlotAndPhase computeSlotAndPhase(OpBuilder &builder, Location loc,
           arith::TruncIOp::create(builder, loc, i32Ty, phase)};
 }
 
-
 // Buffer count of the allocation behind `v`. Returns 0 when it is not a view
 // into a buffer array -- i.e. a single, non-rotating buffer.
 static unsigned getAllocDepth(Value v) {

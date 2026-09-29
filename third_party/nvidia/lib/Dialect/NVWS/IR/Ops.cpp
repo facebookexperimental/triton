@@ -379,9 +379,9 @@ ParseResult SemaphoreAcquireOp::parse(OpAsmParser &parser,
   if (hasPhase && parser.resolveOperand(phase, i32Type, result.operands))
     return failure();
 
-  result.addAttribute("operand_segment_sizes",
-                      builder.getDenseI32ArrayAttr(
-                          {1, hasStage ? 1 : 0, hasPhase ? 1 : 0}));
+  result.addAttribute(
+      "operand_segment_sizes",
+      builder.getDenseI32ArrayAttr({1, hasStage ? 1 : 0, hasPhase ? 1 : 0}));
   result.addTypes(tokenType);
   return success();
 }
@@ -394,7 +394,8 @@ void SemaphoreAcquireOp::print(OpAsmPrinter &p) {
       p << ", " << getPhase();
     p << "]";
   }
-  p.printOptionalAttrDict((*this)->getAttrs(), {getOperandSegmentSizesAttrName()});
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          {getOperandSegmentSizesAttrName()});
   p << " : ";
   Type semaphoreType = getSemaphore().getType();
   if (auto validType = dyn_cast<SemaphoreType>(semaphoreType))

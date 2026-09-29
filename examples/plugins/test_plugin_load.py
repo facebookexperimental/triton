@@ -110,6 +110,7 @@ def _dynamic_tags(path):
 
 
 class TritonPluginLoadTest(unittest.TestCase):
+
     def test_plugin_path_is_wired_up(self):
         paths = knobs.compilation.plugin_paths
         self.assertTrue(paths, "TRITON_PLUGIN_PATHS unset; the target's env is not reaching the test")
@@ -122,7 +123,8 @@ class TritonPluginLoadTest(unittest.TestCase):
         # any more and a green run stops meaning anything.
         carriers = _mapped_files_containing(_DUPLICATE_CL_OPT)
         self.assertGreaterEqual(
-            len(carriers), 2,
+            len(carriers),
+            2,
             "expected libtriton's LLVM and torch's llvm-fb/19 to both be mapped into this process, "
             f"found only {carriers}; check the caffe2:torch dep on the target",
         )
@@ -133,7 +135,8 @@ class TritonPluginLoadTest(unittest.TestCase):
         # the second LLVM above, which would re-register the same option names and
         # abort the process at import. Reaching this assertion at all is the
         # behavioral half; the assertion itself pins the flag on the artifact.
-        symbolic = [(tag, val) for tag, val in _dynamic_tags(libtriton.__file__)
+        symbolic = [(tag, val)
+                    for tag, val in _dynamic_tags(libtriton.__file__)
                     if tag == _DT_SYMBOLIC or (tag == _DT_FLAGS and val & _DF_SYMBOLIC)]
         self.assertTrue(symbolic, "libtriton is not linked -Bsymbolic; its LLVM will merge with torch's")
 

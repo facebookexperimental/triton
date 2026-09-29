@@ -24,7 +24,6 @@ from triton.language.extra.tlx.tutorials.fused_attention_ws_device_tma_dp import
 
 from triton._internal_testing import is_blackwell
 
-
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -169,6 +168,8 @@ def test_autows_fa_2cta_non_causal(baseVariant):
     finally:
         kernel.configs = old_configs
         kernel.cache = old_cache
+
+
 def test_autows_fa_2cta_persistent_multi_iteration():
     """Cover persistent tile reuse and V staging-slot rotation."""
     config = next(
@@ -218,6 +219,8 @@ def test_autows_fa_rescale_opt_long_sequence(N_CTX):
     finally:
         _attn_fwd_persist.configs = old_configs
         _attn_fwd_persist.cache = old_cache
+
+
 @pytest.mark.skipif(
     os.environ.get("AUTOWS_FWD_CLC") != "1" or os.environ.get("AUTOWS_FWD_NUM_CTAS") != "2",
     reason="Run with AUTOWS_FWD_CLC=1 and AUTOWS_FWD_NUM_CTAS=2",

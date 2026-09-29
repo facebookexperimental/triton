@@ -7,13 +7,13 @@ from triton.tlx.ops.kernels.addmm._shapes import CORRECTNESS_SHAPES, inputs
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="tlx.ops.addmm requires gfx942")
 
 
-@pytest.mark.parametrize("m,n,k,a_strides,b_strides,dtype_name", CORRECTNESS_SHAPES)
-def test_addmm(m, n, k, a_strides, b_strides, dtype_name):
+@pytest.mark.parametrize("m,n,k,a_strides,b_strides,bias_strides,dtype_name", CORRECTNESS_SHAPES)
+def test_addmm(m, n, k, a_strides, b_strides, bias_strides, dtype_name):
     from triton.tlx.ops import addmm as tlx_addmm
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
     torch.manual_seed(m + n + k)
-    bias, a, b = inputs((m, n, k, a_strides, b_strides, dtype_name), dtype)
+    bias, a, b = inputs((m, n, k, a_strides, b_strides, bias_strides, dtype_name), dtype)
     out = torch.empty((m, n), device="cuda", dtype=dtype)
     actual = tlx_addmm(bias, a, b, out=out)
     expected = torch.addmm(bias, a, b)

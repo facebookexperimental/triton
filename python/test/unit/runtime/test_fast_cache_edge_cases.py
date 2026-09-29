@@ -855,6 +855,7 @@ class TestCtasPerCgaAutotunerSteadyState(TestCase):
         self.assertTrue(torch.allclose(o2, x2 + y2))
 
     def _run_new_key_cluster_config_sequence(self, check_best_config):
+
         def select_cta_count(configs, named_args, **kwargs):
             if named_args["n_elements"] == 256:
                 return [config for config in configs if config.kwargs["USE_2CTA"]]
@@ -988,6 +989,7 @@ class TestCtasPerCgaAutotunerSteadyState(TestCase):
         device = _get_device()
 
         def run(n):
+
             def grid(meta):
                 num_ctas = meta["NUM_CTAS"]
                 tiles = triton.cdiv(n, meta["BLOCK_SIZE"])

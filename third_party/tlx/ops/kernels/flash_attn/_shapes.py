@@ -54,11 +54,21 @@ FOCUS_SUITES = (
             FlashAttentionShape(4, 32, 4096, 128, False, "fp16"),
         ),
     ),
+    FocusSuite(
+        name="gfx950_1",
+        op="flash_attn",
+        shapes=(
+            FlashAttentionShape(1, 16, 4096, 64, False, "bf16"),
+            FlashAttentionShape(16, 16, 1024, 128, False, "bf16"),
+            FlashAttentionShape(16, 16, 1024, 128, True, "bf16"),
+        ),
+    ),
 )
 
 DEFAULT_SUITES = {
     "sm90": ("sm90_1", ),
     "sm100": ("sm100_1", ),
+    "gfx950": ("gfx950_1", ),
 }
 FOCUS = FocusRegistry("flash_attn", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))

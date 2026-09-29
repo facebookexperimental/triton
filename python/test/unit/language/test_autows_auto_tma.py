@@ -61,6 +61,8 @@ def _scale_2d_strided(x_ptr, out_ptr, M, N, stride_xm, stride_om, BLOCK_M: tl.co
     # Row-major x: innermost (offs_n) is contiguous -> auto-TMA eligible.
     x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :], mask=mask, other=0.0)
     tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :], x * 2.0, mask=mask)
+
+
 def test_auto_tma_2d_strided_numerics():
     M, N = 512, 384
     BLOCK_M, BLOCK_N = 64, 64
@@ -100,6 +102,8 @@ def _gemm_nows(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bn, stride_cm, BL
         acc = tl.dot(a, b.T, acc)
     tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :], acc.to(tl.float16),
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
 def test_auto_tma_gemm_nows():
     """Isolates the auto-TMA DOT-operand path WITHOUT warp specialization."""
     M, N, K = 256, 256, 256
@@ -123,6 +127,8 @@ def test_auto_tma_gemm_nows():
     assert "tt.descriptor_load" in kernel.asm["ttir"], "expected auto-TMA promotion"
     ref = (A.to(torch.float32) @ B.T.to(torch.float32)).to(dtype)
     torch.testing.assert_close(ref, C, atol=0.05, rtol=0.05)
+
+
 def test_auto_tma_gemm_nows_device(monkeypatch):
     """Phase A: addptr loads promoted to a DEVICE-built tt.make_tensor_descriptor
     (TRITON_AUTO_TMA_DEVICE=1), not the host-recipe path. Verifies the pass
@@ -187,6 +193,8 @@ def _batched_scale(x_ptr, out_ptr, B, M, N, stride_b, stride_m, BLOCK_M: tl.cons
     ob = out_ptr + pid_b * stride_b
     x = tl.load(xb + offs_m[:, None] * stride_m + offs_n[None, :], mask=mask, other=0.0)
     tl.store(ob + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
+
+
 def test_auto_tma_batched_device(monkeypatch):
     """per-program base (pid_b*stride_b) must fold into the DEVICE descriptor base
     (make_tensor_descriptor(addptr(x, off), ...)), giving a per-batch view."""
@@ -271,6 +279,8 @@ def _ws_auto_tma_matmul(
         c = acc.to(tl.float16)
         tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :], c,
                  mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
 def test_ws_auto_tma_data_partition_numerics():
     M, N, K = 512, 512, 512
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 128, 64  # dp=2 needs BLOCK_M=256 (256/2=128) so Blackwell tcgen05.mma M=128 is satisfied per partition
@@ -663,6 +673,8 @@ def _plain_fa_fwd(Q, K, V, O, sm_scale, N_CTX, stride_h, stride_m, BLOCK_M: tl.c
         m_i = m_ij
     acc = acc / l_i[:, None]
     tl.store(o_base + offs_m[:, None] * stride_m + offs_d[None, :], acc.to(tl.float16), mask=offs_m[:, None] < N_CTX)
+
+
 def test_plain_fa_fwd_device(monkeypatch):
     """A plain-pointer FA fwd (no descriptors, no warp_specialize): the Q/K/V
     loads are auto-TMA promoted to DEVICE make_tensor_descriptor + descriptor_load
@@ -739,6 +751,8 @@ def _plain_fa_fwd_ws(Q, K, V, O, sm_scale, N_CTX, stride_h, stride_m, BLOCK_M: t
         m_i = m_ij
     acc = acc / l_i[:, None]
     tl.store(o_base + offs_m[:, None] * stride_m + offs_d[None, :], acc.to(tl.float16), mask=offs_m[:, None] < N_CTX)
+
+
 def test_plain_fa_fwd_ws_device(monkeypatch):
     """plain-pointer FA + warp_specialize: loads auto-TMA'd to device descriptors,
     loop warp-specialized, numerics vs torch SDPA."""
@@ -794,6 +808,8 @@ def _run_plain_fa_ws(q, k, v, o, sm_scale, N_CTX, BLOCK_M, BLOCK_N, HEAD_DIM):
         triton.knobs.nvidia.disable_wsbarrier_reorder = True
         return _plain_fa_fwd_ws[grid](q, k, v, o, sm_scale, N_CTX, q.stride(1), q.stride(2), BLOCK_M=BLOCK_M,
                                       BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, num_warps=4, num_stages=2, maxRegAutoWS=192)
+
+
 @pytest.mark.parametrize("N_CTX", [512, 1024, 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 def test_plain_fa_fwd_ws_shapes(monkeypatch, N_CTX, HEAD_DIM):
