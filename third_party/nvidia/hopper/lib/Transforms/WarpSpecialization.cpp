@@ -47,6 +47,32 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   return flags;
 }
 
+// Returns a user of an MMAv5 accumulator that sits in a nested region of the
+// MMA's enclosing scf.for (e.g. a tmem_load in an scf.if in the loop body), or
+// null if there is none. handleOperandD only walks the direct children of that
+// loop body and treats every other tmem_load as a consumer after the loop, so
+// it cannot build operand-D channels for such a user. Flattened persistent
+// loops (tritongpu-fuse-nested-loops) produce this shape: the epilogue's
+// tmem_load lands in an `scf.if` guarded by "last K iteration".
+static Operation *findNestedOperandDUser(triton::FuncOp funcOp) {
+  namespace ttng = triton::nvidia_gpu;
+  Operation *nestedUser = nullptr;
+  funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
+    auto allocOp = mmaOp.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
+    auto forOp = mmaOp->getParentOfType<scf::ForOp>();
+    if (!allocOp || !forOp)
+      return WalkResult::advance();
+    for (Operation *user : allocOp.getResult().getUsers()) {
+      if (user->getParentOp() != forOp && forOp->isProperAncestor(user)) {
+        nestedUser = user;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return nestedUser;
+}
+
 static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   runDeadIterArgElimination(op);
   RewritePatternSet patterns(op->getContext());
@@ -212,6 +238,14 @@ public:
     if (hasUnsupportedElse) {
       LDBG("Warp specialization only supports else blocks contained in one "
            "task. Skipping.");
+      return bailOut(funcOp);
+    }
+
+    if (Operation *nestedUser = findNestedOperandDUser(funcOp)) {
+      nestedUser->emitWarning(
+          "meta autoWS does not support an MMA accumulator used inside a "
+          "nested region of its loop (e.g. a flattened persistent loop); "
+          "compiling without warp specialization");
       return bailOut(funcOp);
     }
 
