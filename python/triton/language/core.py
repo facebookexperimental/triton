@@ -2763,6 +2763,11 @@ def load(
     if other is not None:
         other = _semantic.to_tensor(other)
     padding_option = _unwrap_if_constexpr(padding_option)
+    boundary_check = _unwrap_if_constexpr(boundary_check)
+    if padding_option or boundary_check:
+        raise ValueError("`padding_option` or `boundary_check` argument is not supported for loading a tensor of"
+                         "pointers or loading a scalar. Because the compiler does not know the boundary; please "
+                         "use block pointers (defined by `make_block_ptr`) instead")
     cache_modifier = _unwrap_if_constexpr(cache_modifier)
     eviction_policy = _unwrap_if_constexpr(eviction_policy)
     volatile = _unwrap_if_constexpr(volatile)
@@ -2771,8 +2776,6 @@ def load(
         pointer,
         mask,
         other,
-        boundary_check,
-        padding_option,
         cache_modifier,
         eviction_policy,
         volatile,
@@ -2890,9 +2893,14 @@ def store(
     mask = _unwrap_if_constexpr(mask)
     if mask is not None:
         mask = _semantic.to_tensor(mask)
+    boundary_check = _unwrap_if_constexpr(boundary_check)
+    if boundary_check:
+        raise ValueError("`boundary_check` argument is not supported for storing a tensor of pointers or storing a "
+                         "scalar. Because the compiler does not know the boundary; please use block pointers "
+                         "(defined by `make_block_ptr`) instead")
     cache_modifier = _unwrap_if_constexpr(cache_modifier)
     eviction_policy = _unwrap_if_constexpr(eviction_policy)
-    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+    return _semantic.store(pointer, value, mask, cache_modifier, eviction_policy)
 
 
 @builtin

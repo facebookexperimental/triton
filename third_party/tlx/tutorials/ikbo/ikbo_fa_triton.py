@@ -148,19 +148,27 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
-    K_block_ptr,
-    V_block_ptr,
+    K_base,
+    V_base,
+    stride_kd,
+    stride_kt,
+    stride_vt,
+    stride_vd,
     max_seq_len,
     qk_scale,
     allow_tf32,
+    D_HEAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    offs_d = tl.arange(0, D_HEAD)
     offset_seq_n = tl.arange(0, BLOCK_N)
     num_iter = tl.cdiv(max_seq_len, BLOCK_N)
     for i_iter in tl.range(0, num_iter):
         start_n = i_iter * BLOCK_N
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        kT = tl.load(K_block_ptr, boundary_check=[0, 1], padding_option="zero")
+        off_n = start_n + offset_seq_n
+        kT = tl.load(K_base + offs_d[:, None] * stride_kd + off_n[None, :] * stride_kt,
+                     mask=off_n[None, :] < max_seq_len, other=0.0)
         qk = tl.dot(q, kT, allow_tf32=allow_tf32)
         if (i_iter == num_iter - 1) & (max_seq_len % BLOCK_N != 0):
             mask_seq = offset_seq_n[None, :] < max_seq_len - start_n
@@ -171,13 +179,12 @@ def _attn_fwd_inner(
         alpha = tl.math.exp2(m_i - m_ij)
         l_ij = tl.sum(p, 1)
         acc = acc * alpha[:, None]
-        v = tl.load(V_block_ptr, boundary_check=[0, 1], padding_option="zero")
+        v = tl.load(V_base + off_n[:, None] * stride_vt + offs_d[None, :] * stride_vd,
+                     mask=off_n[:, None] < max_seq_len, other=0.0)
         p = p.to(v.dtype)
         acc += tl.dot(p, v, allow_tf32=allow_tf32)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
     inv_li = 1.0 / l_i[:, None]
     acc *= inv_li
     return acc, l_i, m_i
@@ -255,58 +262,40 @@ def _ikbo_fa_kernel(
 
     qk_scale = 1.44269504089 * (1.0 / tl.sqrt(tl.cast(d_head, tl.float32)))
 
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q + pid_head * stride_q_head,
-        shape=(total_q_tokens, d_head),
-        strides=(stride_q_token, stride_q_dim),
-        offsets=(seq_start_q + pid_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, d_head),
-        order=(1, 0),
-    )
-    K_block_ptr = tl.make_block_ptr(
-        base=K + pid_head * stride_k_head,
-        shape=(d_head, total_kv_tokens),
-        strides=(stride_k_dim, stride_k_token),
-        offsets=(0, seq_start_kv),
-        block_shape=(d_head, BLOCK_N),
-        order=(0, 1),
-    )
-    V_block_ptr = tl.make_block_ptr(
-        base=V + pid_head * stride_v_head,
-        shape=(total_kv_tokens, d_head),
-        strides=(stride_v_token, stride_v_dim),
-        offsets=(seq_start_kv, 0),
-        block_shape=(BLOCK_N, d_head),
-        order=(1, 0),
-    )
-    O_block_ptr = tl.make_block_ptr(
-        base=output + pid_head * stride_o_head,
-        shape=(total_q_tokens, d_head),
-        strides=(stride_o_token, stride_o_dim),
-        offsets=(seq_start_q + pid_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, d_head),
-        order=(1, 0),
-    )
+    Q_base = Q + pid_head * stride_q_head
+    K_base = K + pid_head * stride_k_head + seq_start_kv * stride_k_token
+    V_base = V + pid_head * stride_v_head + seq_start_kv * stride_v_token
+    O_base = output + pid_head * stride_o_head
 
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, d_head], dtype=tl.float32)
 
-    q = tl.load(Q_block_ptr, boundary_check=[0, 1], padding_option="zero")
+    offs_m = seq_start_q + pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, d_head)
+    mask_m = offs_m < total_q_tokens
+    q = tl.load(Q_base + offs_m[:, None] * stride_q_token + offs_d[None, :] * stride_q_dim,
+                mask=mask_m[:, None], other=0.0)
 
     acc, l_i, m_i = _attn_fwd_inner(
         acc,
         l_i,
         m_i,
         q,
-        K_block_ptr,
-        V_block_ptr,
+        K_base,
+        V_base,
+        stride_k_dim,
+        stride_k_token,
+        stride_v_token,
+        stride_v_dim,
         max_seq_len,
         qk_scale,
         allow_tf32,
+        d_head,
         BLOCK_N,
     )
-    tl.store(O_block_ptr, acc.to(output.dtype.element_ty), boundary_check=[0, 1])
+    tl.store(O_base + offs_m[:, None] * stride_o_token + offs_d[None, :] * stride_o_dim,
+             acc.to(output.dtype.element_ty), mask=mask_m[:, None])
 
 
 # =============================================================================
