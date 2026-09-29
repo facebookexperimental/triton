@@ -363,10 +363,6 @@ def get_llvm_flags(options):
     per-function LLVM attributes (see make_llir) whenever LLVM offers one.
     """
     flags = []
-    # LLVM has no per-function attribute for the AMDGPU register pressure
-    # trackers yet.
-    if options.arch in ["gfx942", "gfx950"]:
-        flags.append("amdgpu-use-amdgpu-trackers")
     # Discourage VGPR reuse that creates VALU-to-DS WAR hazards and requires
     # s_wait_alu va_vdst waits in expert scheduling mode.
     if options.va_vdst_anti_hints and options.arch == "gfx1250" and is_expert_scheduling_enabled(options.arch):
