@@ -170,8 +170,13 @@ jobs:
           PR_BODY_FILE="$(mktemp)"
           printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
           bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}"
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
       - name: Run TritonBench tests on B200 GPU
         id: tritonbench
+        if: ${{ steps.select.outputs.run_tritonbench != 'false' }}
         env:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
         run: |
@@ -230,6 +235,10 @@ jobs:
           . "${SETUP_SCRIPT}"
           uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
@@ -250,6 +259,11 @@ jobs:
           done
           FILES=("${TLX_FILES[@]}")
           [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
+            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -Fxf /tmp/affected.txt || true)
+            echo "kernel-only PR: ${#FILES[@]} TLX core file(s) touch the changed kernel(s)"
+            [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
+          fi
           echo "b200 collects:" "${FILES[@]}"
           python -m pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
@@ -257,12 +271,28 @@ jobs:
         timeout-minutes: 30
         run: |
           . "${SETUP_SCRIPT}"
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
+            MODE="${{ steps.select.outputs.correctness_mode }}"
+            if [ "$MODE" = "skip" ]; then
+              echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"
+              exit 0
+            fi
+            if [ "$MODE" = "filtered" ]; then
+              echo "kernel-only PR: correctness filter: ${{ steps.select.outputs.correctness_k }}"
+              python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -k "${{ steps.select.outputs.correctness_k }}" -v --junitxml=/tmp/tlx-correctness.xml
+              exit 0
+            fi
+          fi
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
       - name: Run device-agnostic TLX codegen tests
         id: run_codegen_tests
         timeout-minutes: 30
         run: |
           . "${SETUP_SCRIPT}"
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -qxF "python/test/unit/language/test_tlx_codegen.py" /tmp/affected.txt; then
+            echo "kernel-only PR: codegen tests do not touch the changed kernel(s); skipping"
+            exit 0
+          fi
           python -m pytest python/test/unit/language/test_tlx_codegen.py -v --junitxml=/tmp/tlx-codegen.xml
       - name: Run host-default TLX L2 perf
         id: run_perf_tests
@@ -438,11 +468,19 @@ jobs:
           . "${SETUP_SCRIPT}"
           uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
           uv pip install pytest expecttest
+      - name: Select kernel-affected tests
+        id: select
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/select-kernel-tests
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
         timeout-minutes: 50
         run: |
           . "${SETUP_SCRIPT}"
+          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
+            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
+            exit 0
+          fi
           python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
