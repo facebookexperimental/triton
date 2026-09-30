@@ -26,7 +26,17 @@ def _assert_strides(tensor, wanted):
             assert got == expected, f"dim {dim}: stride {got}, recorded {expected}"
 
 
-def run_mm_case(arch, M, N, K, a_strides, b_strides, dtype_name):
+def run_mm_case(
+    arch,
+    M,
+    N,
+    K,
+    a_strides,
+    b_strides,
+    dtype_name,
+    *,
+    allow_decline=True,
+):
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
     from triton.tlx.ops import mm as tlx_mm
 
@@ -40,6 +50,8 @@ def run_mm_case(arch, M, N, K, a_strides, b_strides, dtype_name):
     try:
         out = tlx_mm(a, b, space="heuristic")
     except (InvalidInput, UnsupportedOp) as declined:
+        if not allow_decline:
+            raise
         pytest.skip(f"{arch} declines this shape: {declined}")
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - started

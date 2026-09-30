@@ -44,6 +44,14 @@ SYNTHETIC: tuple[MMShape, ...] = (
 
 FOCUS_SUITES = (
     FocusSuite(
+        name="sm90_baseline",
+        op="mm",
+        shapes=(
+            MMShape(2176, 2176, 2176, (2176, 1), (2176, 1), "fp16"),
+            MMShape(2176, 2176, 2176, (2176, 1), (2176, 1), "bf16"),
+        ),
+    ),
+    FocusSuite(
         name="sm100_1",
         op="mm",
         shapes=(
@@ -550,6 +558,7 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
+    "sm90": ("sm90_baseline", ),
     "sm100": ("sm100_1", ),
     "gfx950": ("gfx950_all", ),
     "gfx942": ("gfx942_all", ),
@@ -557,6 +566,7 @@ DEFAULT_SUITES = {
 FOCUS = FocusRegistry("mm", FOCUS_SUITES, DEFAULT_SUITES)
 
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
+SM90_FOCUS = FOCUS.shapes("sm90")
 
 
 def operand(rows, cols, strides, dtype, device="cuda"):
