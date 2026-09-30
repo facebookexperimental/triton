@@ -98,6 +98,8 @@ from .types import (
     CLCPipelineContext,
     DummyRegisterLayoutEncoding,
     layout_encoding,
+    make_tensor_memory_layout,
+    make_tensor_memory_scales_layout,
     mbarrier,
     mbarrier_type,
     nv_mma_layout,
@@ -120,6 +122,7 @@ from .types import (
     tensor_descriptor_ptr,
     tensor_descriptor_ptr_type,
     tensor_memory_layout_encoding,
+    tensor_memory_scales_layout_encoding,
     TMemCTAMode,
 )
 from .utility import (
@@ -151,6 +154,8 @@ __all__ = [
     "packed_fma4",
     # types
     "layout_encoding",
+    "make_tensor_memory_layout",
+    "make_tensor_memory_scales_layout",
     "shared_layout_encoding",
     "swizzled_layout",
     "swizzled_shared_layout_encoding",
@@ -160,6 +165,7 @@ __all__ = [
     "slice_layout",
     "dot_operand_layout",
     "tensor_memory_layout_encoding",
+    "tensor_memory_scales_layout_encoding",
     "TMemCTAMode",
     "nv_mma_layout",
     "nv_mma_shared_layout_encoding",
