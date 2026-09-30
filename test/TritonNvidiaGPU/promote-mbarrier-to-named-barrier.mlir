@@ -173,6 +173,146 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 6 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @prefer_smaller_group
+  // CHECK: ttg.local_alloc : () -> !ttg.memdesc<2x1xi64
+  // CHECK-NOT: ttg.local_alloc : () -> !ttg.memdesc<1xi64
+  // CHECK: ttng.arrive_barrier
+  // CHECK: arith.constant 4 : i32
+  // CHECK: ttng.arrive_barrier_named
+  // CHECK: ttng.wait_barrier %
+  // CHECK: arith.constant 4 : i32
+  // CHECK: ttng.wait_barrier_named
+  tt.func public @prefer_smaller_group(%index: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c6 = arith.constant 6 : i32
+    %c7 = arith.constant 7 : i32
+    %c8 = arith.constant 8 : i32
+    %c9 = arith.constant 9 : i32
+    %c10 = arith.constant 10 : i32
+    %c11 = arith.constant 11 : i32
+    %c12 = arith.constant 12 : i32
+    %c13 = arith.constant 13 : i32
+    %c14 = arith.constant 14 : i32
+    %c15 = arith.constant 15 : i32
+    %u6 = ttng.user_named_barrier_id %c6 : i32
+    %u7 = ttng.user_named_barrier_id %c7 : i32
+    %u8 = ttng.user_named_barrier_id %c8 : i32
+    %u9 = ttng.user_named_barrier_id %c9 : i32
+    %u10 = ttng.user_named_barrier_id %c10 : i32
+    %u11 = ttng.user_named_barrier_id %c11 : i32
+    %u12 = ttng.user_named_barrier_id %c12 : i32
+    %u13 = ttng.user_named_barrier_id %c13 : i32
+    %u14 = ttng.user_named_barrier_id %c14 : i32
+    %u15 = ttng.user_named_barrier_id %c15 : i32
+    %large = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64, #barrier, #smem, mutable>
+    %large0 = ttg.memdesc_index %large[%c0] : !ttg.memdesc<2x1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %large1 = ttg.memdesc_index %large[%c1] : !ttg.memdesc<2x1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.init_barrier %large0, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.init_barrier %large1, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.init_barrier %small, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttg.warp_specialize(%large, %index, %small) attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 5>}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !ttg.memdesc<2x1xi64, #barrier, #smem, mutable>, %arg1: i32, %arg2: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) num_warps(1) {
+      %bar = ttg.memdesc_index %arg0[%arg1] : !ttg.memdesc<2x1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      ttng.arrive_barrier %arg2, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      ttg.warp_return
+    }
+    partition1(%arg0: !ttg.memdesc<2x1xi64, #barrier, #smem, mutable>, %arg1: i32, %arg2: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) num_warps(1) {
+      %phase = arith.constant 0 : i32
+      %bar = ttg.memdesc_index %arg0[%arg1] : !ttg.memdesc<2x1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      ttng.wait_barrier %bar, %phase : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      ttng.wait_barrier %arg2, %phase : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<2x1xi64, #barrier, #smem, mutable>, i32, !ttg.memdesc<1xi64, #barrier, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 6 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @prefer_deeper_loop
+  // CHECK: ttg.local_alloc
+  // CHECK: ttng.arrive_barrier
+  // CHECK: scf.for
+  // CHECK: arith.constant 15 : i32
+  // CHECK: ttng.arrive_barrier_named
+  // CHECK: ttng.wait_barrier %
+  // CHECK: scf.for
+  // CHECK: arith.constant 15 : i32
+  // CHECK: ttng.wait_barrier_named
+  tt.func public @prefer_deeper_loop() {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c4_i32 = arith.constant 4 : i32
+    %c5_i32 = arith.constant 5 : i32
+    %c6_i32 = arith.constant 6 : i32
+    %c7_i32 = arith.constant 7 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %c9_i32 = arith.constant 9 : i32
+    %c10_i32 = arith.constant 10 : i32
+    %c11_i32 = arith.constant 11 : i32
+    %c12_i32 = arith.constant 12 : i32
+    %c13_i32 = arith.constant 13 : i32
+    %c14_i32 = arith.constant 14 : i32
+    %u4 = ttng.user_named_barrier_id %c4_i32 : i32
+    %u5 = ttng.user_named_barrier_id %c5_i32 : i32
+    %u6 = ttng.user_named_barrier_id %c6_i32 : i32
+    %u7 = ttng.user_named_barrier_id %c7_i32 : i32
+    %u8 = ttng.user_named_barrier_id %c8_i32 : i32
+    %u9 = ttng.user_named_barrier_id %c9_i32 : i32
+    %u10 = ttng.user_named_barrier_id %c10_i32 : i32
+    %u11 = ttng.user_named_barrier_id %c11_i32 : i32
+    %u12 = ttng.user_named_barrier_id %c12_i32 : i32
+    %u13 = ttng.user_named_barrier_id %c13_i32 : i32
+    %u14 = ttng.user_named_barrier_id %c14_i32 : i32
+    %shallow = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %deep = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.init_barrier %shallow, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.init_barrier %deep, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttg.warp_specialize(%shallow, %deep) attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 5>}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %arg1: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) num_warps(1) {
+      %lb = arith.constant 0 : index
+      %ub = arith.constant 1 : index
+      %step = arith.constant 1 : index
+      ttng.arrive_barrier %arg0, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      scf.for %i = %lb to %ub step %step {
+        ttng.arrive_barrier %arg1, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      }
+      ttg.warp_return
+    }
+    partition1(%arg0: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %arg1: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) num_warps(1) {
+      %phase = arith.constant 0 : i32
+      %lb = arith.constant 0 : index
+      %ub = arith.constant 1 : index
+      %step = arith.constant 1 : index
+      ttng.wait_barrier %arg0, %phase : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      scf.for %i = %lb to %ub step %step {
+        ttng.wait_barrier %arg1, %phase : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      }
+      ttg.warp_return
+    } : (!ttg.memdesc<1xi64, #barrier, #smem, mutable>, !ttg.memdesc<1xi64, #barrier, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 6 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @promote_multibuffer
   // CHECK-NOT: ttg.local_alloc
   // CHECK: partition0
