@@ -3190,21 +3190,17 @@ def _mxfp8_32x32_qdata_dual_scale_kernel(
     row_normal = offs_m[:, None]
     col_normal = tl.arange(0, 4)[None, :]
     row_in_128 = row_normal % 128
-    normal_offset = ((row_normal // 128) * 32 + row_in_128 % 32) * 16 + (
-        row_in_128 // 32 * 4 + col_normal
-    )
+    normal_offset = ((row_normal // 128) * 32 + row_in_128 % 32) * 16 + (row_in_128 // 32 * 4 + col_normal)
     normal_scale = tl.reshape(tl.broadcast_to(block_scale[:, None, :], (1, 32, 4)), (32, 4))
     tl.store(normal_scale_ptr + normal_offset, normal_scale)
 
     # Swapped orientation: expand each block scale over its 32 transposed rows.
-    block_scale = tl.reshape(block_scale, (4,))
-    swapped_scale = tl.reshape(tl.broadcast_to(block_scale[:, None], (4, 32)), (128,))
+    block_scale = tl.reshape(block_scale, (4, ))
+    swapped_scale = tl.reshape(tl.broadcast_to(block_scale[:, None], (4, 32)), (128, ))
     row_swapped = tl.arange(0, 128)
     col_swapped = pid_m
     row_in_128 = row_swapped % 128
-    swapped_offset = (
-        (col_swapped // 4) * 32 + row_in_128 % 32
-    ) * 16 + (row_in_128 // 32 * 4 + col_swapped % 4)
+    swapped_offset = ((col_swapped // 4) * 32 + row_in_128 % 32) * 16 + (row_in_128 // 32 * 4 + col_swapped % 4)
     tl.store(swapped_scale_ptr + swapped_offset, swapped_scale)
 
 
@@ -3219,7 +3215,7 @@ def _quantize_mxfp8_32x32_operand(ref):
     data = torch.empty_like(flat, dtype=torch.float8_e4m3fn)
     normal_scale = torch.empty((M // 128, 1, 32, 16), dtype=torch.uint8, device=ref.device)
     swapped_scale = torch.empty((1, M // 128, 32, 16), dtype=torch.uint8, device=ref.device)
-    _mxfp8_32x32_qdata_dual_scale_kernel[(M // 32,)](
+    _mxfp8_32x32_qdata_dual_scale_kernel[(M // 32, )](
         flat,
         data,
         normal_scale,
@@ -3228,12 +3224,8 @@ def _quantize_mxfp8_32x32_operand(ref):
     )
     return (
         data.reshape_as(ref),
-        swizzled_to_tma_preshuffled(
-            normal_scale.view(torch.float8_e8m0fnu), N_CTX, HEAD_DIM, 32, Z * H
-        ),
-        swizzled_to_tma_preshuffled(
-            swapped_scale.view(torch.float8_e8m0fnu), HEAD_DIM, N_CTX, 32, Z * H
-        ),
+        swizzled_to_tma_preshuffled(normal_scale.view(torch.float8_e8m0fnu), N_CTX, HEAD_DIM, 32, Z * H),
+        swizzled_to_tma_preshuffled(swapped_scale.view(torch.float8_e8m0fnu), HEAD_DIM, N_CTX, 32, Z * H),
     )
 
 def _quantize_mxfp8_operand(ref, transpose_for_reduction=False):
