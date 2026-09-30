@@ -47,65 +47,6 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   return flags;
 }
 
-// Returns a tmem_load of an MMAv5 accumulator, placed after the MMA's scf.for,
-// that runs in the MMA's own task, or null if there is none. handleOperandD
-// only models such a consumer as a cross-partition channel from the MMA; a
-// same-task consumer gets no channel and leaves the accumulator's
-// synchronization and buffer counts unthreaded. This happens when the
-// partition scheduler places the epilogue in the gemm partition, e.g. a GEMM
-// whose operands are pointer loads (no load partition) and whose epilogue is a
-// tl.store (no epilogue partition), so every op propagates to one task.
-static Operation *findSameTaskPostLoopOperandDUser(triton::FuncOp funcOp) {
-  namespace ttng = triton::nvidia_gpu;
-  Operation *sameTaskUser = nullptr;
-  funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
-    auto allocOp = mmaOp.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
-    auto forOp = mmaOp->getParentOfType<scf::ForOp>();
-    SmallVector<AsyncTaskId> mmaTaskIds = getAsyncTaskIds(mmaOp);
-    if (!allocOp || !forOp || mmaTaskIds.size() != 1)
-      return WalkResult::advance();
-    for (Operation *user : allocOp.getResult().getUsers()) {
-      if (!isa<ttng::TMEMLoadOp>(user) || forOp->isAncestor(user))
-        continue;
-      SmallVector<AsyncTaskId> userTaskIds = getAsyncTaskIds(user);
-      if (llvm::all_of(userTaskIds, [&](AsyncTaskId id) {
-            return id == mmaTaskIds.front();
-          })) {
-        sameTaskUser = user;
-        return WalkResult::interrupt();
-      }
-    }
-    return WalkResult::advance();
-  });
-  return sameTaskUser;
-}
-
-// Returns an MMAv5 in an scf.for whose A operand is a `tmem_alloc %src` in the
-// same loop and the same task as the MMA, or null if there is none. Each
-// iteration's tmem_alloc rewrites the A tile in TMEM while the previous
-// iteration's asynchronous MMA may still be reading it. The non-WS pipeliner
-// orders the two by waiting for every such MMA to complete before the next
-// write; code partitioning only synchronizes TMEM through cross-partition
-// channels, so a same-task producer gets no channel, no wait, and no TMEM live
-// range. The partition scheduler produces this shape when A is a pointer
-// tl.load (no TMA, so it stays with the MMA) that is promoted to TMEM.
-static Operation *findSameTaskTmemOperandA(triton::FuncOp funcOp) {
-  namespace ttng = triton::nvidia_gpu;
-  Operation *found = nullptr;
-  funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
-    auto allocOp = mmaOp.getA().getDefiningOp<ttng::TMEMAllocOp>();
-    auto forOp = mmaOp->getParentOfType<scf::ForOp>();
-    if (!allocOp || !allocOp.getSrc() || !forOp || !forOp->isAncestor(allocOp))
-      return WalkResult::advance();
-    if (getAsyncTaskIds(allocOp) == getAsyncTaskIds(mmaOp)) {
-      found = mmaOp;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return found;
-}
-
 static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   runDeadIterArgElimination(op);
   RewritePatternSet patterns(op->getContext());
@@ -274,19 +215,23 @@ public:
       return bailOut(funcOp);
     }
 
-    if (Operation *mmaOp = findSameTaskTmemOperandA(funcOp)) {
-      mmaOp->emitWarning(
-          "meta autoWS does not support an MMA whose A operand is written to "
-          "TMEM in the MMA's own partition inside the loop; compiling without "
-          "warp specialization");
-      return bailOut(funcOp);
-    }
-
-    if (Operation *sameTaskUser = findSameTaskPostLoopOperandDUser(funcOp)) {
-      sameTaskUser->emitWarning(
-          "meta autoWS does not support reading an MMA accumulator after its "
-          "loop in the MMA's own partition; compiling without warp "
-          "specialization");
+    // Every op of an MMA kernel propagated to one task, e.g. a GEMM whose
+    // operands are pointer loads (no load partition) and whose epilogue is a
+    // tl.store (no epilogue partition). There is nothing to specialize, and
+    // code partitioning would build channels for the MMA's buffers without
+    // threading buffer counters through the loop, since no region spans two
+    // tasks.
+    Operation *firstMMA = nullptr;
+    funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
+      firstMMA = mmaOp;
+      return WalkResult::interrupt();
+    });
+    if (firstMMA && getNestedAsyncTaskIds(funcOp).size() == 1) {
+      LDBG("Warp specialization found an MMA kernel with a single partition. "
+           "Skipping.");
+      firstMMA->emitRemark(
+          "meta autoWS placed every op of this MMA kernel in one partition; "
+          "compiling without warp specialization");
       return bailOut(funcOp);
     }
 

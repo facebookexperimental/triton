@@ -17,6 +17,26 @@ from triton._internal_testing import is_blackwell
 
 
 @triton.jit
+def _pointer_a_persistent_gemm(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr,
+                               BN: tl.constexpr, BK: tl.constexpr, NUM_SMS: tl.constexpr, WS: tl.constexpr):
+    b_desc = tl.make_tensor_descriptor(B, shape=[K, N], strides=[N, 1], block_shape=[BK, BN])
+    c_desc = tl.make_tensor_descriptor(C, shape=[M, N], strides=[N, 1], block_shape=[BM, BN])
+    grid_m = tl.cdiv(M, BM)
+    grid_n = tl.cdiv(N, BN)
+    for tile_id in tl.range(tl.program_id(0), grid_m * grid_n, NUM_SMS, warp_specialize=WS):
+        pid_m = tile_id % grid_m
+        pid_n = tile_id // grid_m
+        rm = pid_m * BM + tl.arange(0, BM)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for ki in range(tl.cdiv(K, BK)):
+            rk = ki * BK + tl.arange(0, BK)
+            a = tl.load(A + rm[:, None].to(tl.int64) * K + rk[None, :]).to(tl.bfloat16)
+            b = b_desc.load([ki * BK, pid_n * BN])
+            acc = tl.dot(a, b, acc)
+        c_desc.store([pid_m * BM, pid_n * BN], acc)
+
+
+@triton.jit
 def _first_flag_gemm(A, B, C, M: tl.constexpr, N: tl.constexpr, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                      STAGES: tl.constexpr):
     a_desc = tl.make_tensor_descriptor(A, shape=[M, K], strides=[K, 1], block_shape=[BM, BK])
@@ -37,6 +57,39 @@ def _first_flag_gemm(A, B, C, M: tl.constexpr, N: tl.constexpr, K, BM: tl.conste
 
 def _alloc(size, align, stream):
     return torch.empty(size, dtype=torch.int8, device="cuda")
+
+
+def _run_pointer_a_gemm(BN, K, num_stages):
+    M, N, BM, BK, NUM_SMS = 1024, 1024, 128, 64, 148
+    triton.set_allocator(_alloc)
+    grid = (min(NUM_SMS, (M // BM) * (N // BN)), )
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        for it in range(5):
+            g = torch.Generator(device="cuda").manual_seed(it)
+            A = torch.randn(M, K, device="cuda", generator=g)
+            B = torch.randn(K, N, device="cuda", generator=g).to(torch.bfloat16)
+            outs = []
+            for ws in (True, False):
+                C = torch.full((M, N), float("nan"), device="cuda")
+                k = _pointer_a_persistent_gemm[grid](A, B, C, M, N, K, BM, BN, BK, NUM_SMS, ws, num_warps=4,
+                                                     num_stages=num_stages)
+                outs.append(C)
+                if ws:
+                    kernel = k
+            # Bitwise against the non-WS kernel, and close to the reference so
+            # that both cannot be wrong together.
+            assert torch.equal(outs[0], outs[1])
+            ref = A.to(torch.bfloat16).float() @ B.float()
+            torch.testing.assert_close(outs[0], ref, atol=1e-3, rtol=1e-5)
+    return kernel
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("K, num_stages", [(128, 3)])
+def test_autows_pointer_a_short_k_loop(K, num_stages):
+    kernel = _run_pointer_a_gemm(128, K, num_stages)
+    assert "ttg.warp_specialize(" in kernel.asm["ttgir"]
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
