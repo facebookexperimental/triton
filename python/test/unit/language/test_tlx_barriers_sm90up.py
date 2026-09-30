@@ -127,6 +127,22 @@ def tlx_promotable_mbarrier(output_ptr, USE_NAMED_BARRIER: tl.constexpr):
             tl.store(output_ptr + offsets, offsets)
 
 
+@triton.jit
+def tlx_multi_partition_mbarrier(output_ptr):
+    bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)
+    bar = tlx.local_view(bars, 0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            tlx.barrier_wait(bar, 0)
+            offsets = tl.arange(0, 32)
+            tl.store(output_ptr + offsets, offsets)
+        with tlx.async_task(num_warps=1):
+            tlx.barrier_arrive(bar)
+        with tlx.async_task(num_warps=1):
+            tlx.barrier_arrive(bar)
+
+
 def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
     # prepare inputs
     torch.manual_seed(0)
@@ -229,6 +245,26 @@ def test_tlx_mbarrier_promotion_avoids_user_named_barrier(device):
     assert re.search(r"bar\.arrive\s+9,\s*64;", ptx), f"PTX {ptx}"
     assert re.search(r"bar\.sync\s+4,\s*64;", ptx), f"PTX {ptx}"
     assert re.search(r"bar\.arrive\s+4,\s*64;", ptx), f"PTX {ptx}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_tlx_multi_partition_mbarrier_promotion(device):
+    output = torch.empty(32, dtype=torch.int32, device=device)
+    tlx_multi_partition_mbarrier.device_caches.clear()
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = True
+        triton.knobs.compilation.always_compile = True
+        kernel = tlx_multi_partition_mbarrier[(1, )](output, num_warps=4)
+
+    torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
+    ttgir = kernel.asm["ttgir"]
+    assert "ttng.init_barrier" not in ttgir, f"TTGIR {ttgir}"
+    assert ttgir.count("ttng.compiler_named_barrier_id") == 3, f"TTGIR {ttgir}"
+    assert ttgir.count("ttng.arrive_barrier_named") == 2, f"TTGIR {ttgir}"
+    assert ttgir.count("ttng.wait_barrier_named") == 1, f"TTGIR {ttgir}"
+    ptx = kernel.asm["ptx"]
+    assert len(re.findall(r"bar\.arrive\s+4,\s*192;", ptx)) == 2, f"PTX {ptx}"
+    assert len(re.findall(r"bar\.sync\s+4,\s*192;", ptx)) == 1, f"PTX {ptx}"
 
 
 @triton.jit
