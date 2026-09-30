@@ -1702,13 +1702,14 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_buffer_load_to_local",
           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
              std::optional<Value> mask, std::optional<Value> other,
-             tt::CacheModifier cache) -> Value {
+             tt::CacheModifier cache, uint32_t contiguity) -> Value {
             return self.create<ttag::BufferLoadToLocalOp>(
                 dest, ptr, offsets, mask.value_or(Value()),
-                other.value_or(Value()), Value() /*stride*/, cache);
+                other.value_or(Value()), Value() /*stride*/, cache, contiguity);
           },
           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
-          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"))
+          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"),
+          py::arg("contiguity"))
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);

@@ -1133,6 +1133,89 @@ def _buffer_load_contiguity_kernel(x_ptr, y_ptr):
 
 
 @triton.jit
+def _buffer_load_to_local_contiguity_kernel(
+    x_ptr,
+    mask_boundary,
+    CONTIGUITY: tl.constexpr,
+):
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(512, 16)],
+        [32, 16],
+        order=[1, 0],
+    )
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    pair_boundary = mask_boundary - mask_boundary % 2
+    mask = (k[:, None] < 32) & (m[None, :] < pair_boundary)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1, layout=shared_layout)
+    tlx.buffer_load_to_local(
+        tlx.local_view(buffer, 0),
+        x_ptr,
+        offsets,
+        mask=mask,
+        contiguity=CONTIGUITY,
+    )
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_contiguity_kernel,
+        signature={
+            "x_ptr": "*bf16",
+            "mask_boundary": "i32",
+            "CONTIGUITY": "constexpr",
+        },
+        constexprs={"CONTIGUITY": 2},
+    )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 2" in ttgir
+    assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
+
+
+@pytest.mark.parametrize("contiguity", [0, 3, True], ids=["zero", "non-power-of-two", "bool"])
+def test_buffer_load_to_local_rejects_invalid_contiguity_gfx950(contiguity):
+    with pytest.raises(CompilationError, match="contiguity must be a positive power of two"):
+        compile_for_gfx950(
+            _buffer_load_to_local_contiguity_kernel,
+            signature={
+                "x_ptr": "*bf16",
+                "mask_boundary": "i32",
+                "CONTIGUITY": "constexpr",
+            },
+            constexprs={"CONTIGUITY": contiguity},
+        )
+
+
+@triton.jit
+def _buffer_load_to_local_unpinned_contiguity_kernel(x_ptr):
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1)
+    tlx.buffer_load_to_local(
+        tlx.local_view(buffer, 0),
+        x_ptr,
+        offsets,
+        contiguity=2,
+    )
+
+
+def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
+    with pytest.raises(
+            RuntimeError,
+            match="contiguity > 1 requires a directly indexed user-pinned padded_shared destination",
+    ):
+        compile_for_gfx950(
+            _buffer_load_to_local_unpinned_contiguity_kernel,
+            signature={"x_ptr": "*bf16"},
+            constexprs={},
+        )
+
+
+@triton.jit
 def _buffer_atomic_contiguity_layout_anchor_kernel(x_ptr, atomic_ptr, y_ptr):
     contiguous_layout: tl.constexpr = tlx.layout(
         shape=((64, 4), (4, )),

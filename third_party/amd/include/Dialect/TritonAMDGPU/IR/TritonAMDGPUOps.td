@@ -361,9 +361,10 @@ def BufferLoadToLocalOp
   let summary =
       "Load from a scalar base pointer and a tensor offset to shared memory";
   let description = [{
-      AMD Buffer load operation. Similar to amdg.buffer_load op but directly wirtes to shared memory instead of into registers.
-      Contiguity is the maximum number of elements that can be loaded in a single vector with the given layout and mask.
-      This allows to use buffer_load_to_local even if the alignment cannot be proven based on IR.
+      AMD Buffer load operation. Similar to amdg.buffer_load op but directly writes to shared memory instead of into registers.
+      Contiguity is a trusted positive power-of-two lower bound on consecutive
+      elements available in the final offsets and mask layout. This allows
+      buffer_load_to_local to vectorize when alignment or mask uniformity cannot be proven from the IR.
     }];
   let arguments =
       (ins Arg<
