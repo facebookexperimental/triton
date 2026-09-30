@@ -4080,8 +4080,8 @@ public:
   ///       loose gate has MORE edges than the strict one, so a strict-orderable
   ///       group is NOT guaranteed loose-orderable -- an added cross-partition
   ///       program-order edge can create a cycle. If it does, insertAsyncComm
-  ///       (WSCodePartition) would later hit its report_fatal_error on this
-  ///       very group. Requiring loose-orderability here refuses such a group
+  ///       (WSCodePartition) would later reject this very group and fail the
+  ///       pass. Requiring loose-orderability here refuses such a group
   ///       up front so a repair can never manufacture a group code partitioning
   ///       then rejects.
   ///
@@ -4148,8 +4148,8 @@ public:
       }
       // Require BOTH the sound formation gate AND the loose (code-partition)
       // gate: a group that is strict-orderable but loose-unorderable would
-      // still trip insertAsyncComm's report_fatal_error, so the residual left
-      // after a relocation must be orderable under both (mirrors
+      // still be rejected by insertAsyncComm (failing the pass), so the
+      // residual left after a relocation must be orderable under both (mirrors
       // canJoinReuseGroupChain).
       return !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false)
                   .empty() &&
