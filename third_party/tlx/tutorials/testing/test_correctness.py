@@ -100,7 +100,7 @@ if is_hip():
         attention as _amd_fa_cluster, )
     from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
         persistent_attention as _amd_fa_cluster_persistent, )
-    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
         fa_backward as _amd_fa_backward, )
     from triton.language.extra.tlx.ops.amd_pa_decode import (
         allocate_5d_kv_cache as _amd_pa_decode_allocate_5d,

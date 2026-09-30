@@ -121,6 +121,10 @@ struct ClusterBarrierArriveOpConversion
   LogicalResult
   matchAndRewrite(triton::amdgpu::ClusterBarrierArriveOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (triton::gpu::lookupPhysicalNumCTAs(op) == 1) {
+      rewriter.eraseOp(op);
+      return success();
+    }
     Location loc = op->getLoc();
     TritonLLVMOpBuilder b(loc, rewriter);
 
@@ -129,8 +133,7 @@ struct ClusterBarrierArriveOpConversion
     Value isFirstWarp = b.icmp_eq(warpId, b.i32_val(0));
 
     Block *currentBlock = rewriter.getInsertionBlock();
-    Block *afterBlock =
-        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    Block *afterBlock = currentBlock->splitBlock(rewriter.getInsertionPoint());
     Block *signalBlock = rewriter.createBlock(afterBlock);
     rewriter.setInsertionPointToEnd(currentBlock);
     LLVM::CondBrOp::create(rewriter, loc, isFirstWarp, signalBlock, afterBlock);
@@ -154,6 +157,10 @@ struct ClusterBarrierWaitOpConversion
   LogicalResult
   matchAndRewrite(triton::amdgpu::ClusterBarrierWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (triton::gpu::lookupPhysicalNumCTAs(op) == 1) {
+      rewriter.eraseOp(op);
+      return success();
+    }
     Location loc = op->getLoc();
     // Use ROCDL barrier wait op with barrier ID -3 for cluster barriers
     ROCDL::BarrierWaitOp::create(rewriter, loc, -3);

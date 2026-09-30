@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
@@ -299,6 +300,38 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
+      .def(
+          "create_packed_arith",
+          [](TritonOpBuilder &self, Type resultElementType,
+             const std::string &operation, std::vector<Value> operands,
+             std::optional<Value> reference) -> Value {
+            auto kind = ttng::symbolizePackedArithOpKind(operation);
+            if (!kind)
+              throw std::runtime_error("unknown packed arithmetic operation");
+            if (operands.empty())
+              throw std::runtime_error("packed arithmetic requires operands");
+
+            RankedTensorType resultType;
+            if (reference) {
+              auto referenceType = cast<RankedTensorType>(reference->getType());
+              resultType = RankedTensorType::get(referenceType.getShape(),
+                                                 resultElementType,
+                                                 referenceType.getEncoding());
+            } else {
+              auto operandType =
+                  cast<RankedTensorType>(operands.front().getType());
+              auto inferred = ttg::inferFp4ToFpResultType(
+                  operandType, resultElementType, operandType.getRank() - 1,
+                  self.getLastLoc());
+              if (failed(inferred))
+                throw std::runtime_error("cannot infer packed FP4 layout");
+              resultType = *inferred;
+            }
+            return self.create<ttng::PackedArithOp>(resultType, *kind,
+                                                    operands);
+          },
+          py::arg("resultElementType"), py::arg("operation"),
+          py::arg("operands"), py::arg("reference").none())
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
@@ -928,6 +961,18 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, uint32_t variant) {
              self.create<ROCDL::IglpOpt>(variant);
            })
+      .def("create_amd_set_wave_sched_mode",
+           [](TritonOpBuilder &self, uint32_t value, unsigned offset,
+              unsigned width) {
+             // HW_REG_WAVE_SCHED_MODE is register 26. The intrinsic's hwreg
+             // operand packs the register ID, bit offset, and width minus one.
+             uint32_t hwreg = 26 | (offset << 6) | ((width - 1) << 11);
+             Value reg = self.create<arith::ConstantIntOp>(hwreg, 32);
+             Value val = self.create<arith::ConstantIntOp>(value, 32);
+             self.create<LLVM::CallIntrinsicOp>(
+                 self.getBuilder().getStringAttr("llvm.amdgcn.s.setreg"),
+                 ValueRange{reg, val});
+           })
       .def("create_warp_vote",
            [](TritonOpBuilder &self, Value pred,
               const std::string &kind) -> mlir::Value {
@@ -943,6 +988,16 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
              self.create<triton::nvidia_gpu::ClusterWaitOp>();
+           })
+      .def("create_amd_cluster_barrier",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::ClusterBarrierArriveOp>();
+             self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
+      .def("create_amd_cluster_cta_rank",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<ROCDL::ClusterWorkgroupIdXOp>(
+                 self.getBuilder().getI32Type());
            })
       .def("create_fence_mbarrier_init_cluster",
            [](TritonOpBuilder &self) -> void {
@@ -1093,14 +1148,16 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_async_tdm_fused_copy_global_to_local",
           [](TritonOpBuilder &self, std::vector<Value> descs,
              std::vector<Value> dests, std::vector<int32_t> warpUsedHints,
-             tt::CacheModifier cacheModifier) -> mlir::Value {
+             tt::CacheModifier cacheModifier,
+             std::vector<Value> multicastMasks) -> mlir::Value {
             auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
             auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
             return self.create<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
-                tokenType, descs, dests, hints, cacheModifier);
+                tokenType, descs, dests, multicastMasks, hints, cacheModifier);
           },
           py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
-          py::arg("cacheModifier") = tt::CacheModifier::NONE)
+          py::arg("cacheModifier") = tt::CacheModifier::NONE,
+          py::arg("multicastMasks") = std::vector<Value>{})
       .def(
           "create_async_tdm_copy_local_to_global",
           [](TritonOpBuilder &self, Value desc, Value src,
@@ -1543,7 +1600,7 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
              // bracketed by SchedBarrier(0) guards so the scheduler cannot
-             // hoist ops across the ping-pong cluster border.
+             // hoist operations across the barrier.
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
              self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);

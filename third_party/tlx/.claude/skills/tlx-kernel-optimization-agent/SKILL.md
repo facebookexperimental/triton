@@ -35,6 +35,15 @@ but never replace, the generic workflow.
 7. When continuing a completed optimization, pass `--prior-run <output-dir>`.
    This imports prior evidence and source hashes for cross-run deduplication but
    never adopts the old winner or replaces validation of the current kernel.
+8. Keep production kernel authoring and heuristic tuning independent:
+   - Use `--task authoring --op <op> --arch <arch> --suite <suite>` to author
+     against the production kernel, harness, and cases. This does not tune the
+     heuristic policy.
+   - Add `--tune-after-authoring` only when source changes may alter the winning
+     configurations across the production suite and the user wants both steps.
+     The flag is opt-in and tuning runs only after authoring succeeds.
+   - Use `--task tuning --op <op> --arch <arch> --suite <suite>` when the kernel
+     implementation is already ready and only the heuristic policy needs work.
 
 Reading agent implementation is allowed only after the CLI reports an internal
 failure that requires diagnosis. The first attempt must use the public contract.

@@ -45,8 +45,61 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Optimize a Triton or TLX kernel with a deterministic harness."
     )
-    parser.add_argument("--kernel", type=Path, required=True)
-    parser.add_argument("--reference-kernel", type=Path, default=None, help="Optional reference kernel source used as correctness oracle (harness verify can compare candidate vs reference).")
+    parser.add_argument(
+        "--kernel",
+        type=Path,
+        default=None,
+        help="kernel source for standalone authoring; inferred when --op and --arch are given",
+    )
+    parser.add_argument(
+        "--task",
+        choices=("authoring", "tuning"),
+        default=None,
+        help=(
+            "top-level TLX-agent task; inferred as tuning when --op/--suite "
+            "are provided, otherwise authoring"
+        ),
+    )
+    parser.add_argument(
+        "--objective",
+        choices=("kernel", "heuristic-policy"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--op",
+        default=None,
+        help="tlx.ops name for production authoring or tuning",
+    )
+    parser.add_argument(
+        "--suite",
+        default=None,
+        help="production shape suite for authoring or tuning",
+    )
+    parser.add_argument(
+        "--tune-after-authoring",
+        action="store_true",
+        help=(
+            "after successful production authoring, tune its heuristic policy "
+            "(default: disabled; requires --op, --arch, and --suite)"
+        ),
+    )
+    parser.add_argument(
+        "--search-rounds",
+        type=int,
+        default=2,
+        help="deprecated compatibility option; tuning keeps the full space fixed",
+    )
+    parser.add_argument("--heuristic-rounds", type=int, default=5)
+    parser.add_argument(
+        "--reference-kernel",
+        type=Path,
+        default=None,
+        help=(
+            "Optional reference kernel source used as correctness oracle "
+            "(harness verify can compare candidate vs reference)."
+        ),
+    )
     parser.add_argument("--harness", type=Path, default=None)
     parser.add_argument("--cases", type=Path, default=None)
     parser.add_argument("--target", type=Path, default=None)
@@ -63,7 +116,23 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
             "(e.g. blackwell, hopper, host). Defaults to the first match."
         ),
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="artifact directory; tuning defaults to /tmp/tlx-agent-<arch>-<op>-<suite>",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="physical GPU index, or auto to select the least-used matching GPU (default)",
+    )
+    parser.add_argument(
+        "--govern",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="apply clock/power and GPU-local NUMA controls (default: enabled)",
+    )
     parser.add_argument(
         "--prior-run",
         type=Path,
@@ -451,47 +520,154 @@ def _result_exit_code(result: KernelOptimizationResult) -> int:
     return 0 if result.success else 2
 
 
-def main() -> int:
-    args = _parse_args()
-    harness_path, cases_path, target_path = _resolve_harness_paths(
-        args.kernel,
-        args.harness,
-        args.cases,
-        args.target,
-        args.arch,
-        args.target_name,
+def _repository_root() -> Path:
+    repository = next(
+        (parent for parent in Path(__file__).resolve().parents
+         if parent.joinpath("third_party", "tlx", "ops").is_dir()),
+        None,
     )
-    case_payloads = _load_json(cases_path)
-    target_payload = _load_json(target_path)
-    optimization_skills = target_payload.get("optimization_skills", [])
-    if not isinstance(optimization_skills, list):
-        raise ValueError("target optimization_skills must be a list")
-    cases = tuple(
-        InputCase(
-            case_id=str(case["case_id"]),
-            parameters=case.get("parameters", {}),
-            weight=float(case.get("weight", 1.0)),
-            protected=bool(case.get("protected", True)),
+    if repository is None:
+        raise SystemExit("could not locate the Triton repository")
+    return repository
+
+
+def _resolve_task(args: argparse.Namespace) -> str:
+    if args.task is not None and args.objective is not None:
+        raise SystemExit("use --task; do not combine it with deprecated --objective")
+    if args.objective is not None:
+        task = {"kernel": "authoring", "heuristic-policy": "tuning"}[args.objective]
+        print(
+            f"warning: --objective {args.objective} is deprecated; use --task {task}",
+            file=sys.stderr,
         )
-        for case in case_payloads
+        return task
+    if args.task is not None:
+        return args.task
+    if args.tune_after_authoring:
+        return "authoring"
+    return "tuning" if args.op is not None or args.suite is not None else "authoring"
+
+
+def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> int:
+    task = _resolve_task(args)
+    args.task = task
+    args.objective = None
+    if task == "tuning":
+        if args.tune_after_authoring:
+            raise SystemExit("--tune-after-authoring requires --task authoring")
+        if not args.op or not args.arch or not args.suite:
+            raise SystemExit("--task tuning requires --op, --arch, and --suite")
+        if args.kernel is not None:
+            raise SystemExit("--kernel is inferred for tuning; remove the redundant argument")
+    tuning_epilogue = task == "authoring" and args.tune_after_authoring
+    production_authoring = task == "authoring" and (
+        args.op is not None or args.suite is not None or tuning_epilogue
     )
-    target = KernelTarget(
-        backend=str(target_payload["backend"]),
-        architecture=str(target_payload["architecture"]),
-        device=target_payload.get("device"),
-        environment=target_payload.get("environment", {}),
-        optimization_guidance=str(target_payload.get("optimization_guidance", "")),
-        optimization_skills=tuple(optimization_skills),
-        supported_experiment_kinds=tuple(
-            ExperimentKind(value)
-            for value in target_payload.get(
-                "supported_experiment_kinds",
-                (ExperimentKind.PROMOTABLE.value, ExperimentKind.HUMAN_REVIEW.value),
-            )
-        ),
-    )
-    _validate_host_matches_target(target, args.arch)
+    if production_authoring and (not args.op or not args.arch or not args.suite):
+        requirement = "--tune-after-authoring" if tuning_epilogue else "production authoring"
+        raise SystemExit(f"{requirement} requires --op, --arch, and --suite")
+    if args.output_dir is None:
+        if task != "tuning" or not args.op or not args.arch or not args.suite:
+            raise SystemExit("--output-dir is required for --task authoring")
+        args.output_dir = Path(f"/tmp/tlx-agent-{args.arch}-{args.op}-{args.suite}")
+
+    repository = _repository_root() if task == "tuning" or production_authoring else None
+    if repository is not None and not environment_ready:
+        from .benchmark_environment import governed_benchmark_device
+
+        with governed_benchmark_device(
+            repository,
+            args.arch,
+            args.device,
+            govern=args.govern,
+        ):
+            return _run_task(args, environment_ready=True)
+
     budget = _budget_from_args(args)
+    provider = (
+        MockLLMProvider()
+        if args.provider == "mock"
+        else CodexCandidateProvider(
+            model=args.model, timeout_seconds=budget.max_candidate_seconds
+        )
+    )
+    if task == "tuning":
+        from .tuning import run_tuning
+
+        assert repository is not None
+        exit_code, result = run_tuning(
+            repository=repository,
+            op=args.op,
+            arch=args.arch,
+            suite=args.suite,
+            output_dir=args.output_dir,
+            provider=provider,
+            budget=budget,
+            search_rounds=args.search_rounds,
+            heuristic_rounds=args.heuristic_rounds,
+            commit=args.commit_winner,
+            commit_message=args.commit_message,
+            vcs=args.vcs,
+        )
+        print(json.dumps(result["summary"], indent=2, sort_keys=True))
+        return exit_code
+
+    if production_authoring:
+        from .tuning import _tuning_target, infer_kernel_path, production_cases
+
+        assert repository is not None
+        production_kernel = infer_kernel_path(repository, args.op, args.arch).resolve()
+        if args.kernel is None:
+            args.kernel = production_kernel
+        elif args.kernel.resolve() != production_kernel:
+            raise SystemExit(
+                f"production authoring targets {production_kernel}, "
+                f"but --kernel is {args.kernel.resolve()}"
+            )
+    if args.kernel is None:
+        raise SystemExit("--kernel is required for standalone authoring")
+    if production_authoring and args.harness is None and args.cases is None and args.target is None:
+        harness_path = Path(__file__).with_name("tuning_harnesses") / f"{args.op}.py"
+        cases = production_cases(args.op, args.suite)
+        target = _tuning_target(args.op, args.arch)
+    else:
+        harness_path, cases_path, target_path = _resolve_harness_paths(
+            args.kernel,
+            args.harness,
+            args.cases,
+            args.target,
+            args.arch,
+            args.target_name,
+        )
+        case_payloads = _load_json(cases_path)
+        target_payload = _load_json(target_path)
+        optimization_skills = target_payload.get("optimization_skills", [])
+        if not isinstance(optimization_skills, list):
+            raise ValueError("target optimization_skills must be a list")
+        cases = tuple(
+            InputCase(
+                case_id=str(case["case_id"]),
+                parameters=case.get("parameters", {}),
+                weight=float(case.get("weight", 1.0)),
+                protected=bool(case.get("protected", True)),
+            ) for case in case_payloads)
+        target = KernelTarget(
+            backend=str(target_payload["backend"]),
+            architecture=str(target_payload["architecture"]),
+            device=target_payload.get("device"),
+            environment=target_payload.get("environment", {}),
+            optimization_guidance=str(target_payload.get("optimization_guidance", "")),
+            optimization_skills=tuple(optimization_skills),
+            evaluation_policy=target_payload.get("evaluation_policy", {}),
+            supported_experiment_kinds=tuple(
+                ExperimentKind(value)
+                for value in target_payload.get(
+                    "supported_experiment_kinds",
+                    (ExperimentKind.PROMOTABLE.value, ExperimentKind.HUMAN_REVIEW.value),
+                )
+            ),
+        )
+    _validate_host_matches_target(target, args.arch)
     # CLI always evaluates via the optimizer's SubprocessHarness. The legacy
     # --harness-mode flag is kept for compatibility and documented as such;
     # standalone evaluation is available programmatically via StandaloneHarness.
@@ -503,13 +679,6 @@ def main() -> int:
             "(StandaloneHarness); CLI still uses subprocess isolation.",
             file=_sys.stderr,
         )
-    provider = (
-        MockLLMProvider()
-        if args.provider == "mock"
-        else CodexCandidateProvider(
-            model=args.model, timeout_seconds=budget.max_candidate_seconds
-        )
-    )
     kernel_path = args.kernel.resolve()
     kernel_source = kernel_path.read_text()
     fallback_commit_subject = f"Optimize {kernel_path.name} with TLX agent"
@@ -575,8 +744,42 @@ def main() -> int:
         args.output_dir.joinpath("auto_commit.json").write_text(
             json.dumps(to_json_value(result.auto_commit), indent=2, sort_keys=True) + "\n"
         )
-    print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
-    return exit_code
+    if exit_code != 0 or not tuning_epilogue:
+        print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
+        return exit_code
+
+    from .tuning import run_tuning
+
+    assert repository is not None
+    tuning_exit_code, tuning_result = run_tuning(
+        repository=repository,
+        op=args.op,
+        arch=args.arch,
+        suite=args.suite,
+        output_dir=args.output_dir / "tuning",
+        provider=provider,
+        budget=budget,
+        search_rounds=args.search_rounds,
+        heuristic_rounds=args.heuristic_rounds,
+        commit=args.commit_winner,
+        commit_message=None,
+        vcs=args.vcs,
+        initial_source=result.best_kernel,
+    )
+    task_result = {
+        "task": "authoring",
+        "authoring": to_json_value(result),
+        "epilogue": tuning_result,
+    }
+    args.output_dir.joinpath("task_result.json").write_text(
+        json.dumps(task_result, indent=2, sort_keys=True) + "\n"
+    )
+    print(json.dumps(task_result, indent=2, sort_keys=True))
+    return tuning_exit_code
+
+
+def main() -> int:
+    return _run_task(_parse_args())
 
 
 if __name__ == "__main__":

@@ -155,12 +155,12 @@ void multiBufferSemaphore(
       uint32_t releasedMask = resizeReleasedMask(
           getReleasedMask(semaOp), semaOp.getType().getNumStages(),
           semaTy.getNumStages());
-      auto newSema =
-          SemaphoreCreateOp::create(semaBuilder, semaOp.getLoc(), semaTy,
-                                    newBuffers, releasedMask);
+      auto newSema = SemaphoreCreateOp::create(
+          semaBuilder, semaOp.getLoc(), semaTy, newBuffers, releasedMask);
       newSema->setAttrs(semaOp->getAttrs());
       if (releasedMask)
-        newSema.setReleasedMaskAttr(semaBuilder.getI32IntegerAttr(releasedMask));
+        newSema.setReleasedMaskAttr(
+            semaBuilder.getI32IntegerAttr(releasedMask));
       else
         newSema.removeReleasedMaskAttr();
       semaOp.getResult().replaceAllUsesWith(newSema.getResult());
@@ -470,14 +470,12 @@ CombinedSemaPair createCombinedSemaphores(ArrayRef<SemaToCombineInfo> infos,
   // processes FULL first. lowerTMALoads on the FULL semaphore follows
   // the producer-release token chain through the EMPTY semaphore's
   // acquire/buffer ops; those must still be live at that point.
-  auto combinedEmpty =
-      SemaphoreCreateOp::create(builder, lastCreate->getLoc(), combinedType,
-                                allBufs,
-                                getReleasedMask(infos.front().emptySema));
-  auto combinedFull =
-      SemaphoreCreateOp::create(builder, lastCreate->getLoc(), combinedType,
-                                allBufs,
-                                getReleasedMask(infos.front().fullSema));
+  auto combinedEmpty = SemaphoreCreateOp::create(
+      builder, lastCreate->getLoc(), combinedType, allBufs,
+      getReleasedMask(infos.front().emptySema));
+  auto combinedFull = SemaphoreCreateOp::create(
+      builder, lastCreate->getLoc(), combinedType, allBufs,
+      getReleasedMask(infos.front().fullSema));
   return {combinedEmpty, combinedFull};
 }
 

@@ -258,15 +258,13 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
 
 
 @triton.jit
-def _bmm_mi16_quad(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
-                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                   NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
+def _bmm_mi16_quad(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
+                   BN: tl.constexpr, BK: tl.constexpr, NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
                    B_BASES: tl.constexpr):
     """2x2 operand decomposition: defer A-high/B-high LDS reads under MFMA."""
     HM: tl.constexpr = BM // 2
     HN: tl.constexpr = BN // 2
-    tl.static_assert(HM == 128 and HN == 128,
-                     "_C4_128 requires 128x128 accumulator quadrants")
+    tl.static_assert(HM == 128 and HN == 128, "_C4_128 requires 128x128 accumulator quadrants")
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
     bid = pidf // GMN
@@ -306,15 +304,13 @@ def _bmm_mi16_quad(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
         a_lo = tlx.local_load(tlx.local_view(buf_a_lo, cur))
         b_lo = tlx.local_load(tlx.local_view(buf_b_lo, cur))
         next_a_lo = tl.load(a_ptr + ao_lo + (kp + ok[None, :]) * sak)
-        tlx.buffer_load_to_local(tlx.local_view(buf_b_lo, nxt), b_ptr,
-                                 (kp + ok[:, None]) * sbk + bo_lo)
+        tlx.buffer_load_to_local(tlx.local_view(buf_b_lo, nxt), b_ptr, (kp + ok[:, None]) * sbk + bo_lo)
         c00 = tl.dot(a_lo, b_lo, c00)
         a_hi = tlx.local_load(tlx.local_view(buf_a_hi, cur))
         next_a_hi = tl.load(a_ptr + ao_hi + (kp + ok[None, :]) * sak)
         c10 = tl.dot(a_hi, b_lo, c10)
         b_hi = tlx.local_load(tlx.local_view(buf_b_hi, cur))
-        tlx.buffer_load_to_local(tlx.local_view(buf_b_hi, nxt), b_ptr,
-                                 (kp + ok[:, None]) * sbk + bo_hi)
+        tlx.buffer_load_to_local(tlx.local_view(buf_b_hi, nxt), b_ptr, (kp + ok[:, None]) * sbk + bo_hi)
         c01 = tl.dot(a_lo, b_hi, c01)
         c11 = tl.dot(a_hi, b_hi, c11)
         tlx.local_store(tlx.local_view(buf_a_lo, nxt), next_a_lo)
@@ -360,9 +356,8 @@ def _bmm_mi16_quad(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
 
 
 @tl.core.builtin
-def _load_all_a_tiles_from_local(a_local_tiles, stage,
-                                 a_tile_count: tl.constexpr,
-                                 a_layout: tl.constexpr, _semantic=None):
+def _load_all_a_tiles_from_local(a_local_tiles, stage, a_tile_count: tl.constexpr, a_layout: tl.constexpr,
+                                 _semantic=None):
     """Load every A operand tile from LDS into its dot layout."""
     a_tile_count = tl.core._unwrap_if_constexpr(a_tile_count)
     a_layout = tl.core._unwrap_if_constexpr(a_layout)
@@ -371,17 +366,14 @@ def _load_all_a_tiles_from_local(a_local_tiles, stage,
     for mi in range(a_tile_count):
         view = tlx.local_view(a_local_tiles[mi], stage, _semantic=_semantic)
         a_value = tlx.local_load(view, _semantic=_semantic)
-        a_value = tlx.require_layout(
-            a_value, a_layout, pin=False, _semantic=_semantic
-        )
+        a_value = tlx.require_layout(a_value, a_layout, pin=False, _semantic=_semantic)
         values.append(a_value)
     return tl.tuple(values)
 
 
 @tl.core.builtin
-def _load_all_b_tiles_from_local(b_local_tiles, stage,
-                                 b_tile_count: tl.constexpr,
-                                 b_layout: tl.constexpr, _semantic=None):
+def _load_all_b_tiles_from_local(b_local_tiles, stage, b_tile_count: tl.constexpr, b_layout: tl.constexpr,
+                                 _semantic=None):
     """Load every B operand tile from LDS into its dot layout."""
     b_tile_count = tl.core._unwrap_if_constexpr(b_tile_count)
     b_layout = tl.core._unwrap_if_constexpr(b_layout)
@@ -390,18 +382,14 @@ def _load_all_b_tiles_from_local(b_local_tiles, stage,
     for nj in range(b_tile_count):
         view = tlx.local_view(b_local_tiles[nj], stage, _semantic=_semantic)
         b_value = tlx.local_load(view, _semantic=_semantic)
-        b_value = tlx.require_layout(
-            b_value, b_layout, pin=False, _semantic=_semantic
-        )
+        b_value = tlx.require_layout(b_value, b_layout, pin=False, _semantic=_semantic)
         values.append(b_value)
     return tl.tuple(values)
 
 
 @tl.core.builtin
-def _dot_preloaded_a_and_b_tiles(a_dot_operands, b_dot_operands, acc,
-                                 a_tile_count: tl.constexpr,
-                                 b_tile_count: tl.constexpr,
-                                 _semantic=None):
+def _dot_preloaded_a_and_b_tiles(a_dot_operands, b_dot_operands, acc, a_tile_count: tl.constexpr,
+                                 b_tile_count: tl.constexpr, _semantic=None):
     """Expand the dot grid when both operand families are preloaded."""
     a_tile_count = tl.core._unwrap_if_constexpr(a_tile_count)
     b_tile_count = tl.core._unwrap_if_constexpr(b_tile_count)
@@ -411,10 +399,7 @@ def _dot_preloaded_a_and_b_tiles(a_dot_operands, b_dot_operands, acc,
     for nj in range(b_tile_count):
         for mi in range(a_tile_count):
             index = mi * b_tile_count + nj
-            values[index] = tl.dot(
-                a_dot_operands[mi], b_dot_operands[nj], values[index],
-                _semantic=_semantic
-            )
+            values[index] = tl.dot(a_dot_operands[mi], b_dot_operands[nj], values[index], _semantic=_semantic)
     return tl.tuple(values)
 
 
@@ -439,15 +424,10 @@ def _load_each_b_tile_and_dot_with_preloaded_a(
     for nj in range(b_tile_count):
         view = tlx.local_view(b_local_tiles[nj], stage, _semantic=_semantic)
         b_value = tlx.local_load(view, _semantic=_semantic)
-        b_value = tlx.require_layout(
-            b_value, b_layout, pin=False, _semantic=_semantic
-        )
+        b_value = tlx.require_layout(b_value, b_layout, pin=False, _semantic=_semantic)
         for mi in range(a_tile_count):
             index = mi * b_tile_count + nj
-            values[index] = tl.dot(
-                a_dot_operands[mi], b_value, values[index],
-                _semantic=_semantic
-            )
+            values[index] = tl.dot(a_dot_operands[mi], b_value, values[index], _semantic=_semantic)
     return tl.tuple(values)
 
 
@@ -472,15 +452,10 @@ def _load_each_a_tile_and_dot_with_preloaded_b(
     for mi in range(a_tile_count):
         view = tlx.local_view(a_local_tiles[mi], stage, _semantic=_semantic)
         a_value = tlx.local_load(view, _semantic=_semantic)
-        a_value = tlx.require_layout(
-            a_value, a_layout, pin=False, _semantic=_semantic
-        )
+        a_value = tlx.require_layout(a_value, a_layout, pin=False, _semantic=_semantic)
         for nj in range(b_tile_count):
             index = mi * b_tile_count + nj
-            values[index] = tl.dot(
-                a_value, b_dot_operands[nj], values[index],
-                _semantic=_semantic
-            )
+            values[index] = tl.dot(a_value, b_dot_operands[nj], values[index], _semantic=_semantic)
     return tl.tuple(values)
 
 
@@ -568,8 +543,7 @@ def _spec_item(values: tl.constexpr, index: tl.constexpr, _semantic=None):
 
 
 @tl.core.builtin
-def _tile_extent(index: tl.constexpr, tile_sizes: tl.constexpr,
-                 _semantic=None):
+def _tile_extent(index: tl.constexpr, tile_sizes: tl.constexpr, _semantic=None):
     """Select one heterogeneous tile extent from the compile-time spec."""
     index = tl.core._unwrap_if_constexpr(index)
     tile_sizes = tl.core._unwrap_if_constexpr(tile_sizes)
@@ -577,8 +551,7 @@ def _tile_extent(index: tl.constexpr, tile_sizes: tl.constexpr,
 
 
 @tl.core.builtin
-def _tile_start(index: tl.constexpr, tile_sizes: tl.constexpr,
-                _semantic=None):
+def _tile_start(index: tl.constexpr, tile_sizes: tl.constexpr, _semantic=None):
     """Return the compile-time prefix sum preceding one operand tile."""
     index = tl.core._unwrap_if_constexpr(index)
     tile_sizes = tl.core._unwrap_if_constexpr(tile_sizes)
@@ -599,16 +572,14 @@ def _make_output_tile_coordinates(
     output_rows = tl.tuple([])
     for mi in tl.static_range(a_tile_count):
         output_rows += tl.tuple([
-            m_block * block_m
-            + _tile_start(mi, kernel_spec.a_row_tile_sizes)
-            + tl.arange(0, _tile_extent(mi, kernel_spec.a_row_tile_sizes))
+            m_block * block_m + _tile_start(mi, kernel_spec.a_row_tile_sizes) +
+            tl.arange(0, _tile_extent(mi, kernel_spec.a_row_tile_sizes))
         ])
     output_cols = tl.tuple([])
     for nj in tl.static_range(b_tile_count):
         output_cols += tl.tuple([
-            n_block * block_n
-            + _tile_start(nj, kernel_spec.b_col_tile_sizes)
-            + tl.arange(0, _tile_extent(nj, kernel_spec.b_col_tile_sizes))
+            n_block * block_n + _tile_start(nj, kernel_spec.b_col_tile_sizes) +
+            tl.arange(0, _tile_extent(nj, kernel_spec.b_col_tile_sizes))
         ])
     return tl.tuple([output_rows, output_cols])
 
@@ -638,9 +609,7 @@ def _make_global_tile_offsets(
                 output_rows[mi],
                 output_rows[mi] - m,
             )
-        a_global_offsets += tl.tuple([
-            a_global_rows[:, None] * stride_am
-        ])
+        a_global_offsets += tl.tuple([a_global_rows[:, None] * stride_am])
     b_global_offsets = tl.tuple([])
     for nj in tl.static_range(b_tile_count):
         if even_n:
@@ -651,15 +620,12 @@ def _make_global_tile_offsets(
                 output_cols[nj],
                 output_cols[nj] - n,
             )
-        b_global_offsets += tl.tuple([
-            b_global_cols[None, :] * stride_bn
-        ])
+        b_global_offsets += tl.tuple([b_global_cols[None, :] * stride_bn])
     return tl.tuple([a_global_offsets, b_global_offsets])
 
 
 @triton.jit
-def _local_alloc_pipeline(a_ptr, b_ptr, block_k: tl.constexpr,
-                          kernel_spec: tl.constexpr):
+def _local_alloc_pipeline(a_ptr, b_ptr, block_k: tl.constexpr, kernel_spec: tl.constexpr):
     """Allocate every A/B tile in the explicit multi-stage LDS pipeline."""
     num_stages: tl.constexpr = tl.constexpr(kernel_spec.num_stages)
     swizzle_b_local: tl.constexpr = tl.constexpr(kernel_spec.swizzle_b_local)
@@ -728,12 +694,8 @@ def _bmm_register_staged(
     NUM_STAGES: tl.constexpr = tl.constexpr(KERNEL_SPEC.num_stages)
     LOOP_UNROLL: tl.constexpr = tl.constexpr(KERNEL_SPEC.loop_unroll)
     GLOBAL_LOAD_B_CG: tl.constexpr = tl.constexpr(KERNEL_SPEC.global_load_b_cg)
-    GLOBAL_TAIL_LOAD_BEFORE_LAST_DOT: tl.constexpr = tl.constexpr(
-        KERNEL_SPEC.global_tail_load_before_last_dot
-    )
-    LOCAL_LOAD_B_BEFORE_GLOBAL_PREFETCH: tl.constexpr = tl.constexpr(
-        KERNEL_SPEC.local_load_b_before_global_prefetch
-    )
+    GLOBAL_TAIL_LOAD_BEFORE_LAST_DOT: tl.constexpr = tl.constexpr(KERNEL_SPEC.global_tail_load_before_last_dot)
+    LOCAL_LOAD_B_BEFORE_GLOBAL_PREFETCH: tl.constexpr = tl.constexpr(KERNEL_SPEC.local_load_b_before_global_prefetch)
     A_TILE_COUNT: tl.constexpr = _spec_length(KERNEL_SPEC.a_row_tile_sizes)
     B_TILE_COUNT: tl.constexpr = _spec_length(KERNEL_SPEC.b_col_tile_sizes)
     INSTR_M: tl.constexpr = _spec_item(KERNEL_SPEC.instr_shape, 0)
@@ -746,17 +708,11 @@ def _bmm_register_staged(
     # WARPS_N; their common K32 depth cancels from this VGPR-footprint estimate.
     # Cross multiplication keeps the comparison integral:
     #   BLOCK_M / WARPS_M <= BLOCK_N / WARPS_N.
-    RESIDENT_OPERAND_POLICY: tl.constexpr = tl.constexpr(
-        KERNEL_SPEC.resident_operand_policy
-    )
+    RESIDENT_OPERAND_POLICY: tl.constexpr = tl.constexpr(KERNEL_SPEC.resident_operand_policy)
     PRELOAD_A_OPERANDS: tl.constexpr = tl.constexpr(
         RESIDENT_OPERAND_POLICY == _RESIDENT_OPERAND_A
-        or (
-            RESIDENT_OPERAND_POLICY == _RESIDENT_OPERAND_AUTO
-            and KERNEL_SPEC.block_m * WARPS_N
-            <= KERNEL_SPEC.block_n * WARPS_M
-        )
-    )
+        or (RESIDENT_OPERAND_POLICY == _RESIDENT_OPERAND_AUTO
+            and KERNEL_SPEC.block_m * WARPS_N <= KERNEL_SPEC.block_n * WARPS_M))
     BLOCK_K: tl.constexpr = 32
 
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -781,37 +737,32 @@ def _bmm_register_staged(
 
     # Tile setup: build logical output coordinates, wrapped global input
     # offsets, and the heterogeneous A/B LDS images described by KERNEL_SPEC.
-    output_rows, output_cols = _make_output_tile_coordinates(
-        m_block, n_block, KERNEL_SPEC
-    )
+    output_rows, output_cols = _make_output_tile_coordinates(m_block, n_block, KERNEL_SPEC)
     a_global_offsets, b_global_offsets = _make_global_tile_offsets(
-        output_rows, output_cols, M, N, sam, sbn,
-        EVEN_M, EVEN_N, KERNEL_SPEC,
+        output_rows,
+        output_cols,
+        M,
+        N,
+        sam,
+        sbn,
+        EVEN_M,
+        EVEN_N,
+        KERNEL_SPEC,
     )
-    a_local_tiles, b_local_tiles = _local_alloc_pipeline(
-        a_ptr, b_ptr, BLOCK_K, KERNEL_SPEC
-    )
+    a_local_tiles, b_local_tiles = _local_alloc_pipeline(a_ptr, b_ptr, BLOCK_K, KERNEL_SPEC)
 
     # Prologue: globally prefetch K0, publish it to LDS stage 0, then make the
     # complete A/B stage visible to every wave before the first iteration.
     for mi in tl.static_range(A_TILE_COUNT):
-        first_a_global = tl.load(
-            a_ptr + a_global_offsets[mi] + rk[None, :] * sak
-        )
-        tlx.local_store(
-            tlx.local_view(a_local_tiles[mi], 0), first_a_global
-        )
+        first_a_global = tl.load(a_ptr + a_global_offsets[mi] + rk[None, :] * sak)
+        tlx.local_store(tlx.local_view(a_local_tiles[mi], 0), first_a_global)
     for nj in tl.static_range(B_TILE_COUNT):
         b_global_ptrs = b_ptr + rk[:, None] * sbk + b_global_offsets[nj]
         if GLOBAL_LOAD_B_CG:
-            first_b_global = tl.load(
-                b_global_ptrs, cache_modifier=".cg"
-            )
+            first_b_global = tl.load(b_global_ptrs, cache_modifier=".cg")
         else:
             first_b_global = tl.load(b_global_ptrs)
-        tlx.local_store(
-            tlx.local_view(b_local_tiles[nj], 0), first_b_global
-        )
+        tlx.local_store(tlx.local_view(b_local_tiles[nj], 0), first_b_global)
     tl.debug_barrier()
     # Keep accumulator construction in the same JIT scope as the K loop. A
     # helper return would erase the native #mma encoding from the tuple type.
@@ -832,65 +783,78 @@ def _bmm_register_staged(
     # Steady state: consume LDS K(t), globally prefetch K(t+1), execute the
     # current dot grid, then publish K(t+1) into the alternate LDS stage.
     full_tiles = K // BLOCK_K
-    for k in tl.range(
-        0, full_tiles - 1, loop_unroll_factor=LOOP_UNROLL
-    ):
+    for k in tl.range(0, full_tiles - 1, loop_unroll_factor=LOOP_UNROLL):
         current_stage = k % NUM_STAGES
         next_stage = (k + 1) % NUM_STAGES
         next_k_offset = (k + 1) * BLOCK_K
         if PRELOAD_A_OPERANDS or LOCAL_LOAD_B_BEFORE_GLOBAL_PREFETCH:
             preloaded_operands = _load_preloaded_operand_tiles(
-                a_local_tiles, b_local_tiles, current_stage,
-                A_TILE_COUNT, B_TILE_COUNT, dot0, dot1,
+                a_local_tiles,
+                b_local_tiles,
+                current_stage,
+                A_TILE_COUNT,
+                B_TILE_COUNT,
+                dot0,
+                dot1,
                 PRELOAD_A_OPERANDS,
             )
         if PRELOAD_A_OPERANDS and LOCAL_LOAD_B_BEFORE_GLOBAL_PREFETCH:
-            b_dot_operands = _load_all_b_tiles_from_local(
-                b_local_tiles, current_stage, B_TILE_COUNT, dot1
-            )
+            b_dot_operands = _load_all_b_tiles_from_local(b_local_tiles, current_stage, B_TILE_COUNT, dot1)
         a_global_prefetch = tl.tuple([])
         for mi in tl.static_range(A_TILE_COUNT):
-            a_global_prefetch += tl.tuple([tl.load(
-                a_ptr
-                + a_global_offsets[mi]
-                + (next_k_offset + rk[None, :]) * sak
-            )])
+            a_global_prefetch += tl.tuple([tl.load(a_ptr + a_global_offsets[mi] + (next_k_offset + rk[None, :]) * sak)])
         b_global_prefetch = tl.tuple([])
         for nj in tl.static_range(B_TILE_COUNT):
-            b_global_ptrs = (
-                b_ptr
-                + (next_k_offset + rk[:, None]) * sbk
-                + b_global_offsets[nj]
-            )
+            b_global_ptrs = (b_ptr + (next_k_offset + rk[:, None]) * sbk + b_global_offsets[nj])
             if GLOBAL_LOAD_B_CG:
-                b_global_prefetch += tl.tuple([
-                    tl.load(b_global_ptrs, cache_modifier=".cg")
-                ])
+                b_global_prefetch += tl.tuple([tl.load(b_global_ptrs, cache_modifier=".cg")])
             else:
                 b_global_prefetch += tl.tuple([tl.load(b_global_ptrs)])
         if PRELOAD_A_OPERANDS:
             if LOCAL_LOAD_B_BEFORE_GLOBAL_PREFETCH:
                 acc = _dot_preloaded_a_and_b_tiles(
-                    preloaded_operands, b_dot_operands, acc,
-                    A_TILE_COUNT, B_TILE_COUNT,
+                    preloaded_operands,
+                    b_dot_operands,
+                    acc,
+                    A_TILE_COUNT,
+                    B_TILE_COUNT,
                 )
             else:
                 acc = _load_each_streamed_operand_and_dot(
-                    a_local_tiles, b_local_tiles, preloaded_operands,
-                    current_stage, acc, A_TILE_COUNT, B_TILE_COUNT,
-                    dot0, dot1, PRELOAD_A_OPERANDS,
+                    a_local_tiles,
+                    b_local_tiles,
+                    preloaded_operands,
+                    current_stage,
+                    acc,
+                    A_TILE_COUNT,
+                    B_TILE_COUNT,
+                    dot0,
+                    dot1,
+                    PRELOAD_A_OPERANDS,
                 )
         else:
             if not LOCAL_LOAD_B_BEFORE_GLOBAL_PREFETCH:
                 preloaded_operands = _load_preloaded_operand_tiles(
-                    a_local_tiles, b_local_tiles, current_stage,
-                    A_TILE_COUNT, B_TILE_COUNT, dot0, dot1,
+                    a_local_tiles,
+                    b_local_tiles,
+                    current_stage,
+                    A_TILE_COUNT,
+                    B_TILE_COUNT,
+                    dot0,
+                    dot1,
                     PRELOAD_A_OPERANDS,
                 )
             acc = _load_each_streamed_operand_and_dot(
-                a_local_tiles, b_local_tiles, preloaded_operands,
-                current_stage, acc, A_TILE_COUNT, B_TILE_COUNT,
-                dot0, dot1, PRELOAD_A_OPERANDS,
+                a_local_tiles,
+                b_local_tiles,
+                preloaded_operands,
+                current_stage,
+                acc,
+                A_TILE_COUNT,
+                B_TILE_COUNT,
+                dot0,
+                dot1,
+                PRELOAD_A_OPERANDS,
             )
         for mi in tl.static_range(A_TILE_COUNT):
             tlx.local_store(
@@ -908,8 +872,14 @@ def _bmm_register_staged(
     # by 32, one masked and zero-padded tail stage.
     current_stage = (full_tiles - 1) % NUM_STAGES
     preloaded_operands = _load_preloaded_operand_tiles(
-        a_local_tiles, b_local_tiles, current_stage,
-        A_TILE_COUNT, B_TILE_COUNT, dot0, dot1, PRELOAD_A_OPERANDS,
+        a_local_tiles,
+        b_local_tiles,
+        current_stage,
+        A_TILE_COUNT,
+        B_TILE_COUNT,
+        dot0,
+        dot1,
+        PRELOAD_A_OPERANDS,
     )
 
     if HAS_K_TAIL:
@@ -918,27 +888,24 @@ def _bmm_register_staged(
         if GLOBAL_TAIL_LOAD_BEFORE_LAST_DOT:
             a_tail_global = tl.tuple([])
             for mi in tl.static_range(A_TILE_COUNT):
-                a_tail_global += tl.tuple([tl.load(
-                    a_ptr
-                    + a_global_offsets[mi]
-                    + (tail_k_offset + rk[None, :]) * sak,
-                    mask=tail_mask[None, :],
-                    other=0.0,
-                )])
+                a_tail_global += tl.tuple([
+                    tl.load(
+                        a_ptr + a_global_offsets[mi] + (tail_k_offset + rk[None, :]) * sak,
+                        mask=tail_mask[None, :],
+                        other=0.0,
+                    )
+                ])
             b_tail_global = tl.tuple([])
             for nj in tl.static_range(B_TILE_COUNT):
-                b_global_ptrs = (
-                    b_ptr
-                    + (tail_k_offset + rk[:, None]) * sbk
-                    + b_global_offsets[nj]
-                )
+                b_global_ptrs = (b_ptr + (tail_k_offset + rk[:, None]) * sbk + b_global_offsets[nj])
                 if GLOBAL_LOAD_B_CG:
-                    b_tail_global += tl.tuple([tl.load(
-                        b_global_ptrs,
-                        mask=tail_mask[:, None],
-                        other=0.0,
-                        cache_modifier=".cg",
-                    )])
+                    b_tail_global += tl.tuple(
+                        [tl.load(
+                            b_global_ptrs,
+                            mask=tail_mask[:, None],
+                            other=0.0,
+                            cache_modifier=".cg",
+                        )])
                 else:
                     b_tail_global += tl.tuple([tl.load(
                         b_global_ptrs,
@@ -946,39 +913,50 @@ def _bmm_register_staged(
                         other=0.0,
                     )])
             acc = _load_each_streamed_operand_and_dot(
-                a_local_tiles, b_local_tiles, preloaded_operands,
-                current_stage, acc, A_TILE_COUNT, B_TILE_COUNT,
-                dot0, dot1, PRELOAD_A_OPERANDS,
+                a_local_tiles,
+                b_local_tiles,
+                preloaded_operands,
+                current_stage,
+                acc,
+                A_TILE_COUNT,
+                B_TILE_COUNT,
+                dot0,
+                dot1,
+                PRELOAD_A_OPERANDS,
             )
         else:
             acc = _load_each_streamed_operand_and_dot(
-                a_local_tiles, b_local_tiles, preloaded_operands,
-                current_stage, acc, A_TILE_COUNT, B_TILE_COUNT,
-                dot0, dot1, PRELOAD_A_OPERANDS,
+                a_local_tiles,
+                b_local_tiles,
+                preloaded_operands,
+                current_stage,
+                acc,
+                A_TILE_COUNT,
+                B_TILE_COUNT,
+                dot0,
+                dot1,
+                PRELOAD_A_OPERANDS,
             )
             a_tail_global = tl.tuple([])
             for mi in tl.static_range(A_TILE_COUNT):
-                a_tail_global += tl.tuple([tl.load(
-                    a_ptr
-                    + a_global_offsets[mi]
-                    + (tail_k_offset + rk[None, :]) * sak,
-                    mask=tail_mask[None, :],
-                    other=0.0,
-                )])
+                a_tail_global += tl.tuple([
+                    tl.load(
+                        a_ptr + a_global_offsets[mi] + (tail_k_offset + rk[None, :]) * sak,
+                        mask=tail_mask[None, :],
+                        other=0.0,
+                    )
+                ])
             b_tail_global = tl.tuple([])
             for nj in tl.static_range(B_TILE_COUNT):
-                b_global_ptrs = (
-                    b_ptr
-                    + (tail_k_offset + rk[:, None]) * sbk
-                    + b_global_offsets[nj]
-                )
+                b_global_ptrs = (b_ptr + (tail_k_offset + rk[:, None]) * sbk + b_global_offsets[nj])
                 if GLOBAL_LOAD_B_CG:
-                    b_tail_global += tl.tuple([tl.load(
-                        b_global_ptrs,
-                        mask=tail_mask[:, None],
-                        other=0.0,
-                        cache_modifier=".cg",
-                    )])
+                    b_tail_global += tl.tuple(
+                        [tl.load(
+                            b_global_ptrs,
+                            mask=tail_mask[:, None],
+                            other=0.0,
+                            cache_modifier=".cg",
+                        )])
                 else:
                     b_tail_global += tl.tuple([tl.load(
                         b_global_ptrs,
@@ -998,19 +976,39 @@ def _bmm_register_staged(
             )
         tl.debug_barrier()
         preloaded_operands = _load_preloaded_operand_tiles(
-            a_local_tiles, b_local_tiles, tail_stage,
-            A_TILE_COUNT, B_TILE_COUNT, dot0, dot1, PRELOAD_A_OPERANDS,
+            a_local_tiles,
+            b_local_tiles,
+            tail_stage,
+            A_TILE_COUNT,
+            B_TILE_COUNT,
+            dot0,
+            dot1,
+            PRELOAD_A_OPERANDS,
         )
         acc = _load_each_streamed_operand_and_dot(
-            a_local_tiles, b_local_tiles, preloaded_operands,
-            tail_stage, acc, A_TILE_COUNT, B_TILE_COUNT,
-            dot0, dot1, PRELOAD_A_OPERANDS,
+            a_local_tiles,
+            b_local_tiles,
+            preloaded_operands,
+            tail_stage,
+            acc,
+            A_TILE_COUNT,
+            B_TILE_COUNT,
+            dot0,
+            dot1,
+            PRELOAD_A_OPERANDS,
         )
     else:
         acc = _load_each_streamed_operand_and_dot(
-            a_local_tiles, b_local_tiles, preloaded_operands,
-            current_stage, acc, A_TILE_COUNT, B_TILE_COUNT,
-            dot0, dot1, PRELOAD_A_OPERANDS,
+            a_local_tiles,
+            b_local_tiles,
+            preloaded_operands,
+            current_stage,
+            acc,
+            A_TILE_COUNT,
+            B_TILE_COUNT,
+            dot0,
+            dot1,
+            PRELOAD_A_OPERANDS,
         )
 
     # Epilogue: keep the high-RP accumulator tuple in this JIT scope while
@@ -1020,9 +1018,7 @@ def _bmm_register_staged(
     for mi in tl.static_range(A_TILE_COUNT):
         for nj in tl.static_range(B_TILE_COUNT):
             offsets = tlx.require_layout(
-                base
-                + output_rows[mi][:, None] * scm
-                + output_cols[nj][None, :] * scn,
+                base + output_rows[mi][:, None] * scm + output_cols[nj][None, :] * scn,
                 mma,
                 pin=False,
             )
@@ -1060,8 +1056,7 @@ def _validate_register_staged_spec(kernel_spec):
     )
 
 
-def _launch_register_staged_bmm(a, b, c, *, kernel_spec, batch_group,
-                                schedule_spec=None):
+def _launch_register_staged_bmm(a, b, c, *, kernel_spec, batch_group, schedule_spec=None):
     """Launch one specialization of the register-staged K32 pipeline."""
     # Validate the compile-time kernel policy independently from the runtime
     # tensor contract. A new tile shape should only need a new kernel_spec.
@@ -1083,14 +1078,10 @@ def _launch_register_staged_bmm(a, b, c, *, kernel_spec, batch_group,
     batch, m, k = a.shape
     n = b.shape[-1]
     assert k >= BLOCK_K, f"K must be >= BLOCK_K={BLOCK_K}, got K={k}"
-    assert block_m <= 2 * m, (
-        f"BLOCK_M={block_m} requires M >= {(block_m + 1) // 2}, "
-        f"got M={m}"
-    )
-    assert block_n <= 2 * n, (
-        f"BLOCK_N={block_n} requires N >= {(block_n + 1) // 2}, "
-        f"got N={n}"
-    )
+    assert block_m <= 2 * m, (f"BLOCK_M={block_m} requires M >= {(block_m + 1) // 2}, "
+                              f"got M={m}")
+    assert block_n <= 2 * n, (f"BLOCK_N={block_n} requires N >= {(block_n + 1) // 2}, "
+                              f"got N={n}")
 
     # Flatten [batch, M-tile, N-tile] into one launch dimension. The kernel
     # recovers batch_id and the two output-tile coordinates from program_id.
@@ -1098,9 +1089,15 @@ def _launch_register_staged_bmm(a, b, c, *, kernel_spec, batch_group,
     tiles_per_batch = triton.cdiv(m, block_m) * n_blocks
     program_count = batch * tiles_per_batch
     strides = (
-        a.stride(0), a.stride(1), a.stride(2),
-        b.stride(0), b.stride(1), b.stride(2),
-        c.stride(0), c.stride(1), c.stride(2),
+        a.stride(0),
+        a.stride(1),
+        a.stride(2),
+        b.stride(0),
+        b.stride(1),
+        b.stride(2),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
     )
     launch_options = {}
     if schedule_spec is not None:
@@ -1111,7 +1108,13 @@ def _launch_register_staged_bmm(a, b, c, *, kernel_spec, batch_group,
             disable_unclustered_high_rp_reschedule=schedule_spec[1],
         )
     _bmm_register_staged[(program_count, )](
-        a, b, c, m, n, k, *strides,
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        *strides,
         KERNEL_SPEC=kernel_spec,
         EVEN_M=m % block_m == 0,
         EVEN_N=n % block_n == 0,
@@ -1128,13 +1131,14 @@ def _launch_register_staged_bmm(a, b, c, *, kernel_spec, batch_group,
     return c
 
 
-def bmm_register_staged_template(a, b, kernel_spec, batch_group=NUM_XCDS,
-                                 schedule_spec=None):
+def bmm_register_staged_template(a, b, kernel_spec, batch_group=NUM_XCDS, schedule_spec=None):
     batch, m, _ = a.shape
     n = b.shape[-1]
     c = torch.empty((batch, m, n), device=a.device, dtype=a.dtype)
     return _launch_register_staged_bmm(
-        a, b, c,
+        a,
+        b,
+        c,
         kernel_spec=kernel_spec,
         batch_group=batch_group,
         schedule_spec=schedule_spec,
@@ -1166,19 +1170,19 @@ def bmm(a, b):
     if M == 40 and N == 256 and K == 1956:
         batch_group = LARGE_BATCH_GROUP if Bs >= LARGE_BATCH_GROUP else NUM_XCDS
         return _launch_register_staged_bmm(
-            a, b, c,
+            a,
+            b,
+            c,
             kernel_spec=_MT64X256_MI32_KERNEL_SPEC,
             batch_group=batch_group,
             schedule_spec=_REGISTER_STAGED_SCHEDULE_SPEC,
         )
     if M == 262 and N == 256 and K == 294:
-        batch_group = (
-            BMM_262_256_BATCH_GROUP
-            if Bs >= BMM_262_256_BATCH_GROUP
-            else NUM_XCDS
-        )
+        batch_group = (BMM_262_256_BATCH_GROUP if Bs >= BMM_262_256_BATCH_GROUP else NUM_XCDS)
         return _launch_register_staged_bmm(
-            a, b, c,
+            a,
+            b,
+            c,
             kernel_spec=_MT144X256_MI16_KERNEL_SPEC,
             batch_group=batch_group,
         )
@@ -1189,7 +1193,9 @@ def bmm(a, b):
     if M == 448 and N == 160 and K >= BLOCK_K and K % BLOCK_K != 0:
         batch_group = BMM_448_160_BATCH_GROUP if Bs >= BMM_448_160_BATCH_GROUP else NUM_XCDS
         return _launch_register_staged_bmm(
-            a, b, c,
+            a,
+            b,
+            c,
             kernel_spec=_MT224X160_MI16_KERNEL_SPEC,
             batch_group=batch_group,
             schedule_spec=_MT224X160_REGISTER_STAGED_SCHEDULE_SPEC,
@@ -1211,14 +1217,10 @@ def bmm(a, b):
             a, b, c, M, N, K, *st, BM=VENDOR_BLOCK_M, BN=BLOCK_N, BK=VENDOR_BLOCK_K,
             # Group 64 batches of the same M tile consecutively. A is shared
             # across batches, so its cache lines are reused while B streams.
-            NUM_XCDS=LARGE_BATCH_GROUP if use_large_batch_group else NUM_XCDS,
-            GMN=vgmn, NT=vnt, B_BASES=vbb,
-            num_warps=4, num_stages=1,
-            matrix_instr_nonkdim=16,
-            reverse_local_assignment=True,
+            NUM_XCDS=LARGE_BATCH_GROUP if use_large_batch_group else NUM_XCDS, GMN=vgmn, NT=vnt, B_BASES=vbb,
+            num_warps=4, num_stages=1, matrix_instr_nonkdim=16, reverse_local_assignment=True,
             disable_unclustered_high_rp_reschedule=use_large_batch_group,
-            enable_sched_group_barrier_scheduler=use_large_batch_group,
-            sched_group_barrier_required_region_count=4)
+            enable_sched_group_barrier_scheduler=use_large_batch_group, sched_group_barrier_required_region_count=4)
         return c
     # K % BLOCK_K, not K % 8: the direct path does no K-tail masking on
     # buffer_load_to_local, so a K that is 8-aligned but not BLOCK_K-aligned

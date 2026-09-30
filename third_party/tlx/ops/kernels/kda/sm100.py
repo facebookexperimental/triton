@@ -725,12 +725,11 @@ def _kda_bwd_kernel(  # noqa: C901
     # k_hat overwrites g: g's only reader is the cumsum MMA, so the MMA's
     # completion barrier already orders the rewrite.
     kh_buf = tlx.local_alloc((BT, D), dtype, NBUF, reuse=g_buf_storage_alias)
-    g_buf_storage_alias.set_buffer_overlap(
-        tlx.reuse_group(
-            g_buf,
-            kh_buf,
-            group_type=tlx.reuse_group_type.shared,
-        ))
+    g_buf_storage_alias.set_buffer_overlap(tlx.reuse_group(
+        g_buf,
+        kh_buf,
+        group_type=tlx.reuse_group_type.shared,
+    ))
     wa_buf = tlx.local_alloc((BT, D), dtype, NBUF)  # v (TMA) -> betaU -> dU -> dgamma
     # decayed dS, bf16 MMA operand; once its two dots retire the tile is
     # recycled for dU/dv/dq and the dk drain, which is what lets the rhs/U
@@ -750,12 +749,11 @@ def _kda_bwd_kernel(  # noqa: C901
     # epilogue), five masked global stores and their convergences; TMA's own
     # bounds clipping also replaces the row mask on the partial chunk.
     dg_buf = tlx.local_alloc((BT, D), tl.float32, 1, reuse=s_buf_storage_alias)
-    s_buf_storage_alias.set_buffer_overlap(
-        tlx.reuse_group(
-            s_buf,
-            dg_buf,
-            group_type=tlx.reuse_group_type.shared,
-        ))
+    s_buf_storage_alias.set_buffer_overlap(tlx.reuse_group(
+        s_buf,
+        dg_buf,
+        group_type=tlx.reuse_group_type.shared,
+    ))
     # Zk gets its own tile so the g/k_hat tile has no reader left once group
     # F retires. That is what frees the gate branch for prefetching; it also
     # carries dbeta's U term between groups D and E.

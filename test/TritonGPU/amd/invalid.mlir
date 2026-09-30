@@ -1,5 +1,69 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_multicast_missing_member(%a: !tt.tensordesc<64x64xf16>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, %mask: i32) {
+    // expected-error @+1 {{requires one multicast mask per member}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_multicast_outside_cluster(%a: !tt.tensordesc<64x64xf16>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
+    %mask = arith.constant 16 : i32
+    // expected-error @+1 {{multicast mask names a CTA outside the cluster}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask, %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 8 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_multicast_too_many_recipients(%a: !tt.tensordesc<64x64xf16>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
+    %mask = arith.constant 63 : i32
+    // expected-error @+1 {{multicast masks support at most 5 recipients}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask, %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1], [0, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_distributed_multicast_outside_cluster(%a: !tt.tensordesc<64x64xf16, #shared>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
+    %mask = arith.constant 16 : i32
+    // expected-error @+1 {{multicast mask names a CTA outside the cluster}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask, %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0], [0, 0], [0, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tdm_distributed_multicast_too_many_recipients(%a: !tt.tensordesc<64x64xf16, #shared>, %dst: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
+    %mask = arith.constant 63 : i32
+    // expected-error @+1 {{multicast masks support at most 5 recipients}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %a into %dst, %dst multicast %mask, %mask {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Matching padding alone does not make a transposed view TDM-compatible.
 #desc_layout = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 64]}>
 #view_layout = #ttg.padded_shared<[128:+8] {order = [0, 1], shape = [128, 64]}>
@@ -163,21 +227,21 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
 #blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @local_load_packed_tranposed_wrong_op_idx(%arg0: !ttg.memdesc<16x64xi8, #shared, #smem, mutable>, %arg1: !ttg.memdesc<64x16xi8, #shared1, #smem, mutable>) {
+  tt.func @local_load_packed_transposed_wrong_op_idx(%arg0: !ttg.memdesc<16x64xi8, #shared, #smem, mutable>, %arg1: !ttg.memdesc<64x16xi8, #shared1, #smem, mutable>) {
 // expected-error @+1 {{Order of dimensions don't match expected}}
-    %1 = amdg.local_load_packed_tranposed %arg0 : !ttg.memdesc<16x64xi8, #shared, #smem, mutable> -> tensor<32x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma32, kWidth = 16}>>
+    %1 = amdg.local_load_packed_transposed %arg0 : !ttg.memdesc<16x64xi8, #shared, #smem, mutable> -> tensor<32x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma32, kWidth = 16}>>
     tt.return
   }
 
-  tt.func @local_load_packed_tranposed_wrong_op_idx2(%arg0: !ttg.memdesc<64x16xi8, #shared, #smem, mutable>) {
+  tt.func @local_load_packed_transposed_wrong_op_idx2(%arg0: !ttg.memdesc<64x16xi8, #shared, #smem, mutable>) {
 // expected-error @+1 {{Input and output dimensions don't match after packing changes}}
-    %1 = amdg.local_load_packed_tranposed %arg0 : !ttg.memdesc<64x16xi8, #shared, #smem, mutable> -> tensor<32x32xi8, #ttg.dot_op<{opIdx = 0, parent = #mma32, kWidth = 16}>>
+    %1 = amdg.local_load_packed_transposed %arg0 : !ttg.memdesc<64x16xi8, #shared, #smem, mutable> -> tensor<32x32xi8, #ttg.dot_op<{opIdx = 0, parent = #mma32, kWidth = 16}>>
     tt.return
   }
   //  CHECK-LABEL: ds_transpose_t_fp4_mfma16
-  tt.func @local_load_packed_tranposed_wrong_shape(%arg0: !ttg.memdesc<8x128xi8, #shared, #smem, mutable>, %arg1: !ttg.memdesc<128x8xi8, #shared1, #smem, mutable>) {
+  tt.func @local_load_packed_transposed_wrong_shape(%arg0: !ttg.memdesc<8x128xi8, #shared, #smem, mutable>, %arg1: !ttg.memdesc<128x8xi8, #shared1, #smem, mutable>) {
 // expected-error @+1 {{only works with DotOperandEncodingAttr dst encoding}}
-    %1 = amdg.local_load_packed_tranposed %arg0 : !ttg.memdesc<8x128xi8, #shared, #smem, mutable> -> tensor<256x128xi32, #blocked>
+    %1 = amdg.local_load_packed_transposed %arg0 : !ttg.memdesc<8x128xi8, #shared, #smem, mutable> -> tensor<256x128xi32, #blocked>
     tt.return
   }
 
