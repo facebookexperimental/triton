@@ -610,3 +610,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
     tt.return
   }
 }
+
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // An mbarrier arrive signals another task; it orders nothing across this
+  // task's own warps, so the WAR below still needs a barrier.
+  // CHECK-LABEL: @ld_then_arrive_then_st_same_buffer
+  // CHECK: ttng.tmem_load
+  // CHECK: ttng.arrive_barrier
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttng.tmem_store
+  tt.func @ld_then_arrive_then_st_same_buffer(
+      %arg0: tensor<128x128xf32, #blocked>,
+      %bar: !ttg.memdesc<1xi64, #barrier_shared, #ttg.shared_memory, mutable>) {
+    %true = arith.constant true
+    %c1 = arith.constant 1 : i32
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    %rd = ttg.memdesc_index %0[%c1] : !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    %wr = ttg.memdesc_index %0[%c1] : !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    %1 = ttng.tmem_load %rd : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #barrier_shared, #ttg.shared_memory, mutable>
+    ttng.tmem_store %arg0, %wr, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // Same-task WAW across an arrive still needs no barrier: writes are
+  // self-ordered, so only reads are kept across arrives.
+  // CHECK-LABEL: @st_then_arrive_then_st_same_buffer
+  // CHECK: ttng.tmem_store
+  // CHECK: ttng.arrive_barrier
+  // CHECK-NOT: ttg.barrier
+  // CHECK: ttng.tmem_store
+  tt.func @st_then_arrive_then_st_same_buffer(
+      %arg0: tensor<128x128xf32, #blocked>,
+      %bar: !ttg.memdesc<1xi64, #barrier_shared, #ttg.shared_memory, mutable>) {
+    %true = arith.constant true
+    %c1 = arith.constant 1 : i32
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    %idx = ttg.memdesc_index %0[%c1] : !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttng.tmem_store %arg0, %idx, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #barrier_shared, #ttg.shared_memory, mutable>
+    ttng.tmem_store %arg0, %idx, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
