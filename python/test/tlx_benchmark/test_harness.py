@@ -730,7 +730,10 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
         },
-        "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {"sm100": ("sm100_1", )},
+        "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {
+            "sm100": ("sm100_1", ),
+            "gfx950": ("gfx950_1", ),
+        },
         "triton.tlx.ops.kernels.hstu_attn._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": (),
@@ -764,6 +767,19 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
 
     flash_attn = importlib.import_module("triton.tlx.ops.kernels.flash_attn._shapes").FOCUS
     assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+
+
+def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_flash_attn_mxfp8")
+
+    def directions(arch):
+        monkeypatch.setattr(bench.driver, "arch", lambda: arch)
+        return {case.direction for case in bench.cases(synthetic=True)}
+
+    assert directions("gfx950") == {"fwd"}
+    assert directions("sm100") == {"fwd", "bwd"}
 
 
 def test_focus_suite_selection_rejects_unknown_names():

@@ -119,11 +119,14 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Differentiable Blackwell MXFP8 attention over BF16 master tensors.
+    """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
 
-    Q, K, and V are quantized internally to E4M3 data with E8M0 block scales.
-    The initial implementation supports D128 and sequence lengths divisible by
-    256; output and input gradients are BF16.
+    Q, K, V and the softmax probabilities are quantized internally to E4M3
+    data with E8M0 scales per 32 elements. gfx950 folds sm_scale * log2(e)
+    into Q before quantizing it, where Blackwell scales the scores, so the two
+    agree to within the quantization error rather than bitwise. Head dim 128
+    and sequence lengths divisible by 256. Blackwell returns BF16 gradients;
+    gfx950 is forward only.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects rank-4 Q/K/V tensors")
