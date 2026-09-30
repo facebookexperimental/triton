@@ -6,15 +6,6 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-try:
-    from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
-except ImportError:
-    MXTensor = None
-    ScaleCalculationMode = None
-
-_HAS_MXFP8_QUANTIZATION = MXTensor is not None and ScaleCalculationMode is not None
-
 from triton.language.extra.cuda.inline_ptx_lib import _fma_f32x2, _mul_f32x2, _sub_f32x2
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.language.extra.tlx.mxfp8_utils import (
@@ -25,6 +16,14 @@ from triton.language.extra.tlx.mxfp8_utils import (
 )
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
+except ImportError:
+    MXTensor = None
+    ScaleCalculationMode = None
+
+_HAS_MXFP8_QUANTIZATION = MXTensor is not None and ScaleCalculationMode is not None
 
 
 def _mxf8_host_descriptor_pre_hook(nargs):
