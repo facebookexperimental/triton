@@ -2466,6 +2466,32 @@ static bool isFedByDescriptorLoad(Value stored) {
   });
 }
 
+static std::optional<unsigned>
+getRequestedDescriptorBufferDepth(ttg::LocalAllocOp alloc) {
+  SmallVector<Value> worklist = {alloc.getResult()};
+  DenseSet<Value> visited;
+  std::optional<unsigned> requestedDepth;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      if (auto load = dyn_cast<ttnvws::DescriptorLoadOp>(user)) {
+        auto depth =
+            load->getAttrOfType<IntegerAttr>(tt::kRequestedBufferDepthAttrName);
+        if (depth)
+          requestedDepth = static_cast<unsigned>(depth.getInt());
+        continue;
+      }
+      if (user->hasTrait<OpTrait::MemDescViewTrait>())
+        for (Value result : user->getResults())
+          if (isa<ttg::MemDescType>(result.getType()))
+            worklist.push_back(result);
+    }
+  }
+  return requestedDepth;
+}
+
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
@@ -2513,6 +2539,12 @@ static unsigned allocateSmemBuffers(
       buf.minCopies = copies.getInt();
       buf.isPinned = true;
       LDBG("Phase 1: WSBuffer pinned by atomic-broadcast depth: numCopies="
+           << buf.numCopies);
+    } else if (auto depth = getRequestedDescriptorBufferDepth(alloc)) {
+      buf.numCopies = *depth;
+      buf.minCopies = *depth;
+      buf.isPinned = true;
+      LDBG("Phase 1: WSBuffer pinned by operand depth: numCopies="
            << buf.numCopies);
     }
 
