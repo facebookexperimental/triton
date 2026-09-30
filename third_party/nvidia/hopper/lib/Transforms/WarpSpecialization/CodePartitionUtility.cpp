@@ -3382,7 +3382,12 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
-        assert(false && "Unexpected Producer Found");
+        // NVGPUWarpSpecialization bails out of this shape before code
+        // partitioning (findSameTaskPostLoopOperandDUser); reaching it here
+        // means that gate and this walk disagree on the producer.
+        return loadOp.emitError(
+            "handleOperandD: TMEMLoad after the loop is in the producer's "
+            "task; no operand-D channel can be built for it");
       }
     }
   }
