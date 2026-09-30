@@ -215,6 +215,26 @@ public:
       return bailOut(funcOp);
     }
 
+    // Every op of an MMA kernel propagated to one task, e.g. a GEMM whose
+    // operands are pointer loads (no load partition) and whose epilogue is a
+    // tl.store (no epilogue partition). There is nothing to specialize, and
+    // code partitioning would build channels for the MMA's buffers without
+    // threading buffer counters through the loop, since no region spans two
+    // tasks.
+    Operation *firstMMA = nullptr;
+    funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
+      firstMMA = mmaOp;
+      return WalkResult::interrupt();
+    });
+    if (firstMMA && getNestedAsyncTaskIds(funcOp).size() == 1) {
+      LDBG("Warp specialization found an MMA kernel with a single partition. "
+           "Skipping.");
+      firstMMA->emitRemark(
+          "meta autoWS placed every op of this MMA kernel in one partition; "
+          "compiling without warp specialization");
+      return bailOut(funcOp);
+    }
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
