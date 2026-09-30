@@ -10,6 +10,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <numeric>
+#include <type_traits>
 
 #define DEBUG_TYPE "axis-info"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -453,7 +454,13 @@ private:
     // the minimal constancy is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual constancy.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Full-dimension contiguity is not required for unsigned division. A
+    // partially contiguous numerator still produces constant runs when the
+    // run boundaries are aligned to the divisor. Signed division cannot use
+    // this relaxation without a non-negativity proof because it truncates
+    // toward zero. Preserve the pre-existing full-dimension inference there.
+    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::DivUIOp>;
+    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       constancy = std::max(constancy,
                            gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
@@ -514,7 +521,14 @@ private:
     // The minimal contiguity is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual contiguity.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Partial contiguity is sufficient for unsigned remainder. For example,
+    // if lhs repeats contiguous groups of 64 elements, `lhs % 8` repeats
+    // contiguous groups of 8 elements even when the tensor dimension itself
+    // is larger than 64. Signed remainder cannot use this relaxation without
+    // a non-negativity proof because negative dividends break the run at zero.
+    // Preserve the pre-existing full-dimension inference for signed remainder.
+    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
+    if ((isUnsigned || AxisInfoVisitor::isContiguousDim(lhs, shape, dim)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
@@ -524,7 +538,15 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    if (rhs.getConstancy(dim) > 1) {
+    auto resTy = dyn_cast<RankedTensorType>(op.getType());
+    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
+    // Divisibility applies to the base of each resulting contiguity group. If
+    // signed remainder cannot preserve a partial group, the old group-base
+    // divisibility does not apply to every now-scalar result.
+    bool preservesContiguousGroup =
+        isUnsigned ||
+        (resTy && AxisInfoVisitor::isContiguousDim(lhs, resTy.getShape(), dim));
+    if (rhs.getConstancy(dim) > 1 && preservesContiguousGroup) {
       // lhs: d_lhs * k = gcd(d_lhs, d_rhs) * k' * k = gcd(d_lhs, d_rhs) * k''
       // rhs: d_rhs * p = gcd(d_lhs, d_rhs) * p' * p = gcd(d_lhs, d_rhs) * p''
       // lhs = gcd(d_lhs, d_rhs) * k'' = gcd(d_lhs, d_rhs) * d + r

@@ -694,14 +694,14 @@ GFX942 = GPUTarget("hip", "gfx942", 64)
 GFX1250 = GPUTarget("hip", "gfx1250", 32)
 
 
-def compile_for_target(fn, signature, constexprs, target):
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+def compile_for_target(fn, signature, constexprs, target, attrs=None):
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     return triton_compile(src, target=target)
 
 
-def compile_for_gfx950(fn, signature, constexprs):
+def compile_for_gfx950(fn, signature, constexprs, attrs=None):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
-    return compile_for_target(fn, signature, constexprs, GFX950)
+    return compile_for_target(fn, signature, constexprs, GFX950, attrs=attrs)
 
 
 def compile_for_gfx942(fn, signature, constexprs):
@@ -1130,6 +1130,89 @@ def _buffer_load_contiguity_kernel(x_ptr, y_ptr):
     offsets = tlx.require_layout(offsets, load_layout, pin=False)
     values = tlx.buffer_load(x_ptr, offsets, contiguity=4)
     tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _buffer_load_to_local_contiguity_kernel(
+    x_ptr,
+    mask_boundary,
+    CONTIGUITY: tl.constexpr,
+):
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(512, 16)],
+        [32, 16],
+        order=[1, 0],
+    )
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    pair_boundary = mask_boundary - mask_boundary % 2
+    mask = (k[:, None] < 32) & (m[None, :] < pair_boundary)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1, layout=shared_layout)
+    tlx.buffer_load_to_local(
+        tlx.local_view(buffer, 0),
+        x_ptr,
+        offsets,
+        mask=mask,
+        contiguity=CONTIGUITY,
+    )
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_contiguity_kernel,
+        signature={
+            "x_ptr": "*bf16",
+            "mask_boundary": "i32",
+            "CONTIGUITY": "constexpr",
+        },
+        constexprs={"CONTIGUITY": 2},
+    )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 2" in ttgir
+    assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
+
+
+@pytest.mark.parametrize("contiguity", [0, 3, True], ids=["zero", "non-power-of-two", "bool"])
+def test_buffer_load_to_local_rejects_invalid_contiguity_gfx950(contiguity):
+    with pytest.raises(CompilationError, match="contiguity must be a positive power of two"):
+        compile_for_gfx950(
+            _buffer_load_to_local_contiguity_kernel,
+            signature={
+                "x_ptr": "*bf16",
+                "mask_boundary": "i32",
+                "CONTIGUITY": "constexpr",
+            },
+            constexprs={"CONTIGUITY": contiguity},
+        )
+
+
+@triton.jit
+def _buffer_load_to_local_unpinned_contiguity_kernel(x_ptr):
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1)
+    tlx.buffer_load_to_local(
+        tlx.local_view(buffer, 0),
+        x_ptr,
+        offsets,
+        contiguity=2,
+    )
+
+
+def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
+    with pytest.raises(
+            RuntimeError,
+            match="contiguity > 1 requires a directly indexed user-pinned padded_shared destination",
+    ):
+        compile_for_gfx950(
+            _buffer_load_to_local_unpinned_contiguity_kernel,
+            signature={"x_ptr": "*bf16"},
+            constexprs={},
+        )
 
 
 @triton.jit
@@ -4173,6 +4256,26 @@ def _async_load_kernel(
 
 
 @triton.jit
+def _async_load_gather_transpose_kernel(v_ptr, output_ptr):
+    n = tl.arange(0, 128)
+    d = tl.arange(0, 64)
+    n_u32 = n.to(tl.uint32)
+    page = (n_u32 // 64).to(tl.int32)
+    token_u32 = n_u32 % 64
+    token_group = (token_u32 // 8).to(tl.int32)
+    token_in_group = (token_u32 % 8).to(tl.int32)
+    ptrs = (v_ptr + page[:, None] * 4096 + token_group[:, None] * 512 + d[None, :] * 8 + token_in_group[:, None])
+
+    buffers = tlx.local_alloc((128, 64), tl.bfloat16, 2)
+    view = tlx.local_view(buffers, 0)
+    token = tlx.async_load(ptrs, view)
+    tlx.async_load_commit_group([token])
+    tlx.async_load_wait_group(0)
+    value = tlx.local_load(view)
+    tl.store(output_ptr + n[:, None] * 64 + d[None, :], value)
+
+
+@triton.jit
 def _local_load_kernel(
     x_ptr,
     output_ptr,
@@ -4525,6 +4628,19 @@ def test_async_load_compiles_gfx950(device):
     # Verify the kernel compiled all the way to AMDGCN.
     assert "amdgcn" in compiled.asm
     assert len(compiled.asm["amdgcn"]) > 0
+
+
+def test_async_load_gather_transpose_compiles_gfx950(device):
+    """A grouped gather-transpose should lower to a 128-bit direct LDS load."""
+    compiled = compile_for_gfx950(
+        _async_load_gather_transpose_kernel,
+        signature={"v_ptr": "*bf16", "output_ptr": "*bf16"},
+        constexprs={},
+        # Runtime JIT launches attach this base-pointer alignment
+        # automatically; ASTSource compile-only signatures do not.
+        attrs={(0, ): [("tt.divisibility", 16)]},
+    )
+    assert re.search(r"(buffer_load_dwordx4.*lds|global_load_lds_dwordx4)", compiled.asm["amdgcn"])
 
 
 def test_local_load_compiles_gfx950(device):

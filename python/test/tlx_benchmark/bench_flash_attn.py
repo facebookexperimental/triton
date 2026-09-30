@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.flash_attn._shapes import SYNTHETIC, flops, label, qkv
+from triton.tlx.ops.kernels.flash_attn._shapes import FORWARD_ONLY, SYNTHETIC, flops, label, qkv
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -66,7 +66,7 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
              direction=direction, label=label(*entry, direction))
         for entry in shapes(synthetic, suites)
-        for direction in DIRECTIONS
+        for direction in (("fwd", ) if entry in FORWARD_ONLY else DIRECTIONS)
     ]
 
 

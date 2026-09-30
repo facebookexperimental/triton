@@ -219,6 +219,7 @@ def buffer_load_to_local(
     mask=None,
     other=None,
     cache_modifier: str = "",
+    contiguity=1,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -232,11 +233,12 @@ def buffer_load_to_local(
     a compile-time error unless the following requirements are met:
     - Each thread's load must reach a supported direct-to-LDS width (32 or 128
       bits, e.g. 2 or 8 fp16 elements). A smaller vectorization cannot be lowered.
-    - The alignment needed for that width must be statically provable.
+    - The alignment needed for that width must be statically provable or
+      guaranteed by `contiguity`.
     - If `mask` is given it must be aligned to the vector width: each group of
-      (vector width) consecutive mask values must be identical. The copy moves
-      each lane's whole vector in one transaction, so a mask whose boundary cannot
-      be proven vector-aligned (e.g. `offs < K` for runtime `K`) cannot lower.
+      (vector width) consecutive mask values must be identical. When analysis
+      cannot prove this for a dynamic boundary, `contiguity` is a trusted
+      assertion that the pointer, offsets, and mask satisfy that width.
 
     Args:
         dest: Destination buffer in shared memory (buffered_tensor).
@@ -245,8 +247,18 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
+        contiguity: Trusted positive power-of-two lower bound on contiguous
+            elements available for vectorization, including mask uniformity.
+            It must divide the number of elements owned by each thread and be
+            legal for the destination shared-memory layout. Values greater
+            than one require ``dest`` to be the allocation itself or a direct
+            ``local_view`` of a user-pinned padded shared-memory layout.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -265,7 +277,7 @@ def buffer_load_to_local(
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
-                                                           other_handle, cache_mod)
+                                                           other_handle, cache_mod, contiguity)
     return tlx.async_token(handle)
 
 
@@ -395,7 +407,7 @@ def local_alloc(
     num: tl.constexpr,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     reuse: Optional[tlx.buffered_tensor | tlx.storage_alias_spec] = None,
-    layout: Optional[tlx.shared_layout_encoding] = None,
+    layout: Optional[tlx.layout_encoding] = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
@@ -489,22 +501,33 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
             layout_handle = layout.to_ir(_semantic.builder)
     else:
-        if storage != tlx.storage_kind.smem:
-            raise NotImplementedError("User-specified layout encoding is only supported for shared memory (smem)")
         layout = tl._unwrap_if_constexpr(layout)
-        # A CuTe swizzled_layout (Swizzle<B,M,S>) needs the buffer shape to resolve
-        # its perPhase; do it now that shape is known.
-        if isinstance(layout, tlx.swizzled_layout):
-            layout = layout._to_encoding(unwrapped_shape)
-        if not isinstance(layout, tlx.shared_layout_encoding):
-            raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
-        layout_handle = layout.to_ir(_semantic.builder)
-        # This is an explicit, user-pinned layout: wrap it so layout propagation
-        # respects it (does not retag the buffer to satisfy a consumer). The
-        # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
-        if not getattr(layout, "_tlx_default", False):
-            layout._tlx_user_pinned = True
-            layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
+        if storage == tlx.storage_kind.smem:
+            # A CuTe swizzled_layout (Swizzle<B,M,S>) needs the buffer shape to resolve
+            # its perPhase; do it now that shape is known.
+            if isinstance(layout, tlx.swizzled_layout):
+                layout = layout._to_encoding(unwrapped_shape)
+            if not isinstance(layout, tlx.shared_layout_encoding):
+                raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
+            layout_handle = layout.to_ir(_semantic.builder)
+            # This is an explicit, user-pinned layout: wrap it so layout propagation
+            # respects it (does not retag the buffer to satisfy a consumer). The
+            # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
+            if not getattr(layout, "_tlx_default", False):
+                layout._tlx_user_pinned = True
+                layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
+        elif isinstance(
+                layout,
+            (
+                tlx.tensor_memory_layout_encoding,
+                tlx.tensor_memory_scales_layout_encoding,
+            ),
+        ):
+            layout_handle = layout.to_ir(_semantic.builder)
+        else:
+            raise TypeError("`layout` for tensor memory must be a tlx.tensor_memory_layout_encoding "
+                            "or tlx.tensor_memory_scales_layout_encoding, "
+                            f"got {type(layout).__name__}")
 
     alias_handle = None
     shared_buffer_handle = None
@@ -1352,12 +1375,12 @@ def local_reinterpret(
     Reinterpret the dtype and shape of a buffered tensor.
 
     When ``layout`` is supplied, the descriptor is also viewed through that
-    explicit shared-memory layout. This is a zero-copy descriptor change used
-    by the Gluon CDNA4 transpose-read path: a row-major rank-3 physical image
-    is loaded by direct-to-LDS and then reinterpreted as a bank-aware rank-2 K
-    tile. With ``pin=False``, the view remains optimizer-flexible instead of
-    becoming a hard ``#tlx.user_layout`` anchor. Without ``layout`` the source
-    layout is preserved for compatibility.
+    explicit memory layout. Shared-memory layouts support the Gluon CDNA4
+    transpose-read path. Tensor memory additionally supports the scales layout
+    for byte transport into typed scaled-MMA operands. With ``pin=False``, an
+    SMEM view remains optimizer-flexible instead of becoming a hard
+    ``#tlx.user_layout`` anchor. Without ``layout`` the source layout is
+    preserved for compatibility.
     """
     layout = tl._unwrap_if_constexpr(layout)
     pin = tl._unwrap_if_constexpr(pin)
@@ -1370,15 +1393,17 @@ def local_reinterpret(
 
     encoding = None
     if layout is not None:
-        assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
-            "TLX local_reinterpret with an explicit layout only supports SMEM")
+        assert isinstance(src, tlx.buffered_tensor)
+        is_smem_layout = src.type.storage == tlx.storage_kind.smem and isinstance(layout, tlx.shared_layout_encoding)
+        is_tmem_scales_layout = (src.type.storage == tlx.storage_kind.tmem
+                                 and isinstance(layout, tlx.tensor_memory_scales_layout_encoding))
+        assert is_smem_layout or is_tmem_scales_layout, (
+            "TLX local_reinterpret only supports explicit shared-memory layouts "
+            "or the tensor-memory scales layout")
         encoding = layout.to_ir(_semantic.builder)
-        # Match local_alloc's explicit-layout contract.  Leaving the result
-        # unwrapped lets layout propagation treat a user-specified
-        # reinterpret view as inferred, and padded sources then fail the
-        # MemDescReinterpret verifier before placeholder layouts are
-        # finalized (user-wrapped padded source versus raw padded result).
-        if pin and not getattr(layout, "_tlx_default", False):
+        # Match local_alloc's explicit-layout contract for SMEM. TMEM scales
+        # already use a concrete hardware encoding and need no user wrapper.
+        if is_smem_layout and pin and not getattr(layout, "_tlx_default", False):
             layout._tlx_user_pinned = True
             encoding = _semantic.builder.make_user_layout_attr(encoding)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
