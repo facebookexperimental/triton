@@ -40,6 +40,8 @@ def _sdpa(q, k, v, causal, scale=None):
 def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn
 
+    if N_CTX % 128 or HEAD_DIM not in (64, 128):
+        pytest.skip(f"sm90 takes N_CTX % 128 == 0 and HEAD_DIM 64/128, got {N_CTX}x{HEAD_DIM}")
     dtype = DTYPES[dtype_name]
     torch.manual_seed(0)
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype)
@@ -61,6 +63,8 @@ def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
 def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn
 
+    if N_CTX % 128 or HEAD_DIM not in (64, 128):
+        pytest.skip(f"sm90 takes N_CTX % 128 == 0 and HEAD_DIM 64/128, got {N_CTX}x{HEAD_DIM}")
     dtype = DTYPES[dtype_name]
     torch.manual_seed(0)
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=True)
