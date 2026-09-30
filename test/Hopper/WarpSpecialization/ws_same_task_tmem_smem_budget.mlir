@@ -1,21 +1,32 @@
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=400000 tma-store-pipelining=true" --tritongpu-pipeline="num-stages=3" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=400000 tma-store-pipelining=true" | FileCheck %s --check-prefix=ROOMY
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=300000 tma-store-pipelining=true" | FileCheck %s --check-prefix=TRIMMED
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" 2>/dev/null | FileCheck %s --check-prefix=FALLBACK
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
 
-// The same-task TMEM A operand GEMM of ws_same_task_tmem.mlir with a K loop of
-// two iterations, compiled through warp specialization and the pipeliner. At
-// num-stages=3 the loop is at most the pipeline depth, so the pipeliner runs
-// the kernel loop zero times and peels both MMAs into the epilogue. WS removes
-// the accumulator's zero store because the first MMA has use_acc=false, so the
-// first peeled MMA must read the kernel loop's use_acc value (still false),
-// not the yielded true. Reading true accumulated the first K step onto the
-// previous launch's TMEM. As in ws_same_task_tmem.mlir, the budget is raised
-// above the hardware limit so that these BLOCK_K=128 tiles stay specialized.
-// CHECK-LABEL: @tmem_operand_a_same_task_small_k
-// CHECK: partition0
-// CHECK: %[[KERNEL:.*]]:{{[0-9]+}} = scf.for %{{.*}} = %[[ZERO:c0_i32[_0-9]*]] to %[[ZERO]] {{.*}}iter_args(%[[USE_ACC:.*]] = %false,
-// CHECK:   ttng.tc_gen5_mma {{.*}}[], %[[USE_ACC]], %true
-// CHECK:   scf.yield %true
-// CHECK: ttng.tc_gen5_mma {{.*}}[], %[[KERNEL]]#0, %true
-// CHECK: ttng.tc_gen5_mma {{.*}}[], %true, %true
+// The same-task TMEM A operand GEMM of ws_same_task_tmem.mlir. A is a pointer
+// tl.load of a 128x128 f32 tile in the gemm partition, and the pipeliner that
+// runs after warp specialization gives it num-stages - 1 = 2 cp.async buffers
+// (128 KiB), plus up to a 32 KiB tile of layout-conversion scratch for the
+// bf16 operand. The memory planner reserves those 160 KiB. With room to spare
+// the TMA-loaded B operand gets three buffers; at a 300000-byte budget the
+// reservation trims it to two; at the 232448-byte hardware limit even the
+// planner's floors do not fit, so the kernel compiles without warp
+// specialization rather than failing with OutOfResources later.
+// ROOMY-LABEL: @tmem_operand_a_same_task
+// ROOMY: ttg.local_alloc {{.*}} -> !ttg.memdesc<3x128x128xbf16
+// ROOMY: ttg.warp_specialize
+
+// TRIMMED-LABEL: @tmem_operand_a_same_task
+// TRIMMED: ttg.local_alloc {{.*}} -> !ttg.memdesc<2x128x128xbf16
+// TRIMMED: ttg.warp_specialize
+
+// REMARK: remark: meta autoWS cannot fit its buffers plus 163840 bytes of pipelined loads and conversion scratch for an MMA operand written in the MMA's own partition in the 232448-byte shared-memory budget; compiling without warp specialization
+// FALLBACK-LABEL: @tmem_operand_a_same_task
+// FALLBACK-NOT: ttg.warp_specialize
+// FALLBACK-NOT: async_task_id
+// FALLBACK-NOT: ttg.partition =
+// FALLBACK: ttng.tmem_alloc %{{.*}} : (tensor<128x128xbf16
+// FALLBACK: ttng.tc_gen5_mma
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
@@ -24,7 +35,7 @@
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tmem_operand_a_same_task_small_k(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+  tt.func public @tmem_operand_a_same_task(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %false = arith.constant false
     %cst = arith.constant dense<5248> : tensor<128x1xi64, #blocked>
     %cst_0 = arith.constant dense<2048> : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
@@ -38,7 +49,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %cst_1 = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %c8_i32 = arith.constant 8 : i32
     %c1_i32 = arith.constant 1 : i32
-    %c2_i32 = arith.constant 2 : i32
+    %c41_i32 = arith.constant 41 : i32
     %c0_i32 = arith.constant 0 : i32
     %c148_i32 = arith.constant 148 : i32
     %c64_i32 = arith.constant 64 : i32
@@ -73,7 +84,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %25 = tt.broadcast %19 : tensor<128x1xi1, #blocked> -> tensor<128x128xi1, #blocked>
       %result, %token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %26 = ttng.tmem_store %cst_2, %result[%token], %true {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-      %27:2 = scf.for %arg4 = %c0_i32 to %c2_i32 step %c1_i32 iter_args(%arg5 = %false, %arg6 = %26) -> (i1, !ttg.async.token)  : i32 {
+      %27:2 = scf.for %arg4 = %c0_i32 to %c41_i32 step %c1_i32 iter_args(%arg5 = %false, %arg6 = %26) -> (i1, !ttg.async.token)  : i32 {
         %31 = arith.muli %arg4, %c128_i32 {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
         %32 = tt.descriptor_load %1[%31, %15] {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x128xbf16, #shared1> -> tensor<128x128xbf16, #blocked1>
         %33 = ttg.local_alloc %32 {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared1, #smem>

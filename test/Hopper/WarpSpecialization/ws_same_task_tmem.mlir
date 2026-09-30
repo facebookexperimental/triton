@@ -1,5 +1,5 @@
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" | FileCheck %s
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=400000 tma-store-pipelining=true" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=400000 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
 
 // Code partitioning synchronizes TMEM through channels between a producer
 // partition and a consumer partition. When the TMEM producer and consumer are
@@ -7,6 +7,11 @@
 // neighbouring TMEM accesses: the channel is built with the partition as its
 // own consumer, and token lowering drops the same-partition full commit/wait
 // but keeps the empty wait before the write and the MMA completion barrier.
+//
+// The pointer-load cases use BLOCK_K=128 tiles, whose cp.async buffers do not
+// fit in 232448 bytes next to the WS buffers, so the pass falls back to non-WS
+// for them at the hardware budget (ws_same_task_tmem_smem_budget.mlir). The
+// budget here is raised so that the synchronization is checked on its own.
 
 // Persistent GEMM, B via TMA, TMA-store epilogue: A is a pointer tl.load
 // (f32 cast to bf16) promoted to TMEM (`tmem_alloc %src`) in the gemm

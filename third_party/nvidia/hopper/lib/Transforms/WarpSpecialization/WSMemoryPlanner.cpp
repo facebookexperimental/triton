@@ -1392,6 +1392,27 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
                                8);
 }
 
+/// Compute the SMEM that the emitted buffer.id / buffer.copy attributes plan
+/// for, counting each buffer.id once at its largest size and copy count and
+/// skipping allocations that reuse another buffer.
+static unsigned computePlannedSmemBytes(triton::FuncOp funcOp) {
+  DenseMap<int64_t, std::pair<unsigned, unsigned>> idInfo;
+  funcOp.walk([&](ttg::LocalAllocOp alloc) {
+    auto id = alloc->getAttrOfType<IntegerAttr>("buffer.id");
+    auto copies = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!id || !copies || alloc->hasAttr("allocation.reuseTarget"))
+      return;
+    auto &info = idInfo[id.getInt()];
+    info.first = std::max(info.first, getSmemAllocSizeBytes(alloc));
+    info.second = std::max(info.second, static_cast<unsigned>(copies.getInt()));
+  });
+  uint64_t total = 0;
+  for (auto &kv : idInfo)
+    total += static_cast<uint64_t>(kv.second.first) * kv.second.second;
+  return static_cast<unsigned>(
+      std::min<uint64_t>(total, std::numeric_limits<unsigned>::max()));
+}
+
 /// Compute total SMEM usage in bytes across all WSBuffers.
 /// Buffers sharing the same buffer.id (reuse group) contribute
 /// max(sizes) * copies instead of sum(sizes) * copies.
@@ -5658,6 +5679,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   });
 
   unsigned bufferId;
+  std::optional<unsigned> plannedSmemBudget;
+  bool reservationFits = options.reservedSmemBytes < smemBudget;
   if (effectiveSmemAllocAlgo == 1) {
     unsigned auxiliarySmemBytes =
         options.reserveAuxiliarySmem
@@ -5671,6 +5694,13 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
       return failure();
     }
     effectiveSmemBudget -= auxiliarySmemBytes;
+    // A reservation that leaves no room is reported through fitsSmemBudget;
+    // the caller decides whether to plan anyway.
+    unsigned reserved =
+        std::min(effectiveSmemBudget - 1, options.reservedSmemBytes);
+    effectiveSmemBudget -= reserved;
+    plannedSmemBudget = effectiveSmemBudget;
+    reservationFits = reserved == options.reservedSmemBytes;
     // New WSBuffer-based SMEM allocation (Phases 1-5).
     LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)"
          << (hasSmemAllocAlgoAttr ? "" : "; default when not specified")
@@ -5711,6 +5741,17 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
     bufferId = planner.getLastBufferId();
     LLVM_DEBUG(funcOp.dump());
     LLVM_DEBUG(planner.dumpBuffers());
+  }
+
+  if (options.fitsSmemBudget) {
+    unsigned planned = computePlannedSmemBytes(funcOp);
+    unsigned budget =
+        plannedSmemBudget
+            ? *plannedSmemBudget
+            : smemBudget - std::min(smemBudget, options.reservedSmemBytes);
+    *options.fitsSmemBudget = reservationFits && planned <= budget;
+    LDBG("planned SMEM " << planned << " with " << options.reservedSmemBytes
+                         << " reserved bytes against " << budget);
   }
 
   // Dump combined key ops + channel graph (side by side visualization)
