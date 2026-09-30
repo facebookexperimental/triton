@@ -5454,6 +5454,90 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   return success();
 }
 
+// Returns true when \p allocOp is an in-loop `tmem_alloc %src` or
+// `local_alloc %src` whose only users are MMAv5 A/B operands (A only for TMEM)
+// in the same block and the same single task. Such a producer/consumer pair
+// gets no cross-partition channel, so createBuffer never hoists it; it still
+// needs a hoisted buffer and a same-task channel (see createAllocChannel) so
+// that each iteration's write waits for the previous iteration's asynchronous
+// MMA to finish reading the tile.
+static bool isSameTaskMMAOperandAlloc(Operation *allocOp) {
+  Value src, result = allocOp->getResult(0);
+  if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(allocOp))
+    src = tmemAlloc.getSrc();
+  else if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(allocOp))
+    src = localAlloc.getSrc();
+  if (!src || !allocOp->getParentOfType<scf::ForOp>())
+    return false;
+  SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(allocOp);
+  if (taskIds.size() != 1 || result.use_empty())
+    return false;
+  bool isTmem = isa<ttng::TMEMAllocOp>(allocOp);
+  return llvm::all_of(result.getUsers(), [&](Operation *user) {
+    auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user);
+    return mmaOp && mmaOp.getAccumulator() != result &&
+           (mmaOp.getA() == result || (!isTmem && mmaOp.getB() == result)) &&
+           user->getBlock() == allocOp->getBlock() &&
+           getAsyncTaskIds(user) == taskIds;
+  });
+}
+
+static void hoistSameTaskMMAOperandAllocs(triton::FuncOp funcOp) {
+  SmallVector<Operation *> allocs;
+  funcOp.walk([&](Operation *op) {
+    if (isa<ttng::TMEMAllocOp, ttg::LocalAllocOp>(op) &&
+        isSameTaskMMAOperandAlloc(op))
+      allocs.push_back(op);
+  });
+  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
+  for (Operation *allocOp : allocs) {
+    builder.setInsertionPointToStart(&funcOp.getBody().front());
+    hoistLocalAlloc(builder, allocOp);
+  }
+}
+
+unsigned estimateSameTaskOperandStagingSmem(triton::FuncOp funcOp,
+                                            unsigned numStages) {
+  // Pointer loads feeding a same-task operand alloc stay in the MMA's loop,
+  // where the pipeliner that runs after warp specialization gives each one
+  // numStages - 1 cp.async buffers that the WS memory planner never sees.
+  auto tileBytes = [](Type type) {
+    auto tensorType = cast<RankedTensorType>(type);
+    return static_cast<uint64_t>(tensorType.getNumElements()) *
+           tensorType.getElementTypeBitWidth() / 8;
+  };
+  DenseSet<Operation *> loads;
+  uint64_t scratchBytes = 0;
+  funcOp.walk([&](Operation *op) {
+    if (!isa<ttng::TMEMAllocOp, ttg::LocalAllocOp>(op) ||
+        !isSameTaskMMAOperandAlloc(op))
+      return;
+    // Converting the register tile into the operand's layout can take
+    // scratch up to the tile's size, live alongside every planned buffer.
+    scratchBytes =
+        std::max(scratchBytes, tileBytes(op->getOperand(0).getType()));
+    Block *block = op->getBlock();
+    BackwardSliceOptions options;
+    options.omitBlockArguments = true;
+    options.filter = [&](Operation *def) { return def->getBlock() == block; };
+    SetVector<Operation *> slice;
+    (void)getBackwardSlice(op, &slice, options);
+    for (Operation *def : slice)
+      if (isa<tt::LoadOp>(def) &&
+          isa<RankedTensorType>(def->getResult(0).getType()))
+        loads.insert(def);
+  });
+  uint64_t bytes = scratchBytes;
+  for (Operation *load : loads) {
+    auto forOp = load->getParentOfType<scf::ForOp>();
+    int stages = triton::getNumStagesOrDefault(forOp, numStages);
+    bytes += static_cast<uint64_t>(std::max(stages - 1, 0)) *
+             tileBytes(load->getResult(0).getType());
+  }
+  return static_cast<unsigned>(
+      std::min<uint64_t>(bytes, std::numeric_limits<unsigned>::max()));
+}
+
 LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
@@ -5483,6 +5567,9 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
     // Step 3: Create buffers. A buffer for each channel.
     createBuffer(channels, funcOp);
   }
+
+  // Step 3.5: Hoist in-loop MMA operands written in the MMA's own task.
+  hoistSameTaskMMAOperandAllocs(funcOp);
 
   // Step 4: Split remaining local_alloc with tensor source into
   // local_alloc + local_store for downstream channel detection.

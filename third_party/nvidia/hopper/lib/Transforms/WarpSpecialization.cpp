@@ -215,6 +215,36 @@ public:
       return bailOut(funcOp);
     }
 
+    // Every op of an MMA kernel propagated to one task, e.g. a GEMM whose
+    // operands are pointer loads (no load partition) and whose epilogue is a
+    // tl.store (no epilogue partition). There is nothing to specialize, and
+    // code partitioning would build channels for the MMA's buffers without
+    // threading buffer counters through the loop, since no region spans two
+    // tasks.
+    Operation *firstMMA = nullptr;
+    funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
+      firstMMA = mmaOp;
+      return WalkResult::interrupt();
+    });
+    if (firstMMA && getNestedAsyncTaskIds(funcOp).size() == 1) {
+      LDBG("Warp specialization found an MMA kernel with a single partition. "
+           "Skipping.");
+      firstMMA->emitRemark(
+          "meta autoWS placed every op of this MMA kernel in one partition; "
+          "compiling without warp specialization");
+      return bailOut(funcOp);
+    }
+
+    // An MMA operand written in the MMA's own task keeps its pointer loads in
+    // the MMA's loop, where the pipeliner later adds cp.async buffers that
+    // the memory planner would otherwise not budget for. Reserve them, and
+    // keep a copy of the function to fall back to if the plan cannot fit.
+    unsigned stagingSmemBytes =
+        estimateSameTaskOperandStagingSmem(funcOp, numStages);
+    OwningOpRef<triton::FuncOp> preWSFuncOp;
+    if (stagingSmemBytes)
+      preWSFuncOp = funcOp.clone();
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
@@ -265,11 +295,33 @@ public:
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
-    if (failed(doMemoryPlanner(funcOp, numStages, smemBudget))) {
+    MemoryPlannerOptions plannerOptions;
+    bool fitsSmemBudget = true;
+    plannerOptions.reservedSmemBytes = stagingSmemBytes;
+    plannerOptions.fitsSmemBudget = &fitsSmemBudget;
+    if (failed(
+            doMemoryPlanner(funcOp, numStages, smemBudget, plannerOptions))) {
       signalPassFailure();
       return;
     }
     dumpAfter(moduleOp, "doMemoryPlanner");
+
+    if (preWSFuncOp && !fitsSmemBudget) {
+      funcOp.getBody().takeBody(preWSFuncOp->getBody());
+      Operation *mmaOp = nullptr;
+      funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface op) {
+        mmaOp = op;
+        return WalkResult::interrupt();
+      });
+      mmaOp->emitRemark()
+          << "meta autoWS cannot fit its buffers plus " << stagingSmemBytes
+          << " bytes of pipelined loads and conversion scratch for an MMA "
+             "operand written in the MMA's own partition in the "
+          << static_cast<unsigned>(smemBudget)
+          << "-byte shared-memory budget; compiling without warp "
+             "specialization";
+      return bailOut(funcOp);
+    }
 
     if (generateSubtiledRegion) {
       doGenerateSubtiledRegion(funcOp);
