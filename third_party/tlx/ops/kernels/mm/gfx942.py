@@ -535,8 +535,7 @@ def _configs():
             group_m,
             num_warps,
             waves_per_eu=waves_per_eu,
-        )
-        for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
+        ) for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
     ]
 
 
