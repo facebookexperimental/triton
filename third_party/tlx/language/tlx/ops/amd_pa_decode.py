@@ -33,13 +33,12 @@ Consumed by the correctness suite (``test_correctness.py``) and the perf script
 from dataclasses import dataclass
 from functools import lru_cache
 
-import torch
-
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 BUF_DEPTH = tl.constexpr(2)
+_DEFAULT_DTYPE = object()
 
 
 @lru_cache(maxsize=None)
@@ -716,12 +715,16 @@ def _reshape_and_cache_5d_kernel(
     tl.store(value_dst, value, mask=mask)
 
 
-def allocate_5d_kv_cache(num_blocks, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16, device="cuda"):
+def allocate_5d_kv_cache(num_blocks, num_kv_heads, page_size, head_dim, dtype=_DEFAULT_DTYPE, device="cuda"):
     """Allocate the packed K/V cache layout consumed by TLX and AITER.
 
     The returned tensors own their 5-D storage; no 4-D cache or repacking copy is
     involved. Cache slots are intentionally left uninitialized.
     """
+    import torch
+
+    if dtype is _DEFAULT_DTYPE:
+        dtype = torch.bfloat16
     assert dtype in (torch.bfloat16, torch.float16)
     element_size = torch.empty((), dtype=dtype).element_size()
     assert element_size <= 16 and 16 % element_size == 0
@@ -749,6 +752,8 @@ def reshape_and_cache_5d(key, value, key_cache, value_cache, slot_mapping, num_w
     and are skipped. The source values are loaded into VGPRs and scattered
     directly to their final packed cache addresses.
     """
+    import torch
+
     assert key.ndim == value.ndim == 3 and key.shape == value.shape
     assert key.dtype == value.dtype == key_cache.dtype == value_cache.dtype
     assert key.device == value.device == key_cache.device == value_cache.device == slot_mapping.device
@@ -845,6 +850,8 @@ def get_num_splits(
     splits to the KV tile count, and any split that ends up with no keys is dropped
     by the kernel's ``has_kv`` path.
     """
+    import torch
+
     props = torch.cuda.get_device_properties(0)
     num_cu = props.multi_processor_count
     progs = max(1, num_seqs * num_kv_heads)
@@ -904,6 +911,8 @@ class PagedDecodeConfig:
 
 @lru_cache(maxsize=None)
 def _is_gfx950(device_index):
+    import torch
+
     props = torch.cuda.get_device_properties(device_index)
     return getattr(props, "gcnArchName", "").split(":", 1)[0] == "gfx950"
 
@@ -915,6 +924,8 @@ def can_use_pa_decode_tlx(query, key_cache, value_cache, query_length=1, sliding
     The operator itself also retains a 4-D compatibility path for tests and
     experimentation.
     """
+    import torch
+
     if not all(isinstance(tensor, torch.Tensor) for tensor in (query, key_cache, value_cache)):
         return False
     if query.ndim != 3 or key_cache.ndim != 5 or value_cache.ndim != 5:
@@ -1102,6 +1113,8 @@ def allocate_pa_decode_workspace(query, key_cache, config):
     mid_capacity_shape = mid_shape
     if num_seqs == 1 and config.query_length == 1 and query.shape[2] == 64:
         mid_capacity_shape = (*mid_shape[:-1], mid_shape[-1] + 4)
+    import torch
+
     return (
         torch.empty(mid_capacity_shape, dtype=torch.float32, device=query.device),
         torch.empty(lse_shape, dtype=torch.float32, device=query.device),
@@ -1194,6 +1207,8 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         mid_strides = (0, 0, 0, 0, 0)
         lse_strides = (0, 0, 0, 0)
     else:
+        import torch
+
         mid_shape = (num_seqs, num_kv_heads, num_splits, m_pow2, head_dim)
         lse_shape = (num_seqs, num_kv_heads, num_splits, m_pow2)
         if workspace is None:
@@ -1302,13 +1317,17 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
 # correctness suite (test_correctness.py) and the perf harness
 # (test_amd_pa_decode_perf.py).
 def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, query_length=1,
-                 dtype=torch.bfloat16, device="cuda", seed=0, pool_pages=None, cache_layout="4d"):
+                 dtype=_DEFAULT_DTYPE, device="cuda", seed=0, pool_pages=None, cache_layout="4d"):
     """Build paged decode inputs. If ``pool_pages`` is set, physical pages are
     drawn from a shared pool of that size (bounds memory for large sweeps); the
     dense reference uses the same ``block_tables`` so correctness is unaffected.
     ``cache_layout="5d"`` allocates and initializes packed storage natively;
     it never constructs or repacks a 4-D cache.
     """
+    import torch
+
+    if dtype is _DEFAULT_DTYPE:
+        dtype = torch.bfloat16
     torch.manual_seed(seed)
     assert len(ctx_lens) == num_seqs
     num_tokens = num_seqs * query_length
@@ -1342,6 +1361,8 @@ def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_s
 def ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads, num_kv_heads,
                query_length):
     """Dense fp32 reference: gather full K/V from the page table, causal over qlen."""
+    import torch
+
     if key_cache.ndim == 5:
         key_cache, value_cache = unpack_5d_kv_cache(key_cache, value_cache)
     head_dim = query.shape[-1]
