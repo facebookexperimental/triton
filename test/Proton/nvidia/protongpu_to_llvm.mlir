@@ -56,7 +56,7 @@ module attributes {"ttg.num-warps" = 1 : i32} {
   // CHECK-LABEL: event_lowering
   llvm.func @event_lowering() {
     // CHECK-DAG: llvm.mlir.constant(2 : i32)
-    // CHECK-COUNT-2: st.shared::cta.v2.b32
+    // CHECK-COUNT-2: st.shared.v2.b32
     %buffer = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
     %segment = proton_gpu.segment_alloc %buffer : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> !proton_gpu.segment<1024, #smem, warp>
     %clock = arith.constant 123 : i32
