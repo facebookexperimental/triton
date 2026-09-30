@@ -59,6 +59,9 @@ svg { display: block; width: 100%; overflow: visible; }
 svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 svg .direct { fill: var(--text-secondary); font-size: 12px; }
 .chart { position: relative; }
+/* The trend keeps a fixed width per night and scrolls sideways past that, with its y axis pinned over the left edge. */
+.chart .scroll { overflow-x: auto; overflow-y: hidden; }
+.chart .yaxis { position: absolute; left: 0; top: 0; pointer-events: none; }
 .tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--ring);
   border-radius: 6px; padding: 8px 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); font-size: 12px; display: none; min-width: 180px; z-index: 5; }
 .tip .h { color: var(--text-secondary); margin-bottom: 4px; }
@@ -97,6 +100,46 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   background: var(--page); border: 1px solid var(--ring); border-radius: 6px; font-size: 13px; }
 .inputs .fixed { color: var(--muted); font-size: 12px; }
 @media (max-width: 800px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+.ev-open .ev-dim { color: var(--text-secondary); font-size: 12.5px; }
+.ev-op .ev-col { border-left: 1px solid var(--grid); padding-left: 10px; }
+.ev-op tr.ev-units th { text-align: center; font-size: 11.5px; color: var(--text-secondary); padding-bottom: 0; border-bottom: 0; }
+.ev-op tr.ev-units th:first-child { border-left: 0; }
+.ev-op tr.ev-grp td { padding-top: 10px; border-bottom: 1px solid var(--grid); font-size: 12px; white-space: normal; }
+.ev-op tr.ev-grp .ev-dim { margin-left: 4px; }
+.ev-delta { font-size: 11.5px; margin-left: 6px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.ev-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.ev-g { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 18px; padding: 0 5px; border-radius: 4px;
+  font-size: 11.5px; font-weight: 600; font-style: normal; white-space: nowrap; border: 1px solid transparent; }
+.ev-g.ev-bad { background: var(--critical); color: #fff; }
+.ev-g.ev-good { background: var(--good); color: #fff; }
+.ev-g.ev-env { color: var(--warning); border-color: var(--warning); background: var(--surface-1); }
+.ev-g.ev-suite { background: var(--series-7); color: #fff; }
+.ev-g.ev-unc.ev-bad { background: var(--surface-1); color: var(--critical); border: 1.5px dashed var(--critical); }
+.ev-g.ev-unc.ev-good { background: var(--surface-1); color: var(--good); border: 1.5px dashed var(--good); }
+.chart svg :focus { outline: none; }
+.chart svg :focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+.ev-legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--text-secondary); margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--grid); }
+.ev-legend span { display: inline-flex; gap: 5px; align-items: center; }
+#ev-card { padding: 0; overflow: hidden; }
+#ev-card > h2, #ev-card > p { padding: 0 16px; } #ev-card > h2 { padding-top: 14px; } #ev-card > p { padding-bottom: 12px; }
+.ev-ch { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--grid); }
+.ev-ch h2 { margin: 0; }
+.ev-sec { display: grid; grid-template-columns: 110px 1fr; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--grid); font-size: 13px; }
+.ev-sec:first-of-type { border-top: 0; }
+.ev-h { color: var(--text-secondary); font-weight: 600; font-size: 12.5px; }
+.ev-op { margin-bottom: 12px; } .ev-op:last-child { margin-bottom: 0; }
+.ev-oph { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+.ev-pill { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--axis); color: var(--text-secondary); }
+.ev-pill.ev-host { border-color: var(--warning); }
+.ev-pill.ev-uncp { border-style: dashed; }
+.ev-op table { font-size: 12.5px; } .ev-op th, .ev-op td { padding: 3px 8px 3px 0; cursor: default; white-space: nowrap; }
+.ev-badt { color: var(--critical); } .ev-goodt { color: var(--good-text); }
+.ev-op summary { cursor: pointer; color: var(--series-1); font-size: 12.5px; margin: 2px 0 4px; }
+.ev-sus { display: grid; grid-template-columns: 18px 130px 92px 1fr; gap: 6px; padding: 2px 0; align-items: baseline; }
+.ev-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ev-area { font-size: 11px; padding: 0 6px; border-radius: 3px; border: 1px solid var(--axis); color: var(--text-secondary); justify-self: start; }
+.ev-a-dispatch, .ev-a-harness { border-color: var(--warning); }
+.ev-a-kernel, .ev-a-shapes { border-color: var(--critical); color: var(--critical); }
 </style>
 </head>
 <body>
@@ -128,7 +171,14 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     <div class="inputs-slot"></div>
     <div class="legend" id="trend-legend"></div>
     <div class="chart" id="trend"><div class="tip"></div></div>
+    <div class="ev-legend" id="ev-legend">
+      <span><i class="ev-g ev-bad">▼3</i> slower</span><span><i class="ev-g ev-good">▲2</i> faster</span>
+      <span><i class="ev-g ev-bad ev-unc">▼3</i> unconfirmed · awaits next night</span>
+      <span><i class="ev-g ev-env">◆</i> environment</span><span><i class="ev-g ev-suite">▦</i> suite changed</span>
+      <span><svg width="22" height="6" style="display:inline;width:22px"><line x1="0" x2="22" y1="3" y2="3" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="5 4"/></svg> step across a suite change</span></div>
   </section>
+
+  <section class="card" id="ev-card"></section>
 
   <section class="card">
     <h2 id="dist-title"></h2>
@@ -139,6 +189,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
 
   <section class="card">
     <h2 id="summary-title"></h2>
+    <p class="sub" id="summary-sub"></p>
     <div class="inputs-slot"></div>
     <div id="summary"></div>
   </section>
@@ -188,7 +239,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         [op, {ref: o.ref, space: o.space, cold: o.cold, cases: last.ops[op].cases}]))};
       if (!date || last.date > date) date = last.date;
     }
-    return {platforms, date, repo: (raw && raw.repo) || "facebookexperimental/triton", tag: (raw && raw.tag) || "tlx-ops-bench"};
+    return {platforms, date, repo: (raw && raw.repo) || "facebookexperimental/triton", tag: (raw && raw.tag) || "tlx-ops-bench",
+            threshold: raw && raw.threshold};
   }
   const DATA = decode(RAW);
   const BENCH = {
@@ -204,8 +256,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     pip: {label: "PIP", icon: "▼", color: "var(--serious)"},
     error: {label: "ERROR", icon: "✕", color: "var(--critical)"},
   };
-  const state = {platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
-                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50};
+  const state = {platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, trendScroll: null, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
+                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null};
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, text) => {
     const n = document.createElementNS(tag === "svg" || attrs.svg ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml", tag);
@@ -393,7 +445,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   // ---- trend: one line per op, crosshair tooltip listing every series at the hovered night.
   function trend() {
     const box = $("trend"), tip = box.querySelector(".tip");
-    box.querySelectorAll("svg, .note").forEach((n) => n.remove());
+    box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
     const H = plat().history.slice(-state.range);
     const single = state.op !== "all";
     const byTflops = single && !plat().latest[state.op].ref;
@@ -422,7 +474,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       box.prepend(el("p", {class: "note"}, ops.length ? "Every series is hidden; click one in the legend." : `No cases match ${sliceName()}.`));
       return;
     }
-    const W = 1040, Hh = 260, m = {l: 48, r: 150, t: 12, b: 28};
+    // Past ~20 nights the plot widens instead of squeezing, at the same scale as W0: each night gets at least 44
+    // viewBox units, or more when its event badges need it, so neighbouring nights' badges never overlap.
+    const W0 = 1040, NIGHT_W = Math.max(44, evWidest(H) + 12), Hh = 260, m = {l: 48, r: 150, t: 12, b: 28};
+    const W = Math.max(W0, m.l + m.r + NIGHT_W * (H.length - 1));
     const vals = shown.flatMap((o) => H.map((n) => val(n, o))).filter((v) => v);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     if (!byTflops) { lo = Math.min(lo, 0.8); hi = Math.max(hi, 1.05); }
@@ -433,23 +488,38 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const x = (i) => m.l + (W - m.l - m.r) * (i / Math.max(H.length - 1, 1));
     const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / (hi - lo);
     const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label": $("trend-title").textContent});
+    svg.style.width = `${W / W0 * 100}%`;
+    // Tick labels live in their own svg over the left edge, so they stay put while the plot scrolls under them.
+    const yaxis = s("svg", {class: "yaxis", viewBox: `0 0 ${m.l} ${Hh - m.b + 6}`, "aria-hidden": "true"});
+    yaxis.style.width = `${m.l / W0 * 100}%`;
+    yaxis.append(s("rect", {x: 0, y: 0, width: m.l, height: Hh - m.b + 6, fill: "var(--surface-1)"}));
     for (let v = lo; v <= hi + step / 2; v += step) {
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
-      svg.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? v.toFixed(0) : v.toFixed(2) + "×"));
+      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? v.toFixed(0) : v.toFixed(2) + "×"));
     }
     if (!byTflops) {
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1.5}));
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(FLOOR), y2: y(FLOOR), stroke: "var(--critical)", "stroke-width": 1, "stroke-dasharray": "4 4"}));
     }
     // Date labels counted back from the latest night, so the newest one is always labelled.
-    const every = Math.ceil(H.length / 8);
+    const every = Math.ceil(H.length / Math.max(8, Math.floor((W - m.l - m.r) / 105)));
     H.forEach((n, i) => { if ((H.length - 1 - i) % every === 0)
       svg.append(el("text", {svg: 1, x: x(i), y: Hh - 8, "text-anchor": "middle"}, fmtDate(n.date))); });
     const ends = [];
     for (const op of shown) {
       const pts = H.map((n, i) => [i, val(n, op)]).filter(([, v]) => v);
-      svg.append(s("polyline", {points: pts.map(([i, v]) => `${x(i)},${y(v)}`).join(" "), fill: "none",
-                                stroke: colorOfGroup(op, groups), "stroke-width": 2, "stroke-linejoin": "round"}));
+      // A step into a night whose suite changed for this op compares different case sets: draw it dashed.
+      const changed = (i) => state.group === "op" && !!(evNight(H[i].date) || {suite: {}}).suite[op];
+      const runs = [];
+      pts.forEach((pt, k) => {
+        if (k > 0 && changed(pt[0])) runs.push({dashed: true, pts: [pts[k - 1], pt]}, {dashed: false, pts: [pt]});
+        else if (!runs.length) runs.push({dashed: false, pts: [pt]});
+        else runs[runs.length - 1].pts.push(pt);
+      });
+      for (const r of runs) if (r.pts.length > 1)
+        svg.append(s("polyline", {points: r.pts.map(([i, v]) => `${x(i)},${y(v)}`).join(" "), fill: "none",
+                                  stroke: colorOfGroup(op, groups), "stroke-width": 2, "stroke-linejoin": "round",
+                                  ...(r.dashed ? {"stroke-dasharray": "5 4", opacity: 0.8} : {})}));
       const [li, lv] = pts[pts.length - 1];
       svg.append(s("circle", {cx: x(li), cy: y(lv), r: 4, fill: colorOfGroup(op, groups),
                               stroke: "var(--surface-1)", "stroke-width": 2}));
@@ -481,9 +551,11 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         r.append(el("b", {}, byTflops ? fmt(v, 0, " TF/s") : fmt(v, 3, "×")), nm);
         tip.append(r);
       }
-      const bb = svg.getBoundingClientRect(), px = x(i) / W * bb.width;
+      // Position against the box, not the svg: the svg may be scrolled partly out of view.
+      const bb = svg.getBoundingClientRect(), bx = box.getBoundingClientRect();
+      const px = bb.left - bx.left + x(i) / W * bb.width;
       tip.style.display = "block";
-      tip.style.left = (px + 14 + tip.offsetWidth > bb.width ? px - tip.offsetWidth - 14 : px + 14) + "px";
+      tip.style.left = (px + 14 + tip.offsetWidth > bx.width ? px - tip.offsetWidth - 14 : px + 14) + "px";
       tip.style.top = "20px";
     };
     let cur = H.length - 1;
@@ -500,7 +572,18 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     });
     const hide = () => { tip.style.display = "none"; hair.setAttribute("visibility", "hidden"); };
     hit.addEventListener("pointerleave", hide); hit.addEventListener("blur", hide);
-    box.prepend(svg);
+    hit.addEventListener("click", () => evOpenNight(H[cur].date, false));
+    svg.setAttribute("viewBox", `0 0 ${W} ${evLane(svg, H, x, W, Hh, m, hit)}`);
+    const scroll = el("div", {class: "scroll"});
+    scroll.append(svg);
+    box.prepend(scroll, yaxis);
+    // Opens on the latest night; once the reader scrolls back, re-renders keep their place until they return to the end.
+    // Applied again after layout, since the first render can run before the card has a width.
+    const place = () => { scroll.scrollLeft = state.trendScroll ?? scroll.scrollWidth; };
+    place(); requestAnimationFrame(place);
+    scroll.addEventListener("scroll", () => {
+      state.trendScroll = scroll.scrollLeft + scroll.clientWidth >= scroll.scrollWidth - 2 ? null : scroll.scrollLeft;
+    });
   }
 
   // ---- latest night: per-op bars (all ops) or per-case dots sorted by speedup (one op).
@@ -627,6 +710,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         else if (k === "speedup" || k === "x") td.textContent = fmt(v, 3, "×");
         else if (k === "tflops" || k === "t" || k === "r") td.textContent = fmt(v, 0);
         else td.textContent = String(v ?? "–");
+        evDelta(td, k, r);
         tr.append(td);
       }
       tb.append(tr);
@@ -649,11 +733,14 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       const cases = groupCases(L, g, groups), kept = cases.filter(matches), a = aggOf(cases);
       const c = (st) => kept.filter((x) => x.s === st).length;
       return {op: groupName(g), ref: byOp ? L[g].ref || "–" : "", n: kept.length, ok: c("ok"), noisy: c("noisy"), pip: c("pip"),
-              error: c("error"), tflops: a.tflops, speedup: a.speedup};
+              error: c("error"), tflops: a.tflops, speedup: a.speedup, ...evCompare(g, groups)};
     }).filter((r) => r.n);
     sortableTable($("summary"), [["op", groupLabel()], ...(byOp ? [["ref", "reference"]] : []), ["n", "cases", 1], ["ok", "ok", 1],
       ["noisy", "noisy", 1], ["pip", "PIP", 1], ["error", "ERROR", 1], ["tflops", "TLX TF/s", 1], ["speedup", "speedup", 1]],
       sumRows, "sortSum", table);
+    const H = plat().history;
+    $("summary-sub").textContent = H.length > 1 ? `Small figures: change vs ${fmtDate(H[H.length - 2].date)}. Case counts compare all cases; `
+      + "TF/s and speedup compare only cases timed on both nights (hover for how many), so added or removed cases don't read as a perf change." : "";
 
     $("table-title").textContent = `${state.op === "all" ? "All ops" : state.op}: cases, latest night${slice}`;
     const chips = $("chips");
@@ -687,6 +774,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   if (DATA.platforms[params.get("platform")]) state.platform = params.get("platform");
   if (params.get("op") && DATA.platforms[state.platform].latest[params.get("op")]) state.op = params.get("op");
   if (["7", "14", "30", "60"].includes(params.get("nights"))) state.range = Number(params.get("nights"));
+  if (/^\d{8}$/.test(params.get("ev") || "")) state.ev = params.get("ev");
   if (["fwd", "bwd"].includes(params.get("dir"))) state.dir = params.get("dir");
   if (params.get("dtype")) state.dtype = params.get("dtype");
   state.group = params.get("group") || (state.op === "all" ? "op" : "none");  // controls() falls back if not offered
@@ -698,6 +786,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     if (state.platform !== "b200") p.set("platform", state.platform);
     if (state.op !== "all") p.set("op", state.op);
     if (state.range !== 30) p.set("nights", state.range);
+    if (state.ev) p.set("ev", state.ev);
     if (state.dir !== "all") p.set("dir", state.dir);
     if (state.dtype !== "all") p.set("dtype", state.dtype);
     if (state.group !== (state.op === "all" ? "op" : "none")) p.set("group", state.group);
@@ -818,9 +907,203 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     }
   }
 
-  function render() { banner(); controls(); inputs(); tiles(); trend(); dist(); table(); versions(); howto(); saveHash(); }
-  $("platform").onchange = (e) => { state.platform = e.target.value; state.op = "all"; state.inputs = {}; state.group = "op"; state.hidden.clear(); render(); };
-  $("range").onchange = (e) => { state.range = Number(e.target.value); render(); };
+  // ---- events: per night, what changed since the night before (environment, suite, perf) and which commits could
+  // explain a perf change. Built by events() in tlx_ops_bench_dashboard.py; drawn as a lane under the trend and a card.
+  const evEsc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+  const evPct = (v) => (v > 0 ? "+" : "") + (v * 100).toFixed(1) + "%";
+  const evNum = (v) => v == null ? "–" : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3);
+  // Changed cases by time per call on the base night (launch and host included): the shorter the call, the larger
+  // the share of launch and timer noise.
+  const EV_TIME = [[100, "short calls · < 100 µs", "noisiest: a few µs of launch, host or timer jitter is a large share"],
+                   [1000, "medium calls · 100 µs – 1 ms", ""], [Infinity, "long calls · ≥ 1 ms", ""]];
+  function evRows(n, rows) {
+    const us = (v) => v == null ? "–" : evNum(v);
+    const row = ([c, r]) => `<tr><td class="ev-mono">${evEsc(r.key)}</td>`
+      + `<td class="num ev-col">${evNum(r.base)}</td><td class="num">${evNum(r.now)}</td><td class="num">${evNum(r.next)}</td>`
+      + `<td class="num ev-${c}t">${evPct(r.dt)}</td>`
+      + `<td class="num ev-col">${us(r.us)}</td><td class="num">${us(r.us_now)}</td>`
+      + `<td class="num">${r.dus == null ? "–" : (r.dus > 0 ? "+" : "") + r.dus.toFixed(1)}</td></tr>`;
+    const head = `<tr class="ev-units"><th></th><th colspan="4" class="ev-col">TLX TF/s</th><th colspan="3" class="ev-col">µs per call</th></tr>`
+      + `<tr><th>case</th><th class="num ev-col">${fmtDate(n.prev)}</th><th class="num">${fmtDate(n.date)}</th><th class="num">next night</th>`
+      + `<th class="num">Δ</th><th class="num ev-col">${fmtDate(n.prev)}</th><th class="num">${fmtDate(n.date)}</th><th class="num">Δ</th></tr>`;
+    if (!rows.some(([, r]) => r.us != null)) return head + rows.map(row).join("");
+    return head + EV_TIME.map(([hi, label, hint], i) => {
+      const lo = i ? EV_TIME[i - 1][0] : 0, g = rows.filter(([, r]) => r.us != null && r.us >= lo && r.us < hi);
+      if (!g.length) return "";
+      const count = (c, sym) => { const k = g.filter(([x]) => x === c).length; return k ? `<span class="ev-${c}t">${sym}${k}</span> ` : ""; };
+      return `<tr class="ev-grp"><td colspan="8"><b>${label}</b> ${count("bad", "▼")}${count("good", "▲")}${hint ? `<span class="ev-dim">${hint}</span>` : ""}</td></tr>`
+        + g.map(row).join("");
+    }).join("") + rows.filter(([, r]) => r.us == null).map(row).join("");
+  }
+  const evPr = (pr) => pr ? ` <a href="${REPO}/pull/${pr}" target="_blank" rel="noreferrer">#${pr}</a>` : "";
+  const evSha = (sha) => `<a class="ev-mono" href="${REPO}/commit/${sha}" target="_blank" rel="noreferrer">${sha}</a>`;
+  const evNight = (date) => (plat().events || []).find((n) => n.date === date);
+  const evOps = () => (state.op === "all" ? Object.keys(plat().latest) : [state.op]);
+  const evSuiteText = (s) => [s.added && `+${s.added}`, s.removed && `−${s.removed}`, s.broke && `${s.broke} now error`,
+    s.fixed && `${s.fixed} now measured`].filter(Boolean).join(" ");
+
+  // One night's glyphs over `ops`: slower and faster case counts, then environment and suite changes.
+  function evGlyphs(n, ops) {
+    const perf = {bad: null, good: null};
+    for (const op of ops) {
+      const p = n.perf[op];
+      if (!p) continue;
+      for (const [k, count] of [["bad", p.n_slower], ["good", p.n_faster]]) {
+        if (!count) continue;
+        const g = perf[k] ||= {kind: k, n: 0, unconfirmed: false};
+        g.n += count; g.unconfirmed ||= p.unconfirmed;
+      }
+    }
+    const out = Object.values(perf).filter(Boolean);
+    if (n.env.length) out.push({kind: "env"});
+    if (Object.keys(n.suite).some((o) => ops.includes(o))) out.push({kind: "suite"});
+    return out;
+  }
+  const evText = (g) => g.kind === "bad" ? "▼" + g.n : g.kind === "good" ? "▲" + g.n : g.kind === "env" ? "◆" : "▦";
+  const evChip = (g) => `<i class="ev-g ev-${g.kind}${g.unconfirmed ? " ev-unc" : ""}">${evText(g)}</i>`;
+
+  function evOpenNight(date, scroll) {
+    state.ev = date;
+    render();
+    if (scroll) $("ev-card").scrollIntoView({behavior: "smooth", block: "start"});
+  }
+
+  // Lane under the trend's x axis, drawn with trend()'s own geometry so glyphs line up with nights. Returns the
+  // chart's new height.
+  const EV_LANE = 54;
+  // Event badges for one night, as two rows: perf changes, then environment and suite changes.
+  const evBadgeRows = (n) => {
+    const gs = evGlyphs(n, evOps());
+    return [gs.filter((g) => g.kind === "bad" || g.kind === "good"), gs.filter((g) => g.kind === "env" || g.kind === "suite")];
+  };
+  const evBadgeW = (g) => 8 + evText(g).length * 6.4;
+  const evRowW = (items) => items.reduce((a, g) => a + evBadgeW(g), 0) + Math.max(items.length - 1, 0) * 3;
+  // The widest badge row across these nights: trend() spaces nights at least this far apart.
+  function evWidest(H) {
+    if (!plat().events) return 0;
+    return Math.max(0, ...H.map((night) => evNight(night.date)).filter(Boolean).flatMap((n) => evBadgeRows(n).map(evRowW)));
+  }
+
+  function evLane(svg, H, x, W, Hh, m, hit) {
+    if (!plat().events) return Hh;
+    const colW = (W - m.l - m.r) / Math.max(H.length - 1, 1);
+    const y0 = Hh + 2, pad = colW / 2 - 3;
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y0, y2: y0, stroke: "var(--grid)"}));
+    svg.append(el("text", {svg: 1, x: m.l - 18, y: y0 + 16, "text-anchor": "end"}, "events"));
+    const COLOR = {bad: "var(--critical)", good: "var(--good)", env: "var(--warning)", suite: "var(--series-7)"};
+    H.forEach((night, i) => {
+      const n = evNight(night.date);
+      if (!n) return;
+      if (n.date === state.ev)
+        svg.insertBefore(s("rect", {x: x(i) - pad, y: m.t, width: 2 * pad, height: y0 + EV_LANE - 10 - m.t, rx: 4,
+                                    fill: "var(--series-1)", opacity: 0.08}), svg.firstChild);
+      evBadgeRows(n).forEach((items, r) => {
+        const ws = items.map(evBadgeW);
+        let gx = x(i) - evRowW(items) / 2;
+        items.forEach((g, j) => {
+          const c = COLOR[g.kind], solid = g.kind !== "env" && !g.unconfirmed;
+          svg.append(s("rect", {x: gx, y: y0 + 4 + r * 20, width: ws[j], height: 16, rx: 4, fill: solid ? c : "var(--surface-1)",
+                                stroke: c, "stroke-width": g.unconfirmed ? 1.5 : 1, ...(g.unconfirmed ? {"stroke-dasharray": "3 2"} : {})}));
+          const t = el("text", {svg: 1, x: gx + ws[j] / 2, y: y0 + 16 + r * 20, "text-anchor": "middle"}, evText(g));
+          t.setAttribute("style", `fill:${solid ? "#fff" : c};font-weight:600;font-size:11px`);
+          svg.append(t);
+          gx += ws[j] + 3;
+        });
+      });
+      const tgt = s("rect", {x: x(i) - colW / 2, y: y0, width: colW, height: EV_LANE - 10, fill: "transparent", style: "cursor:pointer"});
+      tgt.addEventListener("click", () => evOpenNight(night.date, true));
+      svg.append(tgt);
+    });
+    hit.style.cursor = "pointer";
+    return Hh + EV_LANE;
+  }
+
+  function evCard() {
+    const box = $("ev-card");
+    const n = plat().events && state.ev && evNight(state.ev);
+    box.hidden = !plat().events;
+    if (box.hidden) return;
+    const where = `${state.platform.toUpperCase()} · ${state.ev ? fmtDate(state.ev) : ""}`;
+    if (!n) { box.innerHTML = `<h2>Night details</h2><p class="sub">Click a night on the trend for what changed since the night before, and which commits could explain it.</p>`; return; }
+    if (!n.prev) { box.innerHTML = `<h2>${where}</h2><p class="sub">First night kept; nothing to compare against.</p>`; return; }
+    const ops = evOps(), perfOps = ops.filter((o) => n.perf[o]);
+    let perf = "", sus = "";
+    for (const op of perfOps) {
+      const p = n.perf[op], rows = [...p.slower.map((r) => ["bad", r]), ...p.faster.map((r) => ["good", r])];
+      const hidden = p.n_slower + p.n_faster - rows.length;
+      perf += `<div class="ev-op"><div class="ev-oph"><b>${op}</b>
+        ${p.n_slower ? evChip({kind: "bad", n: p.n_slower, unconfirmed: p.unconfirmed}) : ""}${p.n_faster ? evChip({kind: "good", n: p.n_faster, unconfirmed: p.unconfirmed}) : ""}
+        <span class="ev-dim">of ${p.compared} cases timed on both nights</span>
+        ${p.signature === "host" ? `<span class="ev-pill ev-host">host-side · median ${p.median_dus > 0 ? "+" : ""}${p.median_dus.toFixed(1)} µs per call regardless of size</span>`
+          : p.signature === "kernel" ? `<span class="ev-pill">kernel-side · similar % across sizes</span>` : ""}
+        ${p.unconfirmed ? `<span class="ev-pill ev-uncp">unconfirmed · awaits next night</span>` : ""}</div>
+        <details${rows.length <= 8 ? " open" : ""}><summary>${p.n_slower + p.n_faster} changed case${p.n_slower + p.n_faster > 1 ? "s" : ""}</summary>
+        <table>${evRows(n, rows)}
+        </table><p class="note">A case counts when its TF/s moves ≥${DATA.threshold * 100}% and the next night holds it.${hidden ? ` ${hidden} more not listed.` : ""}</p></details></div>`;
+      if (p.suspects.length)
+        sus += `<div class="ev-op"><div class="ev-oph"><b>${op}</b><span class="ev-dim">ranked by the most relevant file each commit touches on ${state.platform.toUpperCase()}${p.signature === "host" ? "; host-side, so dispatch and harness first" : ""}</span></div>` +
+          p.suspects.map((c, i) => `<div class="ev-sus"><span class="ev-dim">${i + 1}</span><span>${evSha(c.sha)}${evPr(c.pr)}</span><span class="ev-area ev-a-${c.area.split(" ")[0]}">${c.area}</span><span class="ev-title" title="${evEsc(c.title)}">${evEsc(c.title)}</span></div>`).join("") +
+          (p.more ? `<p class="note">+${p.more} lower-ranked commits</p>` : "") + "</div>";
+    }
+    const env = n.env.length ? n.env.map((e) => `<div><b>${e.field}</b> ${evEsc(e.from)} <span class="ev-dim">→</span> ${evEsc(e.to)}</div>`).join("")
+      : `<span class="ev-dim">unchanged · ${evEsc(n.numa || "–")} · driver ${evEsc(n.driver || "–")} · torch ${evEsc(n.torch || "–")}</span>`;
+    const so = Object.entries(n.suite).filter(([o]) => ops.includes(o));
+    const suite = so.length ? so.map(([o, s]) => `<div><b>${o}</b> ${s.new ? `new op, ${s.total} cases` : s.gone ? "no longer reported"
+      : `${evSuiteText(s)} <span class="ev-dim">(${s.total} cases now)</span>`}${n.breaks.includes(o) && !s.new && !s.gone ? ' <span class="ev-dim">· no cases in common with the previous night</span>' : ""}</div>`).join("")
+      : '<span class="ev-dim">unchanged</span>';
+    const nosus = n.commits === null ? "commit history unavailable in this checkout"
+      : perfOps.length ? "no commit in range touches files relevant here" : "ranked only for ops with a perf change";
+    const link = new URLSearchParams(location.hash.slice(1)); link.set("ev", n.date);
+    box.innerHTML = `<div class="ev-ch"><h2>${state.platform.toUpperCase()} · ${fmtDate(n.date)} vs ${fmtDate(n.prev)}${state.op !== "all" ? " · " + state.op : ""}</h2>
+      <span class="ev-dim">wheel <span class="ev-mono">${n.range}</span>${n.commits === null ? "" : ` · ${n.commits} commits`} · <a href="${n.compare}" target="_blank" rel="noreferrer">compare</a> · <a href="#${link}">link</a> ·
+      <a href="#" id="ev-close">close</a></span></div>
+      <div class="ev-sec"><div class="ev-h">Performance</div><div>${perf || `<span class="ev-dim">no case moved ≥${DATA.threshold * 100}% and held</span>`}</div></div>
+      <div class="ev-sec"><div class="ev-h">Environment</div><div>${env}</div></div>
+      <div class="ev-sec"><div class="ev-h">Suite</div><div>${suite}</div></div>
+      <div class="ev-sec"><div class="ev-h">Suspects</div><div>${sus || `<span class="ev-dim">${nosus}</span>`}</div></div>`;
+    $("ev-close").onclick = (e) => { e.preventDefault(); state.ev = null; render(); };
+  }
+
+  // Summary-table comparison with the previous night. Counts compare the group's cases on both nights; TF/s and
+  // speedup compare like for like, over cases timed on both nights, so a suite change never reads as a perf change.
+  function evCompare(g, groups) {
+    const H = plat().history;
+    if (H.length < 2) return {};
+    const A = H[H.length - 2], B = H[H.length - 1], key = (c) => `${c.l}|${c.d}|${c.dt}`;
+    const before = groupCases(A.ops, g, groups).filter(matches), after = groupCases(B.ops, g, groups).filter(matches);
+    const cnt = (cs, st) => cs.filter((c) => c.s === st).length;
+    const sp = [], tf = [];
+    for (const op of scopeOps()) {
+      const prev = new Map((A.ops[op] ? A.ops[op].cases : []).map((c) => [key(c), c]));
+      for (const c of B.ops[op] ? B.ops[op].cases : []) {
+        const v = groupOf(c, op), p = prev.get(key(c));
+        if ((g === OTHER ? groups.includes(v) : v !== g) || !p || !matches(c) || c.s === "error" || p.s === "error") continue;
+        if (c.t && p.t) tf.push(c.t / p.t);
+        if (c.x && p.x) sp.push(c.x / p.x);
+      }
+    }
+    return {_m: tf.length, _d: {n: after.length - before.length, ok: cnt(after, "ok") - cnt(before, "ok"),
+      noisy: cnt(after, "noisy") - cnt(before, "noisy"), pip: cnt(after, "pip") - cnt(before, "pip"),
+      error: cnt(after, "error") - cnt(before, "error"),
+      tflops: tf.length ? geomean(tf) - 1 : null, speedup: sp.length ? geomean(sp) - 1 : null}};
+  }
+  // Append a row's change to its cell: absolute for counts, % for TF/s and speedup. Up is good only for ok, TF/s, speedup.
+  const EV_UP_GOOD = {ok: 1, tflops: 1, speedup: 1}, EV_UP_BAD = {noisy: 1, pip: 1, error: 1};
+  function evDelta(td, k, r) {
+    if (!r._d || !(k in r._d) || r[k] === null || r[k] === undefined) return;
+    const v = r._d[k], pct = k === "tflops" || k === "speedup";
+    if (!pct && !v) return;
+    const d = el("span", {class: "ev-delta"}, v === null ? "–"
+      : pct ? `${v >= 0 ? "+" : "−"}${Math.abs(v * 100).toFixed(1)}%` : `${v > 0 ? "+" : "−"}${Math.abs(v)}`);
+    if (v !== null && (pct ? Math.abs(v) >= 0.02 : true) && (EV_UP_GOOD[k] || EV_UP_BAD[k]))
+      d.style.color = (v > 0) === !!EV_UP_GOOD[k] ? "var(--good-text)" : "var(--critical)";
+    if (pct) td.title = `${r._m} of ${r.n} cases timed on both nights`;
+    td.append(d);
+  }
+
+  function render() { banner(); controls(); inputs(); tiles(); trend(); evCard(); dist(); table(); versions(); howto(); saveHash(); }
+  $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.ev = null; state.op = "all"; state.inputs = {}; state.group = "op"; state.hidden.clear(); render(); };
+  $("range").onchange = (e) => { state.range = Number(e.target.value); state.trendScroll = null; render(); };
   $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
   $("dtype").onchange = (e) => { state.dtype = e.target.value; state.rows = 50; render(); };
   $("group").onchange = (e) => { state.group = e.target.value; state.hidden.clear(); state.sortSum = {key: null, dir: 1}; render(); };
