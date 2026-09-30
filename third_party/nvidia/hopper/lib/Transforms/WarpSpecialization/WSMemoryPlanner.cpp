@@ -1486,6 +1486,7 @@ static unsigned getStagingCopiesCap() {
 
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
+                                        triton::FuncOp funcOp,
                                         unsigned numBuffers,
                                         unsigned smemBudget) {
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
@@ -1503,6 +1504,10 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
         return true;
     return false;
   };
+  bool twoCTAs = false;
+  if (auto module = funcOp->getParentOfType<ModuleOp>())
+    if (auto attr = module->getAttrOfType<BoolAttr>("ttng.two-ctas"))
+      twoCTAs = attr.getValue();
 
   LDBG("Phase 4.5: enter \u2014 numBuffers="
        << numBuffers << " smemBudget=" << smemBudget
@@ -1551,6 +1556,28 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 
     for (unsigned bufferId : ids) {
       auto &indices = epilogueGroups[bufferId];
+      // Ordinary 2CTA TMA stores have one completion phase per paired-CTA
+      // tile, not one cluster-aware phase per circular staging slot. Restrict
+      // every such group, including a single-subtile group, to one copy.
+      if (twoCTAs && wsBuffers[indices.front()].tmaStaging == 1) {
+        unsigned requiredCopies = 1;
+        for (unsigned idx : indices) {
+          requiredCopies = std::max(requiredCopies, wsBuffers[idx].numCopies);
+          requiredCopies = std::max(requiredCopies, wsBuffers[idx].minCopies);
+        }
+        if (requiredCopies > 1) {
+          funcOp->setAttr("ttg.ws_memory_plan_invalid",
+                          UnitAttr::get(funcOp.getContext()));
+          funcOp.emitError()
+              << "2CTA ordinary TMA output staging requires one copy; "
+              << "the correctness floor requires " << requiredCopies;
+          return;
+        }
+        LDBG("Phase 4.5:   bufferId="
+             << bufferId
+             << " kept at one copy for 2CTA ordinary output staging");
+        continue;
+      }
       if (indices.size() < 2) {
         LDBG("Phase 4.5: bufferId=" << bufferId << " \u2014 only "
                                     << indices.size()
@@ -2686,7 +2713,8 @@ static unsigned allocateSmemBuffers(
   LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
   // ── Phase 4.5: Iterative copy increase for fused eligible groups ────
-  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, smemBudget);
+  increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
+                              smemBudget);
 
   LDBG("Phase 4.5 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
@@ -5437,6 +5465,10 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                                          effectiveSmemBudget,
                                          effectiveSmemCircularReuse,
                                          smemAllocAnnotations, annotationMaxId);
+    if (funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
+      funcOp->removeAttr("ttg.ws_memory_plan_invalid");
+      return failure();
+    }
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");
