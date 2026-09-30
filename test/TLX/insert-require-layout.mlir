@@ -363,3 +363,32 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %dot : tensor<256x64xf32, #mma_sw>
   }
 }
+
+// -----
+// A trusted contiguity hint may supply mask-alignment information that
+// AxisInfo cannot prove. The dynamic mask is conservatively scalar, but the
+// contiguity=2 contract lets InsertRequireLayout select a legal 32-bit bf16
+// direct-to-LDS layout and pins offsets and mask together.
+
+#blocked_hint = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 16], warpsPerCTA = [2, 1], order = [1, 0]}>
+#padded_hint = #ttg.padded_shared<[512:+16] {order = [1, 0], shape = [32, 16]}>
+#user_hint = #tlx.user_layout<#padded_hint>
+#smem_hint = #ttg.shared_memory
+// CHECK-DAG: #[[$HINT_LINEAR:.*]] = #ttg.linear<{register = {{\[\[}}0, 1], [16, 0]],
+// CHECK-DAG: #[[$PINNED_HINT_OFFSET:.*]] = #tlx.user_layout<#[[$HINT_LINEAR]]>
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @buffer_load_to_pinned_alloc_honors_trusted_contiguity
+  tt.func public @buffer_load_to_pinned_alloc_honors_trusted_contiguity(
+      %ptr: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+      %offsets: tensor<32x16xi32, #blocked_hint> {tt.contiguity = dense<[1, 16]> : tensor<2xi32>, tt.divisibility = dense<[1, 16]> : tensor<2xi32>},
+      %mask: tensor<32x16xi1, #blocked_hint> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[1, 1]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>}) {
+    %c0_i32 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x32x16xbf16, #user_hint, #smem_hint, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<2x32x16xbf16, #user_hint, #smem_hint, mutable> -> !ttg.memdesc<32x16xbf16, #user_hint, #smem_hint, mutable>
+    // CHECK: %[[PINNED_HINT_OFFSETS:.*]] = tlx.require_layout %{{.*}} : tensor<32x16xi32, #{{.*}}> -> tensor<32x16xi32, #[[$PINNED_HINT_OFFSET]]>
+    // CHECK: %[[PINNED_HINT_MASK:.*]] = tlx.require_layout %{{.*}} : tensor<32x16xi1, #{{.*}}> -> tensor<32x16xi1, #[[$PINNED_HINT_OFFSET]]>
+    // CHECK: amdg.buffer_load_to_local %{{.*}}{{\[}}%[[PINNED_HINT_OFFSETS]]{{\]}} mask = %[[PINNED_HINT_MASK]] into %{{.*}} {contiguity = 2 : i32}
+    %tok = amdg.buffer_load_to_local %ptr[%offsets] mask = %mask into %buf {contiguity = 2 : i32} : <bf16>[tensor<32x16xi32, #blocked_hint>] -> <32x16xbf16, #user_hint, #smem_hint, mutable>
+    tt.return
+  }
+}
