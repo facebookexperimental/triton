@@ -11,6 +11,7 @@ torch.manual_seed(0)
 
 MAX_SECONDS_PER_CASE = 60
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+REFERENCE_ROW_CHUNK = 1 << 16
 
 
 def shapes():
@@ -24,6 +25,15 @@ def _assert_strides(tensor, wanted):
         # torch's chosen stride describe the same layout.
         if tensor.shape[dim] != 1:
             assert got == expected, f"dim {dim}: stride {got}, recorded {expected}"
+
+
+def _reference_mm(a, b, arch):
+    if arch != "gfx942" or a.shape[0] <= REFERENCE_ROW_CHUNK:
+        return torch.matmul(a, b)
+    ref = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
+    for start in range(0, a.shape[0], REFERENCE_ROW_CHUNK):
+        ref[start:start + REFERENCE_ROW_CHUNK] = torch.matmul(a[start:start + REFERENCE_ROW_CHUNK], b)
+    return ref
 
 
 def run_mm_case(
@@ -58,7 +68,7 @@ def run_mm_case(
     assert elapsed < MAX_SECONDS_PER_CASE, (f"mm({M}x{N}x{K}, {dtype}) took {elapsed:.1f}s, "
                                             f"over the {MAX_SECONDS_PER_CASE}s budget")
 
-    ref = torch.matmul(a, b)
+    ref = _reference_mm(a, b, arch)
     precision = REL_PRECISION[dtype]
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
