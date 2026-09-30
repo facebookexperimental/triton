@@ -221,11 +221,17 @@ public:
     // code partitioning would build channels for the MMA's buffers without
     // threading buffer counters through the loop, since no region spans two
     // tasks.
-    bool hasMMAv5 = false;
-    funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface) { hasMMAv5 = true; });
-    if (hasMMAv5 && getNestedAsyncTaskIds(funcOp).size() == 1) {
+    Operation *firstMMA = nullptr;
+    funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
+      firstMMA = mmaOp;
+      return WalkResult::interrupt();
+    });
+    if (firstMMA && getNestedAsyncTaskIds(funcOp).size() == 1) {
       LDBG("Warp specialization found an MMA kernel with a single partition. "
            "Skipping.");
+      firstMMA->emitRemark(
+          "meta autoWS placed every op of this MMA kernel in one partition; "
+          "compiling without warp specialization");
       return bailOut(funcOp);
     }
 

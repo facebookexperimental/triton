@@ -1,4 +1,5 @@
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
 
 // Code partitioning synchronizes TMEM through channels between a producer
 // partition and a consumer partition. When the TMEM producer and consumer are
@@ -20,12 +21,12 @@
 // CHECK: scf.for
 // CHECK: scf.for
 // CHECK: tt.load
-// CHECK: %[[ASLOT:.*]] = ttg.memdesc_index %[[A]][
+// CHECK: %[[ASLOT:.*]] = ttg.memdesc_index %[[A]][%[[ASTOREIDX:[0-9]+]]]
 // CHECK: %[[APHASE:.*]] = arith.xori
 // CHECK: %[[APHASE32:.*]] = arith.extui %[[APHASE]]
 // CHECK: ttng.wait_barrier %{{.*}}, %[[APHASE32]] {{.*}}direction = "backward"
 // CHECK-NEXT: ttng.tmem_store %{{.*}}, %[[ASLOT]], %true
-// CHECK: %[[AOP:.*]] = ttg.memdesc_index %[[A]][
+// CHECK: %[[AOP:.*]] = ttg.memdesc_index %[[A]][%[[AMMAIDX:[0-9]+]]]
 // CHECK: %[[ADONE:.*]] = ttg.memdesc_index %[[AEMPTY]][
 // CHECK-NEXT: ttng.tc_gen5_mma %[[AOP]], {{.*}}, %[[ADONE]][%true]
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -192,8 +193,15 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // partition and every op propagates into the gemm task. With a single
 // partition there is nothing to specialize, and code partitioning would not
 // thread buffer counters through the loop, so the kernel is compiled without
-// warp specialization and all WS metadata is stripped.
-// CHECK-LABEL: @post_loop_acc_load_same_task
+// warp specialization and all WS metadata is stripped. The fallback is
+// reported as a remark on the MMA, and only for this kernel; the specialized
+// kernels in this file take no fallback.
+// REMARK-NOT: does not support
+// REMARK-NOT: compiling without warp specialization
+// REMARK: remark: meta autoWS placed every op of this MMA kernel in one partition; compiling without warp specialization
+// REMARK-NEXT: ttng.tc_gen5_mma
+// REMARK-NOT: compiling without warp specialization
+// CHECK-LABEL: @post_loop_acc_load_same_task(
 // CHECK-NOT: ttg.warp_specialize
 // CHECK-NOT: async_task_id
 // CHECK-NOT: ttg.partition
