@@ -34,7 +34,8 @@ class PTG_Op<string mnemonic, list<Trait> traits = []> :
 //===----------------------------------------------------------------------===//
 
 def PTG_CircularStoreOp : PTG_Op<"circular_store", [
-    MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
+    MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>,
+    AttrSizedOperandSegments
 ]> {
   let summary = "Store the value into a circular buffer";
 
