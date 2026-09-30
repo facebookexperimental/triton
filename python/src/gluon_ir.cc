@@ -624,7 +624,8 @@ void init_gluon_ir(py::module_ &m) {
                           "block_rep_order must be either 'mnThenK' or "
                           "'kThenMn'");
             return self.getChecked<ttng::TensorMemoryScalesEncodingAttr>(
-                ctx, cgaLayout, repOrder);
+                ctx, cgaLayout, repOrder,
+                ttng::TensorMemoryCTAMode::DEFAULT);
           },
           py::arg("cga_bases"), py::arg("block_rep_order") = "mnThenK")
       .def("get_shape_from_tensor",
