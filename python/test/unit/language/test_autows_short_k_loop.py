@@ -86,10 +86,20 @@ def _run_pointer_a_gemm(BN, K, num_stages):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
-@pytest.mark.parametrize("K, num_stages", [(128, 3)])
+@pytest.mark.parametrize("K, num_stages", [(128, 3), (128, 4), (192, 4)])
 def test_autows_pointer_a_short_k_loop(K, num_stages):
     kernel = _run_pointer_a_gemm(128, K, num_stages)
     assert "ttg.warp_specialize(" in kernel.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("num_stages", [2, 3, 4])
+def test_autows_pointer_a_smem_budget(num_stages):
+    # A 128x256 f32 TMA-store tile leaves little room for the pointer-loaded
+    # A's cp.async buffers. The kernel must either specialize with fewer
+    # buffers or compile without warp specialization, not run out of shared
+    # memory.
+    _run_pointer_a_gemm(256, 1024, num_stages)
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
