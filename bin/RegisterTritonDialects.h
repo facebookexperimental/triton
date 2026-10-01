@@ -74,6 +74,10 @@ void registerTestScopeIdAllocationPass();
 } // namespace test
 } // namespace mlir
 
+namespace mlir::triton::AMD {
+void registerSchedulingBarrierExternalModel(mlir::DialectRegistry &registry);
+} // namespace mlir::triton::AMD
+
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::triton::registerTritonPasses();
@@ -197,4 +201,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::proton::ProtonDialect,
       mlir::triton::proton::gpu::ProtonGPUDialect, mlir::ROCDL::ROCDLDialect,
       mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
+
+  mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
 }
