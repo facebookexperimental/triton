@@ -132,6 +132,8 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   ADD_PASS_OPTION_WRAPPER_2("add_sched_group_barrier_scheduler",
                             mlir::createTritonAMDGPUSchedGroupBarrierScheduler,
                             unsigned, unsigned);
+  ADD_PASS_WRAPPER_0("add_intra_wave_pipeline",
+                     mlir::createTritonAMDGPUIntraWavePipeline);
   mlir::registerConSanAMDHooks();
   m.def("add_in_thread_transpose", [](mlir::PassManager &pm) {
     pm.addNestedPass<mlir::triton::FuncOp>(
