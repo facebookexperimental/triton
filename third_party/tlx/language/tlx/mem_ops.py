@@ -305,6 +305,10 @@ def buffer_load_to_local(
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
                                                            other_handle, cache_mod, contiguity)
+    if contiguity > 1:
+        handle.set_attr(
+            "tlx.preserve_layout", _semantic.builder.get_unit_attr()
+        )
     return tlx.async_token(handle)
 
 
