@@ -1521,6 +1521,22 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   PartitionLayout layout = createPartitionLayout(
       schedule, categorizer, localSchedOpts, useHopperDpSchedule);
 
+  // A tt.dot that was not lowered to MMAv5/wgmma (e.g. BLOCK_M < 64 on
+  // Blackwell lowers to mma.sync) leaves no MMA to build roles around. If the
+  // layout is then just the load partition, everything lands in it and code
+  // partitioning cannot handle that single-partition loop nest, so don't warp
+  // specialize. (With e.g. an epilogue_store partition as well, WS works.) Bail
+  // before any op is given a ttg.partition, since nothing rolls that back.
+  unsigned numLayoutPartitions =
+      schedule.getNumPartitions() + (layout.loadPartition ? 0 : 1);
+  if (mmas.empty() && numLayoutPartitions <= 1 &&
+      mainLoop->walk([](triton::DotOp) { return WalkResult::interrupt(); })
+          .wasInterrupted()) {
+    LDBG("tt.dot is not an MMAv5/wgmma and the layout has a single partition; "
+         "not warp specializing");
+    return std::nullopt;
+  }
+
   //===--------------------------------------------------------------------===//
   // Phase 2b: Pre-create per-dpId computation partitions and pre-schedule
   // WarpGroupDotOps when data partitioning is active. This must run before
