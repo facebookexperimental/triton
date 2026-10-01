@@ -48,9 +48,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws_cooperative",
         impl="triton.tlx.ops.kernels.mm.sm90:mm",
         dtypes=_FP16,
-        accepts=lambda d: all(
-            s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]
-        ),
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
     ),
     OpSpec(
