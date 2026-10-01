@@ -119,9 +119,11 @@ fi
 if [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
     echo "Binding CPU and memory to NUMA node $NUMA_NODE"
     numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "$@"
+    COMMAND_STATUS=$?
 else
     echo "Warning: Could not determine a valid GPU-local NUMA node; running without NUMA binding" >&2
     "$@"
+    COMMAND_STATUS=$?
 fi
 
 # Unlock GPU clock
@@ -136,3 +138,5 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
         sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetpoweroverdrive
     ) >/dev/null
 fi
+
+exit "$COMMAND_STATUS"
