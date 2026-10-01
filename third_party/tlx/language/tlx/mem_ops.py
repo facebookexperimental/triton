@@ -114,7 +114,15 @@ def buffer_load(
 
 
 @tl.builtin
-def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=None):
+def buffer_store(
+    stored_value,
+    ptr,
+    offsets,
+    mask=None,
+    cache=None,
+    contiguity=1,
+    _semantic=None,
+):
     """
     AMD buffer store to global memory via a scalar base pointer and a tensor
     of i32 element offsets.
@@ -128,8 +136,20 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
         offsets: Tensor of i32 element offsets.
         mask: Optional bool tensor for predicated stores.
         cache: Optional cache modifier string.
+        contiguity: Trusted positive power-of-two lower bound on contiguous
+            elements available for vectorization. It must divide the number
+            of elements owned by each thread and cannot exceed the physical
+            contiguity of the selected layout. Every vector group must also
+            share one mask predicate. When greater than one, ``stored_value``
+            must first be pinned with ``tlx.require_layout``.
     """
     _verify_buffer_ops(ptr, offsets, mask)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
+    assert (contiguity == 1 or _semantic.builder.has_pinned_layout(stored_value.handle)), (
+        "buffer_store contiguity > 1 requires stored_value to be pinned with tlx.require_layout")
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -145,7 +165,14 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
     mask_handle = mask.handle if mask is not None else None
     cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
-    _semantic.builder.create_buffer_store(stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
+    _semantic.builder.create_buffer_store(
+        stored_value.handle,
+        ptr.handle,
+        offsets.handle,
+        mask_handle,
+        cache_modifier,
+        contiguity,
+    )
 
 
 @tl.builtin

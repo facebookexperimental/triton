@@ -526,7 +526,7 @@ def BufferStoreOp
       the first elements of each row in bytes. Compiler tries to obtain the `stride`
       when it converts to the buffer ops because it is important for optimizing
       the cache memory access.
-      Contiguity is the maximum number of elements that can be loaded in a single vector
+      Contiguity is the maximum number of elements that can be stored in a single vector
       with the given layout and mask.
       This allows to use buffer_store even if the alignment cannot be proven based on IR.
     }];
@@ -545,6 +545,7 @@ def BufferStoreOp
       (`stride` `=` $stride^)?
       attr-dict `:` type($value)
     }];
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

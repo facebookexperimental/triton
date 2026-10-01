@@ -2113,8 +2113,6 @@ struct BufferStoreOpConversion
 
     unsigned numElems = getTotalElemsPerThread(ptrType);
     unsigned vec = getVectorSize(ptr, offset, axisAnalysisPass);
-    // If the op has a contiguity hint use it to increase the vector size.
-    vec = std::max(vec, op.getContiguity());
 
     // Get the offsets and value
     SmallVector<Value> offsetElems = unpackTensorElements(
@@ -2125,6 +2123,19 @@ struct BufferStoreOpConversion
     // Get the mask
     SmallVector<Value> maskElems =
         getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
+
+    // A trusted hint includes mask uniformity, so apply it after conservative
+    // mask analysis. It still cannot exceed the physical register layout or
+    // AMD's 128-bit buffer-store instruction width.
+    vec = std::max(vec, op.getContiguity());
+    auto valueTensorTy = cast<RankedTensorType>(valueTy);
+    auto order = triton::gpu::getOrder(valueTensorTy);
+    auto contigPerThread = triton::gpu::getContigPerThread(valueTensorTy);
+    assert(!order.empty() && order.front() < contigPerThread.size());
+    vec = std::min(vec, contigPerThread[order.front()]);
+    constexpr unsigned maxStoreVectorBits = 128;
+    unsigned elementBits = std::max(8u, valueElemTy.getIntOrFloatBitWidth());
+    vec = std::min(vec, std::max(1u, maxStoreVectorBits / elementBits));
 
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     MLIRContext *ctx = rewriter.getContext();
