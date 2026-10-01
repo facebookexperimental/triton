@@ -312,3 +312,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#source = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#released = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-DAG: #[[$SOURCE:.*]] = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+  // CHECK-DAG: #[[$RELEASED_LAYOUT:.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+  // CHECK-DAG: #[[$COALESCED:.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+  // CHECK-LABEL: tt.func @release_axis_info_drives_coalescing
+  tt.func @release_axis_info_drives_coalescing(%base: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #source>
+    %base_splat = tt.splat %base : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #source>
+    %ptrs = tt.addptr %base_splat, %range : tensor<1024x!tt.ptr<f32>, #source>, tensor<1024xi32, #source>
+    // CHECK: %[[RELEASED:.*]] = ttg.release_layout %{{.*}} : tensor<1024x!tt.ptr<f32>, #[[$SOURCE]]> -> tensor<1024x!tt.ptr<f32>, #[[$RELEASED_LAYOUT]]>
+    %released = ttg.release_layout %ptrs : tensor<1024x!tt.ptr<f32>, #source> -> tensor<1024x!tt.ptr<f32>, #released>
+    // CHECK: %[[COALESCED_PTRS:.*]] = ttg.convert_layout %[[RELEASED]] : tensor<1024x!tt.ptr<f32>, #[[$RELEASED_LAYOUT]]> -> tensor<1024x!tt.ptr<f32>, #[[$COALESCED]]>
+    // CHECK: tt.load %[[COALESCED_PTRS]] : tensor<1024x!tt.ptr<f32>, #[[$COALESCED]]>
+    %loaded = tt.load %released : tensor<1024x!tt.ptr<f32>, #released>
+    tt.return
+  }
+}
