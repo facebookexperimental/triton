@@ -2138,3 +2138,89 @@ def test_ikbo_fa(B, n_seed, num_heads, d_head, max_seq_len, ratio):
         config=IkboFa.CONFIG,
     )
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+# =============================================================================
+# Symmetric-memory distributed all-gather (Blackwell + MI350)
+# =============================================================================
+
+# Rendezvous, barriers, and peer access need two GPUs holding symmetric
+# allocations at once; single-GPU runners skip.
+_SYMM_MEM_DIST_SUPPORTED = ((is_hip_cdna4() or is_blackwell()) and torch.cuda.is_available()
+                            and torch.cuda.device_count() >= 2)
+
+
+def _get_free_tcp_port():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _symm_mem_dist_all_gather_worker(rank, world_size, master_port):
+    import datetime
+    import os
+
+    import torch.distributed as dist
+
+    from triton._internal_testing import is_blackwell, is_hip_cdna4
+
+    if is_hip_cdna4():
+        from triton.language.extra.tlx.tutorials.distributed.amd_dist_all_gather import (
+            DTYPE,
+            MIB,
+            PHASED_THRESHOLD_BYTES,
+            allocate_symmetric_input,
+            check_correctness,
+        )
+    elif is_blackwell():
+        from triton.language.extra.tlx.tutorials.distributed.blackwell_dist_all_gather import (
+            DTYPE,
+            MIB,
+            PHASED_THRESHOLD_BYTES,
+            allocate_symmetric_input,
+            check_correctness,
+        )
+    else:
+        raise RuntimeError("symmetric-memory all-gather worker requires Blackwell or gfx950 GPUs")
+
+    dev = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(dev)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=dev,
+        timeout=datetime.timedelta(minutes=5),
+    )
+    try:
+        cases = (
+            1 * MIB // DTYPE.itemsize,
+            PHASED_THRESHOLD_BYTES // DTYPE.itemsize,
+            PHASED_THRESHOLD_BYTES // DTYPE.itemsize + 1,
+        )
+        for shard_numel in cases:
+            handle, symmetric_input, buffer_ptrs = allocate_symmetric_input((shard_numel, ))
+            check_correctness(shard_numel, handle, symmetric_input, buffer_ptrs)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not _SYMM_MEM_DIST_SUPPORTED, reason="Requires 2+ Blackwell or gfx950 GPUs")
+def test_symm_mem_dist_all_gather():
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    # Spawn, not fork: the parent has already run other GPU tests, so its CUDA
+    # context cannot survive a fork.
+    mp.spawn(
+        _symm_mem_dist_all_gather_worker,
+        args=(world_size, _get_free_tcp_port()),
+        nprocs=world_size,
+        join=True,
+        start_method="spawn",
+    )

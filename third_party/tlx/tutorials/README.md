@@ -161,3 +161,54 @@ checks live in `python/test/unit/language/test_tlx_codegen.py`; gfx1250 runtime
 checks live in `python/test/unit/language/test_tlx_amd_gfx1250.py`. The port
 uses `clamp_bounds=False` explicitly to retain the reference descriptor
 positioning semantics, including predicates and pre-clamped descriptors.
+
+## Symmetric-memory all-gather (Blackwell + MI350)
+
+[`blackwell_dist_all_gather.py`](distributed/blackwell_dist_all_gather.py) and
+[`amd_dist_all_gather.py`](distributed/amd_dist_all_gather.py) implement the same
+forward-only, single-node all-gather on top of
+`torch.distributed._symmetric_memory`. The pattern, identical on both
+architectures:
+
+1. Each rank allocates its shard with `symm_mem.empty()` and exchanges
+   handles with `symm_mem.rendezvous()`, which publishes every rank's base
+   pointer as an int64 `buffer_ptrs` table.
+2. Triton kernels read peer shards with plain `tl.load` on the published
+   pointers and `tl.store` into the local output slice; no collective
+   library sits in the data path.
+3. Phase boundaries are `handle.barrier(channel=...)` calls, alternating two
+   channels so consecutive phases never share one.
+
+The public entry point (`symm_mem_all_gather_into_tensor`) picks one of three
+strategies from the per-rank payload: small payloads use concurrent fanout
+peer reads, large even-length payloads use ring-ordered phased int32 reads
+(two BF16 elements per 4-byte transaction), and odd BF16 lengths fall back to
+phased BF16 reads to preserve slice alignment. Correctness is checked
+bit-for-bit against the vendor collective plus determinism iterations.
+
+Architecture deltas, all host-side (the three kernels are arch-agnostic):
+
+| | Blackwell (NVLink) | MI350 (xGMI) |
+| --- | --- | --- |
+| Collective backend | NCCL (`backend="nccl"`) | RCCL (same string on ROCm builds) |
+| Multicast | Disabled via `TORCH_SYMM_MEM_DISABLE_MULTICAST=1` | Not set |
+| Arch gate | `get_device_capability()[0] >= 10` | `gcnArchName` prefix `gfx950` |
+| Correctness baseline | `_c10d_functional.all_gather_into_tensor` | Same where available, else `dist.all_gather_into_tensor` |
+| Tuning | 64 MiB crossover, `num_warps=8`, `BLOCK_SIZE=4096`, with measured B200 table in the docstring | Same defaults carried over; xGMI retuning is future work |
+
+Multi-node is out of scope: the pattern assumes intranode peer visibility,
+same as the Blackwell original. The
+[`test_symm_mem_dist_all_gather`](testing/test_correctness.py) unit test
+covers both tutorials: it `mp.spawn`s two ranks, runs the 1 MiB / 64 MiB /
+64 MiB+1-element correctness cases through rendezvous, barriers, and the
+kernels, and skips unless 2+ Blackwell or gfx950 GPUs are visible. Run it
+with `pytest -k test_symm_mem_dist_all_gather` from
+`third_party/tlx/tutorials/testing`, or run either tutorial directly:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  third_party/tlx/tutorials/distributed/blackwell_dist_all_gather.py --mode correctness
+
+HIP_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 \
+  third_party/tlx/tutorials/distributed/amd_dist_all_gather.py --mode correctness
+```
