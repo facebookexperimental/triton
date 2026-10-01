@@ -2,6 +2,8 @@
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/IR/DialectRegistry.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -68,5 +70,23 @@ bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
                   bool /*op2IsRead*/, Allocation *allocation) {
   return (filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
           filterLDSMemoryBarriersDependencies(op1, op2));
+}
+
+namespace {
+// External model that stamps the marker interface onto an upstream ROCDL op we
+// do not own. The interface has no methods, so the model body is empty.
+template <typename OpT>
+struct SchedulingBarrierModel
+    : public ::mlir::triton::gpu::SchedulingBarrierOpInterface::ExternalModel<
+          SchedulingBarrierModel<OpT>, OpT> {};
+} // namespace
+
+void registerSchedulingBarrierExternalModel(DialectRegistry &registry) {
+  registry.addExtension(+[](MLIRContext *ctx, ROCDL::ROCDLDialect *) {
+    ROCDL::SchedBarrier::attachInterface<
+        SchedulingBarrierModel<ROCDL::SchedBarrier>>(*ctx);
+    ROCDL::SchedGroupBarrier::attachInterface<
+        SchedulingBarrierModel<ROCDL::SchedGroupBarrier>>(*ctx);
+  });
 }
 } // namespace mlir::triton::AMD
