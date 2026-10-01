@@ -32,14 +32,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
-// Hazard-inference attributes are compiler-owned. Input IR cannot use them to
-// skip the conservative input padding or result drain on an uncommitted chain.
+// Legacy hazard attributes cannot change the native arithmetic lowering or
+// remove its persistent result pin.
 //
 // CHECK-LABEL: llvm.func @forged_hazard_attributes
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
 // CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 3\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, 0", "=a,v,v"
-// CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 11", "=a,0"
+// CHECK-SAME: "", "=a,0"
+// CHECK-NOT: "v_mfma
+// CHECK-NOT: "s_nop
+// CHECK: llvm.return
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
 #lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -67,6 +69,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 // -----
 
 // Pinning the accumulator to VGPRs is the documented remedy and must lower.
+// The explicit live-operand commit retains its required wait.
+// CHECK-LABEL: llvm.func @vgpr_pinned_accumulator_with_live_operand
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "", "=v,0"
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 5", "=v,=a,0,1,~{memory}"
+// CHECK: llvm.return
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
 #lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -93,16 +103,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
-// CDNA4 keeps the explicit AGPR class: there the accumulator read is ordered
-// against the drain, and two persistent accumulator sets may deliberately
-// occupy complementary register files. Contrast CDNA3, where the same request
-// is rejected outright (see invalid.mlir).
+// CDNA4 keeps the explicit AGPR class so two persistent accumulator sets may
+// deliberately occupy complementary register files. CDNA3 retains its explicit
+// VGPR-only contract (see invalid.mlir).
 //
 // CHECK-LABEL: llvm.func @explicit_agpr_accumulator
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
 // CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 3\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, 0", "=a,v,v"
-// CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 11", "=a,0"
+// CHECK-SAME: "", "=a,0"
+// CHECK-NOT: "v_mfma
+// CHECK-NOT: "s_nop
+// CHECK: llvm.return
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
 #lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -126,12 +137,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
-// A block argument that merges a scheduled accumulator with an unrelated
-// value is not one chain. Its producer must retain conservative hazards.
+// A block argument may merge a scheduled accumulator with an unrelated value.
+// Native arithmetic keeps both sides visible to LLVM without a chain proof.
 //
 // CHECK-LABEL: llvm.func @mixed_lineage_block_argument
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
 // CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 3\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, 0", "=a,v,v"
+// CHECK-SAME: "", "=a,0"
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
 #lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>

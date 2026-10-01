@@ -411,6 +411,8 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     output_ptr,
     USE_VGPR: tl.constexpr,
     COMMIT: tl.constexpr,
+    INITIALIZE: tl.constexpr = True,
+    FULL_K: tl.constexpr = False,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -427,26 +429,38 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
     a = tlx.require_layout(a, dot0, pin=False)
     b = tlx.require_layout(b, dot1, pin=False)
-    a0 = tlx.extract_slice(a, [16, 32], [0, 0])
-    b0 = tlx.extract_slice(b, [32, 64], [0, 0])
-    acc = tlx.zeros((16, 64), tl.float32, layout=mma)
-    acc = tlx.amd_scheduled_mfma(
-        a0,
-        b0,
-        acc,
-        accumulator_role="persistent",
-        accumulator_register_class="vgpr" if USE_VGPR else None,
-        initialize=True,
-    )
-    a1 = tlx.extract_slice(a, [16, 32], [0, 32])
-    b1 = tlx.extract_slice(b, [32, 64], [32, 0])
-    acc = tlx.amd_scheduled_mfma(
-        a1,
-        b1,
-        acc,
-        accumulator_role="persistent",
-        accumulator_register_class="vgpr" if USE_VGPR else None,
-    )
+    acc = tl.full((16, 64), 7.0, tl.float32)
+    acc = tlx.require_layout(acc, mma, pin=False)
+    if FULL_K:
+        # Exercise both K fragments inside one scheduled operation.
+        acc = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+            initialize=INITIALIZE,
+        )
+    else:
+        a0 = tlx.extract_slice(a, [16, 32], [0, 0])
+        b0 = tlx.extract_slice(b, [32, 64], [0, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a0,
+            b0,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+            initialize=INITIALIZE,
+        )
+        a1 = tlx.extract_slice(a, [16, 32], [0, 32])
+        b1 = tlx.extract_slice(b, [32, 64], [32, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a1,
+            b1,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+        )
     if COMMIT:
         acc = tlx.amd_mfma_commit(acc)
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
@@ -1691,24 +1705,30 @@ def test_amd_scheduled_mfma_chain_correct_gfx950():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_scheduled_mfma_persistent_acc_correct_gfx950():
+@pytest.mark.parametrize("use_vgpr", [False, True], ids=["agpr", "vgpr"])
+@pytest.mark.parametrize("initialize", [False, True], ids=["preserve_c", "initialize"])
+@pytest.mark.parametrize("commit", [False, True], ids=["direct", "commit"])
+@pytest.mark.parametrize("full_k", [False, True], ids=["split_k", "full_k"])
+def test_amd_scheduled_mfma_persistent_acc_correct_gfx950(use_vgpr, initialize, full_k, commit):
     torch.manual_seed(0)
     a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
-    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    actual = torch.full((16, 64), float("nan"), device="cuda", dtype=torch.float32)
     expected = a.float() @ b.float()
-    for use_vgpr in (False, True):
-        for commit in (False, True):
-            _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
-                a,
-                b,
-                actual,
-                USE_VGPR=use_vgpr,
-                COMMIT=commit,
-                num_warps=4,
-                matrix_instr_nonkdim=16,
-            )
-            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+    if not initialize:
+        expected += 7.0
+    _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
+        a,
+        b,
+        actual,
+        USE_VGPR=use_vgpr,
+        COMMIT=commit,
+        INITIALIZE=initialize,
+        FULL_K=full_k,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

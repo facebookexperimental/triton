@@ -39,12 +39,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 // -----
 
 // CHECK-LABEL: llvm.func @scheduled_mfma_persistent_f16_32x32x8
+// CHECK: rocdl.mfma.f32.32x32x8f16
+// CHECK-SAME: (vector<4xf16>, vector<4xf16>, vector<16xf32>) -> vector<16xf32>
 // CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 3\0Av_mfma_f32_32x32x8_f16 $0, $1, $2, 0", "=&v,v,v"
-// CHECK-SAME: (vector<4xf16>, vector<4xf16>) -> vector<16xf32>
-// CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 15\0As_nop 2"
+// CHECK-SAME: "", "=v,0"
+// CHECK-NOT: "v_mfma
+// CHECK-NOT: "s_nop
 // CHECK-NOT: amdg.
+// CHECK: llvm.return
 
 #mma32 = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [32, 32, 8], isTransposed = true}>
 #lhs32 = #ttg.dot_op<{opIdx = 0, parent = #mma32, kWidth = 4}>
@@ -71,12 +73,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 // No ttg.target: a v3 encoding must still verify and lower on its own.
 
 // CHECK-LABEL: llvm.func @scheduled_mfma_persistent_f16_16x16x16_untargeted
+// CHECK: rocdl.mfma.f32.16x16x16f16
+// CHECK-SAME: (vector<4xf16>, vector<4xf16>, vector<4xf32>) -> vector<4xf32>
 // CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 3\0Av_mfma_f32_16x16x16_f16 $0, $1, $2, 0", "=&v,v,v"
-// CHECK-SAME: (vector<4xf16>, vector<4xf16>) -> vector<4xf32>
-// CHECK: llvm.inline_asm has_side_effects
-// CHECK-SAME: "s_nop 10", "=v,0"
+// CHECK-SAME: "", "=v,0"
+// CHECK-NOT: "v_mfma
+// CHECK-NOT: "s_nop
 // CHECK-NOT: amdg.
+// CHECK: llvm.return
 
 #mma16p = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
 #lhs16p = #ttg.dot_op<{opIdx = 0, parent = #mma16p, kWidth = 4}>
@@ -102,6 +106,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 // The explicit VGPR class is how a persistent accumulator is carried on CDNA3,
 // and it lowers cleanly across a commit that also carries a live dot operand.
+// CHECK-LABEL: llvm.func @vgpr_accumulator_with_live_operand
+// CHECK: rocdl.mfma.f32.16x16x16bf16.1k
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "", "=v,0"
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 10", "=v,=a,0,1,~{memory}"
+// CHECK: llvm.return
 
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
 #lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
@@ -128,13 +139,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
-// CDNA3 refuses an explicit AGPR accumulator outright, before any commit
-// boundary is considered. The MFMA and its hazard padding are inline assembly,
-// so LLVM schedules the compiler-generated v_accvgpr_read into the shadow of
-// the MFMA that wrote the register. The commit-time diagnostic cannot cover
-// that: it needs the producing scheduled_mfma to be visible from an
-// mfma_commit, and an epilogue with no commit -- or one behind an
-// amd_register_class_anchor -- silently miscompiles instead.
+// CDNA3 retains its explicit VGPR-only accumulator contract. Native arithmetic
+// does not broaden the accepted register classes without separate validation.
+// The rejection applies with or without an explicit commit boundary.
 //
 // The commit-time AGPR/live-operand interaction is still covered on CDNA4, in
 // scheduled-mfma-gfx950.mlir, where the explicit class is legal.

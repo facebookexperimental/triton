@@ -1280,6 +1280,13 @@ def _attn_bwd_gqa_front(
     p_nd = tl.permute(p_nd, (0, 2, 3, 1, 4, 5))
     p_nd = tl.reshape(p_nd, (BLOCK_N, BLOCK_M))
     p_nd = tlx.require_layout(p_nd, P_ND_LAYOUT, pin=False)
+    ds_bf16 = ds.to(tl.bfloat16)
+    tlx.local_store(ds_stage, tl.trans(ds_bf16))
+    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
+    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
+    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
+    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
+
     if UPDATE_DV_FIRST_HALF:
         dv = _attn_bwd_gqa_dv_fragmented_half(
             p_nd,
@@ -1291,12 +1298,6 @@ def _attn_bwd_gqa_front(
             True,
         )
 
-    ds_bf16 = ds.to(tl.bfloat16)
-    tlx.local_store(ds_stage, tl.trans(ds_bf16))
-    ds_nd = tl.reshape(ds_bf16, (2, 2, 2, 2, 16, BLOCK_M))
-    ds_nd = tl.permute(ds_nd, (0, 2, 3, 1, 4, 5))
-    ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
-    ds_nd = tlx.require_layout(ds_nd, P_ND_LAYOUT, pin=False)
     return dv, ds_nd, q_out, p_nd, do_out
 
 
@@ -1382,6 +1383,8 @@ def _attn_bwd_gqa_dq_prefetched(
     K_MD_LAYOUT: tl.constexpr,
     V_LAYOUT: tl.constexpr,
     COORDINATE_GROUP: tl.constexpr = None,
+    ds2_prefetched=None,
+    PREFETCH_DS2: tl.constexpr = False,
 ):
     """Reduce eight K=32 bands into two independent native dQ chains."""
     ds0 = tlx.require_layout(ds0, DS_MD_LAYOUT, pin=False)
@@ -1393,12 +1396,15 @@ def _attn_bwd_gqa_dq_prefetched(
     dq0 = tlx.zeros((16, 64), tl.float32, layout=MMA_MD)
     dq1 = tlx.zeros((16, 64), tl.float32, layout=MMA_MD)
 
-    ds2 = tlx.local_load(
-        tlx.local_slice(prev_ds, [0, 64], [16, 32]),
-        layout=DS_MD_LAYOUT,
-        relaxed=True,
-        rematerialize_coordinates_group=COORDINATE_GROUP,
-    )
+    if PREFETCH_DS2:
+        ds2 = ds2_prefetched
+    else:
+        ds2 = tlx.local_load(
+            tlx.local_slice(prev_ds, [0, 64], [16, 32]),
+            layout=DS_MD_LAYOUT,
+            relaxed=True,
+            rematerialize_coordinates_group=COORDINATE_GROUP,
+        )
     k7 = tlx.local_load(
         tlx.local_slice(k_buffer, [224, 0], [32, 128]),
         layout=K_MD_LAYOUT,
@@ -1549,7 +1555,7 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     Q_OUT_LAYOUT: tl.constexpr,
     DS_MD_LAYOUT: tl.constexpr,
 ):
-    """Update fragmented dK while prefetching the first two dQ bands."""
+    """Update fragmented dK while prefetching the first three dQ bands."""
     dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
     dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
     dk = tlx.require_layout(dk, MMA_ND, pin=False)
@@ -1578,6 +1584,11 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     )
     c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
     c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    ds2 = tlx.local_load(
+        tlx.local_slice(prev_ds, [0, 64], [16, 32]),
+        layout=DS_MD_LAYOUT,
+        relaxed=True,
+    )
     c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
     c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
     ds1 = tlx.local_load(
@@ -1600,7 +1611,7 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     )
     new_dk = tl.cat(row0, row1, dim=0)
     new_dk = tlx.require_layout(new_dk, MMA_ND, pin=False)
-    return new_dk, ds0, ds1
+    return new_dk, ds0, ds1, ds2
 
 
 @triton.jit
@@ -1623,7 +1634,7 @@ def _attn_bwd_gqa_bridge(
     V_LAYOUT: tl.constexpr,
 ):
     """Interleave independent current-dK and previous-dQ chains."""
-    new_dk, ds0, ds1 = _attn_bwd_gqa_dk_fragmented_prefetch(
+    new_dk, ds0, ds1, ds2 = _attn_bwd_gqa_dk_fragmented_prefetch(
         dk_lhs,
         dk_rhs,
         dk,
@@ -1646,6 +1657,8 @@ def _attn_bwd_gqa_bridge(
         DS_MD_LAYOUT,
         K_MD_LAYOUT,
         V_LAYOUT,
+        ds2_prefetched=ds2,
+        PREFETCH_DS2=True,
     )
     return new_dk, dq, v_resident
 

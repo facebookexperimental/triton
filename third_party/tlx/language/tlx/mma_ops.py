@@ -141,7 +141,7 @@ def amd_scheduled_mfma(
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
-    """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
+    """Update native CDNA3/CDNA4 MFMA fragments with explicit lifetime contracts.
 
     Unlike ``tl.dot``, which represents one logical matrix product and carries
     no accumulator-lifetime or register-class contract, this operation exposes
@@ -149,34 +149,34 @@ def amd_scheduled_mfma(
 
     With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
     The operation keeps one SSA chain per output fragment and creates updates
-    in K-major, N-major, M-minor order. LLVM may reschedule independent updates
-    on the transient intrinsic path. With ``initialize=True``, the first native
-    K update starts from zero and the result is ``a @ b``; the supplied
-    accumulator value is ignored.
+    in K-major, N-major, M-minor order. LLVM determines the final instruction
+    schedule. With ``initialize=True``, the first native K update starts from
+    zero and the result is ``a @ b``; the supplied accumulator value is ignored.
 
     ``accumulator_role`` changes lowering, not the numerical operation.
-    ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
-    intrinsics. ``"persistent"`` describes a chain carried across phases and
-    uses register-constrained inline assembly. Because LLVM cannot model an
-    MFMA hidden in inline assembly, that path adds target-specific input and
-    result wait padding. On the persistent path,
-    ``resident_operand=0`` or ``1`` selects the left or right input for AGPR
-    placement, and ``accumulator_register_class`` may select ``"agpr"`` or
-    ``"vgpr"``. Persistent ``auto`` selects AGPRs. The transient intrinsic path
-    does not apply these class constraints and leaves physical placement to
-    LLVM; use :func:`amd_register_resident` for a hard source residency point.
+    ``"transient"`` describes a phase-local chain; ``"persistent"`` describes a
+    chain carried across phases. Both roles use native ROCDL MFMA intrinsics,
+    exposing arithmetic latency and hazards to LLVM.
 
-    The compiler recognizes eligible persistent AGPR accumulator chains ending
-    at ``amd_mfma_commit``. After scheduling and physical register assignment,
-    it repairs source and EXEC hazards and drains outstanding results before
-    any physical AGPR read or overwrite. Unknown dataflow and VGPR accumulators
-    retain conservative waits.
+    Persistent chains use empty inline assembly to constrain operand register
+    classes. ``resident_operand=0`` or ``1`` selects the left or right input
+    for AGPR placement; other inputs use VGPRs. ``accumulator_register_class``
+    may select ``"agpr"`` or ``"vgpr"``, and persistent ``auto`` selects AGPRs.
+    Persistent accumulator tuples are pinned after all K updates; nonconstant
+    input accumulators are also pinned before the updates when ``initialize``
+    is false. These side-effecting accumulator pins constrain compiler-side
+    ordering. Empty pins provide no hardware wait or memory fence.
 
-    CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
-    ``accumulator_register_class="vgpr"``. The inputs must be matching rank-two
-    BF16 or F16 dot operands with ``kWidth`` 4 or 8, the accumulator must be
-    rank-two F32 with the corresponding unit-tile MFMA layout, and all active
-    lanes of a wave must execute the operation uniformly.
+    The transient path does not apply these class constraints and leaves
+    physical placement to LLVM; use :func:`amd_register_resident` for a hard
+    source residency point. Completion boundaries with live dependencies are
+    represented separately by :func:`amd_mfma_commit`.
+
+    CDNA3 retains its VGPR-only accumulator contract, so a persistent chain on
+    gfx942 must pass ``accumulator_register_class="vgpr"``. The inputs must be
+    matching rank-two BF16 or F16 dot operands with ``kWidth`` 4 or 8, the
+    accumulator must be rank-two F32 with the corresponding unit-tile MFMA
+    layout, and all active lanes of a wave must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
