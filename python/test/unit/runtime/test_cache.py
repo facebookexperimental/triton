@@ -19,6 +19,45 @@ from triton._internal_testing import is_hip, is_cpu
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
 
 
+@pytest.mark.parametrize("symlink", [False, True])
+@pytest.mark.parametrize("source", ["__init__.py", "nested/kernel.py"])
+def test_triton_key_tracks_sources_without_importing_packages(tmp_path, monkeypatch, symlink, source):
+    from triton.runtime import cache
+
+    triton_path = tmp_path / "python" / "triton"
+    cache_path = triton_path / "runtime" / "cache.py"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("# cache source\n")
+    monkeypatch.setattr(cache, "__file__", str(cache_path))
+
+    lib_path = triton_path / "_C" / ("libtriton." + cache.sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1])
+    lib_path.parent.mkdir()
+    lib_path.write_bytes(b"native compiler")
+
+    language_path = triton_path / "language"
+    language_path.mkdir()
+    package_path = language_path / "cache_key_test_package"
+    if symlink:
+        package_target = tmp_path / "linked_package"
+        package_target.mkdir()
+        package_path.symlink_to(package_target, target_is_directory=True)
+    else:
+        package_path.mkdir()
+    (package_path / "__init__.py").write_text("raise RuntimeError('cache hashing must not import packages')\n")
+    (package_path / "nested").mkdir()
+    (package_path / "nested" / "__init__.py").write_text("")
+    (package_path / "nested" / "kernel.py").write_text("value = 1\n")
+    monkeypatch.setattr(tl, "__path__", [str(language_path)])
+
+    # Bypass memoization so changes are visible without invalidating the real cache.
+    get_key = cache.triton_key.__wrapped__
+    original_key = get_key()
+    assert get_key() == original_key
+    source_path = package_path / source
+    source_path.write_text(source_path.read_text() + "# changed\n")
+    assert get_key() != original_key
+
+
 def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
     env = os.environ.copy()
     env.update({
