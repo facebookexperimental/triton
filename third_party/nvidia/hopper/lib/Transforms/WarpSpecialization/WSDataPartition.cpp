@@ -189,6 +189,9 @@ struct DataPartitionScheme {
   // Function arguments (TensorDescType) that need their block type sliced.
   // Maps argument index -> partition dimension (in descriptor space).
   DenseMap<unsigned, unsigned> funcArgPartitionDims;
+  // Reductions over the partitioned dim with tensor results. Each partition
+  // reduces its own slice, and the partial results are combined after slicing.
+  SetVector<Operation *> crossPartitionReduces;
 
   // op with noOpPartitionDim will be duplicated instead of partitioned.
   // Use -2 to avoid conflict with Empty/Tombstone value.
@@ -206,6 +209,8 @@ struct DataPartitionScheme {
       rematerializedOps.insert(op);
     for (auto op : other.opsToSkip)
       opsToSkip.insert(op);
+    for (auto op : other.crossPartitionReduces)
+      crossPartitionReduces.insert(op);
     for (auto &[argIndex, dim] : other.funcArgPartitionDims) {
       auto it = funcArgPartitionDims.find(argIndex);
       assert((it == funcArgPartitionDims.end() || it->second == dim) &&
@@ -578,6 +583,26 @@ static bool shapedResultsCanRepresentDim(Operation *op, unsigned dim) {
   return true;
 }
 
+// Whether the partial results of reduceOp over each partition's slice can be
+// combined with its combiner applied elementwise.
+static bool canCombineAcrossPartitions(ReduceOp reduceOp) {
+  if (reduceOp.hasDefinedOrdering()) {
+    reduceOp.emitRemark("skipping data partitioning: combining per-partition "
+                        "results of a reduction over the partitioned dim "
+                        "would change its reduction_ordering");
+    return false;
+  }
+  for (Operation &op : reduceOp.getCombineOp().front().without_terminator()) {
+    if (op.getNumRegions() != 0 || !op.hasTrait<OpTrait::Elementwise>()) {
+      reduceOp.emitRemark("skipping data partitioning: cannot combine "
+                          "per-partition results of a reduction over the "
+                          "partitioned dim with a non-elementwise combiner");
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool getBackwardSliceToPartition(Value v,
                                         DataPartitionScheme &partitionScheme,
                                         unsigned currentDim,
@@ -633,6 +658,18 @@ static bool getBackwardSliceToPartition(Value v,
   }
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
     return true;
+  if (auto reduceOp = v.getDefiningOp<ReduceOp>()) {
+    // A reduce's partition dim is recorded in its operands' shape.
+    unsigned operandDim =
+        currentDim + (reduceOp.getAxis() <= currentDim ? 1 : 0);
+    if (!partitionScheme.ops.insert(reduceOp))
+      return partitionScheme.opPartitionDims[reduceOp] == operandDim;
+    partitionScheme.opPartitionDims[reduceOp] = operandDim;
+    for (Value operand : reduceOp.getOperands())
+      if (!getBackwardSliceToPartition(operand, partitionScheme, operandDim))
+        return false;
+    return true;
+  }
   if (auto op = v.getDefiningOp()) {
     // Check dim compatibility
     if (!partitionScheme.ops.insert(op)) {
@@ -943,7 +980,39 @@ static bool getForwardSliceToPartition(Value v,
       currentDim = *dstDim;
     }
 
-    if (!shapedResultsCanRepresentDim(depOp, currentDim))
+    // A reduce records the partition dim of its operands; its results lose
+    // the reduced axis.
+    auto reduceOp = dyn_cast<ReduceOp>(depOp);
+    bool reduceDropsDimBefore =
+        reduceOp && currentDim != DataPartitionScheme::noOpPartitionDim &&
+        reduceOp.getAxis() < currentDim;
+    if (reduceOp && currentDim != DataPartitionScheme::noOpPartitionDim) {
+      if (reduceOp.getAxis() == currentDim &&
+          !getShape(reduceOp->getResult(0)).empty()) {
+        // Each partition yields a partial result over its slice. Their users
+        // see the combined result, so the walk stops here.
+        if (!canCombineAcrossPartitions(reduceOp)) {
+          partitionScheme.skipPartitioning = true;
+          return false;
+        }
+        if (!partitionScheme.ops.insert(depOp)) {
+          if (partitionScheme.opPartitionDims[depOp] != currentDim)
+            return false;
+          continue;
+        }
+        partitionScheme.opPartitionDims[depOp] = currentDim;
+        partitionScheme.crossPartitionReduces.insert(depOp);
+        // Sibling operands (e.g. the indices of an argmax) are sliced too.
+        for (Value operand : reduceOp.getOperands())
+          if (!getBackwardSliceToPartition(operand, partitionScheme,
+                                           currentDim))
+            return false;
+        continue;
+      }
+    }
+
+    if (!shapedResultsCanRepresentDim(
+            depOp, currentDim - (reduceDropsDimBefore ? 1 : 0)))
       return false;
 
     // Check dim compatibility
@@ -1026,9 +1095,9 @@ static bool getForwardSliceToPartition(Value v,
       }
     }
 
+    unsigned resultDim = currentDim - (reduceDropsDimBefore ? 1 : 0);
     for (Value result : depOp->getResults())
-      if (!getForwardSliceToPartition(result, partitionScheme, currentDim,
-                                      seen))
+      if (!getForwardSliceToPartition(result, partitionScheme, resultDim, seen))
         return false;
 
     if (auto yieldOp = dyn_cast<scf::YieldOp>(depOp)) {
@@ -1224,9 +1293,18 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
       partitionSize.push_back(sliceSizeN);
     }
 
+    // A tile too small to slice (e.g. BLOCK_M=64, BLOCK_N=128 at factor 2)
+    // keeps factor 1, like the TMEM blockM bail in partitionIsCompatible.
     if (partitionDim.empty()) {
-      LDBG("Partition not available: " << sliceSizeM << " " << sliceSizeN);
-      return false;
+      op->emitRemark() << "skipping data partitioning: a " << shapePerCTA[0]
+                       << "x" << shapePerCTA[1]
+                       << " accumulator is too small to split "
+                       << partitionScheme.numPartitions << " ways";
+      unsigned numPartitions = partitionScheme.numPartitions;
+      partitionScheme = DataPartitionScheme();
+      partitionScheme.numPartitions = numPartitions;
+      partitionScheme.skipPartitioning = true;
+      return true;
     }
 
     bool success = false;
@@ -2159,6 +2237,10 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     // remain unchanged. This is used by FA forward to form one scalar,
     // warp-uniform accumulator-rescale predicate per M partition.
     bool reducesPartitionedDim = reduceOp.getAxis() == dim;
+    // The results lose the reduced axis, so a later partition dim shifts down.
+    if (dim != DataPartitionScheme::noOpPartitionDim &&
+        reduceOp.getAxis() < dim)
+      --dim;
     newOp = cloneAndSetResultType(op, reducesPartitionedDim);
     // recursively set async task ids for child ops
     newOp->walk(
@@ -2206,6 +2288,37 @@ static Operation *sliceOp(Value v, int offset, IRMapping &mappings,
     }
     return sliceOp(bbAargOwner, offset, mappings, reverseMappings,
                    partitionScheme);
+  }
+}
+
+// Replace each reduction over the partitioned dim with its combiner applied
+// elementwise to the per-partition partial results.
+static void combineCrossPartitionReduces(
+    llvm::MapVector<Operation *, SmallVector<Operation *>> &partials) {
+  for (auto &[op, slices] : partials) {
+    auto reduceOp = cast<ReduceOp>(op);
+    Block &combiner = reduceOp.getCombineOp().front();
+    unsigned numResults = reduceOp.getNumResults();
+    OpBuilderWithAsyncTaskIds builder(op->getContext());
+    builder.setAsynTaskIdsFromArray(getAsyncTaskIds(op));
+    builder.setInsertionPoint(op);
+    SmallVector<Value> acc(slices.front()->getResults());
+    for (Operation *slice : ArrayRef(slices).drop_front()) {
+      IRMapping mapping;
+      for (unsigned i = 0; i < numResults; ++i) {
+        mapping.map(combiner.getArgument(i), acc[i]);
+        mapping.map(combiner.getArgument(numResults + i), slice->getResult(i));
+      }
+      auto tensorType = cast<RankedTensorType>(acc.front().getType());
+      for (Operation &combineOp : combiner.without_terminator()) {
+        Operation *newOp = builder.clone(combineOp, mapping);
+        for (Value result : newOp->getResults())
+          result.setType(tensorType.clone(result.getType()));
+      }
+      for (unsigned i = 0; i < numResults; ++i)
+        acc[i] = mapping.lookup(combiner.getTerminator()->getOperand(i));
+    }
+    op->replaceAllUsesWith(acc);
   }
 }
 
@@ -2554,6 +2667,18 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   if (partitionScheme.ops.empty())
     return true;
 
+  // Users of a cross-partition reduce must read the combined result, so none
+  // of them can be sliced.
+  for (Operation *op : partitionScheme.crossPartitionReduces) {
+    for (Operation *user : op->getUsers()) {
+      if (partitionScheme.ops.contains(user)) {
+        op->emitRemark("skipping data partitioning: a reduction over the "
+                       "partitioned dim feeds a partitioned op");
+        return true;
+      }
+    }
+  }
+
   // Bail out if a TensorDescType func arg is used as a ForOp init arg.
   // This case requires extra handling to update ForOp iter arg types
   // consistently, deferred to a follow-up.
@@ -2585,6 +2710,7 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   });
 
   // Slice the ops.
+  llvm::MapVector<Operation *, SmallVector<Operation *>> reducePartials;
   for (int i = 0; i < partitionScheme.numPartitions; i++) {
     IRMapping mappings, reverseMappings;
     LDBG("partitioning op for task " << i + 1 << ":\n");
@@ -2593,6 +2719,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       auto op = partitionScheme.ops[j];
       sliceOp(op, i, mappings, reverseMappings, partitionScheme);
     }
+    for (Operation *op : partitionScheme.crossPartitionReduces)
+      reducePartials[op].push_back(mappings.lookup(op));
 
     // clean up
     LLVM_DEBUG({
@@ -2609,6 +2737,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
       op->erase();
     }
   }
+
+  combineCrossPartitionReduces(reducePartials);
 
   LLVM_DEBUG({
     LDBG("prior to final cleanup:");
