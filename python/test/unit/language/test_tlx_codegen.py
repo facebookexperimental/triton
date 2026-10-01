@@ -919,6 +919,7 @@ def _concrete_dot_loop_helper_kernel(
     bias_ptr,
     out_ptr,
     CAST_BEFORE_RELEASE: tl.constexpr,
+    RELAXED_RELEASE: tl.constexpr,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -948,7 +949,7 @@ def _concrete_dot_loop_helper_kernel(
     result += bias
     if CAST_BEFORE_RELEASE:
         result = result.to(tl.bfloat16)
-    result = tlx.release_layout(result)
+    result = tlx.release_layout(result, relaxed=RELAXED_RELEASE)
     result = tlx.require_layout(result, consumer_layout, pin=False)
     output = tlx.require_layout(out_ptr + offsets, consumer_layout, pin=False)
     tl.store(output, result)
@@ -963,7 +964,7 @@ def test_concrete_dot_loop_helper_result_layout_compiles_gfx950():
             "bias_ptr": "*fp32",
             "out_ptr": "*fp32",
         },
-        constexprs={"CAST_BEFORE_RELEASE": False},
+        constexprs={"CAST_BEFORE_RELEASE": False, "RELAXED_RELEASE": False},
     )
     assert "amdgcn" in compiled.asm
     assert "scf.for" in compiled.asm["ttir"]
@@ -971,7 +972,8 @@ def test_concrete_dot_loop_helper_result_layout_compiles_gfx950():
     assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
 
 
-def test_release_layout_accepts_cast_helper_result_gfx950():
+@pytest.mark.parametrize("relaxed", [False, True])
+def test_release_layout_accepts_cast_helper_result_gfx950(relaxed):
     module = make_ir_for_target(
         _concrete_dot_loop_helper_kernel,
         signature={
@@ -980,14 +982,15 @@ def test_release_layout_accepts_cast_helper_result_gfx950():
             "bias_ptr": "*fp32",
             "out_ptr": "*bf16",
         },
-        constexprs={"CAST_BEFORE_RELEASE": True},
+        constexprs={"CAST_BEFORE_RELEASE": True, "RELAXED_RELEASE": relaxed},
         target=GFX950,
     )
     ttir = str(module)
     assert "tt.call" in ttir
     assert "arith.addf" in ttir
     assert "arith.truncf" in ttir
-    assert "tlx.release_layout" in ttir
+    release_line = next(line for line in ttir.splitlines() if "tlx.release_layout" in line)
+    assert ("relaxed = true" in release_line) == relaxed
     assert ttir.index("arith.truncf") < ttir.index("tlx.release_layout")
 
 
@@ -1130,6 +1133,89 @@ def _buffer_load_contiguity_kernel(x_ptr, y_ptr):
     offsets = tlx.require_layout(offsets, load_layout, pin=False)
     values = tlx.buffer_load(x_ptr, offsets, contiguity=4)
     tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _buffer_load_to_local_contiguity_kernel(
+    x_ptr,
+    mask_boundary,
+    CONTIGUITY: tl.constexpr,
+):
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(512, 16)],
+        [32, 16],
+        order=[1, 0],
+    )
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    pair_boundary = mask_boundary - mask_boundary % 2
+    mask = (k[:, None] < 32) & (m[None, :] < pair_boundary)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1, layout=shared_layout)
+    tlx.buffer_load_to_local(
+        tlx.local_view(buffer, 0),
+        x_ptr,
+        offsets,
+        mask=mask,
+        contiguity=CONTIGUITY,
+    )
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_contiguity_kernel,
+        signature={
+            "x_ptr": "*bf16",
+            "mask_boundary": "i32",
+            "CONTIGUITY": "constexpr",
+        },
+        constexprs={"CONTIGUITY": 2},
+    )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 2" in ttgir
+    assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
+
+
+@pytest.mark.parametrize("contiguity", [0, 3, True], ids=["zero", "non-power-of-two", "bool"])
+def test_buffer_load_to_local_rejects_invalid_contiguity_gfx950(contiguity):
+    with pytest.raises(CompilationError, match="contiguity must be a positive power of two"):
+        compile_for_gfx950(
+            _buffer_load_to_local_contiguity_kernel,
+            signature={
+                "x_ptr": "*bf16",
+                "mask_boundary": "i32",
+                "CONTIGUITY": "constexpr",
+            },
+            constexprs={"CONTIGUITY": contiguity},
+        )
+
+
+@triton.jit
+def _buffer_load_to_local_unpinned_contiguity_kernel(x_ptr):
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1)
+    tlx.buffer_load_to_local(
+        tlx.local_view(buffer, 0),
+        x_ptr,
+        offsets,
+        contiguity=2,
+    )
+
+
+def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
+    with pytest.raises(
+            RuntimeError,
+            match="contiguity > 1 requires a directly indexed user-pinned padded_shared destination",
+    ):
+        compile_for_gfx950(
+            _buffer_load_to_local_unpinned_contiguity_kernel,
+            signature={"x_ptr": "*bf16"},
+            constexprs={},
+        )
 
 
 @triton.jit
@@ -2880,7 +2966,15 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
         )
     else:
         assert dummy_clamps[0] == "%c0_i32"
-    assert ttgir.count("tlx.rematerialize_coordinates_group = 21 : i32") == (9 if causal else 0)
+    group_marker = "tlx.rematerialize_coordinates_group = 21 : i32"
+    expected_group_count = 9 if causal else 0
+    assert ttgir.count(group_marker) == expected_group_count
+    grouped_local_loads = re.findall(
+        rf"^\s*%.* = ttg\.local_load .*{re.escape(group_marker)}",
+        ttgir,
+        re.MULTILINE,
+    )
+    assert len(grouped_local_loads) == expected_group_count
     assert "amdgcn" in compiled.asm
 
 

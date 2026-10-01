@@ -219,6 +219,7 @@ def buffer_load_to_local(
     mask=None,
     other=None,
     cache_modifier: str = "",
+    contiguity=1,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -232,11 +233,12 @@ def buffer_load_to_local(
     a compile-time error unless the following requirements are met:
     - Each thread's load must reach a supported direct-to-LDS width (32 or 128
       bits, e.g. 2 or 8 fp16 elements). A smaller vectorization cannot be lowered.
-    - The alignment needed for that width must be statically provable.
+    - The alignment needed for that width must be statically provable or
+      guaranteed by `contiguity`.
     - If `mask` is given it must be aligned to the vector width: each group of
-      (vector width) consecutive mask values must be identical. The copy moves
-      each lane's whole vector in one transaction, so a mask whose boundary cannot
-      be proven vector-aligned (e.g. `offs < K` for runtime `K`) cannot lower.
+      (vector width) consecutive mask values must be identical. When analysis
+      cannot prove this for a dynamic boundary, `contiguity` is a trusted
+      assertion that the pointer, offsets, and mask satisfy that width.
 
     Args:
         dest: Destination buffer in shared memory (buffered_tensor).
@@ -245,8 +247,18 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
+        contiguity: Trusted positive power-of-two lower bound on contiguous
+            elements available for vectorization, including mask uniformity.
+            It must divide the number of elements owned by each thread and be
+            legal for the destination shared-memory layout. Values greater
+            than one require ``dest`` to be the allocation itself or a direct
+            ``local_view`` of a user-pinned padded shared-memory layout.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -265,7 +277,7 @@ def buffer_load_to_local(
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
-                                                           other_handle, cache_mod)
+                                                           other_handle, cache_mod, contiguity)
     return tlx.async_token(handle)
 
 
@@ -1083,30 +1095,36 @@ def local_load(
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
-        output = _semantic.builder.create_release_layout(load_handle)
+        output = _semantic.builder.create_release_layout(load_handle, relaxed=True)
         return tl.tensor(output, block_type)
     else:
+        is_hip = _semantic.builder.options.backend_name == "hip"
+        synced_via_async_wait = (token is not None or relaxed) and is_hip
+        rematerialize_coordinates = rematerialize_coordinates and is_hip
+        rematerialize_coordinates_group = rematerialize_coordinates_group if is_hip else None
         if layout is not None:
             # Pin the load result to the requested register layout, wrapped as a
             # user layout so remove-layout-conversions anchors it (won't rewrite
             # it to a "preferred" layout). Unlike require_layout, this survives
             # even when the only consumer is layout-flexible.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
-            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None,
-                                                         layoutEncoding=enc)
-        else:
-            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
-        result = tl.tensor(output, block_type)
-        if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
-        if rematerialize_coordinates and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("tlx.rematerialize_coordinates", _semantic.builder.get_unit_attr())
-        if rematerialize_coordinates_group is not None and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr(
-                "tlx.rematerialize_coordinates_group",
-                _semantic.builder.get_int32_attr(rematerialize_coordinates_group),
+            output = _semantic.builder.create_local_load(
+                src.handle,
+                token.handle if token else None,
+                layoutEncoding=enc,
+                syncedViaAsyncWait=synced_via_async_wait,
+                rematerializeCoordinates=rematerialize_coordinates,
+                rematerializeCoordinatesGroup=rematerialize_coordinates_group,
             )
-        return result
+        else:
+            output = _semantic.builder.create_local_load(
+                src.handle,
+                token.handle if token else None,
+                syncedViaAsyncWait=synced_via_async_wait,
+                rematerializeCoordinates=rematerialize_coordinates,
+                rematerializeCoordinatesGroup=rematerialize_coordinates_group,
+            )
+        return tl.tensor(output, block_type)
 
 
 @tl.builtin

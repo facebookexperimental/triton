@@ -835,6 +835,11 @@ LogicalResult ConcatOp::verify() {
 }
 
 LogicalResult BufferLoadToLocalOp::verify() {
+  if (failed(verifyBufferContiguity(
+          getOperation(), cast<RankedTensorType>(getOffsets().getType()),
+          getContiguity())))
+    return failure();
+
   auto mod = getOperation()->getParentOfType<ModuleOp>();
   if (!mod)
     return success();
