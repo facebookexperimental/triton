@@ -932,6 +932,7 @@ class TestDenseFABackwardSupportGfx950(unittest.TestCase):
     "Need the public PyTorch registry and AMD MI350X (gfx950)",
 )
 class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
+
     @staticmethod
     def _run_sdpa_grads(query, key, value, grad_out, *, causal, enable_gqa, attention_mask=None):
         from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -1186,6 +1187,7 @@ class TestTLXFlashAttentionProviderGfx950(unittest.TestCase):
     "Need the public PyTorch registry",
 )
 class TestTLXFlashAttentionProviderMultiGfx950(unittest.TestCase):
+
     def test_direct_aten_backward_switches_to_query_device_and_restores_current_device(self):
         gfx950_devices = _gfx950_device_indices()
         if len(gfx950_devices) < 2:

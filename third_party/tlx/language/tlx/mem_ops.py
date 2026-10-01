@@ -505,7 +505,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout._tlx_user_pinned = True
                 layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
         elif isinstance(
-            layout,
+                layout,
             (
                 tlx.tensor_memory_layout_encoding,
                 tlx.tensor_memory_scales_layout_encoding,
@@ -513,11 +513,9 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         ):
             layout_handle = layout.to_ir(_semantic.builder)
         else:
-            raise TypeError(
-                "`layout` for tensor memory must be a tlx.tensor_memory_layout_encoding "
-                "or tlx.tensor_memory_scales_layout_encoding, "
-                f"got {type(layout).__name__}"
-            )
+            raise TypeError("`layout` for tensor memory must be a tlx.tensor_memory_layout_encoding "
+                            "or tlx.tensor_memory_scales_layout_encoding, "
+                            f"got {type(layout).__name__}")
 
     alias_handle = None
     shared_buffer_handle = None
@@ -1384,17 +1382,12 @@ def local_reinterpret(
     encoding = None
     if layout is not None:
         assert isinstance(src, tlx.buffered_tensor)
-        is_smem_layout = src.type.storage == tlx.storage_kind.smem and isinstance(
-            layout, tlx.shared_layout_encoding
-        )
-        is_tmem_scales_layout = (
-            src.type.storage == tlx.storage_kind.tmem
-            and isinstance(layout, tlx.tensor_memory_scales_layout_encoding)
-        )
+        is_smem_layout = src.type.storage == tlx.storage_kind.smem and isinstance(layout, tlx.shared_layout_encoding)
+        is_tmem_scales_layout = (src.type.storage == tlx.storage_kind.tmem
+                                 and isinstance(layout, tlx.tensor_memory_scales_layout_encoding))
         assert is_smem_layout or is_tmem_scales_layout, (
             "TLX local_reinterpret only supports explicit shared-memory layouts "
-            "or the tensor-memory scales layout"
-        )
+            "or the tensor-memory scales layout")
         encoding = layout.to_ir(_semantic.builder)
         # Match local_alloc's explicit-layout contract for SMEM. TMEM scales
         # already use a concrete hardware encoding and need no user wrapper.

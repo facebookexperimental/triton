@@ -3228,6 +3228,7 @@ def _quantize_mxfp8_32x32_operand(ref):
         swizzled_to_tma_preshuffled(swapped_scale.view(torch.float8_e8m0fnu), HEAD_DIM, N_CTX, 32, Z * H),
     )
 
+
 def _quantize_mxfp8_operand(ref, transpose_for_reduction=False):
     """Quantize a BF16 operand to E4M3 data and TMA-preshuffled E8M0 scales."""
     if MXTensor is None or ScaleCalculationMode is None:

@@ -134,7 +134,8 @@ for actual, expected in zip((q.grad, k.grad, v.grad), (rq.grad, rk.grad, rv.grad
     assert relative_l2.item() < 5e-3
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, str(previous_device), str(query_device)],
+        [sys.executable, "-c", script, str(previous_device),
+         str(query_device)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -334,7 +335,7 @@ def test_flash_attn_gfx950_short_d128_forward_and_backward(causal, exact, monkey
         ("dq", "dk", "dv"),
         (q.grad, k.grad, v.grad),
         (rq.grad, rk.grad, rv.grad),
-        strict=True,
+            strict=True,
     ):
         assert torch.isfinite(actual).all(), name
         relative_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
