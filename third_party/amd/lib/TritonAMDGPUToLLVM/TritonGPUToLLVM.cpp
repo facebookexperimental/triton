@@ -404,8 +404,10 @@ struct ConvertTritonAMDGPUToLLVM
                       commonBenefit);
 
     auto coordinateGroups = std::make_shared<DistributedCoordinateGroups>();
+    AMD::ScheduledMfmaLoweringState scheduledMfmaState;
     AMD::populateMemoryOpToLLVMPatterns(typeConverter, patterns, targetInfo,
-                                        AMDBenefit, coordinateGroups);
+                                        AMDBenefit, coordinateGroups,
+                                        scheduledMfmaState);
     mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
                                                  patterns, commonBenefit,
                                                  std::move(coordinateGroups));
@@ -457,6 +459,7 @@ struct ConvertTritonAMDGPUToLLVM
       return signalPassFailure();
     }
 
+    AMD::finalizeScheduledMfmaLowering(scheduledMfmaState);
     AMD::adjustModeRegister(mod, targetInfo);
     fixUpLoopAnnotation(mod);
 

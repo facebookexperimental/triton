@@ -355,6 +355,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 // Pin C/D around the whole two-step K chain, retaining the native A/B tuples.
 // Persistent C/D pins anchor both ends of a nonconstant chain to side-effect ordering.
+// Returning D outside the analyzed function requires completion at its pin.
 // Transposition swaps the pinned logical A/B operands at the native MFMA.
 // CHECK-LABEL: llvm.func @scheduled_mfma_persistent_agpr
 // CHECK: %[[GC_BITS:.*]] = llvm.bitcast {{.*}} : vector<4xf32> to vector<4xi32>
@@ -371,7 +372,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // CHECK: %[[GB1:.*]] = llvm.bitcast %[[GB1_PIN]] : vector<4xi32> to vector<8xbf16>
 // CHECK: %[[GD1:.*]] = rocdl.mfma.f32.16x16x32.bf16 %[[GB1]], %[[GA1]], %[[GD0]], 0, 0, {{.*}}
 // CHECK: %[[GD_BITS:.*]] = llvm.bitcast %[[GD1]] : vector<4xf32> to vector<4xi32>
-// CHECK: %[[GD_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "", "=a,0" %[[GD_BITS]] : (vector<4xi32>) -> vector<4xi32>
+// CHECK: %[[GD_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "s_nop 11", "=a,0" %[[GD_BITS]] : (vector<4xi32>) -> vector<4xi32>
 // CHECK: llvm.bitcast %[[GD_PIN]] : vector<4xi32> to vector<4xf32>
 // CHECK-NOT: "v_mfma
 // CHECK: llvm.return
@@ -412,7 +413,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // CONSTANT-C-NOT: llvm.inline_asm{{.*}}"=a,0"
 // CONSTANT-C: %[[C_D1:.*]] = rocdl.mfma.f32.16x16x32.bf16 {{.*}}, {{.*}}, %[[C_D0]], 0, 0, {{.*}}
 // CONSTANT-C: %[[C_D_BITS:.*]] = llvm.bitcast %[[C_D1]] : vector<4xf32> to vector<4xi32>
-// CONSTANT-C: %[[C_D_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "", "=a,0" %[[C_D_BITS]] : (vector<4xi32>) -> vector<4xi32>
+// CONSTANT-C: %[[C_D_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "s_nop 11", "=a,0" %[[C_D_BITS]] : (vector<4xi32>) -> vector<4xi32>
 // CONSTANT-C: llvm.bitcast %[[C_D_PIN]] : vector<4xi32> to vector<4xf32>
 // CONSTANT-C-NOT: llvm.inline_asm{{.*}}"=a,0"
 // CONSTANT-C-NOT: "v_mfma
@@ -451,7 +452,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // CHECK: %[[VB:.*]] = llvm.bitcast %[[VB_PIN]] : vector<4xi32> to vector<8xbf16>
 // CHECK: %[[VD:.*]] = rocdl.mfma.f32.32x32x16.bf16 %[[VA]], %[[VB]], %[[VC]], 0, 0, {{.*}}
 // CHECK: %[[VD_BITS:.*]] = llvm.bitcast %[[VD]] : vector<16xf32> to vector<16xi32>
-// CHECK: %[[VD_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "", "=v,0" %[[VD_BITS]] : (vector<16xi32>) -> vector<16xi32>
+// CHECK: %[[VD_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "s_nop 15\0As_nop 3", "=v,0" %[[VD_BITS]] : (vector<16xi32>) -> vector<16xi32>
 // CHECK: llvm.bitcast %[[VD_PIN]] : vector<16xi32> to vector<16xf32>
 // CHECK-NOT: "v_mfma
 // CHECK: llvm.return
@@ -488,7 +489,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // CHECK-NOT: llvm.inline_asm{{.*}}"=a,0"
 // CHECK: %[[ID1:.*]] = rocdl.mfma.f32.16x16x32.bf16 {{.*}}, {{.*}}, %[[ID0]], 0, 0, {{.*}}
 // CHECK: %[[ID_BITS:.*]] = llvm.bitcast %[[ID1]] : vector<4xf32> to vector<4xi32>
-// CHECK: %[[ID_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "", "=a,0" %[[ID_BITS]] : (vector<4xi32>) -> vector<4xi32>
+// CHECK: %[[ID_PIN:.*]] = llvm.inline_asm has_side_effects asm_dialect = att{{.*}} "s_nop 11", "=a,0" %[[ID_BITS]] : (vector<4xi32>) -> vector<4xi32>
 // CHECK: llvm.bitcast %[[ID_PIN]] : vector<4xi32> to vector<4xf32>
 // CHECK-NOT: "v_mfma
 // CHECK: llvm.return

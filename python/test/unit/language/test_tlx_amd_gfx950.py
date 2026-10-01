@@ -469,6 +469,59 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
 
 
 @triton.jit
+def _amd_scheduled_mfma_opaque_consumer_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    iterations,
+    CONSUMER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :]), dot1, pin=False)
+    acc = tlx.zeros((16, 16), tl.float32, layout=mma)
+    if CONSUMER == "if":
+        if iterations != 0:
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                         initialize=True)
+    elif CONSUMER == "loop":
+        for _ in range(iterations):
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr")
+    else:
+        acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                     initialize=True)
+
+    if CONSUMER == "layout":
+        acc = tlx.require_layout(tlx.release_layout(acc), mma, pin=False)
+    elif CONSUMER == "reshape":
+        acc = tl.reshape(tlx.release_layout(acc), [256])
+
+    # An opaque instruction reads the native MFMA result without an explicit
+    # commit. The compiler must complete the result before this consumer.
+    if CONSUMER == "native":
+        acc = acc + 1.0
+    else:
+        acc = tl.inline_asm_elementwise("v_add_f32 $0, $1, 1.0", constraints="=v,v", args=[acc], dtype=tl.float32,
+                                        is_pure=False, pack=1)
+
+    if CONSUMER == "reshape":
+        tl.store(output_ptr + tl.arange(0, 256), acc)
+    else:
+        output_offsets = tlx.require_layout(output_ptr + rows[:, None] * 16 + cols[None, :], mma, pin=False)
+        tl.store(output_offsets, acc)
+
+
+@triton.jit
 def _amd_scheduled_mfma_forked_chain_kernel(
     a_ptr,
     b_ptr,
@@ -1729,6 +1782,27 @@ def test_amd_scheduled_mfma_persistent_acc_correct_gfx950(use_vgpr, initialize, 
         matrix_instr_nonkdim=16,
     )
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "consumer,iterations",
+    [("direct", 0), ("layout", 0), ("reshape", 0), ("if", 0), ("if", 2), ("loop", 0), ("loop", 2), ("native", 0)],
+)
+def test_amd_scheduled_mfma_opaque_consumer_correct_gfx950(consumer, iterations):
+    for seed in range(3):
+        torch.manual_seed(seed)
+        a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((32, 16), device="cuda", dtype=torch.bfloat16)
+        actual = torch.full((16, 16), float("nan"), device="cuda", dtype=torch.float32)
+        _amd_scheduled_mfma_opaque_consumer_kernel[(1, )](a, b, actual, iterations, CONSUMER=consumer, num_warps=1,
+                                                          matrix_instr_nonkdim=16)
+        expected = a.float() @ b.float()
+        if consumer == "if":
+            expected *= iterations != 0
+        elif consumer == "loop":
+            expected *= iterations
+        torch.testing.assert_close(actual, expected + 1.0, atol=2e-4, rtol=2e-4)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

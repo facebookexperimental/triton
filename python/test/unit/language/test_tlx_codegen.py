@@ -1775,6 +1775,59 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
 
 
 @triton.jit
+def _amd_scheduled_mfma_opaque_consumer_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    iterations,
+    VERSION: tl.constexpr,
+    INSTR_K: tl.constexpr,
+    CONSUMER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=VERSION,
+        instr_shape=[16, 16, INSTR_K],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=INSTR_K // 4)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=INSTR_K // 4)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, INSTR_K)
+    cols = tl.arange(0, 16)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * INSTR_K + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :]), dot1, pin=False)
+    acc = tlx.zeros((16, 16), tl.float32, layout=mma)
+    if CONSUMER == "if":
+        if iterations != 0:
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                         initialize=True)
+    elif CONSUMER == "loop":
+        for _ in range(iterations):
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr")
+    else:
+        acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                     initialize=True)
+
+    if CONSUMER == "layout":
+        acc = tlx.require_layout(tlx.release_layout(acc), mma, pin=False)
+    elif CONSUMER == "reshape":
+        acc = tl.reshape(tlx.release_layout(acc), [256])
+
+    if CONSUMER == "native":
+        acc = acc + 1.0
+    else:
+        acc = tl.inline_asm_elementwise("v_add_f32 $0, $1, 1.0", constraints="=v,v", args=[acc], dtype=tl.float32,
+                                        is_pure=False, pack=1)
+
+    if CONSUMER == "reshape":
+        tl.store(output_ptr + tl.arange(0, 256), acc)
+    else:
+        output_offsets = tlx.require_layout(output_ptr + rows[:, None] * 16 + cols[None, :], mma, pin=False)
+        tl.store(output_offsets, acc)
+
+
+@triton.jit
 def _load_then_restructure(base, offsets):
     value = tlx.buffer_load(base, offsets)
     value = tl.reshape(value, [4, 4, 16, 2, 2])
@@ -3456,6 +3509,61 @@ def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty, use_vgpr):
         assert re.search(
             r'asm sideeffect "", "=' + register_class + r',0"\(<4 x i32> ' + re.escape(packed.group(1)) + r'\)', llir)
     assert 'asm sideeffect "s_nop' not in llir
+
+
+@pytest.mark.parametrize("target,version,instr_k,wait_states", [(GFX942, 3, 16, 11), (GFX950, 4, 32, 12)],
+                         ids=["gfx942", "gfx950"])
+@pytest.mark.parametrize("consumer", ["direct", "layout", "reshape", "if", "loop", "native"])
+def test_amd_scheduled_mfma_opaque_consumer_completion(target, version, instr_k, wait_states, consumer):
+    src = ASTSource(
+        fn=_amd_scheduled_mfma_opaque_consumer_kernel,
+        signature={
+            "a_ptr": "*bf16",
+            "b_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "iterations": "i32",
+            "VERSION": "constexpr",
+            "INSTR_K": "constexpr",
+            "CONSUMER": "constexpr",
+        },
+        constexprs={"VERSION": version, "INSTR_K": instr_k, "CONSUMER": consumer},
+    )
+    compiled = triton_compile(src, target=target, options={"num_warps": 1})
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.mfma_commit" not in compiled.asm["ttir"]
+    if consumer == "if":
+        assert "scf.if" in ttgir
+    elif consumer == "loop":
+        assert "scf.for" in ttgir
+    llir = compiled.asm["llir"]
+    mfma = re.search(r'call <4 x float> @llvm\.amdgcn\.mfma\.f32\.16x16x' + str(instr_k), llir)
+    assert mfma is not None
+    assert not re.search(r'asm sideeffect "[^"\n]*v_mfma_', llir)
+    waits = list(re.finditer(r'asm sideeffect "([^"\n]*s_nop[^"\n]*)", "([^"\n]*)"', llir))
+    if consumer == "native":
+        assert not waits
+        return
+    opaque_consumer = llir.index('asm sideeffect "v_add_f32')
+    if consumer in ("layout", "reshape"):
+        # Releasing the layout introduces a real LDS transfer. Its native
+        # store consumes D, so the later asm reads the load, not a pending MFMA.
+        after_mfma = ttgir[ttgir.index("amdg.scheduled_mfma"):]
+        assert "ttg.convert_layout" in after_mfma[:after_mfma.index("tt.elementwise_inline_asm")]
+        native_transfer = llir[mfma.end():opaque_consumer]
+        assert re.search(r'store <\d+ x float>.*ptr addrspace\(3\)', native_transfer)
+        assert re.search(r'load <\d+ x float>, ptr addrspace\(3\)', native_transfer)
+        assert not waits
+        return
+
+    assert waits
+    for wait in waits:
+        # Check the completion duration and SSA dependency, independent of how
+        # LLVM schedules the final MFMA and consumer instructions.
+        assert sum(int(count) + 1 for count in re.findall(r's_nop (\d+)', wait.group(1))) >= wait_states
+        assert wait.group(2).startswith("=")
+        assert "0" in wait.group(2).split(",")
+    if consumer == "direct":
+        assert mfma.start() < waits[0].start() < opaque_consumer
 
 
 def test_amd_scheduled_mfma_persistent_acc_native_commit_gfx950():

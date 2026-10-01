@@ -7,6 +7,7 @@
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -14,6 +15,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "llvm/ADT/DenseSet.h"
 #include <type_traits>
 
 
@@ -758,7 +760,8 @@ getScheduledMfmaLoweringInfo(Location loc,
 static FailureOr<Value>
 constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
                                    ConversionPatternRewriter &rewriter,
-                                   Location loc, bool hasSideEffects = false) {
+                                   Location loc, bool hasSideEffects = false,
+                                   LLVM::InlineAsmOp *pin = nullptr) {
   auto fragmentTy = cast<VectorType>(fragment.getType());
   unsigned elementBitWidth =
       getIntOrFloatOrPtrBitWidth(fragmentTy.getElementType());
@@ -780,6 +783,8 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
       hasSideEffects,
       /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
       operandAttrs);
+  if (pin)
+    *pin = identity;
   Value constrained = b.bitcast(identity->getResult(0), fragmentTy);
   return constrained;
 }
@@ -804,6 +809,116 @@ static std::string mfmaWaitStateAsm(int waitStates) {
   if (waitStates <= 16)
     return "s_nop " + std::to_string(waitStates - 1);
   return "s_nop 15\ns_nop " + std::to_string(waitStates - 16 - 1);
+}
+
+// Native consumers are visible to LLVM's hazard recognizer, but an instruction
+// in inline asm is not. Follow result identities through the lowered IR because
+// LLVM can fold even arithmetic (for example, adding zero) back to the MFMA
+// destination. A later MFMA starts a new chain with its own result pin.
+static bool
+needsOpaqueConsumerDrain(Operation *pin, int requiredWait,
+                         const DenseMap<Operation *, int> &commitWaitStates) {
+  SmallVector<Value> worklist(pin->getResults());
+  llvm::SmallDenseSet<Value, 16> visited;
+  auto appendRegionSuccessors = [&](RegionBranchOpInterface branch,
+                                    RegionBranchPoint point, OpOperand &use) {
+    RegionBranchSuccessorMapping mapping;
+    branch.getSuccessorOperandInputMapping(mapping, point);
+    auto found = mapping.find(&use);
+    if (found != mapping.end())
+      llvm::append_range(worklist, found->second);
+  };
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *consumer = use.getOwner();
+      if (consumer->getName().getStringRef().starts_with("rocdl.mfma."))
+        continue;
+
+      if (auto inlineAsm = dyn_cast<LLVM::InlineAsmOp>(consumer)) {
+        auto commit = commitWaitStates.find(consumer);
+        if (commit != commitWaitStates.end()) {
+          if (commit->second >= requiredWait)
+            continue;
+          // The gfx950 live-operand handoff provides only six wait states.
+          // Its output can still need the full result-read delay.
+        } else if (!inlineAsm.getAsmString().empty()) {
+          return true;
+        }
+        llvm::append_range(worklist, consumer->getResults());
+        continue;
+      }
+
+      // Calls and returns can hide a consumer outside this conversion. Invoke
+      // also implements BranchOpInterface, so check it before CFG forwarding.
+      if (isa<LLVM::CallOp, LLVM::CallIntrinsicOp, LLVM::InvokeOp,
+              LLVM::ReturnOp>(consumer))
+        return true;
+
+      if (auto branch = dyn_cast<BranchOpInterface>(consumer)) {
+        for (unsigned i = 0; i < consumer->getNumSuccessors(); ++i) {
+          SuccessorOperands operands = branch.getSuccessorOperands(i);
+          OperandRange forwarded = operands.getForwardedOperands();
+          if (forwarded.empty())
+            continue;
+          unsigned begin = forwarded.getBeginOperandIndex();
+          unsigned index = use.getOperandNumber();
+          if (index >= begin && index - begin < forwarded.size())
+            worklist.push_back(consumer->getSuccessor(i)->getArgument(
+                operands.getProducedOperandCount() + index - begin));
+        }
+        continue;
+      }
+
+      // warp_predicate has capture-only regions and no region branch
+      // interface. Its init values bypass the body on inactive lanes.
+      if (auto predicate = dyn_cast<triton::gpu::WarpPredicateOp>(consumer)) {
+        unsigned index = use.getOperandNumber();
+        if (index != 0)
+          worklist.push_back(predicate.getResult(index - 1));
+        continue;
+      }
+      if (auto yield = dyn_cast<triton::gpu::PredicateYieldOp>(consumer)) {
+        worklist.push_back(
+            yield->getParentOp()->getResult(use.getOperandNumber()));
+        continue;
+      }
+
+      // This includes warp_specialize partition captures and warp_yield, as
+      // well as SCF loop-carried values and conditional results.
+      if (auto branch = dyn_cast<RegionBranchOpInterface>(consumer)) {
+        appendRegionSuccessors(branch, RegionBranchPoint::parent(), use);
+        continue;
+      }
+      if (auto terminator =
+              dyn_cast<RegionBranchTerminatorOpInterface>(consumer)) {
+        auto parent =
+            dyn_cast<RegionBranchOpInterface>(consumer->getParentOp());
+        if (!parent)
+          return true;
+        appendRegionSuccessors(parent, RegionBranchPoint(terminator), use);
+        continue;
+      }
+
+      // Aggregates, vector operations, casts, selects, and native arithmetic
+      // can all preserve the destination through LLVM optimization. Native
+      // stores have no results and naturally terminate the traversal.
+      if (consumer->getNumRegions() == 0 &&
+          (isa_and_nonnull<LLVM::LLVMDialect, ROCDL::ROCDLDialect>(
+               consumer->getDialect()) ||
+           isa<UnrealizedConversionCastOp>(consumer))) {
+        llvm::append_range(worklist, consumer->getResults());
+        continue;
+      }
+
+      // An unmodeled operation or region may let the destination escape.
+      return true;
+    }
+  }
+  return false;
 }
 
 class RematerializedRangeOpConversion
@@ -1065,10 +1180,11 @@ public:
 
   MfmaCommitOpConversion(const LLVMTypeConverter &converter,
                          const AMD::TargetInfo &targetInfo,
+                         AMD::ScheduledMfmaLoweringState &scheduledMfmaState,
                          PatternBenefit benefit)
       : ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp>(converter,
                                                              benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), scheduledMfmaState(scheduledMfmaState) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::MfmaCommitOp op, OpAdaptor adaptor,
@@ -1262,11 +1378,13 @@ public:
           cast<RankedTensorType>(op.getOutputs()[inputIndex].getType())));
     }
     rewriter.replaceOp(op, results);
+    scheduledMfmaState.commitWaitStates[inlineAsm] = waitStates;
     return success();
   }
 
 private:
   const AMD::TargetInfo &targetInfo;
+  AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
 };
 
 class ScheduledMfmaOpConversion
@@ -1276,10 +1394,11 @@ public:
 
   ScheduledMfmaOpConversion(const LLVMTypeConverter &converter,
                             const AMD::TargetInfo &targetInfo,
+                            AMD::ScheduledMfmaLoweringState &scheduledMfmaState,
                             PatternBenefit benefit)
       : ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaOp>(converter,
                                                                 benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), scheduledMfmaState(scheduledMfmaState) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::ScheduledMfmaOp op, OpAdaptor adaptor,
@@ -1367,6 +1486,16 @@ public:
           LLVM::ConstantOp::create(rewriter, loc, fragmentTy, zeroElements);
     }
     bool isPersistent = op.getAccumulatorRole() == "persistent";
+    int drainWaitStates = 0;
+    if (isPersistent) {
+      FailureOr<int> requiredWait =
+          getMfmaDrainWaitStates(targetInfo.getISAFamily(), instrShape);
+      if (failed(requiredWait))
+        return rewriter.notifyMatchFailure(
+            op, "persistent MFMA layout has no modeled result-read hazard "
+                "requirement");
+      drainWaitStates = *requiredWait;
+    }
     bool pinAccumulatorInput = isPersistent && !op.getInitialize() &&
                                !matchPattern(op.getAcc(), m_Constant());
 
@@ -1438,17 +1567,20 @@ public:
       }
     }
 
+    SmallVector<LLVM::InlineAsmOp> resultPins;
     if (isPersistent) {
       for (Value &fragment : updatedFragments) {
         // Anchor each completed K chain to side-effect ordering while keeping
         // its arithmetic in native MFMAs.
+        LLVM::InlineAsmOp pin;
         FailureOr<Value> constrainedD = constrainMfmaFragmentRegisterClass(
             fragment, accumulatorStorage, rewriter, loc,
-            /*hasSideEffects=*/true);
+            /*hasSideEffects=*/true, &pin);
         if (failed(constrainedD))
           return rewriter.notifyMatchFailure(
               op, "native MFMA result must pack into complete 32-bit registers");
         fragment = *constrainedD;
+        resultPins.push_back(pin);
       }
     }
 
@@ -1465,11 +1597,14 @@ public:
     Value result = packTensorElements(loc, typeConverter, elements, rewriter,
                                       op.getResult().getType());
     rewriter.replaceOp(op, result);
+    for (LLVM::InlineAsmOp pin : resultPins)
+      scheduledMfmaState.resultPins.emplace_back(pin, drainWaitStates);
     return success();
   }
 
 private:
   const AMD::TargetInfo &targetInfo;
+  AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
 };
 
 class BarrierOpConversion
@@ -1645,10 +1780,24 @@ private:
 
 } // namespace
 
+void mlir::triton::AMD::finalizeScheduledMfmaLowering(
+    const ScheduledMfmaLoweringState &state) {
+  SmallVector<std::pair<Operation *, int>> needsDrain;
+  for (auto [pin, requiredWait] : state.resultPins)
+    if (needsOpaqueConsumerDrain(pin, requiredWait, state.commitWaitStates))
+      needsDrain.emplace_back(pin, requiredWait);
+
+  // Analyze every root before changing any asm: otherwise an upgraded pin
+  // could appear to be an opaque consumer of a different root.
+  for (auto [pin, requiredWait] : needsDrain)
+    cast<LLVM::InlineAsmOp>(pin).setAsmString(mfmaWaitStateAsm(requiredWait));
+}
+
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfo &targetInfo, PatternBenefit benefit,
-    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups,
+    ScheduledMfmaLoweringState &scheduledMfmaState) {
   PatternBenefit transBenefit = PatternBenefit(benefit.getBenefit() + 1);
   PatternBenefit barrierBenefit = PatternBenefit(benefit.getBenefit() + 1);
 
@@ -1664,7 +1813,7 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
   patterns.add<RegisterResidentOpConversion, RegisterClassAnchorOpConversion>(
       typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
-      typeConverter, targetInfo, transBenefit);
+      typeConverter, targetInfo, scheduledMfmaState, transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(
       typeConverter, targetInfo, barrierBenefit);
 }

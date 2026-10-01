@@ -158,19 +158,23 @@ def amd_scheduled_mfma(
     chain carried across phases. Both roles use native ROCDL MFMA intrinsics,
     exposing arithmetic latency and hazards to LLVM.
 
-    Persistent chains use empty inline assembly to constrain operand register
+    Persistent chains use inline assembly to constrain operand register
     classes. ``resident_operand=0`` or ``1`` selects the left or right input
     for AGPR placement; other inputs use VGPRs. ``accumulator_register_class``
     may select ``"agpr"`` or ``"vgpr"``, and persistent ``auto`` selects AGPRs.
     Persistent accumulator tuples are pinned after all K updates; nonconstant
     input accumulators are also pinned before the updates when ``initialize``
     is false. These side-effecting accumulator pins constrain compiler-side
-    ordering. Empty pins provide no hardware wait or memory fence.
+    ordering. For native-only consumer chains, the pins are empty and provide
+    no hardware wait. If a persistent result reaches opaque inline assembly or
+    an unmodeled escape without a sufficient explicit commit, affected result
+    pins include a target-specific completion wait. Neither form is a memory
+    fence.
 
     The transient path does not apply these class constraints and leaves
     physical placement to LLVM; use :func:`amd_register_resident` for a hard
-    source residency point. Completion boundaries with live dependencies are
-    represented separately by :func:`amd_mfma_commit`.
+    source residency point. Use :func:`amd_mfma_commit` for explicit completion
+    boundaries with live dependencies.
 
     CDNA3 retains its VGPR-only accumulator contract, so a persistent chain on
     gfx942 must pass ``accumulator_register_class="vgpr"``. The inputs must be

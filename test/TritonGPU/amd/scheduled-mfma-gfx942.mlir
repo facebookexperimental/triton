@@ -227,3 +227,87 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+// -----
+
+// Opaque assembly needs completion even through value forwarding. Native MFMA
+// arithmetic and tied VGPR placement remain visible to the backend.
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: llvm.func @opaque_consumer_direct
+  // CHECK: rocdl.mfma.f32.16x16x16bf16.1k
+  // CHECK: llvm.inline_asm has_side_effects
+  // CHECK-SAME: "s_nop 10", "=v,0"
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_direct(
+      %a: tensor<16x16xbf16, #lhs>, %b: tensor<16x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x16xbf16, #lhs>, tensor<16x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %out = tt.elementwise_inline_asm "v_add_f32 $0, $1, 1.0"
+        {constraints = "=v,v", packed_element = 1 : i32, pure = false}
+        %result : tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+
+  // CHECK-LABEL: llvm.func @opaque_consumer_full_commit
+  // CHECK: rocdl.mfma.f32.16x16x16bf16.1k
+  // CHECK: llvm.inline_asm has_side_effects
+  // CHECK-SAME: "", "=v,0"
+  // CHECK: llvm.inline_asm has_side_effects
+  // CHECK-SAME: "s_nop 10", "=a,0,~{memory}"
+  // CHECK-NOT: "s_nop
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_full_commit(
+      %a: tensor<16x16xbf16, #lhs>, %b: tensor<16x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x16xbf16, #lhs>, tensor<16x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %ready = amdg.mfma_commit %result : tensor<16x16xf32, #mma>
+    %out = tt.elementwise_inline_asm "v_add_f32 $0, $1, 1.0"
+        {constraints = "=v,v", packed_element = 1 : i32, pure = false}
+        %ready : tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+
+}
+
+// -----
+
+// A 32x32 destination needs more than the maximum single s_nop delay.
+// CHECK-LABEL: llvm.func @opaque_consumer_32x32
+// CHECK: rocdl.mfma.f32.32x32x8bf16.1k
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 15\0As_nop 2", "=v,0"
+// CHECK: llvm.inline_asm has_side_effects {{.*}} "v_add_f32 $0, $1, 1.0"
+// CHECK: llvm.return
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [32, 32, 8], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @opaque_consumer_32x32(
+      %a: tensor<32x8xbf16, #lhs>, %b: tensor<8x32xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<32x32xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<32x8xbf16, #lhs>, tensor<8x32xbf16, #rhs>,
+          tensor<32x32xf32, #mma> -> tensor<32x32xf32, #mma>
+    %out = tt.elementwise_inline_asm "v_add_f32 $0, $1, 1.0"
+        {constraints = "=v,v", packed_element = 1 : i32, pure = false}
+        %result : tensor<32x32xf32, #mma> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+}
