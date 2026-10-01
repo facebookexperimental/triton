@@ -136,6 +136,40 @@ void LayoutBackwardPropagation::visitWarpSpecRegionArgs(
   }
 }
 
+static bool hasExplicitLayoutUserThroughAliases(Value root) {
+  auto isAliasLike = [](Operation *op) {
+    return isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
+               ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+               ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+               ttng::TMEMSubSliceOp>(op);
+  };
+
+  SmallVector<Value> worklist = {root};
+  SmallVector<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (llvm::is_contained(visited, value))
+      continue;
+    visited.push_back(value);
+
+    if (Operation *def = value.getDefiningOp(); def && isAliasLike(def)) {
+      for (Value operand : def->getOperands())
+        if (isa<ttg::MemDescType>(operand.getType()))
+          worklist.push_back(operand);
+    }
+    for (Operation *user : value.getUsers()) {
+      if (isa<RequireLayoutOp>(user))
+        return true;
+      if (!isAliasLike(user))
+        continue;
+      for (Value result : user->getResults())
+        if (isa<ttg::MemDescType>(result.getType()))
+          worklist.push_back(result);
+    }
+  }
+  return false;
+}
+
 LogicalResult LayoutBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<LayoutEncodingLattice *> operands,
     ArrayRef<const LayoutEncodingLattice *> results) {
@@ -282,8 +316,11 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
     auto srcType = cast<ttg::MemDescType>(tmemCopyOp.getSrc().getType());
     auto dstType = cast<ttg::MemDescType>(tmemCopyOp.getDst().getType());
     auto dstLattice = operands[1];
+    bool hasExplicitLayoutUser =
+        hasExplicitLayoutUserThroughAliases(tmemCopyOp.getDst());
     if (isa<DummyTMEMLayoutAttr>(dstType.getEncoding()) &&
-        dstType.getRank() == 2 && srcType.getElementType().isInteger(8) &&
+        !hasExplicitLayoutUser && dstType.getRank() == 2 &&
+        srcType.getElementType().isInteger(8) &&
         dstType.getElementType().isInteger(8)) {
       auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(op->getContext(), 2);
       auto scalesEncoding = ttng::TensorMemoryScalesEncodingAttr::get(

@@ -30,6 +30,74 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#shared_a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
+#shared_b = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#shared_scale = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
+#shared_barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem_acc = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1, ctaMode = twocta_rhs>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
+  // CHECK-LABEL: two_cta_m64_scale_publication
+  // CHECK-NOT: ttng.cluster_barrier
+  // CHECK: %[[A_SCALE:.*]] = ttng.tmem_alloc
+  // CHECK: ttng.tmem_copy {{.*}}, %[[A_SCALE]]
+  // CHECK: %[[B_SCALE:.*]] = ttng.tmem_alloc
+  // CHECK: ttg.memdesc_reinterpret
+  // CHECK: ttg.local_load
+  // CHECK: ttng.tmem_store {{.*}}, %[[B_SCALE]]
+  // CHECK: ttng.arrive_barrier {{.*}}#ttng.shared_cluster_memory
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK: ttng.tc_gen5_mma_scaled {{.*}}, %[[A_SCALE]], %[[B_SCALE]]
+  // CHECK-NOT: ttng.cluster_barrier
+  tt.func public @two_cta_m64_scale_publication(
+      %a: !ttg.memdesc<64x128xf8E4M3FN, #shared_a, #smem>,
+      %b: !ttg.memdesc<128x64xf8E4M3FN, #shared_b, #smem>,
+      %acc: !ttg.memdesc<64x128xf32, #tmem_acc, #ttng.tensor_memory, mutable>,
+      %a_scale: !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>,
+      %b_scale: !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>,
+      %publication_barrier: !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>,
+      %mma_barrier: !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>,
+      %publication_phase: i32) {
+    %true = arith.constant true
+    %false = arith.constant false
+    %phase = arith.constant 0 : i32
+    %cta_rank = "nvg.cluster_id"() : () -> i32
+    %is_cta0 = arith.cmpi eq, %cta_rank, %phase : i32
+    %remote_barrier = ttng.map_to_remote_buffer %publication_barrier, %phase : !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #shared_barrier, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %remote_barrier, 1 : !ttg.memdesc<1xi64, #shared_barrier, #ttng.shared_cluster_memory, mutable>
+    ttng.wait_barrier %publication_barrier, %publication_phase, %is_cta0 : !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>
+    ttng.tc_gen5_mma_scaled %a, %b, %acc, %a_scale, %b_scale, %false, %true lhs = e4m3 rhs = e4m3, %mma_barrier[%true] {is_async, two_ctas} : !ttg.memdesc<64x128xf8E4M3FN, #shared_a, #smem>, !ttg.memdesc<128x64xf8E4M3FN, #shared_b, #smem>, !ttg.memdesc<64x128xf32, #tmem_acc, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>, !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>, !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: two_cta_m64_scale_publication_phase_one
+  // CHECK: ttng.wait_barrier {{.*}}, %[[PHASE_ONE:.*]]
+  // CHECK: ttng.tc_gen5_mma_scaled
+  tt.func public @two_cta_m64_scale_publication_phase_one(
+      %a: !ttg.memdesc<64x128xf8E4M3FN, #shared_a, #smem>,
+      %b: !ttg.memdesc<128x64xf8E4M3FN, #shared_b, #smem>,
+      %acc: !ttg.memdesc<64x128xf32, #tmem_acc, #ttng.tensor_memory, mutable>,
+      %a_scale: !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>,
+      %b_scale: !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>,
+      %publication_barrier: !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>,
+      %mma_barrier: !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>) {
+    %true = arith.constant true
+    %false = arith.constant false
+    %phase0 = arith.constant 0 : i32
+    %phase1 = arith.constant 1 : i32
+    %cta_rank = "nvg.cluster_id"() : () -> i32
+    %is_cta0 = arith.cmpi eq, %cta_rank, %phase0 : i32
+    %remote_barrier = ttng.map_to_remote_buffer %publication_barrier, %phase0 : !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #shared_barrier, #ttng.shared_cluster_memory, mutable>
+    ttng.arrive_barrier %remote_barrier, 1 : !ttg.memdesc<1xi64, #shared_barrier, #ttng.shared_cluster_memory, mutable>
+    ttng.wait_barrier %publication_barrier, %phase1, %is_cta0 : !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>
+    ttng.tc_gen5_mma_scaled %a, %b, %acc, %a_scale, %b_scale, %false, %true lhs = e4m3 rhs = e4m3, %mma_barrier[%true] {is_async, two_ctas} : !ttg.memdesc<64x128xf8E4M3FN, #shared_a, #smem>, !ttg.memdesc<128x64xf8E4M3FN, #shared_b, #smem>, !ttg.memdesc<64x128xf32, #tmem_acc, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>, !ttg.memdesc<1x1x1x2x256xi8, #shared_scale, #smem>, !ttg.memdesc<1xi64, #shared_barrier, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #sharedT = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
@@ -55,6 +123,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: ttng.tmem_copy {{.*}}, %[[B_SC_TMEM]]
     // CHECK: ttng.tc_gen5_mma_scaled {{.*}}, %[[A_SC_TMEM]], %[[B_SC_TMEM]]
     ttng.tc_gen5_mma_scaled %A_sh, %B_sh, %C_tmem, %A_scale_sh, %B_scale_sh, %true, %true lhs = e2m1 rhs = e2m1, %barrier[%true] {is_async} : !ttg.memdesc<128x256xi8, #shared, #ttg.shared_memory>, !ttg.memdesc<256x128xi8, #sharedT, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x2x32x4x4xf8E4M3FN, #shared1, #smem>, !ttg.memdesc<1x2x32x4x4xf8E4M3FN, #shared1, #smem>, !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
+#tmem_scales_rhs = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+
+module attributes {tlx.enable_paired_cta_mma = true, "ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
+  // CHECK-LABEL: two_cta_rhs_scale_copy
+  tt.func public @two_cta_rhs_scale_copy(
+      %src: !ttg.memdesc<1x1x1x2x256xi8, #shared, #ttg.shared_memory>,
+      %dst: !ttg.memdesc<128x4xi8, #tmem_scales_rhs, #ttng.tensor_memory, mutable>) {
+    // CHECK: ttg.memdesc_reinterpret
+    // CHECK: ttg.local_load
+    // CHECK: ttng.tmem_store
+    // CHECK-NEXT: ttng.cluster_barrier
+    // CHECK-NOT: ttng.tmem_copy
+    ttng.tmem_copy %src, %dst : !ttg.memdesc<1x1x1x2x256xi8, #shared, #ttg.shared_memory>, !ttg.memdesc<128x4xi8, #tmem_scales_rhs, #ttng.tensor_memory, mutable>
+    ttng.cluster_barrier
     tt.return
   }
 }
