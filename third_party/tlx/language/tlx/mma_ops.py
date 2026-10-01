@@ -277,16 +277,19 @@ def require_layout(
 
 
 @tl.builtin
-def release_layout(x, _semantic=None):
+def release_layout(x, relaxed: tl.constexpr = False, _semantic=None):
     """Release a register tensor's explicit layout for a flexible consumer.
 
-     The returned tensor has the same logical shape and element type as ``x``,
-     but downstream operations may choose their own layout.  Use this at a
-     helper or control-flow boundary when a source-scheduled fragment layout is
-     intentionally local to the preceding region.
-     """
+    The returned tensor has the same logical shape and element type as ``x``,
+    but downstream operations may choose their own layout. With the default
+    ``relaxed=False``, the release remains a strict boundary across layout
+    optimization passes. Set ``relaxed=True`` for implementation-generated
+    releases that layout optimization may remove.
+    """
+    relaxed = tl._unwrap_if_constexpr(relaxed)
+    assert isinstance(relaxed, bool), f"relaxed must be a constexpr bool, got {type(relaxed).__name__}"
     assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
-    handle = _semantic.builder.create_release_layout(x.handle)
+    handle = _semantic.builder.create_release_layout(x.handle, relaxed=relaxed)
     return tl.tensor(handle, x.type)
 
 
@@ -541,8 +544,8 @@ def async_dot(
             A_handle = require_dot_operand_layout(A, 0, mma_layout, _semantic.builder)
         output = _semantic.builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision,
                                                          max_num_imprecise_acc, True)
-        # Release the mma layout for the output to conform to what the user expects
-        output = _semantic.builder.create_release_layout(output)
+        # Keep the result flexible without creating a strict user boundary.
+        output = _semantic.builder.create_release_layout(output, relaxed=True)
         return tl.tensor(output, ret_ty)
 
 
