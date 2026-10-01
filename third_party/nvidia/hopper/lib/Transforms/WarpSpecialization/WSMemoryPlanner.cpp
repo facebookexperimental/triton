@@ -3828,6 +3828,28 @@ public:
             hasLoopCarriedMMA = true;
             break;
           }
+          // A per-iteration accumulator (MMA directly in the loop body,
+          // not loop-carried, e.g. k_tiles == 1) needs a slot per in-flight
+          // iteration too, since the loop scheduler can put its init and its
+          // epilogue load in different stages; createBufferForAllocs already
+          // rotates these by the loop's accumCnt. Only accept accumulators
+          // whose value is dead across iterations: a tmem_store in the body
+          // writes them before any other access in the body.
+          auto mma = dyn_cast<ttng::MMAv5OpInterface>(user);
+          if (mma && user->getParentOp() == forOp.getOperation() &&
+              mma.getAccumulator() == alloc.getResult()) {
+            Block *body = forOp.getBody();
+            Operation *first = nullptr;
+            for (auto *other : alloc.getResult().getUsers()) {
+              Operation *anc = body->findAncestorOpInBlock(*other);
+              if (anc && (!first || anc->isBeforeInBlock(first)))
+                first = anc;
+            }
+            if (first && isa<ttng::TMEMStoreOp>(first)) {
+              hasLoopCarriedMMA = true;
+              break;
+            }
+          }
         }
       }
       if (!hasLoopCarriedMMA)
