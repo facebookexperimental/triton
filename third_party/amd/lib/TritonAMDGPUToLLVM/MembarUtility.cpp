@@ -1,9 +1,12 @@
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "triton/Analysis/Membar.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/STLExtras.h"
@@ -62,8 +65,9 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
 // A deliberately narrow reuse rule. Equal concrete tensor types select
 // equal shared swizzles, and equal allocation intervals select the same base.
 // Warp-local, injective layouts therefore give both conversions the same
-// disjoint per-wave byte partitions. The leading wave fence in scratch lowering
-// orders the previous reads before the next writes without rendezvousing waves.
+// disjoint per-wave byte partitions. Membar pairs this proof with a leading
+// wave fence only when allocated scratch has an unsynchronized read-to-write
+// dependency, without rendezvousing waves.
 bool filterWarpLocalScratchReuse(Operation *op1, Operation *op2,
                                  Allocation *allocation) {
   auto first = dyn_cast<triton::gpu::ConvertLayoutOp>(op1);
@@ -125,8 +129,20 @@ bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
                   bool op2IsRead, Allocation *allocation) {
   return (filterAsyncLocalLoadsDependencies(op1, op2, op1IsRead, op2IsRead,
                                             allocation) ||
-          filterLDSMemoryBarriersDependencies(op1, op2) ||
-          filterWarpLocalScratchReuse(op1, op2, allocation));
+          filterLDSMemoryBarriersDependencies(op1, op2));
+}
+
+MembarScratchSync getWarpLocalScratchSync() {
+  return {filterWarpLocalScratchReuse, [](Operation *op, OpBuilder &builder) {
+            // Repeated Membar runs retain the real fence rather than trusting
+            // an input attribute to stand for synchronization.
+            auto previous =
+                dyn_cast_or_null<LLVM::CallIntrinsicOp>(op->getPrevNode());
+            if (previous && previous.getIntrin() == "llvm.amdgcn.wave.barrier")
+              return;
+            LLVM::createLLVMIntrinsicCallOp(builder, op->getLoc(),
+                                            "llvm.amdgcn.wave.barrier", {}, {});
+          }};
 }
 
 namespace {

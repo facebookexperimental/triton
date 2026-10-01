@@ -370,11 +370,9 @@ struct ConvertLayoutOpConversion
     };
 
     for (int i = 0; i < nReps; ++i) {
-      // AMD may reuse an identical per-wave scratch partition without a CTA
-      // rendezvous. Keep the previous conversion's reads before these writes;
-      // the fence after the writes alone does not establish that ordering.
-      if (i > 0 || (isWarpSync &&
-                    targetInfo.requiresLeadingWarpSyncForScratchConversion()))
+      // Membar orders inter-operation scratch reuse after allocation. Repeated
+      // tiles within this operation still need to release the preceding reads.
+      if (i > 0)
         emitBarrier();
       auto tileInVals =
           ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);

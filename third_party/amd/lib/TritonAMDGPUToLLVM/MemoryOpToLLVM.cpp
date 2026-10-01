@@ -1716,7 +1716,6 @@ public:
     int64_t numRepN = bRep[2];
     int64_t numRepK = aRep[2] * aDot.getKWidth() / info.kBase;
     int64_t numRepKB = bRep[1] * bDot.getKWidth() / info.kBase;
-    int64_t outputFragment = op.getOutputFragmentAttr().getInt();
     if (failed(maybeA) || failed(maybeB) || numRepK <= 0 ||
         numRepK != numRepKB ||
         maybeA->size() != static_cast<size_t>(numRepM * numRepK) ||
@@ -1759,7 +1758,6 @@ public:
     auto inputConstraint = [](StringRef registerClass) -> StringRef {
       return registerClass == "agpr" ? "a" : "v";
     };
-    StringRef outputConstraint = accumulatorStorage == "agpr" ? "=a" : "=&v";
     Value zeroFragment;
     if (op.getAccumulatorRole() == "transient" && op.getInitialize()) {
       Attribute zeroAttr = rewriter.getZeroAttr(accElemTy);
@@ -1786,8 +1784,6 @@ public:
     for (int64_t k = 0; k < numRepK; ++k) {
       for (int64_t n = 0; n < numRepN; ++n) {
         for (int64_t m = 0; m < numRepM; ++m) {
-          if (outputFragment >= 0 && n * numRepM + m != outputFragment)
-            continue;
           int64_t accumulatorIndex = m * numRepN + n;
           Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
@@ -1841,6 +1837,17 @@ public:
             }
             current = rewriter.create(loweredOp)->getResult(0);
           } else {
+            // A tied AGPR accumulator and a resident A/B source need distinct
+            // registers. Early-clobber also exposes their simultaneous demand
+            // to LLVM's minimum AGPR allocation, which otherwise omits numbered
+            // tied inputs. A zero-initialized instruction may reuse source
+            // AGPRs because it does not read the accumulator.
+            bool tiedResidentAgpr =
+                !zeroThisInstruction &&
+                (aRegisterClass == "agpr" || bRegisterClass == "agpr");
+            StringRef outputConstraint = accumulatorStorage == "agpr"
+                                             ? (tiedResidentAgpr ? "=&a" : "=a")
+                                             : "=&v";
             std::string constraints = outputConstraint.str();
             constraints += "," + inputConstraint(aRegisterClass).str();
             constraints += "," + inputConstraint(bRegisterClass).str();

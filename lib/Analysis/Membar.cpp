@@ -41,7 +41,11 @@ static Interval<size_t> narrowIntervalForSubview(Value value,
   auto parentType = cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
   int64_t dim0 = parentType.getShape()[0];
   size_t totalSize = interval.end() - interval.start();
-  if (dim0 <= 0 || totalSize % dim0 != 0)
+  // Padded stages need the validated stride and extent from getStageGeometry;
+  // equal fractions of the parent interval do not describe their byte ranges.
+  if (dim0 <= 0 || indexVal.isNegative() || indexVal.getZExtValue() >= dim0 ||
+      triton::gpu::isPaddedEncoding(parentType.getEncoding()) ||
+      totalSize % dim0 != 0)
     return interval;
 
   size_t stride = totalSize / dim0;
@@ -54,22 +58,85 @@ static bool isConstantInt(Value value, int64_t expected) {
   return matchPattern(value, m_ConstantInt(&constant)) && constant == expected;
 }
 
-// Recognize only parity of the induction value supplied by discoverStageLoops.
-// In particular, a scalar stage index unrelated to that value is not a proof
-// that different waves access the same stage.
-static std::optional<unsigned> getStageParity(Value value, Value induction,
-                                              unsigned depth = 0) {
-  if (!induction || depth > 3)
+// Track both a residue relative to the induction value and signed i32 bounds.
+// Congruence alone is insufficient: signed remainder may be negative, and an
+// overflowing addition need not preserve a residue for a non-power-of-two ring.
+struct StageExpression {
+  unsigned offset;
+  int64_t min;
+  int64_t max;
+};
+
+static unsigned stageResidue(int64_t value, unsigned numStages) {
+  int64_t residue = value % numStages;
+  return residue < 0 ? residue + numStages : residue;
+}
+
+static std::optional<StageExpression>
+getStageExpression(Value value, Value induction, unsigned numStages,
+                   StageExpression inductionRange, unsigned depth = 0) {
+  if (depth > 8 || value.getType() != induction.getType())
     return std::nullopt;
+  if (value == induction)
+    return inductionRange;
+  auto recurse = [&](Value operand) {
+    return getStageExpression(operand, induction, numStages, inductionRange,
+                              depth + 1);
+  };
   if (auto rem = value.getDefiningOp<arith::RemSIOp>()) {
-    if (rem.getLhs() == induction && isConstantInt(rem.getRhs(), 2))
-      return 0;
+    if (!isConstantInt(rem.getRhs(), numStages))
+      return std::nullopt;
+    auto source = recurse(rem.getLhs());
+    if (source && source->min >= 0)
+      return StageExpression{source->offset, 0, numStages - 1};
+    return std::nullopt;
   }
   if (auto bitAnd = value.getDefiningOp<arith::AndIOp>()) {
-    if ((bitAnd.getLhs() == induction && isConstantInt(bitAnd.getRhs(), 1)) ||
-        (bitAnd.getRhs() == induction && isConstantInt(bitAnd.getLhs(), 1)))
-      return 0;
+    if (!llvm::isPowerOf2_32(numStages))
+      return std::nullopt;
+    Value source;
+    if (isConstantInt(bitAnd.getRhs(), numStages - 1))
+      source = bitAnd.getLhs();
+    else if (isConstantInt(bitAnd.getLhs(), numStages - 1))
+      source = bitAnd.getRhs();
+    if (source)
+      if (auto expression = recurse(source))
+        return StageExpression{expression->offset, 0, numStages - 1};
+    return std::nullopt;
   }
+
+  Value source;
+  APInt constant;
+  int64_t delta = 0;
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    if (matchPattern(add.getRhs(), m_ConstantInt(&constant)))
+      source = add.getLhs();
+    else if (matchPattern(add.getLhs(), m_ConstantInt(&constant)))
+      source = add.getRhs();
+    if (source)
+      delta = constant.getSExtValue();
+  } else if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    if (matchPattern(sub.getRhs(), m_ConstantInt(&constant))) {
+      source = sub.getLhs();
+      delta = -constant.getSExtValue();
+    }
+  }
+  if (source) {
+    auto expression = recurse(source);
+    if (!expression ||
+        expression->min + delta < std::numeric_limits<int32_t>::min() ||
+        expression->max + delta > std::numeric_limits<int32_t>::max())
+      return std::nullopt;
+    return StageExpression{
+        stageResidue(static_cast<int64_t>(expression->offset) + delta,
+                     numStages),
+        expression->min + delta, expression->max + delta};
+  }
+
+  // For two stages, 1-x and x XOR 1 are also a unit residue offset. This
+  // equivalence does not hold for arbitrary larger stage counts.
+  if (numStages != 2)
+    return std::nullopt;
   Value complemented;
   if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
     if (isConstantInt(sub.getLhs(), 1))
@@ -81,9 +148,45 @@ static std::optional<unsigned> getStageParity(Value value, Value induction,
       complemented = bitXor.getLhs();
   }
   if (complemented)
-    if (auto parity = getStageParity(complemented, induction, depth + 1))
-      return *parity ^ 1;
+    if (auto expression = recurse(complemented))
+      if (expression->min >= 0 && expression->max <= 1)
+        return StageExpression{expression->offset ^ 1, 0, 1};
   return std::nullopt;
+}
+
+// Only discoverStageLoops supplies an induction value. Recover its proven
+// initial and exclusive upper bounds without assuming a particular residue.
+static std::optional<unsigned> getStageOffset(Value value, Value induction,
+                                              unsigned numStages) {
+  auto argument = dyn_cast_or_null<BlockArgument>(induction);
+  if (!argument)
+    return std::nullopt;
+  Block *header = argument.getOwner();
+  auto branch = dyn_cast<cf::CondBranchOp>(header->getTerminator());
+  auto compare = branch ? branch.getCondition().getDefiningOp<arith::CmpIOp>()
+                        : arith::CmpIOp();
+  if (!compare || compare.getLhs() != induction ||
+      compare.getPredicate() != arith::CmpIPredicate::slt)
+    return std::nullopt;
+  std::optional<int64_t> initial;
+  for (Block *predecessor : header->getPredecessors()) {
+    auto entry = dyn_cast<cf::BranchOp>(predecessor->getTerminator());
+    APInt constant;
+    if (entry && matchPattern(entry.getDestOperands()[argument.getArgNumber()],
+                              m_ConstantInt(&constant)))
+      initial = constant.getSExtValue();
+  }
+  int64_t max = std::numeric_limits<int32_t>::max() - 1;
+  APInt upper;
+  if (matchPattern(compare.getRhs(), m_ConstantInt(&upper)))
+    max = upper.getSExtValue() - 1;
+  if (!initial || *initial < 0 || *initial > max)
+    return std::nullopt;
+  auto expression =
+      getStageExpression(value, induction, numStages, {0, *initial, max});
+  if (!expression || expression->min < 0 || expression->max >= numStages)
+    return std::nullopt;
+  return expression->offset;
 }
 
 // Limit symbolic slices to a direct, stable allocation dominating the header.
@@ -108,6 +211,8 @@ struct StageGeometry {
   Value parent;
   Value index;
   size_t stride;
+  size_t extent;
+  unsigned numStages;
 };
 
 static std::optional<StageGeometry>
@@ -137,7 +242,7 @@ getStageGeometry(Value value, Interval<size_t> interval,
   if (!layout || isa<triton::gpu::PartitionedSharedEncodingAttr>(encoding) ||
       parentType.getRank() != stageType.getRank() + 1 ||
       layout.getRank() != stageType.getRank() ||
-      parentType.getShape().front() != 2 ||
+      parentType.getShape().front() <= 0 ||
       parentType.getShape() != parentType.getAllocShape() ||
       stageType.getShape() != stageType.getAllocShape() ||
       parentType.getShape().drop_front() != stageType.getShape() ||
@@ -150,8 +255,8 @@ getStageGeometry(Value value, Interval<size_t> interval,
     return std::nullopt;
 
   // Match Allocation's footprint and MemDescIndex lowering's stage stride.
-  // Padding omits the gap after the last element, so interval.size()/2 is not
-  // necessarily the byte offset of stage 1.
+  // Padding omits the gap after the last element, so dividing the footprint
+  // by the stage count does not necessarily give the stage stride.
   unsigned bitWidth = getIntOrFloatOrPtrBitWidth(parentType.getElementType());
   if (bitWidth < 8 || bitWidth % 8)
     return std::nullopt;
@@ -159,20 +264,31 @@ getStageGeometry(Value value, Interval<size_t> interval,
       triton::gpu::getAllocationElems(encoding, parentType.getAllocShape());
   int64_t stageElems =
       triton::gpu::getAllocationElems(encoding, stageType.getAllocShape());
+  int64_t numStages = parentType.getShape().front();
   if (parentElems <= 0 || stageElems <= 0 ||
-      stageElems >= std::numeric_limits<int32_t>::max() || parentElems % 2 ||
-      parentElems / 2 != stageElems)
+      parentElems > std::numeric_limits<int32_t>::max() ||
+      parentElems % numStages || parentElems / numStages != stageElems)
     return std::nullopt;
   int64_t strideElems = stageElems;
   int64_t extentElems = stageElems;
   if (auto padded = triton::gpu::getPaddedEncoding(encoding)) {
+    // Every stage must start at the same point in each padding period. Without
+    // this alignment the first stage's stride cannot describe later stages.
+    if (llvm::any_of(padded.getIntervals(), [&](unsigned interval) {
+          return stageElems % interval != 0;
+        }))
+      return std::nullopt;
     parentElems = padded.getPaddedSize({parentElems});
     extentElems = padded.getPaddedSize({stageElems});
     // getPaddedSize(N+1)-1 includes the padding immediately before element N.
     strideElems = padded.getPaddedSize({stageElems + 1}) - 1;
   }
+  // memdesc_index lowers the unpadded product and padded offset as i32. Bound
+  // both, and check the last stage's extent without overflowing a product.
   if (extentElems <= 0 || strideElems < extentElems ||
-      parentElems <= strideElems || parentElems - strideElems != extentElems)
+      parentElems > std::numeric_limits<int32_t>::max() ||
+      parentElems < extentElems || (parentElems - extentElems) % strideElems ||
+      (parentElems - extentElems) / strideElems != numStages - 1)
     return std::nullopt;
   size_t bytesPerElement = bitWidth / 8;
   size_t parentBytes = interval.end() - interval.start();
@@ -180,7 +296,9 @@ getStageGeometry(Value value, Interval<size_t> interval,
       parentBytes / bytesPerElement != static_cast<uint64_t>(parentElems))
     return std::nullopt;
   return StageGeometry{alloc.getResult(), index.getIndex(),
-                       static_cast<size_t>(strideElems) * bytesPerElement};
+                       static_cast<size_t>(strideElems) * bytesPerElement,
+                       static_cast<size_t>(extentElems) * bytesPerElement,
+                       static_cast<unsigned>(numStages)};
 }
 
 AllocationSlice::AllocationSlice(Value value,
@@ -207,33 +325,38 @@ AllocationSlice::AllocationSlice(Value value,
       getStageGeometry(value, allocationInterval, bufferId, allocation);
   if (!geometry)
     return;
-  std::optional<unsigned> parity;
-  if (isConstantInt(geometry->index, 0))
-    parity = 0;
-  else if (isConstantInt(geometry->index, 1))
-    parity = 1;
-  else if (isStableStageParent(geometry->parent, stageBasis)) {
-    parity = getStageParity(geometry->index, stageBasis);
-    if (parity)
+  std::optional<unsigned> offset;
+  APInt index;
+  if (matchPattern(geometry->index, m_ConstantInt(&index)) &&
+      !index.isNegative() && index.getZExtValue() < geometry->numStages) {
+    offset = index.getZExtValue();
+    size_t start = allocationInterval.start() + *offset * geometry->stride;
+    this->allocationInterval = {start, start + geometry->extent};
+  } else if (isStableStageParent(geometry->parent, stageBasis)) {
+    offset = getStageOffset(geometry->index, stageBasis, geometry->numStages);
+    if (offset)
       stage.basis = stageBasis;
   }
-  if (!parity)
+  if (!offset)
     return;
   stage.parent = geometry->parent;
   stage.parentInterval = allocationInterval;
   stage.stride = geometry->stride;
-  stage.parity = *parity;
+  stage.numStages = geometry->numStages;
+  stage.offset = *offset;
 }
 
 AllocationSlice AllocationSlice::enterStageLoop(Value induction,
-                                                unsigned initialParity) const {
+                                                unsigned initialValue) const {
   auto result = forgetStageLoop();
   if (!result.stage.parent ||
       !isStableStageParent(result.stage.parent, induction))
     return result;
   result.stage.basis = induction;
-  result.stage.parity ^= initialParity;
-  // A lifted entry access now denotes either physical stage. Keeping its old
+  result.stage.offset =
+      stageResidue(static_cast<int64_t>(result.stage.offset) - initialValue,
+                   result.stage.numStages);
+  // A lifted entry access now denotes any physical stage. Keeping its old
   // constant interval would incorrectly prove later-iteration accesses
   // disjoint.
   result.allocationInterval = result.stage.parentInterval;
@@ -246,8 +369,9 @@ AllocationSlice AllocationSlice::advanceStageLoop(Value induction) const {
   if (stage.basis != induction)
     return forgetStageLoop();
   auto result = *this;
-  // old parity(iv) = new parity(iv) XOR 1 for the recognized +1 latch.
-  result.stage.parity ^= 1;
+  // old iv = new iv - 1 for the recognized +1 latch. Normalize so the set of
+  // symbolic states is finite, independent of the loop's trip count.
+  result.stage.offset = stage.offset ? stage.offset - 1 : stage.numStages - 1;
   return result;
 }
 
@@ -269,7 +393,8 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
       stage.parent == other.stage.parent &&
       stage.parentInterval == other.stage.parentInterval &&
       stage.stride == other.stage.stride && bufferId == other.bufferId &&
-      stage.parity != other.stage.parity)
+      stage.numStages == other.stage.numStages &&
+      stage.offset != other.stage.offset)
     return false;
 
   // If access types are unknown, assume intersection
@@ -425,8 +550,8 @@ void MembarOrFenceAnalysis::discoverStageLoops(FunctionOpInterface function) {
     if (!hasEntryBarrier)
       continue;
 
-    stageLoops.push_back(
-        {entry, &header, body, induction, static_cast<unsigned>(initial[0])});
+    stageLoops.push_back({entry, &header, body, induction,
+                          static_cast<unsigned>(initial.getZExtValue())});
   }
 }
 
@@ -442,7 +567,7 @@ BlockInfo MembarOrFenceAnalysis::transferEdge(const BlockInfo &info,
   for (const StageLoop &loop : stageLoops) {
     if (from == loop.entry && to == loop.header)
       return info.mapSlices([&](const AllocationSlice &slice) {
-        return slice.enterStageLoop(loop.induction, loop.initialParity);
+        return slice.enterStageLoop(loop.induction, loop.initialValue);
       });
     if (from == loop.body && to == loop.header)
       return info.mapSlices([&](const AllocationSlice &slice) {
@@ -452,7 +577,7 @@ BlockInfo MembarOrFenceAnalysis::transferEdge(const BlockInfo &info,
       return info;
   }
   // No symbolic coordinates escape the recognized edges. In particular the
-  // exit can contain either physical stage, including on a zero-trip path.
+  // exit can contain any physical stage, including on a zero-trip path.
   return info.mapSlices(
       [](const AllocationSlice &slice) { return slice.forgetStageLoop(); });
 }
@@ -462,6 +587,24 @@ void MembarOrFenceAnalysis::run(FunctionOpInterface function,
   // Discover the qualifying barriers before the analysis inserts new ones.
   discoverStageLoops(function);
   triton::PostOrderFunctionAnalysis<BlockInfo>::run(function, funcMap);
+}
+
+void MembarAnalysis::run(FunctionOpInterface function, FuncMapT &funcMap) {
+  scratchSyncOps.clear();
+  MembarOrFenceAnalysis::run(function, funcMap);
+  if (!scratchSync)
+    return;
+
+  // A later fixed-point visit can discover a CTA hazard that supersedes a
+  // scratch-only WAR. Keep emission out of the short-circuiting hazard query
+  // and out of the fixed-point traversal itself.
+  OpBuilder builder(function.getContext());
+  function.walk([&](Operation *op) {
+    if (!scratchSyncOps.contains(op))
+      return;
+    builder.setInsertionPoint(op);
+    scratchSync.emitBefore(op, builder);
+  });
 }
 
 void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
@@ -578,9 +721,11 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
         next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
       return true;
 
-    // A contained barrier follows the operation's incoming shared-memory
-    // effects, so it cannot protect those effects from the preceding wait.
-    if (stages.betweenMemoryEffects)
+    // Allocated scratch accesses shared memory even when the operation is
+    // otherwise pure or synchronizes only within a warp. Its internal barrier
+    // (if any) follows the first write and cannot defer the preceding wait's
+    // synchronization past that access.
+    if (getScratchBufferId(next, allocation) != Allocation::InvalidBufferId)
       return false;
 
     // Barriers classified as "after" have no shared-memory effects before
@@ -596,6 +741,8 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
 
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncMapT *funcMap, OpBuilder *builder) {
+  // Replace any provisional decision whenever this operation is revisited.
+  scratchSyncOps.erase(op);
   if (isa<CallOpInterface>(op))
     *blockInfo = blockInfo->mapSlices(
         [](const AllocationSlice &slice) { return slice.forgetStageLoop(); });
@@ -695,11 +842,25 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     auto interval = allocation.getAllocatedInterval(scratchBufferId);
     auto scratchSlice = AllocationSlice(interval);
     curBlockInfo.syncWriteSlices[scratchSlice].insert(op);
+    bool needsScratchSync = false;
+    auto scratchFilter = [&](Operation *lhs, Operation *rhs, bool lhsIsRead,
+                             bool rhsIsRead, Allocation *allocation) {
+      if (filter && filter(lhs, rhs, lhsIsRead, rhsIsRead, allocation))
+        return true;
+      if (!scratchSync || !scratchSync.canReuse(lhs, rhs, allocation))
+        return false;
+      needsScratchSync |= lhsIsRead && !rhsIsRead;
+      return true;
+    };
     auto insertCTABarrier =
-        blockInfo->isIntersected(curBlockInfo, filter, &allocation);
+        blockInfo->isIntersected(curBlockInfo, scratchFilter, &allocation);
     if (insertCTABarrier) {
       builder->setInsertionPoint(op);
       insertBarrier(op, builder);
+    } else if (needsScratchSync) {
+      // Preserve all pending effects: this synchronization releases only the
+      // proven per-warp scratch ownership, not arbitrary workgroup accesses.
+      scratchSyncOps.insert(op);
     }
     if (insertCTABarrier)
       blockInfo->sync();

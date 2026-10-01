@@ -36,13 +36,6 @@ public:
   // emit a block-level barrier with local address space visibility.
   virtual void warpSync(Location loc, RewriterBase &rewriter) const = 0;
 
-  // A backend may omit a CTA barrier between identical warp-local scratch
-  // conversions. Such a backend must order the preceding scratch reads before
-  // the next writes, even though the usual conversion fence follows the writes.
-  virtual bool requiresLeadingWarpSyncForScratchConversion() const {
-    return false;
-  }
-
   // Store/load a value from shared memory, either in the same CTA or, if
   // `ctaId` is non-null, in another CTA in the same group.
   //

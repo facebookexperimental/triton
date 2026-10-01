@@ -35,12 +35,6 @@ _VERSION_SKEW_FILES = {
     "test_consan.py",
 }
 
-# This regression explicitly restores the loaded value's distributed type with
-# reshape, so it also runs on the pinned frontend.
-_PINNED_FRONTEND_TESTS = {
-    ("test_core.py", "test_convert_layout_wave_local_scratch_reuse"),
-}
-
 # Individual frontend/layout cases that don't pass on the pinned build:
 #  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled/warp_pipeline emit IR that
 #    legitimately differs per parametrized target, so a single `assert_expected_inline`
@@ -74,7 +68,7 @@ def pytest_collection_modifyitems(config, items):
     known = pytest.mark.skip(reason=_KNOWN_FAIL_REASON)
     for item in items:
         filename = item.path.name
-        if filename in _VERSION_SKEW_FILES and (filename, item.originalname) not in _PINNED_FRONTEND_TESTS:
+        if filename in _VERSION_SKEW_FILES:
             item.add_marker(skew)
             continue
         if any(sub in item.nodeid for sub in _KNOWN_FAIL_SUBSTRINGS):

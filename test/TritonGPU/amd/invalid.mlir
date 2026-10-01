@@ -1021,17 +1021,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 #scheduled_fragment_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_fragment_mma, kWidth = 8}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @scheduled_mfma_rejects_output_fragment_below_sentinel(
+  tt.func @scheduled_mfma_rejects_full_accumulator_for_column_subtile(
       %a: tensor<16x32xbf16, #scheduled_fragment_lhs>,
-      %b: tensor<32x32xbf16, #scheduled_fragment_rhs>) {
+      %b: tensor<32x16xbf16, #scheduled_fragment_rhs>) {
     %acc = arith.constant dense<0.000000e+00> :
         tensor<16x32xf32, #scheduled_fragment_mma>
-    // expected-error @+1 {{output_fragment must be -1 or in the range [0, 2), got -2}}
+    // expected-error @+1 {{operand and accumulator matrix shapes are inconsistent}}
     %result = amdg.scheduled_mfma %a, %b, %acc
         resident "none" accumulator "transient"
-        register_class "auto" initialize true {output_fragment = -2 : i32}
+        register_class "auto" initialize true
         : tensor<16x32xbf16, #scheduled_fragment_lhs>,
-          tensor<32x32xbf16, #scheduled_fragment_rhs>,
+          tensor<32x16xbf16, #scheduled_fragment_rhs>,
           tensor<16x32xf32, #scheduled_fragment_mma>
           -> tensor<16x32xf32, #scheduled_fragment_mma>
     tt.return
@@ -1045,19 +1045,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 #scheduled_fragment_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_fragment_mma, kWidth = 8}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @scheduled_mfma_rejects_output_fragment_at_grid_size(
+  tt.func @scheduled_mfma_rejects_full_accumulator_for_row_subtile(
       %a: tensor<16x32xbf16, #scheduled_fragment_lhs>,
       %b: tensor<32x32xbf16, #scheduled_fragment_rhs>) {
     %acc = arith.constant dense<0.000000e+00> :
-        tensor<16x32xf32, #scheduled_fragment_mma>
-    // expected-error @+1 {{output_fragment must be -1 or in the range [0, 2), got 2}}
+        tensor<32x32xf32, #scheduled_fragment_mma>
+    // expected-error @+1 {{operand and accumulator matrix shapes are inconsistent}}
     %result = amdg.scheduled_mfma %a, %b, %acc
         resident "none" accumulator "transient"
-        register_class "auto" initialize true {output_fragment = 2 : i32}
+        register_class "auto" initialize true
         : tensor<16x32xbf16, #scheduled_fragment_lhs>,
           tensor<32x32xbf16, #scheduled_fragment_rhs>,
-          tensor<16x32xf32, #scheduled_fragment_mma>
-          -> tensor<16x32xf32, #scheduled_fragment_mma>
+          tensor<32x32xf32, #scheduled_fragment_mma>
+          -> tensor<32x32xf32, #scheduled_fragment_mma>
     tt.return
   }
 }

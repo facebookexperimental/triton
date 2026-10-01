@@ -5,6 +5,7 @@
 #include "CallGraph.h"
 #include "Function.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
 #include <set>
@@ -27,6 +28,22 @@ using MembarFilterFn =
 using MembarSliceFilterFn =
     std::function<bool(const AllocationSlice &, const AllocationSlice &,
                        bool /*lhsIsRead*/, bool /*rhsIsRead*/, Allocation *)>;
+
+/// Optional backend policy for reusing scratch without a CTA rendezvous.
+/// canReuse must be a pure proof that both operations use the same disjoint
+/// per-warp scratch partitions and that only prior reads need ordering before
+/// the next write. It is queried only for intersecting allocated scratch
+/// effects, after the ordinary filter. emitBefore must order those reads before
+/// the supplied operation's writes and be idempotent across repeated analysis.
+/// Membar emits it only for an actual WAR and when no incoming hazard needs a
+/// CTA barrier. Neither callback may discard pending BlockInfo dependencies.
+/// Omitting either callback conservatively disables scratch reuse.
+struct MembarScratchSync {
+  std::function<bool(Operation *, Operation *, Allocation *)> canReuse;
+  std::function<void(Operation *, OpBuilder &)> emitBefore;
+
+  explicit operator bool() const { return canReuse && emitBefore; }
+};
 
 // Represents the access to a slice of an allocation
 // It contains information both on physical memory (the interval) and a
@@ -60,7 +77,7 @@ public:
   Allocation::BufferId getBufferId() const { return bufferId; }
 
   // Transport a pending access into the counted loop's current-IV coordinates.
-  AllocationSlice enterStageLoop(Value induction, unsigned initialParity) const;
+  AllocationSlice enterStageLoop(Value induction, unsigned initialValue) const;
   AllocationSlice advanceStageLoop(Value induction) const;
   AllocationSlice forgetStageLoop() const;
 
@@ -85,16 +102,18 @@ public:
 
 private:
   // An empty basis denotes a literal stage. A nonempty basis denotes
-  // parity(basis) XOR parity. Only an eligible counted loop supplies a basis.
+  // (basis + offset) % numStages. Only an eligible counted loop supplies a
+  // basis.
   struct StageInfo {
     Value parent;
     Value basis;
     Interval<size_t> parentInterval{0, 0};
     size_t stride = 0;
-    unsigned parity = 0;
+    unsigned numStages = 0;
+    unsigned offset = 0;
   } stage;
   using StageKey = std::tuple<const void *, const void *, Interval<size_t>,
-                              size_t, unsigned>;
+                              size_t, unsigned, unsigned>;
 
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
              llvm::ArrayRef<int64_t>, StageKey>
@@ -105,7 +124,7 @@ private:
             subsliceOffsets,
             {stage.parent.getAsOpaquePointer(),
              stage.basis.getAsOpaquePointer(), stage.parentInterval,
-             stage.stride, stage.parity}};
+             stage.stride, stage.numStages, stage.offset}};
   }
   // Offsets from subslice. Empty when offsets are unknown
   SmallVector<int64_t> subsliceOffsets;
@@ -257,8 +276,10 @@ inline BlockInfo translateBlockInfoToCallsite(const BlockInfo &calleeBlockInfo,
 class MembarOrFenceAnalysis
     : public triton::PostOrderFunctionAnalysis<BlockInfo> {
 public:
-  MembarOrFenceAnalysis(Allocation &allocation, MembarFilterFn filter)
-      : allocation(allocation), filter(std::move(filter)) {}
+  MembarOrFenceAnalysis(Allocation &allocation, MembarFilterFn filter,
+                        MembarScratchSync scratchSync = {})
+      : allocation(allocation), filter(std::move(filter)),
+        scratchSync(std::move(scratchSync)) {}
 
   void run(FunctionOpInterface function, FuncMapT &funcMap);
 
@@ -270,7 +291,7 @@ protected:
     Block *header;
     Block *body;
     Value induction;
-    unsigned initialParity;
+    unsigned initialValue;
   };
   SmallVector<StageLoop> stageLoops;
   void discoverStageLoops(FunctionOpInterface function);
@@ -280,6 +301,7 @@ protected:
 
   Allocation &allocation;
   MembarFilterFn filter;
+  MembarScratchSync scratchSync;
 };
 
 class MembarAnalysis : public MembarOrFenceAnalysis {
@@ -299,12 +321,17 @@ public:
   /// analysis.
   using MembarOrFenceAnalysis::MembarOrFenceAnalysis;
 
+  void run(FunctionOpInterface function, FuncMapT &funcMap);
+
 private:
   /// Updates the BlockInfo operation based on the operation.
   void update(Operation *operation, BlockInfo *blockInfo, FuncMapT *funcMap,
               OpBuilder *builder) override;
 
   void insertBarrier(Operation *operation, OpBuilder *builder);
+
+  // Materialize only the final decisions, after CFG analysis has converged.
+  llvm::SmallPtrSet<Operation *, 16> scratchSyncOps;
 };
 
 /// Postorder traversal on the callgraph to insert membar instructions
@@ -316,9 +343,11 @@ template <typename AnalysisT>
 class ModuleMembarOrFenceAnalysis : public triton::CallGraph<BlockInfo> {
 public:
   ModuleMembarOrFenceAnalysis(ModuleAllocation &moduleAllocation,
-                              MembarFilterFn filter = nullptr)
+                              MembarFilterFn filter = nullptr,
+                              MembarScratchSync scratchSync = {})
       : triton::CallGraph<BlockInfo>(moduleAllocation.getModuleOp()),
-        moduleAllocation(moduleAllocation), filter(std::move(filter)) {}
+        moduleAllocation(moduleAllocation), filter(std::move(filter)),
+        scratchSync(std::move(scratchSync)) {}
 
   void run() {
     walk<WalkOrder::PreOrder, WalkOrder::PostOrder>(
@@ -329,13 +358,14 @@ public:
           auto &allocation = *moduleAllocation.getFuncData(funcOp);
           if (!funcMap.try_emplace(funcOp).second)
             return;
-          AnalysisT(allocation, filter).run(funcOp, funcMap);
+          AnalysisT(allocation, filter, scratchSync).run(funcOp, funcMap);
         });
   }
 
 private:
   ModuleAllocation &moduleAllocation;
   MembarFilterFn filter;
+  MembarScratchSync scratchSync;
 };
 
 using ModuleMembarAnalysis = ModuleMembarOrFenceAnalysis<MembarAnalysis>;

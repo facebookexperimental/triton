@@ -315,11 +315,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
-// Selecting the two native N fragments in order preserves a single full-tensor
-// accumulator chain. Each call updates one fragment, forwards the other, and
-// the final commit drains both updated fragments together.
+// Explicit N subtiles own independent native accumulator chains. The final
+// commit drains both updated subtiles together without widening either chain.
 //
-// CHECK-LABEL: llvm.func @partial_output_fragments
+// CHECK-LABEL: llvm.func @independent_output_subtiles
 // CHECK: %[[FIRST:[0-9]+]] = llvm.inline_asm has_side_effects
 // CHECK-SAME: "; triton_amd_scheduled_mfma\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, 0", "=a,v,v"
 // CHECK: llvm.extractelement %[[FIRST]]
@@ -335,26 +334,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 #rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func public @partial_output_fragments(
+  tt.func public @independent_output_subtiles(
       %a: tensor<16x32xbf16, #lhs>,
       %b: tensor<32x32xbf16, #rhs>,
-      %acc: tensor<16x32xf32, #mma>) -> tensor<16x32xf32, #mma> {
-    %first = amdg.scheduled_mfma %a, %b, %acc
+      %acc: tensor<16x32xf32, #mma>) -> (tensor<16x16xf32, #mma>, tensor<16x16xf32, #mma>) {
+    %b0 = amdg.extract_slice %b [0, 0] : tensor<32x32xbf16, #rhs> to tensor<32x16xbf16, #rhs>
+    %b1 = amdg.extract_slice %b [0, 16] : tensor<32x32xbf16, #rhs> to tensor<32x16xbf16, #rhs>
+    %acc0 = amdg.extract_slice %acc [0, 0] : tensor<16x32xf32, #mma> to tensor<16x16xf32, #mma>
+    %acc1 = amdg.extract_slice %acc [0, 16] : tensor<16x32xf32, #mma> to tensor<16x16xf32, #mma>
+    %first = amdg.scheduled_mfma %a, %b0, %acc0
         resident "none" accumulator "persistent"
-        register_class "auto" initialize true {output_fragment = 0 : i32}
+        register_class "auto" initialize true
         : tensor<16x32xbf16, #lhs>,
-          tensor<32x32xbf16, #rhs>,
-          tensor<16x32xf32, #mma>
-          -> tensor<16x32xf32, #mma>
-    %second = amdg.scheduled_mfma %a, %b, %first
+          tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    %second = amdg.scheduled_mfma %a, %b1, %acc1
         resident "none" accumulator "persistent"
-        register_class "auto" initialize true {output_fragment = 1 : i32}
+        register_class "auto" initialize true
         : tensor<16x32xbf16, #lhs>,
-          tensor<32x32xbf16, #rhs>,
-          tensor<16x32xf32, #mma>
-          -> tensor<16x32xf32, #mma>
-    %committed = amdg.mfma_commit %second : tensor<16x32xf32, #mma>
-    tt.return %committed : tensor<16x32xf32, #mma>
+          tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    %committed0, %committed1 = amdg.mfma_commit %first, %second : tensor<16x16xf32, #mma>, tensor<16x16xf32, #mma>
+    tt.return %committed0, %committed1 : tensor<16x16xf32, #mma>, tensor<16x16xf32, #mma>
   }
 }
 
@@ -406,9 +409,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.tar
 
 // -----
 
-// Each four-wave group owns one batch; each wave has two native N fragments.
-// CHECK-LABEL: llvm.func @wave_batched_selected_fragment
-// CHECK-COUNT-1: llvm.inline_asm has_side_effects{{.*}}v_mfma_f32_16x16x32_bf16
+// Each four-wave group owns one batch and explicitly slices the second N64
+// subtile. Each wave updates one native output fragment. The resident operand
+// and tied accumulator must have distinct AGPRs, including in LLVM's inferred
+// minimum AGPR allocation.
+// CHECK-LABEL: llvm.func @wave_batched_column_subtile
+// CHECK: llvm.inline_asm has_side_effects{{.*}}v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0", "=&a,a,v,0"
+// CHECK-NOT: v_mfma_f32_16x16x32_bf16
 // CHECK: llvm.inline_asm has_side_effects{{.*}}s_nop 11
 // CHECK: llvm.return
 
@@ -416,13 +423,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.tar
 #lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
 #rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func public @wave_batched_selected_fragment(%a: tensor<2x16x32xbf16, #lhs>, %b: tensor<2x32x128xbf16, #rhs>) {
+  tt.func public @wave_batched_column_subtile(%a: tensor<2x16x32xbf16, #lhs>, %b: tensor<2x32x128xbf16, #rhs>) {
     %acc = arith.constant dense<7.000000e+00> : tensor<2x16x128xf32, #mma>
+    %b_subtile = amdg.extract_slice %b [0, 0, 64] : tensor<2x32x128xbf16, #rhs> to tensor<2x32x64xbf16, #rhs>
+    %acc_subtile = amdg.extract_slice %acc [0, 0, 64] : tensor<2x16x128xf32, #mma> to tensor<2x16x64xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b_subtile, %acc_subtile
+        resident "rhs" accumulator "persistent" register_class "agpr" initialize false
+        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x64xbf16, #rhs>, tensor<2x16x64xf32, #mma>
+          -> tensor<2x16x64xf32, #mma>
+    %committed = amdg.mfma_commit %result : tensor<2x16x64xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+// Initializing from zero permits source/destination AGPR reuse. A later native
+// K update has a tied accumulator and must reserve distinct AGPRs for the
+// resident source, even when the source kernel requested initialize=true.
+// CHECK-LABEL: llvm.func @persistent_resident_lhs_k_updates
+// CHECK: llvm.inline_asm has_side_effects{{.*}}v_mfma_f32_32x32x16_bf16 $0, $1, $2, 0", "=a,v,a"
+// CHECK: llvm.inline_asm has_side_effects{{.*}}v_mfma_f32_32x32x16_bf16 $0, $1, $2, $0", "=&a,v,a,0"
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @persistent_resident_lhs_k_updates(%a: tensor<32x32xbf16, #lhs>, %b: tensor<32x32xbf16, #rhs>) {
+    %acc = arith.constant dense<7.000000e+00> : tensor<32x32xf32, #mma>
     %result = amdg.scheduled_mfma %a, %b, %acc
-        resident "none" accumulator "persistent" register_class "agpr" initialize true {output_fragment = 1 : i32}
-        : tensor<2x16x32xbf16, #lhs>, tensor<2x32x128xbf16, #rhs>, tensor<2x16x128xf32, #mma>
-          -> tensor<2x16x128xf32, #mma>
-    %committed = amdg.mfma_commit %result : tensor<2x16x128xf32, #mma>
+        resident "lhs" accumulator "persistent" register_class "agpr" initialize true
+        : tensor<32x32xbf16, #lhs>, tensor<32x32xbf16, #rhs>, tensor<32x32xf32, #mma>
+          -> tensor<32x32xf32, #mma>
+    %committed = amdg.mfma_commit %result : tensor<32x32xf32, #mma>
     tt.return
   }
 }

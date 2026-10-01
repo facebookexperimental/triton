@@ -6027,7 +6027,7 @@ test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch_compiles = _gfx1250_grouped.te
 
 
 @triton.jit
-def _amd_scheduled_mfma_output_fragment_atomic_kernel(a_ptr, b_ptr, atomic_ptr, output_ptr):
+def _amd_scheduled_mfma_output_subtiles_atomic_kernel(a_ptr, b_ptr, atomic_ptr, output_ptr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[16, 16, 32],
@@ -6049,14 +6049,16 @@ def _amd_scheduled_mfma_output_fragment_atomic_kernel(a_ptr, b_ptr, atomic_ptr, 
         dot1,
         pin=False,
     )
-    acc = tlx.zeros((16, 128), tl.float32, layout=mma)
-    acc = tlx.amd_scheduled_mfma(
+    b_left = tlx.extract_slice(b, [32, 64], [0, 0])
+    b_right = tlx.extract_slice(b, [32, 64], [0, 64])
+    acc_left = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc_right = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc_left = tlx.amd_scheduled_mfma(
         a,
-        b,
-        acc,
+        b_left,
+        acc_left,
         accumulator_role="persistent",
         initialize=True,
-        output_fragment=0,
     )
     tlx.amd_sched_barrier(0)
     atomic_layout: tl.constexpr = tlx.layout(
@@ -6075,15 +6077,15 @@ def _amd_scheduled_mfma_output_fragment_atomic_kernel(a_ptr, b_ptr, atomic_ptr, 
         sem="relaxed",
     )
     tlx.amd_sched_barrier(0)
-    acc = tlx.amd_scheduled_mfma(
+    acc_right = tlx.amd_scheduled_mfma(
         a,
-        b,
-        acc,
+        b_right,
+        acc_right,
         accumulator_role="persistent",
         initialize=True,
-        output_fragment=1,
     )
-    acc = tlx.amd_mfma_commit(acc)
+    acc_left, acc_right = tlx.amd_mfma_commit((acc_left, acc_right))
+    acc = tlx.require_layout(tl.cat(acc_left, acc_right, dim=1), mma, pin=False)
     output_offsets = tlx.require_layout(
         output_ptr + rows[:, None] * 128 + cols[None, :],
         mma,
@@ -6092,53 +6094,9 @@ def _amd_scheduled_mfma_output_fragment_atomic_kernel(a_ptr, b_ptr, atomic_ptr, 
     tl.store(output_offsets, acc)
 
 
-@triton.jit
-def _amd_scheduled_mfma_output_fragment_validation_kernel(
-    a_ptr,
-    b_ptr,
-    output_ptr,
-    OUTPUT_FRAGMENT: tl.constexpr,
-):
-    mma: tl.constexpr = tlx.amd_mfma_layout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[1, 4],
-    )
-    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
-    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
-    rows = tl.arange(0, 16)
-    reduction = tl.arange(0, 32)
-    cols = tl.arange(0, 128)
-    a = tlx.require_layout(
-        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
-        dot0,
-        pin=False,
-    )
-    b = tlx.require_layout(
-        tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]),
-        dot1,
-        pin=False,
-    )
-    acc = tlx.zeros((16, 128), tl.float32, layout=mma)
-    acc = tlx.amd_scheduled_mfma(
-        a,
-        b,
-        acc,
-        accumulator_role="transient",
-        output_fragment=OUTPUT_FRAGMENT,
-    )
-    output_offsets = tlx.require_layout(
-        output_ptr + rows[:, None] * 128 + cols[None, :],
-        mma,
-        pin=False,
-    )
-    tl.store(output_offsets, acc)
-
-
-def test_amd_scheduled_mfma_output_fragment_orders_atomic_gfx950():
+def test_amd_scheduled_mfma_output_subtiles_order_atomic_gfx950():
     compiled = compile_for_gfx950(
-        _amd_scheduled_mfma_output_fragment_atomic_kernel,
+        _amd_scheduled_mfma_output_subtiles_atomic_kernel,
         signature={
             "a_ptr": "*bf16",
             "b_ptr": "*bf16",
@@ -6148,8 +6106,10 @@ def test_amd_scheduled_mfma_output_fragment_orders_atomic_gfx950():
         constexprs={},
     )
     ttir = compiled.asm["ttir"]
-    assert "output_fragment = 0 : i32" in ttir
-    assert "output_fragment = 1 : i32" in ttir
+    assert "output_fragment" not in ttir
+    subtiles = [line for line in ttir.splitlines() if "amdg.scheduled_mfma" in line]
+    assert len(subtiles) == 2
+    assert all("tensor<16x64xf32" in line for line in subtiles)
     assert ttir.count("amdg.mfma_commit") == 1
 
     mnemonic = "v_mfma_f32_16x16x32_bf16"
@@ -6159,20 +6119,3 @@ def test_amd_scheduled_mfma_output_fragment_orders_atomic_gfx950():
         if mnemonic in line or "buffer_atomic_add_f32" in line
     ]
     assert instructions == ["mfma", "atomic", "mfma"]
-
-
-@pytest.mark.parametrize("output_fragment", [True, 0.0, "0", -1])
-def test_amd_scheduled_mfma_output_fragment_rejects_invalid_python_values(output_fragment):
-    with triton.knobs.compilation.scope():
-        triton.knobs.compilation.always_compile = True
-        with pytest.raises(CompilationError, match="output_fragment must be None or a non-negative constexpr integer"):
-            compile_for_gfx950(
-                _amd_scheduled_mfma_output_fragment_validation_kernel,
-                signature={
-                    "a_ptr": "*bf16",
-                    "b_ptr": "*bf16",
-                    "output_ptr": "*fp32",
-                    "OUTPUT_FRAGMENT": "constexpr",
-                },
-                constexprs={"OUTPUT_FRAGMENT": output_fragment},
-            )

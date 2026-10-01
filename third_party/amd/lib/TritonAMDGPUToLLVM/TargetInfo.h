@@ -50,10 +50,6 @@ public:
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
-  bool requiresLeadingWarpSyncForScratchConversion() const override {
-    return true;
-  }
-
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     Value ctaId, Value val, Value pred,
                     std::optional<Value> barrierPtr = {}) const override;

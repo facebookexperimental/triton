@@ -3371,60 +3371,6 @@ def test_in_thread_convert_layout_8bit(src_reg_bases, dst_reg_bases):
 
 
 @gluon.jit
-def _wave_local_scratch_reuse_kernel(X, Y, valid_rows, iterations):
-    source: ttgl.constexpr = ttgl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]],
-        warp_bases=[[0, 32], [32, 0]], block_bases=[], shape=[64, 128])
-    dest: ttgl.constexpr = ttgl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]],
-        lane_bases=[[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]],
-        warp_bases=[[0, 32], [32, 0]], block_bases=[], shape=[64, 128])
-    src_n = ttgl.arange(0, 64, layout=ttgl.SliceLayout(1, source))
-    src_d = ttgl.arange(0, 128, layout=ttgl.SliceLayout(0, source))
-    dst_n = ttgl.arange(0, 64, layout=ttgl.SliceLayout(1, dest))
-    dst_d = ttgl.arange(0, 128, layout=ttgl.SliceLayout(0, dest))
-    base = ttgl.program_id(0) * 4 * 64 * 128
-    for iteration in range(iterations):
-        for part in ttgl.static_range(4):
-            offset = base + part * 64 * 128
-            value = ttgl.load(X + offset + src_n[:, None] * 128 + src_d[None, :],
-                            src_n[:, None] < valid_rows, other=0)
-            # Rewrap the layout carried by the load IR. The current inherited
-            # load frontend returns a plain block_type to Python.
-            value = ttgl.reshape(value, [64, 128])
-            value = (value.to(ttgl.float32) + iteration).to(ttgl.bfloat16)
-            converted = ttgl.convert_layout(value, dest)
-            ttgl.store(Y + offset + dst_n[:, None] * 128 + dst_d[None, :], converted,
-                     dst_n[:, None] < valid_rows)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
-@pytest.mark.parametrize("valid_rows", [1, 17, 31, 32, 33, 63, 64])
-@pytest.mark.parametrize("iterations", [1, 3, 11])
-def test_convert_layout_wave_local_scratch_reuse(valid_rows, iterations):
-    # The two layouts preserve each wave's physical scratch partition. Repeated
-    # conversions must order each wave's loads before reusing that partition.
-    shape = (32, 4, 64, 128)
-    count = math.prod(shape)
-    inp_cpu = ((torch.arange(count, dtype=torch.int32) * 17 + 31) % 251 - 125).to(torch.bfloat16).reshape(shape)
-    inp = inp_cpu.to("cuda")
-    raw_output = torch.full((count + 128,), 256, dtype=torch.bfloat16, device="cuda")
-    output = raw_output[64:-64].view(shape)
-    compiled = _wave_local_scratch_reuse_kernel[(32,)](inp, output, valid_rows, iterations, num_warps=4)
-
-    expected = torch.full((count + 128,), 256, dtype=torch.bfloat16)
-    expected[64:-64].view(shape)[:, :, :valid_rows, :] = inp_cpu[:, :, :valid_rows, :] + (iterations - 1)
-    # Every value is an exactly representable BF16 integer. This checks valid
-    # outputs, untouched masked rows, and 64-element guards at both ends.
-    torch.testing.assert_close(raw_output.cpu(), expected, atol=0, rtol=0)
-    # Keep this a scratch-reuse test if later conversion lowering changes.
-    asm = compiled.asm["amdgcn"]
-    assert re.search(r"\bds_write", asm)
-    assert re.search(r"\bds_read", asm)
-
-
-@gluon.jit
 def descriptor_shape_kernel(desc, expect_shape):
     for i in ttgl.static_range(len(expect_shape)):
         ttgl.device_assert(desc.shape[i] == expect_shape[i])

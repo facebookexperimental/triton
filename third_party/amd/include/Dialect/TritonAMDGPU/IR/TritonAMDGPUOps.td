@@ -882,10 +882,9 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   let summary = "Execute source-scheduled independent native MFMA fragments";
   let description = [{
-    By default, computes the full per-wave Cartesian product of the native
+    Computes the full per-wave Cartesian product of the native
     fragments in `a` and `b`, replacing every corresponding fragment in `acc`.
-    When `output_fragment` selects one output fragment, only that fragment is
-    updated and all others pass through. Native instructions are emitted in
+    Native instructions are emitted in
     K-major, N-major, M-minor order. This round-robins each K slice over the
     independent output fragments before returning to an accumulator dependency
     chain, while preserving one SSA chain per output fragment.
@@ -905,9 +904,9 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     drain, so any AGPR accumulator request is rejected, including persistent
     `auto`: a persistent accumulator must request `vgpr`.
     `initialize` starts the updated native accumulators from zero.
-    `output_fragment` selects one fragment in N-major, M-minor schedule order;
-    the default value `-1` updates the full grid, while a non-negative value
-    updates only the selected fragment and passes every other fragment through.
+    To interleave work between output subtiles, use separate operations with
+    explicit input panels and independent accumulator tensors. Commit those
+    chains before joining their results into a larger output tile.
     Completion of transient result fragments is represented separately by
     `mfma_commit`.
 
@@ -925,7 +924,7 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     CDNA4. Operands and accumulator must have matching rank two or three.
     Rank-three tensors have matching leading batch dimensions distributed
     over waves, with exactly one batch repetition per wave. The fragment grid
-    and output_fragment index remain local to each wave's batch.
+    remains local to each wave's batch.
     It accepts one or more K fragments per wave and the target's native
     instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
     16x16x32 on CDNA4. The logical K dimension must be a positive multiple
@@ -935,8 +934,7 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
       StrAttr:$resident_operand, StrAttr:$accumulator_role,
-      StrAttr:$accumulator_register_class, BoolAttr:$initialize,
-      DefaultValuedAttr<I32Attr, "-1">:$output_fragment);
+      StrAttr:$accumulator_register_class, BoolAttr:$initialize);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{

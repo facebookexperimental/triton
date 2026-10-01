@@ -1268,7 +1268,7 @@ LogicalResult ScheduledMfmaOp::verify() {
   SmallVector<int64_t> bRep =
       mfma.getRepForOperand(bTy.getShape(), bDot.getKWidth(), 1);
   // Rank-3 batches must be distributed over waves. With one batch per wave,
-  // the native fragment grid and output_fragment indexing remain identical
+  // the native fragment grid remains identical
   // to rank 2; the lowering does not need an additional batch loop.
   if (aRep[0] != 1 || bRep[0] != 1 || aRep[2] <= 0 || aRep[2] != bRep[1])
     return emitOpError(
@@ -1298,12 +1298,6 @@ LogicalResult ScheduledMfmaOp::verify() {
   if (ttg::getTotalElemsPerThread(accTy) != expectedElements)
     return emitOpError(
         "accumulator ownership does not match the native MFMA grid");
-
-  int64_t outputFragment = getOutputFragmentAttr().getInt();
-  int64_t numOutputFragments = numRepM * numRepN;
-  if (outputFragment < -1 || outputFragment >= numOutputFragments)
-    return emitOpError() << "output_fragment must be -1 or in the range [0, "
-                         << numOutputFragments << "), got " << outputFragment;
 
   if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
       getResidentOperand() != "rhs")

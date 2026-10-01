@@ -139,7 +139,6 @@ def amd_scheduled_mfma(
     resident_operand: tl.constexpr = None,
     accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
-    output_fragment: tl.constexpr = None,
     _semantic=None,
 ):
     """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
@@ -148,17 +147,16 @@ def amd_scheduled_mfma(
     no accumulator-lifetime or register-class contract, this operation exposes
     independent native fragment chains in source order.
 
-    With ``initialize=False``, each updated fragment computes its part of
-    ``acc + a @ b``. The operation keeps one SSA chain per output fragment and
+    With ``initialize=False``, the operation computes ``acc + a @ b`` over
+    the supplied output tile. It keeps one SSA chain per native output fragment and
     creates updates in K-major, N-major, M-minor order. LLVM may reschedule
     independent updates on the transient intrinsic path. With
-    ``initialize=True``, the first native K update of each selected fragment
-    starts from zero; only those fragments ignore their supplied accumulator
-    values.
+    ``initialize=True``, the first native K update of every output fragment
+    starts from zero, ignoring the supplied accumulator values.
 
-    ``output_fragment`` selects one native output fragment in N-major, M-minor
-    schedule order. The selected fragment is updated while all other fragments
-    pass through unchanged. ``None`` updates every output fragment.
+    To interleave work between output subtiles, slice the corresponding input
+    panels and use separate accumulator tensors and calls. Commit those chains
+    before joining the subtiles for a consumer of the full output tile.
 
     ``accumulator_role`` changes lowering, not the numerical operation.
     ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
@@ -188,15 +186,13 @@ def amd_scheduled_mfma(
     layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile span two
     native K fragments. All tensors must have the
     same rank, either two or three. Rank-three tensors have matching leading
-    batch dimensions distributed over waves, with one batch per wave;
-    ``output_fragment`` retains its per-wave meaning. All active lanes of a
-    wave must execute the operation uniformly.
+    batch dimensions distributed over waves, with one batch per wave. All active
+    lanes of a wave must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
     accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
     initialize = tl._unwrap_if_constexpr(initialize)
-    output_fragment = tl._unwrap_if_constexpr(output_fragment)
     assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
     assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
     assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
@@ -206,12 +202,8 @@ def amd_scheduled_mfma(
     assert accumulator_register_class in (None, "agpr",
                                           "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
-    assert output_fragment is None or (isinstance(output_fragment, int) and not isinstance(output_fragment, bool)
-                                       and output_fragment >= 0), (
-                                           "output_fragment must be None or a non-negative constexpr integer")
     resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand]
     accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
-    output_fragment = -1 if output_fragment is None else output_fragment
     handle = _semantic.builder.create_amd_scheduled_mfma(
         a.handle,
         b.handle,
@@ -220,7 +212,6 @@ def amd_scheduled_mfma(
         accumulator_role,
         accumulator_class,
         initialize,
-        output_fragment,
     )
     return tl.tensor(handle, acc.type)
 

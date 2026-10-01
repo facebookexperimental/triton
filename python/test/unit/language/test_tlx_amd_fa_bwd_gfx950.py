@@ -276,6 +276,35 @@ def _assert_fp32_dq_wave8_pipeline(compiled):
     _assert_scratch_free(compiled.name, compiled)
 
 
+def _assert_dk_native_column_subtiles(compiled):
+    # Interleaved dK updates must own independent D64 accumulator chains.
+    # A full D128 result with a selected update hides that ownership from
+    # the normal scheduled-MFMA contract.
+    ttir = compiled.asm["ttir"]
+    dk_updates = [
+        line for line in ttir.splitlines()
+        if "amdg.scheduled_mfma" in line and 'accumulator "persistent" register_class "agpr"' in line
+    ]
+    subtiles = [line for line in dk_updates if "-> tensor<64x64xf32," in line]
+    assert subtiles, "dK must carry independent native D64 accumulator chains"
+    assert all("tensor<64x16xbf16," in line and "tensor<16x64xbf16," in line for line in subtiles)
+    assert "output_fragment" not in ttir
+
+
+def _assert_dk_column_panels_match(result, reference):
+    # Check each independent column panel against the mathematical oracle;
+    # a misplaced panel must not be diluted by the other panel's norm.
+    for column in (0, 64):
+        target = reference[..., column:column + 64].float()
+        value = result[..., column:column + 64].float()
+        norm = torch.linalg.vector_norm(target)
+        if norm.item() == 0:
+            assert torch.count_nonzero(value).item() == 0, column
+        else:
+            error = (torch.linalg.vector_norm(value - target) / norm).item()
+            assert error < 1e-2, (column, error)
+
+
 def _capture_kernel_with_constexprs(monkeypatch, module, name, **constexprs):
     kernel = getattr(module, name)
     launches = []
@@ -2813,6 +2842,8 @@ def test_varlen_d128_fp32_dq_atomics_gfx950(monkeypatch, max_q, q_heads, kv_head
     assembly = compiled.asm["amdgcn"]
     assert "buffer_atomic_add_f32" in assembly
     assert "buffer_atomic_pk_add_bf16" not in assembly
+    _assert_dk_native_column_subtiles(compiled)
+    _assert_dk_column_panels_match(actual[1], expected[1])
     if q_heads == kv_heads:
         _assert_fp32_dq_wave8_pipeline(compiled)
 
@@ -3351,6 +3382,8 @@ def _assert_prefix_ds_result(actual, inputs, expected, q_lengths, kv_lengths):
                 assert torch.count_nonzero(value).item() == 0, (name, start)
             else:
                 assert (torch.linalg.vector_norm(value - target) / norm).item() < 1e-2, (name, start)
+            if name == "dk":
+                _assert_dk_column_panels_match(value, target)
             # Each producer Q512 chunk and its final tail is checked separately.
             if name == "dq":
                 for offset in range(0, length, 512):
@@ -3395,6 +3428,7 @@ def _assert_h12_ds_route(records, handoff):
     assert preprocess["ZERO_DQ"] is (not handoff)
     assert preprocess["PACK_STATS_MHA16"] is True and preprocess["PACK_STATS"] is False
     assert records[1][1]["Q_SPLITS"] == (1 if handoff else 2)
+    _assert_dk_native_column_subtiles(records[1][2])
     if not handoff:
         assert records[2][1]["KV_SPLITS"] == 2
     if handoff:
@@ -4195,6 +4229,7 @@ def _assert_h64_ds_route(records, handoff):
     assert preprocess["ZERO_DQ"] is (not handoff)
     assert preprocess["PACK_STATS_MHA16"] is True and preprocess["PACK_STATS"] is False
     assert records[1][1]["Q_SPLITS"] == 1
+    _assert_dk_native_column_subtiles(records[1][2])
     if handoff:
         assert records[-1][1]["enable_fp_fusion"] is False
         for name, _, compiled in records[1:]:
@@ -4312,6 +4347,7 @@ def test_varlen_d128_h64_ds_producer_boundaries_gfx950(fixture, sorted_tasks, sm
     assert torch.isnan(ds_storage[:4096]).all() and torch.isnan(ds_storage[-4096:]).all()
     assert torch.isnan(dq_storage[q.shape[0]:]).all()
     _assert_scratch_free("producer", producer)
+    _assert_dk_native_column_subtiles(producer)
     _assert_scratch_free("consumer", consumer)
 
 
