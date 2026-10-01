@@ -288,18 +288,25 @@ def triton_key():
     import pkgutil
     TRITON_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     contents = []
+
+    def hash_modules(path):
+        # walk_packages imports packages to discover their children, which can
+        # pull optional dependencies such as torch into compilation. FileFinder
+        # can locate modules (including symlinked packages) without importing them.
+        for module in pkgutil.iter_modules([path]):
+            spec = module.module_finder.find_spec(module.name)
+            with open(spec.origin, "rb") as f:
+                contents.append(hashlib.sha256(f.read()).hexdigest())
+            if module.ispkg:
+                for package_path in spec.submodule_search_locations:
+                    hash_modules(package_path)
+
     # frontend
     with open(__file__, "rb") as f:
         contents += [hashlib.sha256(f.read()).hexdigest()]
     # compiler
-    path_prefixes = [
-        (os.path.join(TRITON_PATH, "compiler"), "triton.compiler."),
-        (os.path.join(TRITON_PATH, "backends"), "triton.backends."),
-    ]
-    for path, prefix in path_prefixes:
-        for lib in pkgutil.walk_packages([path], prefix=prefix):
-            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-                contents += [hashlib.sha256(f.read()).hexdigest()]
+    for subdir in ["compiler", "backends"]:
+        hash_modules(os.path.join(TRITON_PATH, subdir))
 
     # backend
     libtriton_hash = hashlib.sha256()
@@ -313,16 +320,12 @@ def triton_key():
     contents.append(libtriton_hash.hexdigest())
     # language
     language_path = os.path.join(TRITON_PATH, 'language')
-    for lib in pkgutil.walk_packages([language_path], prefix="triton.language."):
-        with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-            contents += [hashlib.sha256(f.read()).hexdigest()]
+    hash_modules(language_path)
     # third-party TLX
     from pathlib import Path
     for tlx_sub_folder in ["language", "compiler"]:
         tlx_path = str(Path(TRITON_PATH).parent.parent / "third_party" / "tlx" / tlx_sub_folder)
-        for lib in pkgutil.walk_packages([tlx_path], prefix="tlx."):
-            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
-                contents += [hashlib.sha256(f.read()).hexdigest()]
+        hash_modules(tlx_path)
     return f'{__version__}' + '-'.join(contents)
 
 

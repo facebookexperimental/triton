@@ -2,14 +2,13 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import torch
 
 import pytest
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_hopper_or_newer
 
 
 def test_nvidia_kernel_dispatch_without_torch():
-    if not is_cuda() and torch.cuda.get_device_capability()[0] >= 9:
+    if not is_hopper_or_newer():
         pytest.skip("Requires CUDA and TMAs")
 
     env = os.environ.copy()
