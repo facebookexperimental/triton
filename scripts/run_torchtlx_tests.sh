@@ -29,6 +29,7 @@ PY="$VENV/bin/python"
 TESTS=(
   python/test/unit/language/test_torchtlx_templates.py
   python/test/unit/language/test_torchtlx_fusions.py
+  python/test/unit/language/test_torchtlx_registry_gate.py
 )
 log() { echo "[run_torchtlx_tests] $*"; }
 

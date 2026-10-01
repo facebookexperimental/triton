@@ -83,3 +83,5 @@ Second, it scales better than manual agentic kernel authoring. There is growing 
 - force - TLX templates enabled + forced epilogue fusion
 
 Only `allow` and `force` engage TLX; every other value (including an unset env var or a legacy `default`) maps to `None`, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.
+
+`TRITON_ENABLE_TORCH_TLX` (`0` by default, see `triton.knobs.tlx`) is the master switch for the integration import: with it unset and no TLX mode, importing `registry` is a no-op exposing only `tlx_only_cuda_options == []`, so processes that never engage TLX pay no registration or monkey-patch cost. Setting the TLX mode to `allow`/`force` (env var, `config.patch`, JustKnob, or build default) loads the integration without needing this switch. Explicit use of any other `registry` name loads the implementation on demand, preserving direct consumers such as the template unit tests; a bare import stays cheap.

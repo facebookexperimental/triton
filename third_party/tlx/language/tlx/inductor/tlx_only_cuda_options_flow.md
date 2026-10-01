@@ -56,9 +56,9 @@ sequenceDiagram
 
 To add a new FB-only option (e.g., `my_new_option`):
 
-1. **Add to registry.py**:
+1. **Add to `_TLX_ONLY_CUDA_OPTIONS_ENABLED` in tlx_config.py**:
    ```python
-   tlx_only_cuda_options = ["ctas_per_cga", "my_new_option"]
+   _TLX_ONLY_CUDA_OPTIONS_ENABLED = ("ctas_per_cga", "my_new_option")
    ```
 
 2. **Return from get_extra_kwargs()**:

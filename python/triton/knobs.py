@@ -720,6 +720,18 @@ class proton_knobs(base_knobs):
     enable_hw_trace: env_bool = env_bool("TRITON_ENABLE_HW_TRACE", False)
 
 
+class tlx_knobs(base_knobs):
+    # Master switch for the torchTLX inductor integration
+    # (triton.language.extra.tlx.inductor.registry). Default OFF: importing the
+    # integration registers TLX template heuristics and monkey-patches
+    # TritonTemplateKernel, which regressed default-path compile time (S713810).
+    # Opt in with TRITON_ENABLE_TORCH_TLX=1. Setting this knob also exports the
+    # env var, so the integration's import-time gate (which reads os.environ
+    # directly to avoid importing triton._C) observes a programmatic set made
+    # before the integration is first imported.
+    enable_torch_tlx: env_bool = env_bool("TRITON_ENABLE_TORCH_TLX", False)
+
+
 build = build_knobs()
 redis = redis_knobs()
 cache = cache_knobs()
@@ -730,6 +742,7 @@ language = language_knobs()
 nvidia = nvidia_knobs()
 amd = amd_knobs()
 proton = proton_knobs()
+tlx = tlx_knobs()
 
 
 def refresh_knobs():
