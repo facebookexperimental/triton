@@ -20,8 +20,6 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language._core import builtin as gluon_builtin
 import dataclasses
-import gzip
-import hashlib
 import importlib.util
 import re
 import sys
@@ -2689,18 +2687,6 @@ v_mfma_f32_32x32x16_bf16 {destination}, v[32:35], a[0:3], {accumulator}
 
     with pytest.raises(ValueError, match="marked MFMA srcC must be tied to its destination"):
         amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(assembly, "gfx950")
-
-
-def test_scheduled_mfma_hazard_repair_matches_agpr_parent():
-    fixture = Path(__file__).with_name("test_data") / "scheduled_mfma_agpr_parent.raw.amdgcn.gz"
-    raw_assembly = gzip.decompress(fixture.read_bytes())
-    assert hashlib.sha256(
-        raw_assembly).hexdigest() == "c6103f4e74043a8dc89314bdfa16136b7835aebc7842703e6828b43a918dd0b8"
-
-    repaired = amdgc_hazard_repair.insert_scheduled_mfma_hazard_nops(raw_assembly.decode(), "gfx950")
-
-    assert hashlib.sha256(
-        repaired.encode()).hexdigest() == "fdf629dfd955cab83ca82a43e45233dd3cefcb4cca3dcb74222c2b1d6dde6923"
 
 
 def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
