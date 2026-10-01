@@ -1384,15 +1384,11 @@ bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
   return outDims.empty() || ArrayRef(outDims) == ArrayRef({kRegister});
 }
 
-bool cvtNeedsWarpShuffle(triton::gpu::ConvertLayoutOp op) {
-  auto srcTy = op.getSrc().getType();
-  auto dstTy = op.getType();
+bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
   // Warp decomposition assumes pow2 GF(2) layouts.
   if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
     return false;
   }
-  if (op.getForceWarpShuffle())
-    return true;
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1405,6 +1401,42 @@ bool cvtNeedsWarpShuffle(triton::gpu::ConvertLayoutOp op) {
     return (factors.mixedTranspositions.size() < 2);
   }
   return false;
+}
+
+bool cvtNeedsWarpShuffle(triton::gpu::ConvertLayoutOp op) {
+  if (op.getForceWarpShuffle())
+    return true;
+  auto srcTy = op.getSrc().getType();
+  auto dstTy = op.getType();
+  // Warp decomposition assumes pow2 GF(2) layouts.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    return false;
+  }
+  auto layout = minimalCvtLayout(srcTy, dstTy);
+  MLIRContext *ctx = srcTy.getContext();
+  auto kRegister = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  if (to_vector(layout.getOutDimNames()) ==
+      SmallVector<StringAttr, 2>{kRegister, kLane}) {
+    auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
+    auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+    auto factors = getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32);
+    return (factors.mixedTranspositions.size() < 2);
+  }
+  return false;
+}
+
+bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // Keep modular-unsafe encodings out of layout algebra.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    bool srcSafe = npotSafeForLinearLayout(srcTy.getEncoding());
+    bool dstSafe = npotSafeForLinearLayout(dstTy.getEncoding());
+    if (!srcSafe || !dstSafe) {
+      return true;
+    }
+  }
+  return !cvtReordersRegisters(srcTy, dstTy) &&
+         !cvtNeedsWarpShuffle(srcTy, dstTy);
 }
 
 bool cvtNeedsSharedMemory(triton::gpu::ConvertLayoutOp op) {

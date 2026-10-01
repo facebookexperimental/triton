@@ -53,8 +53,9 @@ OpFoldResult RequireLayoutOp::fold(FoldAdaptor) {
 //-- ReleaseLayoutOp --
 
 OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
-  if (getType() == getSrc().getType()) {
-    // no-op
+  if (getType() == getSrc().getType() &&
+      (getRelaxed() || !getType().getEncoding())) {
+    // A relaxed release or an encoding-free release has no boundary to keep.
     return getSrc();
   }
   return {};
