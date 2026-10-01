@@ -288,6 +288,12 @@
 - **Tests**: `partition-scheduling-meta-unreached-epilogue-store.mlir` (own and shared mask, both fail without the fix); `test_autows_epilogue_side_store.py` (own mask: store dropped; shared mask: illegal memory access, both without the fix).
 - **Follow-ups (not fixed)**: re-run the partition solver after late store assignment instead of patching them in; make a tensor capture into `ttg.warp_specialize` a hard error; size tensor captures correctly.
 
+### 39. Pipeliner leaves a dead drain iteration's `local_store` unpredicated → TMA-store staging buffer clobbered (2026-10-01, fixed)
+- **Symptom**: Persistent autoWS addmm with an in-partition TMA store (`c_desc.store`, no separate epilogue store) and `num_stages=4` gives wrong results when some CTAs get fewer than 3 tiles. Example: M=5247, N=1024, K=128 (k_tiles==1), 128x128x128, 328 tiles on 148 SMs. Only the last tile of each 2-tile CTA is wrong, and only in the columns owned by warps 4-7 of the 8-warp default partition. 3-tile CTAs, `num_stages=3` and the non-TMA epilogue are all correct. The bias is not involved: zero and constant bias fail the same way.
+- **Root cause** (`PipeliningUtility.cpp` `predicateOp`): the default partition's tile loop is pipelined into a 3-deep drain, predicated on numIter >= 1/2/3. The staging `wait_barrier`/`arrive_barrier` of a dead drain iteration are predicated off, but `predicateOp` returned `ttg.local_store` unchanged. So the dead iteration still writes the single-slot TMA staging buffer while the store partition's `async_tma_copy_local_to_global` of the previous tile is reading it. The same unpredicated store also appears in the steady-state loop of predicated (non-peeled) pipelining.
+- **Fix**: inside `ttg.warp_specialize`, wrap `ttg.local_store` in `scf.if %pred`, the same way descriptor loads and stores are handled. Outside WS the early return is kept, since the store there targets a pipeliner-owned buffer.
+- **Tests**: `test_autows_addmm.py::test_autows_addmm_tma_store_short_trip_count` (num_warps 4/8; 25-27% of elements wrong without the fix). `ws_single_partition_else_hstu_bwd.mlir` now gets result-less `scf.if` wrappers around its stage-0 `local_store`s, so its `CHECK-NOT: scf.if` was narrowed to `= scf.if`.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

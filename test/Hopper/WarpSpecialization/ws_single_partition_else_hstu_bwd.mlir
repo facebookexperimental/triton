@@ -19,10 +19,11 @@
 // CHECK: tt.expand_dims
 // CHECK: arith.select
 // The remainder starts at lb + step and contains only the unmasked activation
-// path: no scalar branch and no per-element activation select.
+// path: no scalar branch and no per-element activation select. (Result-less
+// scf.if wrappers are the pipeliner predicating stage-0 local_stores.)
 // CHECK: arith.addi
 // CHECK: scf.for
-// CHECK-NOT: scf.if
+// CHECK-NOT: = scf.if
 // CHECK-NOT: arith.select
 // CHECK: scf.yield
 
