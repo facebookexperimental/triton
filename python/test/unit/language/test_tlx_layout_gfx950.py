@@ -490,7 +490,9 @@ def test_buffer_load_to_local_infers_offset_layout_amd():
         offs_k = tl.arange(0, K)
         off = offs_m[:, None] * STRIDE_M + offs_k[None, :]
         smem = tlx.local_alloc((M, K), tl.float16, tl.constexpr(1), layout=SHARED)
-        tlx.buffer_load_to_local(smem[0], a_ptr, off)
+        tlx.buffer_load_to_local(
+            smem[0], a_ptr, off, contiguity=8
+        )
 
     pad = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
                                                        _A16W16_TILE)
@@ -504,6 +506,7 @@ def test_buffer_load_to_local_infers_offset_layout_amd():
     assert "#ttg.linear" in ttgir
     assert expected in ttgir, f"inferred offset layout mismatch; expected substring:\n{expected}\n\nttgir:\n{ttgir}"
     assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 8" in ttgir
     # It lowers all the way to amdgcn (the direct-to-LDS width/alignment
     # requirements are met by the inferred offset layout).
     assert compiled.asm.get("amdgcn")

@@ -17,6 +17,7 @@
 #include "mlir/IR/Builders.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -40,6 +41,7 @@ enum : int32_t {
   kMaskVMEMRead = 1 << 5,
   kMaskDSRead = 1 << 8,
   kMaskDSWrite = 1 << 9,
+  kMaskLDSDMA = 1 << 11,
 };
 
 // --- "pretend it is decomposed": machine-instruction counts per TTGIR op -----
@@ -229,9 +231,32 @@ static VMEMPrice priceVMEM(Operation *op,
   if (auto load = dyn_cast<triton::amdgpu::BufferLoadOp>(op))
     return priceBufferAccess(load.getPtr(), load.getOffsets(),
                              load.getContiguity(), axisInfo);
-  if (auto load = dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op))
-    return priceBufferAccess(load.getPtr(), load.getOffsets(),
-                             load.getContiguity(), axisInfo);
+  if (auto load = dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op)) {
+    VMEMPrice price = priceBufferAccess(load.getPtr(), load.getOffsets(),
+                                        load.getContiguity(), axisInfo);
+    auto dstTy = load.getDest().getType();
+    auto padded =
+        dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstTy.getEncoding());
+    auto target = triton::amdgpu::TargetFeatures::fromModuleOp(
+        op->getParentOfType<ModuleOp>());
+    if (padded && !target.supportsDirectToLdsScatter()) {
+      // Direct-to-LDS lowering clamps a padded destination's vector width so
+      // padding is inserted only at wave boundaries. Mirror that clamp here;
+      // otherwise one TTGIR copy may be priced as one dwordx4 even though it
+      // lowers to four buffer_load_dword instructions, and the requested MFMA
+      // cover cannot be materialized by the machine scheduler.
+      unsigned elemBits = triton::getPointeeBitWidth(load.getPtr().getType());
+      unsigned elemBytes = std::max(1u, elemBits / 8);
+      unsigned requestedVec = std::max(1u, price.accessBytes / elemBytes);
+      unsigned paddedVec = padded.getMinInterval() / target.getWarpSize();
+      unsigned loweredVec = std::max(1u, std::min(requestedVec, paddedVec));
+      auto offsetTy = cast<RankedTensorType>(load.getOffsets().getType());
+      unsigned elems = triton::gpu::getTotalElemsPerThread(offsetTy);
+      price.count = std::max(1u, (elems + loweredVec - 1) / loweredVec);
+      price.accessBytes = loweredVec * elemBytes;
+    }
+    return price;
+  }
   // The tile is the DESTINATION memdesc for buffer_load_to_local; operand(0)
   // is the base pointer.
   for (Value r : op->getResults()) {
@@ -290,8 +315,13 @@ struct TritonAMDGPUSchedGroupBarrierSchedulerPass
       else if (isa<triton::gpu::LocalStoreOp>(op))
         annotate(op, kMaskDSWrite, dsWriteCountOf(op));
       else if (isa<triton::gpu::AsyncCopyGlobalToLocalOp,
-                   triton::amdgpu::BufferLoadToLocalOp,
-                   triton::amdgpu::BufferLoadOp, triton::LoadOp>(op)) {
+                   triton::amdgpu::BufferLoadToLocalOp>(op)) {
+        VMEMPrice price = priceVMEM(op, axisInfo);
+        unsigned bytes = std::min(price.accessBytes, 16u);
+        unsigned cover = std::max(
+            1u, (static_cast<unsigned>(mfmaPerDwordx4) * bytes + 15u) / 16u);
+        annotate(op, kMaskLDSDMA, price.count, cover);
+      } else if (isa<triton::amdgpu::BufferLoadOp, triton::LoadOp>(op)) {
         VMEMPrice price = priceVMEM(op, axisInfo);
         // Keep the measured dwordx4 schedule as the calibration point, then
         // scale the MFMA cover with the actual lowering width. This avoids
