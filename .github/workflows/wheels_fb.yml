@@ -48,6 +48,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # Release lines built via `ref` (e.g. release/3.8.x) vendor
+          # third_party/sleef as a submodule; main has none, so this is a no-op here.
+          submodules: recursive
 
       # Apply the caller-provided version: pin the clean wheel version and stamp
       # the short commit hash into the runtime __version__ (HEAD is the
