@@ -55,8 +55,33 @@
 <p>Lowers to <code>amdg.buffer_load</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.load</code>.</p>
 <h2 id="tlx-buffer-store"><code>tlx.buffer_store</code></h2>
 <p>Store a tensor of values to global memory.</p>
-<pre><code class="language-python">tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)</code></pre>
-<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>stored_value</code></td><td>tensor</td><td>Values to write.</td></tr><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not written.</td></tr><tr><td><code>cache</code></td><td>str, optional</td><td>Cache modifier.</td></tr></tbody></table>
+<pre><code class="language-python">tlx.buffer_store(
+    stored_value,
+    ptr,
+    offsets,
+    mask=None,
+    cache=None,
+    contiguity=1,
+)</code></pre>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>stored_value</code></td><td>tensor</td><td>Values to write.</td></tr><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not written.</td></tr><tr><td><code>cache</code></td><td>str, optional</td><td>Cache modifier.</td></tr><tr><td><code>contiguity</code></td><td>constexpr int</td><td>Trusted positive power-of-two lower bound on the number of adjacent elements available for vectorization. Values greater than one require <code>stored_value</code> to be pinned with <code>tlx.require_layout</code>.</td></tr></tbody></table>
+<p><code>contiguity</code> is a correctness contract, not a best-effort hint. For every group of <code>contiguity</code> elements owned by one thread, the caller promises that the offsets are consecutive, the mask predicate is identical, and the first address meets the packed access's alignment. The compiler verifies that the width is a positive power of two, divides the number of elements owned by each thread, and does not exceed the physical adjacency of the pinned layout; it cannot verify the runtime address or mask promises. An incorrect promise can change which elements are written.</p>
+<p>Pinning <code>stored_value</code> anchors the store layout; the store's operand constraint keeps offsets and mask in the same encoding. The final instruction width is also capped by AMD's 128-bit buffer-store limit. For example, BF16 <code>contiguity=16</code> is emitted as legal eight-element <code>buffer_store_dwordx4</code> operations. The default <code>contiguity=1</code> retains the existing scalar-contract behavior.</p>
+<pre><code class="language-python">store_layout: tl.constexpr = tlx.amd_mfma_layout(
+    version=4,
+    instr_shape=[16, 16, 32],
+    transposed=True,
+    warps_per_cta=[2, 2],
+)
+mask_boundary = mask_boundary - mask_boundary % 4
+mask = offsets &lt; mask_boundary
+values = tlx.require_layout(values, store_layout)
+tlx.buffer_store(
+    values,
+    out_ptr,
+    offsets,
+    mask=mask,
+    contiguity=4,
+)</code></pre>
 <p><strong>Returns</strong>: Nothing.</p>
 <p>Lowers to <code>amdg.buffer_store</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.store</code>.</p>
 <h2 id="tlx-buffer-atomic-add"><code>tlx.buffer_atomic_add</code></h2>

@@ -239,7 +239,8 @@ LogicalResult verifyTDMCommonLayout(Operation *op,
 }
 
 LogicalResult verifyBufferContiguity(Operation *op, RankedTensorType tensorTy,
-                                     int64_t contiguity) {
+                                     int64_t contiguity,
+                                     bool checkPhysicalLayout = false) {
   if (contiguity <= 0 || (contiguity & (contiguity - 1)) != 0)
     return op->emitError("contiguity must be a positive power-of-two integer");
 
@@ -257,6 +258,16 @@ LogicalResult verifyBufferContiguity(Operation *op, RankedTensorType tensorTy,
     return op->emitError() << "contiguity " << contiguity << " must divide the "
                            << elementsPerThread
                            << " elements owned by each thread";
+  if (checkPhysicalLayout) {
+    auto order = triton::gpu::getOrder(tensorTy);
+    auto contigPerThread = triton::gpu::getContigPerThread(tensorTy);
+    assert(!order.empty() && order.front() < contigPerThread.size());
+    int64_t physicalContiguity = contigPerThread[order.front()];
+    if (contiguity > physicalContiguity)
+      return op->emitError()
+             << "contiguity " << contiguity
+             << " exceeds physical layout contiguity " << physicalContiguity;
+  }
   return success();
 }
 
@@ -870,6 +881,12 @@ LogicalResult BufferLoadOp::verify() {
   return verifyBufferContiguity(getOperation(),
                                 cast<RankedTensorType>(getOffsets().getType()),
                                 getContiguity());
+}
+
+LogicalResult BufferStoreOp::verify() {
+  return verifyBufferContiguity(getOperation(),
+                                cast<RankedTensorType>(getOffsets().getType()),
+                                getContiguity(), /*checkPhysicalLayout=*/true);
 }
 
 LogicalResult BufferAtomicRMWOp::verify() {
