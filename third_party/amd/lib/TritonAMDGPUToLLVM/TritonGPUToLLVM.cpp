@@ -22,6 +22,7 @@
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -225,14 +226,12 @@ public:
 // TLX layout propagation is allowed to create captured or yielded
 // convert_layout operations temporarily while it reconciles a predicate
 // body's native layout with its carried values. By LLVM lowering, every such
-// cross-lane conversion must have moved outside a non-wave-uniform region.
-// Otherwise its shuffle would execute after EXEC is restricted and could read
-// inactive lanes.
+// unsafe conversion must have moved outside the region. Non-wave-uniform EXEC
+// forbids any cross-lane transfer; wave-uniform EXEC permits warp shuffles but
+// not conversions that lower through CTA shared memory and a barrier.
 static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
   WalkResult result = mod.walk([&](triton::gpu::WarpPredicateOp predicateOp) {
-    if (predicateOp.getWaveUniform().value_or(false))
-      return WalkResult::advance();
-
+    bool waveUniform = predicateOp.getWaveUniform().value_or(false);
     triton::gpu::ConvertLayoutOp unsafeConvert;
     predicateOp.getRegion().walk([&](Operation *nested) {
       if (nested != predicateOp.getOperation() &&
@@ -246,14 +245,21 @@ static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
       if (triton::gpu::toLinearLayout(srcType) ==
           triton::gpu::toLinearLayout(dstType))
         return WalkResult::advance();
+      if (waveUniform && (triton::gpu::lookupNumWarps(predicateOp) == 1 ||
+                          !cvtNeedsSharedMemory(srcType, dstType)))
+        return WalkResult::advance();
       unsafeConvert = convert;
       return WalkResult::interrupt();
     });
 
     if (!unsafeConvert)
       return WalkResult::advance();
-    predicateOp.emitError(
-        "non-wave-uniform body still contains cross-lane layout conversion");
+    if (waveUniform)
+      predicateOp.emitError(
+          "wave-uniform body still contains a shared-memory layout conversion");
+    else
+      predicateOp.emitError(
+          "non-wave-uniform body still contains cross-lane layout conversion");
     return WalkResult::interrupt();
   });
   return failure(result.wasInterrupted());

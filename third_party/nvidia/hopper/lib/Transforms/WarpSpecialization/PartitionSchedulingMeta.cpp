@@ -3066,14 +3066,14 @@ void PartitionSchedulingMeta::runOnOperation() {
       // written -> shared-memory overrun). Schedule such stores with the
       // loop's other stores so task-id propagation reaches their operands.
       {
-        Partition *storePartition = nullptr;
+        Partition *storePartition = result->layout.defaultPartition;
         getLoopBodyRegion(loop).walk([&](StoreOp store) {
           SetVector<int> ids = safeGetPartitionIds(store);
-          if (!storePartition && ids.size() == 1)
-            storePartition = schedule.getPartition(ids.front());
+          if (ids.size() != 1)
+            return WalkResult::advance();
+          storePartition = schedule.getPartition(ids.front());
+          return WalkResult::interrupt();
         });
-        if (!storePartition)
-          storePartition = result->layout.defaultPartition;
         if (storePartition) {
           // Atomics are left alone: a tile-claim atomic must keep the full
           // partition union (or make autoWS bail out).
