@@ -124,6 +124,7 @@ jobs:
           path: s3-artifacts/*/*.whl
           s3-bucket: gha-artifacts
           s3-prefix: tritonci-artifacts
+          retention-days: 14
           overwrite: "true"
           if-no-files-found: error
 
