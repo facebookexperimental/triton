@@ -5533,6 +5533,213 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
+// A conversion that canonicalization folds into its users never reaches
+// shared-memory allocation.
+static bool isFoldedConversion(Operation *op) {
+  auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op);
+  if (!cvt || cvt->use_empty())
+    return false;
+  return llvm::all_of(cvt->getUsers(), [&](Operation *user) {
+    if (isa<ttg::LocalStoreOp, ttg::LocalAllocOp, ttg::RemoteShmemStoreOp,
+            ttg::AsyncRemoteShmemStoreOp, ttg::ConvertLayoutOp>(user))
+      return true;
+    if (auto split = dyn_cast<tt::SplitOp>(user))
+      return inferDstEncoding(split, cvt.getSrc().getType().getEncoding()) ==
+             split.getOutLHS().getType().getEncoding();
+    auto store = dyn_cast<ttng::TMEMStoreOp>(user);
+    return store && store.getSrc() == cvt.getResult() &&
+           ttng::isDistributedLayoutTMemCompatible(
+               store, cvt.getSrc().getType(), store.getDst().getType());
+  });
+}
+
+// Mirrors TMemSplitLoadPattern (triton-nvidia-optimize-tmem-layouts), which
+// runs after warp specialization: a tmem_load -> reshape -> trans[0,2,1] ->
+// split chain (possibly nested, with conversions anywhere on it) becomes one
+// tmem_load per subtile, each followed by a conversion from the default TMEM
+// layout to the split result layout. Returns the root tmem_load, collects the
+// conversions on the chain (which the rewrite drops) and sets `parent` to the
+// split this one re-splits, if any.
+static ttng::TMEMLoadOp
+matchTmemSplitChain(tt::SplitOp split, SmallVectorImpl<Operation *> &chainCvts,
+                    tt::SplitOp &parent) {
+  auto strip = [&](Value v) {
+    while (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
+      chainCvts.push_back(cvt);
+      v = cvt.getSrc();
+    }
+    return v;
+  };
+  auto trans = strip(split.getSrc()).getDefiningOp<tt::TransOp>();
+  if (!trans || trans.getOrder() != ArrayRef<int>({0, 2, 1}))
+    return {};
+  auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
+  if (!reshape)
+    return {};
+  Value reshapeSrc = strip(reshape.getSrc());
+  ttng::TMEMLoadOp root;
+  parent = reshapeSrc.getDefiningOp<tt::SplitOp>();
+  if (parent) {
+    tt::SplitOp grandparent;
+    root = matchTmemSplitChain(parent, chainCvts, grandparent);
+  } else {
+    root = reshapeSrc.getDefiningOp<ttng::TMEMLoadOp>();
+  }
+  if (!root)
+    return {};
+  auto shape = reshape.getResult().getType().getShape();
+  if (shape[0] != cast<RankedTensorType>(reshapeSrc.getType()).getShape()[0])
+    return {};
+  int mDim = ttg::getShapePerCTA(root.getSrc().getType())[0];
+  if ((mDim != 64 && mDim != 128) || shape[2] < 8)
+    return {};
+  return root;
+}
+
+// Scratch of the per-subtile conversion TMemSplitLoadPattern creates for a
+// leaf split, measured on a temporary copy of the IR it would emit. The later
+// layout-conversion cleanup keeps the TMEM layout through the elementwise ops
+// that follow (e.g. the truncf to the output type), so the conversion lands on
+// the value they produce.
+static uint64_t
+tmemSplitLeafScratchBytes(tt::SplitOp split, ttng::TMEMLoadOp root,
+                          const triton::AllocationAnalysisScratchSizeFn &fn) {
+  OpBuilder b(split);
+  Location loc = split.getLoc();
+  Value v = split.getOutLHS();
+  while (v.hasOneUse()) {
+    Operation *user = *v.getUsers().begin();
+    if (!user->hasTrait<OpTrait::Elementwise>() || user->getNumResults() != 1 ||
+        llvm::count_if(user->getOperands(), [](Value operand) {
+          return isa<RankedTensorType>(operand.getType());
+        }) != 1)
+      break;
+    v = user->getResult(0);
+  }
+  auto outTy = cast<RankedTensorType>(v.getType());
+  int splitN = outTy.getShape()[1];
+  auto subSlice =
+      ttng::TMEMSubSliceOp::create(b, loc, root.getSrc(), 0, splitN, 1);
+  auto dist = ttng::getDefaultLayoutForTmemLdSt(
+      cast<ttg::MemDescType>(subSlice.getType()), ttg::lookupNumWarps(split));
+  auto load = UnrealizedConversionCastOp::create(
+      b, loc, TypeRange{outTy.cloneWithEncoding(dist)}, ValueRange{});
+  auto cvt = ttg::ConvertLayoutOp::create(b, loc, outTy, load.getResult(0));
+  uint64_t bytes = fn(cvt);
+  cvt->erase();
+  load->erase();
+  subSlice->erase();
+  return bytes;
+}
+
+// Peak op scratch (layout conversions, reductions, ...) live alongside the
+// planned buffers, mirroring AllocateSharedMemoryNv. The planned buffers are
+// live from function entry through the warp_specialize, so scratch after a WS
+// loop does not count. Scratch before it can share one slot (each scratch is
+// live only during its op). Inside the warp_specialize, scratch in different
+// regions always interferes because the partitions run concurrently, while
+// scratch in one region can share. Code partitioning puts each task's copy of
+// a loop body in its own region, so the WS peak is the sum over (task,
+// region) of the largest scratch in it.
+static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
+  // Size it with the same function AllocateSharedMemoryNv uses (the generic
+  // one, which over-sizes layout conversions, only for IR without a CUDA
+  // target).
+  auto mod = funcOp->getParentOfType<ModuleOp>();
+  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  std::optional<triton::NVIDIA::TargetInfo> targetInfo;
+  triton::AllocationAnalysisScratchSizeFn scratchSizeFn =
+      triton::defaultAllocationAnalysisScratchSizeFn;
+  if (target && target.getValue().starts_with("cuda:")) {
+    targetInfo.emplace(getNVIDIAComputeCapability(mod));
+    scratchSizeFn = ttng::getNvidiaAllocationAnalysisScratchSizeFn(*targetInfo);
+  }
+
+  SmallVector<Operation *> wsLoops;
+  funcOp->walk([&](LoopLikeOpInterface loop) {
+    if (loop->hasAttr(tt::kWarpSpecializeAttrName))
+      wsLoops.push_back(loop);
+  });
+  auto topLevelAncestor = [&](Operation *op) {
+    while (op->getParentOp() != funcOp.getOperation())
+      op = op->getParentOp();
+    return op;
+  };
+
+  // Conversions the TMEM split rewrite drops, and the per-subtile conversion
+  // it adds for each leaf split (one whose results are not split again).
+  DenseSet<Operation *> droppedCvts;
+  DenseMap<Operation *, uint64_t> leafSplitBytes;
+  DenseMap<Operation *, ttng::TMEMLoadOp> splitRoots;
+  DenseSet<Operation *> parentSplits;
+  funcOp->walk([&](tt::SplitOp split) {
+    SmallVector<Operation *> chainCvts;
+    tt::SplitOp parent;
+    ttng::TMEMLoadOp root = matchTmemSplitChain(split, chainCvts, parent);
+    if (!root)
+      return;
+    splitRoots[split] = root;
+    droppedCvts.insert(chainCvts.begin(), chainCvts.end());
+    if (parent)
+      parentSplits.insert(parent);
+  });
+  for (auto &[split, root] : splitRoots)
+    if (!parentSplits.contains(split))
+      leafSplitBytes[split] = tmemSplitLeafScratchBytes(
+          cast<tt::SplitOp>(split), root, scratchSizeFn);
+
+  uint64_t outsideBytes = 0;
+  DenseMap<Operation *, DenseMap<std::pair<AsyncTaskId, Region *>, uint64_t>>
+      wsBytes;
+  funcOp->walk([&](Operation *op) {
+    // Tensor-map scratch is reserved separately.
+    if (isa<ttng::TensormapCreateOp>(op) || isFoldedConversion(op) ||
+        droppedCvts.contains(op))
+      return;
+    auto leaf = leafSplitBytes.find(op);
+    uint64_t bytes =
+        leaf != leafSplitBytes.end() ? leaf->second : scratchSizeFn(op);
+    if (bytes == 0)
+      return;
+    Operation *wsLoop = nullptr;
+    for (Operation *loop : wsLoops)
+      if (loop->isProperAncestor(op))
+        wsLoop = loop;
+    if (wsLoop) {
+      SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(op);
+      if (taskIds.empty())
+        taskIds.push_back(-1);
+      for (AsyncTaskId taskId : taskIds) {
+        uint64_t &slot = wsBytes[wsLoop][{taskId, op->getParentRegion()}];
+        slot = std::max(slot, bytes);
+      }
+      LDBG("auxiliary op scratch (in WS loop): " << bytes << " bytes for "
+                                                 << *op);
+      return;
+    }
+    Operation *anchor = topLevelAncestor(op);
+    bool beforeWS = llvm::any_of(wsLoops, [&](Operation *loop) {
+      Operation *wsAnchor = topLevelAncestor(loop);
+      return anchor == wsAnchor || anchor->isBeforeInBlock(wsAnchor);
+    });
+    if (!beforeWS)
+      return;
+    outsideBytes = std::max(outsideBytes, bytes);
+    LDBG("auxiliary op scratch (before WS loop): " << bytes << " bytes for "
+                                                   << *op);
+  });
+
+  uint64_t peak = outsideBytes;
+  for (auto &[loop, regions] : wsBytes) {
+    uint64_t sum = 0;
+    for (auto &[key, bytes] : regions)
+      sum += bytes;
+    peak = std::max(peak, sum);
+  }
+  LDBG("auxiliary op scratch: reserving " << peak << " bytes");
+  return peak;
+}
+
 // Reserve a conservative allowance for barriers, captures, tensor-map and op
 // scratch created after SMEM planning.
 static unsigned estimateAuxiliarySmemBytes(
@@ -5576,41 +5783,7 @@ static unsigned estimateAuxiliarySmemBytes(
     tensorMapScratchBytes += tensorMapBytesPerOp;
   });
 
-  // Op scratch (layout conversions, reductions, ...) is live only during its
-  // op, but the planned buffers are live across the whole warp_specialize, so
-  // the largest single scratch adds to the peak. Without it an epilogue
-  // convert_layout can push a budget-filling plan past the hardware limit.
-  // Size it with the same function AllocateSharedMemoryNv uses (the generic
-  // one, which over-sizes layout conversions, only for IR without a CUDA
-  // target).
-  auto mod = funcOp->getParentOfType<ModuleOp>();
-  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
-  std::optional<triton::NVIDIA::TargetInfo> targetInfo;
-  triton::AllocationAnalysisScratchSizeFn scratchSizeFn =
-      triton::defaultAllocationAnalysisScratchSizeFn;
-  if (target && target.getValue().starts_with("cuda:")) {
-    targetInfo.emplace(getNVIDIAComputeCapability(mod));
-    scratchSizeFn = ttng::getNvidiaAllocationAnalysisScratchSizeFn(*targetInfo);
-  }
-  uint64_t opScratchBytes = 0;
-  funcOp->walk([&](Operation *op) {
-    if (isa<ttng::TensormapCreateOp>(op))
-      return;
-    // Canonicalization folds a conversion into these users, so it never
-    // reaches allocation.
-    if (isa<ttg::ConvertLayoutOp>(op) && !op->use_empty() &&
-        llvm::all_of(op->getUsers(), [](Operation *user) {
-          return isa<ttg::LocalStoreOp, ttg::LocalAllocOp,
-                     ttg::RemoteShmemStoreOp, ttg::AsyncRemoteShmemStoreOp>(
-              user);
-        }))
-      return;
-    uint64_t bytes = scratchSizeFn(op);
-    if (bytes > opScratchBytes) {
-      opScratchBytes = bytes;
-      LDBG("auxiliary op scratch: " << bytes << " bytes for " << *op);
-    }
-  });
+  uint64_t opScratchBytes = estimateOpScratchBytes(funcOp);
 
   uint64_t totalBytes = numBarrierSlots * barrierBytesPerSlot *
                             triton::gpu::lookupNumCTAs(funcOp) +

@@ -429,8 +429,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // The budget comes from tt.smem_budget on the loop, not from the RUN-line
 // option; the two are kept in sync only for readability. It is 206096 rather
 // than the shipped 200000 because the point of this fixture is the dV
-// two-copy store-wait ring: the planner reserves 8332 B of auxiliary SMEM
-// (barriers, captures, and the 4 KiB scratch of the dQ subtile convert_layout),
+// two-copy store-wait ring: the planner reserves 8588 B of auxiliary SMEM
+// (barriers, captures, and 4352 B of conversion scratch in two partitions),
 // and at 200000 Phase 3.7's dV bump no longer fits, so the planner reverts dV
 // to one copy and there is no rotation left to check. dK must still miss the
 // bump for the asymmetry below to hold, so do not raise this further.
