@@ -192,9 +192,10 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   if (isa<ttng::TMEMAllocOp, ttng::TMEMLoadOp>(op))
     return op;
   // A local_alloc only writes the buffer it creates, and every reader of that
-  // buffer goes through its result and is predicated by the same mask. This
-  // covers the early-lowered TMA store staging alloc that lands in a peeled
-  // epilogue stage when a K == BLOCK_K tile loop is pipelined without WS.
+  // buffer goes through its result and is predicated by the same mask. Meta WS
+  // peels the epilogue and masks its last-stage ops for every pipelined loop,
+  // which can include an early-lowered TMA store staging alloc (e.g. a
+  // K == BLOCK_K tile loop) or a multi-buffered alloc in a WS partition.
   if (isa<ttg::LocalAllocOp>(op))
     return op;
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
