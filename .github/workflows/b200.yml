@@ -66,6 +66,8 @@ env:
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
+  # Build and test jobs require shared local storage outside checkout and runner.temp.
+  WHEEL_DIR: /tmp/triton-wheels/b200/${{ github.run_id }}
 
 jobs:
   b200-build:
@@ -98,15 +100,9 @@ jobs:
       - name: Build wheel
         run: |
           . "${SETUP_SCRIPT}"
-          uv build --wheel --no-build-isolation --out-dir dist/
-          ls -la dist/
-          python3 -c "import glob,sys,zipfile; w=glob.glob('dist/*.whl'); sys.exit('no wheel built') if len(w)!=1 else None; zipfile.ZipFile(w[0]).testzip(); print('wheel ok:', w[0])"
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: triton-wheel-b200-${{ github.sha }}
-          path: dist/*.whl
-          retention-days: 1
+          uv build --wheel --no-build-isolation --out-dir "${WHEEL_DIR}"
+          ls -la "${WHEEL_DIR}"
+          python3 -c "import glob,os,sys,zipfile; w=glob.glob(os.path.join(os.environ['WHEEL_DIR'], '*.whl')); sys.exit('no wheel built') if len(w)!=1 else None; zipfile.ZipFile(w[0]).testzip(); print('wheel ok:', w[0])"
 
   b200-meta-triton-test:
     needs: b200-build
@@ -135,15 +131,10 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: triton-wheel-b200-${{ github.sha }}
-          path: ${{ runner.temp }}/prebuilt-wheel
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+          uv pip install --force-reinstall --no-deps "${WHEEL_DIR}"/*.whl
       - name: Install torchao
         timeout-minutes: 10
         run: |
@@ -223,15 +214,10 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: triton-wheel-b200-${{ github.sha }}
-          path: ${{ runner.temp }}/prebuilt-wheel
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+          uv pip install --force-reinstall --no-deps "${WHEEL_DIR}"/*.whl
           uv pip install pytest
       - name: Install torchao
         timeout-minutes: 10
@@ -462,15 +448,10 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: triton-wheel-b200-${{ github.sha }}
-          path: ${{ runner.temp }}/prebuilt-wheel
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
+          uv pip install --force-reinstall --no-deps "${WHEEL_DIR}"/*.whl
           uv pip install pytest expecttest
       - name: Select kernel-affected tests
         id: select
