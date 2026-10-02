@@ -105,9 +105,27 @@ CATALOG: tuple[OpSpec, ...] = (
     ),
     OpSpec(
         op="mm_torchtlx",
+        arch="gfx942",
+        variant="inductor_gfx942_mm",
+        impl="triton.language.extra.tlx.inductor.gfx942_torch:mm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="mm_torchtlx",
         arch="gfx950",
         variant="inductor_gfx950_mm",
         impl="triton.language.extra.tlx.inductor.gfx950_torch:mm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        # TorchTLX providers are benchmark/catalog entries rather than public
+        # wrappers: their API is torch.addmm, with TLX selected by Inductor.
+        op="addmm_torchtlx",
+        arch="gfx942",
+        variant="inductor_gfx942_addmm",
+        impl="triton.tlx.ops.kernels.addmm.gfx942_torch:addmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),
