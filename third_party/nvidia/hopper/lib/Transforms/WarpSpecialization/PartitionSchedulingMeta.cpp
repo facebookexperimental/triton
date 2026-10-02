@@ -3056,6 +3056,34 @@ void PartitionSchedulingMeta::runOnOperation() {
                           result->layout.defaultPartition);
       fixupScalarPartitions();
 
+      // A store whose operands are not reachable from any partition (e.g. an
+      // epilogue store of a pointer-loaded value that does not depend on the
+      // accumulator) forms a cluster with no def partitions, which
+      // propagatePartitions skips. Left unscheduled, doTaskIdPropagate never
+      // tags its operand chain: the store is dropped, or, when it inherits a
+      // task through a shared mask, its hoisted pointer splat is captured into
+      // ttg.warp_specialize as a tensor (8-byte slot, full register struct
+      // written -> shared-memory overrun). Schedule such stores with the
+      // loop's other stores so task-id propagation reaches their operands.
+      {
+        Partition *storePartition = result->layout.defaultPartition;
+        getLoopBodyRegion(loop).walk([&](StoreOp store) {
+          SetVector<int> ids = safeGetPartitionIds(store);
+          if (ids.size() != 1)
+            return WalkResult::advance();
+          storePartition = schedule.getPartition(ids.front());
+          return WalkResult::interrupt();
+        });
+        if (storePartition) {
+          // Atomics are left alone: a tile-claim atomic must keep the full
+          // partition union (or make autoWS bail out).
+          getLoopBodyRegion(loop).walk([&](StoreOp store) {
+            if (isa<RankedTensorType>(store.getPtr().getType()))
+              tryScheduleOp(storePartition, store);
+          });
+        }
+      }
+
       // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
       // These arise from early TMA reduce lowering: the wait's token comes
       // from AsyncTMAReduceOp which was categorized as TMAReduction, but

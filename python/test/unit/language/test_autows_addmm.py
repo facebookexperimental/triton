@@ -375,3 +375,138 @@ def test_autows_addmm_hoist_convert_before_broadcast():
 
     # Verify correctness: bias_1d + A @ B.T
     torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+@triton.jit
+def addmm_kernel_pointer_bias_ws(
+    bias_ptr,
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Persistent addmm with a pointer-loaded bias and pointer store epilogue."""
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * num_pid_n
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    a_desc = tl.make_tensor_descriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = tl.make_tensor_descriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, flatten=False, warp_specialize=True,
+                            data_partition_factor=1, separate_epilogue_store=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, ki * BLOCK_SIZE_K])
+            b = b_desc.load([pid_n * BLOCK_SIZE_N, ki * BLOCK_SIZE_K])
+            accumulator += tl.dot(a, b.T)
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:, None]
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :]
+        mask = (rm < M) & (rn < N)
+        bias = tl.load(bias_ptr + tl.broadcast_to(rn, [BLOCK_SIZE_M, BLOCK_SIZE_N]), mask)
+        tl.store(C + rm * N + rn, (accumulator + bias.to(tl.float32)).to(tl.bfloat16), mask)
+
+
+@pytest.mark.parametrize("K", [128, 256])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_autows_addmm_pointer_bias_single_k_tile(K):
+    """With a single K tile the accumulator is not loop-carried: the bias is
+    folded into the MMA and the TMEM accumulator is initialised every tile.
+    The loop scheduler puts that init and the epilogue load in different
+    stages, so the accumulator needs one TMEM buffer per in-flight tile.
+    With one buffer, the next tile's init overwrites the accumulator before
+    the epilogue reads it, and tiles beyond the first wave come out wrong."""
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        BLOCK = 128
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        N = 1024
+        # More tiles than SMs, with a ragged last M tile.
+        M = (NUM_SMS // (N // BLOCK) + 1) * BLOCK + BLOCK // 2
+        torch.manual_seed(0)
+        bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        C = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+        triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+        num_tiles = triton.cdiv(M, BLOCK) * (N // BLOCK)
+        kernel = addmm_kernel_pointer_bias_ws[(min(NUM_SMS, num_tiles), )](bias, A, B, C, M, N, K, BLOCK, BLOCK, BLOCK,
+                                                                           NUM_SMS, num_warps=4, num_stages=3)
+        assert "ttg.warp_specialize" in kernel.asm["ttgir"], "Expected warp specialization in IR"
+        ref_out = (A.double() @ B.double().T + bias.double()).to(torch.bfloat16)
+        torch.testing.assert_close(C, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@triton.jit
+def addmm_kernel_tma_store_bias_ws(
+    bias_ptr,
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Persistent addmm with a pointer-loaded bias and a TMA store epilogue."""
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * num_pid_n
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    a_desc = tl.make_tensor_descriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = tl.make_tensor_descriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = tl.make_tensor_descriptor(C, [M, N], [N, 1], [BLOCK_SIZE_M, BLOCK_SIZE_N])
+    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, flatten=False, warp_specialize=True,
+                            data_partition_factor=1, separate_epilogue_store=False):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, ki * BLOCK_SIZE_K])
+            b = b_desc.load([pid_n * BLOCK_SIZE_N, ki * BLOCK_SIZE_K])
+            accumulator += tl.dot(a, b.T)
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :]
+        bias = tl.load(bias_ptr + rn)
+        c_desc.store([pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], (accumulator + bias.to(tl.float32)).to(tl.bfloat16))
+
+
+@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_autows_addmm_tma_store_short_trip_count(num_warps):
+    """With num_stages=4 the epilogue partition is peeled into a three-deep
+    drain. CTAs with fewer tiles than that run dead drain iterations, whose
+    staging-buffer wait is predicated off; the local_store into the
+    single-slot TMA staging buffer must be predicated too, or it overwrites
+    the tile the TMA store partition is still reading."""
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        BLOCK = 128
+        K = 128
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        N = 1024
+        num_pid_n = N // BLOCK
+        # Most CTAs get two tiles, a few get three.
+        M = triton.cdiv(2 * NUM_SMS + 32, num_pid_n) * BLOCK - BLOCK // 2
+        torch.manual_seed(0)
+        bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        C = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+        triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+        num_tiles = triton.cdiv(M, BLOCK) * num_pid_n
+        kernel = addmm_kernel_tma_store_bias_ws[(min(NUM_SMS,
+                                                     num_tiles), )](bias, A, B, C, M, N, K, BLOCK, BLOCK, BLOCK,
+                                                                    NUM_SMS, num_warps=num_warps, num_stages=4)
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir
+        assert "ttng.async_tma_copy_local_to_global" in ttgir
+        ref_out = (A.double() @ B.double().T + bias.double()).to(torch.bfloat16)
+        torch.testing.assert_close(C, ref_out, atol=1e-2, rtol=1e-2)
