@@ -386,6 +386,21 @@ def TritonAMDGPUConvertToTensorOps
   }];
 }
 
+def TritonAMDGPUPreserveWarpPipelineOwners
+    : Pass<"tritonamdgpu-preserve-warp-pipeline-owners", "mlir::ModuleOp"> {
+  let summary = "Preserve warp-pipeline loop ownership across loop folding";
+
+  let description = [{
+    Add internal begin/end markers around loops that directly own warp-pipeline
+    stage borders.  The markers survive loop folding and unrolling, allowing
+    the late warp-pipeline pass to recover the original owner scope.  Stage
+    borders on statically single-trip loops are removed because phase-shifting
+    one iteration cannot overlap loop iterations.
+  }];
+
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect"];
+}
+
 def TritonAMDGPUWarpPipeline
     : Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
   let summary = "partition and pipeline";
