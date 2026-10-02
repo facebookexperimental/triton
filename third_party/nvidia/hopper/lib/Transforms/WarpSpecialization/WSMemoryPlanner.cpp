@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "llvm/Support/raw_os_ostream.h"
@@ -5601,8 +5602,15 @@ matchTmemSplitChain(tt::SplitOp split, SmallVectorImpl<Operation *> &chainCvts,
 // layout-conversion cleanup keeps the TMEM layout through the elementwise ops
 // that follow (e.g. the truncf to the output type), so the conversion lands on
 // the value they produce.
+//
+// `numWarps` is the warp count the split's partition is predicted to end up
+// with. When it differs from the current one, the store layout is rebuilt with
+// fewer warps along its most-warped dimension, the way relayout after
+// tritongpu-optimize-partition-warps assigns it; non-blocked layouts keep the
+// current (larger, so conservative) estimate.
 static uint64_t
 tmemSplitLeafScratchBytes(tt::SplitOp split, ttng::TMEMLoadOp root,
+                          int numWarps,
                           const triton::AllocationAnalysisScratchSizeFn &fn) {
   OpBuilder b(split);
   Location loc = split.getLoc();
@@ -5617,11 +5625,22 @@ tmemSplitLeafScratchBytes(tt::SplitOp split, ttng::TMEMLoadOp root,
     v = user->getResult(0);
   }
   auto outTy = cast<RankedTensorType>(v.getType());
+  auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(outTy.getEncoding());
+  if (!blocked || numWarps >= ttg::lookupNumWarps(split)) {
+    numWarps = ttg::lookupNumWarps(split);
+  } else {
+    SmallVector<unsigned> warpsPerCTA(blocked.getWarpsPerCTA());
+    while (product(warpsPerCTA) > static_cast<unsigned>(numWarps))
+      *llvm::max_element(warpsPerCTA) /= 2;
+    outTy = outTy.cloneWithEncoding(ttg::BlockedEncodingAttr::get(
+        b.getContext(), blocked.getSizePerThread(), blocked.getThreadsPerWarp(),
+        warpsPerCTA, blocked.getOrder(), blocked.getCGALayout()));
+  }
   int splitN = outTy.getShape()[1];
   auto subSlice =
       ttng::TMEMSubSliceOp::create(b, loc, root.getSrc(), 0, splitN, 1);
   auto dist = ttng::getDefaultLayoutForTmemLdSt(
-      cast<ttg::MemDescType>(subSlice.getType()), ttg::lookupNumWarps(split));
+      cast<ttg::MemDescType>(subSlice.getType()), numWarps);
   auto load = UnrealizedConversionCastOp::create(
       b, loc, TypeRange{outTy.cloneWithEncoding(dist)}, ValueRange{});
   auto cvt = ttg::ConvertLayoutOp::create(b, loc, outTy, load.getResult(0));
@@ -5630,6 +5649,96 @@ tmemSplitLeafScratchBytes(tt::SplitOp split, ttng::TMEMLoadOp root,
   load->erase();
   subSlice->erase();
   return bytes;
+}
+
+// Predicts each task's final warp count by replaying the register-budget
+// reduction of tritongpu-optimize-partition-warps on the IR as it will look
+// after the TMEM split rewrite: ops in `droppedOps` are gone, and each leaf
+// split becomes per-subtile TMEM loads (its results, minimum 4 warps). Task 0
+// is the default region and keeps the function's warps.
+static DenseMap<AsyncTaskId, int>
+predictTaskNumWarps(triton::FuncOp funcOp, Operation *wsLoop,
+                    const DenseSet<Operation *> &droppedOps,
+                    const DenseMap<Operation *, uint64_t> &leafSplits) {
+  auto tensorRegs = [](Type type) -> unsigned {
+    auto ty = dyn_cast<RankedTensorType>(type);
+    if (!ty || ty.getNumElements() <= 1 || !ty.getEncoding())
+      return 0;
+    unsigned numElems = ttg::getTotalElemsPerThread(ty) *
+                        product(ttg::getThreadsPerWarp(ty)) *
+                        product(ttg::getWarpsPerCTA(ty));
+    unsigned elSize = isa<tt::PointerType>(ty.getElementType())
+                          ? 64
+                          : ty.getElementTypeBitWidth();
+    return numElems * elSize / 32;
+  };
+  std::map<AsyncTaskId, unsigned> maxRegs;
+  std::map<AsyncTaskId, int> minWarps;
+  funcOp->walk([&](Operation *op) {
+    if (droppedOps.contains(op))
+      return;
+    bool isLeaf = leafSplits.contains(op);
+    for (AsyncTaskId taskId : getAsyncTaskIds(op)) {
+      unsigned &regs = maxRegs[taskId];
+      int &warps = minWarps.try_emplace(taskId, 1).first->second;
+      warps = std::max(warps, isLeaf ? 4 : ttng::getMinWarpsForOp(op));
+      if (!isLeaf)
+        for (Type type : op->getOperandTypes())
+          regs = std::max(regs, tensorRegs(type));
+      for (Type type : op->getResultTypes())
+        regs = std::max(regs, tensorRegs(type));
+    }
+  });
+
+  constexpr unsigned nTotalRegs = 1 << 16;
+  const unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(
+      funcOp->getParentOfType<ModuleOp>());
+  const int defaultNumWarps = ttg::lookupNumWarps(funcOp);
+  DenseMap<AsyncTaskId, int> numWarps;
+  numWarps[0] = defaultNumWarps;
+  SmallVector<AsyncTaskId> partitions;
+  for (auto &[taskId, regs] : maxRegs)
+    if (taskId != 0) {
+      partitions.push_back(taskId);
+      numWarps[taskId] = defaultNumWarps;
+    }
+  bool changed;
+  do {
+    changed = false;
+    int total = 0;
+    for (auto &[taskId, warps] : numWarps)
+      total += warps;
+    for (AsyncTaskId taskId : partitions) {
+      int &warps = numWarps[taskId];
+      if (warps <= minWarps[taskId])
+        continue;
+      unsigned reqRegsPerThread =
+          2 * maxRegs[taskId] / threadsPerWarp / (warps / 2);
+      unsigned nextRegsPerThread =
+          nTotalRegs / threadsPerWarp / (total - warps / 2);
+      if (reqRegsPerThread <= nextRegsPerThread) {
+        warps /= 2;
+        changed = true;
+        break;
+      }
+    }
+  } while (changed);
+
+  // Backward attention (reduction + computation roles) pins computation to 8.
+  if (auto types = wsLoop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName)) {
+    auto has = [&](StringRef role) {
+      return llvm::any_of(types, [&](Attribute a) {
+        return cast<StringAttr>(a).getValue() == role;
+      });
+    };
+    if (has("reduction") && has("computation") &&
+        !funcOp->getParentOfType<ModuleOp>()->hasAttr(ttng::AttrTwoCTAsName))
+      for (AsyncTaskId taskId : partitions)
+        if (taskId < static_cast<AsyncTaskId>(types.size()) &&
+            cast<StringAttr>(types[taskId]).getValue() == "computation")
+          numWarps[taskId] = 8;
+  }
+  return numWarps;
 }
 
 // Peak op scratch (layout conversions, reductions, ...) live alongside the
@@ -5683,10 +5792,37 @@ static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
     if (parent)
       parentSplits.insert(parent);
   });
-  for (auto &[split, root] : splitRoots)
-    if (!parentSplits.contains(split))
-      leafSplitBytes[split] = tmemSplitLeafScratchBytes(
-          cast<tt::SplitOp>(split), root, scratchSizeFn);
+  // Everything the rewrite removes, for the warp prediction.
+  DenseSet<Operation *> droppedOps(droppedCvts.begin(), droppedCvts.end());
+  for (auto &[split, root] : splitRoots) {
+    if (parentSplits.contains(split))
+      droppedOps.insert(split);
+    else
+      leafSplitBytes[split] = 0;
+    auto trans = cast<tt::SplitOp>(split).getSrc();
+    while (auto cvt = trans.getDefiningOp<ttg::ConvertLayoutOp>())
+      trans = cvt.getSrc();
+    auto transOp = trans.getDefiningOp<tt::TransOp>();
+    droppedOps.insert(transOp);
+    droppedOps.insert(transOp.getSrc().getDefiningOp());
+    droppedOps.insert(root);
+  }
+  for (auto &[split, bytes] : leafSplitBytes) {
+    int numWarps = ttg::lookupNumWarps(split);
+    for (Operation *loop : wsLoops) {
+      if (!loop->isProperAncestor(split))
+        continue;
+      auto predicted =
+          predictTaskNumWarps(funcOp, loop, droppedOps, leafSplitBytes);
+      int maxPredicted = 0;
+      for (AsyncTaskId taskId : getAsyncTaskIds(split))
+        maxPredicted = std::max(maxPredicted, predicted.lookup(taskId));
+      if (maxPredicted > 0)
+        numWarps = std::min(numWarps, maxPredicted);
+    }
+    bytes = tmemSplitLeafScratchBytes(
+        cast<tt::SplitOp>(split), splitRoots[split], numWarps, scratchSizeFn);
+  }
 
   uint64_t outsideBytes = 0;
   DenseMap<Operation *, DenseMap<std::pair<AsyncTaskId, Region *>, uint64_t>>
