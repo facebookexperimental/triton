@@ -1,0 +1,99 @@
+{
+ "schema_version": "prepared-joint-probe-v1",
+ "execution_mode": "first-window-probe",
+ "provenance": {
+  "model": "paper",
+  "ddg_sha256": "20501ee1daaaeda57da0f050b38c502248577c5f362504cad844b804c197d96d",
+  "solver_sources_sha256": "9c996b45262a0ec33fa2af162414801ce24257eb0b09c9bf723acb287e2f95cd",
+  "normalization_u": 150,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 32,
+   "warp_fixed_overhead": 0,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  },
+  "curation_source": {
+   "baseline_graph_sha256": "7b4622046616ea6b951e81091d6c78c02e8a5ac101e1d3198add2ab6e1e8755b",
+   "curator_sources_sha256": "2bef320b1288ea32a96348ecd50399b7ce2b56b561e74bfd328f90a8dcc7eac4",
+   "ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2"
+  },
+  "experiment_inputs": {
+   "allow_cross_warp": true,
+   "num_warps_override": null,
+   "reg_budget": null
+  },
+  "preparation": {
+   "regime": "prepared",
+   "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+   "curated_ddg_sha256": "20501ee1daaaeda57da0f050b38c502248577c5f362504cad844b804c197d96d",
+   "raw_ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2",
+   "assumptions": {
+    "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+    "a2_issue_width": 128,
+    "a2_elementwise_dialects": [
+     "arith",
+     "math"
+    ],
+    "a3_async_tokens_keep_measured_cost": true,
+    "a4_tmem_functional_unit": "TMEM",
+    "b1_cluster_tolerance": [
+     11,
+     10
+    ],
+    "b2_floor_divisor": 32,
+    "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+    "b4_second_objective": "maximize sum(C') at F = F*",
+    "b5_u": 150
+   },
+   "health": {
+    "pool_size": 75,
+    "positive_entries": 66,
+    "collapsed_entries": 59,
+    "collapse_ratio": 0.8939,
+    "survivor_spread": 1.0,
+    "distinct_survivors": [
+     1
+    ],
+    "objective_f": 320,
+    "first_stage_sum": 7,
+    "second_stage_sum": 7,
+    "u": 150,
+    "clusters": 13
+   },
+   "b5_u_applied": 150
+  },
+  "probe_sources_sha256": "72832d469eabe759656b1b669836c1a75917238ab255b9829e8933723b2be3ec"
+ },
+ "ii": 2,
+ "window": [
+  {
+   "L": 4,
+   "verdict": "unsat"
+  }
+ ],
+ "window_size": 1,
+ "unsat_count": 1,
+ "sat_found": false
+}

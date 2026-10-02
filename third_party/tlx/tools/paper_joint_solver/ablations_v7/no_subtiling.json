@@ -1,0 +1,472 @@
+{
+ "schema_version": "twill-joint-solution-v1",
+ "provenance": {
+  "ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2",
+  "baseline_graph_sha256": "7b4622046616ea6b951e81091d6c78c02e8a5ac101e1d3198add2ab6e1e8755b",
+  "solver_sources_sha256": "42f28efe2e94f97c13fc4c8a7e0326aaf5fe2955d21c8a0793b24b7cf93ef237",
+  "normalization_u": 300,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 32,
+   "warp_fixed_overhead": 4,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  }
+ },
+ "attempts": [
+  {
+   "ii": 28,
+   "L": 63,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 7.3
+  },
+  {
+   "ii": 28,
+   "L": 64,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 7.0
+  },
+  {
+   "ii": 28,
+   "L": 65,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 11.2
+  },
+  {
+   "ii": 28,
+   "L": 66,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 14.0
+  },
+  {
+   "ii": 28,
+   "L": 67,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 17.5
+  },
+  {
+   "ii": 28,
+   "L": 68,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 9.2
+  },
+  {
+   "ii": 28,
+   "L": 69,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 36.6
+  },
+  {
+   "ii": 28,
+   "L": 70,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 13.6
+  },
+  {
+   "ii": 28,
+   "L": 71,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 20.4
+  },
+  {
+   "ii": 28,
+   "L": 72,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 16.9
+  },
+  {
+   "ii": 28,
+   "L": 73,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 13.4
+  },
+  {
+   "ii": 28,
+   "L": 74,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 27.5
+  },
+  {
+   "ii": 28,
+   "L": 75,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 12.5
+  },
+  {
+   "ii": 28,
+   "L": 76,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 27.0
+  },
+  {
+   "ii": 28,
+   "L": 77,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 19.6
+  },
+  {
+   "ii": 28,
+   "L": 78,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 13.4
+  },
+  {
+   "ii": 28,
+   "L": 79,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 19.4
+  },
+  {
+   "ii": 28,
+   "L": 80,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 31.1
+  },
+  {
+   "ii": 28,
+   "L": 81,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 27.0
+  },
+  {
+   "ii": 28,
+   "L": 82,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 32.7
+  },
+  {
+   "ii": 28,
+   "L": 83,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 30.5
+  },
+  {
+   "ii": 28,
+   "L": 84,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 12.3
+  },
+  {
+   "ii": 29,
+   "L": 63,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 12.6
+  },
+  {
+   "ii": 29,
+   "L": 64,
+   "stage": "joint",
+   "result": "sat",
+   "seconds": 22.7
+  }
+ ],
+ "wall_s": 458.4,
+ "status": "sat",
+ "satisfiable": true,
+ "ii": 29,
+ "length": 64,
+ "copies": 3,
+ "horizon": 122,
+ "cycles": {
+  "0": 0,
+  "1": 0,
+  "2": 0,
+  "3": 46,
+  "4": 46,
+  "5": 0,
+  "6": 0,
+  "7": 0,
+  "8": 19,
+  "9": 26,
+  "10": 31,
+  "11": 31,
+  "12": 31,
+  "13": 34,
+  "14": 29,
+  "15": 31,
+  "16": 31,
+  "17": 31,
+  "18": 32,
+  "19": 45,
+  "20": 44,
+  "21": 46,
+  "22": 35,
+  "23": 39,
+  "24": 40,
+  "25": 29,
+  "26": 41,
+  "27": 44,
+  "28": 46,
+  "29": 63,
+  "30": 63
+ },
+ "warp": {
+  "0": 1,
+  "1": 2,
+  "2": 0,
+  "3": 0,
+  "4": 1,
+  "5": 3,
+  "6": 4,
+  "7": 5,
+  "8": 6,
+  "9": 7,
+  "10": 7,
+  "11": 7,
+  "12": 7,
+  "13": 3,
+  "14": 1,
+  "15": 7,
+  "16": 7,
+  "17": 7,
+  "18": 7,
+  "19": 3,
+  "20": 7,
+  "21": 1,
+  "22": 3,
+  "23": 3,
+  "24": 1,
+  "25": 6,
+  "26": 1,
+  "27": 1,
+  "28": 1,
+  "29": 3,
+  "30": 3
+ },
+ "group_widths": {
+  "0": 1,
+  "1": 8,
+  "2": 1,
+  "3": 8,
+  "4": 1,
+  "5": 1,
+  "6": 4,
+  "7": 4
+ },
+ "lane_masks": {
+  "2": [
+   0
+  ],
+  "3": [
+   0
+  ],
+  "0": [
+   0
+  ],
+  "4": [
+   1
+  ],
+  "14": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "21": [
+   2
+  ],
+  "24": [
+   3,
+   4,
+   5,
+   6
+  ],
+  "26": [
+   1,
+   3,
+   4,
+   5
+  ],
+  "27": [
+   1,
+   3,
+   4,
+   5
+  ],
+  "28": [
+   7
+  ],
+  "1": [
+   0
+  ],
+  "5": [
+   0
+  ],
+  "13": [
+   1,
+   2,
+   3,
+   4
+  ],
+  "19": [
+   1,
+   2,
+   5,
+   6
+  ],
+  "22": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "23": [
+   3,
+   5,
+   6,
+   7
+  ],
+  "29": [
+   1,
+   2,
+   5,
+   6
+  ],
+  "30": [
+   1,
+   2,
+   5,
+   6
+  ],
+  "6": [
+   0
+  ],
+  "7": [
+   0
+  ],
+  "8": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "25": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "9": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "10": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "11": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "12": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "15": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "16": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "17": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "18": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "20": [
+   0,
+   1,
+   2,
+   3
+  ]
+ },
+ "stats": {
+  "num_asserts": 18591,
+  "T": 122,
+  "num_groups": 8,
+  "scheduled_warps": 28,
+  "fixed_warps": 4,
+  "num_warps": 32,
+  "physical_warp_budget": 32,
+  "max_groups": 13,
+  "regs_per_warp": 8160,
+  "regs_per_sm": 65536,
+  "regs_fixed_overhead": 0,
+  "smem_capacity": 232448,
+  "smem_fixed_overhead": 0,
+  "barrier_pair_bytes": 16,
+  "tmem_capacity": 512,
+  "tmem_fixed_cols": 0,
+  "emitter_infra_nodes": 2,
+  "compact_encoding": true,
+  "time_variables": 31,
+  "live_variables": 0,
+  "lane_variables": 248,
+  "lane_mask_model": "paper_physical_masks"
+ }
+}

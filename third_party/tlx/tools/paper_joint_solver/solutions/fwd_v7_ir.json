@@ -1,0 +1,5886 @@
+{
+  "schema_version": "twill-pipelined-warp-ir-v2",
+  "source_program": {
+    "format": "ttgir-derived-operation-table",
+    "sha256": "7b4622046616ea6b951e81091d6c78c02e8a5ac101e1d3198add2ab6e1e8755b",
+    "input_schema_version": "0.1",
+    "kernel": {
+      "name": "fa_fwd_kernel_nows",
+      "args": [
+        {
+          "name": "Q",
+          "type": "*f16"
+        },
+        {
+          "name": "K",
+          "type": "*f16"
+        },
+        {
+          "name": "V",
+          "type": "*f16"
+        },
+        {
+          "name": "Out",
+          "type": "*f16"
+        },
+        {
+          "name": "M_lse",
+          "type": "*f32"
+        },
+        {
+          "name": "sm_scale",
+          "type": "f32"
+        },
+        {
+          "name": "H",
+          "type": "i32"
+        },
+        {
+          "name": "N_CTX",
+          "type": "i32"
+        }
+      ]
+    },
+    "ops": {
+      "op_264720288": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i1"
+        ],
+        "attributes": {
+          "value": 0
+        }
+      },
+      "op_264720400": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i1"
+        ],
+        "attributes": {
+          "value": -1
+        }
+      },
+      "op_264727680": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "value": 128
+        }
+      },
+      "op_264729024": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i64"
+        ],
+        "attributes": {
+          "value": 128
+        }
+      },
+      "op_264729232": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i64"
+        ],
+        "attributes": {
+          "value": 1
+        }
+      },
+      "op_264725120": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "value": 0
+        }
+      },
+      "op_264732320": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "f32"
+        ],
+        "attributes": {
+          "value": "1.44269502 : f32"
+        }
+      },
+      "op_264732528": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "value": 64
+        }
+      },
+      "op_264732736": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "value": 1
+        }
+      },
+      "op_264736432": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "value": "dense<0.000000e+00> : tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        }
+      },
+      "op_264741248": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "value": "dense<1.000000e+00> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        }
+      },
+      "op_264743744": {
+        "kind": "arith.constant",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "value": "dense<0xFF800000> : tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        }
+      },
+      "op_264745088": {
+        "kind": "tt.get_program_id",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "axis": 0
+        }
+      },
+      "op_264745280": {
+        "kind": "tt.get_program_id",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "axis": 1
+        }
+      },
+      "op_264639776": {
+        "kind": "arith.muli",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264745280"
+          },
+          {
+            "arg": "N_CTX"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "overflowFlags": "#arith.overflow<none>"
+        }
+      },
+      "op_264521792": {
+        "kind": "arith.muli",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264745088"
+          },
+          {
+            "const": 128,
+            "type": "i32"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "overflowFlags": "#arith.overflow<none>"
+        }
+      },
+      "op_264660144": {
+        "kind": "arith.addi",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264639776"
+          },
+          {
+            "op": "op_264521792"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "overflowFlags": "#arith.overflow<none>"
+        }
+      },
+      "op_264665440": {
+        "kind": "arith.muli",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "H"
+          },
+          {
+            "arg": "N_CTX"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "overflowFlags": "#arith.overflow<none>"
+        }
+      },
+      "op_264754432": {
+        "kind": "tt.make_tensor_descriptor",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "Q"
+          },
+          {
+            "op": "op_264665440"
+          },
+          {
+            "const": 128,
+            "type": "i32"
+          },
+          {
+            "const": 128,
+            "type": "i64"
+          },
+          {
+            "const": 1,
+            "type": "i64"
+          }
+        ],
+        "result_types": [
+          "!tt.tensordesc<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
+        ],
+        "attributes": {
+          "operandSegmentSizes": [
+            1,
+            2,
+            2,
+            0
+          ],
+          "padding": 1
+        }
+      },
+      "op_264757088": {
+        "kind": "tt.make_tensor_descriptor",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "K"
+          },
+          {
+            "op": "op_264665440"
+          },
+          {
+            "const": 128,
+            "type": "i32"
+          },
+          {
+            "const": 128,
+            "type": "i64"
+          },
+          {
+            "const": 1,
+            "type": "i64"
+          }
+        ],
+        "result_types": [
+          "!tt.tensordesc<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
+        ],
+        "attributes": {
+          "operandSegmentSizes": [
+            1,
+            2,
+            2,
+            0
+          ],
+          "padding": 1
+        }
+      },
+      "op_264757472": {
+        "kind": "tt.make_tensor_descriptor",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "V"
+          },
+          {
+            "op": "op_264665440"
+          },
+          {
+            "const": 128,
+            "type": "i32"
+          },
+          {
+            "const": 128,
+            "type": "i64"
+          },
+          {
+            "const": 1,
+            "type": "i64"
+          }
+        ],
+        "result_types": [
+          "!tt.tensordesc<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
+        ],
+        "attributes": {
+          "operandSegmentSizes": [
+            1,
+            2,
+            2,
+            0
+          ],
+          "padding": 1
+        }
+      },
+      "op_264757856": {
+        "kind": "tt.make_tensor_descriptor",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "Out"
+          },
+          {
+            "op": "op_264665440"
+          },
+          {
+            "const": 128,
+            "type": "i32"
+          },
+          {
+            "const": 128,
+            "type": "i64"
+          },
+          {
+            "const": 1,
+            "type": "i64"
+          }
+        ],
+        "result_types": [
+          "!tt.tensordesc<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
+        ],
+        "attributes": {
+          "operandSegmentSizes": [
+            1,
+            2,
+            2,
+            0
+          ],
+          "padding": 1
+        }
+      },
+      "op_264411392": {
+        "kind": "tt.descriptor_load",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264754432"
+          },
+          {
+            "op": "op_264660144"
+          },
+          {
+            "const": 0,
+            "type": "i32"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>"
+        ],
+        "attributes": {
+          "cache": 1,
+          "evict": 1
+        }
+      },
+      "op_264521648": {
+        "kind": "ttg.local_alloc",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264411392"
+          }
+        ],
+        "result_types": [
+          "!ttg.memdesc<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>, #ttg.shared_memory>"
+        ],
+        "attributes": {}
+      },
+      "op_264761840": {
+        "kind": "arith.mulf",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "sm_scale"
+          },
+          {
+            "const": 1.4427,
+            "type": "f32"
+          }
+        ],
+        "result_types": [
+          "f32"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>"
+        }
+      },
+      "op_264765184": {
+        "kind": "arith.divsi",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "N_CTX"
+          },
+          {
+            "const": 64,
+            "type": "i32"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {}
+      },
+      "op_264660000": {
+        "kind": "tt.splat",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264761840"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {}
+      },
+      "op_264766688": {
+        "kind": "tt.splat",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264761840"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {}
+      },
+      "op_264775264": {
+        "kind": "ttng.tmem_alloc",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "!ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable>",
+          "!ttg.async.token"
+        ],
+        "attributes": {}
+      },
+      "op_264768544": {
+        "kind": "ttng.tmem_alloc",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "!ttg.memdesc<128x128xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>, #ttng.tensor_memory, mutable>",
+          "!ttg.async.token"
+        ],
+        "attributes": {}
+      },
+      "op_264659344": {
+        "kind": "ttng.tmem_store",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264768544",
+            "result": 0
+          },
+          {
+            "op": "op_264768544",
+            "result": 1
+          },
+          {
+            "const": 0,
+            "type": "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+          },
+          {
+            "const": -1,
+            "type": "i1"
+          }
+        ],
+        "result_types": [
+          "!ttg.async.token"
+        ],
+        "attributes": {}
+      },
+      "op_264768288": {
+        "kind": "arith.muli",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "iv": 0
+          },
+          {
+            "const": 64,
+            "type": "i32"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "loop.cluster": 0,
+          "loop.stage": 0,
+          "overflowFlags": "#arith.overflow<none>"
+        }
+      },
+      "op_264768656": {
+        "kind": "arith.addi",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264639776"
+          },
+          {
+            "op": "op_264768288"
+          }
+        ],
+        "result_types": [
+          "i32"
+        ],
+        "attributes": {
+          "loop.cluster": 1,
+          "loop.stage": 0,
+          "overflowFlags": "#arith.overflow<none>",
+          "ttg.partition": [
+            1
+          ]
+        }
+      },
+      "op_264377440": {
+        "kind": "tt.descriptor_load",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264757088"
+          },
+          {
+            "op": "op_264768656"
+          },
+          {
+            "const": 0,
+            "type": "i32"
+          }
+        ],
+        "result_types": [
+          "tensor<64x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>"
+        ],
+        "attributes": {
+          "cache": 1,
+          "evict": 1,
+          "loop.cluster": 2,
+          "loop.stage": 0,
+          "ttg.partition": [
+            1
+          ]
+        }
+      },
+      "op_264376128": {
+        "kind": "tt.descriptor_load",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264757472"
+          },
+          {
+            "op": "op_264768656"
+          },
+          {
+            "const": 0,
+            "type": "i32"
+          }
+        ],
+        "result_types": [
+          "tensor<64x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>"
+        ],
+        "attributes": {
+          "cache": 1,
+          "evict": 1,
+          "loop.cluster": 3,
+          "loop.stage": 0,
+          "ttg.partition": [
+            2
+          ]
+        }
+      },
+      "op_264786080": {
+        "kind": "ttg.local_alloc",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264376128"
+          }
+        ],
+        "result_types": [
+          "!ttg.memdesc<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>, #ttg.shared_memory>"
+        ],
+        "attributes": {
+          "buffer.id": 0,
+          "buffer.merge_group_id": 0,
+          "loop.cluster": 5,
+          "loop.stage": 0,
+          "tt.num_buffers": 3,
+          "ttg.partition": [
+            2
+          ]
+        }
+      },
+      "op_264778080": {
+        "kind": "ttg.local_alloc",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264377440"
+          }
+        ],
+        "result_types": [
+          "!ttg.memdesc<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>, #ttg.shared_memory>"
+        ],
+        "attributes": {
+          "buffer.id": 1,
+          "buffer.merge_group_id": 1,
+          "loop.cluster": 4,
+          "loop.stage": 0,
+          "tt.num_buffers": 1,
+          "ttg.partition": [
+            1
+          ]
+        }
+      },
+      "op_264778416": {
+        "kind": "ttg.memdesc_trans",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264778080"
+          }
+        ],
+        "result_types": [
+          "!ttg.memdesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>, #ttg.shared_memory>"
+        ],
+        "attributes": {
+          "loop.cluster": 4,
+          "loop.stage": 0,
+          "order": [
+            1,
+            0
+          ],
+          "ttg.partition": [
+            3
+          ]
+        }
+      },
+      "op_264065792": {
+        "kind": "ttng.tc_gen5_mma",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264521648"
+          },
+          {
+            "op": "op_264778416"
+          },
+          {
+            "op": "op_264775264",
+            "result": 0
+          },
+          {
+            "iter_arg": {
+              "loop": 0,
+              "idx": 3
+            }
+          },
+          {
+            "const": 0,
+            "type": "i1"
+          },
+          {
+            "const": -1,
+            "type": "i1"
+          }
+        ],
+        "result_types": [
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "loop.cluster": 4,
+          "loop.stage": 0,
+          "operandSegmentSizes": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0
+          ],
+          "ttg.partition": [
+            3
+          ]
+        }
+      },
+      "op_264785712": {
+        "kind": "ttng.tmem_load",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264775264",
+            "result": 0
+          },
+          {
+            "op": "op_264065792"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>",
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "loop.cluster": 0,
+          "loop.stage": 1,
+          "resultSegmentSizes": [
+            1,
+            1,
+            0
+          ],
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264789664": {
+        "kind": "arith.maxnumf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "unknown_block_arg": true
+          },
+          {
+            "unknown_block_arg": true
+          }
+        ],
+        "result_types": [
+          "f32"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>"
+        }
+      },
+      "op_264768144": {
+        "kind": "tt.reduce.return",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264789664"
+          }
+        ],
+        "result_types": [],
+        "attributes": {}
+      },
+      "op_264781840": {
+        "kind": "tt.reduce",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264785712",
+            "result": 0
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "axis": 1,
+          "loop.cluster": 1,
+          "loop.stage": 1,
+          "reduction_ordering": "unordered",
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264781280": {
+        "kind": "arith.mulf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264781840"
+          },
+          {
+            "op": "op_264660000"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 3,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264796880": {
+        "kind": "arith.maxnumf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "iter_arg": {
+              "loop": 0,
+              "idx": 0
+            }
+          },
+          {
+            "op": "op_264781280"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 4,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264788320": {
+        "kind": "arith.subf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "iter_arg": {
+              "loop": 0,
+              "idx": 0
+            }
+          },
+          {
+            "op": "op_264796880"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 7,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264797328": {
+        "kind": "math.exp2",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264788320"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 8,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264797536": {
+        "kind": "arith.mulf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264785712",
+            "result": 0
+          },
+          {
+            "op": "op_264766688"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 2,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264797984": {
+        "kind": "tt.expand_dims",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264796880"
+          }
+        ],
+        "result_types": [
+          "tensor<128x1xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "axis": 1,
+          "loop.cluster": 5,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264798192": {
+        "kind": "tt.broadcast",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264797984"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "loop.cluster": 5,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264798576": {
+        "kind": "arith.subf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264797536"
+          },
+          {
+            "op": "op_264798192"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 5,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264799632": {
+        "kind": "math.exp2",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264798576"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 6,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264800064": {
+        "kind": "arith.addf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "unknown_block_arg": true
+          },
+          {
+            "unknown_block_arg": true
+          }
+        ],
+        "result_types": [
+          "f32"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>"
+        }
+      },
+      "op_264800304": {
+        "kind": "tt.reduce.return",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264800064"
+          }
+        ],
+        "result_types": [],
+        "attributes": {}
+      },
+      "op_264797088": {
+        "kind": "tt.reduce",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264799632"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "axis": 1,
+          "loop.cluster": 4,
+          "loop.stage": 2,
+          "reduction_ordering": "unordered",
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264663600": {
+        "kind": "arith.truncf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264799632"
+          }
+        ],
+        "result_types": [
+          "tensor<128x64xf16, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "loop.cluster": 10,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264807488": {
+        "kind": "ttng.tmem_alloc",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264663600"
+          }
+        ],
+        "result_types": [
+          "!ttg.memdesc<128x64xf16, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory>"
+        ],
+        "attributes": {
+          "buffer.id": 2,
+          "buffer.merge_group_id": 2,
+          "loop.cluster": 1,
+          "loop.stage": 2,
+          "tt.num_buffers": 1,
+          "ttg.partition": [
+            6
+          ]
+        }
+      },
+      "op_264807632": {
+        "kind": "tt.expand_dims",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264797328"
+          }
+        ],
+        "result_types": [
+          "tensor<128x1xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "axis": 1,
+          "loop.cluster": 9,
+          "loop.stage": 1,
+          "ttg.partition": [
+            5
+          ]
+        }
+      },
+      "op_264807840": {
+        "kind": "ttg.convert_layout",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264807632"
+          }
+        ],
+        "result_types": [
+          "tensor<128x1xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "loop.cluster": 9,
+          "loop.stage": 1,
+          "ttg.partition": [
+            5
+          ]
+        }
+      },
+      "op_264808048": {
+        "kind": "tt.broadcast",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264807840"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "loop.cluster": 9,
+          "loop.stage": 1,
+          "ttg.partition": [
+            5
+          ]
+        }
+      },
+      "op_264799856": {
+        "kind": "ttng.tmem_load",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264768544",
+            "result": 0
+          },
+          {
+            "iter_arg": {
+              "loop": 0,
+              "idx": 4
+            }
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>",
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "loop.cluster": 6,
+          "loop.stage": 0,
+          "resultSegmentSizes": [
+            1,
+            1,
+            0
+          ],
+          "ttg.partition": [
+            5
+          ]
+        }
+      },
+      "op_264800448": {
+        "kind": "arith.mulf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264799856",
+            "result": 0
+          },
+          {
+            "op": "op_264808048"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 0,
+          "loop.stage": 2,
+          "ttg.partition": [
+            5
+          ]
+        }
+      },
+      "op_264145856": {
+        "kind": "ttng.tmem_store",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264768544",
+            "result": 0
+          },
+          {
+            "op": "op_264799856",
+            "result": 1
+          },
+          {
+            "op": "op_264800448"
+          },
+          {
+            "const": -1,
+            "type": "i1"
+          }
+        ],
+        "result_types": [
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "loop.cluster": 2,
+          "loop.stage": 2,
+          "ttg.partition": [
+            5
+          ]
+        }
+      },
+      "op_264072080": {
+        "kind": "ttng.tc_gen5_mma",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264807488"
+          },
+          {
+            "op": "op_264786080"
+          },
+          {
+            "op": "op_264768544",
+            "result": 0
+          },
+          {
+            "op": "op_264145856"
+          },
+          {
+            "iter_arg": {
+              "loop": 0,
+              "idx": 2
+            }
+          },
+          {
+            "const": -1,
+            "type": "i1"
+          }
+        ],
+        "result_types": [
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "loop.cluster": 3,
+          "loop.stage": 2,
+          "operandSegmentSizes": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0
+          ],
+          "ttg.partition": [
+            6
+          ]
+        }
+      },
+      "op_264810576": {
+        "kind": "arith.mulf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "iter_arg": {
+              "loop": 0,
+              "idx": 1
+            }
+          },
+          {
+            "op": "op_264797328"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 11,
+          "loop.stage": 1,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264810832": {
+        "kind": "arith.addf",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264810576"
+          },
+          {
+            "op": "op_264797088"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "loop.cluster": 0,
+          "loop.stage": 3,
+          "ttg.partition": [
+            4
+          ]
+        }
+      },
+      "op_264411696": {
+        "kind": "scf.yield",
+        "scope": "loop:0",
+        "operands": [
+          {
+            "op": "op_264796880"
+          },
+          {
+            "op": "op_264810832"
+          },
+          {
+            "const": -1,
+            "type": "i1"
+          },
+          {
+            "op": "op_264785712",
+            "result": 1
+          },
+          {
+            "op": "op_264072080"
+          }
+        ],
+        "result_types": [],
+        "attributes": {}
+      },
+      "op_264715504": {
+        "kind": "scf.for",
+        "scope": "function",
+        "operands": [
+          {
+            "const": 0,
+            "type": "i32"
+          },
+          {
+            "op": "op_264765184"
+          },
+          {
+            "const": 1,
+            "type": "i32"
+          },
+          {
+            "const": "-inf",
+            "type": "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+          },
+          {
+            "const": 1,
+            "type": "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+          },
+          {
+            "const": 0,
+            "type": "i1"
+          },
+          {
+            "op": "op_264775264",
+            "result": 1
+          },
+          {
+            "op": "op_264659344"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>",
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>",
+          "i1",
+          "!ttg.async.token",
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "tt.modulo_ii": 1325,
+          "tt.num_stages": 3,
+          "tt.scheduled_max_stage": 3,
+          "ttg.partition.stages": [
+            0,
+            0,
+            0,
+            0,
+            3,
+            2,
+            2
+          ],
+          "ttg.partition_num_warps": [
+            4,
+            1,
+            1,
+            1,
+            4,
+            4,
+            1
+          ],
+          "ttg.warp_specialize.tag": 0
+        }
+      },
+      "op_264787952": {
+        "kind": "ttng.tmem_load",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264768544",
+            "result": 0
+          },
+          {
+            "op": "op_264715504",
+            "result": 4
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>",
+          "!ttg.async.token"
+        ],
+        "attributes": {
+          "resultSegmentSizes": [
+            1,
+            1,
+            0
+          ],
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264811280": {
+        "kind": "tt.expand_dims",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264715504",
+            "result": 1
+          }
+        ],
+        "result_types": [
+          "tensor<128x1xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "axis": 1,
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264811424": {
+        "kind": "ttg.convert_layout",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264811280"
+          }
+        ],
+        "result_types": [
+          "tensor<128x1xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264811568": {
+        "kind": "tt.broadcast",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264811424"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264811712": {
+        "kind": "arith.divf",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264787952",
+            "result": 0
+          },
+          {
+            "op": "op_264811568"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf32, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264670304": {
+        "kind": "arith.truncf",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264811712"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf16, #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>>"
+        ],
+        "attributes": {
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264771984": {
+        "kind": "ttg.convert_layout",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264670304"
+          }
+        ],
+        "result_types": [
+          "tensor<128x128xf16, #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>"
+        ],
+        "attributes": {
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264064032": {
+        "kind": "tt.descriptor_store",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264757856"
+          },
+          {
+            "op": "op_264771984"
+          },
+          {
+            "op": "op_264660144"
+          },
+          {
+            "const": 0,
+            "type": "i32"
+          }
+        ],
+        "result_types": [],
+        "attributes": {
+          "reduce_kind": 0,
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264751968": {
+        "kind": "tt.make_range",
+        "scope": "function",
+        "operands": [],
+        "result_types": [
+          "tensor<128xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>"
+        ],
+        "attributes": {
+          "end": 128,
+          "start": 0
+        }
+      },
+      "op_264808784": {
+        "kind": "tt.splat",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264521792"
+          }
+        ],
+        "result_types": [
+          "tensor<128xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>"
+        ],
+        "attributes": {}
+      },
+      "op_264808256": {
+        "kind": "arith.addi",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264808784"
+          },
+          {
+            "op": "op_264751968"
+          }
+        ],
+        "result_types": [
+          "tensor<128xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>"
+        ],
+        "attributes": {
+          "overflowFlags": "#arith.overflow<none>"
+        }
+      },
+      "op_264805712": {
+        "kind": "tt.addptr",
+        "scope": "function",
+        "operands": [
+          {
+            "arg": "M_lse"
+          },
+          {
+            "op": "op_264639776"
+          }
+        ],
+        "result_types": [
+          "!tt.ptr<f32>"
+        ],
+        "attributes": {}
+      },
+      "op_264810176": {
+        "kind": "tt.splat",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264805712"
+          }
+        ],
+        "result_types": [
+          "tensor<128x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>"
+        ],
+        "attributes": {}
+      },
+      "op_264808432": {
+        "kind": "tt.addptr",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264810176"
+          },
+          {
+            "op": "op_264808256"
+          }
+        ],
+        "result_types": [
+          "tensor<128x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>"
+        ],
+        "attributes": {}
+      },
+      "op_264803232": {
+        "kind": "math.log2",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264715504",
+            "result": 1
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264805888": {
+        "kind": "arith.addf",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264715504",
+            "result": 0
+          },
+          {
+            "op": "op_264803232"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>}>>"
+        ],
+        "attributes": {
+          "fastmath": "#arith.fastmath<none>",
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264806080": {
+        "kind": "ttg.convert_layout",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264805888"
+          }
+        ],
+        "result_types": [
+          "tensor<128xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>"
+        ],
+        "attributes": {
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264808592": {
+        "kind": "tt.store",
+        "scope": "function",
+        "operands": [
+          {
+            "op": "op_264808432"
+          },
+          {
+            "op": "op_264806080"
+          }
+        ],
+        "result_types": [],
+        "attributes": {
+          "cache": 1,
+          "evict": 1,
+          "ttg.partition": [
+            0
+          ]
+        }
+      },
+      "op_264783968": {
+        "kind": "tt.return",
+        "scope": "function",
+        "operands": [],
+        "result_types": [],
+        "attributes": {}
+      }
+    },
+    "data_partition_candidates": []
+  },
+  "pipeline": {
+    "ii": 3,
+    "length": 5,
+    "copies": 2,
+    "horizon": 8,
+    "regions": [
+      {
+        "kind": "prologue",
+        "cycle_begin": 0,
+        "cycle_end": 3
+      },
+      {
+        "kind": "steady_state",
+        "cycle_begin": 3,
+        "cycle_end": 6
+      },
+      {
+        "kind": "epilogue",
+        "cycle_begin": 6,
+        "cycle_end": 8
+      }
+    ]
+  },
+  "pipelined_program": {
+    "instances": [
+      {
+        "node": 0,
+        "copy": 0,
+        "cycle": 0,
+        "region": "prologue"
+      },
+      {
+        "node": 0,
+        "copy": 1,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 1,
+        "copy": 0,
+        "cycle": 0,
+        "region": "prologue"
+      },
+      {
+        "node": 1,
+        "copy": 1,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 2,
+        "copy": 0,
+        "cycle": 0,
+        "region": "prologue"
+      },
+      {
+        "node": 2,
+        "copy": 1,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 3,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 3,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 4,
+        "copy": 0,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 4,
+        "copy": 1,
+        "cycle": 6,
+        "region": "epilogue"
+      },
+      {
+        "node": 5,
+        "copy": 0,
+        "cycle": 0,
+        "region": "prologue"
+      },
+      {
+        "node": 5,
+        "copy": 1,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 6,
+        "copy": 0,
+        "cycle": 0,
+        "region": "prologue"
+      },
+      {
+        "node": 6,
+        "copy": 1,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 7,
+        "copy": 0,
+        "cycle": 0,
+        "region": "prologue"
+      },
+      {
+        "node": 7,
+        "copy": 1,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 8,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 8,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 9,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 9,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 10,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 10,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 11,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 11,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 12,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 12,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 13,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 13,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 14,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 14,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 15,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 15,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 16,
+        "copy": 0,
+        "cycle": 1,
+        "region": "prologue"
+      },
+      {
+        "node": 16,
+        "copy": 1,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 17,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 17,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 18,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 18,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 19,
+        "copy": 0,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 19,
+        "copy": 1,
+        "cycle": 6,
+        "region": "epilogue"
+      },
+      {
+        "node": 20,
+        "copy": 0,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 20,
+        "copy": 1,
+        "cycle": 6,
+        "region": "epilogue"
+      },
+      {
+        "node": 21,
+        "copy": 0,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 21,
+        "copy": 1,
+        "cycle": 7,
+        "region": "epilogue"
+      },
+      {
+        "node": 22,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 22,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 23,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 23,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 24,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 24,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 25,
+        "copy": 0,
+        "cycle": 2,
+        "region": "prologue"
+      },
+      {
+        "node": 25,
+        "copy": 1,
+        "cycle": 5,
+        "region": "steady_state"
+      },
+      {
+        "node": 26,
+        "copy": 0,
+        "cycle": 3,
+        "region": "steady_state"
+      },
+      {
+        "node": 26,
+        "copy": 1,
+        "cycle": 6,
+        "region": "epilogue"
+      },
+      {
+        "node": 27,
+        "copy": 0,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 27,
+        "copy": 1,
+        "cycle": 7,
+        "region": "epilogue"
+      },
+      {
+        "node": 28,
+        "copy": 0,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 28,
+        "copy": 1,
+        "cycle": 7,
+        "region": "epilogue"
+      },
+      {
+        "node": 29,
+        "copy": 0,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 29,
+        "copy": 1,
+        "cycle": 7,
+        "region": "epilogue"
+      },
+      {
+        "node": 30,
+        "copy": 0,
+        "cycle": 4,
+        "region": "steady_state"
+      },
+      {
+        "node": 30,
+        "copy": 1,
+        "cycle": 7,
+        "region": "epilogue"
+      }
+    ],
+    "instance_dependencies": [
+      {
+        "edge_index": 0,
+        "producer": {
+          "node": 0,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 1,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 0,
+        "producer": {
+          "node": 0,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 1,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 1,
+        "producer": {
+          "node": 1,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 2,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 1,
+        "producer": {
+          "node": 1,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 2,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 2,
+        "producer": {
+          "node": 1,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 3,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 2,
+        "producer": {
+          "node": 1,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 3,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 3,
+        "producer": {
+          "node": 3,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 4,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 3,
+        "producer": {
+          "node": 3,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 4,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 4,
+        "producer": {
+          "node": 2,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 5,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 4,
+        "producer": {
+          "node": 2,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 5,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 5,
+        "producer": {
+          "node": 5,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 6,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 5,
+        "producer": {
+          "node": 5,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 6,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 6,
+        "producer": {
+          "node": 6,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 7,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 6,
+        "producer": {
+          "node": 6,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 7,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 7,
+        "producer": {
+          "node": 7,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 8,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 7,
+        "producer": {
+          "node": 7,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 8,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 8,
+        "producer": {
+          "node": 8,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 9,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 8,
+        "producer": {
+          "node": 8,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 9,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 9,
+        "producer": {
+          "node": 9,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 10,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 9,
+        "producer": {
+          "node": 9,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 10,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 10,
+        "producer": {
+          "node": 10,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 11,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 10,
+        "producer": {
+          "node": 10,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 11,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 11,
+        "producer": {
+          "node": 11,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 12,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 11,
+        "producer": {
+          "node": 11,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 12,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 12,
+        "producer": {
+          "node": 12,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 13,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 12,
+        "producer": {
+          "node": 12,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 13,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 13,
+        "producer": {
+          "node": 8,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 14,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 13,
+        "producer": {
+          "node": 8,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 14,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 14,
+        "producer": {
+          "node": 11,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 15,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 14,
+        "producer": {
+          "node": 11,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 15,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 15,
+        "producer": {
+          "node": 15,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 16,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 15,
+        "producer": {
+          "node": 15,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 16,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 16,
+        "producer": {
+          "node": 14,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 17,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 16,
+        "producer": {
+          "node": 14,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 17,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 17,
+        "producer": {
+          "node": 16,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 17,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 17,
+        "producer": {
+          "node": 16,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 17,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 18,
+        "producer": {
+          "node": 17,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 18,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 18,
+        "producer": {
+          "node": 17,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 18,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 19,
+        "producer": {
+          "node": 18,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 19,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 19,
+        "producer": {
+          "node": 18,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 19,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 20,
+        "producer": {
+          "node": 18,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 20,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 20,
+        "producer": {
+          "node": 18,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 20,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 21,
+        "producer": {
+          "node": 20,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 21,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 21,
+        "producer": {
+          "node": 20,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 21,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 22,
+        "producer": {
+          "node": 13,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 22,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 22,
+        "producer": {
+          "node": 13,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 22,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 23,
+        "producer": {
+          "node": 22,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 23,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 23,
+        "producer": {
+          "node": 22,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 23,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 24,
+        "producer": {
+          "node": 23,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 24,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 24,
+        "producer": {
+          "node": 23,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 24,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 25,
+        "producer": {
+          "node": 25,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 26,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 25,
+        "producer": {
+          "node": 25,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 26,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 26,
+        "producer": {
+          "node": 24,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 26,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 26,
+        "producer": {
+          "node": 24,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 26,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 27,
+        "producer": {
+          "node": 25,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 27,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 27,
+        "producer": {
+          "node": 25,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 27,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 28,
+        "producer": {
+          "node": 26,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 27,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 28,
+        "producer": {
+          "node": 26,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 27,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 29,
+        "producer": {
+          "node": 21,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 28,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 29,
+        "producer": {
+          "node": 21,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 28,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 30,
+        "producer": {
+          "node": 4,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 28,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 30,
+        "producer": {
+          "node": 4,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 28,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 31,
+        "producer": {
+          "node": 27,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 28,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 31,
+        "producer": {
+          "node": 27,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 28,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 32,
+        "producer": {
+          "node": 13,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 29,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 32,
+        "producer": {
+          "node": 13,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 29,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 33,
+        "producer": {
+          "node": 29,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 30,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 33,
+        "producer": {
+          "node": 29,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 30,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 34,
+        "producer": {
+          "node": 19,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 30,
+          "copy": 0
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 34,
+        "producer": {
+          "node": 19,
+          "copy": 1
+        },
+        "consumer": {
+          "node": 30,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 0
+      },
+      {
+        "edge_index": 35,
+        "producer": {
+          "node": 11,
+          "copy": -1
+        },
+        "consumer": {
+          "node": 11,
+          "copy": 0
+        },
+        "external": true,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 35,
+        "producer": {
+          "node": 11,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 11,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 36,
+        "producer": {
+          "node": 11,
+          "copy": -1
+        },
+        "consumer": {
+          "node": 12,
+          "copy": 0
+        },
+        "external": true,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 36,
+        "producer": {
+          "node": 11,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 12,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 37,
+        "producer": {
+          "node": 30,
+          "copy": -1
+        },
+        "consumer": {
+          "node": 29,
+          "copy": 0
+        },
+        "external": true,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 37,
+        "producer": {
+          "node": 30,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 29,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 38,
+        "producer": {
+          "node": 8,
+          "copy": -1
+        },
+        "consumer": {
+          "node": 7,
+          "copy": 0
+        },
+        "external": true,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 38,
+        "producer": {
+          "node": 8,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 7,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 39,
+        "producer": {
+          "node": 28,
+          "copy": -1
+        },
+        "consumer": {
+          "node": 25,
+          "copy": 0
+        },
+        "external": true,
+        "carried_distance": 1
+      },
+      {
+        "edge_index": 39,
+        "producer": {
+          "node": 28,
+          "copy": 0
+        },
+        "consumer": {
+          "node": 25,
+          "copy": 1
+        },
+        "external": false,
+        "carried_distance": 1
+      }
+    ],
+    "steady_state": {
+      "slots": [
+        {
+          "node": 0,
+          "copy": 1,
+          "cycle": 3,
+          "iteration_lag": 0
+        },
+        {
+          "node": 1,
+          "copy": 1,
+          "cycle": 3,
+          "iteration_lag": 0
+        },
+        {
+          "node": 2,
+          "copy": 1,
+          "cycle": 3,
+          "iteration_lag": 0
+        },
+        {
+          "node": 3,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 4,
+          "copy": 0,
+          "cycle": 3,
+          "iteration_lag": 1
+        },
+        {
+          "node": 5,
+          "copy": 1,
+          "cycle": 3,
+          "iteration_lag": 0
+        },
+        {
+          "node": 6,
+          "copy": 1,
+          "cycle": 3,
+          "iteration_lag": 0
+        },
+        {
+          "node": 7,
+          "copy": 1,
+          "cycle": 3,
+          "iteration_lag": 0
+        },
+        {
+          "node": 8,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 9,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 10,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 11,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 12,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 13,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 14,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 15,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 16,
+          "copy": 1,
+          "cycle": 4,
+          "iteration_lag": 0
+        },
+        {
+          "node": 17,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 18,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 19,
+          "copy": 0,
+          "cycle": 3,
+          "iteration_lag": 1
+        },
+        {
+          "node": 20,
+          "copy": 0,
+          "cycle": 3,
+          "iteration_lag": 1
+        },
+        {
+          "node": 21,
+          "copy": 0,
+          "cycle": 4,
+          "iteration_lag": 1
+        },
+        {
+          "node": 22,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 23,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 24,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 25,
+          "copy": 1,
+          "cycle": 5,
+          "iteration_lag": 0
+        },
+        {
+          "node": 26,
+          "copy": 0,
+          "cycle": 3,
+          "iteration_lag": 1
+        },
+        {
+          "node": 27,
+          "copy": 0,
+          "cycle": 4,
+          "iteration_lag": 1
+        },
+        {
+          "node": 28,
+          "copy": 0,
+          "cycle": 4,
+          "iteration_lag": 1
+        },
+        {
+          "node": 29,
+          "copy": 0,
+          "cycle": 4,
+          "iteration_lag": 1
+        },
+        {
+          "node": 30,
+          "copy": 0,
+          "cycle": 4,
+          "iteration_lag": 1
+        }
+      ]
+    }
+  },
+  "warp_groups": [
+    {
+      "id": 0,
+      "width": 1,
+      "issue_trace": [
+        {
+          "node": 2,
+          "cycle": 0,
+          "stage": 0,
+          "offset": 0,
+          "lanes": [
+            0
+          ]
+        },
+        {
+          "node": 3,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "width": 1,
+      "issue_trace": [
+        {
+          "node": 0,
+          "cycle": 0,
+          "stage": 0,
+          "offset": 0,
+          "lanes": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "width": 1,
+      "issue_trace": [
+        {
+          "node": 1,
+          "cycle": 0,
+          "stage": 0,
+          "offset": 0,
+          "lanes": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "width": 8,
+      "issue_trace": [
+        {
+          "node": 9,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "node": 11,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            1,
+            2,
+            4,
+            5
+          ]
+        },
+        {
+          "node": 15,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "node": 16,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "node": 12,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            1,
+            2,
+            4,
+            5
+          ]
+        },
+        {
+          "node": 18,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            1,
+            2,
+            4,
+            5
+          ]
+        },
+        {
+          "node": 25,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            0,
+            3,
+            6,
+            7
+          ]
+        },
+        {
+          "node": 4,
+          "cycle": 3,
+          "stage": 1,
+          "offset": 0,
+          "lanes": [
+            0
+          ]
+        },
+        {
+          "node": 19,
+          "cycle": 3,
+          "stage": 1,
+          "offset": 0,
+          "lanes": [
+            1,
+            2,
+            6,
+            7
+          ]
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "width": 1,
+      "issue_trace": [
+        {
+          "node": 5,
+          "cycle": 0,
+          "stage": 0,
+          "offset": 0,
+          "lanes": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "width": 2,
+      "issue_trace": [
+        {
+          "node": 6,
+          "cycle": 0,
+          "stage": 0,
+          "offset": 0,
+          "lanes": [
+            0
+          ]
+        },
+        {
+          "node": 7,
+          "cycle": 0,
+          "stage": 0,
+          "offset": 0,
+          "lanes": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "width": 4,
+      "issue_trace": [
+        {
+          "node": 8,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "node": 13,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "width": 8,
+      "issue_trace": [
+        {
+          "node": 10,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "node": 14,
+          "cycle": 1,
+          "stage": 0,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            4,
+            5
+          ]
+        },
+        {
+          "node": 17,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            0,
+            1,
+            4,
+            5
+          ]
+        },
+        {
+          "node": 22,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            0,
+            3,
+            6,
+            7
+          ]
+        },
+        {
+          "node": 23,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            0,
+            1,
+            6,
+            7
+          ]
+        },
+        {
+          "node": 24,
+          "cycle": 2,
+          "stage": 0,
+          "offset": 2,
+          "lanes": [
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        {
+          "node": 20,
+          "cycle": 3,
+          "stage": 1,
+          "offset": 0,
+          "lanes": [
+            0,
+            2,
+            6,
+            7
+          ]
+        },
+        {
+          "node": 26,
+          "cycle": 3,
+          "stage": 1,
+          "offset": 0,
+          "lanes": [
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        {
+          "node": 27,
+          "cycle": 4,
+          "stage": 1,
+          "offset": 1,
+          "lanes": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "node": 29,
+          "cycle": 4,
+          "stage": 1,
+          "offset": 1,
+          "lanes": [
+            0,
+            3,
+            6,
+            7
+          ]
+        },
+        {
+          "node": 30,
+          "cycle": 4,
+          "stage": 1,
+          "offset": 1,
+          "lanes": [
+            0,
+            3,
+            6,
+            7
+          ]
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "width": 1,
+      "issue_trace": [
+        {
+          "node": 21,
+          "cycle": 4,
+          "stage": 1,
+          "offset": 1,
+          "lanes": [
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "width": 1,
+      "issue_trace": [
+        {
+          "node": 28,
+          "cycle": 4,
+          "stage": 1,
+          "offset": 1,
+          "lanes": [
+            0
+          ]
+        }
+      ]
+    }
+  ],
+  "instructions": [
+    {
+      "id": 0,
+      "op_ref": "op_264768288",
+      "op_kind": "arith.muli",
+      "pipeline": "CUDA",
+      "cycle": 0,
+      "stage": 0,
+      "offset": 0,
+      "group": 1,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "op_ref": "op_264768656",
+      "op_kind": "arith.addi",
+      "pipeline": "CUDA",
+      "cycle": 0,
+      "stage": 0,
+      "offset": 0,
+      "group": 2,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 2,
+      "op_ref": "op_264377440",
+      "op_kind": "tt.descriptor_load",
+      "pipeline": "TMA",
+      "cycle": 0,
+      "stage": 0,
+      "offset": 0,
+      "group": 0,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 3,
+      "op_ref": "op_264376128",
+      "op_kind": "tt.descriptor_load",
+      "pipeline": "TMA",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 0,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 4,
+      "op_ref": "op_264786080",
+      "op_kind": "ttg.local_alloc",
+      "pipeline": "NONE",
+      "cycle": 3,
+      "stage": 1,
+      "offset": 0,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 5,
+      "op_ref": "op_264778080",
+      "op_kind": "ttg.local_alloc",
+      "pipeline": "NONE",
+      "cycle": 0,
+      "stage": 0,
+      "offset": 0,
+      "group": 4,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 6,
+      "op_ref": "op_264778416",
+      "op_kind": "ttg.memdesc_trans",
+      "pipeline": "NONE",
+      "cycle": 0,
+      "stage": 0,
+      "offset": 0,
+      "group": 5,
+      "group_width": 2,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 7,
+      "op_ref": "op_264065792",
+      "op_kind": "ttng.tc_gen5_mma",
+      "pipeline": "TC",
+      "cycle": 0,
+      "stage": 0,
+      "offset": 0,
+      "group": 5,
+      "group_width": 2,
+      "lanes": [
+        1
+      ]
+    },
+    {
+      "id": 8,
+      "op_ref": "op_264785712",
+      "op_kind": "ttng.tmem_load",
+      "pipeline": "TMEM",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 6,
+      "group_width": 4,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": 9,
+      "op_ref": "op_264781840",
+      "op_kind": "tt.reduce",
+      "pipeline": "CUDA",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": 10,
+      "op_ref": "op_264781280",
+      "op_kind": "arith.mulf",
+      "pipeline": "CUDA",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": 11,
+      "op_ref": "op_264796880",
+      "op_kind": "arith.maxnumf",
+      "pipeline": "CUDA",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        1,
+        2,
+        4,
+        5
+      ]
+    },
+    {
+      "id": 12,
+      "op_ref": "op_264788320",
+      "op_kind": "arith.subf",
+      "pipeline": "CUDA",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        1,
+        2,
+        4,
+        5
+      ]
+    },
+    {
+      "id": 13,
+      "op_ref": "op_264797328",
+      "op_kind": "math.exp2",
+      "pipeline": "SFU",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 6,
+      "group_width": 4,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": 14,
+      "op_ref": "op_264797536",
+      "op_kind": "arith.mulf",
+      "pipeline": "CUDA",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        4,
+        5
+      ]
+    },
+    {
+      "id": 15,
+      "op_ref": "op_264797984",
+      "op_kind": "tt.expand_dims",
+      "pipeline": "NONE",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": 16,
+      "op_ref": "op_264798192",
+      "op_kind": "tt.broadcast",
+      "pipeline": "NONE",
+      "cycle": 1,
+      "stage": 0,
+      "offset": 1,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        3,
+        4
+      ]
+    },
+    {
+      "id": 17,
+      "op_ref": "op_264798576",
+      "op_kind": "arith.subf",
+      "pipeline": "CUDA",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        4,
+        5
+      ]
+    },
+    {
+      "id": 18,
+      "op_ref": "op_264799632",
+      "op_kind": "math.exp2",
+      "pipeline": "SFU",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        1,
+        2,
+        4,
+        5
+      ]
+    },
+    {
+      "id": 19,
+      "op_ref": "op_264797088",
+      "op_kind": "tt.reduce",
+      "pipeline": "CUDA",
+      "cycle": 3,
+      "stage": 1,
+      "offset": 0,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        1,
+        2,
+        6,
+        7
+      ]
+    },
+    {
+      "id": 20,
+      "op_ref": "op_264663600",
+      "op_kind": "arith.truncf",
+      "pipeline": "CUDA",
+      "cycle": 3,
+      "stage": 1,
+      "offset": 0,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        2,
+        6,
+        7
+      ]
+    },
+    {
+      "id": 21,
+      "op_ref": "op_264807488",
+      "op_kind": "ttng.tmem_alloc",
+      "pipeline": "NONE",
+      "cycle": 4,
+      "stage": 1,
+      "offset": 1,
+      "group": 8,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 22,
+      "op_ref": "op_264807632",
+      "op_kind": "tt.expand_dims",
+      "pipeline": "NONE",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        3,
+        6,
+        7
+      ]
+    },
+    {
+      "id": 23,
+      "op_ref": "op_264807840",
+      "op_kind": "ttg.convert_layout",
+      "pipeline": "CUDA",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        6,
+        7
+      ]
+    },
+    {
+      "id": 24,
+      "op_ref": "op_264808048",
+      "op_kind": "tt.broadcast",
+      "pipeline": "NONE",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "id": 25,
+      "op_ref": "op_264799856",
+      "op_kind": "ttng.tmem_load",
+      "pipeline": "TMEM",
+      "cycle": 2,
+      "stage": 0,
+      "offset": 2,
+      "group": 3,
+      "group_width": 8,
+      "lanes": [
+        0,
+        3,
+        6,
+        7
+      ]
+    },
+    {
+      "id": 26,
+      "op_ref": "op_264800448",
+      "op_kind": "arith.mulf",
+      "pipeline": "CUDA",
+      "cycle": 3,
+      "stage": 1,
+      "offset": 0,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "id": 27,
+      "op_ref": "op_264145856",
+      "op_kind": "ttng.tmem_store",
+      "pipeline": "TMEM",
+      "cycle": 4,
+      "stage": 1,
+      "offset": 1,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": 28,
+      "op_ref": "op_264072080",
+      "op_kind": "ttng.tc_gen5_mma",
+      "pipeline": "TC",
+      "cycle": 4,
+      "stage": 1,
+      "offset": 1,
+      "group": 9,
+      "group_width": 1,
+      "lanes": [
+        0
+      ]
+    },
+    {
+      "id": 29,
+      "op_ref": "op_264810576",
+      "op_kind": "arith.mulf",
+      "pipeline": "CUDA",
+      "cycle": 4,
+      "stage": 1,
+      "offset": 1,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        3,
+        6,
+        7
+      ]
+    },
+    {
+      "id": 30,
+      "op_ref": "op_264810832",
+      "op_kind": "arith.addf",
+      "pipeline": "CUDA",
+      "cycle": 4,
+      "stage": 1,
+      "offset": 1,
+      "group": 7,
+      "group_width": 8,
+      "lanes": [
+        0,
+        3,
+        6,
+        7
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "index": 0,
+      "src": 0,
+      "dst": 1,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 1,
+      "consumer_group": 2,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": false,
+      "spill_cost": 0
+    },
+    {
+      "index": 1,
+      "src": 1,
+      "dst": 2,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 2,
+      "consumer_group": 0,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": false,
+      "spill_cost": 0
+    },
+    {
+      "index": 2,
+      "src": 1,
+      "dst": 3,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 2,
+      "consumer_group": 0,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": false,
+      "spill_cost": 0
+    },
+    {
+      "index": 3,
+      "src": 3,
+      "dst": 4,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 0,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 4,
+      "src": 2,
+      "dst": 5,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 0,
+      "consumer_group": 4,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 5,
+      "src": 5,
+      "dst": 6,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 4,
+      "consumer_group": 5,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 6,
+      "src": 6,
+      "dst": 7,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 5,
+      "consumer_group": 5,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        1
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 7,
+      "src": 7,
+      "dst": 8,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 5,
+      "consumer_group": 6,
+      "producer_lanes": [
+        1
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 8,
+      "src": 8,
+      "dst": 9,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 9,
+      "src": 9,
+      "dst": 10,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 10,
+      "src": 10,
+      "dst": 11,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 11,
+      "src": 11,
+      "dst": 12,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 12,
+      "src": 12,
+      "dst": 13,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 6,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 13,
+      "src": 8,
+      "dst": 14,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 14,
+      "src": 11,
+      "dst": 15,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 15,
+      "src": 15,
+      "dst": 16,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        3,
+        4
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 16,
+      "src": 14,
+      "dst": 17,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 17,
+      "src": 16,
+      "dst": 17,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        3,
+        4
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 18,
+      "src": 17,
+      "dst": 18,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 19,
+      "src": 18,
+      "dst": 19,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 20,
+      "src": 18,
+      "dst": 20,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        2,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 21,
+      "src": 20,
+      "dst": 21,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 8,
+      "producer_lanes": [
+        0,
+        2,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 22,
+      "src": 13,
+      "dst": 22,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 23,
+      "src": 22,
+      "dst": 23,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 24,
+      "src": 23,
+      "dst": 24,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 25,
+      "src": 25,
+      "dst": 26,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 26,
+      "src": 24,
+      "dst": 26,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "consumer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 27,
+      "src": 25,
+      "dst": 27,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 28,
+      "src": 26,
+      "dst": 27,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 29,
+      "src": 21,
+      "dst": 28,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 8,
+      "consumer_group": 9,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 30,
+      "src": 4,
+      "dst": 28,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 9,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 31,
+      "src": 27,
+      "dst": 28,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 9,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 32,
+      "src": 13,
+      "dst": 29,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 33,
+      "src": 29,
+      "dst": 30,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 34,
+      "src": 19,
+      "dst": 30,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        1,
+        2,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 35,
+      "src": 11,
+      "dst": 11,
+      "distance": 1,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 36,
+      "src": 11,
+      "dst": 12,
+      "distance": 1,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 37,
+      "src": 30,
+      "dst": 29,
+      "distance": 1,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 38,
+      "src": 8,
+      "dst": 7,
+      "distance": 1,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 5,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        1
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 39,
+      "src": 28,
+      "dst": 25,
+      "distance": 1,
+      "latency": 1,
+      "producer_group": 9,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    }
+  ],
+  "cross_warp_dependencies": [
+    {
+      "index": 3,
+      "src": 3,
+      "dst": 4,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 0,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 4,
+      "src": 2,
+      "dst": 5,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 0,
+      "consumer_group": 4,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 5,
+      "src": 5,
+      "dst": 6,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 4,
+      "consumer_group": 5,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 6,
+      "src": 6,
+      "dst": 7,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 5,
+      "consumer_group": 5,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        1
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 7,
+      "src": 7,
+      "dst": 8,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 5,
+      "consumer_group": 6,
+      "producer_lanes": [
+        1
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 8,
+      "src": 8,
+      "dst": 9,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 9,
+      "src": 9,
+      "dst": 10,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 10,
+      "src": 10,
+      "dst": 11,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 12,
+      "src": 12,
+      "dst": 13,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 6,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 13,
+      "src": 8,
+      "dst": 14,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 14,
+      "src": 11,
+      "dst": 15,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 15,
+      "src": 15,
+      "dst": 16,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        3,
+        4
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 17,
+      "src": 16,
+      "dst": 17,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        3,
+        4
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 18,
+      "src": 17,
+      "dst": 18,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 19,
+      "src": 18,
+      "dst": 19,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 3,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        1,
+        2,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 20,
+      "src": 18,
+      "dst": 20,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "consumer_lanes": [
+        0,
+        2,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 21,
+      "src": 20,
+      "dst": 21,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 8,
+      "producer_lanes": [
+        0,
+        2,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 22,
+      "src": 13,
+      "dst": 22,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 23,
+      "src": 22,
+      "dst": 23,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 24,
+      "src": 23,
+      "dst": 24,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 25,
+      "src": 25,
+      "dst": 26,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 27,
+      "src": 25,
+      "dst": 27,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 28,
+      "src": 26,
+      "dst": 27,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 7,
+      "producer_lanes": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 29,
+      "src": 21,
+      "dst": 28,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 8,
+      "consumer_group": 9,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 30,
+      "src": 4,
+      "dst": 28,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 3,
+      "consumer_group": 9,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 31,
+      "src": 27,
+      "dst": 28,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 7,
+      "consumer_group": 9,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 32,
+      "src": 13,
+      "dst": 29,
+      "distance": 0,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 7,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 34,
+      "src": 19,
+      "dst": 30,
+      "distance": 0,
+      "latency": 1,
+      "producer_group": 3,
+      "consumer_group": 7,
+      "producer_lanes": [
+        1,
+        2,
+        6,
+        7
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 38,
+      "src": 8,
+      "dst": 7,
+      "distance": 1,
+      "latency": 0,
+      "producer_group": 6,
+      "consumer_group": 5,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "consumer_lanes": [
+        1
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    },
+    {
+      "index": 39,
+      "src": 28,
+      "dst": 25,
+      "distance": 1,
+      "latency": 1,
+      "producer_group": 9,
+      "consumer_group": 3,
+      "producer_lanes": [
+        0
+      ],
+      "consumer_lanes": [
+        0,
+        3,
+        6,
+        7
+      ],
+      "ws_semantics": true,
+      "spill_cost": 0
+    }
+  ],
+  "provenance": {
+    "ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2",
+    "baseline_graph_sha256": "7b4622046616ea6b951e81091d6c78c02e8a5ac101e1d3198add2ab6e1e8755b",
+    "solver_sources_sha256": "42f28efe2e94f97c13fc4c8a7e0326aaf5fe2955d21c8a0793b24b7cf93ef237",
+    "normalization_u": 150,
+    "machine": {
+      "capacities": {
+        "TC": 1,
+        "TMA": 1,
+        "TMEM": 1,
+        "SFU": 1,
+        "CUDA": 1
+      },
+      "smem_bytes": 232448,
+      "tmem_cols": 512,
+      "smem_fixed_overhead": 0,
+      "tmem_fixed_cols": 0,
+      "num_warpgroups": 32,
+      "num_warps": 32,
+      "warp_fixed_overhead": 4,
+      "group_widths": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "regs_per_sm": 65536,
+      "regs_fixed_overhead": 0,
+      "regs_per_warp": 8160,
+      "tmem_column_bytes": 512,
+      "barrier_pair_bytes": 16,
+      "spill_cost": 30
+    }
+  },
+  "solution_sha256": "2c9efdebacd1c16ad3a0ad1997ba66ca44a97d1203fa5119d905516fb6899021"
+}

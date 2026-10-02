@@ -1,0 +1,16 @@
+# SCIP suite 10.0 — the paper's cited solver version. PySCIPOpt 6.2.1 is the
+# binding that ships/links SCIP 10.0. Known-optimum F pins in tests assume it.
+#
+# Version self-check:
+#   python -c "from pyscipopt import Model; print(Model().version())"  -> 10.0
+PySCIPOpt==6.2.1
+
+# Yices is the second solver, and its arithmetic decides artifact contents just
+# as SCIP's does, so it is pinned too. Only the Python binding is a package:
+# the matching libyices 2.7.0 shared library is built separately and reaches
+# the process through SOLVER_LIB_PATH (see DEVIATIONS section 6).
+#
+# Version self-check:
+#   python -c "import yices_api as y; y.yices_init(); print(y.yices_version)"
+#     -> 2.7.0
+yices==1.1.6

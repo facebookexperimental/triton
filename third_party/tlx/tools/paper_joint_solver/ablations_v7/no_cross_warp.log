@@ -1,0 +1,7 @@
+case=no_cross_warp
+expected_rc=2
+command=env -u LD_LIBRARY_PATH LD_LIBRARY_PATH="$SOLVER_LIB_PATH" /usr/local/fbcode/platform010-aarch64/bin/python3.12 -m paper_joint_solver ../sched2tlx/examples/case3_FA_fp16_subtiled/ddg.json --baseline-graph ../sched2tlx/examples/case3_FA_fp16_subtiled/schedule_graph.json --no-cross-warp -o ablations_v7/no_cross_warp.json --warp-fixed-overhead 4 --ilp-seconds 240 --smt-seconds 300 --max-wall-s 3600 
+[attempt] {'stage': 'structural', 'result': 'unsat', 'reason': 'VARIABLELATENCY conflicts with no-cross-warp', 'edge': 3}
+[paper_joint_solver] unsat after 0.0s -> ablations_v7/no_cross_warp.json
+
+actual_rc=2
