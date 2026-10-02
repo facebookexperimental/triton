@@ -768,6 +768,48 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
   return success();
 }
 
+// When the source is a view of the destination's logical [MN, K] scale tile,
+// returns the SMEM element offset of each 32x128b chunk, indexed by the
+// chunk's position along the TMEM columns. Returns std::nullopt when the
+// source uses a packed shape, or when a chunk is not a contiguous 32x16B
+// block in SMEM, which the blocked scales SMEM descriptor requires.
+static std::optional<SmallVector<int32_t>>
+getScaleChunkSmemOffsets(MemDescType srcTy, MemDescType dstTy) {
+  if (srcTy.getRank() != 2 || srcTy.getShape() != dstTy.getShape())
+    return std::nullopt;
+  auto *ctx = srcTy.getContext();
+  auto kOffset = str_attr("offset");
+  auto kRow = str_attr("row");
+  auto kCol = str_attr("col");
+  auto kBlock = str_attr("block");
+
+  auto tmemLl = toLinearLayout(dstTy.getShape(), dstTy.getEncoding());
+  auto cvt = tmemLl.invertAndCompose(toLinearLayout(srcTy));
+
+  int chunkCols = 128 / srcTy.getElementType().getIntOrFloatBitWidth();
+  if (cvt.getInDimSize(kCol) % chunkCols != 0)
+    return std::nullopt;
+  for (int i = 0; i < llvm::Log2_32(32); ++i) {
+    if (cvt.getBasis(kRow, i, kOffset) != (1 << i) * chunkCols)
+      return std::nullopt;
+  }
+  for (int i = 0; i < llvm::Log2_32(chunkCols); ++i) {
+    if (cvt.getBasis(kCol, i, kOffset) != (1 << i))
+      return std::nullopt;
+  }
+
+  SmallVector<int32_t> offsets;
+  int offsetIdx = cvt.getOutDimIndex(kOffset);
+  for (int col = 0; col < cvt.getInDimSize(kCol); col += chunkCols) {
+    auto outs = cvt.apply({{kRow, 0}, {kCol, col}, {kBlock, 0}});
+    int32_t offset = outs[offsetIdx].second;
+    if (offset % chunkCols != 0)
+      return std::nullopt;
+    offsets.push_back(offset);
+  }
+  return offsets;
+}
+
 static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
                        const TypeConverter *typeConverter,
                        triton::nvidia_gpu::TMEMCopyOp op, Value src, Value dst,
@@ -783,6 +825,21 @@ static void copyScales(ConversionPatternRewriter &rewriter, Location loc,
   Value baseDst = dst;
   auto elemPtrTy = ptr_ty(rewriter.getContext(), 3);
   auto llvmElementTy = typeConverter->convertType(srcTy.getElementType());
+
+  if (auto chunkOffsets = getScaleChunkSmemOffsets(srcTy, dstTy)) {
+    // Each 32x128b chunk occupies 4 TMEM columns.
+    for (auto [idx, offset] : llvm::enumerate(*chunkOffsets)) {
+      auto tmemAddr =
+          b.add(b.ptrtoint(i32_ty, baseDst), b.int_val(32, idx * 4));
+      auto smemAddr =
+          b.gep(elemPtrTy, llvmElementTy, baseSrc, b.i32_val(offset));
+      auto smemDesc =
+          createBlockedScalesSMEMDescriptor(rewriter, loc, smemAddr);
+      createTcgen05Cp(rewriter, loc, tmemAddr, smemDesc, pred,
+                      TMemCopyAtomWarp4, twoCTAs);
+    }
+    return;
+  }
 
   auto ll = toLinearLayout(srcTy);
   // flattenOuts flattens into fortran order, so need to transpose first to
