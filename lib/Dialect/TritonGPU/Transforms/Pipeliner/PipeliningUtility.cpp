@@ -191,6 +191,12 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (isa<ttng::TMEMAllocOp, ttng::TMEMLoadOp>(op))
     return op;
+  // A local_alloc only writes the buffer it creates, and every reader of that
+  // buffer goes through its result and is predicated by the same mask. This
+  // covers the early-lowered TMA store staging alloc that lands in a peeled
+  // epilogue stage when a K == BLOCK_K tile loop is pipelined without WS.
+  if (isa<ttg::LocalAllocOp>(op))
+    return op;
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
     rewriter.setInsertionPoint(op);
     Value cnd = getPredMask(rewriter, ifOp.getCondition().getType(),
