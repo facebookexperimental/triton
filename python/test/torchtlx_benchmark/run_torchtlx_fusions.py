@@ -208,7 +208,7 @@ def run_interleaved_comparison(case, args) -> None:
             ("baseline", case.BASELINE_CONFIG),
             ("candidate", case.CANDIDATE_CONFIG),
         ),
-        models,
+            models,
     ):
         compiled[variant], output = compile_variant(
             case,
@@ -225,11 +225,9 @@ def run_interleaved_comparison(case, args) -> None:
             rtol=case.RTOL,
         )
         diff = (output.float() - eager.float()).abs()
-        print(
-            f"{variant}_correctness_vs_eager "
-            f"max_abs={diff.max().item():.6f} "
-            f"mean_abs={diff.mean().item():.6f}"
-        )
+        print(f"{variant}_correctness_vs_eager "
+              f"max_abs={diff.max().item():.6f} "
+              f"mean_abs={diff.mean().item():.6f}")
 
     samples = {"baseline": [], "candidate": []}
     for sample in range(args.samples):
@@ -244,18 +242,14 @@ def run_interleaved_comparison(case, args) -> None:
                 args.rep,
             )
             samples[variant].append(measured[variant])
-        print(
-            f"sample={sample + 1} baseline={measured['baseline']:.3f}us "
-            f"{case.CANDIDATE_NAME}={measured['candidate']:.3f}us"
-        )
+        print(f"sample={sample + 1} baseline={measured['baseline']:.3f}us "
+              f"{case.CANDIDATE_NAME}={measured['candidate']:.3f}us")
 
     baseline_us = statistics.median(samples["baseline"])
     candidate_us = statistics.median(samples["candidate"])
-    print(
-        f"FINAL {case.problem()} baseline={baseline_us:.3f}us "
-        f"{case.CANDIDATE_NAME}={candidate_us:.3f}us "
-        f"speedup={baseline_us / candidate_us:.3f}x"
-    )
+    print(f"FINAL {case.problem()} baseline={baseline_us:.3f}us "
+          f"{case.CANDIDATE_NAME}={candidate_us:.3f}us "
+          f"speedup={baseline_us / candidate_us:.3f}x")
 
 
 def main() -> None:
@@ -265,7 +259,7 @@ def main() -> None:
     if args.list:
         for listed_case in cases.values():
             print(f"{listed_case.NAME}:")
-            for shape in getattr(listed_case, "SHAPES", ({},)):
+            for shape in getattr(listed_case, "SHAPES", ({}, )):
                 description = format_shape(shape) if shape else listed_case.problem()
                 print(f"  {description}")
         return

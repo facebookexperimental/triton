@@ -576,7 +576,7 @@ class TestTorchTLXEpilogueFusion(TestCase):
         from triton.language.extra.tlx.inductor import registry as tlx_registry
 
         m, k, n = 129, 256, 257
-        bias = torch.randn((n,), device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
         a = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
         weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
         y = torch.randn(y_shape, device=GPU_TYPE, dtype=dtype)
@@ -594,24 +594,22 @@ class TestTorchTLXEpilogueFusion(TestCase):
             return templates
 
         with (
-            mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
-            mock.patch.object(
-                tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic,
-                "WARPPIPE_CONFIGS",
-                [(64, 64, 64, 8, 8, 3)],
-            ),
-            config.patch({
-                "triton.tlx_mode": "force",
-                "force_disable_caches": True,
-                "max_autotune": True,
-                "max_autotune_gemm_backends": "TRITON",
-                "enable_caching_generated_triton_templates": False,
-            }),
-            torch.no_grad(),
+                mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
+                mock.patch.object(
+                    tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic,
+                    "WARPPIPE_CONFIGS",
+                    [(64, 64, 64, 8, 8, 3)],
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                torch.no_grad(),
         ):
-            actual, code = run_and_get_code(
-                torch.compile(fused, fullgraph=True), bias, a, weight, y
-            )
+            actual, code = run_and_get_code(torch.compile(fused, fullgraph=True), bias, a, weight, y)
 
         expected = fused(bias, a, weight, y)
         atol = 2e-2 * expected.abs().max().item()
@@ -638,7 +636,7 @@ class TestTorchTLXEpilogueFusion(TestCase):
 
         m, k, n = 129, 256, 257
         dtype = torch.bfloat16
-        bias = torch.randn((n,), device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
         a = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
         weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
         y = torch.randn((m, n), device=GPU_TYPE, dtype=dtype)
@@ -657,23 +655,21 @@ class TestTorchTLXEpilogueFusion(TestCase):
             return templates
 
         with (
-            mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
-            mock.patch.object(
-                tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic,
-                "WARPPIPE_CONFIGS",
-                [(64, 64, 64, 8, 8, 3)],
-            ),
-            config.patch({
-                "triton.tlx_mode": "force",
-                "force_disable_caches": True,
-                "max_autotune": True,
-                "max_autotune_gemm_backends": "TRITON",
-                "enable_caching_generated_triton_templates": False,
-            }),
+                mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
+                mock.patch.object(
+                    tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic,
+                    "WARPPIPE_CONFIGS",
+                    [(64, 64, 64, 8, 8, 3)],
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
         ):
-            actual, code = run_and_get_code(
-                torch.compile(fused, fullgraph=True), bias, a, weight, y, z
-            )
+            actual, code = run_and_get_code(torch.compile(fused, fullgraph=True), bias, a, weight, y, z)
 
         expected = fused(bias, a, weight, y, z)
         atol = 2e-2 * expected.abs().max().item()
