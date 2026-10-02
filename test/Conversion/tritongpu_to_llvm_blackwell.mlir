@@ -535,6 +535,52 @@ tt.func public @tmem_copy_2d_slice(%src: !ttg.memdesc<1x1x8x2x256xi8, #shared2, 
 
 // -----
 
+// Unswizzled 256x16 scale view (rep_m = 2, rep_k = 4) of a packed scale load.
+// Chunk (m, k) sits at SMEM offset m * 2048 + k * 512 and is copied to TMEM
+// column (k * 2 + m) * 4.
+#shared_lin = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [128, 0]]}, alignment = 128>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+
+// CHECK-LABEL: @tmem_copy_2d_logical_scales
+tt.func public @tmem_copy_2d_logical_scales(%src: !ttg.memdesc<256x16xf8E4M3FN, #shared_lin, #ttg.shared_memory>,
+                                            %dst: !ttg.memdesc<256x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>) {
+  // CHECK: [[SMEM:%.*]] = llvm.getelementptr
+  // CHECK: [[TMEM:%.*]] = llvm.ptrtoint %arg1
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[T1:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK: llvm.add [[TMEM]], [[T1]]
+  // CHECK: [[S1:%.*]] = llvm.mlir.constant(2048 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S1]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S2:%.*]] = llvm.mlir.constant(512 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S2]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S3:%.*]] = llvm.mlir.constant(2560 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S3]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S4:%.*]] = llvm.mlir.constant(1024 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S4]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S5:%.*]] = llvm.mlir.constant(3072 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S5]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S6:%.*]] = llvm.mlir.constant(1536 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S6]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S7:%.*]] = llvm.mlir.constant(3584 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S7]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK-NOT: tcgen05.cp
+  ttng.tmem_copy %src, %dst : !ttg.memdesc<256x16xf8E4M3FN, #shared_lin, #ttg.shared_memory>, !ttg.memdesc<256x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
+  tt.return
+}
+
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread=[1, 4], threadsPerWarp=[32, 1], warpsPerCTA=[4, 1], order=[0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
