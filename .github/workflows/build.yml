@@ -1,7 +1,6 @@
 name: Build Triton wheel
 
 on:
-  pull_request:
   workflow_dispatch:
   workflow_call:
     inputs:
