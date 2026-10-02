@@ -93,6 +93,24 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="grouped_gemm",
+        arch="sm100",
+        variant="ws",
+        impl="triton.tlx.ops.kernels.grouped_gemm.sm100:grouped_gemm",
+        dtypes=frozenset({"float16"}),
+        accepts=lambda d: all(stride * d["elem_bytes"] % 16 == 0
+                              for stride in d["row_strides"]) and all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="grouped_gemm",
+        arch="gfx950",
+        variant="heuristic",
+        impl="triton.tlx.ops.kernels.grouped_gemm.gfx950:grouped_gemm",
+        dtypes=frozenset({"float16"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
         # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
         # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
         op="mm_torchtlx",
