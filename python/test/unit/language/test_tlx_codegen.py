@@ -778,7 +778,7 @@ def _explicit_mfma_reduce_add(a, b):
 
 @triton.jit
 def _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr,
-                                     COLUMN_WARPS: tl.constexpr = 4):
+                                       COLUMN_WARPS: tl.constexpr = 4):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=VERSION,
         instr_shape=[16, 16, INSTR_K],
@@ -802,7 +802,7 @@ def _lower_explicit_mfma_reduction_layouts(module, backend, options):
     pm = ir.pass_manager(module.context)
     pm.enable_debug()
     passes.ttir.add_convert_to_ttgpuir(pm, backend.get_target_name(options), options.num_warps, options.warp_size,
-                                     options.num_ctas)
+                                       options.num_ctas)
     tlx_ir.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
     pm.run(module, "explicit_mfma_reduction_layouts")
 
@@ -851,7 +851,7 @@ def test_explicit_mfma_reduction_deferred_layout_validation(target, version, ins
 
 @triton.jit
 def _explicit_mfma_batch_reduce_ws_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr,
-                                        PARTITION_WARPS: tl.constexpr):
+                                          PARTITION_WARPS: tl.constexpr):
     with tlx.async_tasks():
         with tlx.async_task("default"):
             _ = tl.arange(0, 1)

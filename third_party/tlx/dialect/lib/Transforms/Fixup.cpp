@@ -1288,7 +1288,8 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
             Attribute inferredPhysical = getEffectiveEncoding(inferredSrcEnc);
             if (srcEnc != inferredSrcEnc &&
                 isa_and_nonnull<ttg::DistributedEncodingTrait>(srcPhysical) &&
-                isa_and_nonnull<ttg::DistributedEncodingTrait>(inferredPhysical) &&
+                isa_and_nonnull<ttg::DistributedEncodingTrait>(
+                    inferredPhysical) &&
                 haveSamePhysicalLayout(
                     srcTy.cloneWithEncoding(srcPhysical),
                     srcTy.cloneWithEncoding(inferredPhysical)))
