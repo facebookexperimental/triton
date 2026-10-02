@@ -10,6 +10,8 @@
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/Allocation.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -5531,7 +5533,7 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
-// Reserve a conservative allowance for barriers, captures, and tensor-map
+// Reserve a conservative allowance for barriers, captures, tensor-map and op
 // scratch created after SMEM planning.
 static unsigned estimateAuxiliarySmemBytes(
     triton::FuncOp funcOp,
@@ -5574,10 +5576,46 @@ static unsigned estimateAuxiliarySmemBytes(
     tensorMapScratchBytes += tensorMapBytesPerOp;
   });
 
+  // Op scratch (layout conversions, reductions, ...) is live only during its
+  // op, but the planned buffers are live across the whole warp_specialize, so
+  // the largest single scratch adds to the peak. Without it an epilogue
+  // convert_layout can push a budget-filling plan past the hardware limit.
+  // Size it with the same function AllocateSharedMemoryNv uses (the generic
+  // one, which over-sizes layout conversions, only for IR without a CUDA
+  // target).
+  auto mod = funcOp->getParentOfType<ModuleOp>();
+  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  std::optional<triton::NVIDIA::TargetInfo> targetInfo;
+  triton::AllocationAnalysisScratchSizeFn scratchSizeFn =
+      triton::defaultAllocationAnalysisScratchSizeFn;
+  if (target && target.getValue().starts_with("cuda:")) {
+    targetInfo.emplace(getNVIDIAComputeCapability(mod));
+    scratchSizeFn = ttng::getNvidiaAllocationAnalysisScratchSizeFn(*targetInfo);
+  }
+  uint64_t opScratchBytes = 0;
+  funcOp->walk([&](Operation *op) {
+    if (isa<ttng::TensormapCreateOp>(op))
+      return;
+    // Canonicalization folds a conversion into these users, so it never
+    // reaches allocation.
+    if (isa<ttg::ConvertLayoutOp>(op) && !op->use_empty() &&
+        llvm::all_of(op->getUsers(), [](Operation *user) {
+          return isa<ttg::LocalStoreOp, ttg::LocalAllocOp,
+                     ttg::RemoteShmemStoreOp, ttg::AsyncRemoteShmemStoreOp>(
+              user);
+        }))
+      return;
+    uint64_t bytes = scratchSizeFn(op);
+    if (bytes > opScratchBytes) {
+      opScratchBytes = bytes;
+      LDBG("auxiliary op scratch: " << bytes << " bytes for " << *op);
+    }
+  });
+
   uint64_t totalBytes = numBarrierSlots * barrierBytesPerSlot *
                             triton::gpu::lookupNumCTAs(funcOp) +
                         numBarrierArrays * barrierCaptureBytesPerArray +
-                        captureBytes + tensorMapScratchBytes;
+                        captureBytes + tensorMapScratchBytes + opScratchBytes;
   return static_cast<unsigned>(
       std::min<uint64_t>(totalBytes, std::numeric_limits<unsigned>::max()));
 }

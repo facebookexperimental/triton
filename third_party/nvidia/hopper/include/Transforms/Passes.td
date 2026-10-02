@@ -84,7 +84,7 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
            "Allocate SMEM via the plan-space beam search (default off)">,
     Option<"reserveAuxiliarySmem", "reserve-auxiliary-smem",
            "bool", /*default*/"true",
-           "Reserve SMEM for post-planning barriers, captures, and tensor-map scratch">,
+           "Reserve SMEM for post-planning barriers, captures, tensor-map scratch, and op scratch">,
     Option<"readDecisionFile", "read-decision-file",
            "std::string", /*default*/"\"\"",
            "path to JSON file containing buffer decisions to apply">,
