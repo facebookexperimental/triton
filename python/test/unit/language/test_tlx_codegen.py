@@ -1828,6 +1828,53 @@ def _amd_scheduled_mfma_opaque_consumer_kernel(
 
 
 @triton.jit
+def _amd_scheduled_mfma_dead_result_writer_kernel(
+    output_ptr,
+    VERSION: tl.constexpr,
+    INSTR_M: tl.constexpr,
+    INSTR_K: tl.constexpr,
+    K_WIDTH: tl.constexpr,
+    WRITER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=VERSION,
+        instr_shape=[INSTR_M, INSTR_M, INSTR_K],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=K_WIDTH)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=K_WIDTH)
+    BLOCK_N: tl.constexpr = INSTR_M * (2 if WRITER == "partial" else 1)
+    a = tlx.require_layout(tl.full((INSTR_M, INSTR_K), 1.0, tl.bfloat16), dot0, pin=False)
+    b = tl.full((INSTR_K, BLOCK_N), 1.0, tl.bfloat16)
+    if WRITER == "partial":
+        # Distinct tiles prevent LLVM from merging the two native MFMAs.
+        b = (b + (tl.arange(0, BLOCK_N)[None, :] >= INSTR_M)).to(tl.bfloat16)
+    b = tlx.require_layout(b, dot1, pin=False)
+    zero = tlx.zeros((INSTR_M, BLOCK_N), tl.float32, layout=mma)
+    result = tlx.amd_scheduled_mfma(a, b, zero, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                    initialize=True)
+    if WRITER == "commit":
+        tlx.amd_mfma_commit(result)
+
+    # Unused result fragments let the writer reuse their physical registers.
+    # It deliberately has no SSA dependency on the MFMA destination.
+    if WRITER == "native":
+        written = zero + 1.0
+    else:
+        written = tl.inline_asm_elementwise("v_mov_b32 $0, 1.0", constraints="=v,v", args=[zero], dtype=tl.float32,
+                                            is_pure=WRITER == "pure", pack=1)
+    offsets = output_ptr + tl.arange(0, INSTR_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    tl.store(tlx.require_layout(offsets, mma, pin=False), written)
+    if WRITER == "partial":
+        # Keep only the first native fragment live across the opaque writer.
+        live = tlx.extract_slice(result, [INSTR_M, INSTR_M], [0, 0])
+        live_offsets = (output_ptr + INSTR_M * BLOCK_N + tl.arange(0, INSTR_M)[:, None] * INSTR_M +
+                        tl.arange(0, INSTR_M)[None, :])
+        tl.store(tlx.require_layout(live_offsets, mma, pin=False), live)
+
+
+@triton.jit
 def _load_then_restructure(base, offsets):
     value = tlx.buffer_load(base, offsets)
     value = tl.reshape(value, [4, 4, 16, 2, 2])
@@ -3476,8 +3523,7 @@ def test_amd_scheduled_mfma_native_grid_gfx942():
 
     # Native MFMA instructions retain the eight grid updates while LLVM may
     # reschedule them; source-level K/N/M ordering is checked in lit.
-    assert len(re.findall(r'call <4 x float> @llvm\.amdgcn\.mfma\.f32\.16x16x16f16\(',
-                          compiled.asm["llir"])) == 8
+    assert len(re.findall(r'call <4 x float> @llvm\.amdgcn\.mfma\.f32\.16x16x16f16\(', compiled.asm["llir"])) == 8
 
 
 @pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
@@ -3539,11 +3585,15 @@ def test_amd_scheduled_mfma_opaque_consumer_completion(target, version, instr_k,
     mfma = re.search(r'call <4 x float> @llvm\.amdgcn\.mfma\.f32\.16x16x' + str(instr_k), llir)
     assert mfma is not None
     assert not re.search(r'asm sideeffect "[^"\n]*v_mfma_', llir)
-    waits = list(re.finditer(r'asm sideeffect "([^"\n]*s_nop[^"\n]*)", "([^"\n]*)"', llir))
+    # Inspect the tied completion boundaries separately from the waits now
+    # prefixed to the opaque consumer's own assembly.
+    waits = list(re.finditer(r'asm sideeffect "(s_nop \d+(?:\\0As_nop \d+)*)", "([^"\n]*)"', llir))
     if consumer == "native":
-        assert not waits
+        assert not re.search(r'asm(?: sideeffect)? "[^"\n]*s_nop', llir)
         return
-    opaque_consumer = llir.index('asm sideeffect "v_add_f32')
+    opaque_consumer = re.search(r'asm sideeffect "[^"\n]*v_add_f32', llir)
+    assert opaque_consumer is not None
+    opaque_consumer = opaque_consumer.start()
     if consumer in ("layout", "reshape"):
         # The alias analysis conservatively follows LDS reloads too, even if
         # this particular layout transfer survives LLVM optimization.
@@ -3562,6 +3612,56 @@ def test_amd_scheduled_mfma_opaque_consumer_completion(target, version, instr_k,
         assert "0" in wait.group(2).split(",")
     if consumer == "direct":
         assert mfma.start() < waits[0].start() < opaque_consumer
+
+
+@pytest.mark.parametrize(
+    "target,version,instr_m,instr_k,k_width,wait_states",
+    [(GFX942, 3, 16, 16, 4, 11), (GFX942, 3, 32, 8, 4, 19), (GFX950, 4, 16, 32, 8, 12), (GFX950, 4, 32, 16, 8, 20)],
+    ids=["gfx942_16x16", "gfx942_32x32", "gfx950_16x16", "gfx950_32x32"],
+)
+@pytest.mark.parametrize("writer", ["opaque", "pure", "partial", "commit", "native"])
+def test_amd_scheduled_mfma_dead_result_writer_completion(target, version, instr_m, instr_k, k_width, wait_states,
+                                                          writer):
+    src = ASTSource(
+        fn=_amd_scheduled_mfma_dead_result_writer_kernel,
+        signature={
+            "output_ptr": "*fp32",
+            "VERSION": "constexpr",
+            "INSTR_M": "constexpr",
+            "INSTR_K": "constexpr",
+            "K_WIDTH": "constexpr",
+            "WRITER": "constexpr",
+        },
+        constexprs={"VERSION": version, "INSTR_M": instr_m, "INSTR_K": instr_k, "K_WIDTH": k_width, "WRITER": writer},
+    )
+    compiled = triton_compile(src, target=target, options={"num_warps": 1, "matrix_instr_nonkdim": instr_m})
+    llir = compiled.asm["llir"]
+    registers = instr_m * instr_m // 64
+    mfmas = list(
+        re.finditer(
+            rf'(%[\w.]+) = (?:tail )?call <{registers} x float> @llvm\.amdgcn\.mfma\.f32\.{instr_m}x{instr_m}x{instr_k}',
+            llir,
+        ))
+    assert len(mfmas) == (2 if writer == "partial" else 1)
+    assert not re.search(r'asm sideeffect "[^"\n]*v_mfma_', llir)
+    writers = list(re.finditer(r'asm( sideeffect)? "([^"\n]*v_mov_b32[^"\n]*)", "=v,v"', llir))
+    if writer == "native":
+        assert not writers
+        assert not re.search(r'asm(?: sideeffect)? "[^"\n]*s_nop', llir)
+        return
+
+    assert writers
+    for opaque_writer in writers:
+        # Put the delay inside the writer so pure assembly cannot be moved
+        # away from it, even when the MFMA result has no SSA consumer.
+        prefix, instruction = opaque_writer.group(2).split("v_mov_b32", 1)
+        assert instruction == " $0, 1.0"
+        assert re.fullmatch(r"(?:s_nop \d+\\0A)+", prefix)
+        assert sum(int(count) + 1 for count in re.findall(r"s_nop (\d+)", prefix)) >= wait_states
+        assert bool(opaque_writer.group(1)) == (writer != "pure")
+    if writer == "commit":
+        # The explicit commit remains a separate tied completion boundary.
+        assert re.search(r'asm sideeffect "s_nop \d+(?:\\0As_nop \d+)*", "=a,0,~\{memory\}"', llir)
 
 
 def _amd_scheduled_mfma_memory_forward_ir(target, version, instr_k, k_width, memory, consumer):
@@ -3636,15 +3736,17 @@ def test_amd_scheduled_mfma_memory_forward_completion(tmp_path, target, version,
     mfma = re.search(r"call <4 x float> @llvm\.amdgcn\.mfma\.f32\.16x16x" + str(instr_k), llir)
     assert mfma is not None
     assert not re.search(r'asm sideeffect "[^"\n]*v_mfma_', llir)
-    waits = list(re.finditer(r'asm sideeffect "([^"\n]*s_nop[^"\n]*)", "([^"\n]*)"', llir))
+    waits = list(re.finditer(r'asm sideeffect "(s_nop \d+(?:\\0As_nop \d+)*)", "([^"\n]*)"', llir))
     if consumer == "native":
         assert "fadd float" in llir
-        assert not waits
+        assert not re.search(r'asm(?: sideeffect)? "[^"\n]*s_nop', llir)
         return
     assert len(waits) == 1
     wait = waits[0]
     assert wait.group(1) == expected_wait
-    assert mfma.start() < wait.start() < llir.index('asm sideeffect "v_add_f32')
+    opaque_consumer = re.search(r'asm sideeffect "[^"\n]*v_add_f32', llir)
+    assert opaque_consumer is not None
+    assert mfma.start() < wait.start() < opaque_consumer.start()
     if consumer == "commit":
         # A full explicit commit supplies the wait; the producer pin stays empty.
         assert wait.group(2) == "=a,0,~{memory}"

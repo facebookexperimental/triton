@@ -1896,10 +1896,80 @@ void mlir::triton::AMD::finalizeScheduledMfmaLowering(
     const ScheduledMfmaLoweringState &state) {
   SmallVector<std::pair<Operation *, int>> needsDrain;
   DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>> memoryForwarding;
-  for (auto [pin, requiredWait] : state.resultPins)
-    if (needsOpaqueConsumerDrain(pin, requiredWait, state.commitWaitStates,
+  DenseMap<Operation *, int> functionWaitStates;
+  DenseMap<Operation *, bool> functionNeedsDrain;
+  auto isNativeInstruction = [](StringRef name) {
+    // These lower to native instructions on the supported targets. Exp2 is
+    // also emitted as a direct LLVM call by the elementwise conversion.
+    return llvm::is_contained(
+        {"llvm.amdgcn.perm", "llvm.amdgcn.permlane16.swap",
+         "llvm.amdgcn.permlane32.swap", "llvm.amdgcn.readfirstlane",
+         "llvm.amdgcn.ds.permute", "llvm.amdgcn.ds.bpermute",
+         "llvm.amdgcn.raw.ptr.buffer.atomic.fadd", "llvm.amdgcn.wave.barrier",
+         "llvm.amdgcn.exp2.f32", "llvm.exp2.f32"},
+        name);
+  };
+  for (auto [pin, requiredWait] : state.resultPins) {
+    auto function = pin->getParentOfType<LLVM::LLVMFuncOp>();
+    bool crossesCallBoundary = !function;
+    if (function) {
+      auto entry = functionNeedsDrain.try_emplace(function);
+      bool &needsFunctionDrain = entry.first->second;
+      if (entry.second) {
+        // Callable helpers must complete before returning. Kernels have no
+        // symbol uses and external linkage at this conversion stage.
+        needsFunctionDrain = function.getLinkage() != LLVM::Linkage::External ||
+                             !SymbolTable::symbolKnownUseEmpty(
+                                 function, function->getParentOp());
+        function.walk([&](Operation *op) {
+          // Coroutine intrinsics can introduce calls or helper functions in
+          // LLVM's later coroutine lowering despite having dedicated MLIR ops.
+          if (isa<LLVM::InvokeOp>(op) ||
+              op->getName().getStringRef().starts_with("llvm.intr.coro."))
+            needsFunctionDrain = true;
+          if (auto call = dyn_cast<LLVM::CallOp>(op)) {
+            auto callee = call.getCallee();
+            if (!callee || !isNativeInstruction(*callee))
+              needsFunctionDrain = true;
+          }
+          if (auto call = dyn_cast<LLVM::CallIntrinsicOp>(op)) {
+            // Unknown intrinsics may lower to calls (including some amdgcn
+            // intrinsics), so keep their boundary covered conservatively.
+            if (!isNativeInstruction(call.getIntrin()))
+              needsFunctionDrain = true;
+          }
+        });
+      }
+      crossesCallBoundary = needsFunctionDrain;
+      int &waitStates = functionWaitStates[function];
+      waitStates = std::max(waitStates, requiredWait);
+    }
+    // A call can reuse registers even without consuming the MFMA result. Keep
+    // its full destination tuple live until completion on either side of a
+    // call/return, including when LLVM moves otherwise independent operations.
+    if (crossesCallBoundary ||
+        needsOpaqueConsumerDrain(pin, requiredWait, state.commitWaitStates,
                                  memoryForwarding))
       needsDrain.emplace_back(pin, requiredWait);
+  }
+
+  // A dead destination can be reused by an unrelated inline-assembly output
+  // while its native MFMA is still in flight. SSA consumer analysis cannot see
+  // that physical-register WAW hazard (or a reused source's WAR hazard).
+  // Keep completion inside the opaque instruction sequence: pure assembly can
+  // move across other operations during LLVM optimization. Function scope also
+  // covers backedges and values or partial fragments eliminated later by LLVM.
+  // Empty register pins and compiler-owned commits emit no register writes.
+  // The latter retain their separately modeled completion contract.
+  for (auto [function, waitStates] : functionWaitStates) {
+    std::string completion = mfmaWaitStateAsm(waitStates) + "\n";
+    function->walk([&](LLVM::InlineAsmOp assembly) {
+      if (assembly.getAsmString().empty() ||
+          state.commitWaitStates.contains(assembly))
+        return;
+      assembly.setAsmString(completion + assembly.getAsmString().str());
+    });
+  }
 
   // Analyze every root before changing any asm: otherwise an upgraded pin
   // could appear to be an opaque consumer of a different root.

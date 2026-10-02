@@ -76,10 +76,13 @@ def _attn_bwd_preprocess_kernel(
     DO,
     Delta,
     DQ_ACC,
+    LSE,
+    LSE_LOG2,
     N: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     ZERO_DQ: tl.constexpr,
+    SCALE_LSE: tl.constexpr,
 ):
     batch_head = tl.program_id(1)
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -96,9 +99,24 @@ def _attn_bwd_preprocess_kernel(
     tl.store(Delta + delta_base + rows, tl.sum(o * do, axis=1), mask=rows < N)
     if ZERO_DQ:
         tl.store(DQ_ACC + tensor_base + offsets, 0.0, mask=mask)
+    if SCALE_LSE:
+        lse_values = tl.load(LSE + delta_base + rows, mask=rows < N, other=0.0)
+        # Preserve the main kernel's scalar FP32 multiply and rounding boundary.
+        # This preprocess kernel contains no MFMA that requires an opaque drain.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        tl.store(LSE_LOG2 + delta_base + rows, lse_log2, mask=rows < N)
 
 
-def _run_bwd_preprocess(o, do, delta, dq_acc=None):
+def _run_bwd_preprocess(o, do, delta, dq_acc=None, lse=None, lse_log2=None):
+    if (lse is None) != (lse_log2 is None):
+        raise ValueError("LSE preprocessing requires both input and output buffers")
     batch, heads, n_ctx, head_dim = o.shape
     block_m = 64
     grid = (triton.cdiv(n_ctx, block_m), batch * heads)
@@ -107,10 +125,13 @@ def _run_bwd_preprocess(o, do, delta, dq_acc=None):
         do,
         delta,
         dq_acc if dq_acc is not None else delta,
+        lse if lse is not None else delta,
+        lse_log2 if lse_log2 is not None else delta,
         N=n_ctx,
         D=head_dim,
         BLOCK_M=block_m,
         ZERO_DQ=dq_acc is not None,
+        SCALE_LSE=lse is not None,
         num_warps=4,
     )
 
@@ -1186,14 +1207,7 @@ def _attn_bwd_gqa_front(
     if IS_CAUSAL:
         # Mask after scaling so custom zero or negative scales cannot turn an
         # invalid raw-score sentinel into a NaN or a finite probability.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        lse_log2 = lse_values
         lse_full = tlx.require_layout(
             tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
             MMA_NM,
@@ -1240,17 +1254,9 @@ def _attn_bwd_gqa_front(
     q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
     do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     if not IS_CAUSAL:
-        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
-        # the multiply lets LLVM pair an LSE lane with a score fragment in a
-        # packed multiply and creates a false cross-fragment dependency.
-        lse_log2 = tl.inline_asm_elementwise(
-            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-            "=v,v",
-            [lse_values],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        # Preprocess stores the rounded log2 LSE, keeping its multiply out of
+        # this register-heavy phase and preventing score/LSE packed pairing.
+        lse_log2 = lse_values
         # These are soft requirements. Layout propagation does not yet infer
         # the score MFMA layout for broadcast/full operands from elementwise users.
         lse_full = tlx.require_layout(
@@ -3832,6 +3838,7 @@ def _run_bwd_d128_gqa(
     sm_scale,
     causal,
 ):
+    """Run the D128 bridge with LSE already scaled by log2(e)."""
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
     assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
@@ -4710,13 +4717,14 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
-        _run_bwd_preprocess(o, do, delta)
+        lse_log2 = torch.empty_like(lse)
+        _run_bwd_preprocess(o, do, delta, lse=lse, lse_log2=lse_log2)
         _run_bwd_d128_gqa(
             q,
             k,
             v,
             do,
-            lse,
+            lse_log2,
             delta,
             dq_acc,
             dq,

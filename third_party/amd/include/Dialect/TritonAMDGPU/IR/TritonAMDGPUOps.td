@@ -917,12 +917,23 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     assembly. Persistent accumulator tuples are pinned after all K updates;
     nonconstant input accumulators are also pinned before the updates when
     `initialize` is false. These side-effecting accumulator pins constrain
-    compiler-side ordering. For native-only consumer chains, the pins are empty
-    and provide no hardware wait. If a persistent result reaches opaque inline
-    assembly or an unmodeled escape, including through potentially aliasing
-    memory reloads, without a sufficient explicit `mfma_commit`, affected result
-    pins include a target-specific completion wait. Neither form is a memory
-    fence.
+    compiler-side ordering. Kernel chains with only native consumers and no
+    calls retain empty pins that provide no hardware wait. If a persistent
+    result reaches opaque inline assembly or an unmodeled escape, including
+    through potentially aliasing memory reloads, without a sufficient explicit
+    `mfma_commit`, affected result pins include a target-specific completion
+    wait. Non-kernel helpers and functions with remaining calls conservatively
+    complete every persistent result at its pin, including unused fragments.
+
+    Functions containing persistent MFMAs also prefix nonempty opaque inline
+    assembly with the largest required completion delay in that function. This
+    includes pure assembly and writers unrelated to the result: register reuse
+    can otherwise overlap an MFMA's in-flight accesses after a result becomes
+    dead or partially unused. Keeping the delay inside the assembly preserves
+    it through LLVM scheduling. Empty register pins and compiler-owned commits
+    retain their separate handling. These conservative rules may add redundant
+    waits around opaque code; MFMA arithmetic remains native, and the waits are
+    not memory fences.
 
     All active lanes of a wave must execute this operation uniformly. This
     source contract covers the native arithmetic and register-pinning boundaries.

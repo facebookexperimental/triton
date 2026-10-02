@@ -523,6 +523,49 @@ def _amd_scheduled_mfma_opaque_consumer_kernel(
 
 
 @triton.jit
+def _amd_scheduled_mfma_dead_result_writer_kernel(
+    output_ptr,
+    INSTR_M: tl.constexpr,
+    INSTR_K: tl.constexpr,
+    WRITER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[INSTR_M, INSTR_M, INSTR_K],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    BLOCK_N: tl.constexpr = INSTR_M * (2 if WRITER == "partial" else 1)
+    a = tlx.require_layout(tl.full((INSTR_M, INSTR_K), 1.0, tl.bfloat16), dot0, pin=False)
+    b = tl.full((INSTR_K, BLOCK_N), 1.0, tl.bfloat16)
+    if WRITER == "partial":
+        b = (b + (tl.arange(0, BLOCK_N)[None, :] >= INSTR_M)).to(tl.bfloat16)
+    b = tlx.require_layout(b, dot1, pin=False)
+    zero = tlx.zeros((INSTR_M, BLOCK_N), tl.float32, layout=mma)
+    result = tlx.amd_scheduled_mfma(a, b, zero, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                    initialize=True)
+    if WRITER == "commit":
+        tlx.amd_mfma_commit(result)
+
+    # Discarding the result lets the opaque writer reuse an MFMA destination
+    # register while the instruction may still have writes in flight.
+    if WRITER == "native":
+        written = zero + 1.0
+    else:
+        written = tl.inline_asm_elementwise("v_mov_b32 $0, 1.0", constraints="=v,v", args=[zero], dtype=tl.float32,
+                                            is_pure=WRITER == "pure", pack=1)
+    offsets = output_ptr + tl.arange(0, INSTR_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    tl.store(tlx.require_layout(offsets, mma, pin=False), written)
+    if WRITER == "partial":
+        live = tlx.extract_slice(result, [INSTR_M, INSTR_M], [0, 0])
+        live_offsets = (output_ptr + INSTR_M * BLOCK_N + tl.arange(0, INSTR_M)[:, None] * INSTR_M +
+                        tl.arange(0, INSTR_M)[None, :])
+        tl.store(tlx.require_layout(live_offsets, mma, pin=False), live)
+
+
+@triton.jit
 def _amd_scheduled_mfma_forked_chain_kernel(
     a_ptr,
     b_ptr,
@@ -1804,6 +1847,24 @@ def test_amd_scheduled_mfma_opaque_consumer_correct_gfx950(consumer, iterations)
         elif consumer == "loop":
             expected *= iterations
         torch.testing.assert_close(actual, expected + 1.0, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("instr_m,instr_k", [(16, 32), (32, 16)], ids=["16x16", "32x32"])
+@pytest.mark.parametrize("writer", ["opaque", "pure", "partial", "commit", "native"])
+def test_amd_scheduled_mfma_dead_result_writer_correct_gfx950(instr_m, instr_k, writer):
+    elements = instr_m * instr_m
+    expected = torch.ones((elements * (3 if writer == "partial" else 1), ), device="cuda", dtype=torch.float32)
+    if writer == "partial":
+        # The saved first fragment is an all-ones matrix product. The other
+        # fragment is unused and must not corrupt the opaque writer's ones.
+        expected[2 * elements:] = instr_k
+    for _ in range(3):
+        actual = torch.full_like(expected, float("nan"))
+        _amd_scheduled_mfma_dead_result_writer_kernel[(1, )](actual, INSTR_M=instr_m, INSTR_K=instr_k, WRITER=writer,
+                                                             num_warps=1, matrix_instr_nonkdim=instr_m)
+        # Values written by the opaque instruction are always exactly 1.
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
