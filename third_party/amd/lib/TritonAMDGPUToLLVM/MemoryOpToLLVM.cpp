@@ -1667,11 +1667,12 @@ public:
           // use B-lane permutation flags.
           MLIRContext *ctx = rewriter.getContext();
           if (cast<VectorType>(fragmentTy).getElementType().isF64()) {
-            loweredOp.addAttribute("blgp", ROCDL::MFMANegModifierAttr::get(
-                                               ctx, ROCDL::MFMANegModifier::none));
+            loweredOp.addAttribute("blgp",
+                                   ROCDL::MFMANegModifierAttr::get(
+                                       ctx, ROCDL::MFMANegModifier::none));
           } else {
-            loweredOp.addAttribute("blgp", ROCDL::MFMAPermBAttr::get(
-                                               ctx, ROCDL::MFMAPermB::none));
+            loweredOp.addAttribute(
+                "blgp", ROCDL::MFMAPermBAttr::get(ctx, ROCDL::MFMAPermB::none));
           }
           updatedFragments[accumulatorIndex] =
               rewriter.create(loweredOp)->getResult(0);
@@ -1690,7 +1691,8 @@ public:
             /*hasSideEffects=*/true, &pin);
         if (failed(constrainedD))
           return rewriter.notifyMatchFailure(
-              op, "native MFMA result must pack into complete 32-bit registers");
+              op,
+              "native MFMA result must pack into complete 32-bit registers");
         fragment = *constrainedD;
         resultPins.push_back(pin);
       }
