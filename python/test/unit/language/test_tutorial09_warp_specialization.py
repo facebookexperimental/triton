@@ -1311,6 +1311,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         True,
         id="static-2cta-data-partition-2",
     ),
+    pytest.param(tl.StaticPersistent1DScheduler, 128, 256, 4, 1, 2, True, True, 1, True,
+                 id="static-2cta-epilogue-subtile-4"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="dynamic-subtile-1"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="dynamic-subtile-2"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="dynamic-subtile-4"),
@@ -1469,6 +1471,11 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             "Expected every epilogue subtile and data partition to emit a TMA store")
         if NUM_CTAS == 2:
             assert ttgir.count("two_ctas") >= DATA_PARTITION_FACTOR, "Expected 2-CTA MMA per data partition"
+            if separate_epilogue_store and EPILOGUE_SUBTILE > 1:
+                output_staging = [line for line in ttgir.splitlines() if "buffer.tmaStaging = 1" in line]
+                assert output_staging, "Expected ordinary TMA output staging"
+                assert all("buffer.copy = 1" in line for line in output_staging), (
+                    "2CTA ordinary TMA output staging must not use an unsafe multi-copy ring")
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
