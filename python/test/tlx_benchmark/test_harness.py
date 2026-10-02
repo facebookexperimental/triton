@@ -754,13 +754,13 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert mm.suite("gfx942_2").includes == ("gfx950_2", )
     assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
     assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
-    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
 
     addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
-    assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
+    assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_4")
 
     bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
-    assert bmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
+    assert bmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
 
     flash_attn = importlib.import_module("triton.tlx.ops.kernels.flash_attn._shapes").FOCUS
     assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
