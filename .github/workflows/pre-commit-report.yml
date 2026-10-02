@@ -1,0 +1,158 @@
+name: Pre-Commit Inline Report
+
+on:
+  workflow_run:
+    workflows: ["Integration Tests"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: precommit-report-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    # Reporting must not replace or change the blocking formatting result.
+    continue-on-error: true
+    env:
+      HAS_APP_CREDENTIALS: ${{ secrets.APP_ID != '' && secrets.APP_PRIVATE_KEY != '' }}
+    steps:
+      # No checkout or cache restore: fork code and artifacts are never executed.
+      - name: Resolve failed check and current PR
+        id: check
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const repo = context.repo;
+            if (run.repository.full_name !== `${repo.owner}/${repo.repo}` ||
+                run.path !== '.github/workflows/ci.yml') return;
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              ...repo, run_id: run.id, attempt_number: run.run_attempt,
+              per_page: 100,
+            });
+            if (!jobs.some(job => job.name === 'pre-commit-strict / pre-commit (code formatting)' &&
+                job.steps?.some(step => step.name === 'Check pre-commit (strict)' &&
+                  step.conclusion === 'failure'))) return;
+
+            // workflow_run.pull_requests may be empty for forks. Resolve through
+            // the API, never through PR numbers or commit IDs in the artifact.
+            const prs = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
+              ...repo, commit_sha: run.head_sha, per_page: 100,
+            });
+            const matches = prs.filter(pr => pr.state === 'open' &&
+              pr.base.repo.full_name === `${repo.owner}/${repo.repo}` &&
+              pr.head.sha === run.head_sha && pr.head.ref === run.head_branch);
+            if (matches.length !== 1) {
+              core.info('No unique current PR for this run; skipping inline comments.');
+              return;
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...repo, run_id: run.id, per_page: 100,
+            });
+            const matchesArtifact = artifacts.filter(a => !a.expired &&
+              a.name === `precommit-strict-diagnostics-${run.run_attempt}`);
+            if (matchesArtifact.length !== 1 || matchesArtifact[0].size_in_bytes > 10 * 1024 * 1024) {
+              core.warning('Diagnostics artifact missing, ambiguous, or too large; skipping.');
+              return;
+            }
+            core.setOutput('pr', matches[0].number);
+            core.setOutput('artifact', matchesArtifact[0].id);
+
+      - name: Download diagnostics from the triggering run
+        if: steps.check.outputs.artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.check.outputs.artifact }}
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/precommit-report
+
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.check.outputs.artifact != '' && env.HAS_APP_CREDENTIALS == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Report unavailable credentials
+        if: steps.check.outputs.artifact != '' && env.HAS_APP_CREDENTIALS != 'true'
+        run: echo "::warning::App credentials unavailable; inline comments skipped. See the formatting check summary."
+
+      - name: Post inline review comments
+        if: steps.app-token.outcome == 'success'
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ steps.check.outputs.pr }}
+          DIAGNOSTICS_PATH: ${{ runner.temp }}/precommit-report/precommit-diagnostics.json
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const repo = context.repo;
+            const pull_number = Number(process.env.PR_NUMBER);
+            const sha = context.payload.workflow_run.head_sha;
+            // Recheck after downloading: the author may have pushed meanwhile.
+            const {data: pr} = await github.rest.pulls.get({...repo, pull_number});
+            if (pr.state !== 'open' || pr.head.sha !== sha ||
+                pr.base.repo.full_name !== `${repo.owner}/${repo.repo}`) return;
+            const file = process.env.DIAGNOSTICS_PATH;
+            const stat = fs.lstatSync(file);
+            if (!stat.isFile() || stat.size > 8 * 1024 * 1024) {
+              throw new Error('Invalid diagnostics file');
+            }
+            const diagnostics = JSON.parse(fs.readFileSync(file, 'utf8'));
+            if (!Array.isArray(diagnostics) || diagnostics.length > 1000) {
+              throw new Error('Invalid diagnostics list');
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...repo, pull_number, per_page: 100,
+            });
+            const paths = new Set(files.filter(f => f.status !== 'removed').map(f => f.filename));
+            const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+              ...repo, pull_number, per_page: 100,
+            });
+            const marker = '<!-- precommit-strict-lint -->';
+            const existing = new Set(comments.filter(c => c.commit_id === sha &&
+              c.user?.type === 'Bot' && c.body.includes(marker))
+              .map(c => c.body.trim().split('\n').at(-1)));
+            let posted = 0;
+            let dropped = 0;
+            for (const d of diagnostics) {
+              if (!d || typeof d.path !== 'string' || !paths.has(d.path) ||
+                  d.path.startsWith('/') || d.path.split('/').some(p => p === '..' || p === '.') ||
+                  /[\x00-\x1f\x7f\\`]/.test(d.path) ||
+                  !Number.isSafeInteger(d.line) || d.line < 1 || d.line > 2147483647 ||
+                  !Number.isSafeInteger(d.column) || d.column < 1 || d.column > 2147483647 ||
+                  typeof d.message !== 'string' || d.message.length > 4000) continue;
+              const footer = `\`${d.path}:${d.line}:${d.column}\``;
+              if (existing.has(footer)) continue;
+              if (posted >= 10) { dropped++; continue; }
+              // Escape diagnostic text so fork-controlled messages cannot inject
+              // Markdown, HTML, mentions, or the deduplication footer.
+              const message = d.message.replace(/[&<>`*_\[\]\\@]/g,
+                c => `&#${c.charCodeAt(0)};`).replace(/[\r\n\x00-\x1f\x7f]/g, ' ');
+              try {
+                await github.rest.pulls.createReviewComment({
+                  ...repo, pull_number, commit_id: sha, path: d.path,
+                  line: d.line, side: 'RIGHT',
+                  body: `${marker}\n**pre-commit-strict** (blocking): ${message}\n${footer}`,
+                });
+                existing.add(footer);
+                posted++;
+              } catch (error) {
+                // A valid diagnostic can be outside the PR diff. Other errors
+                // stop reporting rather than repeatedly hitting a failing API.
+                if (error.status !== 422) throw error;
+                core.warning('Could not post a diagnostic outside the reviewable diff.');
+              }
+            }
+            core.info(`Posted ${posted} inline comments; ${dropped} exceeded the ten-comment cap.`);
