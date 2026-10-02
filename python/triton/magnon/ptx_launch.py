@@ -110,7 +110,7 @@ def parse_entry(ptx: str):
     return name, [_param_kind(p) for p in params]
 
 
-def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
+def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version: str = "") -> dict:
     """Build the source-free launch spec from a compiled kernel + its (bound-order) call args.
 
     ordered_args: list in source/bound order, each one of:
@@ -118,6 +118,8 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
         ("tensordesc", {"base": {"id","shape","dtype","strides"}, "desc_shape", "desc_strides",
                         "block_shape", "padding"})   # host-side TMA TensorDescriptor
         ("scalar", value) | ("constexpr",)
+    A tensor info dict may also carry "pickle_sha256" (its data saved by the collector), which is
+    copied onto the spec's tensor entry.
     Applies Triton's specialization (drop constexprs and `equal_to_1` integer scalars), maps the
     survivors onto the PTX `.entry` param slots -- including expanding each TensorDescriptor into its
     [tensormap, *shape, *strides] params (the TMA ABI, see nvidia/backend/driver.py
@@ -164,7 +166,10 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
         if key is not None and key in _id2idx:
             return _id2idx[key]
         idx = len(tensors)
-        tensors.append({"shape": list(info["shape"]), "dtype": info["dtype"], "strides": list(info["strides"])})
+        entry = {"shape": list(info["shape"]), "dtype": info["dtype"], "strides": list(info["strides"])}
+        if "pickle_sha256" in info:
+            entry["pickle_sha256"] = info["pickle_sha256"]
+        tensors.append(entry)
         if key is not None:
             _id2idx[key] = idx
         return idx
@@ -254,6 +259,7 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
         "block": [int(getattr(metadata, "num_warps", 1) or 1) * 32, 1, 1],
         "grid": g,
         "ptxas": ptxas,
+        "ptxas_version": ptxas_version,
         "tensors": tensors,
         "args": args,
     }
