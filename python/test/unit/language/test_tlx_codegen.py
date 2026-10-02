@@ -777,12 +777,13 @@ def _explicit_mfma_reduce_add(a, b):
 
 
 @triton.jit
-def _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr):
+def _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr,
+                                     COLUMN_WARPS: tl.constexpr = 4):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=VERSION,
         instr_shape=[16, 16, INSTR_K],
         transposed=True,
-        warps_per_cta=[2, 1, 4],
+        warps_per_cta=[2, 1, COLUMN_WARPS],
     )
     batch = tl.arange(0, 2)
     rows = tl.arange(0, 16)
@@ -794,26 +795,98 @@ def _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION: tl.constexpr, INS
     tl.store(Output + output_offsets, total)
 
 
-@pytest.mark.parametrize("target,version,instr_k", [(GFX942, 3, 16), (GFX950, 4, 32)])
-def test_explicit_mfma_reduction_uses_target_metadata_during_ast(target, version, instr_k):
+def _lower_explicit_mfma_reduction_layouts(module, backend, options):
+    from triton._C.libtriton import passes, tlx as tlx_ir
+
+    backend.make_ttir(module, {}, options)
+    pm = ir.pass_manager(module.context)
+    pm.enable_debug()
+    passes.ttir.add_convert_to_ttgpuir(pm, backend.get_target_name(options), options.num_warps, options.warp_size,
+                                     options.num_ctas)
+    tlx_ir.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
+    pm.run(module, "explicit_mfma_reduction_layouts")
+
+
+@pytest.mark.parametrize(
+    "target,version,instr_k,num_warps,error",
+    [
+        pytest.param(GFX942, 3, 16, 8, None, id="gfx942"),
+        pytest.param(GFX950, 4, 32, 8, None, id="gfx950"),
+        pytest.param(GFX950, 4, 32, 4, "Layout has 8 warps per CTA, but the context requires 4 warps per CTA",
+                     id="invalid-warps"),
+        pytest.param(GFX1250, 4, 32, 8, "Layout has 64 threads per warp, but the module specifies 32 threads per warp",
+                     id="invalid-wave-size"),
+    ],
+)
+def test_explicit_mfma_reduction_deferred_layout_validation(target, version, instr_k, num_warps, error, capfd):
+    from triton.compiler.code_generator import ast_to_ttir
+
     backend = triton.compiler.compiler.make_backend(target)
-    options = backend.parse_options({"num_warps": 8})
+    options = backend.parse_options({"num_warps": num_warps})
     context = ir.context()
     ir.load_dialects(context)
     backend.load_dialects(context)
     source = ASTSource(
         fn=_explicit_mfma_batch_reduce_kernel,
         signature={"Input": "*fp32", "Output": "*fp32"},
-        constexprs={"VERSION": version, "INSTR_K": instr_k},
+        constexprs={"VERSION": version, "INSTR_K": instr_k, "COLUMN_WARPS": 4},
     )
-    # tl.reduce verifies its explicit input layout before post_ast_lowering.
-    module = source.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
-                            context)
-    assert module.get_int_attr("ttg.threads-per-warp") == 64
-    assert module.get_int_attr("ttg.num-warps") == 8
+    codegen_fns = backend.get_codegen_implementation(options)
+    # Layout verification must wait until target and execution context are known.
+    module = ast_to_ttir(source.fn, source, context=context, options=options, codegen_fns=codegen_fns,
+                         module_map=backend.get_module_map())
+    codegen_fns["post_ast_lowering"](module)
+    assert module.verify()
+    if error is not None:
+        with pytest.raises(RuntimeError):
+            _lower_explicit_mfma_reduction_layouts(module, backend, options)
+        assert error in capfd.readouterr().err
+        return
+    _lower_explicit_mfma_reduction_layouts(module, backend, options)
     assert module.verify()
     assert "tt.reduce" in str(module)
     assert "#ttg.slice" in str(module)
+    assert "#tlx.no_verify_layout" not in str(module)
+
+
+@triton.jit
+def _explicit_mfma_batch_reduce_ws_kernel(Input, Output, VERSION: tl.constexpr, INSTR_K: tl.constexpr,
+                                        PARTITION_WARPS: tl.constexpr):
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            _ = tl.arange(0, 1)
+        with tlx.async_task(num_warps=PARTITION_WARPS):
+            _explicit_mfma_batch_reduce_kernel(Input, Output, VERSION, INSTR_K, COLUMN_WARPS=2)
+
+
+@pytest.mark.parametrize("target,version,instr_k", [(GFX942, 3, 16), (GFX950, 4, 32)])
+@pytest.mark.parametrize("partition_warps", [4, 2])
+def test_explicit_mfma_reduction_helper_partition_warp_count(target, version, instr_k, partition_warps, capfd):
+    backend = triton.compiler.compiler.make_backend(target)
+    options = backend.parse_options({"num_warps": 8})
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    source = ASTSource(
+        fn=_explicit_mfma_batch_reduce_ws_kernel,
+        signature={"Input": "*fp32", "Output": "*fp32"},
+        constexprs={"VERSION": version, "INSTR_K": instr_k, "PARTITION_WARPS": partition_warps},
+    )
+    module = source.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                            context)
+    assert module.verify()
+    if partition_warps == 2:
+        with pytest.raises(RuntimeError):
+            _lower_explicit_mfma_reduction_layouts(module, backend, options)
+        assert "Layout has 4 warps per CTA, but the context requires 2 warps per CTA" in capfd.readouterr().err
+        return
+    _lower_explicit_mfma_reduction_layouts(module, backend, options)
+    assert module.verify()
+    module_text = str(module)
+    assert "tt.call" not in module_text
+    assert "tt.reduce" in module_text
+    assert "num_warps(4)" in module_text
+    assert "#tlx.no_verify_layout" not in module_text
 
 
 @triton.jit

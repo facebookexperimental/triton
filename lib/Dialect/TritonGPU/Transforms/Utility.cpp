@@ -197,7 +197,8 @@ static bool hasDotOperandLayoutUser(Operation *op) {
     for (Value result : user->getResults()) {
       auto resultType = dyn_cast<RankedTensorType>(result.getType());
       if (resultType &&
-          isa<ttg::DotOperandEncodingAttr>(resultType.getEncoding()))
+          isa<ttg::DotOperandEncodingAttr>(
+              unwrapTlxWrappers(resultType.getEncoding())))
         return true;
     }
   }

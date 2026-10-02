@@ -1090,8 +1090,8 @@ LogicalResult MfmaCommitOp::verify() {
       return emitOpError() << "input " << index << " must be rank two or three";
 
     if (tensorTy.getElementType().isF32()) {
-      auto mfma =
-          dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+      auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+          unwrapTlxWrappers(tensorTy.getEncoding()));
       if (!mfma || mfma.getRank() != tensorTy.getRank() ||
           !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
           !mfma.hasUnitTilesPerWarp())
@@ -1124,8 +1124,8 @@ LogicalResult MfmaCommitOp::verify() {
 
     if (tensorTy.getElementType().isBF16() ||
         tensorTy.getElementType().isF16()) {
-      auto dot =
-          dyn_cast_or_null<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
+      auto dot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+          unwrapTlxWrappers(tensorTy.getEncoding()));
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
                       : ttg::AMDMfmaEncodingAttr();
       if (!dot || !mfma || mfma.getRank() != tensorTy.getRank() ||
@@ -1224,7 +1224,8 @@ LogicalResult ScheduledMfmaOp::verify() {
     return emitOpError(
         "operand and accumulator matrix shapes are inconsistent");
 
-  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
+  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+      unwrapTlxWrappers(accTy.getEncoding()));
   if (!mfma || mfma.getRank() != rank ||
       !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
       !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
@@ -1238,8 +1239,10 @@ LogicalResult ScheduledMfmaOp::verify() {
     return failure();
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
 
-  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
-  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(aTy.getEncoding()));
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(bTy.getEncoding()));
   if (!aDot || aDot.getOpIdx() != 0 ||
       !llvm::is_contained({4u, 8u}, aDot.getKWidth()) ||
       aDot.getParent() != mfma)
