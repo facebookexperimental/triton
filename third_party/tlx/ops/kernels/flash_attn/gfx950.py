@@ -3614,10 +3614,8 @@ def _alert_nondeterministic_backward():
             stacklevel=2,
         )
         return
-    raise RuntimeError(
-        f"{caller} does not have a deterministic implementation, but "
-        "'torch.use_deterministic_algorithms(True)' is enabled"
-    )
+    raise RuntimeError(f"{caller} does not have a deterministic implementation, but "
+                       "'torch.use_deterministic_algorithms(True)' is enabled")
 
 
 class _attention(torch.autograd.Function):
@@ -3635,14 +3633,14 @@ class _attention(torch.autograd.Function):
         q, k, v, o, lse = ctx.saved_tensors
         do = do.contiguous()
         if torch.are_deterministic_algorithms_enabled() and not gfx950_bwd.fa_backward_is_deterministic(
-            q,
-            k,
-            v,
-            o,
-            do,
-            lse,
-            ctx.sm_scale,
-            ctx.causal,
+                q,
+                k,
+                v,
+                o,
+                do,
+                lse,
+                ctx.sm_scale,
+                ctx.causal,
         ):
             _alert_nondeterministic_backward()
         dq, dk, dv = gfx950_bwd.fa_backward(

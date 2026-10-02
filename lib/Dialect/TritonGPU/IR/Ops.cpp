@@ -1130,6 +1130,26 @@ LogicalResult LocalScatterOp::verify() {
 }
 
 // LocalAtomicScatterRMWOp
+bool LocalAtomicScatterRMWOp::isCommutative() {
+  if (!getResult().use_empty() ||
+      !getDst().getType().getElementType().isInteger())
+    return false;
+
+  switch (getAtomicRmwOp()) {
+  case RMWOp::ADD:
+  case RMWOp::AND:
+  case RMWOp::OR:
+  case RMWOp::XOR:
+  case RMWOp::MAX:
+  case RMWOp::MIN:
+  case RMWOp::UMAX:
+  case RMWOp::UMIN:
+    return true;
+  default:
+    return false;
+  }
+}
+
 LogicalResult LocalAtomicScatterRMWOp::verify() {
   auto dstTy = getDst().getType();
   auto valuesTy = cast<RankedTensorType>(getValues().getType());
@@ -1898,12 +1918,10 @@ LogicalResult WarpPredicateOp::verify() {
       return emitOpError("region reduction axis must be warp-local");
     if (crossLaneOp)
       return emitOpError("cross-lane operation ")
-             << crossLaneOp->getName()
-             << " requires a wave-uniform predicate";
+             << crossLaneOp->getName() << " requires a wave-uniform predicate";
     return emitOpError("region may not contain nested operation ")
            << unsupportedRegion->getName();
   }
-
 
   WalkResult barrier = getRegion().walk([&](Operation *nested) {
     if (nested != getOperation() && isa<WarpPredicateOp>(nested))
