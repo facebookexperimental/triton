@@ -3545,15 +3545,13 @@ def test_amd_scheduled_mfma_opaque_consumer_completion(target, version, instr_k,
         return
     opaque_consumer = llir.index('asm sideeffect "v_add_f32')
     if consumer in ("layout", "reshape"):
-        # Releasing the layout introduces a real LDS transfer. Its native
-        # store consumes D, so the later asm reads the load, not a pending MFMA.
+        # The alias analysis conservatively follows LDS reloads too, even if
+        # this particular layout transfer survives LLVM optimization.
         after_mfma = ttgir[ttgir.index("amdg.scheduled_mfma"):]
         assert "ttg.convert_layout" in after_mfma[:after_mfma.index("tt.elementwise_inline_asm")]
         native_transfer = llir[mfma.end():opaque_consumer]
         assert re.search(r'store <\d+ x float>.*ptr addrspace\(3\)', native_transfer)
         assert re.search(r'load <\d+ x float>, ptr addrspace\(3\)', native_transfer)
-        assert not waits
-        return
 
     assert waits
     for wait in waits:
@@ -3564,6 +3562,95 @@ def test_amd_scheduled_mfma_opaque_consumer_completion(target, version, instr_k,
         assert "0" in wait.group(2).split(",")
     if consumer == "direct":
         assert mfma.start() < waits[0].start() < opaque_consumer
+
+
+def _amd_scheduled_mfma_memory_forward_ir(target, version, instr_k, k_width, memory, consumer):
+    if memory == "global":
+        pointer_ir = """%scratch_ptr = builtin.unrealized_conversion_cast %scratch : !tt.ptr<f32> to !llvm.ptr<1>
+    %slot = llvm.getelementptr %scratch_ptr[%lane] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32"""
+        pointer_type = "!llvm.ptr<1>"
+    else:
+        pointer_ir = "%slot = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>"
+        pointer_type = "!llvm.ptr<5>"
+        if memory == "private_cast":
+            pointer_ir = """%allocation = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>
+    %slot = llvm.addrspacecast %allocation : !llvm.ptr<5> to !llvm.ptr"""
+            pointer_type = "!llvm.ptr"
+    overwrite = "llvm.store %zero_f32, %slot : f32, !llvm.ptr<1>" if memory == "global" else ""
+    commit = "%committed = amdg.mfma_commit %result : tensor<16x16xf32, #mma>" if consumer == "commit" else ""
+    result = "%committed" if consumer == "commit" else "%result"
+    read = "%read = llvm.fadd %reloaded, %one_f32 : f32" if consumer == "native" else (
+        '%read = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32')
+    return f"""
+#mma = #ttg.amd_mfma<{{version = {version}, warpsPerCTA = [1, 1], instrShape = [16, 16, {instr_k}], isTransposed = false}}>
+#lhs = #ttg.dot_op<{{opIdx = 0, parent = #mma, kWidth = {k_width}}}>
+#rhs = #ttg.dot_op<{{opIdx = 1, parent = #mma, kWidth = {k_width}}}>
+module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:{target.arch}", "ttg.threads-per-warp" = 64 : i32}} {{
+  tt.func public @memory_forward(%out: !tt.ptr<f32>, %scratch: !tt.ptr<f32>) {{
+    %a = arith.constant dense<1.0> : tensor<16x{instr_k}xbf16, #lhs>
+    %b = arith.constant dense<1.0> : tensor<{instr_k}x16xbf16, #rhs>
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent" register_class "vgpr" initialize true
+        : tensor<16x{instr_k}xbf16, #lhs>, tensor<{instr_k}x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    {commit}
+    %pack = builtin.unrealized_conversion_cast {result} : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %count = llvm.mlir.constant(1 : i32) : i32
+    %zero_f32 = llvm.mlir.constant(0.0 : f32) : f32
+    %one_f32 = llvm.mlir.constant(1.0 : f32) : f32
+    %lane = rocdl.workitem.id.x : i32
+    {pointer_ir}
+    llvm.store %x, %slot : f32, {pointer_type}
+    %reloaded = llvm.load %slot : {pointer_type} -> f32
+    {overwrite}
+    {read}
+    %ptr = builtin.unrealized_conversion_cast %out : !tt.ptr<f32> to !llvm.ptr<1>
+    %dst = llvm.getelementptr %ptr[%lane] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+    llvm.store %read, %dst : f32, !llvm.ptr<1>
+    tt.return
+  }}
+}}
+"""
+
+
+@pytest.mark.parametrize("target,version,instr_k,k_width,expected_wait", [(GFX942, 3, 16, 4, "s_nop 10"),
+                                                                          (GFX950, 4, 32, 8, "s_nop 11")],
+                         ids=["gfx942", "gfx950"])
+@pytest.mark.parametrize("memory,consumer", [("private", "opaque"), ("private_cast", "opaque"), ("global", "opaque"),
+                                             ("private", "native"), ("private", "commit")])
+def test_amd_scheduled_mfma_memory_forward_completion(tmp_path, target, version, instr_k, k_width, expected_wait,
+                                                      memory, consumer):
+    source = tmp_path / "memory_forward.ttgir"
+    source.write_text(_amd_scheduled_mfma_memory_forward_ir(target, version, instr_k, k_width, memory, consumer))
+    compiled = triton_compile(str(source), target=target, options={"num_warps": 1})
+    llir = compiled.asm["llir"]
+    # LLVM O3 must remove the store/load forwarding edge that hid the opaque
+    # consumer during Triton lowering. A retained reload would miss the bug.
+    assert not re.search(r"\balloca\b|\bload float\b", llir)
+    stores = re.findall(r"^\s*store float [^\n]+", llir, re.MULTILINE)
+    assert len(stores) == (2 if memory == "global" else 1)
+    if memory == "global":
+        assert any("store float 0.000000e+00" in store for store in stores)
+    mfma = re.search(r"call <4 x float> @llvm\.amdgcn\.mfma\.f32\.16x16x" + str(instr_k), llir)
+    assert mfma is not None
+    assert not re.search(r'asm sideeffect "[^"\n]*v_mfma_', llir)
+    waits = list(re.finditer(r'asm sideeffect "([^"\n]*s_nop[^"\n]*)", "([^"\n]*)"', llir))
+    if consumer == "native":
+        assert "fadd float" in llir
+        assert not waits
+        return
+    assert len(waits) == 1
+    wait = waits[0]
+    assert wait.group(1) == expected_wait
+    assert mfma.start() < wait.start() < llir.index('asm sideeffect "v_add_f32')
+    if consumer == "commit":
+        # A full explicit commit supplies the wait; the producer pin stays empty.
+        assert wait.group(2) == "=a,0,~{memory}"
+        assert 'asm sideeffect "", "=v,0"' in llir
+    else:
+        assert wait.group(2) == "=v,0"
 
 
 def test_amd_scheduled_mfma_persistent_acc_native_commit_gfx950():

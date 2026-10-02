@@ -3,11 +3,14 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -16,8 +19,8 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/AMDGPUAddrSpace.h"
 #include <type_traits>
-
 
 using mlir::triton::amdgpu::ISAFamily;
 using ::mlir::triton::gpu::MemDescType;
@@ -811,13 +814,102 @@ static std::string mfmaWaitStateAsm(int waitStates) {
   return "s_nop 15\ns_nop " + std::to_string(waitStates - 16 - 1);
 }
 
+// LLVM can forward a stored MFMA destination into a later load, including by
+// promoting private allocations. Preserve that dependency in the consumer
+// analysis even though the lowered IR has no SSA edge between store and load.
+class MfmaMemoryForwarding {
+public:
+  explicit MfmaMemoryForwarding(LLVM::LLVMFuncOp function)
+      : function(function), aliases(function) {
+    function.walk([&](Operation *op) {
+      if (!isa_and_nonnull<LLVM::LLVMDialect>(op->getDialect()) ||
+          op->getNumRegions() || isa<LLVM::InlineAsmOp>(op))
+        return;
+      // Inline assembly's hidden memory accesses cannot be promoted into SSA;
+      // its explicit register operands are handled by the normal value walk.
+      // Missing effect interfaces (e.g. masked loads) remain conservative.
+      auto effects = dyn_cast<MemoryEffectOpInterface>(op);
+      if (!effects || effects.hasEffect<MemoryEffects::Read>())
+        readers.push_back(op);
+    });
+  }
+
+  // Returns true for a memory escape that needs completion, otherwise appends
+  // possible reloads. Cache edges once per store, shared by all result pins.
+  bool appendReloads(LLVM::StoreOp store, SmallVectorImpl<Value> &worklist) {
+    auto [it, inserted] = forwarding.try_emplace(store);
+    auto &uses = it->second;
+    if (inserted) {
+      // Kernels are unreferenced external definitions. Callable helpers can
+      // expose stored values to an inlined caller outside this local walk.
+      uses.escapes =
+          function.getLinkage() != LLVM::Linkage::External ||
+          !SymbolTable::symbolKnownUseEmpty(function, function->getParentOp());
+      for (Operation *reader : readers) {
+        if (!mayExecuteAfter(reader, store))
+          continue;
+        if (auto load = dyn_cast<LLVM::LoadOp>(reader)) {
+          if (!disjointAddressSpaces(store.getAddr(), load.getAddr()) &&
+              !aliases.alias(store.getAddr(), load.getAddr()).isNo())
+            uses.loads.push_back(load.getResult());
+        } else if (aliases.getModRef(reader, store.getAddr()).isRef()) {
+          // Calls, copies, and unmodeled reads can expose the stored bytes
+          // after inlining or memory optimization. Do not lose that path.
+          uses.escapes = true;
+        }
+      }
+    }
+    llvm::append_range(worklist, uses.loads);
+    return uses.escapes;
+  }
+
+private:
+  bool mayExecuteAfter(Operation *reader, Operation *store) {
+    // Flat CFG reachability does not model region exits or enclosing loops.
+    if (reader->getParentRegion() != &function.getBody() ||
+        store->getParentRegion() != &function.getBody())
+      return true;
+    Block *from = store->getBlock();
+    Block *to = reader->getBlock();
+    // isReachable starts at successors, so reaching the same block requires
+    // a real backedge. Acyclic epilogue stores cannot feed earlier loads.
+    return (from == to && store->isBeforeInBlock(reader)) ||
+           from->isReachable(to);
+  }
+
+  static bool disjointAddressSpaces(Value lhs, Value rhs) {
+    unsigned a = cast<LLVM::LLVMPointerType>(lhs.getType()).getAddressSpace();
+    unsigned b = cast<LLVM::LLVMPointerType>(rhs.getType()).getAddressSpace();
+    // Only global, shared, and private are pairwise disjoint. Flat, constant,
+    // and buffer/resource spaces must not be excluded by their number alone.
+    auto isDistinctSpace = [](unsigned space) {
+      return llvm::is_contained({llvm::AMDGPUAS::GLOBAL_ADDRESS,
+                                 llvm::AMDGPUAS::LOCAL_ADDRESS,
+                                 llvm::AMDGPUAS::PRIVATE_ADDRESS},
+                                space);
+    };
+    return a != b && isDistinctSpace(a) && isDistinctSpace(b);
+  }
+
+  struct ForwardedUses {
+    SmallVector<Value> loads;
+    bool escapes = false;
+  };
+  LLVM::LLVMFuncOp function;
+  AliasAnalysis aliases;
+  SmallVector<Operation *> readers;
+  DenseMap<Operation *, ForwardedUses> forwarding;
+};
+
 // Native consumers are visible to LLVM's hazard recognizer, but an instruction
 // in inline asm is not. Follow result identities through the lowered IR because
 // LLVM can fold even arithmetic (for example, adding zero) back to the MFMA
 // destination. A later MFMA starts a new chain with its own result pin.
-static bool
-needsOpaqueConsumerDrain(Operation *pin, int requiredWait,
-                         const DenseMap<Operation *, int> &commitWaitStates) {
+static bool needsOpaqueConsumerDrain(
+    Operation *pin, int requiredWait,
+    const DenseMap<Operation *, int> &commitWaitStates,
+    DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>>
+        &memoryForwarding) {
   SmallVector<Value> worklist(pin->getResults());
   llvm::SmallDenseSet<Value, 16> visited;
   auto appendRegionSuccessors = [&](RegionBranchOpInterface branch,
@@ -857,6 +949,20 @@ needsOpaqueConsumerDrain(Operation *pin, int requiredWait,
       if (isa<LLVM::CallOp, LLVM::CallIntrinsicOp, LLVM::InvokeOp,
               LLVM::ReturnOp>(consumer))
         return true;
+
+      if (auto store = dyn_cast<LLVM::StoreOp>(consumer)) {
+        if (use.getOperandNumber() != 0)
+          continue;
+        auto function = store->getParentOfType<LLVM::LLVMFuncOp>();
+        if (!function)
+          return true;
+        auto &memory = memoryForwarding[function];
+        if (!memory)
+          memory = std::make_unique<MfmaMemoryForwarding>(function);
+        if (memory->appendReloads(store, worklist))
+          return true;
+        continue;
+      }
 
       if (auto branch = dyn_cast<BranchOpInterface>(consumer)) {
         for (unsigned i = 0; i < consumer->getNumSuccessors(); ++i) {
@@ -904,12 +1010,18 @@ needsOpaqueConsumerDrain(Operation *pin, int requiredWait,
       }
 
       // Aggregates, vector operations, casts, selects, and native arithmetic
-      // can all preserve the destination through LLVM optimization. Native
-      // stores have no results and naturally terminate the traversal.
+      // can all preserve the destination through LLVM optimization.
       if (consumer->getNumRegions() == 0 &&
           (isa_and_nonnull<LLVM::LLVMDialect, ROCDL::ROCDLDialect>(
                consumer->getDialect()) ||
            isa<UnrealizedConversionCastOp>(consumer))) {
+        if (isa_and_nonnull<LLVM::LLVMDialect>(consumer->getDialect())) {
+          auto effects = dyn_cast<MemoryEffectOpInterface>(consumer);
+          // Masked/scattered stores and other unmodeled writers cannot be
+          // treated as dead ends just because they have no SSA results.
+          if (!effects || effects.hasEffect<MemoryEffects::Write>())
+            return true;
+        }
         llvm::append_range(worklist, consumer->getResults());
         continue;
       }
@@ -1783,8 +1895,10 @@ private:
 void mlir::triton::AMD::finalizeScheduledMfmaLowering(
     const ScheduledMfmaLoweringState &state) {
   SmallVector<std::pair<Operation *, int>> needsDrain;
+  DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>> memoryForwarding;
   for (auto [pin, requiredWait] : state.resultPins)
-    if (needsOpaqueConsumerDrain(pin, requiredWait, state.commitWaitStates))
+    if (needsOpaqueConsumerDrain(pin, requiredWait, state.commitWaitStates,
+                                 memoryForwarding))
       needsDrain.emplace_back(pin, requiredWait);
 
   // Analyze every root before changing any asm: otherwise an upgraded pin

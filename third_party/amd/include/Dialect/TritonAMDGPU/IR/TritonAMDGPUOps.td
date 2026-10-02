@@ -919,9 +919,10 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     `initialize` is false. These side-effecting accumulator pins constrain
     compiler-side ordering. For native-only consumer chains, the pins are empty
     and provide no hardware wait. If a persistent result reaches opaque inline
-    assembly or an unmodeled escape without a sufficient explicit `mfma_commit`,
-    affected result pins include a target-specific completion wait. Neither
-    form is a memory fence.
+    assembly or an unmodeled escape, including through potentially aliasing
+    memory reloads, without a sufficient explicit `mfma_commit`, affected result
+    pins include a target-specific completion wait. Neither form is a memory
+    fence.
 
     All active lanes of a wave must execute this operation uniformly. This
     source contract covers the native arithmetic and register-pinning boundaries.

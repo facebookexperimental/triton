@@ -14,6 +14,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 import traceback
 from triton._internal_testing import is_hip_cdna4
+from triton.backends.compiler import GPUTarget
 from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _cluster_causal_query_tile as _amd_fa_cluster_causal_query_tile,
     _cluster_direct_workgroup_window as _amd_fa_cluster_direct_workgroup_window,
@@ -1803,6 +1804,58 @@ def test_amd_scheduled_mfma_opaque_consumer_correct_gfx950(consumer, iterations)
         elif consumer == "loop":
             expected *= iterations
         torch.testing.assert_close(actual, expected + 1.0, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("pointer_cast", [False, True], ids=["private", "private_to_generic"])
+@pytest.mark.parametrize("commit", [False, True], ids=["no_commit", "full_commit"])
+def test_amd_scheduled_mfma_private_forward_correct_gfx950(tmp_path, pointer_cast, commit):
+    pointer = "%slot = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>"
+    pointer_type = "!llvm.ptr<5>"
+    if pointer_cast:
+        pointer = """%allocation = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>
+    %slot = llvm.addrspacecast %allocation : !llvm.ptr<5> to !llvm.ptr"""
+        pointer_type = "!llvm.ptr"
+    boundary = "%committed = amdg.mfma_commit %result : tensor<16x16xf32, #mma>" if commit else ""
+    result = "%committed" if commit else "%result"
+    source = tmp_path / "private_forward.ttgir"
+    source.write_text(f"""
+#mma = #ttg.amd_mfma<{{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = false}}>
+#lhs = #ttg.dot_op<{{opIdx = 0, parent = #mma, kWidth = 8}}>
+#rhs = #ttg.dot_op<{{opIdx = 1, parent = #mma, kWidth = 8}}>
+module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32}} {{
+  tt.func public @private_forward(%out: !tt.ptr<f32>) {{
+    %a = arith.constant dense<1.0> : tensor<16x32xbf16, #lhs>
+    %b = arith.constant dense<1.0> : tensor<32x16xbf16, #rhs>
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent" register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    {boundary}
+    %pack = builtin.unrealized_conversion_cast {result} : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %count = llvm.mlir.constant(1 : i32) : i32
+    {pointer}
+    llvm.store %x, %slot : f32, {pointer_type}
+    %reloaded = llvm.load %slot : {pointer_type} -> f32
+    %read = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    %ptr = builtin.unrealized_conversion_cast %out : !tt.ptr<f32> to !llvm.ptr<1>
+    %lane = rocdl.workitem.id.x : i32
+    %dst = llvm.getelementptr %ptr[%lane] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+    llvm.store %read, %dst : f32, !llvm.ptr<1>
+    tt.return
+  }}
+}}
+""")
+    compiled = triton.compile(str(source), target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 1})
+    # Each lane reads one element of an all-ones 16x32 @ 32x16 product,
+    # then adds one in opaque asm after LLVM forwards the private store/load.
+    expected = torch.full((64, ), 33.0, device="cuda", dtype=torch.float32)
+    for _ in range(3):
+        actual = torch.full((64, ), float("nan"), device="cuda", dtype=torch.float32)
+        compiled[(1, 1, 1)](actual)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

@@ -281,6 +281,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 
+  // Promoting a private store/load must not hide the opaque destination read.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_reload
+  // CHECK: rocdl.mfma.f32.16x16x16bf16.1k
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "s_nop 10", "=v,0"
+  // CHECK: llvm.store
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_reload(
+      %a: tensor<16x16xbf16, #lhs>, %b: tensor<16x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x16xbf16, #lhs>, tensor<16x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %result : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.store %x, %slot : f32, !llvm.ptr<5>
+    %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    tt.return
+  }
+
 }
 
 // -----

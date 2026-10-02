@@ -167,9 +167,9 @@ def amd_scheduled_mfma(
     is false. These side-effecting accumulator pins constrain compiler-side
     ordering. For native-only consumer chains, the pins are empty and provide
     no hardware wait. If a persistent result reaches opaque inline assembly or
-    an unmodeled escape without a sufficient explicit commit, affected result
-    pins include a target-specific completion wait. Neither form is a memory
-    fence.
+    an unmodeled escape, including through potentially aliasing memory reloads,
+    without a sufficient explicit commit, affected result pins include a
+    target-specific completion wait. Neither form is a memory fence.
 
     The transient path does not apply these class constraints and leaves
     physical placement to LLVM; use :func:`amd_register_resident` for a hard

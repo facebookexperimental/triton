@@ -331,6 +331,184 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 
+  // A private store/load can disappear during LLVM memory promotion.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_reload
+  // CHECK: rocdl.mfma.f32.16x16x32.bf16
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "s_nop 11", "=v,0"
+  // CHECK: llvm.store
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_reload(
+      %a: tensor<16x32xbf16, #lhs>, %b: tensor<32x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %result : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.store %x, %slot : f32, !llvm.ptr<5>
+    %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    tt.return
+  }
+
+  // A copy reads the stored bytes even though the final load uses another slot.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_memcpy
+  // CHECK: rocdl.mfma.f32.16x16x32.bf16
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "s_nop 11", "=v,0"
+  // CHECK: llvm.store
+  // CHECK: llvm.intr.memcpy
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_memcpy(
+      %a: tensor<16x32xbf16, #lhs>, %b: tensor<32x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %result : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %bytes = llvm.mlir.constant(4 : i64) : i64
+    %src = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    %dst = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.store %x, %src : f32, !llvm.ptr<5>
+    "llvm.intr.memcpy"(%dst, %src, %bytes) {isVolatile = false} : (!llvm.ptr<5>, !llvm.ptr<5>, i64) -> ()
+    %reloaded = llvm.load %dst : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    tt.return
+  }
+
+  // An unmodeled writer must not terminate the destination's use chain.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_masked_store
+  // CHECK: rocdl.mfma.f32.16x16x32.bf16
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "s_nop 11", "=v,0"
+  // CHECK: llvm.intr.masked.store
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_masked_store(
+      %a: tensor<16x32xbf16, #lhs>, %b: tensor<32x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %result : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %index = llvm.mlir.constant(0 : i32) : i32
+    %mask = llvm.mlir.constant(dense<true> : vector<1xi1>) : vector<1xi1>
+    %undef = llvm.mlir.undef : vector<1xf32>
+    %vector = llvm.insertelement %x, %undef[%index : i32] : vector<1xf32>
+    %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.intr.masked.store %vector, %slot, %mask {alignment = 4 : i32} : vector<1xf32>, vector<1xi1> into !llvm.ptr<5>
+    %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    tt.return
+  }
+
+  // The load precedes the store in this block, but can read it next iteration.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_backedge
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: rocdl.mfma.f32.16x16x32.bf16
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "s_nop 11", "=v,0"
+  // CHECK: llvm.store
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_backedge(
+      %a: tensor<16x32xbf16, #lhs>, %b: tensor<32x16xbf16, #rhs>, %condition: i1) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %initial = llvm.mlir.constant(0.0 : f32) : f32
+    %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.store %initial, %slot : f32, !llvm.ptr<5>
+    cf.br ^loop
+  ^loop:
+    %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %result : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    llvm.store %x, %slot : f32, !llvm.ptr<5>
+    cf.cond_br %condition, ^loop, ^exit
+  ^exit:
+    tt.return
+  }
+
+  // Without a backedge, an earlier load cannot expose a later stored result.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_earlier_load
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: rocdl.mfma.f32.16x16x32.bf16
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "", "=v,0"
+  // CHECK-NOT: "s_nop
+  // CHECK: llvm.store
+  // CHECK-NOT: "s_nop
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_earlier_load(
+      %a: tensor<16x32xbf16, #lhs>, %b: tensor<32x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %initial = llvm.mlir.constant(0.0 : f32) : f32
+    %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.store %initial, %slot : f32, !llvm.ptr<5>
+    %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %result : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    llvm.store %x, %slot : f32, !llvm.ptr<5>
+    tt.return
+  }
+
+  // A full commit already completes the result before memory forwarding.
+  // CHECK-LABEL: llvm.func @opaque_consumer_private_committed
+  // CHECK: rocdl.mfma.f32.16x16x32.bf16
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "", "=v,0"
+  // CHECK: llvm.inline_asm has_side_effects {{.*}} "s_nop 11", "=a,0,~{memory}"
+  // CHECK-NOT: "s_nop
+  // CHECK: llvm.store
+  // CHECK: llvm.load
+  // CHECK: llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0"
+  // CHECK: llvm.return
+  tt.func public @opaque_consumer_private_committed(
+      %a: tensor<16x32xbf16, #lhs>, %b: tensor<32x16xbf16, #rhs>) {
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %ready = amdg.mfma_commit %result : tensor<16x16xf32, #mma>
+    %pack = builtin.unrealized_conversion_cast %ready : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
+    llvm.store %x, %slot : f32, !llvm.ptr<5>
+    %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
+    %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    tt.return
+  }
+
 }
 
 // -----
