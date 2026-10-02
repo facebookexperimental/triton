@@ -480,6 +480,11 @@ class HIPBackend(BaseBackend):
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        # Consume explicit tlx.warp_pipeline_stage(scope="intra_wave")
+        # regions. This pass is
+        # inert for kernels without those markers and deliberately does not
+        # reuse the inter-wave cond_barrier lowering above.
+        amd.passes.ttgpuir.add_intra_wave_pipeline(pm)
         if options.enable_sched_group_barrier_scheduler:
             amd.passes.ttgpuir.add_sched_group_barrier_scheduler(
                 pm,
