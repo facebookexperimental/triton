@@ -37,6 +37,14 @@
     the barrier phase: `num_waiting_threads + num_arriving_threads`. Wait and
     Arrive calls for the same barrier phase must use the same value.
 
+    The backend lowers these to PTX `bar.sync`/`bar.arrive` (the `.aligned`
+    forms) whenever the barrier provably executes warp-uniformly -- i.e. all
+    threads in a warp execute the same barrier instruction -- and to the
+    non-aligned `barrier.sync`/`barrier.arrive` otherwise. Warp-level
+    divergence (warp specialization, branches on warp IDs) is compatible with
+    `.aligned`; divergence on thread IDs or on data that can vary by thread
+    within a warp is not.
+
 - `tlx.barrier_expect_bytes(bar, bytes)` **[sm90+]**
 
   Signal a barrier of an expected number of bytes to be copied.
