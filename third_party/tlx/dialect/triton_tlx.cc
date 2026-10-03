@@ -53,8 +53,8 @@ createPinnedRegisterLayoutBoundary(TritonOpBuilder &builder, Value src,
 }
 
 // Producers that already have a concrete register encoding can materialize the
-// durable TTG boundary immediately. Keeping their result wrapper-free avoids
-// hiding physical encodings from strict consumers such as scheduled MFMA.
+// durable TTG boundary immediately. Verification stays deferred through helper
+// inlining until the TLX placeholder resolver removes the layout wrapper.
 static ttg::RequireLayoutOp
 createPinnedProducerLayoutBoundary(TritonOpBuilder &builder, Value src,
                                    Attribute encoding) {

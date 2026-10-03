@@ -1,4 +1,6 @@
 // RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory -test-tritonamdgpu-membar | FileCheck %s
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --test-tritonamdgpu-membar | FileCheck %s --check-prefix=SCF
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --test-tritonamdgpu-membar --test-tritonamdgpu-membar | FileCheck %s --check-prefix=SCF
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
@@ -383,4 +385,76 @@ tt.func @lone_sched_fence_still_needs_barrier(%A: !tt.ptr<f16>) {
   tt.return
 }
 
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[0, 32], [32, 0]], block = []}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [16, 0], [0, 64]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]], warp = [[0, 32], [32, 0]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // Differently sized live buffers put the identical conversions at overlapping
+  // but unequal scratch intervals. Do not infer physical wave ownership from
+  // logical tensor types when the scratch bases differ.
+  // CHECK-LABEL: @warp_local_scratch_reuse_reject_different_interval
+  // CHECK: ttg.local_alloc{{.*}}allocation.offset = 0
+  // CHECK: ttg.convert_layout{{.*}}allocation.offset = 24576
+  // CHECK: ttg.local_dealloc
+  // CHECK: ttg.local_alloc{{.*}}allocation.offset = 0
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: {{.*}}ttg.convert_layout{{.*}}allocation.offset = 16384
+  // CHECK: tt.return
+  tt.func @warp_local_scratch_reuse_reject_different_interval(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>) {
+    %large = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable>
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    ttg.local_dealloc %large : !ttg.memdesc<3x64x64xbf16, #shared, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xbf16, #shared, #smem, mutable>
+    %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #dst>
+    ttg.local_dealloc %small : !ttg.memdesc<2x64x64xbf16, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // In structured IR the false path retains the same-block x -> z dependency,
+  // which qualifies for a wave fence. The true path contributes y -> z from a
+  // different block, which needs a CTA barrier. The CTA barrier must win over
+  // the qualifying dependency, including when the analysis is run again.
+  // CHECK-LABEL: @warp_local_scratch_reuse_mixed_control_flow
+  // CHECK-NOT: llvm.amdgcn.wave.barrier
+  // CHECK: ttg.convert_layout{{.*}}allocation.offset = 0
+  // CHECK-NOT: llvm.amdgcn.wave.barrier
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: {{.*}}ttg.convert_layout{{.*}}allocation.offset = 0
+  // CHECK-NOT: llvm.amdgcn.wave.barrier
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: {{.*}}ttg.convert_layout{{.*}}allocation.offset = 0
+  // CHECK-NOT: llvm.amdgcn.wave.barrier
+  // CHECK: tt.return
+  // SCF-LABEL: @warp_local_scratch_reuse_mixed_control_flow
+  // SCF-NOT: llvm.amdgcn.wave.barrier
+  // SCF-NOT: ttg.barrier local
+  // SCF: ttg.convert_layout{{.*}}allocation.offset = 0
+  // SCF-NEXT: tt.store
+  // SCF-NEXT: scf.if
+  // SCF-NEXT: ttg.barrier local
+  // SCF-NEXT: {{.*}}ttg.convert_layout{{.*}}allocation.offset = 0
+  // SCF-NEXT: tt.store
+  // SCF-NEXT: }
+  // SCF-NEXT: ttg.barrier local
+  // SCF-NEXT: {{.*}}ttg.convert_layout{{.*}}allocation.offset = 0
+  // SCF-NEXT: tt.store
+  // SCF-NEXT: tt.return
+  tt.func @warp_local_scratch_reuse_mixed_control_flow(%a: tensor<64x128xbf16, #src>, %b: tensor<64x128xbf16, #src>, %c: tensor<64x128xbf16, #src>, %out: tensor<64x128x!tt.ptr<bf16>, #dst>, %cond: i1) {
+    %x = ttg.convert_layout %a : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %x : tensor<64x128x!tt.ptr<bf16>, #dst>
+    scf.if %cond {
+      %y = ttg.convert_layout %b : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+      tt.store %out, %y : tensor<64x128x!tt.ptr<bf16>, #dst>
+    }
+    %z = ttg.convert_layout %c : tensor<64x128xbf16, #src> -> tensor<64x128xbf16, #dst>
+    tt.store %out, %z : tensor<64x128x!tt.ptr<bf16>, #dst>
+    tt.return
+  }
 }
