@@ -131,6 +131,49 @@ def amd_register_class_anchor(
 
 
 @tl.builtin
+def amd_dot(
+    a,
+    b,
+    acc,
+    cd_regclass: tl.constexpr = None,
+    _semantic=None,
+):
+    """``tl.dot`` with an optional register-class pin on the MFMA accumulator.
+
+    Computes ``acc + a @ b`` exactly like ``tl.dot(a, b, acc)``. The product is
+    still one logical matrix multiplication that the AMD backend lowers to
+    LLVM-visible MFMA intrinsics, so LLVM and LLVM-IR passes can schedule it.
+
+    ``cd_regclass`` selects the register file of every MFMA tile's accumulator
+    input (C) and result (D): ``"a"`` keeps them in AGPRs, ``"v"`` keeps them
+    in VGPRs. ``None`` (default) leaves the choice to LLVM and is identical to
+    ``tl.dot``. The request is recorded on the dot as ``amdg.cd_regclass``; the
+    MFMA lowering then wraps each tile's accumulator in an empty inline asm
+    with a tied ``"=a,0"`` / ``"=v,0"`` constraint, right before the tile's
+    first MFMA and right after its last. No instruction is emitted. This is
+    the mechanism of Gluon's ``gl.amd.cdna3.mfma(..., cd_regclass=...)``.
+
+    The pins sit next to their own MFMAs, tile by tile. That placement is what
+    lets LLVM drop the AGPR/VGPR copies around a large accumulator: anchoring
+    the whole accumulator tensor at one source point with
+    :func:`amd_register_class_anchor` does not, because all tiles then meet at
+    one program point.
+
+    ``a`` and ``b`` are the dot operands, ``acc`` the F32 accumulator.
+    ``cd_regclass`` is AMD-only and currently verified on gfx950.
+    """
+    cd_regclass = tl._unwrap_if_constexpr(cd_regclass)
+    assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), "a and b must be distributed tensors"
+    assert isinstance(acc, tl.tensor) and acc.type.is_block(), "acc must be a distributed tensor"
+    assert cd_regclass in (None, "a", "v"), f'cd_regclass must be None, "a", or "v", got {cd_regclass!r}'
+    result = _semantic.dot(a, b, acc, input_precision=None, max_num_imprecise_acc=None, out_dtype=acc.dtype)
+    if cd_regclass is not None:
+        assert _semantic.builder.options.backend_name == "hip", "cd_regclass is only supported on AMD targets"
+        result.handle.set_attr("amdg.cd_regclass", _semantic.builder.get_string_attr(cd_regclass))
+    return result
+
+
+@tl.builtin
 def amd_scheduled_mfma(
     a,
     b,
