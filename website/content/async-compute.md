@@ -176,6 +176,7 @@ the register allocator still chooses physical registers.
 
 | API | Verified targets | Purpose |
 |-----|------------------|---------|
+| `tlx.amd_dot` | gfx950 | `tl.dot` with an optional per-tile register-class pin on the MFMA accumulator. |
 | `tlx.amd_scheduled_mfma` | gfx942, gfx950 | Update explicitly ordered native MFMA accumulator chains. |
 | `tlx.amd_mfma_commit` | gfx942, gfx950 | Join one or more chains at an MFMA completion and liveness boundary. |
 | `tlx.amd_register_class_anchor` | gfx950 | Add a separate local register-class anchor for each native 32-bit value. |
@@ -186,6 +187,32 @@ fragment without cross-thread movement; `tlx.rematerialized_range`, which
 recreates inexpensive coordinates near a use; and `tlx.amd_sched_barrier`,
 which prevents selected AMD instruction classes from crossing a source
 boundary. None of these operations is a workgroup barrier or memory fence.
+
+### `tlx.amd_dot`
+
+```python
+acc = tlx.amd_dot(a, b, acc, cd_regclass="a")
+```
+
+Computes `acc + a @ b` exactly like `tl.dot(a, b, acc)`: one logical product
+that the backend lowers to LLVM-visible MFMA intrinsics. `cd_regclass` selects
+the register file of every MFMA tile's accumulator input (C) and result (D):
+`"a"` for AGPRs, `"v"` for VGPRs. `None` (default) leaves the choice to LLVM
+and is identical to `tl.dot`.
+
+The request is recorded on the dot as `amdg.cd_regclass`. The MFMA lowering
+wraps each tile's accumulator in an empty inline asm with a tied `"=a,0"` or
+`"=v,0"` constraint, right before the tile's first MFMA and right after its
+last; no instruction is emitted. This is the mechanism of Gluon's
+`gl.amd.cdna3.mfma(..., cd_regclass=...)`.
+
+Use it when a large accumulator is carried across a hot loop and LLVM would
+otherwise move it between the two register files around every MFMA. A 256x256
+FP32 accumulator on four waves needs 256 registers per lane, so it cannot
+stay in VGPRs alone; pinned to AGPRs, the loop needs no `v_accvgpr` copies.
+The pins have to sit next to their own MFMAs. Anchoring the whole accumulator
+tensor at one source point with `tlx.amd_register_class_anchor` makes all
+tiles meet at one program point and does not remove the copies.
 
 ### `tlx.amd_register_resident`
 

@@ -710,6 +710,55 @@ def compile_for_gfx942(fn, signature, constexprs):
 
 
 @triton.jit
+def _amd_dot_cd_regclass_kernel(a_ptr, b_ptr, c_ptr, CD_REGCLASS: tl.constexpr):
+    offs_m = tl.arange(0, 64)
+    offs_n = tl.arange(0, 64)
+    offs_k = tl.arange(0, 32)
+    a = tl.load(a_ptr + offs_m[:, None] * 32 + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * 64 + offs_n[None, :])
+    c_ptrs = c_ptr + offs_m[:, None] * 64 + offs_n[None, :]
+    # A loaded (non-constant) accumulator, so the input (C) is pinned as well as the result (D).
+    acc = tl.load(c_ptrs)
+    if CD_REGCLASS == "none":
+        acc = tlx.amd_dot(a, b, acc)
+    else:
+        acc = tlx.amd_dot(a, b, acc, cd_regclass=CD_REGCLASS)
+    tl.store(c_ptrs, acc)
+
+
+def _compile_amd_dot_cd_regclass(cd_regclass):
+    return compile_for_gfx950(
+        _amd_dot_cd_regclass_kernel,
+        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "c_ptr": "*fp32"},
+        constexprs={"CD_REGCLASS": cd_regclass},
+    )
+
+
+@pytest.mark.parametrize("cd_regclass", ["a", "v"])
+def test_amd_dot_cd_regclass_pins_mfma_accumulator_gfx950(cd_regclass):
+    """The request survives the MFMA rewrite and becomes tied register-class pins."""
+    compiled = _compile_amd_dot_cd_regclass(cd_regclass)
+    assert f'amdg.cd_regclass = "{cd_regclass}"' in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "llvm.amdgcn.mfma" in llir
+    assert f'asm "", "={cd_regclass},0"' in llir
+
+
+def test_amd_dot_without_cd_regclass_matches_tl_dot_gfx950():
+    """Without a request, amd_dot is a plain dot: no attribute and no pins."""
+    compiled = _compile_amd_dot_cd_regclass("none")
+    assert "amdg.cd_regclass" not in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "llvm.amdgcn.mfma" in llir
+    assert '"=a,0"' not in llir and '"=v,0"' not in llir
+
+
+def test_amd_dot_rejects_unknown_cd_regclass():
+    with pytest.raises(CompilationError, match="cd_regclass must be None"):
+        _compile_amd_dot_cd_regclass("agpr")
+
+
+@triton.jit
 def _warp_predicate_update(lhs, rhs, increment, side_ptr, offsets):
     tl.store(side_ptr + offsets, lhs)
     return lhs + increment, rhs - increment
