@@ -709,6 +709,164 @@ def compile_for_gfx942(fn, signature, constexprs):
 
 
 @triton.jit
+def _amd_dot_register_class_kernel(a_ptr, b_ptr, c_ptr, REGISTER_CLASS: tl.constexpr):
+    offs_m = tl.arange(0, 64)
+    offs_n = tl.arange(0, 64)
+    offs_k = tl.arange(0, 32)
+    a = tl.load(a_ptr + offs_m[:, None] * 32 + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * 64 + offs_n[None, :])
+    c_ptrs = c_ptr + offs_m[:, None] * 64 + offs_n[None, :]
+    # A loaded (non-constant) accumulator, so the input (C) is pinned as well as the result (D).
+    acc = tl.load(c_ptrs)
+    if REGISTER_CLASS == "none":
+        acc = tlx.amd_dot(a, b, acc)
+    else:
+        acc = tlx.amd_dot(a, b, acc, register_class=REGISTER_CLASS)
+    tl.store(c_ptrs, acc)
+
+
+def _compile_amd_dot_register_class(register_class):
+    return compile_for_gfx950(
+        _amd_dot_register_class_kernel,
+        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "c_ptr": "*fp32"},
+        constexprs={"REGISTER_CLASS": register_class},
+    )
+
+
+@pytest.mark.parametrize("register_class, constraint", [("agpr", "a"), ("vgpr", "v")])
+def test_amd_dot_register_class_pins_mfma_accumulator_gfx950(register_class, constraint):
+    """The request survives the MFMA rewrite and becomes tied register-class pins."""
+    compiled = _compile_amd_dot_register_class(register_class)
+    assert f'amdg.cd_regclass = "{constraint}"' in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "llvm.amdgcn.mfma" in llir
+    assert f'asm "", "={constraint},0"' in llir
+
+
+def test_amd_dot_without_register_class_matches_tl_dot_gfx950():
+    """Without a request, amd_dot is a plain dot: no attribute and no pins."""
+    compiled = _compile_amd_dot_register_class("none")
+    assert "amdg.cd_regclass" not in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "llvm.amdgcn.mfma" in llir
+    assert '"=a,0"' not in llir and '"=v,0"' not in llir
+
+
+def test_amd_dot_rejects_unknown_register_class():
+    # The backend attribute's spelling is not accepted at the frontend.
+    with pytest.raises(CompilationError, match="register_class must be None"):
+        _compile_amd_dot_register_class("a")
+
+
+@triton.jit
+def _amd_dot_explicit_kernel(a_ptr, b_ptr, output_ptr, ROLE: tl.constexpr, REGISTER_CLASS: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]), dot1, pin=False)
+    acc = tlx.require_layout(tl.zeros((32, 128), tl.float32), mma, pin=False)
+    if ROLE == "default":
+        result = tlx.amd_dot(a, b, acc, mfma_order="explicit", initialize=True)
+    elif REGISTER_CLASS == "none":
+        result = tlx.amd_dot(a, b, acc, mfma_order="explicit", accumulator_role=ROLE, initialize=True)
+    else:
+        result = tlx.amd_dot(a, b, acc, register_class=REGISTER_CLASS, mfma_order="explicit", accumulator_role=ROLE,
+                             initialize=True)
+    if ROLE == "persistent":
+        # The explicit order keeps amd_scheduled_mfma's completion semantics.
+        result = tlx.amd_mfma_commit(result)
+    tl.store(output_ptr + rows[:, None] * 128 + cols[None, :], result)
+
+
+def _compile_amd_dot_explicit(role, register_class):
+    return compile_for_gfx950(
+        _amd_dot_explicit_kernel,
+        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "output_ptr": "*fp32"},
+        constexprs={"ROLE": role, "REGISTER_CLASS": register_class},
+    )
+
+
+@pytest.mark.parametrize("role, register_class, pinned", [("default", "none", False), ("transient", "none", False),
+                                                          ("persistent", "none", True), ("persistent", "agpr", True),
+                                                          ("persistent", "vgpr", True)])
+def test_amd_dot_explicit_order_is_scheduled_mfma_gfx950(role, register_class, pinned):
+    """mfma_order="explicit" is amd_scheduled_mfma: its op, its native lowering, its pins and its commit."""
+    compiled = _compile_amd_dot_explicit(role, register_class)
+    ttir = compiled.asm["ttir"]
+    assert "amdg.scheduled_mfma" in ttir
+    assert ("amdg.mfma_commit" in ttir) == (role == "persistent")
+    assert "amdg.cd_regclass" not in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "@llvm.amdgcn.mfma.f32.16x16x32.bf16" in llir
+    constraint = {"none": "a", "agpr": "a", "vgpr": "v"}[register_class]
+    assert (f'"={constraint},0"' in llir) == pinned
+
+
+def test_amd_scheduled_mfma_is_amd_dot_explicit_order_gfx950():
+    """The original name and the unified call produce the same IR."""
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_regclass_gfx950_kernel,
+        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "output_ptr": "*fp32"},
+        constexprs={"ACC_CLASS": "agpr"},
+    )
+    unified = _compile_amd_dot_explicit("persistent", "agpr")
+    assert compiled.asm["ttgir"].count("amdg.scheduled_mfma") == unified.asm["ttgir"].count("amdg.scheduled_mfma")
+    assert compiled.asm["amdgcn"].count("v_mfma_f32_16x16x32_bf16") == unified.asm["amdgcn"].count(
+        "v_mfma_f32_16x16x32_bf16")
+    assert compiled.asm["llir"].count('"=a,0"') == unified.asm["llir"].count('"=a,0"')
+
+
+@triton.jit
+def _amd_scheduled_mfma_regclass_gfx950_kernel(a_ptr, b_ptr, output_ptr, ACC_CLASS: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]), dot1, pin=False)
+    acc = tlx.require_layout(tl.zeros((32, 128), tl.float32), mma, pin=False)
+    result = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class=ACC_CLASS,
+                                    initialize=True)
+    result = tlx.amd_mfma_commit(result)
+    tl.store(output_ptr + rows[:, None] * 128 + cols[None, :], result)
+
+
+@triton.jit
+def _amd_dot_auto_with_role_kernel(a_ptr, b_ptr, c_ptr):
+    offs_m = tl.arange(0, 64)
+    offs_n = tl.arange(0, 64)
+    offs_k = tl.arange(0, 32)
+    a = tl.load(a_ptr + offs_m[:, None] * 32 + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * 64 + offs_n[None, :])
+    c_ptrs = c_ptr + offs_m[:, None] * 64 + offs_n[None, :]
+    acc = tlx.amd_dot(a, b, tl.load(c_ptrs), accumulator_role="persistent")
+    tl.store(c_ptrs, acc)
+
+
+def test_amd_dot_auto_order_is_phase_local():
+    # A logical dot has no persistent-chain contract; the role stays "transient" under the auto order.
+    with pytest.raises(CompilationError, match="no persistent-chain contract"):
+        compile_for_gfx950(_amd_dot_auto_with_role_kernel,
+                           signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "c_ptr": "*fp32"}, constexprs={})
+
+
+@triton.jit
 def _warp_predicate_update(lhs, rhs, increment, side_ptr, offsets):
     tl.store(side_ptr + offsets, lhs)
     return lhs + increment, rhs - increment
