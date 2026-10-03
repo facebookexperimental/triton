@@ -7,7 +7,14 @@ import multiprocessing
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
+
+# An LLVM pass plugin (LLVM_PASS_PLUGIN_PATH, e.g. ../plugins/llir_scheduler)
+# resolves LLVM symbols from libtriton when it is loaded, and CPython loads
+# extension modules RTLD_LOCAL. Opt into RTLD_GLOBAL before importing triton.
+if os.environ.get("LLVM_PASS_PLUGIN_PATH"):
+    sys.setdlopenflags(os.RTLD_NOW | os.RTLD_GLOBAL)
 
 import torch
 import triton

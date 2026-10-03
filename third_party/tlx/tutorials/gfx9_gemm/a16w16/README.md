@@ -38,7 +38,7 @@ high and is not sustained — steady-state under load is the number reported her
 | v4_global_prefetch | 866 | 836 | 72% | Manual 2-stage pipeline + inferred padded layout |
 | v5_local_prefetch | 868 | 836 | 72% | Manual 3-stage pipeline + inferred padded layout |
 | v6_loop_unroll | 833 | 859 | 74% | Step-2 loop unrolling, alternating register sets |
-| v7_slice | 958 | 913 | 79% | N-sliced B + inferred padded layout, manual 4-region pipeline |
+| v7_slice | 958 | 913² | 79%² | N-sliced B, manual 4-region pipeline; conflict-free LDS layout, AGPR accumulator pins, scalar K offsets |
 | v8_warp_pipeline | — | **1005** | **86%** | v7 + `warp_pipeline_stage` for `s_setprio` mem/MFMA interleave (8 warps) |
 | v9_beyond_hotloop | —¹ | **1026** | **89%** | v8 + PID remap (8 XCDs) + workgroup swizzle (GROUP_SIZE_M=4) |
 
@@ -64,14 +64,67 @@ win is the warp pipeline; the grid remap is the finishing polish.
 passes — that scheduler control is the main remaining headroom over the LLVM backend's
 default scheduling.
 
+² Measured before v7 gained its explicit LDS layout, accumulator pins and scalar K offsets.
+For the current kernel, unscheduled and with the LLIR scheduler plugin, see
+[v7 and the LLIR scheduler](#v7-and-the-llir-scheduler).
+
 ### Layout inference
 
-From v4 onward the padded shared layout is **inferred by the compiler** from the dot
+From v4 to v6 the padded shared layout is **inferred by the compiler** from the dot
 operands — `tlx.local_alloc(...)` with no `layout=` argument produces the exact same
 `padded_shared<[512:+16]>` encoding (and identical assembly) as the hand-written
 `tlx.padded_shared_layout.with_identity_for([(512,16)], ...)`. v3 keeps the explicit
 form to teach what the layout is; v2 keeps an explicit *swizzled* layout to stay the
 pre-padding step. See `InsertRequireLayout.cpp`.
+
+v7 pins explicit offset bases again. For direct-to-LDS buffers the inferred layout keeps
+plain row-major order, which costs 4 bank conflicts per LDS instruction; the bit
+permutation v7 uses measures 0 (see [below](#v7-and-the-llir-scheduler)).
+
+## v7 and the LLIR scheduler
+
+v7 is the last 4-wave step: one wave both loads and computes. v8 closes the remaining
+scheduling gap with hardware (8 waves and `warp_pipeline_stage`). The other way is the one the
+Gluon tutorial uses: a compiler pass that interleaves the MFMAs with the memory work inside each
+wave. That pass, the LLIR scheduler, is available here as an out-of-tree LLVM pass plugin in
+[`../plugins/llir_scheduler`](../plugins/llir_scheduler/README.md).
+
+For the pass to deliver, v7 has to be the same kernel as the Gluon `v7_sliceN`. Three details
+of the kernel source matter:
+
+| | Without it | In v7 |
+|---|---|---|
+| LDS layout | inferred padded layout, plain row-major order: 4 bank conflicts per LDS instruction | explicit conflict-free offset bases: 0 |
+| Accumulator | LLVM splits it across VGPRs and AGPRs: ~140 `v_accvgpr` copies in the hot loop | `tlx.amd_dot(..., cd_regclass="a")` pins every MFMA tile to AGPRs: 0 copies |
+| K offset | added to every element of the i32 offset tensors: vector adds in the hot loop | advances the scalar base pointer: none |
+
+Measured with this `bench.py` on one idle gfx950 (MI355X), fp16, M=N=4096, K=8192, two rounds.
+`triton` is the default `do_bench` median; `batched` is `--timing-mode batched`. This is a
+different GPU from the table at the top, so compare by the ratio to rocBLAS. "Before" is v7
+with the inferred layout, no pins and tensor K offsets.
+
+| Kernel | `triton` TFLOPS | %rocBLAS | `batched` TFLOPS | %rocBLAS | `SQ_LDS_BANK_CONFLICT` per launch |
+|---|---:|---:|---:|---:|---:|
+| rocBLAS | 1393 - 1421 | | 1461 - 1470 | | |
+| v7 before | 1088 / 1085 | 77% | 1164 / 1161 | 79% | 1.68e7 |
+| v7 before + plugin | 1223 / 1225 | 87% | 1255 / 1255 | 86% | 1.68e7 |
+| v7 | 1054 / 1059 | 75% | 1226 / 1226 | 84% | 0 |
+| v7 + plugin | **1368 / 1412** | **99%** | **1496 / 1495** | **102%** | 0 |
+
+The three details are not a consistent win on their own: without the scheduler, LLVM's default
+schedule still decides the outcome. They are what lets the scheduler deliver, and the scheduled
+hot loop is then instruction-for-instruction the scheduled Gluon v7 loop (256 MFMA, 64
+`ds_read_b128`, 32 direct-to-LDS loads, 0 `v_accvgpr`, 0 vector ALU).
+
+The plugin is for 4-wave kernels. Do not load it for v8 / v9 or other `warp_pipeline_stage`
+kernels: it declines their regions but still pads them, which measured 2-5% slower.
+
+```bash
+../plugins/llir_scheduler/build.sh
+python bench.py --version 7 --K 8192                                     # unscheduled
+LLVM_PASS_PLUGIN_PATH=$PWD/../plugins/llir_scheduler/libLlirSched.so \
+  python bench.py --version 7 --K 8192                                   # scheduled
+```
 
 ## Compiler Fixes Applied
 
@@ -98,6 +151,8 @@ All versions use `num_stages=1` with manual pipeline management (matching Gluon'
 - **v4-v7**: Manual pipelines reach ~72-77% of rocBLAS, a few % behind Gluon. The gap
   is LLVM-backend instruction scheduling — Gluon's published best uses custom
   `llirSched` / `amdgcnSched` passes that the default backend scheduler doesn't match.
+  v7 can now be scheduled by the same LLIR scheduler, loaded as a pass plugin: 99% of
+  rocBLAS at 4 waves (see [v7 and the LLIR scheduler](#v7-and-the-llir-scheduler)).
 - **v8**: `warp_pipeline_stage` (`s_setprio` mem/compute interleaving) is the big
   hot-loop win — 1005T / 86% of rocBLAS, ahead of Gluon v7 (958T) measured here.
   TLX-only (Gluon has no warp-pipeline step).

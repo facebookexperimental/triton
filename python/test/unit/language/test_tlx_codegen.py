@@ -3987,6 +3987,54 @@ def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
     bench.validate_shape_for_providers((256, 256, 128), 9, ["tlx"])
 
 
+def test_tlx_gfx9_gemm_v7_keeps_pins_and_lds_layout_gfx950():
+    """The 4-wave v7 keeps its accumulator pins and explicit LDS layout through codegen."""
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v7_slice.matmul_kernel import v7_slice
+
+    src = ASTSource(
+        fn=v7_slice,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*fp16",
+            "M": "i32",
+            "N": "i32",
+        },
+        # K-contiguous A and B and a row-major C, as the benchmark launches it.
+        # The direct-to-LDS loads need the strides' contiguity and alignment,
+        # which the JIT gets from specializing the launch arguments.
+        constexprs={
+            "K": 512,
+            "stride_am": 512,
+            "stride_ak": 1,
+            "stride_bk": 1,
+            "stride_bn": 512,
+            "stride_cm": 256,
+            "stride_cn": 1,
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 64,
+        },
+        # Runtime JIT launches attach the base-pointer alignment and range
+        # automatically; ASTSource compile-only signatures do not.
+        attrs={(i, ): [("tt.divisibility", 16), ("tt.pointer_range", 32)]
+               for i in range(3)},
+    )
+    compiled = triton_compile(src, target=GFX950, options={
+        "num_warps": 4,
+        "num_stages": 1,
+        "matrix_instr_nonkdim": 16,
+    })
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count('amdg.cd_regclass = "a"') == 8
+    # A-tile LDS bases: the row-128 bit comes last.
+    assert "[1, 0], [2, 0], [4, 0], [8, 0], [128, 0]], block = []" in ttgir
+    assert 'asm "", "=a,0"' in compiled.asm["llir"]
+    amdgcn = compiled.asm["amdgcn"]
+    assert "v_mfma_f32_16x16x32_f16" in amdgcn
+    assert "ds_read_b128" in amdgcn
+
+
 def test_tlx_gfx9_gemm_bench_input_modes_are_deterministic():
     bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_inputs")
     inter_wave = _load_tlx_gfx9_inter_wave_bench_module("_tlx_amd_test_gfx9_inter_wave_bench_inputs")
