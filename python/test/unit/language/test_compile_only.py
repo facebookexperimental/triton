@@ -3,28 +3,54 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 import pytest
 import re
+from unittest.mock import PropertyMock, patch
 from triton.compiler import ASTSource
+from triton.backends.nvidia.compiler import _max_shared_mem_for_capability
+from triton.runtime.driver import driver
 
 
-def test_compile_only_sm100() -> None:
+@pytest.mark.parametrize("capability", [80, 86, 90, 100, 120])
+@pytest.mark.parametrize("reduce", [False, True])
+def test_compile_only_cuda_does_not_initialize_driver(capability, reduce, fresh_triton_cache) -> None:
 
     @triton.jit
-    def kernel_add(a, b, c):
+    def kernel_add(a, b, c, REDUCE: tl.constexpr):
         idx = tl.arange(0, 32)
-        tl.store(c + idx, tl.load(a + idx) + tl.load(b + idx))
+        value = tl.load(a + idx) + tl.load(b + idx)
+        if REDUCE:
+            tl.store(c, tl.sum(value, 0))
+        else:
+            tl.store(c + idx, value)
 
-    k = triton.compile(
-        triton.compiler.ASTSource(
-            fn=kernel_add,
-            signature={"a": "*fp32", "b": "*fp32", "c": "*fp32"},
-            constexprs={},
-        ),
-        target=GPUTarget("cuda", 100, 32),
-    )
+    # Compilation with an explicit target must not initialize CUDA in each
+    # compiler subprocess. The old helper swallowed the driver exception, so
+    # successful offline compilation alone did not catch the regression.
+    with patch.object(type(driver), "active", new_callable=PropertyMock) as active:
+        active.side_effect = RuntimeError("runtime driver accessed during compilation")
+        k = triton.compile(
+            triton.compiler.ASTSource(
+                fn=kernel_add,
+                signature={"a": "*fp32", "b": "*fp32", "c": "*fp32", "REDUCE": "constexpr"},
+                constexprs={"REDUCE": reduce},
+            ),
+            target=GPUTarget("cuda", capability, 32),
+        )
+        active.assert_not_called()
     ptx = k.asm["ptx"]
-    assert ".target sm_100a" in ptx
+    suffix = "a" if capability >= 90 else ""
+    assert f".target sm_{capability}{suffix}" in ptx
     assert ".address_size 64" in ptx
     assert k.asm["cubin"] != b""
+
+
+@pytest.mark.parametrize("capability, expected", [(80, 166912), (86, 101376), (90, 232448), (100, 232448),
+                                              (120, 101376)])
+def test_shared_memory_budget_uses_compilation_target(capability, expected):
+    with patch.object(type(driver), "active", new_callable=PropertyMock) as active:
+        # A different GPU may be active while cross-compiling.
+        active.return_value.utils.get_device_properties.return_value = {"max_shared_mem": 49152}
+        assert _max_shared_mem_for_capability(capability) == expected
+        active.assert_not_called()
 
 
 def test_compile_only_ws_cluster_barrier_shared_memory(tmp_path) -> None:
