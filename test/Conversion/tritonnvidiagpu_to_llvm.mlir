@@ -236,11 +236,17 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 2 : i32, "ttg
     // CHECK: fence.mbarrier_init.release.cluster
     // CHECK: nvvm.cluster.arrive.relaxed
     // CHECK-NEXT: nvvm.cluster.wait
-    // CHECK-COUNT-2: mbarrier.arrive.shared::cluster.b64 _, [${{.*}}];
+    // CHECK: nvvm.mapa
+    // CHECK-NEXT: {{.*}}mbarrier.arrive.shared::cluster.b64 _, [${{.*}}];
+    // CHECK: nvvm.mapa
+    // CHECK-NEXT: {{.*}}mbarrier.arrive.shared::cluster.b64 _, [${{.*}}];
     // CHECK-NOT: multicast::cluster::32b
     // CHECK-NOT: mbarrier.arrive.shared::cta.b64
     // RUBIN-PTX87-LABEL: arrive_barrier_multicast
-    // RUBIN-PTX87-COUNT-2: mbarrier.arrive.shared::cluster.b64 _, [${{.*}}];
+    // RUBIN-PTX87: nvvm.mapa
+    // RUBIN-PTX87-NEXT: {{.*}}mbarrier.arrive.shared::cluster.b64 _, [${{.*}}];
+    // RUBIN-PTX87: nvvm.mapa
+    // RUBIN-PTX87-NEXT: {{.*}}mbarrier.arrive.shared::cluster.b64 _, [${{.*}}];
     // RUBIN-PTX87-NOT: multicast::cluster::32b
     // RUBIN-LABEL: arrive_barrier_multicast
     // RUBIN: mbarrier.arrive.shared::cluster.multicast::cluster::32b.b64 _, [${{.*}}], ${{.*}};
