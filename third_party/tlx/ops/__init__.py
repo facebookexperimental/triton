@@ -45,8 +45,8 @@ from __future__ import annotations
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill",
-    "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward", "InvalidInput"
+    "mm", "grouped_gemm", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention",
+    "kda_paged_prefill", "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward", "InvalidInput"
 ]
 
 
@@ -83,6 +83,68 @@ def mm(a, b, *, out=None, space="heuristic"):
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
+
+
+def grouped_gemm(group_a, group_b):
+    """Run a ragged group of FP16 ``A[i] @ B[i]`` products.
+
+    ``A[i]`` must be rank-2 row-major. ``B[i]`` must be a rank-2 column-major
+    view with K contiguous. The operation is currently forward-only;
+    architecture-specific alignment restrictions may also apply.
+    """
+    import torch
+
+    if not isinstance(group_a, (list, tuple)) or not isinstance(group_b, (list, tuple)):
+        raise InvalidInput("tlx.ops.grouped_gemm expects group_a and group_b to be lists or tuples")
+    group_a = tuple(group_a)
+    group_b = tuple(group_b)
+    if len(group_a) != len(group_b):
+        raise InvalidInput("tlx.ops.grouped_gemm operand groups must have the same length; "
+                           f"got len(group_a)={len(group_a)}, len(group_b)={len(group_b)}")
+    if not group_a:
+        raise InvalidInput("tlx.ops.grouped_gemm requires at least one matrix pair")
+
+    for index, (a, b) in enumerate(zip(group_a, group_b)):
+        if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+            raise InvalidInput("tlx.ops.grouped_gemm expects tensor elements; "
+                               f"pair {index} has a={type(a).__name__}, b={type(b).__name__}")
+        if a.ndim != 2 or b.ndim != 2:
+            raise InvalidInput("tlx.ops.grouped_gemm expects rank-2 tensors; "
+                               f"pair {index} has a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+        if any(dim <= 0 for dim in (*a.shape, *b.shape)):
+            raise InvalidInput("tlx.ops.grouped_gemm dimensions must be positive; "
+                               f"pair {index} has a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+        if a.shape[1] != b.shape[0]:
+            raise InvalidInput("tlx.ops.grouped_gemm reduction dimensions must match; "
+                               f"pair {index} has a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+        if a.stride() != (a.shape[1], 1):
+            raise InvalidInput("tlx.ops.grouped_gemm requires row-major A tensors; "
+                               f"pair {index} has a.stride={a.stride()}")
+        if b.stride() != (1, b.shape[0]):
+            raise InvalidInput("tlx.ops.grouped_gemm requires column-major B tensors; "
+                               f"pair {index} has b.stride={b.stride()}")
+
+    dtype = group_a[0].dtype
+    device = group_a[0].device
+    for index, tensor in enumerate((*group_a, *group_b)):
+        if tensor.dtype != dtype or tensor.device != device:
+            raise InvalidInput("tlx.ops.grouped_gemm operands must share a dtype and device; "
+                               f"tensor {index} is ({tensor.dtype}, {tensor.device}), expected ({dtype}, {device})")
+
+    fn, spec = impl_for("grouped_gemm", device=device)
+    # TMA implementations describe A, the zero-copy B.T view, and C as
+    # row-major tensors. Direct-load implementations ignore these facts.
+    row_strides = tuple(stride for a, b in zip(group_a, group_b) for stride in (a.stride(0), b.stride(1), b.shape[1]))
+    base_ptrs = tuple(tensor.data_ptr() for pair in zip(group_a, group_b) for tensor in pair)
+    check_inputs(
+        spec,
+        dtype=dtype,
+        row_strides=row_strides,
+        base_ptrs=base_ptrs,
+        elem_bytes=group_a[0].element_size(),
+    )
+    check_backward(spec, *group_a, *group_b)
+    return fn(group_a, group_b)
 
 
 def addmm(input, a, b, *, out=None, space="heuristic"):
