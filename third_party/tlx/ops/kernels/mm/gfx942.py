@@ -575,9 +575,9 @@ def heuristic_config(M, N, K):
     # At M near 1024, strongly N-dominant matrices favor four-wave 128-square tiles with a short K step.
     if M <= 1024 and N >= 2 * K:
         return [_config(128, 128, 32, 8, 4)]
-    # Remaining M-near-1024 matrices benefit from a wider N tile without enlarging the M tile.
+    # Remaining balanced M-near-1024 matrices favor four-wave square tiles with stronger row grouping.
     if M <= 1024:
-        return [_config(128, 256, 64, 4, 8)]
+        return [_config(128, 128, 64, 16, 4)]
     # Narrow-output, deep-reduction matrices need compact output tiles to expose sufficient parallelism.
     if M <= 4096 and N <= 2048 and K >= 16 * N:
         return [_config(64, 64, 256, 4, 8)]
@@ -608,6 +608,9 @@ def heuristic_config(M, N, K):
     # Tall matrices with shallow K and N-dominant output favor four-wave rectangular tiles.
     if N >= 2 * K:
         return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
+    # Tall matrices with an output width at least half the reduction depth favor stronger row grouping.
+    if 2 * N >= K:
+        return [_config(256, 256, 64, 8, 8)]
     # Tall matrices with narrow N favor square 256 tiles to maximize reuse across output rows.
     if N <= 256:
         return [_config(256, 256, 64, 8, 8)]

@@ -3494,9 +3494,21 @@ def heuristic_config(m, n, k, dtype, element_size, a_strides, b_strides):
     if n >= 8 * k:
         return register(128, 256, 32, 16, 1, 2, 4, 2)
 
+    # Large-M shapes with nearly equal K and N favor the measured wide-N K64 pipeline.
+    if m >= 16384 and n <= k and 8 * k <= 9 * n:
+        return register(128, 256, 64, 8, 1, 0, 8, 3)
+
+    # Large-M strongly N-major shapes favor the measured narrow-N K32 pipeline.
+    if m >= 16384 and n >= 2 * k:
+        return register(256, 128, 32, 4, 1, 2, 4, 3)
+
     # Large-M throughput shapes favor the measured 256x256 two-stage family.
     if m >= 16384:
         return register(256, 256, 64, 4, 1, 0, 8, 2)
+
+    # Medium-M shapes exactly at the 2:1 N-to-K boundary favor the measured wide-N K32 family.
+    if m >= 4096 and n == 2 * k:
+        return register(128, 256, 32, 16, 1, 2, 4, 2)
 
     # Low-M N-major shapes amortize best with the larger square tile.
     if n >= 2 * k and m <= 1024:

@@ -83,6 +83,30 @@ def run_tuning(
     # space as its fixed oracle and edits only the dispatch decision tree.
     del search_rounds
 
+    oracle_target = _phase_target(
+        target,
+        phase="full",
+        source=original_source,
+        editable_symbols=(),
+        guidance="Measure the fixed full configuration space.",
+    )
+    oracle_path = output_dir / "full_space_oracle.json"
+    print(f"[tlx-agent] measuring full-space oracle for {len(cases)} shapes", flush=True)
+    oracle = SubprocessHarness(
+        harness_path,
+        None,  # type: ignore[arg-type] -- full-space measurement has no aggregate timeout.
+    ).evaluate(
+        original_source,
+        cases,
+        oracle_target,
+        budget.benchmark_repetitions,
+        profile=False,
+    )
+    if not oracle.correct or any(case.timing is None for case in oracle.cases):
+        raise RuntimeError("full-space oracle failed correctness or produced no timing")
+    oracle_path.write_text(json.dumps(to_json_value(oracle), indent=2, sort_keys=True) + "\n")
+    print(f"[tlx-agent] saved full-space oracle to {oracle_path}", flush=True)
+
     heuristic_target = _phase_target(
         target,
         phase="heuristic",
@@ -105,6 +129,13 @@ def run_tuning(
             "progressive": True,
         },
     )
+    heuristic_target = replace(
+        heuristic_target,
+        environment={
+            **heuristic_target.environment,
+            "TLX_AGENT_FULL_SPACE_ORACLE": str(oracle_path.resolve()),
+        },
+    )
     heuristic_budget = replace(budget, max_rounds=heuristic_rounds, min_speedup=1.0)
     heuristic_request = KernelOptimizationRequest(
         kernel_source=original_source,
@@ -121,6 +152,8 @@ def run_tuning(
     final_source = heuristic_result.best_kernel
     output_dir.joinpath("best_kernel.py").write_text(final_source)
     summary = _parity_summary(heuristic_result.final, cases)
+    recall_before = _recall_summary(heuristic_result.baseline)
+    recall_after = _recall_summary(heuristic_result.final)
     summary.update({
         "success": passed,
         "task": "tuning",
@@ -131,6 +164,9 @@ def run_tuning(
         "winner_experiment_id": heuristic_result.winner_experiment_id,
         "heuristic_speedup": heuristic_result.final.aggregate_speedup,
         "best_kernel": str(output_dir / "best_kernel.py"),
+        "full_space_oracle": str(oracle_path),
+        "recall_before": recall_before,
+        "recall_after": recall_after,
         "result": str(output_dir / "result.json"),
     })
     output_dir.joinpath("summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -210,6 +246,28 @@ def _parity_summary(
         "minimum_stable_shape_parity": min((parity for parity, _ in stable_parities), default=0.0),
         "maximum_heuristic_config_count": max_config_count,
     }
+
+
+def _recall_summary(performance: PerformanceSummary) -> dict[str, int | float]:
+    matches = 0
+    for evaluation in performance.cases:
+        metrics = evaluation.verification.metrics
+        heuristic = _config_signature(metrics.get("heuristic_config"))
+        full = _config_signature(metrics.get("full_best_config"))
+        matches += bool(heuristic and heuristic == full)
+    total = len(performance.cases)
+    return {
+        "matched_shapes": matches,
+        "total_shapes": total,
+        "rate": matches / total if total else 0.0,
+    }
+
+
+def _config_signature(config: Any) -> tuple[str, ...]:
+    if not config:
+        return ()
+    specification = str(config).split(": ", 1)[-1]
+    return tuple(sorted(specification.split()))
 
 
 def _maximum_full_config_count(performance: PerformanceSummary) -> int:

@@ -55,6 +55,7 @@ from ..decision_maker.policy import (
 from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
 from ..decision_maker.tuning import (
     _parity_summary,
+    _recall_summary,
     _tuning_symbols,
     infer_kernel_path,
     production_cases,
@@ -977,6 +978,39 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(decision.status, DecisionStatus.PROMOTE)
         self.assertIn("continue refinement", decision.rationale)
 
+    def test_tuning_reports_exact_config_recall(self) -> None:
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="match",
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_best_config": "kernel: BLOCK_M=64 GROUP_M=4",
+                            "heuristic_config": "GROUP_M=4 BLOCK_M=64",
+                        },
+                    ),
+                    timing=TimingSamples((1.0, )),
+                ),
+                CaseEvaluation(
+                    case_id="miss",
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_best_config": "kernel: BLOCK_M=128 GROUP_M=4",
+                            "heuristic_config": "BLOCK_M=128 GROUP_M=8",
+                        },
+                    ),
+                    timing=TimingSamples((1.0, )),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            _recall_summary(performance),
+            {"matched_shapes": 1, "total_shapes": 2, "rate": 0.5},
+        )
+
     def test_tuning_edits_only_the_heuristic(self) -> None:
         source = (
             "def _configs():\n"
@@ -995,6 +1029,8 @@ class ScoringTest(unittest.TestCase):
                         True,
                         metrics={
                             "full_config_count": 16,
+                            "full_best_config": "kernel: VALUE=1",
+                            "heuristic_config": "VALUE=1",
                             "full_space_parity": 1.0,
                             "heuristic_config_count": 1,
                             "parity_stable": True,
@@ -1021,9 +1057,12 @@ class ScoringTest(unittest.TestCase):
             kernel.write_text(source)
             optimizer = Mock()
             optimizer.optimize.return_value = optimization_result
+            oracle_harness = Mock()
+            oracle_harness.evaluate.return_value = performance
             with (
                 patch.object(tuning_module, "production_cases", return_value=cases),
                 patch.object(tuning_module, "_validate_device_arch"),
+                patch.object(tuning_module, "SubprocessHarness", return_value=oracle_harness),
                 patch.object(tuning_module, "KernelOptimizer", return_value=optimizer),
             ):
                 exit_code, result = tuning_module.run_tuning(
@@ -1050,6 +1089,15 @@ class ScoringTest(unittest.TestCase):
                 request.target.environment["TLX_AGENT_EDITABLE_SYMBOLS"],
                 "heuristic_config",
             )
+            self.assertEqual(
+                request.target.environment["TLX_AGENT_FULL_SPACE_ORACLE"],
+                str((root / "out/full_space_oracle.json").resolve()),
+            )
+            self.assertEqual(
+                result["summary"]["recall_before"],
+                {"matched_shapes": 1, "total_shapes": 1, "rate": 1.0},
+            )
+            self.assertEqual(result["summary"]["recall_after"], result["summary"]["recall_before"])
             self.assertEqual((root / "out/best_kernel.py").read_text(), candidate)
 
     def test_tuning_rejects_an_unreasonably_small_full_space(self) -> None:
@@ -1727,6 +1775,43 @@ class HarnessTest(unittest.TestCase):
             with self.subTest(arch=arch):
                 op = _install_candidate(candidate, arch)
                 self.assertEqual(op(a, b, space="full"), (marker, "full"))
+
+    def test_mm_heuristic_benchmark_reuses_full_space_oracle(self) -> None:
+        import torch
+
+        from ..decision_maker.tuning_harnesses import mm
+
+        spaces = []
+        artifact = {
+            "op": lambda _a, _b, *, space: spaces.append(space),
+            "phase": "heuristic",
+            "device": "cpu",
+            "oracle_cases": {
+                "a": {
+                    "case_id": "a",
+                    "verification": {
+                        "metrics": {
+                            "full_config_count": 16,
+                            "full_best_config": "best",
+                            "top_full_configs": [],
+                        }
+                    },
+                    "timing": {"samples_us": [10.0, 10.0]},
+                }
+            },
+            "stable_cv_max": 0.03,
+            "records": {},
+        }
+        tensor = torch.empty((1, 1))
+        with (
+            patch.object(mm, "_inputs", return_value=(tensor, tensor)),
+            patch.object(mm.torch.cuda, "synchronize"),
+            patch.object(mm, "_measure", return_value=[10.0, 10.0]),
+        ):
+            result = mm.benchmark(artifact, {"case_id": "a"}, 10)
+
+        self.assertEqual(spaces, ["heuristic"])
+        self.assertEqual(result["metrics"]["full_space_parity"], 1.0)
 
     def test_benchmark_metrics_are_attached_to_verification(self) -> None:
         harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
