@@ -5,15 +5,26 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <memory>
+#include <utility>
 
 namespace mlir::triton {
 class DistributedCoordinateGroups;
 }
 
 namespace mlir::triton::AMD {
-void inferScheduledMfmaHazards(ModuleOp mod, const TargetInfo &targetInfo);
+
+// Conversion-local bookkeeping for result pins whose consumers are only known
+// after the complete module has been lowered.
+struct ScheduledMfmaLoweringState {
+  SmallVector<std::pair<Operation *, int>> resultPins;
+  DenseMap<Operation *, int> commitWaitStates;
+};
+
+void finalizeScheduledMfmaLowering(const ScheduledMfmaLoweringState &state);
 
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
@@ -23,8 +34,8 @@ void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
 void populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfo &targetInfo, PatternBenefit benefit,
-    std::shared_ptr<mlir::triton::DistributedCoordinateGroups>
-        coordinateGroups);
+    std::shared_ptr<mlir::triton::DistributedCoordinateGroups> coordinateGroups,
+    ScheduledMfmaLoweringState &scheduledMfmaState);
 
 void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,

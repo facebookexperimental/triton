@@ -2519,6 +2519,44 @@ def test_dense_bwd_d256_dispatches_cover_retained_topologies(monkeypatch):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("zero_dq", [False, True], ids=["delta-only", "zero-dq"])
+def test_dense_bwd_preprocess_scaled_lse_tail_gfx950(zero_dq):
+    batch, heads, n_ctx, head_dim = 2, 3, 70, 128
+    rows = batch * heads * n_ctx
+    shape = (batch, heads, n_ctx, head_dim)
+    elements = torch.arange(rows * head_dim, device="cuda", dtype=torch.float32).reshape(shape)
+    # Dyadic inputs keep the delta reduction exact; distinct row patterns also
+    # expose a missing batch/head offset. N=70 exercises the final 64-row tile.
+    out = ((elements % 17 - 8) / 8).to(torch.bfloat16)
+    grad_out = ((elements % 13 - 6) / 8).to(torch.bfloat16)
+    lse = (torch.arange(rows, device="cuda", dtype=torch.float32).reshape(shape[:-1]) - rows // 2) / 8
+    original_lse = lse.clone()
+    expected_delta = (out.float() * grad_out.float()).sum(dim=-1)
+    baseline_delta = torch.full_like(lse, float("nan"))
+    amd_fa_bwd._run_bwd_preprocess(out, grad_out, baseline_delta)
+
+    # The guard catches writes from inactive rows in the final preprocess tile.
+    guard_rows = 64
+    lse_storage = torch.full((rows + guard_rows, ), -123.0, device="cuda", dtype=torch.float32)
+    scaled_lse = lse_storage[:rows].reshape(shape[:-1])
+    scaled_lse.fill_(float("nan"))
+    delta = torch.full_like(lse, float("nan"))
+    dq_acc = torch.full_like(out, float("nan"), dtype=torch.float32) if zero_dq else None
+    # Keep dq_acc in its existing fourth positional slot when enabling LSE work.
+    amd_fa_bwd._run_bwd_preprocess(out, grad_out, delta, dq_acc, lse=lse, lse_log2=scaled_lse)
+
+    log2e = torch.tensor(1.4426950408889634, device="cuda", dtype=torch.float32)
+    torch.testing.assert_close(scaled_lse, original_lse * log2e, atol=0, rtol=0)
+    torch.testing.assert_close(lse, original_lse, atol=0, rtol=0)
+    torch.testing.assert_close(baseline_delta, expected_delta, atol=0, rtol=0)
+    torch.testing.assert_close(delta, expected_delta, atol=0, rtol=0)
+    torch.testing.assert_close(delta, baseline_delta, atol=0, rtol=0)
+    torch.testing.assert_close(lse_storage[rows:], torch.full_like(lse_storage[rows:], -123.0), atol=0, rtol=0)
+    if zero_dq:
+        torch.testing.assert_close(dq_acc, torch.zeros_like(dq_acc), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize(
     "shape",
