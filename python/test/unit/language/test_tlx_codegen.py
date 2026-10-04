@@ -1309,6 +1309,43 @@ def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
     assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
 
 
+@triton.jit
+def _buffer_load_to_local_contiguity_subslice_kernel(x_ptr):
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(512, 16)],
+        [32, 16],
+        order=[1, 0],
+    )
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1, layout=shared_layout)
+    destination = tlx.local_slice(
+        tlx.local_view(buffer, 0),
+        [0, 0],
+        [32, 16],
+    )
+    tlx.buffer_load_to_local(
+        destination,
+        x_ptr,
+        offsets,
+        contiguity=2,
+    )
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_subslice_gfx950():
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_contiguity_subslice_kernel,
+        signature={"x_ptr": "*bf16"},
+        constexprs={},
+    )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 2" in ttgir
+    assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
+
+
 @pytest.mark.parametrize("contiguity", [0, 3, True], ids=["zero", "non-power-of-two", "bool"])
 def test_buffer_load_to_local_rejects_invalid_contiguity_gfx950(contiguity):
     with pytest.raises(CompilationError, match="contiguity must be a positive power of two"):
@@ -1340,7 +1377,7 @@ def _buffer_load_to_local_unpinned_contiguity_kernel(x_ptr):
 def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
     with pytest.raises(
             RuntimeError,
-            match="contiguity > 1 requires a directly indexed user-pinned padded_shared destination",
+            match="contiguity > 1 requires a supported view of a user-pinned padded_shared destination",
     ):
         compile_for_gfx950(
             _buffer_load_to_local_unpinned_contiguity_kernel,
@@ -1571,6 +1608,214 @@ def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, result)
+
+
+@triton.jit
+def _amd_intra_wave_pipeline_kernel(
+    a_ptr,
+    b_ptr,
+    future_ptr,
+    output_ptr,
+    side_output_ptr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+    future_sum = tl.zeros((128,), tl.float16)
+
+    # A pair identifier names the relationship, so a statically unrolled
+    # source pipeline may reuse it for consecutive windows.
+    for offset in tl.static_range(0, 256, 128):
+        with tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=7):
+            acc = tl.dot(a, b, acc, allow_tf32=False)
+        with tlx.warp_pipeline_stage("future_load", scope="intra_wave", pair=7):
+            future = tl.load(
+                future_ptr + offset + tl.arange(0, 128)
+            )
+            future_sum += future
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
+    tl.store(side_output_ptr + tl.arange(0, 128), future_sum)
+
+
+@triton.jit
+def _amd_intra_wave_coarse_pipeline_kernel(
+    a_ptr,
+    b_ptr,
+    future_ptr,
+    output_ptr,
+    side_output_ptr,
+    WITH_BARRIER: tl.constexpr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+
+    with tlx.warp_pipeline_stage(
+        "future_loads", scope="intra_wave", pair=0, auto_interleave=True
+    ):
+        future0 = tl.load(future_ptr + tl.arange(0, 128))
+        future0 += 1.0
+        future1 = tl.load(future_ptr + 128 + tl.arange(0, 128))
+        future1 += 2.0
+    with tlx.warp_pipeline_stage(
+        "compute", scope="intra_wave", pair=0, auto_interleave=True
+    ):
+        if WITH_BARRIER:
+            tl.debug_barrier()
+        for _ in tl.static_range(5):
+            acc = tl.dot(a, b, acc, allow_tf32=False)
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
+    tl.store(side_output_ptr + tl.arange(0, 128), future0 + future1)
+
+
+@triton.jit
+def _amd_intra_wave_single_window_kernel(
+    a_ptr,
+    b_ptr,
+    future_ptr,
+    output_ptr,
+    side_output_ptr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+
+    # The compiler derives the two independent streams from this one bounded
+    # source region; users do not have to split memory and MFMA manually.
+    with tlx.warp_pipeline_stage(
+        "load_and_compute", scope="intra_wave", pair=0, auto_interleave=True
+    ):
+        future0 = tl.load(future_ptr + tl.arange(0, 128))
+        future0 += 1.0
+        future1 = tl.load(future_ptr + 128 + tl.arange(0, 128))
+        future1 += 2.0
+        for _ in tl.static_range(5):
+            acc = tl.dot(a, b, acc, allow_tf32=False)
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
+    tl.store(side_output_ptr + tl.arange(0, 128), future0 + future1)
+
+
+@triton.jit
+def _amd_intra_wave_single_window_dependent_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+
+    with tlx.warp_pipeline_stage(
+        "dependent_load_and_compute", scope="intra_wave", pair=0, auto_interleave=True
+    ):
+        a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+        acc = tl.dot(a, b, acc, allow_tf32=False)
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
+
+
+@triton.jit
+def _amd_intra_wave_single_window_write_kernel(
+    a_ptr,
+    b_ptr,
+    publish_ptr,
+    output_ptr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+    published = tl.load(publish_ptr + tl.arange(0, 2048))
+    local = tlx.local_alloc((2048,), tl.float16, 1)
+
+    with tlx.warp_pipeline_stage(
+        "write_and_compute", scope="intra_wave", pair=0, auto_interleave=True
+    ):
+        tlx.local_store(tlx.local_view(local, 0), published)
+        acc = tl.dot(a, b, acc, allow_tf32=False)
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
+
+
+@triton.jit
+def _amd_intra_wave_mixed_pipeline_kernel(
+    a_ptr,
+    b_ptr,
+    publish_ptr,
+    future_ptr,
+    output_ptr,
+    side_output_ptr,
+    DOT_COUNT: tl.constexpr,
+    COVER_POLICY: tl.constexpr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+    offsets = tl.arange(0, 2048)
+    published = tl.load(publish_ptr + offsets)
+    local = tlx.local_alloc((2048,), tl.float16, 1)
+    local_next = tlx.local_alloc((2048,), tl.float16, 1)
+
+    with tlx.warp_pipeline_stage(
+        "mixed_memory", scope="intra_wave",
+        pair=0,
+        auto_interleave=True,
+        cover_policy=COVER_POLICY,
+    ):
+        tlx.local_store(tlx.local_view(local, 0), published)
+        future = tl.load(future_ptr + offsets)
+        tlx.local_store(tlx.local_view(local_next, 0), published)
+        future_next = tl.load(future_ptr + 2048 + offsets)
+    with tlx.warp_pipeline_stage(
+        "compute", scope="intra_wave",
+        pair=0,
+        auto_interleave=True,
+        cover_policy=COVER_POLICY,
+    ):
+        for _ in tl.static_range(DOT_COUNT):
+            acc = tl.dot(a, b, acc, allow_tf32=False)
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
+    tl.store(side_output_ptr + offsets, future + future_next)
+
+
+@triton.jit
+def _amd_intra_wave_dependent_pipeline_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+):
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    b = tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :])
+    acc = tl.zeros((16, 16), tl.float32)
+
+    with tlx.warp_pipeline_stage("load", scope="intra_wave", pair=0):
+        a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    with tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=0):
+        acc = tl.dot(a, b, acc, allow_tf32=False)
+
+    tl.store(output_ptr + rows[:, None] * 16 + cols[None, :], acc)
 
 
 @triton.jit
@@ -3275,6 +3520,352 @@ def test_amd_scheduled_mfma_compiles_gfx950():
     assert 'asm sideeffect "v_mfma' not in compiled.asm["llir"]
     assert "v_mfma_f32_16x16x32_bf16" in compiled.asm["amdgcn"]
     assert "s_nop 5" in compiled.asm["llir"]
+
+
+def test_amd_intra_wave_pipeline_lowers_to_schedule_groups_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_pipeline_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+        },
+        constexprs={},
+    )
+    assert "triton.intra_wave_pipeline.marker" in compiled.asm["ttir"]
+    assert "triton.intra_wave_pipeline.auto_interleave" not in compiled.asm[
+        "ttir"
+    ]
+    assert "triton.intra_wave_pipeline.marker" not in compiled.asm["ttgir"]
+    assert "rocdl.sched.group.barrier" in compiled.asm["ttgir"]
+    assert "triton.intra_wave_pipeline.pair = 7" in compiled.asm["ttgir"]
+    assert "amdg.cond_barrier" not in compiled.asm["ttgir"]
+    # A one-load/one-dot pair is already a fine-grained window. Preserve the
+    # source's compute-before-prefetch order instead of applying the coarse
+    # stage merger, which would perturb existing tuned schedules.
+    ttgir = compiled.asm["ttgir"]
+    outer_barriers = [
+        match.start()
+        for match in re.finditer("rocdl.sched.barrier none", ttgir)
+    ]
+    first_window = ttgir[outer_barriers[0]:outer_barriers[1]]
+    assert first_window.index(" = tt.dot ") < first_window.index(
+        "amdg.buffer_load"
+    )
+
+
+def test_amd_intra_wave_pipeline_interleaves_coarse_stages_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_coarse_pipeline_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+            "WITH_BARRIER": "constexpr",
+        },
+        constexprs={"WITH_BARRIER": False},
+    )
+    assert "triton.intra_wave_pipeline.auto_interleave" in compiled.asm[
+        "ttir"
+    ]
+    ttgir = compiled.asm["ttgir"]
+    assert "triton.intra_wave_pipeline.marker" not in ttgir
+    assert "triton.intra_wave_pipeline.auto_interleave" not in ttgir
+    assert "rocdl.sched.group.barrier" in ttgir
+    outer_barriers = [
+        match.start()
+        for match in re.finditer("rocdl.sched.barrier none", ttgir)
+    ]
+    # The source window supplies the two hard outer boundaries. Reconstructed
+    # source anchors share one scheduling-group pipeline inside that window;
+    # making every anchor a separate hard boundary defeats cross-anchor
+    # latency hiding.
+    assert len(outer_barriers) == 2
+    window = ttgir[outer_barriers[0]:outer_barriers[-1]]
+    loads = [
+        match.start() for match in re.finditer("amdg.buffer_load", window)
+    ]
+    post_loads = [
+        match.start() for match in re.finditer("arith.addf", window)
+    ]
+    dots = [match.start() for match in re.finditer(" = tt.dot ", window)]
+    assert len(loads) == 2
+    assert len(post_loads) == 2
+    assert len(dots) == 5
+    assert (
+        loads[0]
+        < post_loads[0]
+        < dots[0]
+        < dots[1]
+        < loads[1]
+        < post_loads[1]
+        < dots[2]
+        < dots[3]
+        < dots[4]
+    )
+    # Reconstructed chunks carry their scheduling groups in source order, but
+    # all groups use one sync ID so they form one LLVM scheduling pipeline.
+    groups = re.findall(
+        r"rocdl\.sched\.group\.barrier ([a-z_]+), ([0-9]+),", window
+    )
+    assert groups == [
+        ("vmem_read", "1"),
+        ("mfma_wmma", "2"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "3"),
+    ]
+    sync_ids = re.findall(
+        r"rocdl\.sched\.group\.barrier [a-z_]+, [0-9]+, ([0-9]+)",
+        window,
+    )
+    assert len(set(sync_ids)) == 1
+
+
+def test_amd_intra_wave_pipeline_partitions_one_mixed_window_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_single_window_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+        },
+        constexprs={},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "triton.intra_wave_pipeline.marker" not in ttgir
+    outer_barriers = [
+        match.start()
+        for match in re.finditer("rocdl.sched.barrier none", ttgir)
+    ]
+    assert len(outer_barriers) == 2
+    window = ttgir[outer_barriers[0]:outer_barriers[-1]]
+    loads = [
+        match.start() for match in re.finditer("amdg.buffer_load", window)
+    ]
+    dots = [match.start() for match in re.finditer(" = tt.dot ", window)]
+    assert len(loads) == 2
+    assert len(dots) == 5
+    assert loads[0] < dots[0] < dots[1] < loads[1] < dots[2]
+    assert re.findall(
+        r"rocdl\.sched\.group\.barrier ([a-z_]+), ([0-9]+),", window
+    ) == [
+        ("vmem_read", "1"),
+        ("mfma_wmma", "2"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "3"),
+    ]
+    sync_ids = re.findall(
+        r"rocdl\.sched\.group\.barrier [a-z_]+, [0-9]+, ([0-9]+)",
+        window,
+    )
+    assert len(set(sync_ids)) == 1
+
+
+def test_amd_intra_wave_pipeline_rejects_dependent_mixed_window_gfx950():
+    with pytest.raises(
+        RuntimeError,
+        match="dataflow between its memory and MFMA streams",
+    ):
+        compile_for_gfx950(
+            _amd_intra_wave_single_window_dependent_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "output_ptr": "*fp32",
+            },
+            constexprs={},
+        )
+
+
+def test_amd_intra_wave_pipeline_rejects_one_window_memory_write_gfx950():
+    with pytest.raises(
+        RuntimeError,
+        match="supports only read-only memory operations",
+    ):
+        compile_for_gfx950(
+            _amd_intra_wave_single_window_write_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "publish_ptr": "*fp16",
+                "output_ptr": "*fp32",
+            },
+            constexprs={},
+        )
+
+
+def test_amd_intra_wave_pipeline_prices_mixed_memory_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_mixed_pipeline_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "publish_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+            "DOT_COUNT": "constexpr",
+            "COVER_POLICY": "constexpr",
+        },
+        constexprs={"DOT_COUNT": 10, "COVER_POLICY": "balanced"},
+    )
+    ttgir = compiled.asm["ttgir"]
+    groups = re.findall(
+        r"rocdl\.sched\.group\.barrier ([a-z_]+), ([0-9]+),", ttgir
+    )
+    mixed_begin = groups.index(("ds_write", "1"))
+    mixed_groups = groups[mixed_begin:mixed_begin + 8]
+    assert mixed_groups == [
+        ("ds_write", "1"),
+        ("mfma_wmma", "2"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "3"),
+        ("ds_write", "1"),
+        ("mfma_wmma", "2"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "3"),
+    ], mixed_groups
+
+
+def test_amd_intra_wave_pipeline_scales_mixed_memory_proportionally_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_mixed_pipeline_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "publish_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+            "DOT_COUNT": "constexpr",
+            "COVER_POLICY": "constexpr",
+        },
+        constexprs={"DOT_COUNT": 10, "COVER_POLICY": "proportional"},
+    )
+    groups = re.findall(
+        r"rocdl\.sched\.group\.barrier ([a-z_]+), ([0-9]+),",
+        compiled.asm["ttgir"],
+    )
+    mixed_begin = groups.index(("ds_write", "1"))
+    assert groups[mixed_begin:mixed_begin + 8] == [
+        ("ds_write", "1"),
+        ("mfma_wmma", "1"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "4"),
+        ("ds_write", "1"),
+        ("mfma_wmma", "1"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "4"),
+    ]
+
+
+def test_amd_intra_wave_pipeline_reserves_mixed_memory_anchors_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_mixed_pipeline_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "publish_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+            "DOT_COUNT": "constexpr",
+            "COVER_POLICY": "constexpr",
+        },
+        constexprs={"DOT_COUNT": 2, "COVER_POLICY": "balanced"},
+    )
+    ttgir = compiled.asm["ttgir"]
+    groups = re.findall(
+        r"rocdl\.sched\.group\.barrier ([a-z_]+), ([0-9]+),", ttgir
+    )
+    mixed_begin = groups.index(("ds_write", "1"))
+    mixed_groups = groups[mixed_begin:mixed_begin + 6]
+    assert mixed_groups == [
+        ("ds_write", "1"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "1"),
+        ("ds_write", "1"),
+        ("vmem_read", "1"),
+        ("mfma_wmma", "1"),
+    ], mixed_groups
+
+
+def test_amd_intra_wave_pipeline_rejects_unknown_side_effects_gfx950():
+    with pytest.raises(
+        RuntimeError,
+        match="unsupported side effect inside an intra-wave pipeline stage",
+    ):
+        compile_for_gfx950(
+            _amd_intra_wave_coarse_pipeline_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "future_ptr": "*fp16",
+                "output_ptr": "*fp32",
+                "side_output_ptr": "*fp16",
+                "WITH_BARRIER": "constexpr",
+            },
+            constexprs={"WITH_BARRIER": True},
+        )
+
+
+def test_amd_intra_wave_pipeline_rejects_dependent_stages_gfx950():
+    with pytest.raises(
+        RuntimeError,
+        match="intra-wave pipeline stages must be dataflow-independent",
+    ):
+        compile_for_gfx950(
+            _amd_intra_wave_dependent_pipeline_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "output_ptr": "*fp32",
+            },
+            constexprs={},
+        )
+
+
+def test_warp_pipeline_stage_scope_validation():
+    inter_wave = tlx.warp_pipeline_stage("compute", priority=2)
+    assert inter_wave.scope == "inter_wave"
+    assert inter_wave.priority == 2
+    stage = tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=3)
+    assert stage.label == "compute"
+    assert stage.scope == "intra_wave"
+    assert stage.pair == 3
+    assert not stage.auto_interleave
+    assert tlx.warp_pipeline_stage(
+        "compute", scope="intra_wave", auto_interleave=True
+    ).auto_interleave
+    proportional = tlx.warp_pipeline_stage(
+        "compute", scope="intra_wave", auto_interleave=True, cover_policy="proportional"
+    )
+    assert proportional.cover_policy == "proportional"
+    with pytest.raises(ValueError, match="label must be a string"):
+        tlx.warp_pipeline_stage(1, scope="intra_wave")
+    with pytest.raises(ValueError, match="pair must be a non-negative integer"):
+        tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=-1)
+    with pytest.raises(ValueError, match="auto_interleave must be a bool"):
+        tlx.warp_pipeline_stage("compute", scope="intra_wave", auto_interleave=1)
+    with pytest.raises(ValueError, match="cover_policy must be"):
+        tlx.warp_pipeline_stage(
+            "compute", scope="intra_wave", auto_interleave=True, cover_policy="unknown"
+        )
+    with pytest.raises(ValueError, match="requires auto_interleave=True"):
+        tlx.warp_pipeline_stage("compute", scope="intra_wave", cover_policy="proportional")
+    with pytest.raises(ValueError, match="scope must be"):
+        tlx.warp_pipeline_stage("compute", scope="warp")
+    with pytest.raises(ValueError, match="only meaningful with scope='intra_wave'"):
+        tlx.warp_pipeline_stage("compute", auto_interleave=True)
+    with pytest.raises(ValueError, match="only meaningful with scope='inter_wave'"):
+        tlx.warp_pipeline_stage("compute", scope="intra_wave", priority=1)
+    assert not hasattr(tlx, "intra_wave_pipeline_stage")
 
 
 @pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])

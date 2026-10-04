@@ -477,4 +477,25 @@ def TritonAMDGPUSchedGroupBarrierScheduler
                            "mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUIntraWavePipeline
+    : Pass<"tritonamdgpu-intra-wave-pipeline", "mlir::ModuleOp"> {
+  let summary =
+      "Lower explicit TLX intra-wave regions to AMD scheduling groups";
+
+  let description = [{
+    Consumes adjacent paired regions or one mixed automatic region emitted by
+    tlx.warp_pipeline_stage(scope="intra_wave"). The source defines the
+    complete memory/compute cover set; this pass validates or partitions the
+    window, derives the machine-instruction counts represented by its TTGIR
+    operations, and emits sched_group_barrier constraints. It does not split
+    or phase-shift warp groups and does not add operations from outside the
+    explicit regions.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
+}
+
 #endif

@@ -1723,9 +1723,11 @@ void init_triton_tlx_ir(py::module_ &m) {
           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
              std::optional<Value> mask, std::optional<Value> other,
              tt::CacheModifier cache, uint32_t contiguity) -> Value {
-            return self.create<ttag::BufferLoadToLocalOp>(
+            auto load = self.create<ttag::BufferLoadToLocalOp>(
                 dest, ptr, offsets, mask.value_or(Value()),
                 other.value_or(Value()), Value() /*stride*/, cache, contiguity);
+            load.setContiguity(contiguity);
+            return load;
           },
           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("other").none(), py::arg("cache"),

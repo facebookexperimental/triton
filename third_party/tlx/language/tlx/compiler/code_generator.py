@@ -396,13 +396,77 @@ def visit_withWarpPipelineStage(self, node):
     context = node.items[0].context_expr
     args = [self.visit(arg) for arg in context.args]
     kwargs = {kw.arg: self.visit(kw.value) for kw in context.keywords}
+    if len(args) > 1:
+        raise ValueError("tlx.warp_pipeline_stage accepts at most one positional argument")
+    unknown = set(kwargs) - {
+        "scope",
+        "priority",
+        "pair",
+        "auto_interleave",
+        "cover_policy",
+    }
+    if unknown:
+        raise ValueError(
+            "unexpected tlx.warp_pipeline_stage keyword(s): "
+            + ", ".join(sorted(unknown))
+        )
 
     label = _unwrap_if_constexpr(args[0]) if args else None
+    scope = _unwrap_if_constexpr(kwargs.get("scope", "inter_wave"))
+    if scope not in ("inter_wave", "intra_wave"):
+        raise ValueError(
+            "scope must be 'inter_wave' or 'intra_wave', got "
+            f"{scope!r}"
+        )
     if label is None:
-        label = "cluster"
+        label = "cluster" if scope == "inter_wave" else "stage"
     priority = _unwrap_if_constexpr(kwargs.get("priority", None))
-    if priority is None:
-        priority = -1
+    pair = _unwrap_if_constexpr(kwargs.get("pair", 0))
+    auto_interleave = _unwrap_if_constexpr(
+        kwargs.get("auto_interleave", False)
+    )
+    cover_policy = _unwrap_if_constexpr(
+        kwargs.get("cover_policy", "balanced")
+    )
 
+    if priority is not None and not (0 <= priority <= 3):
+        raise ValueError(f"priority must be 0-3, got {priority}")
+    if not isinstance(pair, int) or isinstance(pair, bool) or pair < 0:
+        raise ValueError(f"pair must be a non-negative integer, got {pair!r}")
+    if not isinstance(auto_interleave, bool):
+        raise ValueError(
+            "auto_interleave must be a bool, got "
+            f"{type(auto_interleave).__name__}"
+        )
+    if cover_policy not in ("balanced", "proportional"):
+        raise ValueError(
+            "cover_policy must be 'balanced' or 'proportional', got "
+            f"{cover_policy!r}"
+        )
+    if cover_policy != "balanced" and not auto_interleave:
+        raise ValueError(
+            "a non-default cover_policy requires auto_interleave=True"
+        )
+    if scope == "inter_wave":
+        if pair != 0 or auto_interleave or cover_policy != "balanced":
+            raise ValueError(
+                "pair, auto_interleave, and cover_policy are only meaningful "
+                "with scope='intra_wave'"
+            )
+        self.visit_compound_statement(node.body)
+        self.builder.create_warp_pipeline_border(
+            str(label), -1 if priority is None else priority
+        )
+        return
+
+    if priority is not None:
+        raise ValueError(
+            "priority is only meaningful with scope='inter_wave'"
+        )
+    self.builder.create_intra_wave_pipeline_marker(
+        str(label), pair, auto_interleave, str(cover_policy), True
+    )
     self.visit_compound_statement(node.body)
-    self.builder.create_warp_pipeline_border(str(label), priority)
+    self.builder.create_intra_wave_pipeline_marker(
+        str(label), pair, auto_interleave, str(cover_policy), False
+    )
