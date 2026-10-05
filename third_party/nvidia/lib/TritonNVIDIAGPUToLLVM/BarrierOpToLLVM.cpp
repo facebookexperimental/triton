@@ -514,20 +514,22 @@ struct ArriveBarrierOpConversion
       };
 
       if (op.isMulticast() && targetInfo->supportsMbarrierMulticast()) {
+        int physicalNumCTAs = triton::gpu::lookupPhysicalNumCTAs(op);
         Value mask = LLVM::NVIDIA::createTMAMulticastMask(
-            loc, rewriter, static_cast<uint16_t>(op.getCtaMask()));
+            loc, rewriter, static_cast<uint16_t>(op.getCtaMask()), Value(),
+            physicalNumCTAs);
         emitArrive(barrierPtr, mask);
       } else if (op.isMulticast()) {
         uint32_t broadcastMask = op.getCtaMask();
         Value ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
-        Value classBase = b.and_(
-            ctaId, b.i32_val(static_cast<int32_t>(~broadcastMask)));
+        Value classBase =
+            b.and_(ctaId, b.i32_val(static_cast<int32_t>(~broadcastMask)));
         auto remotePtrTy = LLVM::LLVMPointerType::get(getContext(), 7);
         uint32_t ctaOffset = broadcastMask;
         while (true) {
           Value targetCtaId = b.or_(classBase, b.i32_val(ctaOffset));
-          Value targetBarrier = NVVM::MapaOp::create(
-              rewriter, loc, remotePtrTy, barrierPtr, targetCtaId);
+          Value targetBarrier = NVVM::MapaOp::create(rewriter, loc, remotePtrTy,
+                                                     barrierPtr, targetCtaId);
           emitArrive(targetBarrier);
           if (ctaOffset == 0)
             break;

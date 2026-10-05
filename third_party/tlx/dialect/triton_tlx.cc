@@ -960,14 +960,23 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_barrier_arrive",
           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
              std::optional<Value> pred, std::optional<uint32_t> ctaMask,
-             int numCTAs) -> void {
+             std::vector<int32_t> clusterDims) -> void {
             if (ctaMask.has_value()) {
+              assert(clusterDims.size() == 3 &&
+                     "expected three cluster dimensions");
               auto module = self.getBuilder()
                                 .getInsertionBlock()
                                 ->getParentOp()
                                 ->getParentOfType<ModuleOp>();
-              module->setAttr(ttg::AttrNumCTAsName,
-                              self.getBuilder().getI32IntegerAttr(numCTAs));
+              module->setAttr(
+                  ttg::AttrClusterDimX,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[0]));
+              module->setAttr(
+                  ttg::AttrClusterDimY,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[1]));
+              module->setAttr(
+                  ttg::AttrClusterDimZ,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[2]));
               self.create<ttng::ArriveBarrierOp>(
                   mbarrierLoc, arriveCount, ctaMask.value(),
                   pred.has_value() ? pred.value() : Value());
@@ -978,8 +987,9 @@ void init_triton_tlx_ir(py::module_ &m) {
               self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount);
             }
           },
-          py::arg("mbarrierLoc"), py::arg("arriveCount"), py::arg("pred").none(),
-          py::arg("ctaMask").none(), py::arg("numCTAs"))
+          py::arg("mbarrierLoc"), py::arg("arriveCount"),
+          py::arg("pred").none(), py::arg("ctaMask").none(),
+          py::arg("clusterDims"))
       .def(
           "create_warp_barrier_arrive",
           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,

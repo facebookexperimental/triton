@@ -4,7 +4,18 @@ from .mem_ops import remote_view
 from .utility import is_hip
 
 
+def _physical_num_ctas(_semantic):
+    """Number of CTAs that physically execute in a cluster."""
+    cluster_dims = _semantic.builder.options.cluster_dims
+    physical_num_ctas = cluster_dims[0] * cluster_dims[1] * cluster_dims[2]
+    if physical_num_ctas > 1:
+        return physical_num_ctas
+    return _semantic.builder.options.num_ctas
+
+
 def _make_mbarrier_layout_handle(_semantic):
+    # Barrier layouts follow the logical distributed-program model. A
+    # ctas_per_cga cluster keeps each CTA's barrier local, so num_ctas remains 1.
     layout = tlx.layout(tlx.swizzled_layout.make_default(rank=1))
     num_ctas = _semantic.builder.options.num_ctas
     if num_ctas > 1:
@@ -130,7 +141,12 @@ def alloc_warp_barrier(
     arrive_count = num_warps.value * 32 * num_arrivals.value
     layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
-        _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count, layout_handle),
+        _semantic.builder.create_alloc_barriers(
+            num_barriers.value,
+            arrive_count,
+            layout_handle,
+            _semantic.builder.options.num_ctas,
+        ),
         num_barriers,
         layout,
         is_warp_barrier=True,
@@ -225,9 +241,12 @@ def barrier_arrive(
         assert remote_cta_rank is None, "cta_mask cannot be combined with remote_cta_rank"
         assert not is_warp_bar, "cta_mask is not supported for warp barriers"
         assert not is_hip(), "cta_mask is only supported on NVIDIA GPUs"
-        num_ctas = _semantic.builder.options.num_ctas
-        assert num_ctas > 1, "cta_mask requires num_ctas > 1"
-        assert cta_mask_value <= num_ctas - 1, "cta_mask must not exceed num_ctas - 1"
+        num_ctas = _physical_num_ctas(_semantic)
+        assert num_ctas > 1, "cta_mask requires more than one CTA per cluster"
+        assert (num_ctas & (num_ctas - 1)) == 0, (
+            "cta_mask requires a power-of-two physical cluster size")
+        assert all((cta_rank | cta_mask_value) < num_ctas for cta_rank in range(num_ctas)), (
+            "cta_mask selects a CTA outside the physical cluster")
 
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
@@ -242,7 +261,7 @@ def barrier_arrive(
             arrive_count.value,
             pred_handle,
             cta_mask_value,
-            _semantic.builder.options.num_ctas,
+            list(_semantic.builder.options.cluster_dims),
         )
 
 

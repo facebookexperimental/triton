@@ -468,13 +468,13 @@ def _cta_mask_barrier_kernel():
     tlx.barrier_wait(bar, phase=0)
 
 
-def _compile_cta_mask_barrier(capability):
+def _compile_cta_mask_barrier(capability, cluster_option="ctas_per_cga"):
     source = ASTSource(fn=_cta_mask_barrier_kernel, signature={}, constexprs={})
     target = GPUTarget("cuda", capability, 32)
     backend = make_backend(target)
     options = backend.parse_options({
         "num_warps": 4,
-        "num_ctas": 2,
+        cluster_option: (2, 1, 1),
         **source.parse_options(),
     })
     context = ir.context()
@@ -502,15 +502,24 @@ def _compile_cta_mask_barrier(capability):
 @pytest.mark.parametrize("capability,ptx_target", [(103, "sm_103a"), (107, "sm_107a")])
 def test_barrier_arrive_cta_mask_lowers_on_sm103up(capability, ptx_target):
     compiled = _compile_cta_mask_barrier(capability)
+    assert '"ttg.num-ctas" = 1 : i32' in compiled["ttgir"]
+    assert '"ttg.cluster-dim-x" = 2 : i32' in compiled["ttgir"]
     assert "ctaMask = 1" in compiled["ttgir"]
     assert ".version 9.4" in compiled["ptx"]
     assert f".target {ptx_target}" in compiled["ptx"]
     if capability == 107:
         assert compiled["ptx"].count("mbarrier.arrive.shared::cluster.multicast::cluster::32b") == 1
+        assert re.search(r"mov\.b32\s+%r\d+, 3;", compiled["ptx"])
     else:
         assert "multicast::cluster::32b" not in compiled["ptx"]
         assert compiled["ptx"].count("mapa.shared::cluster.u32") == 2
         assert compiled["ptx"].count("mbarrier.arrive.shared::cluster.b64") == 2
+
+
+def test_barrier_arrive_cta_mask_accepts_cluster_dims_alias():
+    compiled = _compile_cta_mask_barrier(103, cluster_option="cluster_dims")
+    assert '"ttg.num-ctas" = 1 : i32' in compiled["ttgir"]
+    assert '"ttg.cluster-dim-x" = 2 : i32' in compiled["ttgir"]
 
 
 @pytest.mark.skipif(not is_blackwell_ultra(), reason="Need Blackwell Ultra")
@@ -529,7 +538,7 @@ def test_barrier_arrive_cta_mask_executes_on_sm103(device):
             tl.store(output_ptr + pid, pid + 1)
 
     output = torch.zeros(2, dtype=torch.int32, device=device)
-    compiled = kernel[(2, )](output, num_warps=4, num_ctas=2)
+    compiled = kernel[(2, )](output, num_warps=4, ctas_per_cga=(2, 1, 1))
 
     torch.testing.assert_close(output, torch.tensor([1, 2], dtype=torch.int32, device=device))
     assert "multicast::cluster::32b" not in compiled.asm["ptx"]
@@ -554,7 +563,36 @@ def test_barrier_arrive_cta_mask_value_validation(cta_mask, message):
         tlx.barrier_arrive(bar, cta_mask=CTA_MASK)
 
     with pytest.raises(triton.CompilationError, match=message):
-        run_parser(kernel, args=(cta_mask, ), target=GPUTarget("cuda", 103, 32))
+        run_parser(
+            kernel,
+            args=(cta_mask, ),
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+@pytest.mark.parametrize(
+    "ctas_per_cga,cta_mask,message",
+    [
+        ((2, 1, 1), 2, "outside the physical cluster"),
+        ((2, 1, 3), 1, "power-of-two physical cluster size"),
+    ],
+)
+def test_barrier_arrive_cta_mask_rejects_unsupported_cluster_or_mask(ctas_per_cga, cta_mask, message):
+
+    @triton.jit
+    def kernel(CTA_MASK: tl.constexpr):
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar, cta_mask=CTA_MASK)
+
+    with pytest.raises(triton.CompilationError, match=message):
+        run_parser(
+            kernel,
+            args=(cta_mask, ),
+            kwargs={"ctas_per_cga": ctas_per_cga},
+            target=GPUTarget("cuda", 103, 32),
+        )
 
 
 def test_barrier_arrive_cta_mask_rejects_dynamic_value():
@@ -566,7 +604,12 @@ def test_barrier_arrive_cta_mask_rejects_dynamic_value():
         tlx.barrier_arrive(bar, cta_mask=cta_mask)
 
     with pytest.raises(triton.CompilationError, match="cta_mask must be a compile-time integer"):
-        run_parser(kernel, args=(1, ), target=GPUTarget("cuda", 103, 32))
+        run_parser(
+            kernel,
+            args=(2, ),
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
 
 
 def test_barrier_arrive_cta_mask_rejects_remote_rank():
@@ -578,7 +621,11 @@ def test_barrier_arrive_cta_mask_rejects_remote_rank():
         tlx.barrier_arrive(bar, remote_cta_rank=0, cta_mask=1)
 
     with pytest.raises(triton.CompilationError, match="cta_mask cannot be combined with remote_cta_rank"):
-        run_parser(kernel, target=GPUTarget("cuda", 103, 32))
+        run_parser(
+            kernel,
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
 
 
 def test_barrier_arrive_cta_mask_rejects_warp_barrier():
@@ -590,7 +637,11 @@ def test_barrier_arrive_cta_mask_rejects_warp_barrier():
         tlx.barrier_arrive(bar, cta_mask=1)
 
     with pytest.raises(triton.CompilationError, match="cta_mask is not supported for warp barriers"):
-        run_parser(kernel, target=GPUTarget("cuda", 103, 32))
+        run_parser(
+            kernel,
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
