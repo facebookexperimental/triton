@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       wheel_url: ${{ steps.wheel_url.outputs.wheel_url }}
-      wheel_filename: ${{ steps.wheel_url.outputs.wheel_filename }}
+      wheel_filename: ${{ steps.wheel.outputs.filename }}
     env:
       MAX_JOBS: 32
       CCACHE_DIR: /tmp/fbtriton-ccache
@@ -80,7 +80,7 @@ jobs:
           uv build --wheel --no-build-isolation --out-dir dist/
           ls -lh dist/
 
-      - name: Validate wheel and prepare S3 artifact
+      - name: Validate wheel and prepare artifact
         id: wheel
         shell: bash
         run: |
@@ -103,13 +103,29 @@ jobs:
           python3 -I -c 'import triton; print("OK", triton.__version__)'
 
           artifact_name="run_${GITHUB_RUN_ID}"
+          echo "filename=${wheels[0]##*/}" >> "$GITHUB_OUTPUT"
           # An explicit S3 prefix overrides the action's name input. Preserve
           # the artifact name as a directory under that prefix.
           mkdir -p "s3-artifacts/${artifact_name}"
           mv "${wheels[0]}" "s3-artifacts/${artifact_name}/"
           echo "name=${artifact_name}" >> "$GITHUB_OUTPUT"
 
+      - name: Upload wheel to GitHub artifacts
+        if: >-
+          github.repository != 'facebookexperimental/triton' ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.wheel.outputs.name }}
+          path: s3-artifacts/${{ steps.wheel.outputs.name }}/*.whl
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: error
+
       - name: Authenticate with AWS
+        if: >-
+          github.repository == 'facebookexperimental/triton' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_triton_artifacts
@@ -117,6 +133,9 @@ jobs:
           aws-region: us-east-1
 
       - name: Upload wheel to S3
+        if: >-
+          github.repository == 'facebookexperimental/triton' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         id: upload
         uses: pytorch/test-infra/.github/actions/upload-artifact-s3@main
         with:
@@ -129,6 +148,9 @@ jobs:
           if-no-files-found: error
 
       - name: Export wheel URL
+        if: >-
+          github.repository == 'facebookexperimental/triton' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         id: wheel_url
         env:
           UPLOADED_OBJECTS: ${{ steps.upload.outputs.uploaded-objects }}
@@ -143,8 +165,7 @@ jobs:
               raise RuntimeError(f"Expected exactly one uploaded wheel, found {len(uploaded_objects)}")
           key = next(iter(uploaded_objects))
           url = f"https://gha-artifacts.s3.us-east-1.amazonaws.com/{quote(key, safe='/')}"
-          filename = key.rsplit("/", 1)[-1]
           print(url)
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"wheel_url={url}\nwheel_filename={filename}\n")
+              output.write(f"wheel_url={url}\n")
           PY
