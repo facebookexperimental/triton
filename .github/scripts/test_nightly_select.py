@@ -1,4 +1,4 @@
-from nightly_select import check_green, commit_green, select
+from nightly_select import canonical_check_name, check_green, commit_green, select
 
 CUT = "2026-07-17T04:00:00Z"
 
@@ -51,3 +51,36 @@ def test_select_walks_to_first_green():
 def test_select_returns_none_when_cap_exhausted():
     req = ["LIT Tests"]
     assert select(["a", "b"], lambda s: {"LIT Tests": []}, req, CUT) is None
+
+
+def test_reusable_workflow_check_names():
+    for platform in ("h100", "b200", "mi350"):
+        name = f"{platform}-tlx-test"
+        assert canonical_check_name(name) == name
+        assert canonical_check_name(f"{platform} / {name}") == name
+    assert canonical_check_name("LIT Tests") == "LIT Tests"
+    assert canonical_check_name("unrelated / b200-tlx-test") == "unrelated / b200-tlx-test"
+
+
+def test_fetch_normalizes_names_and_paginates(monkeypatch):
+    import nightly_run
+
+    pages = []
+
+    def gh_json(path):
+        pages.append(path)
+        if path.endswith("page=1"):
+            return {
+                "check_runs": [{"name": "other"}] * 99 +
+                [{"name": "b200-tlx-test", "completed_at": "2026-07-16T01:00:00Z", "conclusion": "success"}]
+            }
+        return {
+            "check_runs":
+            [{"name": "b200 / b200-tlx-test", "completed_at": "2026-07-17T01:00:00Z", "conclusion": "failure"}]
+        }
+
+    monkeypatch.setattr(nightly_run, "gh_json", gh_json)
+    checks = nightly_run.fetch("sha")
+    assert len(pages) == 2
+    assert len(checks["b200-tlx-test"]) == 2
+    assert not check_green(checks["b200-tlx-test"], CUT)

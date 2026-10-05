@@ -1,0 +1,115 @@
+name: Meta Triton GPU Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only superseded PRs cancel. Independent pushes and scheduled runs can test
+# concurrently, including runs that reuse the same cached wheel.
+concurrency:
+  group: gpu-tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  select:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      build: ${{ steps.select.outputs.build }}
+      h100: ${{ steps.select.outputs.h100 }}
+      b200: ${{ steps.select.outputs.b200 }}
+      mi350: ${{ steps.select.outputs.mi350 }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Select affected GPU platforms
+        id: select
+        run: python3 .github/scripts/gpu_test_selection.py
+
+  build:
+    needs: select
+    if: needs.select.outputs.build == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.select.outputs.sha }}
+
+  h100:
+    needs: [select, build]
+    if: needs.select.outputs.h100 == 'true'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/h100.yml
+    with:
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  b200:
+    needs: [select, build]
+    if: needs.select.outputs.b200 == 'true'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/b200.yml
+    with:
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  mi350:
+    needs: [select, build]
+    if: needs.select.outputs.mi350 == 'true'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/mi350.yml
+    with:
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  gpu-tests:
+    name: GPU tests
+    needs: [select, build, h100, b200, mi350]
+    if: always() && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require selected suites and their build to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          needs = json.loads(os.environ["NEEDS"])
+          if needs["select"]["result"] != "success":
+              raise SystemExit("GPU platform selection did not succeed")
+          for job in ("build", "h100", "b200", "mi350"):
+              selected = needs["select"]["outputs"][job] == "true"
+              if selected and needs[job]["result"] != "success":
+                  raise SystemExit(f"{job}: {needs[job]['result']}")
+          PY

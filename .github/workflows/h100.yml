@@ -1,92 +1,30 @@
 name: Meta Triton H100 Tests
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!website/**'
-      - '!test/**'
-      - '!python/test/unit/language/test_tlx_codegen.py'
-      - '!third_party/amd/**'
-      - '!third_party/tlx/tutorials/blackwell*/**'
-      - '!third_party/tlx/tutorials/blackwell*'
-      - '!third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - '!third_party/tlx/tutorials/gfx9_gemm/**'
-      - '!third_party/amd/python/test/**'
-      - '!python/test/unit/language/test_tlx_*_gfx942.py'
-      - '!python/test/unit/language/test_tlx_*_gfx950.py'
-      - '!python/test/unit/language/test_tlx_*_gfx1250.py'
-      - '!python/test/unit/language/test_tlx_*_hip.py'
-      - '!python/test/unit/tlx_ops/*_gfx950.py'
-      - '!python/test/unit/tlx_ops/*_gfx942.py'
-      - '!python/test/unit/tlx_ops/*_gfx1250.py'
-      - '!python/test/unit/tlx_ops/*_hip.py'
-      - '!python/test/unit/language/test_tlx_*_sm100.py'
-      - '!python/test/unit/tlx_ops/*_sm100.py'
-      - '!third_party/tlx/ops/kernels/**/gfx*.py'
-      - '!third_party/tlx/ops/kernels/**/sm100*.py'
-      # Agent instructions and skills do not affect generated code.
-      - '!.agents/**'
-      - '!.claude/**'
-      - '!.llms/**'
-      - '!AGENTS.md'
-      - '!third_party/tlx/tools/agents/skills/**'
-  pull_request:
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!website/**'
-      - '!test/**'
-      - '!python/test/unit/language/test_tlx_codegen.py'
-      - '!third_party/amd/**'
-      - '!third_party/tlx/tutorials/blackwell*/**'
-      - '!third_party/tlx/tutorials/blackwell*'
-      - '!third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - '!third_party/tlx/tutorials/gfx9_gemm/**'
-      - '!third_party/amd/python/test/**'
-      - '!python/test/unit/language/test_tlx_*_gfx942.py'
-      - '!python/test/unit/language/test_tlx_*_gfx950.py'
-      - '!python/test/unit/language/test_tlx_*_gfx1250.py'
-      - '!python/test/unit/language/test_tlx_*_hip.py'
-      - '!python/test/unit/tlx_ops/*_gfx950.py'
-      - '!python/test/unit/tlx_ops/*_gfx942.py'
-      - '!python/test/unit/tlx_ops/*_gfx1250.py'
-      - '!python/test/unit/tlx_ops/*_hip.py'
-      - '!python/test/unit/language/test_tlx_*_sm100.py'
-      - '!python/test/unit/tlx_ops/*_sm100.py'
-      - '!third_party/tlx/ops/kernels/**/gfx*.py'
-      - '!third_party/tlx/ops/kernels/**/sm100*.py'
-      # Agent instructions and skills do not affect generated code.
-      - '!.agents/**'
-      - '!.claude/**'
-      - '!.llms/**'
-      - '!AGENTS.md'
-      - '!third_party/tlx/tools/agents/skills/**'
-  schedule:
-    - cron: '30 */6 * * *'
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit used to build the wheel
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
 
 env:
+  NIGHTLY_WORKFLOW_NAME: Meta Triton H100 Tests
   MAX_JOBS: 16
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
 
 jobs:
-  h100-build:
-    if: github.repository_owner == 'facebookexperimental'
-    permissions:
-      id-token: write
-      contents: read
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ github.sha }}
-
   h100-meta-triton-test:
-    needs: h100-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-gcp-h100
     env:
@@ -100,13 +38,10 @@ jobs:
     outputs:
       failures: ${{ steps.collect.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.h100-build.result != 'success'
-        run: |
-          echo "h100-build result: ${{ needs.h100-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.ref }}
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -114,12 +49,14 @@ jobs:
           nvidia-smi
       - name: Download prebuilt Triton wheel from S3
         env:
-          WHEEL_URL: ${{ needs.h100-build.outputs.wheel_url }}
-          WHEEL_FILENAME: ${{ needs.h100-build.outputs.wheel_filename }}
+          WHEEL_URL: ${{ inputs.wheel_url }}
+          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
         run: |
           mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
           curl --fail --location --retry 3 \
             --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
+          printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -166,12 +103,11 @@ jobs:
         if: always() && github.event_name == 'schedule' && failure()
         run: |
           BUCKET="h100-tritonbench"
-          TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-meta-triton-test / ${BUCKET}"
+          TITLE="[nightly] ${NIGHTLY_WORKFLOW_NAME} / h100-meta-triton-test / ${BUCKET}"
           FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   h100-tlx-test:
-    needs: h100-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-gcp-h100
     env:
@@ -185,13 +121,10 @@ jobs:
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.h100-build.result != 'success'
-        run: |
-          echo "h100-build result: ${{ needs.h100-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.ref }}
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -199,12 +132,14 @@ jobs:
           nvidia-smi
       - name: Download prebuilt Triton wheel from S3
         env:
-          WHEEL_URL: ${{ needs.h100-build.outputs.wheel_url }}
-          WHEEL_FILENAME: ${{ needs.h100-build.outputs.wheel_filename }}
+          WHEEL_URL: ${{ inputs.wheel_url }}
+          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
         run: |
           mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
           curl --fail --location --retry 3 \
             --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
+          printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -285,12 +220,11 @@ jobs:
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-perf.xml \
             --budget /tmp/tlx-core.xml=60 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-perf.xml=60 \
-            --workflow "${GITHUB_WORKFLOW}" \
+            --workflow "${NIGHTLY_WORKFLOW_NAME}" \
             --job "h100-tlx-test" \
             ${FAILED_FLAG}
 
   h100-runtime-test:
-    needs: h100-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-gcp-h100
     env:
@@ -304,13 +238,10 @@ jobs:
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.h100-build.result != 'success'
-        run: |
-          echo "h100-build result: ${{ needs.h100-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.ref }}
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -318,12 +249,14 @@ jobs:
           nvidia-smi
       - name: Download prebuilt Triton wheel from S3
         env:
-          WHEEL_URL: ${{ needs.h100-build.outputs.wheel_url }}
-          WHEEL_FILENAME: ${{ needs.h100-build.outputs.wheel_filename }}
+          WHEEL_URL: ${{ inputs.wheel_url }}
+          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
         run: |
           mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
           curl --fail --location --retry 3 \
             --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
+          printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -356,7 +289,7 @@ jobs:
           python3 .github/scripts/parse_junit_failures.py \
             --junit /tmp/runtime-unit.xml \
             --budget /tmp/runtime-unit.xml=30 \
-            --workflow "${GITHUB_WORKFLOW}" \
+            --workflow "${NIGHTLY_WORKFLOW_NAME}" \
             --job "h100-runtime-test" \
             ${FAILED_FLAG}
 
@@ -376,11 +309,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton H100 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -405,11 +338,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton H100 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -434,11 +367,11 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton H100 Tests
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.ref }}
       event_name: ${{ github.event_name }}
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
@@ -455,7 +388,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton H100 Tests
       job_name: h100-meta-triton-test
       failures: ${{ needs.h100-meta-triton-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -468,7 +401,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton H100 Tests
       job_name: h100-tlx-test
       failures: ${{ needs.h100-tlx-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -481,11 +414,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: Meta Triton H100 Tests
       job_name: h100-runtime-test
       failures: ${{ needs.h100-runtime-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'pull_request' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
