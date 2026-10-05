@@ -624,7 +624,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
             otherElems, vecStart);
 
       Value loadVal = llLoad(rewriter, loc, ptr, vecTy, pred, falseVal,
-                             multicastMask, cacheMod);
+                             multicastMask, cacheMod, op.getIsVolatile());
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, getTypeConverter()->getIndexType(), ii);
@@ -693,7 +693,14 @@ struct BufferLoadOpConversion
 
     // Get the `other` value (if any)
     SmallVector<Value> otherElems;
-    if (llOther)
+    bool isOtherAllBitsZero = llOther && isZeroConst(op.getOther());
+    if (isOtherAllBitsZero) {
+      auto constantOp = op.getOther().getDefiningOp<arith::ConstantOp>();
+      if (auto denseAttr =
+              dyn_cast<DenseFPElementsAttr>(constantOp.getValueAttr()))
+        isOtherAllBitsZero = denseAttr.getSplatValue<APFloat>().isPosZero();
+    }
+    if (llOther && !isOtherAllBitsZero)
       otherElems =
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
 

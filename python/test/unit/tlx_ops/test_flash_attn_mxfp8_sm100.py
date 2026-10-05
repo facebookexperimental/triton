@@ -35,8 +35,7 @@ def _cosine(actual, expected):
 
 def test_quantize_mxfp8_32x32_operand_layouts():
     from triton.tlx.ops.kernels.flash_attn_mxfp8.sm100 import (
-        _quantize_mxfp8_32x32_operand,
-    )
+        _quantize_mxfp8_32x32_operand, )
 
     ref = torch.randn((2, 3, 256, 128), device="cuda", dtype=torch.bfloat16)
     data, normal_scale, swapped_scale = _quantize_mxfp8_32x32_operand(ref)
@@ -53,8 +52,7 @@ def test_quantize_mxfp8_32x32_operand_layouts():
 def test_quantize_mxfp8_32x32_matches_torchao():
     try:
         from torchao.prototype.mx_formats.kernels import (
-            triton_to_mxfp8_32x32_swizzle_dim0_qdata_dim01_scale,
-        )
+            triton_to_mxfp8_32x32_swizzle_dim0_qdata_dim01_scale, )
     except ImportError:
         pytest.skip("installed torchao does not provide the 32x32 reference quantizer")
 
@@ -65,9 +63,8 @@ def test_quantize_mxfp8_32x32_matches_torchao():
 
     ref = torch.randn((2, 3, 256, 128), device="cuda", dtype=torch.bfloat16)
     data, normal_scale, swapped_scale = _quantize_mxfp8_32x32_operand(ref)
-    ref_data, ref_normal_scale, ref_swapped_scale = (
-        triton_to_mxfp8_32x32_swizzle_dim0_qdata_dim01_scale(ref.reshape(-1, 128))
-    )
+    ref_data, ref_normal_scale, ref_swapped_scale = (triton_to_mxfp8_32x32_swizzle_dim0_qdata_dim01_scale(
+        ref.reshape(-1, 128)))
     ref_normal_scale = swizzled_to_tma_preshuffled(ref_normal_scale, 256, 128, 32, 6)
     ref_swapped_scale = swizzled_to_tma_preshuffled(ref_swapped_scale, 128, 256, 32, 6)
 

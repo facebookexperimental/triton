@@ -36,6 +36,13 @@ protected:
   virtual void update(Operation *operation, StateT *state, FuncMapT *funcMap,
                       OpBuilder *builder) = 0;
 
+  // Branch-sensitive analyses can translate state into the successor's
+  // coordinates before joining it. Other analyses propagate state unchanged.
+  virtual StateT transferEdge(const StateT &state, Block *from,
+                              Block *to) const {
+    return state;
+  }
+
 private:
   void resolve(FunctionOpInterface function, FuncMapT *funcMap,
                OpBuilder *builder) {
@@ -93,7 +100,8 @@ private:
       // so overwrite the output state entirely.
       outputs[block] = state;
       for (VirtualBlock successor : successors) {
-        inputs[successor].join(state);
+        inputs[successor].join(
+            transferEdge(state, block.first, successor.first));
         worklist.push_back(successor);
       }
     }

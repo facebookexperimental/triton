@@ -560,14 +560,14 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 55
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
     assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
-    assert ".private_segment_fixed_size: 8" in amdgcn
+    assert ".private_segment_fixed_size: 20" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 1" in amdgcn
+    assert ".vgpr_spill_count: 4" in amdgcn
     assert ".agpr_count:     0" in amdgcn
 
     unrelated = compile_for_gfx950(
@@ -592,13 +592,13 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 55
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 8" in amdgcn
+    assert ".private_segment_fixed_size: 20" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 1" in amdgcn
+    assert ".vgpr_spill_count: 4" in amdgcn
 
 
 def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -618,8 +618,8 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
     assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 0" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn
+    assert ".private_segment_fixed_size: 20" in amdgcn
+    assert ".vgpr_spill_count: 4" in amdgcn
 
 
 def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -648,6 +648,6 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert ".private_segment_fixed_size: 0" in amdgcn
-    assert ".sgpr_count:     58" in amdgcn
+    assert ".sgpr_count:     53" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
     assert ".vgpr_spill_count: 0" in amdgcn

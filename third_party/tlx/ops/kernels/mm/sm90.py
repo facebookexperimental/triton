@@ -18,7 +18,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ..._catalog import InvalidInput
 from ._shapes import SM90_FOCUS
 
-
 PERF_SHAPES = SM90_FOCUS
 
 
@@ -63,9 +62,7 @@ def _config(block_m, block_n, num_stages):
 
 def _full_configs():
     return [
-        _config(block_m, block_n, num_stages)
-        for block_m, block_n in ((128, 256), (256, 128))
-        for num_stages in (3, 4)
+        _config(block_m, block_n, num_stages) for block_m, block_n in ((128, 256), (256, 128)) for num_stages in (3, 4)
     ]
 
 
@@ -337,10 +334,8 @@ def _tuned(space, shape=None):
     elif space == "smoke":
         configs = SMOKE_CONFIGS()
     else:
-        raise InvalidInput(
-            f"sm90 tlx.ops.mm does not provide search space {space!r}; "
-            "expected 'heuristic', 'full', or 'smoke'"
-        )
+        raise InvalidInput(f"sm90 tlx.ops.mm does not provide search space {space!r}; "
+                           "expected 'heuristic', 'full', or 'smoke'")
     return triton.autotune(
         configs=configs,
         key=["M", "N", "K"],
@@ -362,16 +357,9 @@ def mm(a, b, *, out=None, space="full"):
         raise InvalidInput("sm90 tlx.ops.mm requires B to be row- or column-major")
 
     if out is not None:
-        if (
-            out.shape != (M, N)
-            or out.device != a.device
-            or out.dtype != a.dtype
-            or not out.is_contiguous()
-        ):
-            raise InvalidInput(
-                f"out must be a contiguous {a.dtype} tensor with shape "
-                f"({M}, {N}) on A's device"
-            )
+        if (out.shape != (M, N) or out.device != a.device or out.dtype != a.dtype or not out.is_contiguous()):
+            raise InvalidInput(f"out must be a contiguous {a.dtype} tensor with shape "
+                               f"({M}, {N}) on A's device")
         c = out
     else:
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
@@ -392,7 +380,7 @@ def mm(a, b, *, out=None, space="full"):
 
     def grid(meta):
         num_tiles = triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"])
-        return (min(num_sms, num_tiles),)
+        return (min(num_sms, num_tiles), )
 
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
     kernel[grid](
