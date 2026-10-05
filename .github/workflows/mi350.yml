@@ -140,7 +140,14 @@ jobs:
         run: |
           set -eux
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/download-artifact@v4
+        with:
+          name: run_${{ github.run_id }}
+          path: ${{ runner.temp }}/prebuilt-wheel
       - name: Download prebuilt Triton wheel from S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           WHEEL_URL: ${{ needs.mi350-build.outputs.wheel_url }}
           WHEEL_FILENAME: ${{ needs.mi350-build.outputs.wheel_filename }}
@@ -217,7 +224,14 @@ jobs:
         run: |
           set -eux
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/download-artifact@v4
+        with:
+          name: run_${{ github.run_id }}
+          path: ${{ runner.temp }}/prebuilt-wheel
       - name: Download prebuilt Triton wheel from S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           WHEEL_URL: ${{ needs.mi350-build.outputs.wheel_url }}
           WHEEL_FILENAME: ${{ needs.mi350-build.outputs.wheel_filename }}
@@ -467,7 +481,14 @@ jobs:
         run: |
           set -eux
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --no-build
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/download-artifact@v4
+        with:
+          name: run_${{ github.run_id }}
+          path: ${{ runner.temp }}/prebuilt-wheel
       - name: Download prebuilt Triton wheel from S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           WHEEL_URL: ${{ needs.mi350-build.outputs.wheel_url }}
           WHEEL_FILENAME: ${{ needs.mi350-build.outputs.wheel_filename }}
