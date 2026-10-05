@@ -7,8 +7,6 @@
 
 [Warp-specialized MXFP8 GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py)
 
-[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell-grouped-gemm_test.py)
-
 [Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_pipelined.py)
 
 [CLC GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_clc.py)

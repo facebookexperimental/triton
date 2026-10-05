@@ -28,23 +28,36 @@ Ragged handling (mask-free hot loop):
     tail. Small K (< 2 whole tiles) skips the pipeline entirely and runs only
     the tail.
 """
+
 import os
+import threading
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 # gfx950 has 8 XCDs
 NUM_XCDS = 8
+_ENV_LOCK = threading.Lock()
 
 
-def num_sms():
-    return torch.cuda.get_device_properties(DEVICE).multi_processor_count
+def _num_sms(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _setup_env():
+    """Disable post-RA scheduling only while this inter-wave kernel compiles."""
+    previous = os.environ.get("TRITON_DISABLE_POST_MISCHED")
+    os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
+    return previous
+
+
+def _teardown_env(previous):
+    if previous is None:
+        os.environ.pop("TRITON_DISABLE_POST_MISCHED", None)
+    else:
+        os.environ["TRITON_DISABLE_POST_MISCHED"] = previous
 
 
 @triton.jit
@@ -55,7 +68,7 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
         return pid
     xcd = pid % num_xcds
     local_pid = pid // num_xcds
-    return ((local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size))
+    return (local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size)
 
 
 @triton.jit
@@ -285,17 +298,29 @@ def _grouped_gemm_tile(
     offs_cn_right = offs_cn_left + HALF_N
 
     c_tl = acc_tl.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_left[None, :], c_tl,
-             mask=(offs_cm_top[:, None] < gm) & (offs_cn_left[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_left[None, :],
+        c_tl,
+        mask=(offs_cm_top[:, None] < gm) & (offs_cn_left[None, :] < gn),
+    )
     c_bl = acc_bl.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_left[None, :], c_bl,
-             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_left[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_left[None, :],
+        c_bl,
+        mask=(offs_cm_bot[:, None] < gm) & (offs_cn_left[None, :] < gn),
+    )
     c_tr = acc_tr.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_right[None, :], c_tr,
-             mask=(offs_cm_top[:, None] < gm) & (offs_cn_right[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_right[None, :],
+        c_tr,
+        mask=(offs_cm_top[:, None] < gm) & (offs_cn_right[None, :] < gn),
+    )
     c_br = acc_br.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_right[None, :], c_br,
-             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_right[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_right[None, :],
+        c_br,
+        mask=(offs_cm_bot[:, None] < gm) & (offs_cn_right[None, :] < gn),
+    )
 
 
 @triton.jit
@@ -350,17 +375,22 @@ def _grouped_gemm_tile_generic(
     if HAS_K_TAIL and n_full * BLOCK_SIZE_K < gk:
         k_start = n_full * BLOCK_SIZE_K
         k_mask = offs_k < gk - k_start
-        a_t = tl.load(a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]), mask=k_mask[None, :],
-                      other=0.0)
-        b_t = tl.load(b_ptr + (k_start + offs_k[:, None]) + offs_bn[None, :] * stride_bn, mask=k_mask[:, None],
-                      other=0.0)
+        a_t = tl.load(
+            a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]), mask=k_mask[None, :], other=0.0
+        )
+        b_t = tl.load(
+            b_ptr + (k_start + offs_k[:, None]) + offs_bn[None, :] * stride_bn, mask=k_mask[:, None], other=0.0
+        )
         acc = tl.dot(a_t, b_t, acc, allow_tf32=False)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c = acc.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :], c,
-             mask=(offs_cm[:, None] < gm) & (offs_cn[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :],
+        c,
+        mask=(offs_cm[:, None] < gm) & (offs_cn[None, :] < gn),
+    )
 
 
 @triton.jit
@@ -409,12 +439,27 @@ def grouped_gemm_kernel(
 
         # Swizzled (row/col-permuted) LDS layout pinned to kill bank conflicts.
         # All four half-tiles are [128, 64].
-        tl.static_assert(HALF_M == 128 and HALF_N == 128 and BLOCK_SIZE_K == 64,
-                         "pinned swizzle bases are hardcoded for [128, 64] half-tiles")
+        tl.static_assert(
+            HALF_M == 128 and HALF_N == 128 and BLOCK_SIZE_K == 64,
+            "pinned swizzle bases are hardcoded for [128, 64] half-tiles",
+        )
         smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
             [(512, 16)],
-            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0],
-             [8, 0]],
+            [
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [16, 0],
+                [32, 0],
+                [64, 0],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+            ],
             [HALF_M, BLOCK_SIZE_K],
         )
 
@@ -468,14 +513,47 @@ def grouped_gemm_kernel(
 
             # Compute this (pid_m, pid_n) output tile. Scheduler-agnostic logic.
             if TILE_MODE == 0:
-                _grouped_gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn, stride_cm,
-                                   smem_a_top, smem_a_bot, smem_b_left, smem_b_right, BLOCK_SIZE_M=BLOCK_SIZE_M,
-                                   BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_BUFFERS=NUM_BUFFERS,
-                                   HAS_K_TAIL=HAS_K_TAIL)
+                _grouped_gemm_tile(
+                    pid_m,
+                    pid_n,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    gm,
+                    gn,
+                    gk,
+                    stride_am,
+                    stride_bn,
+                    stride_cm,
+                    smem_a_top,
+                    smem_a_bot,
+                    smem_b_left,
+                    smem_b_right,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    NUM_BUFFERS=NUM_BUFFERS,
+                    HAS_K_TAIL=HAS_K_TAIL,
+                )
             else:
-                _grouped_gemm_tile_generic(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn,
-                                           stride_cm, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
-                                           BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_STAGES=NUM_STAGES, HAS_K_TAIL=HAS_K_TAIL)
+                _grouped_gemm_tile_generic(
+                    pid_m,
+                    pid_n,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    gm,
+                    gn,
+                    gk,
+                    stride_am,
+                    stride_bn,
+                    stride_cm,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    NUM_STAGES=NUM_STAGES,
+                    HAS_K_TAIL=HAS_K_TAIL,
+                )
 
             # Program p owns tiles p, p+NUM_SM, p+2*NUM_SM, and so on
             tile_idx += NUM_SM
@@ -514,7 +592,7 @@ def _needs_k_tail(shapes, cfg):
     if cfg["TILE_MODE"] == 0:
         return True
     bk = cfg["BLOCK_SIZE_K"]
-    for (_, _, K) in shapes:
+    for _, _, K in shapes:
         if K > (K // bk) * bk:
             return True
     return False
@@ -556,7 +634,7 @@ def _tile_score(shapes, bm, bn, rate, nsm):
     return rate * util * (useful / padded)
 
 
-def _pick_config(shapes):
+def _pick_config(shapes, device):
     """Choose a launch config from the group's shapes.
 
     The quadrant path is by far the fastest per-tile engine (782.7 vs 683.5
@@ -565,7 +643,7 @@ def _pick_config(shapes):
     it rounds every M up to 256. Score both engines on the same footing and take
     the winner.
     """
-    nsm = num_sms()
+    nsm = _num_sms(device)
 
     def entry(bm, bn, rate, cfg):
         tiles = sum(_cdiv(M, bm) * _cdiv(N, bn) for (M, N, _) in shapes)
@@ -583,10 +661,22 @@ def _pick_config(shapes):
     for (bm, bn), (rate, bk, warps, stages) in _GENERIC_RATES.items():
         cands.append(
             entry(
-                bm, bn, rate, {
-                    "BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "GROUP_SIZE_M": 8, "NUM_BUFFERS": 2,
-                    "XCD_CHUNK": 16, "num_warps": warps, "TILE_MODE": 1, "NUM_STAGES": stages
-                }))
+                bm,
+                bn,
+                rate,
+                {
+                    "BLOCK_SIZE_M": bm,
+                    "BLOCK_SIZE_N": bn,
+                    "BLOCK_SIZE_K": bk,
+                    "GROUP_SIZE_M": 8,
+                    "NUM_BUFFERS": 2,
+                    "XCD_CHUNK": 16,
+                    "num_warps": warps,
+                    "TILE_MODE": 1,
+                    "NUM_STAGES": stages,
+                },
+            )
+        )
 
     # c[0] = predicted throughput
     # c[1] = arithmetic intensity
@@ -612,8 +702,9 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
     group_A[i]: fp16 [M_i, K_i] row-major (K contiguous).
     group_B[i]: fp16 [K_i, N_i] column-major (K contiguous) == [N_i, K_i].t().
     """
+    device = group_A[0].device
     shapes = [(A.shape[0], B.shape[1], A.shape[1]) for A, B in zip(group_A, group_B)]
-    cfg = _pick_config(shapes)
+    cfg = _pick_config(shapes, device)
     if config:
         cfg.update(config)
     if not config or "HAS_K_TAIL" not in config:
@@ -630,7 +721,7 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
         Kb, N = B.shape
         assert K == Kb, f"K mismatch: A has K={K}, B has K={Kb}"
         assert B.stride(0) == 1, "B must be column-major [K, N] (K contiguous, stride(0)==1)"
-        C = torch.empty((M, N), device=DEVICE, dtype=A.dtype)
+        C = torch.empty((M, N), device=device, dtype=A.dtype)
         group_C.append(C)
         A_addrs.append(A.data_ptr())
         B_addrs.append(B.data_ptr())
@@ -639,11 +730,11 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
         # lda = A row stride (K); ldb = B N-stride (== K for col-major); ldc = C row stride (N)
         g_lds += [A.stride(0), B.stride(1), C.stride(0)]
 
-    d_a_ptrs = torch.tensor(A_addrs, dtype=torch.int64, device=DEVICE)
-    d_b_ptrs = torch.tensor(B_addrs, dtype=torch.int64, device=DEVICE)
-    d_c_ptrs = torch.tensor(C_addrs, dtype=torch.int64, device=DEVICE)
-    d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device=DEVICE)
-    d_g_lds = torch.tensor(g_lds, dtype=torch.int32, device=DEVICE)
+    d_a_ptrs = torch.tensor(A_addrs, dtype=torch.int64, device=device)
+    d_b_ptrs = torch.tensor(B_addrs, dtype=torch.int64, device=device)
+    d_c_ptrs = torch.tensor(C_addrs, dtype=torch.int64, device=device)
+    d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device=device)
+    d_g_lds = torch.tensor(g_lds, dtype=torch.int32, device=device)
 
     return d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, group_C
 
@@ -651,94 +742,47 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
 def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
     """Forward already-constructed tensors straight to the kernel (no host-side
     setup), so it can be timed on its own."""
-    NUM_SM = num_sms()
-    grouped_gemm_kernel[(NUM_SM, )](
-        d_a_ptrs,
-        d_b_ptrs,
-        d_c_ptrs,
-        d_g_sizes,
-        d_g_lds,
-        G,
-        NUM_SM=NUM_SM,
-        BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
-        BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
-        BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
-        GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
-        NUM_XCDS=NUM_XCDS,
-        XCD_CHUNK=cfg["XCD_CHUNK"],
-        NUM_BUFFERS=cfg["NUM_BUFFERS"],
-        TILE_MODE=cfg["TILE_MODE"],
-        NUM_STAGES=cfg["NUM_STAGES"],
-        HAS_K_TAIL=cfg["HAS_K_TAIL"],
-        num_warps=cfg["num_warps"],
-        num_stages=1,
-        matrix_instr_nonkdim=16,
-        # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
-        # v_accvgpr moves around each mfma)
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
-    )
+    device = d_a_ptrs.device
+    NUM_SM = _num_sms(device)
+    with _ENV_LOCK:
+        previous_env = _setup_env()
+        try:
+            with torch.cuda.device(device):
+                grouped_gemm_kernel[(NUM_SM,)](
+                    d_a_ptrs,
+                    d_b_ptrs,
+                    d_c_ptrs,
+                    d_g_sizes,
+                    d_g_lds,
+                    G,
+                    NUM_SM=NUM_SM,
+                    BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
+                    BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
+                    BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
+                    GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
+                    NUM_XCDS=NUM_XCDS,
+                    XCD_CHUNK=cfg["XCD_CHUNK"],
+                    NUM_BUFFERS=cfg["NUM_BUFFERS"],
+                    TILE_MODE=cfg["TILE_MODE"],
+                    NUM_STAGES=cfg["NUM_STAGES"],
+                    HAS_K_TAIL=cfg["HAS_K_TAIL"],
+                    num_warps=cfg["num_warps"],
+                    num_stages=1,
+                    matrix_instr_nonkdim=16,
+                    # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
+                    # v_accvgpr moves around each mfma)
+                    llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+                )
+        finally:
+            _teardown_env(previous_env)
 
 
-def grouped_gemm(group_A, group_B, config=None):
-    """group_A[i]: fp16 [M_i, K_i] row-major (K contiguous).
-       group_B[i]: fp16 [K_i, N_i] COLUMN-major (K contiguous) == [N_i, K_i].t().
-    """
-    d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, group_C = _make_grouped_gemm_args(
-        group_A, group_B, config)
-    _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg)
-    return group_C
+def grouped_gemm(group_a, group_b):
+    """Run a ragged group of FP16 matrix multiplications on gfx950."""
+    args = _make_grouped_gemm_args(group_a, group_b)
+    d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, cfg, outputs = args
+    _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, cfg)
+    return outputs
 
 
-def _rand_groups(shape_spec, seed=0):
-    """A[M,K] row-major; B[K,N] column-major (K contiguous) via a [N,K].t() view."""
-    g = torch.Generator(device=DEVICE).manual_seed(seed)
-    group_A, group_B = [], []
-    for (M, N, K) in shape_spec:
-        group_A.append(torch.randn((M, K), device=DEVICE, dtype=torch.float16, generator=g))
-        Bt = torch.randn((N, K), device=DEVICE, dtype=torch.float16, generator=g)  # [N,K] row-major
-        group_B.append(Bt.t())  # [K,N] view, stride (1, K) == column-major
-    return group_A, group_B
-
-
-def _check(shape_spec, label):
-    group_A, group_B = _rand_groups(shape_spec)
-    group_C = grouped_gemm(group_A, group_B)
-    for i, (A, B) in enumerate(zip(group_A, group_B)):
-        ref = torch.matmul(A, B)
-        torch.testing.assert_close(group_C[i], ref, atol=1e-2, rtol=1e-2)
-    print(f"  [PASS] {label} ({len(shape_spec)} groups)")
-
-
-def test_op():
-    _check([(1024, 1024, 1024), (512, 512, 512), (256, 256, 256), (128, 128, 128)], "ragged M=N=K")
-    _check([(4096, 4096, 4096), (2048, 4096, 4096), (1000, 4096, 4096), (333, 4096, 4096)],
-           "ragged-M (MoE-style), N=K=4096")
-    _check([(512, 300, 4000), (333, 1000, 1500), (128, 128, 100), (256, 704, 320)], "k/n-unaligned")
-    _check([(1, 64, 64), (33, 128, 50)], "tiny")
-    print("test_op: all correctness checks passed")
-
-
-def _bench():
-
-    def tflops(ms, total_flops):
-        return total_flops * 1e-12 / (ms * 1e-3)
-
-    n = 16
-    spec = [(4096, 4096, 4096)] * n
-    group_A, group_B = _rand_groups(spec)
-    total_flops = sum(2 * M * N * K for (M, N, K) in spec)
-
-    # Host-side setup (pointer/size/stride tensors, output buffers) is built once,
-    # outside the timed region
-    d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, _ = _make_grouped_gemm_args(group_A, group_B)
-    ms = triton.testing.do_bench(lambda: _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg), rep=100)
-    print(f"  fast grouped GEMM : {tflops(ms, total_flops):7.1f} TFLOPS ({ms:.3f} ms)")
-
-    ms_torch = triton.testing.do_bench(lambda: [group_A[i] @ group_B[i] for i in range(n)], rep=100)
-    print(f"  torch loop        : {tflops(ms_torch, total_flops):7.1f} TFLOPS ({ms_torch:.3f} ms)")
-
-
-if __name__ == "__main__":
-    test_op()
-    print("\n16 x 4096 x 4096 x 4096:")
-    _bench()
+__all__ = ["grouped_gemm"]
