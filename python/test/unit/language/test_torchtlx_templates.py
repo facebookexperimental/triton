@@ -585,6 +585,19 @@ class TestLocalBufferRetention(TestCase):
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_arch_predicates(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        with mock.patch.object(torch.version, "hip", "6.0"), mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
+        ), mock.patch.object(_tlx_registry, "current_target") as target:
+            target.return_value.is_gfx942 = True
+            self.assertIs(_tlx_registry._is_gfx950(), True)
+            self.assertIs(_tlx_registry._is_gfx942(), True)
+
     @staticmethod
     @contextlib.contextmanager
     def _force_warppipe_split_k_choice():

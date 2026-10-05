@@ -124,15 +124,15 @@ def _amd_num_xcds() -> int:
 def _is_gfx950() -> bool:
     if not torch.version.hip:
         return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except (AssertionError, AttributeError, RuntimeError):
+        return False
 
 
 def _is_gfx942() -> bool:
     """Whether the live device is MI300X/CDNA3."""
     return current_target().is_gfx942
-    try:
-        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
-    except (AssertionError, AttributeError, RuntimeError):
-        return False
 
 
 #: Per-arch warp-pipe tile pools, keyed by ``current_target().key``. An arch
