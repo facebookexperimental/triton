@@ -1,11 +1,19 @@
 """TLX AMD tests -- CDNA4 (gfx950)."""
 
+import ast
 import contextlib
 from dataclasses import dataclass, replace
 import importlib
 import inspect
+import itertools
+import math
 import os
+from pathlib import Path
 import re
+import struct
+import subprocess
+import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -234,6 +242,67 @@ def _assert_scratch_free(name, compiled):
         "scratch_loads": 0,
         "scratch_stores": 0,
     }, (name, resources)
+
+
+def _assert_fp32_dq_wave8_pipeline(compiled):
+    ttgir = compiled.asm["ttgir"]
+    # The public route must load both full statistics planes once into shared
+    # memory, then read BM16 slices instead of refetching statistics per tile.
+    assert len(re.findall(r"ttg\.local_alloc[^\n]*!ttg\.memdesc<2x512xf32,", ttgir)) == 1
+    cache_loads = [
+        line for line in ttgir.splitlines() if "amdg.buffer_load_to_local" in line and "-> <512xf32," in line
+    ]
+    assert len(cache_loads) == 2
+    assert all("mask =" in line and "other =" in line for line in cache_loads)
+    assert len(re.findall(r"ttg\.memdesc_dynamic_subslice[^\n]*!ttg\.memdesc<16xf32,", ttgir)) >= 2
+
+    # Follow the store's layout alias rather than depending on SSA numbering.
+    # Its low three register bits are eight consecutive BF16 D elements; the
+    # warp bits retain the native D32/N32 ownership of the accumulator.
+    store_layouts = []
+    for line in ttgir.splitlines():
+        match = re.fullmatch(
+            r"(#\w+) = #ttg\.linear<\{register = (\[.*\]), lane = (\[.*\]), "
+            r"warp = (\[.*\]), block = \[\]\}>", line)
+        if match and ast.literal_eval(match[2])[:3] == [[0, 1], [0, 2], [0, 4]]:
+            if ast.literal_eval(match[4]) == [[0, 32], [32, 0]]:
+                store_layouts.append(match[1])
+    assert len(store_layouts) == 1
+    store_type = f"tensor<64x128xbf16, {store_layouts[0]}>"
+    assert sum("amdg.buffer_store" in line and store_type in line for line in ttgir.splitlines()) == 4
+    assembly = compiled.asm["amdgcn"]
+    assert "buffer_atomic_add_f32" in assembly
+    assert "buffer_atomic_pk_add_bf16" not in assembly
+    _assert_scratch_free(compiled.name, compiled)
+
+
+def _assert_dk_native_column_subtiles(compiled):
+    # Interleaved dK updates must own independent D64 accumulator chains.
+    # A full D128 result with a selected update hides that ownership from
+    # the normal scheduled-MFMA contract.
+    ttir = compiled.asm["ttir"]
+    dk_updates = [
+        line for line in ttir.splitlines()
+        if "amdg.scheduled_mfma" in line and 'accumulator "persistent" register_class "agpr"' in line
+    ]
+    subtiles = [line for line in dk_updates if "-> tensor<64x64xf32," in line]
+    assert subtiles, "dK must carry independent native D64 accumulator chains"
+    assert all("tensor<64x16xbf16," in line and "tensor<16x64xbf16," in line for line in subtiles)
+    assert "output_fragment" not in ttir
+
+
+def _assert_dk_column_panels_match(result, reference):
+    # Check each independent column panel against the mathematical oracle;
+    # a misplaced panel must not be diluted by the other panel's norm.
+    for column in (0, 64):
+        target = reference[..., column:column + 64].float()
+        value = result[..., column:column + 64].float()
+        norm = torch.linalg.vector_norm(target)
+        if norm.item() == 0:
+            assert torch.count_nonzero(value).item() == 0, column
+        else:
+            error = (torch.linalg.vector_norm(value - target) / norm).item()
+            assert error < 1e-2, (column, error)
 
 
 def _capture_kernel_with_constexprs(monkeypatch, module, name, **constexprs):
@@ -1309,7 +1378,7 @@ def test_d64_causal_gqa8_codegen_is_scratch_free_gfx950(monkeypatch):
         assert compiled_objects, kernel.fn.__name__
         for compiled in compiled_objects:
             _assert_scratch_free(kernel.fn.__name__, compiled)
-            assert not re.search(r"\b\w*atomic\w*\b", compiled.asm["amdgcn"])
+            assert not re.search(r"(?m)^[ \t]*\w*atomic\w*(?:[ \t]|$)", compiled.asm["amdgcn"])
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1538,6 +1607,68 @@ def test_varlen_d128_kv_split_selection(max_q, group_size, expected):
 )
 def test_varlen_d128_kernel_block_selection(group_size, kv_splits, expected):
     assert amd_fa_varlen_bwd._select_varlen_kernel_blocks(group_size, kv_splits) == expected
+
+
+def test_varlen_d128_fp32_dq_padding_falls_back_at_i32_boundary():
+    batch = 1024
+    q_heads = 3
+    elements_per_row = q_heads * amd_fa_varlen_bwd._HEAD_DIM
+    max_fp32_rows = amd_fa_varlen_bwd._I32_BUFFER_FP32_ELEMENTS // elements_per_row
+    total_q = max_fp32_rows - batch * (amd_fa_varlen_bwd._BLOCK_M - 1)
+    padded_bm16_elements = (total_q + batch * (amd_fa_varlen_bwd._BLOCK_M - 1)) * elements_per_row
+    padded_bm32_elements = (total_q + batch * (amd_fa_varlen_bwd._WIDE_BLOCK_M - 1)) * elements_per_row
+
+    assert padded_bm16_elements <= amd_fa_varlen_bwd._I32_BUFFER_FP32_ELEMENTS
+    assert amd_fa_varlen_bwd._I32_BUFFER_FP32_ELEMENTS < padded_bm32_elements
+    assert padded_bm32_elements <= amd_fa_varlen_bwd._I32_BUFFER_BF16_ELEMENTS
+
+    fp32_pad_rows = amd_fa_varlen_bwd._select_varlen_dq_pad_rows(
+        total_q=total_q,
+        batch=batch,
+        q_heads=q_heads,
+        block_m=amd_fa_varlen_bwd._WIDE_BLOCK_M,
+        block_n=amd_fa_varlen_bwd._WIDE_BLOCK_N,
+        dq_atomic_fp32=True,
+    )
+    bf16_pad_rows = amd_fa_varlen_bwd._select_varlen_dq_pad_rows(
+        total_q=total_q,
+        batch=batch,
+        q_heads=q_heads,
+        block_m=amd_fa_varlen_bwd._WIDE_BLOCK_M,
+        block_n=amd_fa_varlen_bwd._WIDE_BLOCK_N,
+        dq_atomic_fp32=False,
+    )
+
+    assert fp32_pad_rows == amd_fa_varlen_bwd._BLOCK_M
+    assert bf16_pad_rows == amd_fa_varlen_bwd._WIDE_BLOCK_M
+    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+        total_q=total_q,
+        total_kv=1,
+        batch=batch,
+        q_heads=q_heads,
+        kv_heads=1,
+        dq_atomic_fp32=True,
+        dq_pad_rows=fp32_pad_rows,
+    )
+    amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+        total_q=total_q,
+        total_kv=1,
+        batch=batch,
+        q_heads=q_heads,
+        kv_heads=1,
+        dq_atomic_fp32=False,
+        dq_pad_rows=bf16_pad_rows,
+    )
+    with pytest.raises(ValueError, match="padded dQ size"):
+        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+            total_q=total_q,
+            total_kv=1,
+            batch=batch,
+            q_heads=q_heads,
+            kv_heads=1,
+            dq_atomic_fp32=True,
+            dq_pad_rows=amd_fa_varlen_bwd._WIDE_BLOCK_M,
+        )
 
 
 def test_varlen_d128_kv_partial_workspace_shapes():
@@ -1842,6 +1973,275 @@ def test_varlen_d128_prefix_register_class_tuning_gfx950(monkeypatch, register_c
         compiled.asm["ttir"],
     )
     assert prefix_hints == ([] if expected_class is None else [(expected_class, "4")])
+
+
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "kv_splits", "dq_atomic_fp32", "supply_metadata", "shifted_input"),
+    (
+        pytest.param(12, 4, 3, False, False, None, id="gqa3-bf16-dq"),
+        pytest.param(12, 4, 3, True, False, None, id="gqa3-fp32-dq"),
+        pytest.param(64, 8, 4, False, False, None, id="gqa8-bf16-dq"),
+        pytest.param(64, 8, 4, True, False, None, id="gqa8-fp32-dq"),
+        pytest.param(12, 4, 3, True, True, None, id="gqa3-fp32-metadata"),
+        pytest.param(64, 8, 4, True, True, None, id="gqa8-fp32-metadata"),
+        pytest.param(12, 4, 3, True, False, "q", id="gqa3-fp32-misaligned-q"),
+        pytest.param(64, 8, 4, True, False, "q", id="gqa8-fp32-misaligned-q"),
+        pytest.param(12, 4, 3, True, False, "k", id="gqa3-fp32-misaligned-k"),
+        pytest.param(12, 4, 3, True, False, "v", id="gqa3-fp32-misaligned-v"),
+        pytest.param(12, 4, 3, True, False, "do", id="gqa3-fp32-misaligned-do"),
+        pytest.param(12, 4, 3, False, False, "q", id="gqa3-bf16-misaligned-q"),
+        pytest.param(12, 4, 3, False, False, "k", id="gqa3-bf16-misaligned-k"),
+        pytest.param(12, 4, 3, False, False, "v", id="gqa3-bf16-misaligned-v"),
+        pytest.param(12, 4, 3, False, False, "do", id="gqa3-bf16-misaligned-do"),
+        pytest.param(12, 4, 3, True, True, "q", id="gqa3-fp32-misaligned-q-metadata"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_legacy_prefix_public_backward_gfx950(monkeypatch, q_heads, kv_heads, kv_splits, dq_atomic_fp32,
+                                                          supply_metadata, shifted_input):
+    q_lengths, kv_lengths = _make_seeded_extend_attention_lengths(batch=19, max_context=12331, seed=42)
+    check_reference = dq_atomic_fp32 or shifted_input is not None
+    if check_reference:
+        # Genuine exact-family offsets: the first three sequences end in
+        # 1/15/16 rows after two full Q512 chunks, with KV tails 1/255/full.
+        # The owner must accumulate a second nonzero chunk; the fourth
+        # sequence also exercises a query shorter than one Q512 chunk.
+        q_lengths = [1025, 1039, 1040, 321, 5662, *([3086] * 13), 1549]
+        kv_lengths = [1281, 1279, 1280, 513, 10414, *([6248] * 7), *([6247] * 6), 4711]
+    total_q, total_kv = sum(q_lengths), sum(kv_lengths)
+    assert len(q_lengths) == len(kv_lengths) == 19
+    assert all(0 < q_len <= kv_len for q_len, kv_len in zip(q_lengths, kv_lengths, strict=True))
+    assert (total_q, total_kv, max(q_lengths), max(kv_lengths)) == (50754, 100696, 5662, 10414)
+    cu_q = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, *torch.tensor(kv_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    # Legacy plans have a host-known wide count. Chunking also supports the
+    # device-built plan, whose valid task count is available only on device.
+    metadata = (total_q, total_kv, max(q_lengths), max(kv_lengths)) if supply_metadata else ()
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, *metadata)
+    if supply_metadata:
+        assert plan.wide_task_count is None
+        if dq_atomic_fp32 and shifted_input is None:
+            valid_count = int(plan.task_counts[amd_fa_varlen_bwd._WIDE_KV_TASK_COUNT.value].item())
+            assert 0 < valid_count < plan.wide_q_len.numel() <= 512
+            # Invalid capacity entries must not enter the descending-Q sort.
+            plan.wide_q_len[valid_count:].fill_(plan.max_q)
+    else:
+        assert plan.wide_task_count is not None and plan.wide_task_count > 0
+
+    # Inactive sequences have Q=0, V=O=1 and dO=0: uniform attention with
+    # LSE=log(KV length), and all three gradients exactly zero.
+    q = torch.zeros((total_q, q_heads, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.ones((total_kv, kv_heads, 128), dtype=torch.bfloat16, device="cuda")
+    v = torch.ones_like(k)
+    out = torch.ones_like(q)
+    do = torch.zeros_like(q)
+    lse = torch.empty((q_heads, total_q), dtype=torch.float32, device="cuda")
+    q_start = 0
+    for q_length, kv_length in zip(q_lengths, kv_lengths, strict=True):
+        lse[:, q_start:q_start + q_length].fill_(kv_length)
+        q_start += q_length
+    lse.log_()
+    expected = None
+    if check_reference:
+        # Only four sequences need a dense independent oracle. Their inputs
+        # and gradients are nonzero for every head; all other outputs are
+        # checked against the analytical zero result, without dense matrices.
+        checked_q_lengths, checked_kv_lengths = q_lengths[:4], kv_lengths[:4]
+        checked = _make_varlen_d128_reference_case(checked_q_lengths, checked_kv_lengths, q_heads=q_heads,
+                                                   kv_heads=kv_heads, seed=2473)
+        checked_q, checked_kv = sum(checked_q_lengths), sum(checked_kv_lengths)
+        for full, small, count in zip((q, k, v, out, do), checked[:5],
+                                      (checked_q, checked_kv, checked_kv, checked_q, checked_q), strict=True):
+            full[:count].copy_(small)
+        lse[:, :checked_q].copy_(checked[5])
+        expected = checked[-1]
+        del checked
+    if shifted_input is not None:
+        inputs = {"q": q, "k": k, "v": v, "do": do}
+        original = inputs[shifted_input]
+        storage = torch.empty(original.numel() + 1, dtype=original.dtype, device=original.device)
+        shifted = storage[1:].view_as(original)
+        shifted.copy_(original)
+        assert shifted.is_contiguous() and shifted.data_ptr() % 16 != 0
+        inputs[shifted_input] = shifted
+        q, k, v, do = (inputs[name] for name in ("q", "k", "v", "do"))
+    else:
+        assert all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, do))
+    chunked = dq_atomic_fp32 and shifted_input is None
+    h12_handoff = chunked and (q_heads, kv_heads) == (12, 4)
+    h64_handoff = chunked and (q_heads, kv_heads) == (64, 8) and not supply_metadata
+    ds_handoff = h12_handoff or h64_handoff
+    empty_like = torch.empty_like
+    direct_outputs = []
+
+    def capture_final_outputs(tensor, *args, **kwargs):
+        buffer = empty_like(tensor, *args, **kwargs)
+        if chunked and tensor is k:
+            buffer.fill_(float("nan"))
+            direct_outputs.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(torch, "empty_like", capture_final_outputs)
+    allocate_partials = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials
+    partial_workspaces = []
+
+    def capture_partials(k, splits):
+        buffers = allocate_partials(k, splits)
+        partial_workspaces.append((splits, *buffers))
+        return buffers
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_allocate_varlen_dkdv_partials", capture_partials)
+    legacy_preprocess_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                                 "_varlen_bwd_preprocess_dynamic_owner_queue")
+    preprocess_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_preprocess")
+    rolling_launches = {
+        splits:
+        _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                        f"_varlen_bwd_interleaved_bm32_rolling_fp32_queue_s{splits}")
+        for splits in (3, 4)
+    }
+    shared_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                      "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel")
+    convert_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                       "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel")
+    fallback_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                        "_varlen_bwd_interleaved_kernel")
+    generic_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                       "_varlen_bwd_interleaved_bm32_kernel")
+    reduce_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_varlen_dkdv_reduce_kernel")
+    producer_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_prefix_h12_ds_producer")
+    consumer_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_prefix_h12_ds_dq_consumer")
+    h64_producer_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                            "_prefix_h64_packed_ds_producer")
+    h64_consumer_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                            "_prefix_h64_packed_ds_dq_consumer")
+    helper = amd_fa_varlen_bwd._try_allocate_prefix_h12_ds
+    helper_calls = []
+
+    def observe_helper(*args, **kwargs):
+        helper_calls.append(kwargs["eligible_h12"])
+        return helper(*args, **kwargs)
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_try_allocate_prefix_h12_ds", observe_helper)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, 128**-0.5, dq_atomic_fp32=dq_atomic_fp32)
+    torch.cuda.synchronize()
+
+    assert not generic_launches
+    assert helper_calls == ([True] if h12_handoff else [])
+    if not h12_handoff:
+        assert not producer_launches and not consumer_launches
+    if not h64_handoff:
+        assert not h64_producer_launches and not h64_consumer_launches
+    if h64_handoff:
+        producer_launches, consumer_launches = h64_producer_launches, h64_consumer_launches
+    if shifted_input is None:
+        assert not fallback_launches
+    if chunked:
+        assert len(preprocess_launches) == 1
+        if ds_handoff:
+            assert len(producer_launches) == len(consumer_launches) == 1
+            assert not shared_launches and not convert_launches
+        else:
+            assert len(shared_launches) == len(convert_launches) == 1
+        assert not partial_workspaces
+        assert not reduce_launches
+        assert len(direct_outputs) == 2
+        assert actual[1] is direct_outputs[0]
+        assert actual[2] is direct_outputs[1]
+        assert not legacy_preprocess_launches
+        assert all(not launches for launches in rolling_launches.values())
+        preprocess_kwargs, _ = preprocess_launches[0]
+        core_kwargs, compiled = (producer_launches if ds_handoff else shared_launches)[0]
+        assert preprocess_kwargs["ZERO_DQ"] is (not ds_handoff)
+        assert preprocess_kwargs["PACK_STATS_MHA16"] is True and preprocess_kwargs["PACK_STATS"] is False
+        assert preprocess_kwargs["DQ_PAD_ROWS"] == 16
+        if ds_handoff:
+            consumer_kwargs, consumer = consumer_launches[0]
+            assert core_kwargs["DS_CAP"] == consumer_kwargs["DS_CAP"] == 10496
+            assert consumer_kwargs["TOTAL_Q_PADDED"] == 51039
+            assert consumer_kwargs["enable_fp_fusion"] is False
+            assert consumer_kwargs["num_warps"] == 4
+            assert "buffer_atomic" not in consumer.asm["amdgcn"]
+        else:
+            convert_kwargs, _ = convert_launches[0]
+            assert convert_kwargs["DQ_PAD_ROWS"] == 16
+        assert core_kwargs["CHUNKED_Q"] is True
+        assert core_kwargs["SORT_TASKS"] is True
+        assert core_kwargs["Q_SPLITS"] == 1
+        assert (core_kwargs["HQ"], core_kwargs["HKV"], core_kwargs["BLOCK_M"],
+                core_kwargs["BLOCK_N"]) == (q_heads, kv_heads, 16, 256)
+        if ds_handoff:
+            assert "buffer_atomic" not in compiled.asm["amdgcn"]
+        else:
+            assert "buffer_atomic_add_f32" in compiled.asm["amdgcn"]
+        assert "buffer_atomic_pk_add_bf16" not in compiled.asm["amdgcn"]
+    elif shifted_input is not None:
+        assert len(partial_workspaces) == 1
+        splits, dk_partial, dv_partial = partial_workspaces[0]
+        assert splits == 1 and dk_partial is None and dv_partial is None
+        assert len(preprocess_launches) == 1 and len(fallback_launches) == 2
+        assert not legacy_preprocess_launches and not shared_launches and not convert_launches and not reduce_launches
+        assert all(not launches for launches in rolling_launches.values())
+        preprocess_kwargs, _ = preprocess_launches[0]
+        assert preprocess_kwargs["ZERO_DQ"] is False and preprocess_kwargs["PACK_STATS"] is False
+        assert preprocess_kwargs["DQ_PAD_ROWS"] == 16
+        assert {kwargs["FULL_KV_TILE"] for kwargs, _ in fallback_launches} == {False, True}
+        for core_kwargs, compiled in fallback_launches:
+            assert (core_kwargs["KV_SPLITS"], core_kwargs["BLOCK_M"], core_kwargs["BLOCK_N"]) == (1, 16, 128)
+            assert core_kwargs["QDO_ALIGNED"] is False and core_kwargs["CACHE_MHA_STATS"] is False
+            atomic = "buffer_atomic_add_f32" if dq_atomic_fp32 else "buffer_atomic_pk_add_bf16"
+            assert atomic in compiled.asm["amdgcn"]
+    else:
+        assert len(legacy_preprocess_launches) == len(rolling_launches[kv_splits]) == 1
+        assert all(not launches for splits, launches in rolling_launches.items() if splits != kv_splits)
+        assert not preprocess_launches and not shared_launches and not convert_launches and not reduce_launches
+        preprocess_kwargs, _ = legacy_preprocess_launches[0]
+        assert preprocess_kwargs["ZERO_DQ"] is True and preprocess_kwargs["PACK_STATS"] is True
+        core_kwargs, compiled = rolling_launches[kv_splits][0]
+        assert core_kwargs["KV_SPLITS"] == kv_splits
+        atomic = "buffer_atomic_add_f32" if dq_atomic_fp32 else "buffer_atomic_pk_add_bf16"
+        assert atomic in compiled.asm["amdgcn"]
+    for index, (name, result, source) in enumerate(zip(("dq", "dk", "dv"), actual, (q, k, v), strict=True)):
+        assert result.shape == source.shape and result.device == source.device, name
+        assert result.dtype is torch.bfloat16, name
+        if check_reference:
+            reference = expected[index]
+            count = reference.shape[0]
+            assert torch.count_nonzero(reference).item() > 0, name
+            assert torch.isfinite(result[:count]).all(), name
+            relative_l2 = torch.linalg.vector_norm(result[:count].float() -
+                                                   reference.float()) / torch.linalg.vector_norm(reference.float())
+            assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+            assert torch.count_nonzero(result[count:]).item() == 0, name
+        else:
+            assert torch.count_nonzero(result).item() == 0, name
+    if check_reference:
+        # Check each final chunk independently, so the two preceding Q512
+        # chunks cannot conceal a missing or incorrectly rebased tail.
+        q_start = 0
+        for q_length in checked_q_lengths[:3]:
+            tail = slice(q_start + 1024, q_start + q_length)
+            reference = expected[0][tail].float()
+            relative_l2 = torch.linalg.vector_norm(actual[0][tail].float() -
+                                                   reference) / torch.linalg.vector_norm(reference)
+            assert relative_l2.item() < 1e-2, (q_length - 1024, relative_l2.item())
+            q_start += q_length
+        # Check the short sequence independently; aggregate error from the
+        # three longer sequences must not conceal its missing contribution.
+        short_q = slice(sum(checked_q_lengths[:3]), sum(checked_q_lengths))
+        short_kv = slice(sum(checked_kv_lengths[:3]), sum(checked_kv_lengths))
+        for name, result, reference, rows in zip(
+            ("dq", "dk", "dv"),
+                actual,
+                expected,
+            (short_q, short_kv, short_kv),
+                strict=True,
+        ):
+            reference = reference[rows].float()
+            assert torch.count_nonzero(reference).item() > 0, name
+            relative_l2 = torch.linalg.vector_norm(result[rows].float() -
+                                                   reference) / torch.linalg.vector_norm(reference)
+            assert relative_l2.item() < 1e-2, (name, "short-query", relative_l2.item())
 
 
 @pytest.mark.parametrize("metadata", ("legacy", "missing_sequence", "missing_start", "default_k96"))
@@ -2263,6 +2663,317 @@ def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
         assert "buffer_atomic_pk_add_bf16" in interleaved.asm["amdgcn"]
 
 
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths", "q_heads", "kv_heads", "causal", "wide_split"),
+    (
+        pytest.param([17], [129], 2, 2, False, False, id="noncausal-mha"),
+        pytest.param([33], [257], 3, 1, False, False, id="noncausal-gqa"),
+        pytest.param([5460], [17], 3, 1, False, True, id="noncausal-gqa3-split"),
+        pytest.param([17], [17], 2, 2, True, False, id="causal-mha"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_atomics_generic_paths_gfx950(
+    q_lengths,
+    kv_lengths,
+    q_heads,
+    kv_heads,
+    causal,
+    wide_split,
+):
+    generic_core = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
+    wide_core = amd_fa_varlen_bwd._varlen_bwd_interleaved_bm32_kernel
+    exact_core = amd_fa_varlen_bwd._varlen_bwd_interleaved_bm16_bn256_fp32_kernel
+    generic_core.device_caches.clear()
+    wide_core.device_caches.clear()
+    exact_core.device_caches.clear()
+
+    case = _make_varlen_d128_reference_case(
+        q_lengths,
+        kv_lengths,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        seed=2399 + q_heads,
+        causal=causal,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=causal,
+        dq_atomic_fp32=True,
+    )
+    torch.cuda.synchronize()
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert result.dtype is torch.bfloat16, name
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    device = torch.cuda.current_device()
+    selected_core = wide_core if wide_split else generic_core
+    unused_core = generic_core if wide_split else wide_core
+    compiled_objects = tuple(selected_core.device_caches[device][0].values())
+    assert compiled_objects
+    assert not unused_core.device_caches.get(device)
+    assert not exact_core.device_caches.get(device)
+    atomic_assembly = "\n".join(compiled.asm["amdgcn"] for compiled in compiled_objects)
+    assert "buffer_atomic_add_f32" in atomic_assembly
+    assert "buffer_atomic_pk_add_bf16" not in atomic_assembly
+
+
+@pytest.mark.parametrize(
+    ("max_q", "q_heads", "kv_heads", "sm_scale"),
+    (
+        pytest.param(300, 4, 4, None, id="300"),
+        pytest.param(400, 4, 4, None, id="400"),
+        pytest.param(300, 12, 4, None, id="gqa3-q300"),
+        pytest.param(400, 12, 4, None, id="gqa3-q400"),
+        pytest.param(300, 12, 4, 0.125, id="gqa3-positive-scale"),
+        pytest.param(400, 12, 4, -0.125, id="gqa3-negative-scale"),
+        pytest.param(300, 12, 4, 0.0, id="gqa3-q300-zero-scale"),
+        pytest.param(400, 12, 4, 0.0, id="gqa3-q400-zero-scale"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_atomics_gfx950(monkeypatch, max_q, q_heads, kv_heads, sm_scale):
+    kernels = (
+        amd_fa_varlen_bwd._varlen_bwd_preprocess,
+        amd_fa_varlen_bwd._varlen_bwd_interleaved_bm16_bn256_fp32_kernel,
+        amd_fa_varlen_bwd._varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel,
+        amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel,
+        amd_fa_varlen_bwd._varlen_mha_dq_convert_coalesced_kernel,
+    )
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+    preprocess_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_preprocess")
+    exact_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                     "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel")
+    exact_convert_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                             "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel")
+    generic_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_kernel")
+    generic_convert_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                               "_varlen_mha_dq_convert_coalesced_kernel")
+
+    # Match the public route's batch/maxima while keeping the reference small.
+    # Exercise short/partial BM16 tiles, both sides of Q256, and KV tails.
+    # Q400 also exercises aligned runtime totals; Q300 keeps unaligned totals.
+    last_q = 10 if max_q == 400 else 1
+    q_lengths = [max_q, 1, 15, 16, 17, 255, 256, 257, max_q - 1, *([1] * 758), last_q]
+    kv_lengths = [3200, 1, 127, 128, 129, 255, 256, 257, 257, *([1] * 759)]
+    case = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=q_heads, kv_heads=kv_heads, seed=2417,
+                                            sm_scale=sm_scale)
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
+    assert plan.batch == len(q_lengths) == len(kv_lengths) == 768
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (sum(q_lengths), sum(kv_lengths), max_q, 3200)
+    assert all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, do))
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        dq_atomic_fp32=True,
+    )
+    torch.cuda.synchronize()
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert result.dtype is torch.bfloat16, name
+        assert torch.isfinite(result).all(), name
+        if sm_scale == 0.0 and name in ("dq", "dk"):
+            assert torch.count_nonzero(reference).item() == 0, name
+            assert torch.count_nonzero(result).item() == 0, name
+            continue
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    assert len(preprocess_launches) == len(exact_launches) == len(exact_convert_launches) == 1
+    assert generic_launches == generic_convert_launches == []
+    wide_task_count = plan.task_counts[amd_fa_varlen_bwd._WIDE_KV_TASK_COUNT.value].item()
+    assert wide_task_count == 782
+    wide_q_starts = plan.wide_q_start[:wide_task_count].tolist()
+    assert wide_q_starts.count(0) == 13
+    assert wide_q_starts.count(max_q) == 1
+    preprocess_kwargs, _ = preprocess_launches[0]
+    exact_kwargs, compiled = exact_launches[0]
+    assert preprocess_kwargs["PACK_STATS_MHA16"] is True
+    assert preprocess_kwargs["PACK_STATS"] is False
+    assert exact_kwargs["HQ"] == q_heads and exact_kwargs["HKV"] == kv_heads
+    assert exact_kwargs["BLOCK_M"] == 16 and exact_kwargs["BLOCK_N"] == 256
+    assert exact_kwargs["reverse_local_assignment"] is True
+    assert exact_kwargs["enable_sched_group_barrier_scheduler"] is False
+    assert exact_kwargs["llvm_fn_attrs"] == (("amdgpu-sched-strategy", "max-ilp"), )
+    assert exact_kwargs["SORT_TASKS"] is False
+    assert not ({
+        "sink_insts_to_avoid_spills",
+        "regclass_priority_trumps_globalness",
+        "disable_unclustered_high_rp_reschedule",
+    } & exact_kwargs.keys())
+    assembly = compiled.asm["amdgcn"]
+    assert "buffer_atomic_add_f32" in assembly
+    assert "buffer_atomic_pk_add_bf16" not in assembly
+    _assert_dk_native_column_subtiles(compiled)
+    _assert_dk_column_panels_match(actual[1], expected[1])
+    if q_heads == kv_heads:
+        _assert_fp32_dq_wave8_pipeline(compiled)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_wave8_state_graph_replay_gfx950(monkeypatch):
+    q_lengths = [400, 17, *([1] * 766)]
+    kv_lengths = [3200, 257, *([1] * 766)]
+    original = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=4, kv_heads=4, seed=2431)
+    changed = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=4, kv_heads=4, seed=2437)
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = original
+    original_inputs = tuple(tensor.clone() for tensor in original[:6])
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, q.shape[0], k.shape[0], max(q_lengths),
+                                                     max(kv_lengths))
+    preprocess = amd_fa_varlen_bwd._varlen_bwd_preprocess
+    exact_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd,
+                                                     "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel")
+
+    class PoisonedPreprocess:
+
+        def __getitem__(self, grid):
+
+            def launch(o, do, delta, cu_q, dq_acc, total_q_padded, task_counts, **kwargs):
+                assert kwargs["ZERO_DQ"] and kwargs["PACK_STATS_MHA16"]
+                assert delta.dtype is dq_acc.dtype is torch.float32
+                # Graph replay reuses these allocations. Both the first call
+                # and every replay must initialize statistics and dQ scratch.
+                delta.fill_(float("nan"))
+                dq_acc.fill_(float("nan"))
+                return preprocess[grid](o, do, delta, cu_q, dq_acc, total_q_padded, task_counts, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_bwd_preprocess", PoisonedPreprocess())
+
+    def backward():
+        return amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale, dq_atomic_fp32=True)
+
+    def check(actual, reference):
+        for name, result, target in zip(("dq", "dk", "dv"), actual, reference, strict=True):
+            assert result.dtype is torch.bfloat16, name
+            assert torch.isfinite(result).all(), name
+            relative_l2 = torch.linalg.vector_norm(result.float() - target.float()) / torch.linalg.vector_norm(
+                target.float())
+            assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        first = backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    check(first, expected)
+    assert len(exact_launches) == 1
+    _assert_fp32_dq_wave8_pipeline(exact_launches[0][1])
+    with torch.cuda.stream(stream):
+        repeated = backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    check(repeated, expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = backward()
+    output_pointers = tuple(tensor.data_ptr() for tensor in actual)
+    # Fresh forward output/LSE accompany the changed Q/K/V/dO. The replayed
+    # launch keeps its input pointers, plan, scratch and output allocations.
+    for inputs, reference in ((original_inputs, expected), (changed[:6], changed[-1]), (changed[:6], changed[-1]),
+                              (original_inputs, expected)):
+        for target, replacement in zip(original[:6], inputs, strict=True):
+            target.copy_(replacement)
+        for result in actual:
+            result.fill_(float("nan"))
+        graph.replay()
+        check(actual, reference)
+        assert tuple(tensor.data_ptr() for tensor in actual) == output_pointers
+
+
+@pytest.mark.parametrize(
+    ("max_q", "q_heads", "kv_heads", "dq_atomic_fp32", "shifted_input"),
+    (
+        pytest.param(401, 4, 4, True, None, id="q-above-cache-domain"),
+        pytest.param(300, 4, 4, True, "q", id="misaligned-q"),
+        pytest.param(300, 4, 4, True, "k", id="misaligned-k"),
+        pytest.param(300, 4, 4, True, "v", id="misaligned-v"),
+        pytest.param(300, 4, 4, True, "do", id="misaligned-do"),
+        pytest.param(401, 12, 4, True, None, id="gqa3-q-above-cache-domain"),
+        pytest.param(300, 12, 4, True, "q", id="gqa3-misaligned-q"),
+        pytest.param(300, 12, 4, True, "k", id="gqa3-misaligned-k"),
+        pytest.param(300, 12, 4, True, "v", id="gqa3-misaligned-v"),
+        pytest.param(300, 12, 4, True, "do", id="gqa3-misaligned-do"),
+        pytest.param(300, 12, 4, False, None, id="gqa3-bf16-dq-unchanged"),
+    ),
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_wave8_fallback_gfx950(monkeypatch, max_q, q_heads, kv_heads, dq_atomic_fp32,
+                                                   shifted_input):
+    q_lengths = [max_q, 17, *([1] * 766)]
+    kv_lengths = [3200, 257, *([1] * 766)]
+    case = list(_make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=q_heads, kv_heads=kv_heads, seed=2441))
+    if shifted_input is not None:
+        index = {"q": 0, "k": 1, "v": 2, "do": 4}[shifted_input]
+        tensor = case[index]
+        storage = torch.empty(tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device)
+        shifted = storage[1:].view(tensor.shape)
+        shifted.copy_(tensor)
+        assert shifted.is_contiguous() and shifted.data_ptr() % 16 != 0
+        case[index] = shifted
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, q.shape[0], k.shape[0], max(q_lengths),
+                                                     max(kv_lengths))
+
+    class UnsupportedExactKernel:
+
+        def __getitem__(self, grid):
+            # Fail at dispatch, before an unsafe direct-to-LDS launch can run.
+            pytest.fail("The FP32 BM16/BN256 core must fall back outside its input domain")
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel", UnsupportedExactKernel())
+    generic_launches = _capture_kernel_with_constexprs(monkeypatch, amd_fa_varlen_bwd, "_varlen_bwd_interleaved_kernel")
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale, dq_atomic_fp32=dq_atomic_fp32)
+    torch.cuda.synchronize()
+
+    assert generic_launches
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert result.dtype is torch.bfloat16, name
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_varlen_d128_causal_codegen_is_scratch_free_gfx950():
     kernel = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
@@ -2602,3 +3313,1161 @@ def test_dense_bwd_d256_end_to_end_gfx950(causal):
     for actual, expected in zip(actual_grads, case.grads, strict=True):
         assert torch.isfinite(actual).all()
         assert _snr_db(actual, expected) >= 40.0
+
+
+# Exact-total fixtures keep the production prefix predicate active while limiting
+# dense independent references to a short prefix of nonzero sequences.
+_H12_DS_Q_LENGTHS = [1025, 1039, 1040, 321, 5662, *([3086] * 13), 1549]
+_H12_DS_KV_LENGTHS = [1281, 1279, 1280, 513, 10414, *([6248] * 7), *([6247] * 6), 4711]
+_H12_DS_SCALES = pytest.mark.parametrize("sm_scale", (128**-0.5, 0.0, -128**-0.5), ids=("default", "zero", "negative"))
+_H12_DS_METADATA = pytest.mark.parametrize("supply_metadata", (False, True), ids=("legacy", "device"))
+_H12_DS_ROLES = (
+    "_varlen_bwd_preprocess",
+    "_prefix_h12_ds_producer",
+    "_varlen_dkdv_reduce_kernel",
+    "_prefix_h12_ds_dq_consumer",
+    "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel",
+    "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel",
+)
+
+
+def _make_prefix_ds_case(supply_metadata, sm_scale=128**-0.5, *, seed=2473, q_lengths=None, kv_lengths=None, active=4,
+                         q_heads=12, kv_heads=4):
+    q_lengths = list(_H12_DS_Q_LENGTHS if q_lengths is None else q_lengths)
+    kv_lengths = list(_H12_DS_KV_LENGTHS if kv_lengths is None else kv_lengths)
+    assert len(q_lengths) == len(kv_lengths) == 19
+    assert (sum(q_lengths), sum(kv_lengths), max(q_lengths), max(kv_lengths)) == (50754, 100696, 5662, 10414)
+    q = torch.zeros((50754, q_heads, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.ones((100696, kv_heads, 128), dtype=torch.bfloat16, device="cuda")
+    v, out, do = torch.ones_like(k), torch.ones_like(q), torch.zeros_like(q)
+    lse = torch.empty((q_heads, 50754), dtype=torch.float32, device="cuda")
+    begin = 0
+    for q_len, kv_len in zip(q_lengths, kv_lengths, strict=True):
+        lse[:, begin:begin + q_len].fill_(kv_len)
+        begin += q_len
+    lse.log_()
+    reference = _make_varlen_d128_reference_case(q_lengths[:active], kv_lengths[:active], q_heads=q_heads,
+                                                 kv_heads=kv_heads, seed=seed, sm_scale=sm_scale)
+    nq, nk = sum(q_lengths[:active]), sum(kv_lengths[:active])
+    for full, small, count in zip((q, k, v, out, do), reference[:5], (nq, nk, nk, nq, nq), strict=True):
+        full[:count].copy_(small)
+    lse[:, :nq].copy_(reference[5])
+    cu_q = torch.tensor([0, *itertools.accumulate(q_lengths)], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, *itertools.accumulate(kv_lengths)], dtype=torch.int32, device="cuda")
+    metadata = (50754, 100696, 5662, 10414) if supply_metadata else ()
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, *metadata)
+    if supply_metadata:
+        assert plan.wide_task_count is None
+        valid = int(plan.task_counts[amd_fa_varlen_bwd._WIDE_KV_TASK_COUNT.value].item())
+        assert 0 < valid < plan.wide_q_len.numel() <= 512
+        plan.wide_q_len[valid:].fill_(plan.max_q)
+    else:
+        assert plan.wide_task_count is not None
+    return (q, k, v, out, do, lse, plan), reference[-1], q_lengths[:active], kv_lengths[:active]
+
+
+def _assert_prefix_ds_result(actual, inputs, expected, q_lengths, kv_lengths):
+    for name, result, source, reference in zip(("dq", "dk", "dv"), actual, inputs[:3], expected, strict=True):
+        assert result.shape == source.shape and result.device == source.device, name
+        assert result.dtype is torch.bfloat16 and torch.isfinite(result).all(), name
+        count = reference.shape[0]
+        assert torch.count_nonzero(result[count:]).item() == 0, name
+        lengths = q_lengths if name == "dq" else kv_lengths
+        start = 0
+        for length in lengths:
+            target = reference[start:start + length].float()
+            value = result[start:start + length].float()
+            norm = torch.linalg.vector_norm(target)
+            if norm.item() == 0:
+                assert torch.count_nonzero(value).item() == 0, (name, start)
+            else:
+                assert (torch.linalg.vector_norm(value - target) / norm).item() < 1e-2, (name, start)
+            if name == "dk":
+                _assert_dk_column_panels_match(value, target)
+            # Each producer Q512 chunk and its final tail is checked separately.
+            if name == "dq":
+                for offset in range(0, length, 512):
+                    tail = target[offset:offset + 512]
+                    tail_norm = torch.linalg.vector_norm(tail)
+                    if tail_norm.item():
+                        error = torch.linalg.vector_norm(value[offset:offset + 512] - tail) / tail_norm
+                        assert error.item() < 1e-2, (start, offset, error.item())
+            start += length
+        assert start == count
+
+
+def _observe_prefix_ds_kernels(monkeypatch, before=None, *, roles=_H12_DS_ROLES):
+    records = []
+
+    class ObservedKernel:
+
+        def __init__(self, name, kernel):
+            self.name, self.kernel = name, kernel
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                if before is not None:
+                    before(self.name, args, kwargs)
+                compiled = self.kernel[grid](*args, **kwargs)
+                records.append((self.name, kwargs, compiled))
+                return compiled
+
+            return launch
+
+    for name in roles:
+        monkeypatch.setattr(amd_fa_varlen_bwd, name, ObservedKernel(name, getattr(amd_fa_varlen_bwd, name)))
+    return records
+
+
+def _assert_h12_ds_route(records, handoff):
+    expected = [_H12_DS_ROLES[0], _H12_DS_ROLES[1], _H12_DS_ROLES[3]
+                ] if handoff else [_H12_DS_ROLES[0], _H12_DS_ROLES[4], _H12_DS_ROLES[2], _H12_DS_ROLES[5]]
+    assert [name for name, _, _ in records] == expected
+    preprocess = records[0][1]
+    assert preprocess["ZERO_DQ"] is (not handoff)
+    assert preprocess["PACK_STATS_MHA16"] is True and preprocess["PACK_STATS"] is False
+    assert records[1][1]["Q_SPLITS"] == (1 if handoff else 2)
+    _assert_dk_native_column_subtiles(records[1][2])
+    if not handoff:
+        assert records[2][1]["KV_SPLITS"] == 2
+    if handoff:
+        assert records[-1][1]["enable_fp_fusion"] is False
+        for name, _, compiled in (records[1], records[-1]):
+            assert "buffer_atomic" not in compiled.asm["amdgcn"], name
+    else:
+        assert "buffer_atomic_add_f32" in records[1][2].asm["amdgcn"]
+
+
+def _poison_h12_ds_partials(monkeypatch):
+    allocate = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials
+    recorded = []
+
+    def poisoned(k, splits):
+        buffers = allocate(k, splits)
+        assert splits == 2
+        for buffer in buffers:
+            assert buffer is not None and buffer.dtype is torch.float32
+            buffer.fill_(float("nan"))
+        recorded.append(buffers)
+        return buffers
+
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_allocate_varlen_dkdv_partials", poisoned)
+    return recorded
+
+
+def _assert_h12_ds_empty_owners(buffers, q_lengths, kv_lengths):
+    start = 0
+    for q_len, kv_len in zip(q_lengths, kv_lengths, strict=True):
+        chunks = (q_len + 511) // 512
+        if chunks < 2:
+            for buffer in buffers:
+                assert torch.count_nonzero(buffer[start:start + kv_len, :, chunks:]).item() == 0
+        start += kv_len
+
+
+@_H12_DS_METADATA
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h12_ds_allocation_fallback_gfx950(monkeypatch, supply_metadata):
+    inputs, expected, q_lengths, kv_lengths = _make_prefix_ds_case(supply_metadata)
+    empty = torch.empty
+    attempts, scratch = [], []
+
+    def injected_empty(*args, **kwargs):
+        shape = tuple(args[0]) if args and isinstance(args[0], (tuple, list)) else None
+        if shape == (12, 51039, 10496) and kwargs.get("dtype") is torch.bfloat16:
+            attempts.append(shape)
+            raise torch.cuda.OutOfMemoryError("injected optional dS allocation failure")
+        value = empty(*args, **kwargs)
+        if shape == (12, 51039, 128) and kwargs.get("dtype") is torch.float32:
+            value.fill_(float("nan"))
+            scratch.append(value)
+        return value
+
+    monkeypatch.setattr(torch, "empty", injected_empty)
+    partials = _poison_h12_ds_partials(monkeypatch)
+    records = _observe_prefix_ds_kernels(monkeypatch)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(*inputs, 128**-0.5, dq_atomic_fp32=True)
+    _assert_h12_ds_route(records, False)
+    assert attempts == [(12, 51039, 10496)] and len(scratch) == len(partials) == 1
+    _assert_prefix_ds_result(actual, inputs, expected, q_lengths, kv_lengths)
+    _assert_h12_ds_empty_owners(partials[0], q_lengths, kv_lengths)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h12_ds_kernel_error_propagates_gfx950(monkeypatch):
+    inputs, _, _, _ = _make_prefix_ds_case(False)
+    failure = RuntimeError("injected producer failure")
+    observed = []
+
+    def fail_producer(name, args, kwargs):
+        observed.append(name)
+        if name == "_prefix_h12_ds_producer":
+            raise failure
+
+    _observe_prefix_ds_kernels(monkeypatch, fail_producer)
+    with pytest.raises(RuntimeError) as caught:
+        amd_fa_varlen_bwd.fa_varlen_backward(*inputs, 128**-0.5, dq_atomic_fp32=True)
+    assert caught.value is failure
+    assert observed == ["_varlen_bwd_preprocess", "_prefix_h12_ds_producer"]
+
+
+@_H12_DS_METADATA
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h12_ds_padding_gfx950(monkeypatch, supply_metadata):
+    inputs, expected, q_lengths, kv_lengths = _make_prefix_ds_case(supply_metadata)
+    empty = torch.empty
+    poisoned = []
+
+    def poison_ds(*args, **kwargs):
+        value = empty(*args, **kwargs)
+        if value.shape == (12, 51039, 10496) and value.dtype is torch.bfloat16:
+            value.fill_(float("nan"))
+            poisoned.append(True)
+        return value
+
+    checked = []
+
+    def check_padding(name, args, kwargs):
+        if name != "_prefix_h12_ds_dq_consumer":
+            return
+        ds = args[0]
+        q_start = 0
+        zero_count = gap_count = guard_count = kv_padding_count = 0
+        for batch, (q_len, kv_len) in enumerate(zip(_H12_DS_Q_LENGTHS, _H12_DS_KV_LENGTHS, strict=True)):
+            scratch = q_start + batch * 15
+            q_allocated, kv_allocated = (q_len + 15) // 16 * 16, (kv_len + 255) // 256 * 256
+            block = ds[:, scratch + q_allocated - 16:scratch + q_allocated, :].reshape(12, 10496, 16)
+            first_padding = q_len % 16 or 16
+            q_padding = block[:, :kv_allocated, first_padding:]
+            assert torch.count_nonzero(q_padding).item() == 0
+            kv_padding = block[:, kv_len:kv_allocated, :first_padding]
+            assert torch.count_nonzero(kv_padding).item() == 0
+            gap = ds[:, scratch + q_allocated:q_start + q_len + 15 * (batch + 1), :]
+            guard = block[:, kv_allocated:, :]
+            assert torch.isnan(gap).all() and torch.isnan(guard).all()
+            zero_count += q_padding.numel()
+            gap_count += gap.numel()
+            guard_count += guard.numel()
+            kv_padding_count += kv_padding.numel()
+            q_start += q_len
+        assert min(zero_count, gap_count, guard_count, kv_padding_count) > 0
+        checked.append(True)
+
+    monkeypatch.setattr(torch, "empty", poison_ds)
+    records = _observe_prefix_ds_kernels(monkeypatch, check_padding)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(*inputs, 128**-0.5, dq_atomic_fp32=True)
+    assert poisoned == checked == [True]
+    _assert_h12_ds_route(records, True)
+    _assert_prefix_ds_result(actual, inputs, expected, q_lengths, kv_lengths)
+
+
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h12_ds_consumer_boundaries_gfx950(sm_scale):
+    q_lengths = (127, 128, 129, 511, 512, 513, 1, 17, 33)
+    kv_lengths = (1, 63, 64, 65, 255, 256, 257, 513, 0)
+    q_offsets, kv_offsets = [0, *itertools.accumulate(q_lengths)], [0, *itertools.accumulate(kv_lengths)]
+    padded = q_offsets[-1] + 15 * len(q_lengths) + 16
+    ds = torch.full((12, padded, 10496), float("nan"), dtype=torch.bfloat16, device="cuda")
+    k = torch.full((max(1, kv_offsets[-1]) + 64, 4, 128), float("nan"), dtype=torch.bfloat16, device="cuda")
+    dq = torch.full((q_offsets[-1] + 128, 12, 128), float("nan"), dtype=torch.bfloat16, device="cuda")
+    expected = torch.zeros_like(dq[:q_offsets[-1]])
+    # Each sequence activates a different head, including all three siblings
+    # of one KV head. Unselected heads must remain exactly zero.
+    for batch, (q_len, kv_len) in enumerate(zip(q_lengths, kv_lengths, strict=True)):
+        allocated = (q_len + 15) // 16 * 16
+        kv_allocated = (kv_len + 255) // 256 * 256
+        scratch = q_offsets[batch] + batch * 15
+        blocks = ds[:, scratch:scratch + allocated].reshape(12, allocated // 16, 10496, 16)
+        blocks[:, :, :kv_allocated].zero_()
+        active_head = (0, 1, 2, 3, 5, 8, 11, 7, 10)[batch]
+        # Assign through physical Q16 blocks to retain the producer's ABI.
+        for block in range(allocated // 16):
+            valid = min(16, q_len - block * 16)
+            blocks[active_head, block, :kv_len, :valid].fill_(0.25)
+        if kv_len:
+            for head in range(4):
+                k[kv_offsets[batch]:kv_offsets[batch + 1], head].fill_(head + 1)
+        total = torch.zeros((), dtype=torch.float32, device="cuda")
+        for start in range(0, kv_len, 256):
+            partial = torch.tensor(
+                min(256, kv_len - start) * 0.25 * (active_head // 3 + 1), dtype=torch.float32, device="cuda")
+            total = total + partial * sm_scale
+        expected[q_offsets[batch]:q_offsets[batch + 1], active_head].fill_(total.to(torch.bfloat16))
+    cu_q = torch.tensor(q_offsets, dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor(kv_offsets, dtype=torch.int32, device="cuda")
+    counts = torch.zeros(6, dtype=torch.int32, device="cuda")
+    amd_fa_varlen_bwd._prefix_h12_ds_dq_consumer[((max(q_lengths) + 127) // 128, 12,
+                                                  len(q_lengths))](ds, k, cu_q, cu_kv, counts, dq,
+                                                                   TOTAL_Q_PADDED=padded, SM_SCALE=sm_scale,
+                                                                   DS_CAP=10496, PLAN_ERROR_INDEX=4, num_warps=4,
+                                                                   matrix_instr_nonkdim=16, enable_fp_fusion=False)
+    assert torch.equal(dq[:q_offsets[-1]], expected)
+    assert torch.isnan(dq[q_offsets[-1]:]).all() and torch.isnan(k[kv_offsets[-1]:]).all()
+    for batch, (q_len, kv_len) in enumerate(zip(q_lengths, kv_lengths, strict=True)):
+        allocated = (q_len + 15) // 16 * 16
+        kv_allocated = (kv_len + 255) // 256 * 256
+        scratch = q_offsets[batch] + batch * 15
+        blocks = ds[:, scratch:scratch + allocated].reshape(12, allocated // 16, 10496, 16)
+        assert torch.isnan(blocks[:, :, kv_allocated:]).all()
+        gap_end = q_offsets[batch + 1] + 15 * (batch + 1)
+        assert torch.isnan(ds[:, scratch + allocated:gap_end]).all()
+    assert torch.isnan(ds[:, q_offsets[-1] + 15 * len(q_lengths):]).all()
+
+
+@pytest.mark.parametrize("fixture", ("wrap", "q32_q64", "long"))
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h12_ds_producer_boundaries_gfx950(monkeypatch, fixture):
+    if fixture == "wrap":
+        q_lengths = [1, 15, 16, 17, 31, 32, 127, 128, 129, 1023, 5662, 5223, 5479, 5479, 5479, 5479, 5478, 5478, 5478]
+        kv_lengths = [
+            10241, 767, 768, 769, 767, 768, 769, 767, 768, 1281, 10414, 5526, 5525, 10261, 10261, 10261, 10261, 10261,
+            10261
+        ]
+    elif fixture == "q32_q64":
+        q_lengths = [1, 15, 16, 17, 33, 32, 63, 64, 65, 1023, 5662, 5223, 5479, 5479, 5479, 5479, 5542, 5542, 5540]
+        kv_lengths = [
+            10241, 767, 768, 769, 767, 768, 769, 767, 768, 1281, 10414, 5526, 5525, 10261, 10261, 10261, 10261, 10261,
+            10261
+        ]
+    else:
+        q_lengths = [129, 15, 16, 17, 33, 32, 63, 64, 65, 1023, 5662, 5223, 5479, 5479, 5479, 5479, 5542, 5542, 5412]
+        kv_lengths = [
+            10414, 767, 768, 769, 767, 768, 769, 767, 768, 1281, 10414, 5398, 5480, 10261, 10261, 10261, 10261, 10261,
+            10261
+        ]
+    inputs, expected, active_q, active_kv = _make_prefix_ds_case(fixture != "wrap", q_lengths=q_lengths,
+                                                                 kv_lengths=kv_lengths, active=10)
+    partials = _poison_h12_ds_partials(monkeypatch)
+    records = _observe_prefix_ds_kernels(monkeypatch)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(*inputs, 128**-0.5, dq_atomic_fp32=True)
+    _assert_h12_ds_route(records, True)
+    _assert_prefix_ds_result(actual, inputs, expected, active_q, active_kv)
+    assert partials == []
+
+
+@_H12_DS_METADATA
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h12_ds_scaled_partial_overflow_gfx950(monkeypatch, supply_metadata, sm_scale):
+    q_lengths = [1025, 1039, 256, 321, 5662, 3870, *([3086] * 12), 1549]
+    kv_lengths = [2049, 1279, 512, 513, 10414, *([6248] * 7), *([6247] * 6), 4711]
+    assert (len(q_lengths), len(kv_lengths), sum(q_lengths), sum(kv_lengths)) == (19, 19, 50754, 100696)
+    q = torch.zeros((50754, 12, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((100696, 4, 128), dtype=torch.bfloat16, device="cuda")
+    v, out, do = torch.zeros_like(k), torch.zeros_like(q), torch.zeros_like(q)
+    lse = torch.empty((12, 50754), dtype=torch.float32, device="cuda")
+    q_offsets, kv_offsets = [0, *itertools.accumulate(q_lengths)], [0, *itertools.accumulate(kv_lengths)]
+    for begin, end, kv_len in zip(q_offsets[:-1], q_offsets[1:], kv_lengths, strict=True):
+        lse[:, begin:end].fill_(math.log(kv_len))
+    q0, q1, k0, k1 = q_offsets[2], q_offsets[3], kv_offsets[2], kv_offsets[3]
+    magnitude = float(9 * 2**118)
+    do[q0:q1].fill_(1)
+    k[k0:k0 + 256].fill_(magnitude)
+    k[k0 + 256:k1].fill_(-magnitude)
+    v[k0:k0 + 256].fill_(1)
+    v[k0 + 256:k1].fill_(-1)
+    cu_q = torch.tensor(q_offsets, dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor(kv_offsets, dtype=torch.int32, device="cuda")
+    metadata = (50754, 100696, 5662, 10414) if supply_metadata else ()
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, *metadata)
+    records = _observe_prefix_ds_kernels(monkeypatch)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, dq_atomic_fp32=True)
+    _assert_h12_ds_route(records, True)
+    f32 = lambda value: struct.unpack("<f", struct.pack("<f", value))[0]
+    partial = f32(256 * 0.25 * magnitude)
+    total = 0.0
+    for _ in range(2):
+        total = f32(total + f32(partial * f32(sm_scale)))
+    if sm_scale > 0:
+        assert total == 3.3836619134423587e37
+    for name, value, source, begin, end, expected in zip(
+        ("dq", "dk", "dv"),
+            actual,
+        (q, k, v),
+        (q0, k0, k0),
+        (q1, k1, k1),
+        (total, 0.0, 1.5),
+            strict=True,
+    ):
+        assert value.shape == source.shape and value.device == source.device and value.dtype is torch.bfloat16
+        assert torch.isfinite(value).all(), name
+        assert torch.equal(value[begin:end], torch.full_like(value[begin:end], expected)), name
+        assert torch.count_nonzero(value[:begin]).item() == torch.count_nonzero(value[end:]).item() == 0, name
+
+
+@pytest.mark.parametrize(("q_heads", "kv_heads", "supply_metadata"), ((12, 4, False), (12, 4, True), (64, 8, False)))
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_prefix_ds_cold_capture_graph_replay_gfx950(monkeypatch, q_heads, kv_heads, supply_metadata,
+                                                                sm_scale, tmp_path, request):
+    # One fresh process and cache per metadata/scale case. Running this test
+    # after other tests cannot make its fallback route accidentally warm.
+    child_key = request.node.name
+    if os.environ.get("TLX_PREFIX_DS_COLD_CAPTURE_CHILD") != child_key:
+        cache = tmp_path / "triton-cache"
+        assert not cache.exists()
+        env = os.environ.copy()
+        env.update(TRITON_CACHE_DIR=str(cache), TLX_PREFIX_DS_COLD_CAPTURE_CHILD=child_key)
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-s", "--tb=short",
+             str(Path(__file__).resolve()) + "::" + child_key],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=1200,
+        )
+        assert completed.returncode == 0, completed.stdout
+        return
+
+    cache = Path(os.environ["TRITON_CACHE_DIR"])
+    h12 = q_heads == 12
+    roles = _H12_DS_ROLES if h12 else _H64_DS_ROLES
+    assert_route = _assert_h12_ds_route if h12 else _assert_h64_ds_route
+    old_names = (_H12_DS_ROLES[2], *_H12_DS_ROLES[4:]) if h12 else _H64_DS_ROLES[3:5]
+    originals = {name: getattr(amd_fa_varlen_bwd, name) for name in old_names}
+
+    def assert_cold():
+        for name, function in originals.items():
+            assert not any(value[0] for value in function.device_caches.values()), name
+            assert not list(cache.rglob(name + ".*")), name
+
+    assert_cold()
+    inputs, expected, q_lengths, kv_lengths = _make_prefix_ds_case(supply_metadata, sm_scale, q_heads=q_heads,
+                                                                   kv_heads=kv_heads)
+    changed = _make_varlen_d128_reference_case(q_lengths, kv_lengths, q_heads=q_heads, kv_heads=kv_heads, seed=2479,
+                                               sm_scale=sm_scale)
+    q, k, v, out, do, lse, plan = inputs
+    originals_active = tuple(
+        tensor[:count].clone()
+        for tensor, count in zip((q, k, v, out, do), (sum(q_lengths), sum(kv_lengths), sum(kv_lengths), sum(q_lengths),
+                                                      sum(q_lengths)), strict=True))
+    original_lse = lse[:, :sum(q_lengths)].clone()
+    optional_shape = (12, 51039, 10496) if h12 else (64, plan.packed_ds_head_elements)
+    phase = ["warmup"]
+    empty = torch.empty
+    allocations, scratch = [], []
+
+    def observe_empty(*args, **kwargs):
+        shape = tuple(args[0]) if args and isinstance(args[0], (tuple, list)) else None
+        if shape == optional_shape and kwargs.get("dtype") is torch.bfloat16:
+            allocations.append(phase[0])
+        return empty(*args, **kwargs)
+
+    def before(name, args, kwargs):
+        if phase[0] == "capture" and name == "_varlen_bwd_preprocess":
+            assert kwargs["ZERO_DQ"] is True
+            delta, dq_scratch = args[2], args[4]
+            assert dq_scratch.shape == (q_heads, 51039, 128) and dq_scratch.dtype is torch.float32
+            # These fills are graph nodes, so poison precedes preprocessing
+            # on every replay rather than only during Python capture.
+            delta.fill_(float("nan"))
+            dq_scratch.fill_(float("nan"))
+            scratch.append((delta, dq_scratch))
+
+    monkeypatch.setattr(torch, "empty", observe_empty)
+    partials = _poison_h12_ds_partials(monkeypatch) if h12 else []
+    records = _observe_prefix_ds_kernels(monkeypatch, before, roles=roles)
+
+    def backward():
+        return amd_fa_varlen_bwd.fa_varlen_backward(*inputs, sm_scale, dq_atomic_fp32=True)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        warm = backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    assert_route(records, True)
+    _assert_prefix_ds_result(warm, inputs, expected, q_lengths, kv_lengths)
+    assert partials == []
+    assert allocations == ["warmup"]
+    del warm
+    assert_cold()
+    records.clear()
+    phase[0] = "capture"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = backward()
+    assert_route(records, False)
+    assert allocations == ["warmup"] and len(scratch) == 1 and len(partials) == (1 if h12 else 0)
+    pointers = [value.data_ptr() for value in actual]
+    phase[0] = "replay"
+    for use_changed in (True, False, True):
+        source = changed[:5] if use_changed else originals_active
+        for full, small in zip((q, k, v, out, do), source, strict=True):
+            full[:small.shape[0]].copy_(small)
+        lse[:, :sum(q_lengths)].copy_(changed[5] if use_changed else original_lse)
+        for value in actual:
+            value.fill_(float("nan"))
+        graph.replay()
+        _assert_prefix_ds_result(actual, inputs, changed[-1] if use_changed else expected, q_lengths, kv_lengths)
+        if h12:
+            _assert_h12_ds_empty_owners(partials[0], q_lengths, kv_lengths)
+        assert [value.data_ptr() for value in actual] == pointers
+
+
+class _H12DSHostTensor:
+
+    def __init__(self, shape, dtype=torch.bfloat16, device="cuda:3", ptr=16):
+        self.shape, self.dtype, self.device, self.ptr = tuple(shape), dtype, device, ptr
+
+    def data_ptr(self):
+        return self.ptr
+
+    def numel(self):
+        result = 1
+        for size in self.shape:
+            result *= size
+        return result
+
+    def stride(self, axis):
+        result = 1
+        for size in self.shape[axis + 1:]:
+            result *= size
+        return result
+
+
+class _H12DSHostCuda:
+    OutOfMemoryError = torch.cuda.OutOfMemoryError
+
+    def __init__(self):
+        self.current_device = "cuda:0"
+        self.streams = {"cuda:0": "caller_stream", "cuda:3": "input_stream"}
+        self.capturing = {"cuda:0": False, "cuda:3": False}
+        self.events = []
+        self.errors = {}
+
+    def device(self, target):
+        cuda = self
+
+        class Guard:
+
+            def __enter__(self):
+                self.previous = cuda.current_device
+                cuda.events.append(("enter", target))
+                if "enter" in cuda.errors:
+                    raise cuda.errors["enter"]
+                cuda.current_device = target
+
+            def __exit__(self, *exc):
+                cuda.current_device = self.previous
+                cuda.events.append(("restore", self.previous))
+                if "exit" in cuda.errors:
+                    raise cuda.errors["exit"]
+                return False
+
+        return Guard()
+
+    def is_current_stream_capturing(self):
+        self.events.append(("query", self.current_device, self.streams[self.current_device]))
+        if "query" in self.errors:
+            raise self.errors["query"]
+        return self.capturing[self.current_device]
+
+
+class _H12DSHostTorch:
+    bfloat16 = torch.bfloat16
+    float32 = torch.float32
+    int32 = torch.int32
+
+    def __init__(self):
+        self.cuda = _H12DSHostCuda()
+        self.allocations = []
+        self.errors = {}
+
+    def _allocate(self, kind, shape, dtype, device):
+        tensor = _H12DSHostTensor(shape, dtype, device)
+        self.allocations.append((kind, tensor, self.cuda.current_device))
+        occurrence = sum(allocated.shape == tensor.shape for _, allocated, _ in self.allocations)
+        error = self.errors.get((tensor.shape, occurrence))
+        if error is not None:
+            raise error
+        return tensor
+
+    def empty(self, shape, *, dtype, device):
+        return self._allocate("empty", shape, dtype, device)
+
+    def zeros(self, shape, *, dtype, device):
+        return self._allocate("zeros", shape, dtype, device)
+
+    def empty_like(self, tensor):
+        return self._allocate("empty_like", tensor.shape, tensor.dtype, tensor.device)
+
+
+def _h12_ds_host_fixture(monkeypatch, *, case="h12", task_capacity=400):
+    """Run the real host dispatcher with metadata tensors and recording launches."""
+    api = _H12DSHostTorch()
+    heads, kv_heads = (64, 8) if case == "h64" else (12, 4)
+    if case == "causal":
+        kv_heads = heads
+    total_q = 50755 if case == "total_q" else 50754
+    total_kv = 100697 if case == "total_kv" else 100696
+    q, k, v, o, do = [
+        _H12DSHostTensor(shape, ptr=18 if case == "shifted_" + name else 16) for name, shape in (
+            ("q", (total_q, heads, 128)),
+            ("k", (total_kv, kv_heads, 128)),
+            ("v", (total_kv, kv_heads, 128)),
+            ("o", (total_q, heads, 128)),
+            ("do", (total_q, heads, 128)),
+        )
+    ]
+    plan = SimpleNamespace(
+        batch=20 if case == "batch" else 19,
+        max_q=5663 if case == "max_q" else 5662,
+        max_kv=10415 if case == "max_kv" else 10414,
+        wide_task_count=None,
+        task_counts=object(),
+        cu_seqlens_q=object(),
+        cu_seqlens_k=object(),
+        dq_full_kv_sequence=None,
+        dq_full_kv_start=None,
+    )
+    for name in (
+            "wide_kv_start",
+            "wide_q_start",
+            "wide_dq_start",
+            "wide_q_len",
+            "wide_kv_valid",
+            "q_block_sequence",
+            "q_block_start",
+            "full_kv_block_sequence",
+            "full_kv_block_start",
+            "tail_kv_block_sequence",
+            "tail_kv_block_start",
+    ):
+        setattr(plan, name, _H12DSHostTensor((task_capacity, )))
+    state = SimpleNamespace(api=api, launches=[], launch_errors={}, validations=[], q=q, k=k, v=v, o=o, do=do,
+                            lse=object(), plan=plan)
+    monkeypatch.setattr(amd_fa_varlen_bwd, "torch", api)
+    # Input validation has separate coverage with real tensors; these tests need
+    # metadata-only inputs so an accidental huge workspace cannot reach a GPU.
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_validate_backward_inputs", lambda *args: state.validations.append(args))
+
+    class Kernel:
+
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                state.launches.append((self.name, grid, args, kwargs))
+                if self.name in state.launch_errors:
+                    raise state.launch_errors[self.name]
+
+            return launch
+
+    for name in (
+            "_varlen_bwd_preprocess",
+            "_varlen_bwd_preprocess_dynamic_owner_queue",
+            "_prefix_h12_ds_producer",
+            "_prefix_h12_ds_dq_consumer",
+            "_varlen_dkdv_reduce_kernel",
+            "_prefix_h64_packed_ds_producer",
+            "_prefix_h64_packed_ds_dq_consumer",
+            "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel",
+            "_varlen_bwd_interleaved_bm32_kernel",
+            "_varlen_bwd_interleaved_bm32_rolling_fp32_queue_s3",
+            "_varlen_bwd_interleaved_bm32_rolling_fp32_queue_s4",
+            "_varlen_bwd_interleaved_kernel",
+            "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel",
+            "_varlen_mha_dq_convert_coalesced_kernel",
+            "_varlen_dq_convert_kernel",
+    ):
+        monkeypatch.setattr(amd_fa_varlen_bwd, name, Kernel(name))
+
+    def run():
+        return amd_fa_varlen_bwd.fa_varlen_backward(
+            q,
+            k,
+            v,
+            o,
+            do,
+            state.lse,
+            plan,
+            128**-0.5,
+            causal=case == "causal",
+            dq_atomic_fp32=case != "bf16",
+        )
+
+    state.run = run
+    return state
+
+
+@pytest.mark.parametrize("mode", ["eager", "capture", "oom", "ineligible", "caller_capture", "same_device"])
+def test_varlen_d128_h12_ds_allocation_host(mode):
+    api = _H12DSHostTorch()
+    q = object() if mode == "ineligible" else _H12DSHostTensor((50754, 12, 128))
+    api.cuda.capturing["cuda:3"] = mode == "capture"
+    api.cuda.capturing["cuda:0"] = mode == "caller_capture"
+    previous = "cuda:3" if mode == "same_device" else "cuda:0"
+    api.cuda.current_device = previous
+    if mode == "oom":
+        api.errors[((12, 51039, 10496), 1)] = api.cuda.OutOfMemoryError("optional dS")
+    result = amd_fa_varlen_bwd._try_allocate_prefix_h12_ds(
+        q,
+        51039,
+        eligible_h12=mode != "ineligible",
+        torch_api=api,
+    )
+    assert api.cuda.current_device == previous
+    assert api.cuda.streams == {"cuda:0": "caller_stream", "cuda:3": "input_stream"}
+    if mode == "ineligible":
+        assert result is None and not api.cuda.events and not api.allocations
+        return
+    assert api.cuda.events == [
+        ("enter", "cuda:3"),
+        ("query", "cuda:3", "input_stream"),
+        ("restore", previous),
+    ]
+    assert len(api.allocations) == (mode != "capture")
+    if api.allocations:
+        kind, tensor, current_device = api.allocations[0]
+        assert (kind, tensor.shape, tensor.dtype, tensor.device, current_device) == (
+            "empty",
+            (12, 51039, 10496),
+            torch.bfloat16,
+            "cuda:3",
+            "cuda:3",
+        )
+    assert (result is None) == (mode in ("capture", "oom"))
+    if result is not None:
+        assert result is api.allocations[0][1]
+
+
+@pytest.mark.parametrize("mode", ["eager", "capture", "optional_oom"])
+@pytest.mark.parametrize("task_capacity", [400, 513])
+def test_varlen_d128_h12_ds_dispatch_host(monkeypatch, mode, task_capacity):
+    state = _h12_ds_host_fixture(monkeypatch, task_capacity=task_capacity)
+    api = state.api
+    api.cuda.capturing["cuda:3"] = mode == "capture"
+    if mode == "optional_oom":
+        api.errors[((12, 51039, 10496), 1)] = api.cuda.OutOfMemoryError("optional dS")
+    outputs = state.run()
+    handoff = mode == "eager"
+    assert len(state.validations) == 1
+    assert [call[0] for call in state.launches] == [
+        "_varlen_bwd_preprocess",
+        "_prefix_h12_ds_producer" if handoff else "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel",
+        *([] if handoff else ["_varlen_dkdv_reduce_kernel"]),
+        "_prefix_h12_ds_dq_consumer" if handoff else "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel",
+    ]
+    assert all(result is allocation[1] for result, allocation in zip(outputs, api.allocations[:3]))
+    shapes = [tensor.shape for _, tensor, _ in api.allocations]
+    assert shapes.count((12, 51039, 10496)) == (mode != "capture")
+    assert shapes.count((12, 51039, 128)) == (not handoff)
+    preprocess, core, *remaining = state.launches
+    finish = remaining[-1]
+    assert preprocess[3]["ZERO_DQ"] is (not handoff)
+    assert preprocess[3]["PACK_STATS_MHA16"] is True
+    assert preprocess[3]["PACK_STATS"] is False
+    workspace_shape = (12, 51039, 10496 if handoff else 128)
+    workspace, = (tensor for _, tensor, _ in api.allocations if tensor.shape == workspace_shape)
+    assert preprocess[2][4] is (outputs[0] if handoff else workspace)
+    assert core[2][10] is workspace
+    assert core[1] == ((4, task_capacity) if handoff else (4, task_capacity, 2))
+    assert core[3]["Q_SPLITS"] == (1 if handoff else 2) and core[3]["CHUNKED_Q"] is True
+    assert core[3]["SORT_TASKS"] is (task_capacity <= 512)
+    if handoff:
+        assert core[2][11] is outputs[1] and core[2][12] is outputs[2]
+        assert not any(len(shape) == 4 for shape in shapes)
+    else:
+        reduce = remaining[0]
+        assert reduce[3]["KV_SPLITS"] == 2 and reduce[3]["FLATTEN_HEADS"] is True
+        partials = [tensor for _, tensor, _ in api.allocations if tensor.shape == (100696, 4, 2, 128)]
+        assert len(partials) == 2 and all(tensor.dtype is torch.float32 for tensor in partials)
+        for index, tensor in enumerate(partials):
+            assert core[2][11 + index] is tensor and reduce[2][index] is tensor
+    assert finish[2][0] is workspace
+    assert finish[2][5] is outputs[0]
+    if handoff:
+        assert workspace.dtype is torch.bfloat16
+        assert core[3]["CuKV"] is state.plan.cu_seqlens_k and core[3]["DS_CAP"] == 10496
+        assert finish[3]["enable_fp_fusion"] is False
+    else:
+        assert workspace.dtype is torch.float32
+    assert api.cuda.current_device == "cuda:0"
+    assert [event for event in api.cuda.events if event[0] == "query"] == [
+        ("query", "cuda:3", "input_stream"),
+    ]
+
+
+@pytest.mark.parametrize("case", [
+    "h64",
+    "shifted_q",
+    "shifted_k",
+    "shifted_v",
+    "shifted_do",
+    "bf16",
+    "causal",
+    "batch",
+    "total_q",
+    "total_kv",
+    "max_q",
+    "max_kv",
+])
+def test_varlen_d128_h12_ds_ineligible_host(monkeypatch, case):
+    state = _h12_ds_host_fixture(monkeypatch, case=case)
+    # A failing query makes an accidental helper call fail visibly.
+    state.api.cuda.errors["query"] = AssertionError("ineligible route queried capture")
+    state.run()
+    assert not state.api.cuda.events
+    assert all(tensor.shape[-1] != 10496 for _, tensor, _ in state.api.allocations)
+    assert all("_prefix_h12_ds_" not in call[0] for call in state.launches)
+    if case == "h64":
+        assert [call[0] for call in state.launches] == [
+            "_varlen_bwd_preprocess",
+            "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel",
+            "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel",
+        ]
+        assert state.launches[1][3]["Q_SPLITS"] == 1
+
+
+@pytest.mark.parametrize("failure", [
+    "optional_runtime",
+    "optional_memory",
+    "optional_value",
+    "fallback_after_capture",
+    "fallback_after_oom",
+    "dq_output",
+    "dk_output",
+    "dv_output",
+    "dk_partial",
+    "dv_partial",
+    "delta",
+    "query",
+    "enter",
+    "exit",
+    "preprocess",
+    "producer",
+    "reducer",
+    "consumer",
+    "fallback_core",
+])
+def test_varlen_d128_h12_ds_error_propagation_host(monkeypatch, failure):
+    state = _h12_ds_host_fixture(monkeypatch)
+    api = state.api
+    error_type = {"optional_runtime": RuntimeError, "optional_memory": MemoryError, "optional_value":
+                  ValueError}.get(failure, api.cuda.OutOfMemoryError)
+    error = error_type("CUDA out of memory: injected " + failure)
+    if failure in ("dk_partial", "dv_partial"):
+        api.cuda.capturing["cuda:3"] = True
+    allocations = {
+        "dq_output": ((50754, 12, 128), 1),
+        "dk_output": ((100696, 4, 128), 1),
+        "dv_output": ((100696, 4, 128), 2),
+        "dk_partial": ((100696, 4, 2, 128), 1),
+        "dv_partial": ((100696, 4, 2, 128), 2),
+        "delta": ((12, 101508), 1),
+    }
+    if failure in allocations:
+        api.errors[allocations[failure]] = error
+    elif failure.startswith("optional_"):
+        api.errors[((12, 51039, 10496), 1)] = error
+    elif failure.startswith("fallback_after_"):
+        api.cuda.capturing["cuda:3"] = failure == "fallback_after_capture"
+        if failure == "fallback_after_oom":
+            api.errors[((12, 51039, 10496), 1)] = api.cuda.OutOfMemoryError("optional dS")
+        api.errors[((12, 51039, 128), 1)] = error
+    elif failure in ("query", "enter", "exit"):
+        api.cuda.errors[failure] = error
+    else:
+        kernel = {
+            "preprocess": "_varlen_bwd_preprocess",
+            "producer": "_prefix_h12_ds_producer",
+            "reducer": "_varlen_dkdv_reduce_kernel",
+            "consumer": "_prefix_h12_ds_dq_consumer",
+            "fallback_core": "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel",
+        }[failure]
+        api.cuda.capturing["cuda:3"] = failure in ("fallback_core", "reducer")
+        state.launch_errors[kernel] = error
+    with pytest.raises(error_type) as caught:
+        state.run()
+    assert caught.value is error
+    assert api.cuda.current_device == "cuda:0"
+    assert api.cuda.streams == {"cuda:0": "caller_stream", "cuda:3": "input_stream"}
+    shapes = [tensor.shape for _, tensor, _ in api.allocations]
+    assert shapes.count((12, 51039, 10496)) <= 1
+    assert shapes.count((12, 51039, 128)) == (failure.startswith("fallback_after_")
+                                              or failure in ("fallback_core", "reducer", "dk_partial", "dv_partial"))
+    if state.launch_errors:
+        assert state.launches[-1][0] == kernel
+        assert sum(call[0] == kernel for call in state.launches) == 1
+    else:
+        assert not state.launches
+    if failure in ("dk_partial", "dv_partial"):
+        assert api.cuda.events == [
+            ("enter", "cuda:3"),
+            ("query", "cuda:3", "input_stream"),
+            ("restore", "cuda:0"),
+        ]
+    elif failure in allocations:
+        assert not api.cuda.events
+
+
+_H64_DS_ROLES = (
+    "_varlen_bwd_preprocess",
+    "_prefix_h64_packed_ds_producer",
+    "_prefix_h64_packed_ds_dq_consumer",
+    "_varlen_bwd_interleaved_bm16_bn256_fp32_kernel",
+    "_varlen_mha_dq_convert_coalesced_fp32_swizzled_kernel",
+    "_varlen_dkdv_reduce_kernel",
+)
+
+
+def _packed_ds_offsets(q_lengths, kv_lengths):
+    rectangles = (((q + 15) // 16) * 16 * ((k + 255) // 256) * 256 for q, k in zip(q_lengths, kv_lengths, strict=True))
+    return [0, *itertools.accumulate(rectangles)]
+
+
+def _assert_h64_ds_route(records, handoff):
+    expected = _H64_DS_ROLES[:3] if handoff else (_H64_DS_ROLES[0], _H64_DS_ROLES[3], _H64_DS_ROLES[4])
+    assert [name for name, _, _ in records] == list(expected)
+    preprocess = records[0][1]
+    assert preprocess["ZERO_DQ"] is (not handoff)
+    assert preprocess["PACK_STATS_MHA16"] is True and preprocess["PACK_STATS"] is False
+    assert records[1][1]["Q_SPLITS"] == 1
+    _assert_dk_native_column_subtiles(records[1][2])
+    if handoff:
+        assert records[-1][1]["enable_fp_fusion"] is False
+        for name, _, compiled in records[1:]:
+            assert "buffer_atomic" not in compiled.asm["amdgcn"], name
+            _assert_scratch_free(name, compiled)
+    else:
+        assert "buffer_atomic_add_f32" in records[1][2].asm["amdgcn"]
+
+
+@_H12_DS_METADATA
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h64_ds_public_gfx950(monkeypatch, supply_metadata, sm_scale):
+    inputs, expected, qs, ks = _make_prefix_ds_case(supply_metadata, sm_scale, q_heads=64, kv_heads=8)
+    plan = inputs[-1]
+    if supply_metadata:
+        assert plan.packed_ds_prefix is None and plan.packed_ds_head_elements is None
+    else:
+        offsets = _packed_ds_offsets(_H12_DS_Q_LENGTHS, _H12_DS_KV_LENGTHS)
+        assert plan.packed_ds_prefix.dtype is torch.int64
+        assert plan.packed_ds_prefix.device == inputs[0].device
+        assert plan.packed_ds_prefix.tolist() == offsets
+        assert plan.packed_ds_head_elements == offsets[-1]
+    records = _observe_prefix_ds_kernels(monkeypatch, roles=_H64_DS_ROLES)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(*inputs, sm_scale, dq_atomic_fp32=True)
+    _assert_h64_ds_route(records, not supply_metadata)
+    _assert_prefix_ds_result(actual, inputs, expected, qs, ks)
+
+
+@pytest.mark.parametrize("mode", ("old_plan", "oom"))
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h64_ds_fallback_gfx950(monkeypatch, mode, sm_scale):
+    inputs, expected, qs, ks = _make_prefix_ds_case(False, sm_scale, q_heads=64, kv_heads=8)
+    plan = inputs[-1]
+    empty = torch.empty
+    attempts = []
+
+    def injected_empty(*args, **kwargs):
+        shape = tuple(args[0]) if args and isinstance(args[0], (tuple, list)) else None
+        if shape == (64, plan.packed_ds_head_elements) and kwargs.get("dtype") is torch.bfloat16:
+            attempts.append(shape)
+            raise torch.cuda.OutOfMemoryError("optional compact dS")
+        return empty(*args, **kwargs)
+
+    if mode == "old_plan":
+        inputs = (*inputs[:-1], replace(plan, packed_ds_prefix=None, packed_ds_head_elements=None))
+    monkeypatch.setattr(torch, "empty", injected_empty)
+    records = _observe_prefix_ds_kernels(monkeypatch, roles=_H64_DS_ROLES)
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(*inputs, sm_scale, dq_atomic_fp32=True)
+    _assert_h64_ds_route(records, False)
+    _assert_prefix_ds_result(actual, inputs, expected, qs, ks)
+    assert len(attempts) == (mode == "oom")
+
+
+@pytest.mark.parametrize("fixture", ("short", "chunks"))
+@pytest.mark.parametrize("sorted_tasks", (False, True))
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h64_ds_producer_boundaries_gfx950(fixture, sorted_tasks, sm_scale):
+    if fixture == "short":
+        qs = [1, 15, 16, 17, 31, 32, 63, 64, 127, 128, 129]
+        ks = [1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 513]
+    else:
+        qs, ks = [511, 512, 513, 1025], [255, 256, 257, 1281]
+    case = _make_varlen_d128_reference_case(qs, ks, q_heads=64, kv_heads=8, seed=9417, sm_scale=sm_scale)
+    q, k, v, out, do, lse, cu_q, cu_kv, _, expected = case
+    if fixture == "short":
+        # With one key, P=1 and dQ=dK=0. Use exact binary fractions so
+        # dp and delta both equal 128 * (1/8)**2; relative error against
+        # a cancellation residual would otherwise be ill-conditioned.
+        for tensor in (v, out, do):
+            tensor[0].fill_(0.125)
+        expected[0][0].zero_()
+        expected[1][0].zero_()
+        expected[2][0].fill_(1.0)  # Eight sibling heads each contribute 1/8.
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv, sum(qs), sum(ks), max(qs), max(ks))
+    offsets = _packed_ds_offsets(qs, ks)
+    prefix = torch.tensor(offsets, dtype=torch.int64, device="cuda")
+    # Check both ends of the workspace and the final dQ output. Poisoning the
+    # interior also exposes uninitialized Q16 padding or missing KV256 stores.
+    ds_storage = torch.full((64 * offsets[-1] + 8192, ), float("nan"), dtype=torch.bfloat16, device="cuda")
+    ds = ds_storage[4096:-4096].view(64, offsets[-1])
+    dq_storage = torch.full((q.shape[0] + 128, 64, 128), float("nan"), dtype=torch.bfloat16, device="cuda")
+    dq = dq_storage[:q.shape[0]]
+    dk, dv = torch.full_like(k, float("nan")), torch.full_like(v, float("nan"))
+    delta = torch.empty((64, 2 * q.shape[0]), dtype=torch.float32, device="cuda")
+    padded = q.shape[0] + 15 * len(qs)
+    amd_fa_varlen_bwd._varlen_bwd_preprocess[((max(qs) + 63) // 64,
+                                              len(qs) * 64)](out, do, delta, cu_q, dq, padded, plan.task_counts,
+                                                             PLAN_ERROR_INDEX=4, HEADS=64, D=128, BLOCK_M=64,
+                                                             ZERO_DQ=False, DQ_PAD_ROWS=16, LSE=lse, TOTAL_Q=q.shape[0],
+                                                             PACK_STATS=False, PACK_STATS_MHA16=True, num_warps=4)
+    producer = amd_fa_varlen_bwd._prefix_h64_packed_ds_producer[(8, plan.wide_kv_start.numel())](
+        q, k, v, do, delta, plan.wide_kv_start, plan.wide_q_start, plan.wide_dq_start, plan.wide_q_len,
+        plan.wide_kv_valid, ds, dk, dv, plan.task_counts, CuKV=cu_kv, DS_PREFIX=prefix, DS_HEAD_ELEMENTS=offsets[-1],
+        SM_SCALE=sm_scale, TOTAL_Q=q.shape[0], TOTAL_Q_PADDED=padded, HQ=64, HKV=8, D=128, BLOCK_M=16, BLOCK_N=256,
+        TASK_COUNT_INDEX=3, PLAN_ERROR_INDEX=4, CHUNKED_Q=True, Q_SPLITS=1, SORT_TASKS=sorted_tasks, DS_CAP=10496,
+        num_warps=4, num_stages=1, matrix_instr_nonkdim=16, reverse_local_assignment=True,
+        enable_sched_group_barrier_scheduler=False, llvm_fn_attrs=())
+    for seq, (ql, kl) in enumerate(zip(qs, ks, strict=True)):
+        block = ds[:, offsets[seq]:offsets[seq + 1]].reshape(64, (ql + 15) // 16, ((kl + 255) // 256) * 256, 16)
+        assert torch.isfinite(block).all()
+        assert torch.count_nonzero(block[:, -1, :, (ql % 16 or 16):]).item() == 0
+        assert torch.count_nonzero(block[:, :, kl:, :]).item() == 0
+    consumer = amd_fa_varlen_bwd._prefix_h64_packed_ds_dq_consumer[((max(qs) + 127) // 128, 64, len(qs))](
+        ds, k, cu_q, cu_kv, plan.task_counts, dq, TOTAL_Q_PADDED=padded, DS_PREFIX=prefix, DS_HEAD_ELEMENTS=offsets[-1],
+        SM_SCALE=sm_scale, DS_CAP=10496, PLAN_ERROR_INDEX=4, num_warps=4, matrix_instr_nonkdim=16,
+        enable_fp_fusion=False)
+    if fixture == "short":
+        assert torch.count_nonzero(dq[0]).item() == 0
+        assert torch.count_nonzero(dk[0]).item() == 0
+        assert torch.equal(dv[0], torch.ones_like(dv[0]))
+    _assert_prefix_ds_result((dq, dk, dv), (q, k, v), expected, qs, ks)
+    assert torch.isnan(ds_storage[:4096]).all() and torch.isnan(ds_storage[-4096:]).all()
+    assert torch.isnan(dq_storage[q.shape[0]:]).all()
+    _assert_scratch_free("producer", producer)
+    _assert_dk_native_column_subtiles(producer)
+    _assert_scratch_free("consumer", consumer)
+
+
+@_H12_DS_SCALES
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_h64_ds_consumer_boundaries_gfx950(sm_scale):
+    qs = (127, 128, 129, 511, 512, 513, 1, 17, 33)
+    ks = (1, 63, 64, 65, 255, 256, 257, 513, 0)
+    qo, ko = [0, *itertools.accumulate(qs)], [0, *itertools.accumulate(ks)]
+    offsets = _packed_ds_offsets(qs, ks)
+    ds_storage = torch.full((64 * offsets[-1] + 8192, ), float("nan"), dtype=torch.bfloat16, device="cuda")
+    ds = ds_storage[4096:-4096].view(64, offsets[-1])
+    k = torch.full((ko[-1] + 64, 8, 128), float("nan"), dtype=torch.bfloat16, device="cuda")
+    dq = torch.full((qo[-1] + 128, 64, 128), float("nan"), dtype=torch.bfloat16, device="cuda")
+    expected = torch.zeros_like(dq[:qo[-1]])
+    # Exercise several siblings and the last query/KV head. Padding stays NaN
+    # outside each initialized rectangle; the empty-KV sequence must write zero.
+    for seq, (ql, kl) in enumerate(zip(qs, ks, strict=True)):
+        block = ds[:, offsets[seq]:offsets[seq + 1]].reshape(64, (ql + 15) // 16, ((kl + 255) // 256) * 256, 16)
+        block.zero_()
+        head = (0, 1, 2, 3, 5, 7, 8, 63, 10)[seq]
+        for m in range((ql + 15) // 16):
+            block[head, m, :kl, :min(16, ql - 16 * m)].fill_(0.25)
+        for kh in range(8):
+            k[ko[seq]:ko[seq + 1], kh].fill_(kh + 1)
+        total = torch.zeros((), dtype=torch.float32, device="cuda")
+        for n in range(0, kl, 256):
+            partial = torch.tensor(min(256, kl - n) * 0.25 * (head // 8 + 1), dtype=torch.float32, device="cuda")
+            total = total + partial * sm_scale
+        expected[qo[seq]:qo[seq + 1], head].fill_(total.to(torch.bfloat16))
+    cu_q = torch.tensor(qo, dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor(ko, dtype=torch.int32, device="cuda")
+    prefix = torch.tensor(offsets, dtype=torch.int64, device="cuda")
+    counts = torch.zeros(6, dtype=torch.int32, device="cuda")
+    amd_fa_varlen_bwd._prefix_h64_packed_ds_dq_consumer[((max(qs) + 127) // 128, 64, len(qs))](
+        ds, k, cu_q, cu_kv, counts, dq, TOTAL_Q_PADDED=qo[-1] + 15 * len(qs), DS_PREFIX=prefix,
+        DS_HEAD_ELEMENTS=offsets[-1], SM_SCALE=sm_scale, DS_CAP=10496, PLAN_ERROR_INDEX=4, num_warps=4,
+        matrix_instr_nonkdim=16, enable_fp_fusion=False)
+    assert torch.equal(dq[:qo[-1]], expected)
+    assert torch.isnan(dq[qo[-1]:]).all() and torch.isnan(k[ko[-1]:]).all()
+    assert torch.isnan(ds_storage[:4096]).all() and torch.isnan(ds_storage[-4096:]).all()
+
+
+@pytest.mark.parametrize("mode", ("eager", "capture", "oom", "missing_metadata", "caller_capture"))
+@pytest.mark.parametrize("task_capacity", (403, 513))
+def test_varlen_d128_h64_ds_dispatch_host(monkeypatch, mode, task_capacity):
+    state = _h12_ds_host_fixture(monkeypatch, case="h64", task_capacity=task_capacity)
+    # The real plan preparation is covered by the public GPU test; these
+    # metadata-only tensors keep allocation and fallback tests off the GPU.
+    elements = 306958336
+    if mode != "missing_metadata":
+        state.plan.packed_ds_prefix = object()
+        state.plan.packed_ds_head_elements = elements
+    state.api.cuda.capturing["cuda:3"] = mode == "capture"
+    state.api.cuda.capturing["cuda:0"] = mode == "caller_capture"
+    if mode == "oom":
+        state.api.errors[((64, elements), 1)] = state.api.cuda.OutOfMemoryError("optional compact dS")
+    outputs = state.run()
+    handoff = mode in ("eager", "caller_capture")
+    expected = _H64_DS_ROLES[:3] if handoff else (_H64_DS_ROLES[0], _H64_DS_ROLES[3], _H64_DS_ROLES[4])
+    assert [call[0] for call in state.launches] == list(expected)
+    preprocess, producer, consumer = state.launches
+    assert preprocess[3]["ZERO_DQ"] is (not handoff)
+    assert preprocess[3]["PACK_STATS_MHA16"] is True and preprocess[3]["PACK_STATS"] is False
+    assert producer[3]["Q_SPLITS"] == 1 and producer[3]["SORT_TASKS"] is (task_capacity <= 512)
+    assert producer[2][11] is outputs[1] and producer[2][12] is outputs[2]
+    assert outputs[1].dtype is outputs[2].dtype is torch.bfloat16
+    shapes = [tensor.shape for _, tensor, _ in state.api.allocations]
+    assert shapes.count((64, elements)) == (mode not in ("capture", "missing_metadata"))
+    assert shapes.count((64, 51039, 128)) == (not handoff)
+    assert not any(len(shape) == 4 for shape in shapes)
+    if handoff:
+        assert producer[3]["DS_PREFIX"] is consumer[3]["DS_PREFIX"] is state.plan.packed_ds_prefix
+        assert producer[3]["DS_HEAD_ELEMENTS"] == consumer[3]["DS_HEAD_ELEMENTS"] == elements
+        assert consumer[3]["enable_fp_fusion"] is False
+    assert state.api.cuda.current_device == "cuda:0"
+    assert state.api.cuda.streams == {"cuda:0": "caller_stream", "cuda:3": "input_stream"}
+    queries = [event for event in state.api.cuda.events if event[0] == "query"]
+    assert queries == ([] if mode == "missing_metadata" else [("query", "cuda:3", "input_stream")])
+
+
+@pytest.mark.parametrize("failure", (
+    "optional_runtime",
+    "optional_memory",
+    "optional_value",
+    "preprocess",
+    "producer",
+    "consumer",
+    "query",
+    "enter",
+    "exit",
+    "fallback_after_capture",
+    "fallback_after_oom",
+))
+def test_varlen_d128_h64_ds_error_propagation_host(monkeypatch, failure):
+    state = _h12_ds_host_fixture(monkeypatch, case="h64")
+    elements = 306958336
+    state.plan.packed_ds_prefix = object()
+    state.plan.packed_ds_head_elements = elements
+    api = state.api
+    error_type = {"optional_runtime": RuntimeError, "optional_memory": MemoryError, "optional_value":
+                  ValueError}.get(failure, api.cuda.OutOfMemoryError)
+    error = error_type("injected compact dS failure")
+    if failure.startswith("optional_"):
+        api.errors[((64, elements), 1)] = error
+    elif failure.startswith("fallback_after_"):
+        api.cuda.capturing["cuda:3"] = failure == "fallback_after_capture"
+        if failure == "fallback_after_oom":
+            api.errors[((64, elements), 1)] = api.cuda.OutOfMemoryError("optional compact dS")
+        api.errors[((64, 51039, 128), 1)] = error
+    elif failure in ("query", "enter", "exit"):
+        api.cuda.errors[failure] = error
+    else:
+        kernel = dict(zip(("preprocess", "producer", "consumer"), _H64_DS_ROLES[:3], strict=True))[failure]
+        state.launch_errors[kernel] = error
+    with pytest.raises(error_type) as caught:
+        state.run()
+    assert caught.value is error
+    assert api.cuda.current_device == "cuda:0"
+    assert api.cuda.streams == {"cuda:0": "caller_stream", "cuda:3": "input_stream"}
+    shapes = [tensor.shape for _, tensor, _ in api.allocations]
+    assert shapes.count((64, elements)) <= 1
+    assert shapes.count((64, 51039, 128)) == failure.startswith("fallback_after_")
