@@ -1295,6 +1295,12 @@ def _verify_scale_tmem_copy_shape(src: tlx.buffered_tensor, dst: tlx.buffered_te
     ]
     if rows == 128 and cols % 16 == 0:
         accepted_shapes.append([32 * (cols // 16), 16])
+    # 2CTA scaled MMA stages the full-N B scales into per-CTA 128-row TMEM, so
+    # the 5D blocked source may split the same block count differently across
+    # its rep axes; the copy lowering derives the reps from the source shape.
+    if (len(src_shape) == 5 and src_shape[0] == 1 and src_shape[3:] == [2, 256]
+            and src_shape[1] * src_shape[2] == rep_rows * rep_cols):
+        return
     assert src_shape in accepted_shapes, error_msg
 
 
