@@ -2,6 +2,12 @@ name: Build Triton wheel
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (defaults to the selected workflow ref)
+        type: string
+        required: false
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -16,22 +22,23 @@ on:
       wheel_filename:
         description: Original wheel filename
         value: ${{ jobs.build.outputs.wheel_filename }}
+      wheel_sha256:
+        description: SHA256 of the validated wheel
+        value: ${{ jobs.build.outputs.wheel_sha256 }}
 
 permissions:
   contents: read
   id-token: write
 
-concurrency:
-  group: ${{ github.workflow }}-build-wheel-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: 32-core-ubuntu
-    timeout-minutes: 90
+    # Up to 90 minutes waiting for another producer, then 90 minutes to build.
+    timeout-minutes: 180
     outputs:
-      wheel_url: ${{ steps.wheel_url.outputs.wheel_url }}
-      wheel_filename: ${{ steps.wheel_url.outputs.wheel_filename }}
+      wheel_url: ${{ steps.cache.outputs.wheel_url || steps.wheel_url.outputs.wheel_url }}
+      wheel_filename: ${{ steps.cache.outputs.wheel_filename || steps.wheel_url.outputs.wheel_filename }}
+      wheel_sha256: ${{ steps.cache.outputs.wheel_sha256 || steps.wheel_url.outputs.wheel_sha256 }}
     env:
       MAX_JOBS: 32
       CCACHE_DIR: /tmp/fbtriton-ccache
@@ -41,10 +48,26 @@ jobs:
       TRITON_WHEEL_NAME: fbtriton
       LDFLAGS: -Wl,--strip-all
     steps:
+      - name: Checkout build tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/scripts/wheel_cache.py
+            .github/workflows/build.yml
+
+      - name: Preserve build tooling outside the source checkout
+        run: |
+          mkdir -p "${RUNNER_TEMP}/wheel-ci/scripts" "${RUNNER_TEMP}/wheel-ci/workflows"
+          cp .github/scripts/wheel_cache.py "${RUNNER_TEMP}/wheel-ci/scripts/"
+          cp .github/workflows/build.yml "${RUNNER_TEMP}/wheel-ci/workflows/"
+          echo "WHEEL_CACHE_SCRIPT=${RUNNER_TEMP}/wheel-ci/scripts/wheel_cache.py" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.ref || github.sha }}
           submodules: recursive
 
       - name: Set up Python
@@ -52,21 +75,39 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install wheel cache tools
+        run: |
+          python3 -m pip install 'boto3>=1.36.0' uv
+          echo "WHEEL_CACHE_PYTHON=$(command -v python3)" >> "$GITHUB_ENV"
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_triton_artifacts
+          role-duration-seconds: 18000
+          aws-region: us-east-1
+
+      - name: Reuse a wheel or acquire its build lease
+        id: cache
+        run: '"${WHEEL_CACHE_PYTHON}" "${WHEEL_CACHE_SCRIPT}" acquire'
+
       - name: Install build tools
+        if: steps.cache.outputs.hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld ccache
-          python3 -m pip install --upgrade uv
 
       - name: Restore ccache
+        if: steps.cache.outputs.hit != 'true'
         uses: actions/cache@v4
         with:
           path: /tmp/fbtriton-ccache
-          key: ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          key: ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ref || github.sha }}
           restore-keys: |
             ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up build environment
+        if: steps.cache.outputs.hit != 'true'
         env:
           VIRTUAL_ENV: ${{ runner.temp }}/triton-build-venv
         run: |
@@ -76,11 +117,13 @@ jobs:
           echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
 
       - name: Build wheel
+        if: steps.cache.outputs.hit != 'true'
         run: |
           uv build --wheel --no-build-isolation --out-dir dist/
           ls -lh dist/
 
       - name: Validate wheel and prepare S3 artifact
+        if: steps.cache.outputs.hit != 'true'
         id: wheel
         shell: bash
         run: |
@@ -102,21 +145,15 @@ jobs:
           uv pip install --no-deps "${wheels[0]}"
           python3 -I -c 'import triton; print("OK", triton.__version__)'
 
-          artifact_name="run_${GITHUB_RUN_ID}"
+          artifact_name="run_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
           # An explicit S3 prefix overrides the action's name input. Preserve
           # the artifact name as a directory under that prefix.
           mkdir -p "s3-artifacts/${artifact_name}"
           mv "${wheels[0]}" "s3-artifacts/${artifact_name}/"
           echo "name=${artifact_name}" >> "$GITHUB_OUTPUT"
 
-      - name: Authenticate with AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_triton_artifacts
-          role-duration-seconds: 18000
-          aws-region: us-east-1
-
       - name: Upload wheel to S3
+        if: steps.cache.outputs.hit != 'true'
         id: upload
         uses: pytorch/test-infra/.github/actions/upload-artifact-s3@main
         with:
@@ -128,23 +165,14 @@ jobs:
           overwrite: "true"
           if-no-files-found: error
 
-      - name: Export wheel URL
+      - name: Publish validated wheel manifest
+        if: steps.cache.outputs.hit != 'true'
         id: wheel_url
         env:
           UPLOADED_OBJECTS: ${{ steps.upload.outputs.uploaded-objects }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from urllib.parse import quote
+          "${WHEEL_CACHE_PYTHON}" "${WHEEL_CACHE_SCRIPT}" publish --wheel s3-artifacts/*/*.whl
 
-          uploaded_objects = json.loads(os.environ["UPLOADED_OBJECTS"])
-          if len(uploaded_objects) != 1:
-              raise RuntimeError(f"Expected exactly one uploaded wheel, found {len(uploaded_objects)}")
-          key = next(iter(uploaded_objects))
-          url = f"https://gha-artifacts.s3.us-east-1.amazonaws.com/{quote(key, safe='/')}"
-          filename = key.rsplit("/", 1)[-1]
-          print(url)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"wheel_url={url}\nwheel_filename={filename}\n")
-          PY
+      - name: Release wheel build lease
+        if: always() && steps.cache.outputs.hit == 'false'
+        run: '"${WHEEL_CACHE_PYTHON}" "${WHEEL_CACHE_SCRIPT}" release'
