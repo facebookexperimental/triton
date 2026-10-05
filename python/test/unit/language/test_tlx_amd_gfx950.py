@@ -1429,6 +1429,7 @@ def test_amd_fa_cluster_numerical_matrix_gfx950():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skip(reason="TODO: move performance coverage out of the L1 test suite")
 def test_amd_fa_cluster_performance_gfx950():
     test_name = "test_amd_fa_cluster_performance_gfx950"
     if _run_amd_fa_cluster_regression_isolated(test_name):
