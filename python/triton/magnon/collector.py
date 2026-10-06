@@ -121,3 +121,25 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
         dlog("collector", f"skip (unsupported by PTX-direct spec): {e}")
     except Exception as e:  # collection must never break the user's run
         dlog("collector", f"capture failed: {type(e).__name__}: {e}")
+
+
+def wrap_launcher(kernel, run):
+    """Wrap a CompiledKernel's launcher so its first launch dumps a task.
+
+    Covers kernels compiled with triton.compile() and launched through CompiledKernel.run (e.g.
+    Inductor's generated launchers), which never reach the JITFunction.run hook. Callers may hold on
+    to the returned function, so it stays installed and only the first launch collects."""
+    collected = False
+
+    def launcher(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args):
+        nonlocal collected
+        if not collected:
+            collected = True
+            src = kernel.src
+            fn = getattr(src, "fn", None)
+            if fn is not None:
+                capture(jitfn=fn, kernel=kernel, bound_args=dict(zip(fn.arg_names, args)), signature=src.signature,
+                        constexprs=src.constants, grid=(grid_0, grid_1, grid_2))
+        return run(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args)
+
+    return launcher
