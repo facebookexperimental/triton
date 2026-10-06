@@ -917,7 +917,6 @@ class TestTorchTLXEpilogueFusion(TestCase):
         gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
         scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
         norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
-        torch._dynamo.mark_dynamic(x, 0, min=120, max=766)
 
         def matmul_rmsnorm(
             x: torch.Tensor,
@@ -980,7 +979,9 @@ class TestTorchTLXEpilogueFusion(TestCase):
             atol=3e-2,
             rtol=3e-2,
         )
-        self.assertEqual(compile_counter.frame_count, 1)
+        # The fused custom op declines dynamic M. The remaining TLX addmm
+        # candidates specialize M, so the second shape recompiles once.
+        self.assertEqual(compile_counter.frame_count, 2)
         generated_code = "\n".join(code)
         self.assertNotIn("tlx_gfx950_addmm_rmsnorm", generated_code)
         self.assertGreaterEqual(code[-1].count(".run("), 2)
