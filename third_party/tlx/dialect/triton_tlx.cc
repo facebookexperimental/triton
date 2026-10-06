@@ -906,16 +906,29 @@ void init_triton_tlx_ir(py::module_ &m) {
       // Barrier Ops
       .def("create_alloc_barriers",
            [](TritonOpBuilder &self, int numBarriers, int arriveCount,
-              Attribute barrierEncoding) -> mlir::Value {
+              Attribute barrierEncoding, int numCTAs) -> mlir::Value {
              auto context = self.getBuilder().getContext();
+             auto module = self.getBuilder()
+                               .getInsertionBlock()
+                               ->getParentOp()
+                               ->getParentOfType<ModuleOp>();
+             module->setAttr(ttg::AttrNumCTAsName,
+                             self.getBuilder().getI32IntegerAttr(numCTAs));
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             SmallVector<int64_t> barriersShape = {numBarriers};
+             SmallVector<int64_t> singleBarrierShape = {1};
+             if (numCTAs > 1) {
+               barriersShape.push_back(numCTAs);
+               singleBarrierShape = {numCTAs};
+             }
              auto barriersMemDescType = ttg::MemDescType::get(
-                 {numBarriers}, self.getBuilder().getI64Type(), barrierEncoding,
+                 barriersShape, self.getBuilder().getI64Type(), barrierEncoding,
                  memorySpace, /*mutableMemory=*/true);
 
              auto singleBarrierMemDescType = ttg::MemDescType::get(
-                 {1}, self.getBuilder().getI64Type(), barrierEncoding,
-                 barriersMemDescType.getMemorySpace(), /*mutableMemory=*/true);
+                 singleBarrierShape, self.getBuilder().getI64Type(),
+                 barrierEncoding, barriersMemDescType.getMemorySpace(),
+                 /*mutableMemory=*/true);
 
              // Allocate buffer in shared memory
              mlir::Value bufferViews =
@@ -945,15 +958,38 @@ void init_triton_tlx_ir(py::module_ &m) {
            })
       .def(
           "create_barrier_arrive",
-          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount,
-             std::optional<Value> pred) -> void {
-            if (pred.has_value())
-              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount,
+          [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
+             std::optional<Value> pred, std::optional<uint32_t> ctaMask,
+             std::vector<int32_t> clusterDims) -> void {
+            if (ctaMask.has_value()) {
+              assert(clusterDims.size() == 3 &&
+                     "expected three cluster dimensions");
+              auto module = self.getBuilder()
+                                .getInsertionBlock()
+                                ->getParentOp()
+                                ->getParentOfType<ModuleOp>();
+              module->setAttr(
+                  ttg::AttrClusterDimX,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[0]));
+              module->setAttr(
+                  ttg::AttrClusterDimY,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[1]));
+              module->setAttr(
+                  ttg::AttrClusterDimZ,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[2]));
+              self.create<ttng::ArriveBarrierOp>(
+                  mbarrierLoc, arriveCount, ctaMask.value(),
+                  pred.has_value() ? pred.value() : Value());
+            } else if (pred.has_value()) {
+              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
                                                  pred.value());
-            else
-              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
+            } else {
+              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount);
+            }
           },
-          py::arg("mbarrerLoc"), py::arg("arriveCount"), py::arg("pred").none())
+          py::arg("mbarrierLoc"), py::arg("arriveCount"),
+          py::arg("pred").none(), py::arg("ctaMask").none(),
+          py::arg("clusterDims"))
       .def(
           "create_warp_barrier_arrive",
           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
@@ -1481,6 +1517,12 @@ void init_triton_tlx_ir(py::module_ &m) {
             self.create<ttng::AsyncTMAGatherOp>(
                 desc, xOffsets, yOffset, mbarrier, result, pred, multicast);
           })
+      .def("create_async_TMA_scatter",
+           [](TritonOpBuilder &self, Value desc, Value xOffsets, Value yOffset,
+              Value source) -> void {
+             self.create<ttng::AsyncTMAScatterOp>(desc, xOffsets, yOffset,
+                                                  source);
+           })
       .def("create_async_TMA_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value pred, EvictionPolicy evictionPolicy) -> void {

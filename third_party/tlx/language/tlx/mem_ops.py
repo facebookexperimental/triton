@@ -1612,6 +1612,70 @@ def async_descriptor_gather(
     )
 
 
+@tl.builtin
+def async_descriptor_scatter(
+    desc: tl.tensor_descriptor_base,
+    source: tlx.buffered_tensor,
+    x_offsets: tl.tensor,
+    y_offset: tl.tensor,
+    _semantic=None,
+) -> None:
+    """Asynchronously scatter rows from shared memory into global memory.
+
+    ``desc`` must describe a 2D tensor with a one-row block. ``x_offsets``
+    selects the destination row for each row of ``source``, while ``y_offset``
+    is the common column offset. Use ``async_descriptor_store_wait`` before
+    reusing the source buffer or consuming the global-memory result.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base), "desc must be a tensor descriptor"
+    arch = _semantic.builder.options.arch
+    try:
+        capability = int(cuda_parse_arch(arch))
+    except (TypeError, ValueError):
+        raise NotImplementedError(
+            f"tlx.async_descriptor_scatter is only available on Blackwell; got arch {arch!r}") from None
+    if capability < 100:
+        raise NotImplementedError(f"tlx.async_descriptor_scatter is only available on Blackwell; got arch {arch!r}")
+
+    assert isinstance(source, tlx.buffered_tensor) and source.type.storage == tlx.storage_kind.smem, (
+        "source must be a buffered tensor in SMEM")
+    assert len(desc.block_shape) == 2, f"descriptor must be 2D, but got block shape {desc.block_shape}"
+    assert int(desc.block_shape[0]) == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
+
+    assert isinstance(x_offsets, tl.tensor) and x_offsets.type.is_block(), "x_offsets must be a tensor"
+    assert len(x_offsets.shape) == 1, f"x_offsets must be 1D, but got shape {x_offsets.shape}"
+    assert x_offsets.dtype in (tl.int16,
+                               tl.int32), (f"x_offsets must have dtype int16 or int32, but got {x_offsets.dtype}")
+
+    source_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in source.shape]
+    block_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in desc.block_shape]
+    num_rows = int(tl._unwrap_if_constexpr(x_offsets.shape[0]))
+    assert source_shape == [num_rows, block_shape[1]
+                            ], (f"source shape must be [{num_rows}, {block_shape[1]}], but got {source_shape}")
+    assert source.dtype == desc.dtype, f"source dtype must match descriptor dtype {desc.dtype}, but got {source.dtype}"
+    assert num_rows >= 8, f"descriptor scatter must have at least 8 rows, but got {num_rows}"
+    assert num_rows % 4 == 0, f"descriptor scatter row count must be a multiple of 4, but got {num_rows}"
+    assert source.dtype.primitive_bitwidth <= 32, (
+        f"descriptor scatter dtype cannot be greater than 32 bits, but got {source.dtype}")
+    min_cols = 32 // source.dtype.primitive_bitwidth * 8
+    assert block_shape[1] >= min_cols, (
+        f"descriptor scatter of {source.dtype} must have at least {min_cols} columns, but got {block_shape[1]}")
+
+    if x_offsets.dtype == tl.int16:
+        x_offsets = _semantic.cast(x_offsets, tl.int32)
+    y_offset = _semantic.to_tensor(y_offset)
+    assert not y_offset.type.is_block() and y_offset.dtype.is_int(), "y_offset must be a scalar integer"
+    y_offset = _semantic.cast(y_offset, tl.int32)
+
+    source_handle = require_nv_mma_shared_layout(source, False, _semantic.builder)
+    _semantic.builder.create_async_TMA_scatter(
+        desc.handle,
+        x_offsets.handle,
+        y_offset.handle,
+        source_handle,
+    )
+
+
 def _amd_tdm_descriptor_layout(desc):
     """Compute the AMD TDM descriptor-compatible shared layout.
 

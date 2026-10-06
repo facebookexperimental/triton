@@ -1707,6 +1707,11 @@ public:
     mod->setAttr(ttg::AttrNumThreadsPerWarp,
                  b.getI32IntegerAttr(threadsPerWarp));
     mod->setAttr(ttg::AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
+    if (clusterDims.size() == 3) {
+      mod->setAttr(ttg::AttrClusterDimX, b.getI32IntegerAttr(clusterDims[0]));
+      mod->setAttr(ttg::AttrClusterDimY, b.getI32IntegerAttr(clusterDims[1]));
+      mod->setAttr(ttg::AttrClusterDimZ, b.getI32IntegerAttr(clusterDims[2]));
+    }
     mod->setAttr(ttg::AttrTargetName, b.getStringAttr(this->target.getValue()));
     if (hasTLXOps)
       mod->setAttr(AttrHasTLXOpsName, b.getBoolAttr(true));
