@@ -36,6 +36,8 @@
 <a class="sub" href="#interface">Interface</a>
 <a class="sub" href="#structure">Structure</a>
 <a class="sub" href="#current-availability">Current availability</a>
+<a class="sub" href="#mxfp8-gemm">MXFP8 GEMM</a>
+<a class="sub" href="#mxfp8-grouped-gemm">MXFP8 grouped GEMM</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
@@ -65,6 +67,7 @@ out = tlx_mm(a, b)</code></pre>
 <h2 id="current-availability">Current availability</h2>
 <p>Implemented today:</p>
 <pre><code>mm/sm100.py
+mm_mxfp8/sm100.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
@@ -74,22 +77,70 @@ kda/sm100.py</code></pre>
 <p>Current kernel selections for the rest of the catalog:</p>
 <pre><code>kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
+    mm_mxfp8/             sm100.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
-    flash_attn_mxfp8/     sm100.py  gfx950.py           (gfx950 forward only)
+    flash_attn_mxfp8/     sm100.py  gfx950.py           (fwd + bwd)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
     grouped_gemm/         sm100.py  gfx950.py
+    grouped_gemm_mxfp8/   sm100.py
     addmm_glu/            gfx950.py
     paged_decode/         gfx950.py
     ikbo_fa/              gfx950.py
     ikbo_lce/             gfx950.py
     multi_cta_layernorm/  sm100.py
     cross_attention/      sm100.py
-    bmm_shared_a/         gfx950.py</code></pre></article>
+    bmm_shared_a/         gfx950.py</code></pre>
+<h3 id="gfx950-mxfp8-attention-backward">gfx950 MXFP8 attention backward</h3>
+<p><code>flash_attn_mxfp8</code> accepts contiguous, same-device BF16 Q/K/V with identical <code>[batch, heads, sequence, 128]</code> shapes and a positive sequence length divisible by 256. Each head must contain fewer than <code>2**31</code> elements. Both causal and noncausal backward return BF16 gradients, accumulate in FP32, and avoid atomics. Training uses hardware exp2 and saves the matching base-2 logsumexp.</p>
+<p>Q/K use E4M3 payloads with E8M0 scales per 32×32 block, as in current Blackwell. The general backward requantizes operands for their reduction axes and uses 32×32 dS quantization. Separate dQ and dK/dV owners recompute QK and dP.</p>
+<p>The tuned noncausal <code>B=4, H=32, N=8192, D=128, sm_scale=1.3</code> path instead shares square32 Q/K/dO payloads between reduction orientations, fuses backward preparation, and materializes FP8 dS once for the dQ consumer. It requires whole, aligned contiguous storage and uses <strong>8 GiB + 288 MiB of temporary workspace</strong> per call, excluding gradients and saved inputs. Other configurations use the general implementation; allocation or kernel failures are not silently retried. These are quantized training recipes, not BF16-equivalent gradients.</p>
+<h2 id="mxfp8-gemm">MXFP8 GEMM</h2>
+<pre><code class="language-python">out = triton.tlx.ops.mm_mxfp8(a, a_scale, b, b_scale, out=None, sf_layout=&quot;natural&quot;, space=&quot;full&quot;)</code></pre>
+<p>Computes <code>a @ b.T</code> from contiguous E4M3 <code>a</code> <code>[M, K]</code> and <code>b</code> <code>[N, K]</code> with one E8M0 scale per 32 K values, returning contiguous BF16 <code>[M, N]</code>. <code>M</code>, <code>N</code> and <code>K</code> must be multiples of 128. This is a forward-only SM100 operation promoted from <code>tutorials/blackwell_gemm_ws_mxfp8.py</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>sf_layout=&quot;natural&quot;</code>: <code>a_scale</code> is <code>[M, K // 32]</code> and <code>b_scale</code> is</div></div>
+<p><code>[N, K // 32]</code>; they are packed into the blocked layout on every call.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>sf_layout=&quot;cublas_blocked&quot;</code>: scales are already in the cuBLAS 128x4 atom</div></div>
+<p>layout, e.g. torchao's <code>MXTensor.to_mx(..., is_swizzled_scales=True).scale</code>, and must contain exactly <code>M * K // 32</code> and <code>N * K // 32</code> bytes.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>space=&quot;full&quot;</code> (default) autotunes over 1-/2-CTA, split-K, overlapped-</div></div>
+<p>accumulator and pipeline-depth configs; the first call per shape compiles and benchmarks the pruned space. When all of B fits in shared memory next to at least four A stages (small N and K), it also tries a B-resident family: B is loaded once per CTA, each tile computes a whole 128 x N row so A is read from DRAM once, and the epilogue uses async TMA stores. <code>space=&quot;heuristic&quot;</code> launches one shape-picked config without autotuning.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>A supplied <code>out</code> must be contiguous, non-overlapping BF16 <code>[M, N]</code> on</div></div>
+<p><code>a.device</code> and is returned by identity.</p>
+<h2 id="mxfp8-grouped-gemm">MXFP8 grouped GEMM</h2>
+<pre><code class="language-python">out = triton.tlx.ops.grouped_gemm_mxfp8(
+    x,
+    x_scale,
+    w,
+    w_scale,
+    split_sizes,
+    out=None,
+    num_sms=None,
+    sf_layout=&quot;natural&quot;,
+)</code></pre>
+<p>The exact public signature is <code>(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout=&#x27;natural&#x27;)</code>. This is a forward-only SM100 (compute capability 10.0) operation: E4M3 inputs and E8M0 scale factors produce a contiguous BF16 result. It has no backward implementation or non-SM100 fallback.</p>
+<h3 id="data-and-group-layout">Data and group layout</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>x</code> is contiguous E4M3 <code>[GM, K]</code> data, packed in expert order.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>w</code> is contiguous E4M3 <code>[G, N, K]</code> or packed <code>[G * N, K]</code> data. For rank 2,</div></div>
+<p><code>G</code> comes from <code>split_sizes.shape[0]</code>, and <code>w.shape[0]</code> must be divisible by <code>G</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>split_sizes</code> is contiguous int32 <code>[G]</code> on the same CUDA device. Values may be</div></div>
+<p>zero, must be nonnegative, every exclusive prefix must be divisible by 128, and the final sum must equal <code>GM</code>. Thus zero-sized experts are supported in any position, but a nonzero expert may start only at a 128-row boundary.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>GM</code> and <code>K</code> must be positive and divisible by 128; <code>G</code> and <code>N</code> must be</div></div>
+<p>positive. TMA base pointers and row byte strides must be 16-byte aligned, which additionally requires <code>N</code> to be divisible by 8 for the BF16 output.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Every input must be contiguous and on <code>x.device</code>.</div></div>
+<p>The split values remain on device so dispatch does not introduce a host read or synchronization. The kernel checks nonnegativity, aligned prefixes, and the final sum. Violating one of those requirements triggers a device trap; callers that need to observe the error immediately must synchronize the CUDA stream.</p>
+<h3 id="scale-factor-layouts">Scale-factor layouts</h3>
+<p>Both scale tensors are contiguous E8M0. <code>sf_layout</code> accepts exactly these values:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>&quot;natural&quot;</code> (default): <code>x_scale</code> has exact shape <code>[GM, K // 32]</code>.</div></div>
+<p>With rank-3 <code>w</code>, <code>w_scale</code> is <code>[G, N, K // 32]</code>; with rank-2 <code>w</code>, it is <code>[G * N, K // 32]</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>&quot;cublas_blocked&quot;</code>: both scales are rank-2 opaque byte tensors in the cuBLAS</div></div>
+<p>128-row by 4-scale-column atom layout. Let <code>SK = 4 * ceil((K // 32) / 4)</code>. <code>x_scale</code> must contain exactly <code>ceil(GM / 128) * 128 * SK</code> bytes, and <code>w_scale</code> exactly <code>G * ceil(N / 128) * 128 * SK</code> bytes. Tensor shape is otherwise opaque; byte order, not a semantic row/column interpretation, defines this layout.</p>
+<h3 id="output-and-scheduling">Output and scheduling</h3>
+<p>The result shape is <code>[GM, N]</code>. If <code>out</code> is supplied, it must be a contiguous, non-overlapping BF16 tensor of that exact shape on <code>x.device</code>, and the operation returns the same tensor object. <code>num_sms=None</code> launches one persistent CTA per SM on the input device; an explicit <code>num_sms</code> must be an integer from 1 through the device SM count.</p>
+<p>The SM100 implementation uses fixed, shape-selected 1CTA and 2CTA configurations with a dynamic atomic tile scheduler; it does not autotune. Large, sufficiently saturated N/K shapes use a cooperative 2CTA cluster, while other shapes retain the 1CTA path. Each launch owns a counter initialized to zero; that reset is part of CUDA graph capture and is replayed before the kernel, so repeated graph replays traverse all tiles.</p></article>
 <footer class="pager"><a href="kernels.html">← Tutorial kernels</a><a class="next" href="testing.html">Testing →</a></footer>
     </main>
   </div>

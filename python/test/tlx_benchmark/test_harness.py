@@ -769,7 +769,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
-def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
+def test_flash_attn_mxfp8_gfx950_benchmark_supports_backward(monkeypatch):
     import importlib
 
     bench = importlib.import_module("bench_flash_attn_mxfp8")
@@ -778,7 +778,7 @@ def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
         monkeypatch.setattr(bench.driver, "arch", lambda: arch)
         return {case.direction for case in bench.cases(synthetic=True)}
 
-    assert directions("gfx950") == {"fwd"}
+    assert directions("gfx950") == {"fwd", "bwd"}
     assert directions("sm100") == {"fwd", "bwd"}
 
 
@@ -1254,3 +1254,38 @@ def test_an_unknown_latency_mode_is_rejected():
 
     with pytest.raises(ValueError, match="mode must be one of"):
         measure(lambda: None, mode="profiler")
+
+
+@pytest.mark.parametrize("factor,expected", [(1.0, True), (2.0, False), (0.0, False), (float("nan"), False)])
+def test_mxfp8_backward_check_validates_magnitude_and_finiteness(factor, expected):
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    reference = sum(inputs)
+    actual = inputs[0] * factor + inputs[1] + inputs[2]
+    passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
+    assert passed is expected
+    assert not message if passed else "dQ" in message
+
+
+def test_mxfp8_backward_check_accepts_zero_gradients():
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    actual = sum(inputs) * 0
+    reference = sum(inputs) * 0
+    assert _backward_close_enough(actual, reference, inputs, torch.ones_like(reference)) == (True, "")
+
+
+def test_mxfp8_backward_check_rejects_nonfinite_reference():
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    actual = sum(inputs)
+    reference = inputs[0] * float("nan") + inputs[1] + inputs[2]
+    passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
+    assert not passed
+    assert "reference contains nonfinite" in message

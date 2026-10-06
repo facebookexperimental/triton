@@ -1,4 +1,8 @@
-"""L1 correctness for ``tlx.ops.flash_attn_mxfp8`` on gfx950. Forward only."""
+"""L1 correctness for ``tlx.ops.flash_attn_mxfp8`` on gfx950."""
+
+import subprocess
+import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -102,12 +106,13 @@ def test_flash_attn_mxfp8_fwd_multiple_cta_waves(causal):
     torch.testing.assert_close(out, ref, atol=0.15, rtol=0)
 
 
-def test_flash_attn_mxfp8_rejects_backward():
-    from triton.tlx.ops import UnsupportedBackward, flash_attn_mxfp8
+def test_flash_attn_mxfp8_supports_backward():
+    from triton.tlx.ops import flash_attn_mxfp8
 
     q, k, v = _qkv((1, 1, 256, 128), requires_grad=True)
-    with pytest.raises(UnsupportedBackward, match="does not support backward"):
-        flash_attn_mxfp8(q, k, v, space="smoke")
+    out = flash_attn_mxfp8(q, k, v, space="smoke")
+    grads = torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
+    assert all(x.dtype == torch.bfloat16 and bool(x.isfinite().all()) for x in grads)
 
 
 @pytest.mark.parametrize(
@@ -142,3 +147,416 @@ def test_flash_attn_mxfp8_rejects_unknown_space():
     q, k, v = _qkv((1, 1, 256, 128))
     with pytest.raises(InvalidInput, match="does not provide space"):
         flash_attn_mxfp8(q, k, v, space="heuristic")
+
+
+def _gfx950_device_indices():
+    return [
+        index for index in range(torch.cuda.device_count())
+        if getattr(torch.cuda.get_device_properties(index), "gcnArchName", "").startswith("gfx950")
+    ]
+
+
+def _has_two_gfx950_devices():
+    return len(_gfx950_device_indices()) >= 2
+
+
+def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph():
+    from triton.tlx.ops import flash_attn_mxfp8
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd, gfx950_bwd_shared
+
+    torch.manual_seed(20)
+    inputs = _qkv((4, 32, 8192, 128), requires_grad=True)
+    do = torch.randn_like(inputs[0]) * 0.5
+    out = flash_attn_mxfp8(*inputs, causal=False, sm_scale=1.3)
+    reference = _sdpa(*inputs, False, 1.3)
+    expected = torch.autograd.grad(reference, inputs, do)
+    _, _, v, q8, k8, saved_out, lse, qs, ks = out.grad_fn.saved_tensors
+    args = (q8, k8, qs, ks, v, do, saved_out, lse, 1.3)
+    assert gfx950_bwd_shared.can_use_shared_square(*args)
+    assert not gfx950_bwd_shared.can_use_shared_square(*args, causal=True)
+    assert not gfx950_bwd_shared.can_use_shared_square(*args[:-1], 0.5)
+    # A contiguous view of a larger allocation is outside the fast-path
+    # whole-storage contract; it must remain on the general implementation.
+    oversized = torch.empty(v.numel() + 1, device=v.device, dtype=v.dtype)
+    view = oversized[1:].view_as(v)
+    assert not gfx950_bwd_shared.can_use_shared_square(*args[:4], view, *args[5:])
+
+    def check(grads):
+        for actual, ref in zip(grads, expected):
+            actual, ref = actual.float(), ref.float()
+            assert bool(actual.isfinite().all())
+            rrms = ((actual - ref).square().mean() / ref.square().mean()).sqrt()
+            cosine = torch.nn.functional.cosine_similarity(actual.flatten(), ref.flatten(), dim=0)
+            assert rrms < 0.15 and cosine >= 0.98
+
+    def backward():
+        return torch.autograd.grad(out, inputs, do, retain_graph=True)
+
+    with mock.patch.object(gfx950_bwd, "launch_backward", side_effect=AssertionError("unexpected general path")):
+        eager = backward()
+        check(eager)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(stream):
+                # Autograd records the forward stream on its nodes. Create
+                # fresh leaves and this graph on the capture stream.
+                inputs = tuple(x.detach().clone().requires_grad_() for x in inputs)
+                out = flash_attn_mxfp8(*inputs, causal=False, sm_scale=1.3)
+                for _ in range(2):
+                    backward()
+                stream.synchronize()
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = backward()
+                for _ in range(2):
+                    for grad in captured:
+                        grad.fill_(float("nan"))
+                    graph.replay()
+                    stream.synchronize()
+                    check(captured)
+                    for actual, ref in zip(captured, eager):
+                        torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+        finally:
+            stream.synchronize()
+            graph.reset()
+
+
+def _mxfp8_reference_quantize(x, *, sequence=False, square=False):
+    # Independent mathematical RCEIL, without the implementation's bit tricks.
+    x = x.float().transpose(-1, -2).contiguous() if sequence else x.float()
+    rows, cols = x.shape[-2:]
+    if square:
+        blocks = x.reshape(*x.shape[:-2], rows // 32, 32, cols // 32, 32)
+        maximum = blocks.abs().amax((-3, -1), keepdim=True)
+    else:
+        blocks = x.reshape(*x.shape[:-1], cols // 32, 32)
+        maximum = blocks.abs().amax(-1, keepdim=True)
+    exponent = torch.ceil(torch.log2(maximum * (1.0 / 448.0))).clamp(-127, 127)
+    scale = torch.exp2(exponent)
+    payload = (blocks / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    decoded = (payload.float() * scale).reshape(x.shape)
+    if square:
+        byte = (exponent.squeeze(-1).squeeze(-2) + 127).to(torch.uint8).repeat_interleave(32, -2)
+    else:
+        byte = (exponent.squeeze(-1) + 127).to(torch.uint8)
+    payload = payload.reshape(x.shape)
+    if sequence:
+        payload = payload.transpose(-1, -2).contiguous()
+        decoded = decoded.transpose(-1, -2).contiguous()
+    return payload, byte, decoded
+
+
+def test_flash_attn_mxfp8_gfx950_catalog_buffer_span():
+    from triton.tlx.ops._catalog import CATALOG, InvalidInput, check_inputs
+
+    spec, = [spec for spec in CATALOG if (spec.op, spec.arch) == ("flash_attn_mxfp8", "gfx950")]
+    assert spec.supports_backward
+    check_inputs(spec, dtype=torch.bfloat16, HEAD_DIM=128, N_CTX=2**24 - 256)
+    with pytest.raises(InvalidInput, match="does not support these inputs"):
+        check_inputs(spec, dtype=torch.bfloat16, HEAD_DIM=128, N_CTX=2**24)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("sequence", (False, True))
+@pytest.mark.parametrize("strided", (False, True))
+def test_flash_attn_mxfp8_gfx950_quantization_axes(sequence, strided):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import quantize_mxfp8
+
+    torch.manual_seed(731)
+    source = torch.randn((2, 3, 96, 256 if strided else 128), device="cuda", dtype=torch.bfloat16)
+    x = source[..., ::2] if strided else source
+    x[:, :, :32, :32] = 0
+    x[:, :, 32:64] *= 2.0**-30
+    x[:, :, 64:] *= 2.0**20
+    actual, scales = quantize_mxfp8(x, transpose_for_reduction=sequence)
+    expected, expected_scales, _ = _mxfp8_reference_quantize(x, sequence=sequence)
+    torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("sequence", (False, True))
+def test_flash_attn_mxfp8_gfx950_quantization_scale_boundaries(sequence):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import quantize_mxfp8
+
+    maxima = torch.tensor([448 * 2.0**-10, 448, 450, 448 * 2.0**10], device="cuda", dtype=torch.bfloat16)
+    x = maxima.repeat_interleave(32).expand(1, 1, 128, 128).contiguous()
+    if sequence:
+        x = x.transpose(-1, -2).contiguous()
+    actual, scales = quantize_mxfp8(x, transpose_for_reduction=sequence)
+    expected, expected_scales, _ = _mxfp8_reference_quantize(x, sequence=sequence)
+    torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("sequence", (False, True))
+@pytest.mark.parametrize("forward", (False, True))
+def test_flash_attn_mxfp8_gfx950_quantization_minimum_scale(sequence, forward):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950 import quantize_mxfp8_head, quantize_mxfp8_v
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import quantize_mxfp8
+
+    # The minimum E8M0 scale is subnormal FP32 (2**-127), not zero.
+    # Include adjacent floats at its RCEIL transition, zero, and large values.
+    maxima = torch.tensor([
+        0, 1, 0x00800000, 0x04000000, 0x04600000, 0x04600001, 0x04600002, 0x04dfffff, 0x04e00000, 0x04e00001, 0x7f7fffff
+    ], dtype=torch.int32).view(torch.float32)
+    x = maxima[None, :, None, None].expand(1, len(maxima), 32, 128).contiguous()
+    x[..., 1::2] *= -1
+    # CPU double log/division avoids reference-side log rounding and FTZ.
+    exponent = torch.ceil(torch.log2((maxima * (1.0 / 448.0)).double())).clamp(-127, 127)
+    scales = torch.exp2(exponent)
+    expected = (x.double() / scales[None, :, None, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    if forward:
+        actual, actual_scales = (quantize_mxfp8_v if sequence else quantize_mxfp8_head)(x.cuda())
+    else:
+        actual, actual_scales = quantize_mxfp8(x.cuda(), transpose_for_reduction=sequence)
+    expected_scales = (exponent + 127).to(torch.uint8)[None, :, None, None].expand(actual_scales.shape)
+    torch.testing.assert_close(actual_scales.cpu(), expected_scales, atol=0, rtol=0)
+    torch.testing.assert_close(actual.cpu().view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("n_ctx", (96, 256, 1024))
+@pytest.mark.parametrize("transpose_storage", (False, True))
+def test_flash_attn_mxfp8_gfx950_fused_quantization(n_ctx, transpose_storage):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import quantize_backward_operands
+
+    torch.manual_seed(631)
+    tensors = [torch.randn((1, 2, n_ctx, 128), device="cuda", dtype=torch.bfloat16) for _ in range(4)]
+    tensors[0][:, :, :32, :32] = 0
+    result = quantize_backward_operands(*tensors, transpose_storage=transpose_storage)
+    for (actual, scales), (index, sequence) in zip(result, ((0, True), (1, True), (2, False), (3, False), (3, True))):
+        expected, expected_scales, _ = _mxfp8_reference_quantize(tensors[index], sequence=sequence)
+        torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+        torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0)
+        if transpose_storage and sequence:
+            assert actual.stride(-2) == 1 and actual.stride(-1) == n_ctx
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("scale", (0.0, -0.5, 0.5, 1.3))
+def test_flash_attn_mxfp8_gfx950_forward_returns_base2_lse(causal, scale):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950 import (_launch_quantized, quantize_mxfp8_head,
+                                                                quantize_mxfp8_v)
+
+    torch.manual_seed(20)
+    q, k, v = [torch.randn((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16) * 0.5 for _ in range(3)]
+    q8, qs = quantize_mxfp8_head(q)
+    k8, ks = quantize_mxfp8_head(k)
+    v8, vs = quantize_mxfp8_v(v)
+    _, lse = _launch_quantized(q8, k8, v8, qs, ks, vs, causal, scale, return_lse=True)
+    q_ref = q8.float() * torch.exp2(qs.float() - 127).repeat_interleave(32, -1)
+    k_ref = k8.float() * torch.exp2(ks.float() - 127).repeat_interleave(32, -1)
+    scores = (q_ref @ k_ref.transpose(-1, -2)) * scale
+    if causal:
+        row = torch.arange(256, device=q.device)
+        scores.masked_fill_(row[:, None] < row[None, :], -float("inf"))
+    expected = torch.logsumexp(scores, -1) * 1.4426950408889634
+    torch.testing.assert_close(lse, expected, atol=3e-4, rtol=1e-5)
+
+
+@pytest.mark.skipif(not _has_two_gfx950_devices(), reason="requires two gfx950 GPUs")
+def test_flash_attn_mxfp8_gfx950_uses_input_device_when_current_device_differs():
+    previous_device, query_device = _gfx950_device_indices()[:2]
+    script = r"""
+import sys
+import torch
+from triton.tlx.ops import flash_attn_mxfp8
+previous, target = map(int, sys.argv[1:])
+torch.cuda.set_device(previous)
+q, k, v = [(torch.randn((1, 2, 256, 128), device=f"cuda:{target}", dtype=torch.bfloat16) * .5)
+           .requires_grad_() for _ in range(3)]
+out = flash_attn_mxfp8(q, k, v)
+assert out.device == q.device and torch.cuda.current_device() == previous
+out.backward(torch.randn_like(out))
+assert torch.cuda.current_device() == previous
+assert all(x.grad.device == q.device and bool(x.grad.isfinite().all()) for x in (q, k, v))
+"""
+    subprocess.run([sys.executable, "-c", script, str(previous_device), str(query_device)], check=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("n_ctx", (96, 256))
+def test_flash_attn_mxfp8_gfx950_backward_matches_recipe(causal, n_ctx):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_bwd import launch_backward
+
+    torch.manual_seed(20)
+    q, k, v, do = [torch.randn((1, 2, n_ctx, 128), device="cuda", dtype=torch.bfloat16) * 0.5 for _ in range(4)]
+    q8, qs, qf = _mxfp8_reference_quantize(q)
+    k8, ks, kf = _mxfp8_reference_quantize(k)
+    qdk, qdks, qdkf = _mxfp8_reference_quantize(q, sequence=True)
+    kdq, kdqs, kdqf = _mxfp8_reference_quantize(k, sequence=True)
+    vb, vs, vf = _mxfp8_reference_quantize(v)
+    do8, dos, dof = _mxfp8_reference_quantize(do)
+    dodv, dodvs, dodvf = _mxfp8_reference_quantize(do, sequence=True)
+    sm_scale = 0.5
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        scores = (qf @ kf.transpose(-1, -2)) * sm_scale
+        if causal:
+            row = torch.arange(n_ctx, device=q.device)
+            scores.masked_fill_(row[:, None] < row[None, :], -float("inf"))
+        lse = torch.logsumexp(scores, -1) * 1.4426950408889634
+        p = scores.softmax(-1)
+        out = (p @ vf).to(torch.bfloat16)
+        delta = (out.float() * do.float()).sum(-1)
+        dp = dof @ vf.transpose(-1, -2)
+        _, _, ds = _mxfp8_reference_quantize(p * (dp - delta[..., None]), square=True)
+        p_quant = (p * 256).to(torch.float8_e4m3fn).float() / 256
+        expected = (ds @ kdqf * sm_scale, ds.transpose(-1, -2) @ qdkf * sm_scale, p_quant.transpose(-1, -2) @ dodvf)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    dq = torch.empty_like(q, dtype=torch.float32)
+    dk, dv = torch.empty_like(k), torch.empty_like(v)
+    kernel = launch_backward(do8, dodv, q8, qdk, k8, kdq, vb, out, lse, qs, qdks, ks, kdqs, vs, dos, dodvs, sm_scale,
+                             do, dq, dk, dv, torch.empty_like(lse), causal=causal, block_m=64, block_n=128)
+    assert "v_mfma_scale_f32" in kernel.asm["amdgcn"]
+    for actual, reference in zip((dq, dk, dv), expected):
+        assert torch.isfinite(actual).all()
+        # BF16 output rounding and near-tie FP8 dS rounding can change a few
+        # elements; bound total error, not just gradient direction.
+        relative_rms = ((actual.float() - reference).square().mean() / reference.square().mean()).sqrt()
+        assert relative_rms < 0.01
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("n_ctx", (1024, 2048, 4096, 8192))
+@pytest.mark.parametrize("scale", (128**-0.5, 0.5, 1.3))
+@pytest.mark.parametrize("seed", (20, 21))
+def test_flash_attn_mxfp8_gfx950_backward_meta_shapes(causal, n_ctx, scale, seed):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    torch.manual_seed(seed)
+    q, k, v = [(torch.randn((4, 32, n_ctx, 128), device="cuda", dtype=torch.bfloat16) * 0.5).requires_grad_()
+               for _ in range(3)]
+    rq, rk, rv = [x.detach().clone().requires_grad_() for x in (q, k, v)]
+    do = torch.randn_like(q)
+    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
+    reference = torch.nn.functional.scaled_dot_product_attention(rq, rk, rv, is_causal=causal, scale=scale)
+    out.backward(do)
+    reference.backward(do)
+    if scale <= 0.5:
+        torch.testing.assert_close(out, reference, atol=0.2, rtol=0)
+    # At scale 1.3, Q/K FP8 quantization changes sharp softmax peaks: the
+    # decoded-input FP32 reference also exceeds 0.2 at isolated elements.
+    # Bound direction and magnitude against BF16 for every scale and tensor.
+    for actual, expected in ((out, reference), (q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
+        assert actual.dtype == torch.bfloat16
+        assert torch.isfinite(actual).all()
+        actual, expected = actual.float(), expected.float()
+        cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+        relative_rms = ((actual - expected).square().mean() / expected.square().mean()).sqrt()
+        assert cosine >= 0.98
+        assert relative_rms < 0.15
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_gfx950_backward_zero_blocks(causal):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    q, k, v = [torch.zeros((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    out = flash_attn_mxfp8(q, k, v, causal=causal)
+    out.backward(torch.zeros_like(out))
+    for tensor in (out, q.grad, k.grad, v.grad):
+        torch.testing.assert_close(tensor, torch.zeros_like(tensor), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("scale", (0.0, -0.5))
+@pytest.mark.parametrize("requires_grad", (False, True))
+def test_flash_attn_mxfp8_gfx950_nonpositive_scale(causal, scale, requires_grad):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    torch.manual_seed(21)
+    q, k, v = [(torch.randn((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16) * 0.5).requires_grad_(requires_grad)
+               for _ in range(3)]
+    rq, rk, rv = [x.detach().float().requires_grad_(requires_grad) for x in (q, k, v)]
+    # Some SDPA implementations return NaN for negative scale; use explicit
+    # FP32 softmax attention so the test does not bless a broken reference.
+    scores = (rq @ rk.transpose(-1, -2)) * scale
+    if causal:
+        row = torch.arange(256, device=q.device)
+        scores = scores.masked_fill(row[:, None] < row[None, :], -float("inf"))
+    reference = scores.softmax(-1) @ rv
+    actual = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale)
+    torch.testing.assert_close(actual.float(), reference, atol=0.2, rtol=0)
+    if requires_grad:
+        do = torch.randn_like(actual)
+        actual.backward(do)
+        reference.backward(do.float())
+        for got, ref in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):
+            assert torch.isfinite(got).all()
+            relative_rms = ((got.float() - ref).square().mean() / ref.square().mean().clamp_min(1e-30)).sqrt()
+            assert relative_rms < 0.15
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("shape,scale,match", [
+    ((0, 1, 256, 128), 0.5, "nonempty"),
+    ((1, 0, 256, 128), 0.5, "nonempty"),
+    ((1, 1, 0, 128), 0.5, "nonempty"),
+    ((1, 1, 256, 128), float("nan"), "finite"),
+    ((1, 1, 256, 128), float("inf"), "finite"),
+    ((1, 1, 256, 128), -float("inf"), "finite"),
+])
+def test_flash_attn_mxfp8_gfx950_invalid_inputs(shape, scale, match):
+    from triton.tlx.ops import InvalidInput, flash_attn_mxfp8
+
+    q, k, v = [torch.empty(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    with pytest.raises(InvalidInput, match=match):
+        flash_attn_mxfp8(q, k, v, sm_scale=scale)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("warn_only", (False, True))
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_gfx950_determinism(warn_only, causal):
+    from triton.tlx.ops import flash_attn_mxfp8
+
+    q, k, v = [(torch.randn((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16) * 0.5).requires_grad_()
+               for _ in range(3)]
+    out = flash_attn_mxfp8(q, k, v, causal=causal)
+    do = torch.randn_like(out)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warned = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        expected = torch.autograd.grad(out, (q, k, v), do, retain_graph=True)
+        for _ in range(3):
+            actual = torch.autograd.grad(out, (q, k, v), do, retain_graph=True)
+            for got, ref in zip(actual, expected):
+                torch.testing.assert_close(got, ref, atol=0, rtol=0)
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warned)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("kind", ("head", "v", "v_transposed"))
+def test_flash_attn_mxfp8_gfx950_quantization_large_head_offset_codegen(kind):
+    import re
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950 import (_quantize_mxfp8_kernel, _quantize_mxfp8_v_kernel)
+
+    x = torch.empty((1, 1, 64, 128), device="cuda", dtype=torch.bfloat16)
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((1, 1, 64, 4), device="cuda", dtype=torch.uint8)
+    # Compile only: head 2's source offset would be 2**31 elements. Dummy
+    # tensors stay tiny and the deliberately oversized strides are never run.
+    args = (x, y, scales, 2**30, 2**30, 128, 1, 3, 64)
+    if kind == "head":
+        kernel = _quantize_mxfp8_kernel.warmup(*args, HEAD_DIM=128, BLOCK_N=64, PACK_K=False, num_warps=4, grid=(1, 3))
+    else:
+        kernel = _quantize_mxfp8_v_kernel.warmup(*args, HEAD_DIM=128, BLOCK_N=64, TRANSPOSED=kind == "v_transposed",
+                                                 num_warps=1, grid=(1, 3))
+    ir = kernel.asm["ttir"]
+    pid = re.search(r"(%[\w]+) = tt.get_program_id y : i32", ir).group(1)
+    widened = re.search(rf"(%[\w]+) = arith.extsi {re.escape(pid)} : i32 to i64", ir)
+    assert widened is not None, "widen head index before multiplying tensor strides"
+    assert re.search(r"arith.muli .* : i64", ir)

@@ -402,21 +402,21 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
+    """Differentiable MXFP8 attention over contiguous BF16 Q/K/V.
 
-    Q, K, V and the softmax probabilities are quantized internally to E4M3
-    data with E8M0 scales: per 32x32 block for Q and K, per 32 keys for V and
-    the probabilities. gfx950 quantizes as Blackwell does, but its non-causal
-    kernel computes the probabilities with an approximate exp2 (see
-    kernels/flash_attn_mxfp8/gfx950.py), and the two agree to within the
-    quantization error rather than bitwise. Head dim 128 and sequence lengths
-    divisible by 256. Blackwell returns BF16 gradients; gfx950 is forward only.
+    Inputs have identical [batch, heads, sequence, 128] shapes with sequence
+    lengths divisible by 256. Both architectures return BF16 gradients.
+    Both architectures use 32x32 Q/K blocks. gfx950 training
+    uses hardware exp2 and saves base-2 LSE, whereas its noncausal inference
+    path may use an approximate exp2. See the kernel module for the recipes.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects rank-4 Q/K/V tensors")
     if q.shape != k.shape or q.shape != v.shape:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have identical shapes; "
                            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if any(size == 0 for size in q.shape):
+        raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects nonempty Q/K/V dimensions")
     if q.dtype != k.dtype or q.dtype != v.dtype or q.device != k.device or q.device != v.device:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects Q/K/V to have the same dtype and device")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
@@ -426,7 +426,9 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     fn, spec = impl_for("flash_attn_mxfp8", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
-    return fn(q, k, v, causal, sm_scale, space=space)
+    import torch
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, causal, sm_scale, space=space)
 
 
 def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,
