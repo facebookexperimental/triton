@@ -206,8 +206,7 @@ def test_descriptor_scatter(offset_dtype, device):
     x_offsets = ((torch.arange(BLOCK_M, dtype=torch.int32, device=device) * 37 + 3) % M).to(offset_dtype)
     y = torch.full((M, N), -1, dtype=x.dtype, device=device)
 
-    kernel = descriptor_scatter_kernel[(1, )](x, x_offsets, y, M, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                               num_warps=4)
+    kernel = descriptor_scatter_kernel[(1, )](x, x_offsets, y, M, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4)
 
     assert kernel.asm["ttgir"].count("ttng.async_tma_scatter") == 1
     scatter4_count = BLOCK_M // 16

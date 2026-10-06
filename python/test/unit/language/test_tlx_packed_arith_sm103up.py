@@ -223,18 +223,18 @@ def test_packed_fp4_x4_lowers_on_sm103up(capability, stop_after, ptx_target, ope
 @pytest.mark.parametrize(
     "operation,a_dtype,a_byte,b_dtype,b_byte,c_dtype,c_byte,output_dtype,result_dtype,expected_byte",
     [
-        pytest.param("add", tl.float8e5, 0x3C, tl.float8e4nv, 0x38, tl.float8e4nv, 0x00, tl.float8e4nv,
-                     None, 0x40, id="add-e5m2-e4m3"),
-        pytest.param("sub", tl.float8e5, 0x40, tl.float8e4nv, 0x38, tl.float8e4nv, 0x00, tl.float8e4nv,
-                     tl.float8e4nv, 0x38, id="sub-e5m2-e4m3"),
-        pytest.param("mul", tl.float8e5, 0x40, tl.float8e4nv, 0x40, tl.float8e4nv, 0x00, tl.float8e4nv,
-                     tl.float8e4nv, 0x48, id="mul-e5m2-e4m3"),
-        pytest.param("fma", tl.float8e4nv, 0x38, tl.float8e5, 0x3C, tl.float8e5, 0x3C, tl.float8e5,
-                     tl.float8e5, 0x40, id="fma-e4m3-e5m2"),
+        pytest.param("add", tl.float8e5, 0x3C, tl.float8e4nv, 0x38, tl.float8e4nv, 0x00, tl.float8e4nv, None, 0x40,
+                     id="add-e5m2-e4m3"),
+        pytest.param("sub", tl.float8e5, 0x40, tl.float8e4nv, 0x38, tl.float8e4nv, 0x00, tl.float8e4nv, tl.float8e4nv,
+                     0x38, id="sub-e5m2-e4m3"),
+        pytest.param("mul", tl.float8e5, 0x40, tl.float8e4nv, 0x40, tl.float8e4nv, 0x00, tl.float8e4nv, tl.float8e4nv,
+                     0x48, id="mul-e5m2-e4m3"),
+        pytest.param("fma", tl.float8e4nv, 0x38, tl.float8e5, 0x3C, tl.float8e5, 0x3C, tl.float8e5, tl.float8e5, 0x40,
+                     id="fma-e4m3-e5m2"),
     ],
 )
-def test_packed_fp8_x4_executes_on_sm103up(operation, a_dtype, a_byte, b_dtype, b_byte, c_dtype, c_byte,
-                                         output_dtype, result_dtype, expected_byte):
+def test_packed_fp8_x4_executes_on_sm103up(operation, a_dtype, a_byte, b_dtype, b_byte, c_dtype, c_byte, output_dtype,
+                                           result_dtype, expected_byte):
     _require_sm103_or_newer()
     allocations = []
     try:

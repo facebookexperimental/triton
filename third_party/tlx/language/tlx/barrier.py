@@ -235,18 +235,17 @@ def barrier_arrive(
     cta_mask_value = None
     if cta_mask is not None:
         cta_mask_value = tl._unwrap_if_constexpr(cta_mask)
-        assert isinstance(cta_mask_value, int) and not isinstance(cta_mask_value, bool), (
-            "cta_mask must be a compile-time integer")
+        assert isinstance(cta_mask_value,
+                          int) and not isinstance(cta_mask_value, bool), ("cta_mask must be a compile-time integer")
         assert 0 < cta_mask_value <= 0xFFFFFFFF, "cta_mask must be in the range [1, 2^32 - 1]"
         assert remote_cta_rank is None, "cta_mask cannot be combined with remote_cta_rank"
         assert not is_warp_bar, "cta_mask is not supported for warp barriers"
         assert not is_hip(), "cta_mask is only supported on NVIDIA GPUs"
         num_ctas = _physical_num_ctas(_semantic)
         assert num_ctas > 1, "cta_mask requires more than one CTA per cluster"
-        assert (num_ctas & (num_ctas - 1)) == 0, (
-            "cta_mask requires a power-of-two physical cluster size")
-        assert all((cta_rank | cta_mask_value) < num_ctas for cta_rank in range(num_ctas)), (
-            "cta_mask selects a CTA outside the physical cluster")
+        assert (num_ctas & (num_ctas - 1)) == 0, ("cta_mask requires a power-of-two physical cluster size")
+        assert all((cta_rank | cta_mask_value) < num_ctas
+                   for cta_rank in range(num_ctas)), ("cta_mask selects a CTA outside the physical cluster")
 
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
