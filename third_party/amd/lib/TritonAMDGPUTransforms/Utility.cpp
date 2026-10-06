@@ -152,7 +152,7 @@ int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
     return foundMin;
 
   RegionSuccessor successor = result
-                                  ? RegionSuccessor(owner)
+                                  ? RegionSuccessor(branch.getOperation())
                                   : RegionSuccessor(defValue.getParentRegion());
   ValueRange inputs = branch.getSuccessorInputs(successor);
   auto input = llvm::find(inputs, defValue);

@@ -721,7 +721,8 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
         if (!inputs.empty()) {
           firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
         }
-        RegionSuccessor parentSuccessor(branch.getOperation());
+        RegionSuccessor parentSuccessor =
+            RegionSuccessor(branch.getOperation());
         SmallVector<Value> nonSuccessorInputs =
             branch.getNonSuccessorInputs(parentSuccessor);
         SmallVector<dataflow::IntegerValueRangeLattice *>

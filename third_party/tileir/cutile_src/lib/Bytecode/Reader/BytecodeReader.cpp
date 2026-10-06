@@ -1082,8 +1082,10 @@ private:
       return reader.emitError() << "failed to read scope line number when "
                                    "parsing DISubprogramAttr";
 
-    diSubprogram = DISubprogramAttr::get(&context, file, line, name,
-                                         linkageName, compileUnit, scopeLine);
+    diSubprogram = DISubprogramAttr::get(
+        &context, /*id=*/{}, compileUnit, /*scope=*/{}, name, linkageName,
+        file, line, scopeLine, /*subprogramFlags=*/{}, /*type=*/{},
+        /*retainedNodes=*/{}, /*annotations=*/{});
     return success();
   }
 

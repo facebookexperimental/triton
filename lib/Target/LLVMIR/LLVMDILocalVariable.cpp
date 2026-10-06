@@ -200,8 +200,7 @@ struct LLVMDILocalVariablePass
         context, recId, /*isRecSelf=*/true, id, compileUnitAttr, fileAttr,
         funcNameAttr, funcNameAttr, fileAttr, /*line=*/line, /*scopeline=*/line,
         subprogramFlags, subroutineTypeAttr,
-        /*retainNodes=*/llvm::ArrayRef<Attribute>{},
-        /*annotations=*/{});
+        /*retainNodes=*/{}, /*annotations=*/{});
 
     return subprogramAttr;
   }

@@ -164,12 +164,12 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
         unsigned syncId = nextSyncId++;
         for (const Group &group : groups) {
           ROCDL::SchedGroupBarrier::create(
-              builder, loc, static_cast<ROCDL::SchedGroupMask>(group.mask), 1,
-              syncId);
+              builder, loc,
+              static_cast<ROCDL::SchedGroupMask>(group.mask), 1, syncId);
           if (group.cover)
-            ROCDL::SchedGroupBarrier::create(builder, loc,
-                                             ROCDL::SchedGroupMask::mfma_wmma,
-                                             group.cover, syncId);
+            ROCDL::SchedGroupBarrier::create(
+                builder, loc, ROCDL::SchedGroupMask::mfma_wmma, group.cover,
+                syncId);
         }
         if (regionIndex + 1 < regions.size())
           ROCDL::SchedBarrier::create(builder, loc,

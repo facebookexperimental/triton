@@ -82,8 +82,8 @@ static void addDummyOpIfEmptyCluster(OpBuilder &b, Location loc,
   if (!cluster.empty())
     return;
   b.setInsertionPoint(insertBefore);
-  auto dummyOp =
-      ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
+  auto dummyOp = ROCDL::SchedBarrier::create(b, loc,
+                                                  ROCDL::SchedGroupMask::none);
   dummyOp->setAttr("triton.warp_pipeline.empty_cluster", b.getUnitAttr());
   cluster.push_back(dummyOp);
 }
