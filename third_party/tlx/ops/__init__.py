@@ -45,8 +45,9 @@ from __future__ import annotations
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "grouped_gemm", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention",
-    "kda_paged_prefill", "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward", "InvalidInput"
+    "mm", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev",
+    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward",
+    "InvalidInput"
 ]
 
 
@@ -145,6 +146,146 @@ def grouped_gemm(group_a, group_b):
     )
     check_backward(spec, *group_a, *group_b)
     return fn(group_a, group_b)
+
+
+def _grouped_gemm_mxfp8_dims(x, w, split_sizes):
+    GM, K = x.shape
+    G = split_sizes.shape[0]
+    if w.ndim == 3:
+        w_groups, N, w_k = w.shape
+        if w_groups != G:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects w.shape[0] == G; "
+                               f"got w.shape={tuple(w.shape)}, G={G}")
+    else:
+        grouped_n, w_k = w.shape
+        if G == 0 or grouped_n % G != 0:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects packed w.shape[0] divisible by G; "
+                               f"got w.shape={tuple(w.shape)}, G={G}")
+        N = grouped_n // G
+    return GM, G, N, K, w_k
+
+
+def _check_grouped_gemm_mxfp8_scales(x_scale, w_scale, w, *, GM, G, N, K, sf_layout):
+    scale_k = K // 32
+    if sf_layout == "natural":
+        expected_x = (GM, scale_k)
+        expected_w = (G, N, scale_k) if w.ndim == 3 else (G * N, scale_k)
+        if x_scale.shape != expected_x or w_scale.shape != expected_w:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 natural scales must have exact shapes "
+                               f"x_scale={expected_x}, w_scale={expected_w}; got "
+                               f"x_scale={tuple(x_scale.shape)}, w_scale={tuple(w_scale.shape)}")
+        return
+
+    if sf_layout != "cublas_blocked":
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 sf_layout must be 'natural' or "
+                           f"'cublas_blocked'; got {sf_layout!r}")
+    if x_scale.ndim != 2 or w_scale.ndim != 2:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 cublas_blocked scales must be rank-2 byte tensors; "
+                           f"got x_scale.ndim={x_scale.ndim}, w_scale.ndim={w_scale.ndim}")
+    padded_scale_k = ((scale_k + 3) // 4) * 4
+    expected_x_bytes = ((GM + 127) // 128) * 128 * padded_scale_k
+    expected_w_bytes = G * ((N + 127) // 128) * 128 * padded_scale_k
+    x_bytes = x_scale.numel() * x_scale.element_size()
+    w_bytes = w_scale.numel() * w_scale.element_size()
+    if x_bytes != expected_x_bytes or w_bytes != expected_w_bytes:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 cublas_blocked scales must contain exactly "
+                           f"{expected_x_bytes} x-scale bytes and {expected_w_bytes} w-scale bytes; "
+                           f"got {x_bytes} and {w_bytes}")
+
+
+def _check_grouped_gemm_mxfp8_out(out, tensors, *, GM, N, device):
+    import torch
+
+    if out is None:
+        return
+    if not isinstance(out, torch.Tensor):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects out to be a tensor or None")
+    if out.shape != (GM, N) or out.dtype != torch.bfloat16 or out.device != device or not out.is_contiguous():
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 out must be contiguous BF16 [GM, N] on x's device; "
+                           f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+    if any(torch._C._overlaps(out, tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 out must not overlap any input")
+
+
+def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout="natural"):
+    """Run a forward-only SM100 grouped GEMM over pre-quantized MXFP8 inputs.
+
+    ``x`` is contiguous ``[GM, K]`` and ``w`` is contiguous ``[G, N, K]``
+    or packed ``[G * N, K]`` E4M3 data. Natural E8M0 scales match those
+    logical data shapes with a final ``K // 32`` dimension. CuBLAS-blocked
+    scales are rank-2 opaque byte tensors with exact 128x4-atom storage.
+
+    ``split_sizes`` stays on device: the SM100 kernel validates that values are
+    nonnegative, every prefix is 128-aligned, and the final sum is ``GM``.
+    The BF16 result has shape ``[GM, N]``; a supplied ``out`` is returned by
+    identity. ``num_sms`` defaults to all SMs on ``x.device``.
+    """
+    import torch
+
+    tensors = (x, x_scale, w, w_scale, split_sizes)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects tensor inputs")
+    if x.ndim != 2 or w.ndim not in (2, 3) or split_sizes.ndim != 1:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects x/w/split_sizes ranks 2/(2 or 3)/1; "
+                           f"got {x.ndim}/{w.ndim}/{split_sizes.ndim}")
+
+    GM, G, N, K, w_k = _grouped_gemm_mxfp8_dims(x, w, split_sizes)
+    if min(GM, G, N, K) <= 0:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 requires positive GM, G, N, and K; "
+                           f"got GM={GM}, G={G}, N={N}, K={K}")
+    if w_k != K:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 reduction dimensions must match; "
+                           f"got x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)}")
+    if GM % 128 != 0 or K % 128 != 0:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 requires GM and K divisible by 128; "
+                           f"got GM={GM}, K={K}")
+
+    if x.dtype != torch.float8_e4m3fn or w.dtype != torch.float8_e4m3fn:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects E4M3 x and w; "
+                           f"got x.dtype={x.dtype}, w.dtype={w.dtype}")
+    if x_scale.dtype != torch.float8_e8m0fnu or w_scale.dtype != torch.float8_e8m0fnu:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects E8M0 x_scale and w_scale; "
+                           f"got x_scale.dtype={x_scale.dtype}, w_scale.dtype={w_scale.dtype}")
+    if split_sizes.dtype != torch.int32:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects split_sizes.dtype == torch.int32; "
+                           f"got {split_sizes.dtype}")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects all inputs to be contiguous")
+    if x.device.type != "cuda" or any(tensor.device != x.device for tensor in tensors[1:]):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects all inputs on the same CUDA device; "
+                           f"got {[tensor.device for tensor in tensors]}")
+
+    _check_grouped_gemm_mxfp8_scales(x_scale, w_scale, w, GM=GM, G=G, N=N, K=K, sf_layout=sf_layout)
+    if num_sms is not None:
+        device_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        if type(num_sms) is not int or not 1 <= num_sms <= device_sms:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 num_sms must be an int in "
+                               f"[1, {device_sms}] for {x.device}; got {num_sms!r}")
+    _check_grouped_gemm_mxfp8_out(out, tensors, GM=GM, N=N, device=x.device)
+
+    fn, spec = impl_for("grouped_gemm_mxfp8", device=x.device)
+    tma_tensors = (x, x_scale, w, w_scale) if out is None else (x, x_scale, w, w_scale, out)
+    check_inputs(
+        spec,
+        dtype=x.dtype,
+        row_bytes=(
+            x.stride(0) * x.element_size(),
+            w.stride(-2) * w.element_size(),
+            N * torch.bfloat16.itemsize,
+        ),
+        base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors),
+    )
+    check_backward(spec, x, x_scale, w, w_scale, split_sizes, out)
+    return fn(
+        x,
+        x_scale,
+        w,
+        w_scale,
+        split_sizes,
+        out=out,
+        num_sms=num_sms,
+        sf_layout=sf_layout,
+    )
 
 
 def addmm(input, a, b, *, out=None, space="heuristic"):
