@@ -75,15 +75,8 @@ def _select_num_ctas(*, gm: int, n: int, k: int, launch_sms: int) -> int:
 
 
 def _estimate_operand_smem_bytes(config: dict[str, int]) -> int:
-    return (
-        config["NUM_DATA_BUFFERS"]
-        * (
-            config["BLOCK_SIZE_M"]
-            + config["BLOCK_SIZE_N"] // config["NUM_CTAS"]
-        )
-        * config["BLOCK_SIZE_K"]
-        * _FP8_BYTES
-    )
+    return (config["NUM_DATA_BUFFERS"] * (config["BLOCK_SIZE_M"] + config["BLOCK_SIZE_N"] // config["NUM_CTAS"]) *
+            config["BLOCK_SIZE_K"] * _FP8_BYTES)
 
 
 def _estimate_scale_smem_bytes(config: dict[str, int]) -> int:
@@ -94,11 +87,7 @@ def _estimate_scale_smem_bytes(config: dict[str, int]) -> int:
 
 
 def _estimate_epilogue_smem_bytes(config: dict[str, int]) -> int:
-    return (
-        config["BLOCK_SIZE_M"]
-        * (config["BLOCK_SIZE_N"] // config["EPILOGUE_SUBTILE"])
-        * _BF16_BYTES
-    )
+    return (config["BLOCK_SIZE_M"] * (config["BLOCK_SIZE_N"] // config["EPILOGUE_SUBTILE"]) * _BF16_BYTES)
 
 
 def _estimate_tile_id_smem_bytes(config: dict[str, int]) -> int:
@@ -115,13 +104,9 @@ def _estimate_barrier_smem_bytes(config: dict[str, int]) -> int:
 
 
 def _estimate_smem_bytes(config: dict[str, int]) -> int:
-    return (
-        _estimate_operand_smem_bytes(config)
-        + _estimate_scale_smem_bytes(config)
-        + _estimate_epilogue_smem_bytes(config)
-        + _estimate_tile_id_smem_bytes(config)
-        + _estimate_barrier_smem_bytes(config)
-    )
+    return (_estimate_operand_smem_bytes(config) + _estimate_scale_smem_bytes(config) +
+            _estimate_epilogue_smem_bytes(config) + _estimate_tile_id_smem_bytes(config) +
+            _estimate_barrier_smem_bytes(config))
 
 
 def _accumulator_tmem_columns(config: dict[str, int]) -> int:
@@ -154,11 +139,8 @@ def _config_error(config: dict[str, int]) -> str | None:
     num_ctas = config.get("NUM_CTAS")
     if num_ctas not in (1, 2):
         return "NUM_CTAS must be 1 or 2"
-    expected_pipeline = (
-        {"BLOCK_SIZE_K": 128, "NUM_DATA_BUFFERS": 4, "NUM_SCALE_BUFFERS": 4}
-        if num_ctas == 1
-        else {"BLOCK_SIZE_K": 256, "NUM_DATA_BUFFERS": 3, "NUM_SCALE_BUFFERS": 3}
-    )
+    expected_pipeline = ({"BLOCK_SIZE_K": 128, "NUM_DATA_BUFFERS": 4, "NUM_SCALE_BUFFERS": 4}
+                         if num_ctas == 1 else {"BLOCK_SIZE_K": 256, "NUM_DATA_BUFFERS": 3, "NUM_SCALE_BUFFERS": 3})
     for name, value in expected_pipeline.items():
         if config.get(name) != value:
             return f"{name} must be {value}"
@@ -174,9 +156,7 @@ for _CONFIG_NAME, _CANDIDATE_CONFIG in (
     ("2cta", _CONFIG_2CTA_SPEC),
 ):
     if _CONFIG_ERROR := _config_error(_CANDIDATE_CONFIG):
-        raise RuntimeError(
-            f"invalid SM100 MXFP8 grouped GEMM {_CONFIG_NAME} config: {_CONFIG_ERROR}"
-        )
+        raise RuntimeError(f"invalid SM100 MXFP8 grouped GEMM {_CONFIG_NAME} config: {_CONFIG_ERROR}")
 
 
 @triton.jit
@@ -210,9 +190,7 @@ def _device_trap_if(condition):
 def _load_validated_split(split_sizes_ptr, group_idx, running_m, total_m):
     m_size = tl.load(split_sizes_ptr + group_idx, cache_modifier=".ca").to(tl.int32)
     next_m = running_m + m_size
-    _device_trap_if(
-        (m_size < 0) | (running_m % 128 != 0) | (next_m > total_m)
-    )
+    _device_trap_if((m_size < 0) | (running_m % 128 != 0) | (next_m > total_m))
     return m_size
 
 
@@ -220,7 +198,7 @@ def _load_validated_split(split_sizes_ptr, group_idx, running_m, total_m):
 def _preread_tile_idx(accum_cnt, NUM_BUFFERS: tl.constexpr, bars, tile_id_smem):
     buf, phase = _get_bufidx_phase(accum_cnt, NUM_BUFFERS)
     tlx.barrier_wait(bars[buf], phase)
-    tile_idx = tl.reshape(tlx.local_load(tile_id_smem[buf]), (1,))
+    tile_idx = tl.reshape(tlx.local_load(tile_id_smem[buf]), (1, ))
     return tl.sum(tile_idx)
 
 
@@ -247,7 +225,7 @@ def _producer_signal_tile_ready(
     tile_buf,
     tile_idx,
 ):
-    tlx.local_store(tile_id_smem[tile_buf], tl.full((1,), tile_idx, tl.int32))
+    tlx.local_store(tile_id_smem[tile_buf], tl.full((1, ), tile_idx, tl.int32))
     tlx.barrier_arrive(tile_id_consumer_bars[tile_buf], 1)
 
 
@@ -404,8 +382,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                     group_type=tlx.reuse_group_type.distinct,
                 ),
                 group_type=tlx.reuse_group_type.shared,
-            )
-        )
+            ))
         ACC_RELEASE_ARRIVES: tl.constexpr = 1
     else:
         ACC_SHIFT: tl.constexpr = 0
@@ -418,7 +395,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
         ACC_RELEASE_ARRIVES: tl.constexpr = EPILOGUE_SUBTILE
     SLICE_N: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
     if NUM_CTAS == 1:
-        tile_id_smem = tlx.local_alloc((1,), tl.int32, NUM_TILE_BUFFERS)
+        tile_id_smem = tlx.local_alloc((1, ), tl.int32, NUM_TILE_BUFFERS)
 
     smem_empty_bars = tlx.alloc_barriers(NUM_SMEM_BUFFERS, arrive_count=1)
     smem_full_bars = tlx.alloc_barriers(NUM_SMEM_BUFFERS, arrive_count=1)
@@ -454,9 +431,9 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
         tlx.fence_mbarrier_init_cluster()
 
     with tlx.async_tasks(
-        exclusive=True,
-        no_ending_cluster_sync=True,
-        mbarrier_try_wait_suspend_ns=50000,
+            exclusive=True,
+            no_ending_cluster_sync=True,
+            mbarrier_try_wait_suspend_ns=50000,
     ):
         with tlx.async_task("default"):
             cm_start = 0
@@ -506,10 +483,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                             NUM_TMEM_BUFFERS,
                         )
                         tlx.barrier_wait(tmem_full_bars[tmem_buf], tmem_phase)
-                        offs_cm = (
-                            tile_m_idx * BLOCK_SIZE_M * NUM_CTAS
-                            + cluster_cta_rank * BLOCK_SIZE_M
-                        )
+                        offs_cm = (tile_m_idx * BLOCK_SIZE_M * NUM_CTAS + cluster_cta_rank * BLOCK_SIZE_M)
                         offs_cn = tile_n_idx * BLOCK_SIZE_N
 
                         for i in tl.static_range(EPILOGUE_SUBTILE):
@@ -523,8 +497,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                                             acc_full[0],
                                             (EPILOGUE_SUBTILE - 1 - i) * SLICE_N,
                                             SLICE_N,
-                                        )
-                                    )
+                                        ))
                                     out_n = offs_cn + (EPILOGUE_SUBTILE - 1 - i) * SLICE_N
                                 else:
                                     result = tlx.local_load(
@@ -532,8 +505,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                                             acc_full[0],
                                             ACC_SHIFT + i * SLICE_N,
                                             SLICE_N,
-                                        )
-                                    )
+                                        ))
                                     out_n = offs_cn + i * SLICE_N
                                 if i == 0:
                                     # The shared columns are in registers, so
@@ -547,8 +519,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                                         buffers_c[tmem_buf],
                                         [0, i * SLICE_N],
                                         [BLOCK_SIZE_M, SLICE_N],
-                                    )
-                                )
+                                    ))
                                 out_n = offs_cn + i * SLICE_N
                             c_desc.store(
                                 [offs_cm, out_n],
@@ -713,9 +684,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
             start_bn = 0
             tile_start = 0
             accum_cnt_smem = 0
-            data_bytes: tl.constexpr = (
-                BLOCK_SIZE_M + BLOCK_N_PER_CTA
-            ) * BLOCK_SIZE_K
+            data_bytes: tl.constexpr = (BLOCK_SIZE_M + BLOCK_N_PER_CTA) * BLOCK_SIZE_K
             a_scale_bytes: tl.constexpr = REP_M * REP_K * 2 * 256
             b_scale_bytes: tl.constexpr = REP_N * REP_K * 2 * 256
             smem_bytes: tl.constexpr = data_bytes + a_scale_bytes + b_scale_bytes
@@ -803,18 +772,9 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                             tile_n_idx = cur_tile_idx % num_n_tiles
                             tile_m_idx = cur_tile_idx // num_n_tiles
 
-                        offs_am = (
-                            tile_m_idx * BLOCK_SIZE_M * NUM_CTAS
-                            + cluster_cta_rank * BLOCK_SIZE_M
-                        )
-                        offs_bn = (
-                            tile_n_idx * BLOCK_SIZE_N
-                            + cluster_cta_rank * BLOCK_N_PER_CTA
-                        )
-                        scale_m_idx = (
-                            tile_m_idx * REP_M * NUM_CTAS
-                            + cluster_cta_rank * REP_M
-                        )
+                        offs_am = (tile_m_idx * BLOCK_SIZE_M * NUM_CTAS + cluster_cta_rank * BLOCK_SIZE_M)
+                        offs_bn = (tile_n_idx * BLOCK_SIZE_N + cluster_cta_rank * BLOCK_N_PER_CTA)
+                        scale_m_idx = (tile_m_idx * REP_M * NUM_CTAS + cluster_cta_rank * REP_M)
                         scale_n_idx = tile_n_idx * REP_N
 
                         for kk in range(0, num_k_tiles):
@@ -842,9 +802,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                                 buffers_a[smem_buf],
                                 [a_row_base + offs_am, kk * BLOCK_SIZE_K],
                                 smem_full_bars[smem_buf],
-                                eviction_policy=(
-                                    "evict_last" if NUM_CTAS == 2 else ""
-                                ),
+                                eviction_policy=("evict_last" if NUM_CTAS == 2 else ""),
                                 two_ctas=NUM_CTAS == 2,
                             )
                             tlx.async_descriptor_load(
@@ -852,9 +810,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                                 buffers_b[smem_buf],
                                 [b_row_base + offs_bn, kk * BLOCK_SIZE_K],
                                 smem_full_bars[smem_buf],
-                                eviction_policy=(
-                                    "evict_last" if NUM_CTAS == 2 else ""
-                                ),
+                                eviction_policy=("evict_last" if NUM_CTAS == 2 else ""),
                                 two_ctas=NUM_CTAS == 2,
                             )
 
@@ -870,9 +826,7 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                                     0,
                                 ],
                                 smem_full_bars[smem_buf],
-                                eviction_policy=(
-                                    "evict_last" if NUM_CTAS == 2 else ""
-                                ),
+                                eviction_policy=("evict_last" if NUM_CTAS == 2 else ""),
                                 two_ctas=NUM_CTAS == 2,
                             )
                             if NUM_CTAS == 2:
@@ -973,11 +927,7 @@ def _swizzle_scale_to_5d(
 
     # row = row_group * 32 + row_lane. Flattening the last three axes after
     # this permutation gives dest = row_lane * 16 + row_group * 4 + col.
-    swizzled = (
-        scale.view(batch, outer_chunks, 4, 32, k_chunks, 4)
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-    )
+    swizzled = (scale.view(batch, outer_chunks, 4, 32, k_chunks, 4).permute(0, 1, 4, 3, 2, 5).contiguous())
     return swizzled.view(batch, outer_chunks, k_chunks, 2, 256)
 
 
@@ -990,9 +940,7 @@ def _view_blocked_scale(
         required *= extent
     flat = _as_uint8_scale(scale).view(-1)
     if flat.numel() < required:
-        raise ValueError(
-            f"cublas_blocked scale has {flat.numel()} bytes; expected at least {required}"
-        )
+        raise ValueError(f"cublas_blocked scale has {flat.numel()} bytes; expected at least {required}")
     return flat[:required].view(shape)
 
 
@@ -1013,9 +961,7 @@ def _prepare_scales(
 
     if sf_layout == "natural":
         if x_scale.ndim != 2 or x_scale.shape[0] < gm or x_scale.shape[1] < k_groups:
-            raise ValueError(
-                "natural x_scale must be a 2D tensor covering [GM, K // 32]"
-            )
+            raise ValueError("natural x_scale must be a 2D tensor covering [GM, K // 32]")
         x_scale_5d = _swizzle_scale_to_5d(
             x_scale[:gm, :k_groups],
             batch=1,
@@ -1025,9 +971,7 @@ def _prepare_scales(
             k_chunks=k_chunks,
         )
         if w_scale.numel() != g * n * k_groups:
-            raise ValueError(
-                "natural w_scale must contain exactly G * N * (K // 32) scales"
-            )
+            raise ValueError("natural w_scale must contain exactly G * N * (K // 32) scales")
         w_scale_5d = _swizzle_scale_to_5d(
             w_scale,
             batch=g,
@@ -1046,9 +990,7 @@ def _prepare_scales(
             (g, n_chunks, k_chunks, 2, 256),
         )
     else:
-        raise ValueError(
-            f"unsupported sf_layout {sf_layout!r}; expected 'natural' or 'cublas_blocked'"
-        )
+        raise ValueError(f"unsupported sf_layout {sf_layout!r}; expected 'natural' or 'cublas_blocked'")
     return x_scale_5d, w_scale_5d
 
 
@@ -1082,10 +1024,7 @@ def grouped_gemm_mxfp8(
         raise ValueError("expected rank-2 x, rank-2/rank-3 w, and rank-1 split_sizes")
     if x.dtype != torch.float8_e4m3fn or w.dtype != torch.float8_e4m3fn:
         raise ValueError("SM100 MXFP8 grouped GEMM supports E4M3 operands only")
-    if (
-        x_scale.dtype != torch.float8_e8m0fnu
-        or w_scale.dtype != torch.float8_e8m0fnu
-    ):
+    if (x_scale.dtype != torch.float8_e8m0fnu or w_scale.dtype != torch.float8_e8m0fnu):
         raise ValueError("SM100 MXFP8 grouped GEMM requires E8M0 scales")
     if split_sizes.dtype != torch.int32:
         raise ValueError("split_sizes must have dtype torch.int32")
@@ -1114,9 +1053,7 @@ def grouped_gemm_mxfp8(
     tensors = (x, x_scale, w, w_scale, split_sizes)
     if not all(tensor.is_contiguous() for tensor in tensors):
         raise ValueError("x, scales, w, and split_sizes must be contiguous")
-    if x.device.type != "cuda" or any(
-        tensor.device != x.device for tensor in tensors[1:]
-    ):
+    if x.device.type != "cuda" or any(tensor.device != x.device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on x's CUDA device")
 
     device = x.device
@@ -1125,12 +1062,7 @@ def grouped_gemm_mxfp8(
             raise ValueError("SM100 MXFP8 grouped GEMM requires compute capability 10.0")
         if out is None:
             out = torch.empty((gm, n), device=device, dtype=torch.bfloat16)
-        elif (
-            out.shape != (gm, n)
-            or out.dtype != torch.bfloat16
-            or out.device != device
-            or not out.is_contiguous()
-        ):
+        elif (out.shape != (gm, n) or out.dtype != torch.bfloat16 or out.device != device or not out.is_contiguous()):
             raise ValueError("out must be contiguous BF16 [GM, N] on x's device")
 
         x_scale_5d, w_scale_5d = _prepare_scales(
@@ -1142,11 +1074,7 @@ def grouped_gemm_mxfp8(
             k=k,
             sf_layout=sf_layout,
         )
-        launch_sms = (
-            torch.cuda.get_device_properties(device).multi_processor_count
-            if num_sms is None
-            else num_sms
-        )
+        launch_sms = (torch.cuda.get_device_properties(device).multi_processor_count if num_sms is None else num_sms)
         if launch_sms <= 0:
             raise ValueError("num_sms must be positive")
 
@@ -1167,7 +1095,7 @@ def grouped_gemm_mxfp8(
             counter = split_sizes
 
         with _tma_descriptor_allocator(device):
-            _mxfp8_grouped_gemm_kernel[(launch_sms,)](
+            _mxfp8_grouped_gemm_kernel[(launch_sms, )](
                 a_ptr=x,
                 stride_am=x.stride(0),
                 stride_ak=x.stride(1),

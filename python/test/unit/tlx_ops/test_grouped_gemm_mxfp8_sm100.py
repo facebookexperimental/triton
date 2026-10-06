@@ -73,9 +73,7 @@ def _assert_invalid_before_resolution(monkeypatch, inputs, match, **kwargs):
     from triton.tlx import ops
 
     def unexpected_resolution(*args, **resolution_kwargs):
-        pytest.fail(
-            f"implementation resolution reached with args={args}, kwargs={resolution_kwargs}"
-        )
+        pytest.fail(f"implementation resolution reached with args={args}, kwargs={resolution_kwargs}")
 
     monkeypatch.setattr(ops, "impl_for", unexpected_resolution)
     with pytest.raises(ops.InvalidInput, match=match):
@@ -151,7 +149,7 @@ def _make_numerical_inputs(
     for group, group_rows in enumerate(split_sizes):
         if group_rows:
             w_dequantized = _dequantize_mxfp8(w_3d[group], w_scale_natural[group])
-            references.append(x_dequantized[row : row + group_rows] @ w_dequantized.T)
+            references.append(x_dequantized[row:row + group_rows] @ w_dequantized.T)
         row += group_rows
     reference = torch.cat(references, dim=0)
 
@@ -251,12 +249,11 @@ def test_grouped_gemm_mxfp8_catalog_resolves_fixed_implementation():
     implementation, spec = impl_for("grouped_gemm_mxfp8", arch="sm100")
     assert implementation is grouped_gemm_mxfp8
     assert not spec.supports_backward
-    assert str(inspect.signature(implementation)) == (
-        "(x: 'torch.Tensor', x_scale: 'torch.Tensor', w: 'torch.Tensor', "
-        "w_scale: 'torch.Tensor', split_sizes: 'torch.Tensor', *, "
-        "out: 'torch.Tensor | None' = None, num_sms: 'int | None' = None, "
-        "sf_layout: 'str' = 'natural') -> 'torch.Tensor'"
-    )
+    assert str(
+        inspect.signature(implementation)) == ("(x: 'torch.Tensor', x_scale: 'torch.Tensor', w: 'torch.Tensor', "
+                                               "w_scale: 'torch.Tensor', split_sizes: 'torch.Tensor', *, "
+                                               "out: 'torch.Tensor | None' = None, num_sms: 'int | None' = None, "
+                                               "sf_layout: 'str' = 'natural') -> 'torch.Tensor'")
 
 
 def test_grouped_gemm_mxfp8_fixed_config_resources_are_legal():
@@ -288,17 +285,12 @@ def test_grouped_gemm_mxfp8_fixed_config_resources_are_legal():
     }
     for config in (sm100._CONFIG_SPEC, sm100._CONFIG_2CTA_SPEC):
         assert sm100._config_error(config) is None
-        assert sm100._estimate_smem_bytes(config) == (
-            sm100._estimate_operand_smem_bytes(config)
-            + sm100._estimate_scale_smem_bytes(config)
-            + sm100._estimate_epilogue_smem_bytes(config)
-            + sm100._estimate_tile_id_smem_bytes(config)
-            + sm100._estimate_barrier_smem_bytes(config)
-        )
-        assert (
-            sm100._estimate_smem_bytes(config) + sm100._SMEM_SAFETY_MARGIN_BYTES
-            <= sm100._SM100_SMEM_BYTES
-        )
+        assert sm100._estimate_smem_bytes(config) == (sm100._estimate_operand_smem_bytes(config) +
+                                                      sm100._estimate_scale_smem_bytes(config) +
+                                                      sm100._estimate_epilogue_smem_bytes(config) +
+                                                      sm100._estimate_tile_id_smem_bytes(config) +
+                                                      sm100._estimate_barrier_smem_bytes(config))
+        assert (sm100._estimate_smem_bytes(config) + sm100._SMEM_SAFETY_MARGIN_BYTES <= sm100._SM100_SMEM_BYTES)
         assert sm100._estimate_tmem_columns(config) <= sm100._SM100_TMEM_COLUMNS
     assert sm100._estimate_tile_id_smem_bytes(sm100._CONFIG_SPEC) == 12
     assert sm100._estimate_tile_id_smem_bytes(sm100._CONFIG_2CTA_SPEC) == 0
@@ -393,7 +385,7 @@ def test_grouped_gemm_mxfp8_rejects_scale_contract_num_sms_and_out_before_resolu
         "contiguous BF16",
         out=torch.empty((127, 256), device="cuda", dtype=torch.bfloat16),
     )
-    overlapping_out = inputs[2].view(torch.bfloat16).reshape(-1)[: 128 * 256].view(128, 256)
+    overlapping_out = inputs[2].view(torch.bfloat16).reshape(-1)[:128 * 256].view(128, 256)
     _assert_invalid_before_resolution(monkeypatch, inputs, "must not overlap", out=overlapping_out)
 
 
@@ -458,17 +450,15 @@ def test_grouped_gemm_mxfp8_rejects_tma_alignment_before_kernel_launch(monkeypat
 def test_grouped_gemm_mxfp8_invalid_split_values_trap_in_subprocess(split_sizes):
     result = run_in_process(
         _run_invalid_split_values,
-        (split_sizes,),
+        (split_sizes, ),
         env={"CUDA_LAUNCH_BLOCKING": "1"},
     )
-    assert isinstance(result.exc, RuntimeError), (
-        f"expected a CUDA trap, got {result.exc!r}; driver stderr:\n{result.driver_stderr_output}"
-    )
+    assert isinstance(
+        result.exc,
+        RuntimeError), (f"expected a CUDA trap, got {result.exc!r}; driver stderr:\n{result.driver_stderr_output}")
     error = f"{result.exc}\n{result.driver_stderr_output}"
-    assert any(
-        message in error
-        for message in ("device-side assert", "unspecified launch failure", "illegal instruction")
-    ), error
+    assert any(message in error
+               for message in ("device-side assert", "unspecified launch failure", "illegal instruction")), error
 
 
 @requires_sm100

@@ -108,8 +108,8 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws_persistent_mxfp8",
         impl="triton.tlx.ops.kernels.grouped_gemm_mxfp8.sm100:grouped_gemm_mxfp8",
         dtypes=frozenset({"float8_e4m3fn"}),
-        accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"])
-        and all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
+                                                                                           for ptr in d["base_ptrs"]),
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
