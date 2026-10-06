@@ -615,6 +615,7 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan,
       if (stride > 0 && dotIdx < nM * nN &&
           (dotIdx % static_cast<unsigned>(stride)) == 0) {
         ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none);
+                                          ROCDL::SchedGroupMask::none);
       }
     }
   }
