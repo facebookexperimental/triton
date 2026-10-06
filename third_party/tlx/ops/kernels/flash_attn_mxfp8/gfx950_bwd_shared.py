@@ -713,16 +713,17 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
-    _prepare_fused[(n // 32, 128)](v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32,
-                                   num_warps=4, num_stages=2)
+    _prepare_fused.run(v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32, num_warps=4,
+                       num_stages=2, grid=(n // 32, 128), warmup=False)
     # The KV owner reuses Q/dO payloads and their saved/prepared square32
     # scales directly; no directional exports or second Delta launch.
-    _bwd_kv_owner[(128, n // 64)](q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds,
-                                  dss, D=128, BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True,
-                                  PEEL=False, NATIVE=True, RELAXED=False, num_warps=2, num_stages=1,
-                                  matrix_instr_nonkdim=32, waves_per_eu=0)
-    _bwd_q_consume[(n // 128, 128)](ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal,
-                                    HEADS=128, num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0)
+    _bwd_kv_owner.run(q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds, dss, D=128,
+                      BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True,
+                      RELAXED=False, num_warps=2, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0,
+                      grid=(128, n // 64), warmup=False)
+    _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
+                       num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
+                       warmup=False)
     return dq, dk, dv
 
 
