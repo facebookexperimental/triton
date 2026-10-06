@@ -59,6 +59,11 @@ def is_gfx950() -> bool:
     return current_target().is_gfx950
 
 
+def is_gfx942() -> bool:
+    """True on AMD MI300X (gfx942), where direct-load TorchTLX GEMM runs."""
+    return current_target().is_gfx942
+
+
 def is_hopper() -> bool:
     """True on an H100, where local-buffer retention uses SMEM."""
     return current_target().is_hopper
@@ -580,6 +585,19 @@ class TestLocalBufferRetention(TestCase):
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_arch_predicates(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        with mock.patch.object(torch.version, "hip", "6.0"), mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
+        ), mock.patch.object(_tlx_registry, "current_target") as target:
+            target.return_value.is_gfx942 = True
+            self.assertIs(_tlx_registry._is_gfx950(), True)
+            self.assertIs(_tlx_registry._is_gfx942(), True)
+
     @staticmethod
     @contextlib.contextmanager
     def _force_warppipe_split_k_choice():
@@ -693,21 +711,58 @@ class TestTLXTemplates(TestCase):
             self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
             self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
 
-        expected_uids = {
+        expected = ([_tlx_mm.gfx942_mm_template.uid] if is_gfx942() else [
             _tlx_mm.gfx950_mm_interwave_template.uid,
             _tlx_mm.gfx950_mm_local_split_u_template.uid,
             _tlx_mm.gfx950_mm_register_template.uid,
             _tlx_mm.gfx950_mm_persistent_template.uid,
-        }
+        ])
         self.assertEqual(
-            [template.uid for template in templates if template.uid in expected_uids],
-            [
-                _tlx_mm.gfx950_mm_interwave_template.uid,
-                _tlx_mm.gfx950_mm_local_split_u_template.uid,
-                _tlx_mm.gfx950_mm_register_template.uid,
-                _tlx_mm.gfx950_mm_persistent_template.uid,
-            ],
+            [template.uid for template in templates if template.uid in expected],
+            expected,
         )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_gfx942_torch_providers_are_cataloged(self):
+        from triton.language.extra.tlx.inductor import gfx942_torch as gfx942_mm
+        from triton.tlx.ops._catalog import impl_for
+        from triton.tlx.ops.kernels.addmm import gfx942_torch as gfx942_addmm
+
+        mm_impl, _ = impl_for("mm_torchtlx", arch="gfx942")
+        addmm_impl, _ = impl_for("addmm_torchtlx", arch="gfx942")
+
+        self.assertIs(mm_impl, gfx942_mm.mm)
+        self.assertIs(addmm_impl, gfx942_addmm.addmm)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    def test_tlx_gfx942_mm_template_is_selected(self):
+        from triton.language.extra.tlx.inductor import gfx942_torch
+
+        a = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.reset()
+        actual, code = run_and_get_code(lambda x, y: gfx942_torch.mm(x, y, mode="force"), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_gfx942_mm", "\n".join(code))
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    def test_tlx_gfx942_addmm_template_is_selected(self):
+        from triton.tlx.ops.kernels.addmm import gfx942_torch
+
+        bias = torch.randn((512, ), device=GPU_TYPE, dtype=torch.float16)
+        a = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.reset()
+        actual, code = run_and_get_code(
+            lambda x, y, z: gfx942_torch.addmm(x, y, z, mode="force"),
+            bias,
+            a,
+            b,
+        )
+
+        torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_gfx942_addmm", "\n".join(code))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_mm_interwave_rejects_non_gfx950(self):

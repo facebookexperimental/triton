@@ -73,6 +73,8 @@ from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
     blackwell_gemm_ws_template,
+    gfx942_addmm_template,
+    gfx942_mm_template,
     gfx950_addmm_interwave_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_addmm_warppipe_template,
@@ -126,6 +128,11 @@ def _is_gfx950() -> bool:
         return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
     except (AssertionError, AttributeError, RuntimeError):
         return False
+
+
+def _is_gfx942() -> bool:
+    """Whether the live device is MI300X/CDNA3."""
+    return current_target().is_gfx942
 
 
 #: Per-arch warp-pipe tile pools, keyed by ``current_target().key``. An arch
@@ -1214,6 +1221,80 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
     if max(a_span_bytes, b_span_bytes, c_span_bytes) > int32_max:
         return None
     return m, n, k, out_dtype
+
+
+class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Feed the gfx942 tlx.ops heuristic into an Inductor GEMM template."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx942():
+            return
+        dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+        if dtype not in (torch.float16, torch.bfloat16):
+            return
+        if kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype:
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        strides = kernel_inputs.strides_hinted()
+        a_strides = strides[kernel_inputs._mat1_idx]
+        b_strides = strides[kernel_inputs._mat2_idx]
+        values = (m, n, k, *a_strides[-2:], *b_strides[-2:])
+        if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+            return
+        m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (
+            int(value) for value in values
+        )
+        if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+            return
+
+        # Keep TorchTLX and tlx.ops on the same measured shape policy.  The
+        # special split-panel/local-split-U paths have different program grids;
+        # this template is the common direct-load path only.
+        from triton.tlx.ops.kernels.mm.gfx942 import heuristic_config
+
+        for config in heuristic_config(m, n, k):
+            meta = dict(config.kwargs)
+            if meta.pop("SPLIT_M_128_32", False) or meta.pop(
+                "USE_LOCAL_SPLIT_U", False
+            ):
+                continue
+            meta.pop("XCD_CHUNK", None)  # fixed to four in the template source
+            triton_config = self.triton_config(
+                config.num_stages,
+                config.num_warps,
+                **meta,
+                matrix_instr_nonkdim=16,
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config,
+                m,
+                n,
+                k,
+                kernel_inputs.out_dtype(),
+            )
+
+
+@register_template_heuristic(
+    gfx942_mm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx942MMTemplateConfigHeuristic(_Gfx942MMTemplateConfigHeuristic):
+    """MI300X TorchTLX MM using the gfx942 tlx.ops shape heuristic."""
+
+
+@register_template_heuristic(
+    gfx942_addmm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx942AddMMTemplateConfigHeuristic(
+    AddMMConfigMixin, _Gfx942MMTemplateConfigHeuristic
+):
+    """MI300X TorchTLX AddMM using the gfx942 tlx.ops shape heuristic."""
 
 
 _GFX950_REGISTER_BLOCK_M = 256
