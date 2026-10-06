@@ -13,7 +13,7 @@ from triton._internal_testing import run_in_process, swizzle_scale_to_5d
 
 
 def _is_sm100():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -274,9 +274,9 @@ def test_grouped_gemm_mxfp8_fixed_config_resources_are_legal():
     assert sm100._CONFIG_2CTA_SPEC == {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 256,
-        "NUM_DATA_BUFFERS": 3,
-        "NUM_SCALE_BUFFERS": 3,
+        "BLOCK_SIZE_K": 128,
+        "NUM_DATA_BUFFERS": 6,
+        "NUM_SCALE_BUFFERS": 6,
         "NUM_TMEM_BUFFERS": 1,
         "NUM_TILE_BUFFERS": 3,
         "EPILOGUE_SUBTILE": 4,
@@ -295,9 +295,9 @@ def test_grouped_gemm_mxfp8_fixed_config_resources_are_legal():
     assert sm100._estimate_tile_id_smem_bytes(sm100._CONFIG_SPEC) == 12
     assert sm100._estimate_tile_id_smem_bytes(sm100._CONFIG_2CTA_SPEC) == 0
     assert sm100._estimate_barrier_smem_bytes(sm100._CONFIG_SPEC) == 128
-    assert sm100._estimate_barrier_smem_bytes(sm100._CONFIG_2CTA_SPEC) == 64
+    assert sm100._estimate_barrier_smem_bytes(sm100._CONFIG_2CTA_SPEC) == 112
     assert sm100._estimate_smem_bytes(sm100._CONFIG_SPEC) == 219276
-    assert sm100._estimate_smem_bytes(sm100._CONFIG_2CTA_SPEC) == 222272
+    assert sm100._estimate_smem_bytes(sm100._CONFIG_2CTA_SPEC) == 222320
     # Two overlapped 256-column accumulators share one 64-column subtile.
     assert sm100._accumulator_tmem_columns(sm100._CONFIG_SPEC) == 448
     assert sm100._accumulator_tmem_columns(sm100._CONFIG_2CTA_SPEC) == 448
@@ -473,6 +473,16 @@ def test_grouped_gemm_mxfp8_native_2cta_selected_path():
 
     assert sm100._select_num_ctas(gm=512, n=4096, k=2048, launch_sms=2) == 2
     inputs, reference = _make_numerical_inputs((256, 256), n=4096, k=2048)
+    _assert_correct(_call(inputs, num_sms=2), reference)
+
+
+@requires_sm100
+def test_grouped_gemm_mxfp8_native_2cta_n3072():
+    from triton.tlx.ops.kernels.grouped_gemm_mxfp8 import sm100
+
+    assert sm100._select_num_ctas(gm=512, n=3072, k=2048, launch_sms=2) == 2
+    assert sm100._select_num_ctas(gm=512, n=2048, k=2048, launch_sms=2) == 1
+    inputs, reference = _make_numerical_inputs((256, 256), n=3072, k=2048)
     _assert_correct(_call(inputs, num_sms=2), reference)
 
 
