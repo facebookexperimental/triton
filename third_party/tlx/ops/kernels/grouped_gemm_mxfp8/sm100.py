@@ -55,9 +55,9 @@ _CONFIG_SPEC = {
 }
 _CONFIG_2CTA_SPEC = dict(
     _CONFIG_SPEC,
-    BLOCK_SIZE_K=256,
-    NUM_DATA_BUFFERS=3,
-    NUM_SCALE_BUFFERS=3,
+    BLOCK_SIZE_K=128,
+    NUM_DATA_BUFFERS=6,
+    NUM_SCALE_BUFFERS=6,
     NUM_CTAS=2,
 )
 
@@ -67,7 +67,7 @@ def _cdiv(value: int, divisor: int) -> int:
 
 
 def _select_num_ctas(*, gm: int, n: int, k: int, launch_sms: int) -> int:
-    if launch_sms < 2 or launch_sms % 2 != 0 or n < 4096 or k < 2048:
+    if launch_sms < 2 or launch_sms % 2 != 0 or n < 3072 or k < 2048:
         return 1
     num_clusters = launch_sms // 2
     min_logical_tiles = _cdiv(gm, 2 * _BLOCK_SIZE_M) * _cdiv(n, _BLOCK_SIZE_N)
@@ -140,7 +140,7 @@ def _config_error(config: dict[str, int]) -> str | None:
     if num_ctas not in (1, 2):
         return "NUM_CTAS must be 1 or 2"
     expected_pipeline = ({"BLOCK_SIZE_K": 128, "NUM_DATA_BUFFERS": 4, "NUM_SCALE_BUFFERS": 4}
-                         if num_ctas == 1 else {"BLOCK_SIZE_K": 256, "NUM_DATA_BUFFERS": 3, "NUM_SCALE_BUFFERS": 3})
+                         if num_ctas == 1 else {"BLOCK_SIZE_K": 128, "NUM_DATA_BUFFERS": 6, "NUM_SCALE_BUFFERS": 6})
     for name, value in expected_pipeline.items():
         if config.get(name) != value:
             return f"{name} must be {value}"
@@ -1058,8 +1058,8 @@ def grouped_gemm_mxfp8(
 
     device = x.device
     with torch.cuda.device(device):
-        if torch.cuda.get_device_capability(device) != (10, 0):
-            raise ValueError("SM100 MXFP8 grouped GEMM requires compute capability 10.0")
+        if torch.cuda.get_device_capability(device)[0] != 10:
+            raise ValueError("SM100 MXFP8 grouped GEMM requires an SM10x device")
         if out is None:
             out = torch.empty((gm, n), device=device, dtype=torch.bfloat16)
         elif (out.shape != (gm, n) or out.dtype != torch.bfloat16 or out.device != device or not out.is_contiguous()):
