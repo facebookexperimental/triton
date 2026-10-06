@@ -160,26 +160,34 @@ def _has_two_gfx950_devices():
     return len(_gfx950_device_indices()) >= 2
 
 
-def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph():
+@pytest.mark.parametrize(
+    "n_ctx,causal,scale",
+    [(n, causal, 0.5) for n in (1024, 2048, 4096, 8192) for causal in (False, True)] + [(8192, False, 1.3)],
+)
+def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scale):
     from triton.tlx.ops import flash_attn_mxfp8
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd, gfx950_bwd_shared
 
     torch.manual_seed(20)
-    inputs = _qkv((4, 32, 8192, 128), requires_grad=True)
+    inputs = _qkv((4, 32, n_ctx, 128), requires_grad=True)
     do = torch.randn_like(inputs[0]) * 0.5
-    out = flash_attn_mxfp8(*inputs, causal=False, sm_scale=1.3)
-    reference = _sdpa(*inputs, False, 1.3)
+    out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+    reference = _sdpa(*inputs, causal, scale)
     expected = torch.autograd.grad(reference, inputs, do)
     _, _, v, q8, k8, saved_out, lse, qs, ks = out.grad_fn.saved_tensors
-    args = (q8, k8, qs, ks, v, do, saved_out, lse, 1.3)
-    assert gfx950_bwd_shared.can_use_shared_square(*args)
-    assert not gfx950_bwd_shared.can_use_shared_square(*args, causal=True)
-    assert not gfx950_bwd_shared.can_use_shared_square(*args[:-1], 0.5)
+    args = (q8, k8, qs, ks, v, do, saved_out, lse, scale)
+    assert gfx950_bwd_shared.can_use_shared_square(*args, causal=causal)
+    assert not gfx950_bwd_shared.can_use_shared_square(*args, causal=1)
+    for unsupported_scale in (0.7, float("nan"), float("inf")):
+        assert not gfx950_bwd_shared.can_use_shared_square(*args[:-1], unsupported_scale, causal=causal)
+    if scale == 1.3:
+        assert not gfx950_bwd_shared.can_use_shared_square(*args, causal=True)
     # A contiguous view of a larger allocation is outside the fast-path
     # whole-storage contract; it must remain on the general implementation.
     oversized = torch.empty(v.numel() + 1, device=v.device, dtype=v.dtype)
     view = oversized[1:].view_as(v)
-    assert not gfx950_bwd_shared.can_use_shared_square(*args[:4], view, *args[5:])
+    assert not gfx950_bwd_shared.can_use_shared_square(*args[:4], view, *args[5:], causal=causal)
+    del oversized, view
 
     def check(grads):
         for actual, ref in zip(grads, expected):
@@ -198,28 +206,64 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph():
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
+        workspaces = {}
+        original_empty = torch.empty
+
+        def observe_empty(*allocation_args, **kwargs):
+            tensor = original_empty(*allocation_args, **kwargs)
+            if tuple(tensor.shape) == (4, 32, n_ctx, n_ctx) and tensor.dtype == torch.float8_e4m3fn:
+                assert "ds" not in workspaces, "expected exactly one captured backward"
+                workspaces["ds"] = tensor
+            elif "ds" in workspaces and "dss" not in workspaces:
+                # DSS is allocated immediately after DS. Shape alone is not
+                # unique: at N4096 it equals the preparation scale shapes.
+                assert tuple(tensor.shape) == (4, 32, n_ctx // 32, n_ctx // 32)
+                assert tensor.dtype == torch.uint8 and tensor.device == inputs[0].device
+                workspaces["dss"] = tensor
+            return tensor
+
         try:
             with torch.cuda.stream(stream):
                 # Autograd records the forward stream on its nodes. Create
                 # fresh leaves and this graph on the capture stream.
                 inputs = tuple(x.detach().clone().requires_grad_() for x in inputs)
-                out = flash_attn_mxfp8(*inputs, causal=False, sm_scale=1.3)
+                out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
                 for _ in range(2):
                     backward()
                 stream.synchronize()
-                with torch.cuda.graph(graph, stream=stream):
-                    captured = backward()
+                # Observe only the one captured invocation, not warmups, so
+                # large temporary allocations from other calls are not kept.
+                with mock.patch.object(gfx950_bwd_shared.torch, "empty", side_effect=observe_empty):
+                    with torch.cuda.graph(graph, stream=stream):
+                        captured = backward()
+                assert set(workspaces) == {"ds", "dss"}
                 for _ in range(2):
+                    # Poison before each replay, outside the captured graph.
+                    # E4M3 byte0x7f and E8M0 byte255 represent NaN. Every
+                    # consumed workspace value must come from this replay.
+                    workspaces["ds"].view(torch.uint8).fill_(0x7f)
+                    workspaces["dss"].fill_(255)
                     for grad in captured:
                         grad.fill_(float("nan"))
                     graph.replay()
                     stream.synchronize()
+                    if causal:
+                        ds_bytes = workspaces["ds"].view(torch.uint8)
+                        # Physical [key,query] blocks wholly above the
+                        # causal domain are not initialized or consumed.
+                        assert bool((ds_bytes[0, 0, 128:192, :64] == 0x7f).all())
+                        assert bool((workspaces["dss"][0, 0, :2, 4:6] == 255).all())
+                        # Within diagonal128, even masked key64/query64
+                        # blocks are fully written as zeros before consumption.
+                        assert bool((ds_bytes[0, 0, 64:128, :64] == 0).all())
+                        assert bool((workspaces["dss"][0, 0, :2, 2:4] != 255).all())
                     check(captured)
                     for actual, ref in zip(captured, eager):
                         torch.testing.assert_close(actual, ref, atol=0, rtol=0)
         finally:
             stream.synchronize()
             graph.reset()
+            workspaces.clear()
 
 
 def _mxfp8_reference_quantize(x, *, sequence=False, square=False):
@@ -294,8 +338,12 @@ def test_flash_attn_mxfp8_gfx950_quantization_scale_boundaries(sequence):
 @pytest.mark.parametrize("sequence", (False, True))
 @pytest.mark.parametrize("forward", (False, True))
 def test_flash_attn_mxfp8_gfx950_quantization_minimum_scale(sequence, forward):
+    import triton
+    import triton.language as tl
+    import triton.language.extra.tlx as tlx
     from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950 import quantize_mxfp8_head, quantize_mxfp8_v
-    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import quantize_mxfp8
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import _scale_exponent, quantize_mxfp8
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_bwd_shared import _quantize_ds_square, _scaled_e4m3_words
 
     # The minimum E8M0 scale is subnormal FP32 (2**-127), not zero.
     # Include adjacent floats at its RCEIL transition, zero, and large values.
@@ -315,6 +363,67 @@ def test_flash_attn_mxfp8_gfx950_quantization_minimum_scale(sequence, forward):
     expected_scales = (exponent + 127).to(torch.uint8)[None, :, None, None].expand(actual_scales.shape)
     torch.testing.assert_close(actual_scales.cpu(), expected_scales, atol=0, rtol=0)
     torch.testing.assert_close(actual.cpu().view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0)
+
+    @triton.jit
+    def shared_quantize(X, Y, S, E, REFERENCE: tl.constexpr):
+        tile = tl.program_id(0)
+        rows = tl.arange(0, 64)
+        cols = tl.arange(0, 64)
+        mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
+                                                warps_per_cta=[2, 1])
+        ds = tl.load(X + tile * 64 * 64 + rows[:, None] * 64 + cols[None, :])
+        ds = tlx.release_layout(tlx.require_layout(ds, mma, pin=False))
+        if REFERENCE:
+            # Keep the original reduction association and integer exponent
+            # rule, independently of the shared helper's fused scale bits.
+            square = ds.reshape(2, 32, 2, 32)
+            amax = tl.max(tl.max(tl.abs(square), 3), 1)
+            exponent = _scale_exponent(amax)
+            scale_bits = tl.where(exponent == 0, 0x00400000, exponent << 23)
+            scale_bits = tl.where(exponent == 255, 0x7fc00000, scale_bits)
+            scale = scale_bits.to(tl.float32, bitcast=True)
+            pairs = tl.broadcast_to(scale[:, None, :, None], (2, 32, 2, 16))
+            payload = _scaled_e4m3_words(ds, pairs.reshape(64, 32))
+            scales = tl.broadcast_to(exponent[:, None, :], (2, 32, 2)).reshape(64, 2).to(tl.uint8)
+        else:
+            payload, scales, exponent = _quantize_ds_square(ds, 64, 64)
+        groups = tl.arange(0, 2)
+        tl.store(Y + tile * 64 * 64 + rows[:, None] * 64 + cols[None, :], payload.to(tl.uint8, bitcast=True))
+        tl.store(S + tile * 64 * 2 + rows[:, None] * 2 + groups[None, :], scales)
+        tl.store(E + tile * 4 + groups[:, None] * 2 + groups[None, :], exponent)
+
+    # Exercise the actual square32 dS helper, not just the forward/general
+    # quantizers above. Bit patterns preserve subnormals and adjacent floats.
+    shared_maxima = torch.tensor([
+        0,
+        1,
+        0x04600000,
+        0x04600001,
+        0x04600002,
+        0x43dfffff,
+        0x43e00000,
+        0x43e00001,
+        0x7f7fffff,
+        0x7f800000,
+        0x7fc00000,
+        0x43e00000,
+    ], dtype=torch.int32).view(torch.float32)
+    shared_input = shared_maxima[:, None, None].expand(-1, 64, 64).contiguous()
+    shared_input[..., 1::2] *= -1
+    # Mixed NaN/finite blocks use the same tl.max semantics in both paths;
+    # the default reduction does not promise to propagate every input NaN.
+    shared_input[-1, ::32, ::32] = float('nan')
+    shared_input = shared_input.cuda()
+    results = []
+    for reference in (False, True):
+        payload = torch.empty(shared_input.shape, device="cuda", dtype=torch.uint8)
+        scales = torch.empty((len(shared_maxima), 64, 2), device="cuda", dtype=torch.uint8)
+        exponents = torch.empty((len(shared_maxima), 2, 2), device="cuda", dtype=torch.int32)
+        shared_quantize[(len(shared_maxima), )](shared_input, payload, scales, exponents, reference, num_warps=2,
+                                                num_stages=1, matrix_instr_nonkdim=32)
+        results.append((payload, scales, exponents))
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")

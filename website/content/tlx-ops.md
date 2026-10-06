@@ -82,11 +82,14 @@ Q/K use E4M3 payloads with E8M0 scales per 32×32 block, as in current Blackwell
 The general backward requantizes operands for their reduction axes and uses
 32×32 dS quantization. Separate dQ and dK/dV owners recompute QK and dP.
 
-The tuned noncausal `B=4, H=32, N=8192, D=128, sm_scale=1.3` path instead
-shares square32 Q/K/dO payloads between reduction orientations, fuses backward
-preparation, and materializes FP8 dS once for the dQ consumer. It requires whole,
-aligned contiguous storage and uses **8 GiB + 288 MiB of temporary workspace**
-per call, excluding gradients and saved inputs. Other configurations use the
+For `B=4, H=32, D=128`, the specialized path supports
+`N=1024/2048/4096/8192, sm_scale=0.5` with either causal flag, plus
+`N=8192, sm_scale=1.3` noncausal. It shares square32 Q/K/dO payloads between
+reduction orientations, fuses backward preparation, and materializes FP8 dS
+once for the dQ consumer. It requires whole, aligned contiguous storage.
+Temporary workspace per call is `128*N*N + 128*(N//32)**2 + 35840*N` bytes,
+up to **8 GiB + 288 MiB at N8192**, excluding gradients and saved inputs.
+Causal calls allocate the same dense workspace. Other configurations use the
 general implementation; allocation or kernel failures are not silently retried.
 These are quantized training recipes, not BF16-equivalent gradients.
 

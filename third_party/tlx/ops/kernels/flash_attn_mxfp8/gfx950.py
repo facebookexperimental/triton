@@ -31,11 +31,15 @@ Training uses the hardware-exp loop kernel and saves its base-2 logsumexp
 before P quantization. Backward uses native scaled MFMA for all five unique
 products, fixed-scale P and transpose-compatible 32x32 dS quantization.
 The general path uses separate Q and KV owners that recompute QK and dP.
-For contiguous B4/H32/N8192/D128 noncausal MHA at scale 1.3, a specialized
-backward shares square32 Q/K/dO quantization and materializes FP8 dS for
-reuse by the Q owner. Each gradient has a single writer and accumulates
-deterministically in FP32. The specialization uses 8 GiB + 288 MiB of
-temporary storage, excluding gradients and saved inputs.
+For contiguous B4/H32/D128 MHA at scale 0.5 and N=1024/2048/4096/8192,
+causal or noncausal, a specialized backward shares square32 Q/K/dO
+quantization and materializes FP8 dS for reuse by the Q owner. It also
+supports N8192 noncausal at scale 1.3. Each gradient has a single writer
+and accumulates deterministically in FP32. Whole, aligned storage is
+required. Temporary storage is 128*N*N + 128*(N//32)**2 + 35840*N bytes,
+up to 8 GiB + 288 MiB at N8192, excluding gradients and saved inputs.
+Causal calls allocate the same dense workspace. Other configurations use
+the general implementation; allocation or kernel failures are not retried.
 """
 
 import math

@@ -1,15 +1,19 @@
 """gfx950 shared-square32 MXFP8 attention backward specialization.
 
-Supports contiguous B4/H32/N8192/D128 noncausal MHA at softmax scale 1.3.
+Supports contiguous B4/H32/D128 MHA at softmax scale 0.5 for
+N=1024/2048/4096/8192 with either causal flag, plus N8192 noncausal at 1.3.
 Saved square32 Q/K and newly square32-quantized dO are shared between
 reduction orientations; V uses feature32 quantization. This differs from
 the general directional recipe in gfx950_bwd. The KV owner materializes
 K-major FP8 dS and square32 E8M0 scales, then a separate FP32 dQ consumer
 reuses them. Each gradient has one writer; no atomics are used.
 
-Per call, dS requires 8 GiB, its scales 8 MiB, preparation 276 MiB and
-Delta 4 MiB: 8 GiB + 288 MiB temporary storage, excluding the three
-256 MiB BF16 gradients and saved inputs. All allocations and launches use
+Per call, temporary storage is 128*N*N + 128*(N/32)**2 + 35840*N bytes:
+dS, its square scales, preparation and Delta. At N8192 this is
+8 GiB + 288 MiB, excluding the three 256 MiB BF16 gradients and saved
+inputs. Causal calls retain the same physical workspace size, but only
+initialize/read whole diagonal128 and lower-triangular attention blocks.
+All allocations and launches use
 the input device's current stream. The caller owns input readiness and must
 not mutate inputs until their queued uses finish. Same-stream allocator
 ordering (or a graph's private pool) owns temporary lifetimes after return;
@@ -216,10 +220,14 @@ def _quantize_ds_square(ds, BN: tl.constexpr, BM: tl.constexpr):
     # A shared 32x32 scale makes the quantized dS transpose-compatible.
     square = ds.reshape(BN // 32, 32, BM // 32, 32)
     amax = tl.max(tl.max(tl.abs(square), 3), 1)
-    exponent = _scale_exponent(amax)
-    # Preserve E8M0 byte0 (FP32 subnormal) and byte255 (NaN) decoding.
-    scale_bits = tl.where(exponent == 0, 0x00400000, exponent << 23)
-    scale_bits = tl.where(exponent == 255, 0x7fc00000, scale_bits)
+    bits = amax.to(tl.uint32, bitcast=True)
+    # Fuse ((bits + 0x1fffff) >> 23) - 8 with E8M0-to-FP32 decoding:
+    # 0xfc1fffff is 0x1fffff - (8 << 23), modulo u32. Preserve byte0
+    # as 2**-127 and byte255 as NaN; ordinary inputs also wrap intentionally.
+    scale_bits = tl.add(bits, 0xfc1fffff, sanitize_overflow=False) & 0x7f800000
+    scale_bits = tl.where(bits <= 0x04600001, 0x00400000, scale_bits)
+    scale_bits = tl.where(bits >= 0x7f800000, 0x7fc00000, scale_bits)
+    exponent = scale_bits >> 23
     fp32_scale = scale_bits.to(tl.float32, bitcast=True)
     pair_scale = tl.broadcast_to(fp32_scale[:, None, :, None], (BN // 32, 32, BM // 32, 16))
     payload = _scaled_e4m3_words(ds, pair_scale.reshape(BN, BM // 2))
@@ -387,23 +395,66 @@ def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Del
     if CAUSAL:
         begin = key_tile * BN // 128 * 128
     _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, N, BM, D, EVEN_N, 0)
-    for pair_start in range(begin, N - 128, 128):
+    if CAUSAL:
+        # Keep both first query64 tiles: the consumer reads diagonal128.
+        # When only the final pair exists, leave it for the masked drain.
+        if begin < N - 128:
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, begin, 0, True)
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, begin + 64, 1, True)
+            bulk_begin = begin + 128
+        else:
+            bulk_begin = begin
+        for pair_start in range(bulk_begin, N - 128, 128):
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, pair_start, 0, True)
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, pair_start + 64, 1, True)
+        if begin == N - 128:
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, N - 128, 0, True)
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, N - 64, 1, False)
+        else:
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, N - 128, 0, True)
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, N - 64, 1, False)
+    else:
+        for pair_start in range(begin, N - 128, 128):
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, pair_start, 0, True)
+            dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N,
+                                   sm_scale, DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL,
+                                   NATIVE, RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk,
+                                   dv, head, base, key_tile, keys, pair_start + 64, 1, True)
         dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N, sm_scale,
                                DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE,
                                RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head,
-                               base, key_tile, keys, pair_start, 0, True)
+                               base, key_tile, keys, N - 128, 0, True)
         dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N, sm_scale,
                                DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE,
                                RELAXED, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head,
-                               base, key_tile, keys, pair_start + 64, 1, True)
-    dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N, sm_scale,
-                           DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED,
-                           qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile,
-                           keys, N - 128, 0, True)
-    dk, dv = _compute_tile(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N, sm_scale,
-                           DS_EXPORT, DSS_EXPORT, D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED,
-                           qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile,
-                           keys, N - 64, 1, False)
+                               base, key_tile, keys, N - 64, 1, False)
     out = base + keys[:, None] * D + d[None, :]
     tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
     tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
@@ -421,16 +472,12 @@ def _kdqs_pair(S, head, group: tl.constexpr, start, N):
 
 @triton.jit
 def _uniform_kdqs_scale(S, head, start, N):
-    if (start // 32).to(tl.int64) + 1 < (N // 32).to(tl.int64):
-        w0 = _kdqs_pair(S, head, 0, start, N)
-        w1 = _kdqs_pair(S, head, 1, start, N)
-        w2 = _kdqs_pair(S, head, 2, start, N)
-        w3 = _kdqs_pair(S, head, 3, start, N)
-    else:
-        w0 = tl.full((), 0x7f7f, tl.uint16)
-        w1 = tl.full((), 0x7f7f, tl.uint16)
-        w2 = tl.full((), 0x7f7f, tl.uint16)
-        w3 = tl.full((), 0x7f7f, tl.uint16)
+    # Host admission requires complete query128/key64 tiles. Every loop
+    # start is a multiple of64 below an end that is a multiple of128.
+    w0 = _kdqs_pair(S, head, 0, start, N)
+    w1 = _kdqs_pair(S, head, 1, start, N)
+    w2 = _kdqs_pair(S, head, 2, start, N)
+    w3 = _kdqs_pair(S, head, 3, start, N)
     layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (2, )), stride=((2, 1, 64, 0), (128, )))
     index = tlx.require_layout(tl.arange(0, 256).reshape(128, 2), layout, pin=True)
     # index=2*(lane&31)+(lane>>5)+64*(wave&1)+128*register.
@@ -461,29 +508,25 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
     dq = tlx.zeros((BM, D), tl.float32, layout=mma)
     kmem = tlx.local_alloc((BK, D), tl.float8e4nv, 1, layout=_stage_layout(D))
     dsmem = tlx.local_alloc((BK, BM), tl.float8e4nv, 1, layout=_stage_layout(BM))
+    # Admission guarantees complete query128 tiles. Every key64 iteration
+    # stays inside the producer's initialized physical diagonal128 domain.
     end = N
     if CAUSAL:
-        end = tl.minimum(N, (logical_tile + 1) * BM)
+        end = (logical_tile + 1) * BM
     for start in range(0, end, BK):
         keys = start + tl.arange(0, BK)
         offsets = keys[:, None] * D + d[None, :]
-        tlx.buffer_load_to_local(kmem[0], K + base, offsets, keys[:, None] < N, 0.0)
+        tlx.buffer_load_to_local(kmem[0], K + base, offsets, True, 0.0)
         # Producer visits whole key64/query64 blocks.
         # The physical mask is [key,query], not a fine-grained triangle.
         ds_offsets = (keys[:, None] * N + queries[None, :]).to(tl.int32)
-        valid = (keys[:, None] < N) & (queries[None, :] < N)
-        if CAUSAL:
-            valid = valid & (queries[None, :] // 128 >= keys[:, None] // 128)
-        tlx.buffer_load_to_local(dsmem[0], DS + dsbase, ds_offsets, valid, 0.0, cache_modifier=".cs")
+        tlx.buffer_load_to_local(dsmem[0], DS + dsbase, ds_offsets, True, 0.0, cache_modifier=".cs")
         tlx.async_load_commit_group()
         tlx.async_load_wait_group(0)
         qgroups = (queries // 32).to(tl.int64)
         kgroups = (start // 32 + sn).to(tl.int64)
-        smask = (qgroups[:, None] < N // 32) & (kgroups[None, :] < N // 32)
-        if CAUSAL:
-            smask = smask & (qgroups[:, None] // 4 >= kgroups[None, :] // 4)
         scale_offsets = (head * (N // 32) + qgroups[:, None]) * (N // 32) + kgroups[None, :]
-        dsq = tl.load(DSS + scale_offsets, smask, 0)
+        dsq = tl.load(DSS + scale_offsets)
         k = tlx.local_load(kmem[0], layout=rhs_layout, relaxed=False)
         ds8 = tlx.local_load(tlx.local_trans(dsmem[0]), layout=lhs_layout, relaxed=False)
         kdqs = _uniform_kdqs_scale(KDQS, head, start, N)
@@ -494,17 +537,23 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
         dq = tlx.require_layout(dq, mma, pin=False)
         dq = tlx.dot_scaled(ds8, dsq, "e4m3", k, kdqs, "e4m3", dq)
     out = base + queries[:, None] * D + d[None, :]
-    tl.store(DQ + out, dq * sm_scale, queries[:, None] < N)
+    tl.store(DQ + out, dq * sm_scale)
 
 
 def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
     """Metadata-only admission; this never reads payload or scale values."""
-    if causal is not False:
-        raise ValueError("Shared-square backward requires causal=False (an actual bool)")
-    if type(sm_scale) is not float or not math.isfinite(sm_scale) or sm_scale != 1.3:
-        raise ValueError("Shared-square backward requires Python float sm_scale=1.3")
-    shape = (4, 32, 8192, 128)
-    scale_shape = (4, 32, 8192, 4)
+    if type(causal) is not bool:
+        raise ValueError("Shared-square backward requires an actual bool causal flag")
+    if not isinstance(q_fp8, torch.Tensor) or q_fp8.device.type != "cuda":
+        raise ValueError("Shared-square backward requires GPU tensors")
+    shape = tuple(q_fp8.shape)
+    if len(shape) != 4 or shape[:2] != (4, 32) or shape[2] not in (1024, 2048, 4096, 8192) or shape[3] != 128:
+        raise ValueError("Shared-square backward requires B4/H32/D128 and N1024/2048/4096/8192")
+    n = shape[2]
+    if (type(sm_scale) is not float or not math.isfinite(sm_scale)
+            or not (sm_scale == 0.5 or (sm_scale == 1.3 and n == 8192 and not causal))):
+        raise ValueError("Shared-square backward requires Python float sm_scale=0.5, or N8192 noncausal at 1.3")
+    scale_shape = (4, 32, n, 4)
     specs = (
         ("q_fp8", q_fp8, shape, torch.float8_e4m3fn),
         ("k_fp8", k_fp8, shape, torch.float8_e4m3fn),
@@ -515,8 +564,6 @@ def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16,
         ("out_bf16", out_bf16, shape, torch.bfloat16),
         ("lse", lse, shape[:-1], torch.float32),
     )
-    if not isinstance(q_fp8, torch.Tensor) or q_fp8.device.type != "cuda":
-        raise ValueError("Shared-square backward requires GPU tensors")
     device = q_fp8.device
     for name, tensor, expected_shape, dtype in specs:
         if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided
@@ -544,7 +591,7 @@ def can_use_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_b
 
 def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, *,
                                   causal=False):
-    """Return BF16 (dQ, dK, dV) for the focused shared-square recipe.
+    """Return BF16 (dQ, dK, dV) for the admitted shared-square recipe.
 
     q_fp8/k_fp8 and their uint8 scales MUST be the saved output of the
     production square32 forward quantizer, including repetition over each
@@ -569,9 +616,10 @@ def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf1
         if (torch.version.hip is None or getattr(properties, "gcnArchName", "").split(":", 1)[0] != "gfx950"):
             raise ValueError("Shared-square backward is gfx950-only")
 
-        shape = (4, 32, 8192, 128)
-        feature_scale_shape = (4, 32, 8192, 4)
-        sequence_scale_shape = (4, 32, 128, 256)
+        shape = tuple(q_fp8.shape)
+        n = shape[2]
+        feature_scale_shape = (4, 32, n, 4)
+        sequence_scale_shape = (4, 32, 128, n // 32)
         vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
         do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
         vs = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device)
@@ -580,22 +628,25 @@ def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf1
         kdqs = torch.empty(sequence_scale_shape, dtype=torch.uint8, device=device)
         dodvs = torch.empty(sequence_scale_shape, dtype=torch.uint8, device=device)
         delta = torch.empty(shape[:-1], dtype=torch.float32, device=device)
-        # Never cap or reinterpret the whole 8 GiB DS allocation as range32.
+        # Never cap or reinterpret the whole DS allocation as range32.
         # Kernels use i64 head bases and bounded per-head i32 offsets.
-        ds = torch.empty((4, 32, 8192, 8192), dtype=torch.float8_e4m3fn, device=device)
-        dss = torch.empty((4, 32, 256, 256), dtype=torch.uint8, device=device)
+        # For causal calls the producer starts at floor(key_start/128)*128,
+        # writing both query64 tiles (including fine-diagonal masked zeros).
+        # The query128 consumer reads only these initialized DS/DSS blocks.
+        ds = torch.empty((4, 32, n, n), dtype=torch.float8_e4m3fn, device=device)
+        dss = torch.empty((4, 32, n // 32, n // 32), dtype=torch.uint8, device=device)
         dq = torch.empty(shape, dtype=torch.bfloat16, device=device)
         dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
         dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
-        _prepare_fused[(256, 128)](v_bf16, do_bf16, q_scale, k_scale, vb, do8, vs, dos, qdks, kdqs, dodvs, out_bf16,
-                                   delta, 8192, 128, 32, num_warps=4, num_stages=2)
+        _prepare_fused[(n // 32, 128)](v_bf16, do_bf16, q_scale, k_scale, vb, do8, vs, dos, qdks, kdqs, dodvs, out_bf16,
+                                       delta, n, 128, 32, num_warps=4, num_stages=2)
         # QDK aliases saved Q; DODV aliases square32 dO. No directional
         # requantization or second Delta launch belongs to this recipe.
-        _bwd_kv_owner[(128, 128)](q_fp8, q_fp8, k_fp8, vb, do8, do8, q_scale, qdks, k_scale, vs, dos, dodvs, lse, delta,
-                                  dk, dv, 8192, sm_scale, ds, dss, D=128, BM=64, BN=64, CAUSAL=False,
-                                  SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
-                                  num_warps=2, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0)
-        _bwd_q_consume[(64, 128)](ds, dss, k_fp8, kdqs, dq, 8192, sm_scale, D=128, BM=128, BK=64, CAUSAL=False,
-                                  HEADS=128, num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0)
+        _bwd_kv_owner[(128, n // 64)](q_fp8, q_fp8, k_fp8, vb, do8, do8, q_scale, qdks, k_scale, vs, dos, dodvs, lse,
+                                      delta, dk, dv, n, sm_scale, ds, dss, D=128, BM=64, BN=64, CAUSAL=causal,
+                                      SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True,
+                                      RELAXED=False, num_warps=2, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0)
+        _bwd_q_consume[(n // 128, 128)](ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal,
+                                        HEADS=128, num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0)
     return dq, dk, dv
