@@ -1628,10 +1628,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
-  // Parsed IR carries the mask as a SchedGroupMask enum attribute, not an
-  // integer, so anything but `none` reaches the string path and is flagged.
+  // The mask rides through into tlx.amd_sched_barrier as its integer encoding.
   // CHECK-LABEL: def amd_sched_barrier_other_mask(
-  // CHECK-NOT: tlx.amd_sched_barrier(
+  // CHECK: tlx.amd_sched_barrier(8)
+  // CHECK: tlx.amd_sched_barrier(1)
   tt.func public @amd_sched_barrier_other_mask(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
     rocdl.sched.barrier mfma_wmma
     // The nearest near-miss to `none` in the enum's spellings.
