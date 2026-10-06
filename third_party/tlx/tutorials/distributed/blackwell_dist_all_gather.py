@@ -37,10 +37,10 @@ Requirements
 Examples::
 
     torchrun --standalone --nproc_per_node=2 \
-        third_party/tlx/tutorials/blackwell_dist_all_gather.py --mode correctness
+        third_party/tlx/tutorials/distributed/blackwell_dist_all_gather.py --mode correctness
 
     torchrun --standalone --nproc_per_node=8 \
-        third_party/tlx/tutorials/blackwell_dist_all_gather.py --mode benchmark
+        third_party/tlx/tutorials/distributed/blackwell_dist_all_gather.py --mode benchmark
 """
 
 import argparse

@@ -1,10 +1,10 @@
-"""Test that gfx1250 produces packed f32 arith ops (v_pk_fma_f32 etc).
+"""Test AMD packed f32 instruction selection.
 
-Compile-only test — no gfx1250 hardware required.
-Compiles attn_fwd.ttir for gfx1250 and checks that:
+Compile-only tests; no target hardware required.
+Compiles attn_fwd.ttir and checks that:
   - LLVM IR contains <2 x float> fmul/fsub/fadd (from packed conversion + VectorCombine)
-  - ASM contains v_pk_fma_f32 (from ISel contraction of packed fmul+fsub)
-  - Packed FMA lowering clearly dominates scalar FMA lowering in the resulting ASM
+  - gfx1250 ASM contains v_pk_fma_f32
+  - gfx950 can suppress packed f32 arithmetic per kernel
 """
 
 import re
@@ -13,8 +13,11 @@ from pathlib import Path
 
 import pytest
 import triton
+from triton._C.libtriton import llvm
+from triton.backends.amd import compiler as amd_compiler
 from triton.backends.compiler import GPUTarget
 
+GFX950_TARGET = GPUTarget("hip", "gfx950", 64)
 GFX1250_TARGET = GPUTarget("hip", "gfx1250", 32)
 TTIR_PATH = str(Path(__file__).parent / "attn_fwd.ttir")
 
@@ -54,6 +57,51 @@ def count_asm_instructions(func_body):
 @pytest.fixture(scope="module")
 def gfx1250_kernel():
     return compile_for_target(GFX1250_TARGET)
+
+
+@pytest.mark.parametrize("intrinsic", ["mfma", "smfmac", "wmma"])
+def test_gfx950_matrix_intrinsic_packed_f32_option(intrinsic):
+    llvm_ir = f"call void @llvm.amdgcn.{intrinsic}.test()"
+
+    assert amd_compiler.get_amdgpu_codegen_features("gfx950", llvm_ir) == ""
+    assert amd_compiler.get_amdgpu_codegen_features("gfx950", llvm_ir, True) == "-packed-fp32-ops"
+    assert amd_compiler.get_amdgpu_codegen_features("gfx942", llvm_ir, True) == ""
+    assert amd_compiler.get_amdgpu_codegen_features("gfx1100", llvm_ir, True) == "-real-true16"
+    assert amd_compiler.get_amdgpu_codegen_features("gfx950", "fadd float %a, %b", True) == ""
+
+
+def test_vector_combine_policy_reaches_llvm(monkeypatch):
+    optimize_module = llvm.optimize_module
+    observed = []
+
+    def record_optimize_module(*args, **kwargs):
+        observed.append(kwargs["disable_vector_combine"])
+        return optimize_module(*args, **kwargs)
+
+    monkeypatch.setattr(llvm, "optimize_module", record_optimize_module)
+    monkeypatch.setattr(triton.knobs.compilation, "always_compile", True)
+    triton.compile(TTIR_PATH, target=GFX950_TARGET)
+    triton.compile(TTIR_PATH, target=GFX950_TARGET, options={"disable_vector_combine": True})
+    triton.compile(TTIR_PATH, target=GFX1250_TARGET)
+
+    assert observed == [False, True, True]
+    baseline = amd_compiler.HIPOptions(arch="gfx950")
+    disabled = amd_compiler.HIPOptions(arch="gfx950", disable_vector_combine=True)
+    assert baseline.hash() != disabled.hash()
+
+
+def test_gfx950_packed_f32_suppression_is_per_kernel():
+    baseline = triton.compile(TTIR_PATH, target=GFX950_TARGET)
+    suppressed = triton.compile(TTIR_PATH, target=GFX950_TARGET, options={"disable_packed_fp32_ops": True})
+    baseline_body = get_func_body_asm(baseline.asm["amdgcn"])
+    suppressed_body = get_func_body_asm(suppressed.asm["amdgcn"])
+    packed_f32 = re.compile(r"\bv_pk_(?:add|sub|mul|fma)_f32\b")
+
+    assert "v_mfma" in baseline_body
+    assert packed_f32.search(baseline_body)
+    assert not packed_f32.search(suppressed_body)
+    assert baseline.metadata.disable_packed_fp32_ops is False
+    assert suppressed.metadata.disable_packed_fp32_ops is True
 
 
 def test_gfx1250_packed_f32_in_llir(gfx1250_kernel):

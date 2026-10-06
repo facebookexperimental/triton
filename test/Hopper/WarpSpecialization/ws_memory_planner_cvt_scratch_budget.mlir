@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=232448" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=232448 reserve-auxiliary-smem=false" | FileCheck %s --check-prefix=NORESERVE
 
 // Persistent 128x256x128 bf16 GEMM at num_stages=3 whose epilogue converts the
 // 128x256 bf16 result from the TMEM-load layout to the store layout. That
@@ -7,11 +8,15 @@
 // looks like it fits the budget, but with the scratch the kernel needs 246176 B
 // and fails to launch (Inductor then silently recompiles it at num_stages=1,
 // with a one-deep ring). The auxiliary reservation must include the scratch so
-// the planner settles on A=2 / B=2.
+// the planner settles on A=2 / B=2. Without the reservation it picks A=3 / B=2.
 
 // CHECK-LABEL: @triton_tem_fused_mm_0
 // CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x128xbf16
 // CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<128x256xbf16
+
+// NORESERVE-LABEL: @triton_tem_fused_mm_0
+// NORESERVE: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x128xbf16
+// NORESERVE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<128x256xbf16
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0], [0, 128]], block = []}>

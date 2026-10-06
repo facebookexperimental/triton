@@ -87,14 +87,12 @@ _NONCAUSAL_WORKLOAD_LAUNCH_TUNING = {(torch.bfloat16, 4, 48, n_ctx, 64): {
                                          "WORKER_MULTIPLIER": 1,
                                      }
                                      for n_ctx in (1024, 2048, 4096, 8192)}
-_CAUSAL_BM192_WORKLOAD_LAUNCH_TUNING = {
-    (torch.bfloat16, 4, 48, n_ctx, 64): {
-        "STEADY_UNROLL": 1,
-        "WORKER_CAP": None,
-        "WORKER_MULTIPLIER": 1,
-    }
-    for n_ctx in (1024, 2048, 4096, 8192)
-}
+_CAUSAL_BM192_WORKLOAD_LAUNCH_TUNING = {(torch.bfloat16, 4, 48, n_ctx, 64): {
+                                            "STEADY_UNROLL": 1,
+                                            "WORKER_CAP": None,
+                                            "WORKER_MULTIPLIER": 1,
+                                        }
+                                        for n_ctx in (1024, 2048, 4096, 8192)}
 _CAUSAL_WORKLOAD_LAUNCH_TUNING = {
     (torch.bfloat16, 4, 48, 1024, 128): {
         "STEADY_UNROLL": 1,
@@ -166,8 +164,7 @@ configs = [
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    )
-    for num_buffers in (2, 3)
+    ) for num_buffers in (2, 3)
 ]
 
 
@@ -286,9 +283,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     SERIALIZE_QK: tl.constexpr = (CAUSAL and not USE_BM192) or HEAD_DIM == 128
     USE_SCHEDULER_BARRIER: tl.constexpr = USE_BM192
-    USE_K_AHEAD: tl.constexpr = HEAD_DIM == 64 and (
-        (not CAUSAL and not USE_BM192) or (CAUSAL and USE_BM192)
-    )
+    USE_K_AHEAD: tl.constexpr = HEAD_DIM == 64 and ((not CAUSAL and not USE_BM192) or (CAUSAL and USE_BM192))
     CONSUMER_REGISTERS: tl.constexpr = 160 if USE_BM192 else _FWD_CONSUMER_REGISTERS
 
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
@@ -381,9 +376,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                             k_fulls[kv_buf_id],
                         )
                     else:
-                        tlx.async_descriptor_load(
-                            desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id]
-                        )
+                        tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
 
                 _, q_phase = get_bufidx_phase(i, 1)
                 q_cid: tl.constexpr = 0
@@ -425,10 +418,10 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         producer_loop_end = hi
                         PRODUCER_LOOP_STEP: tl.constexpr = BLOCK_N
                     for kv_idx in tl.range(
-                        producer_loop_start,
-                        producer_loop_end,
-                        PRODUCER_LOOP_STEP,
-                        loop_unroll_factor=STEADY_UNROLL,
+                            producer_loop_start,
+                            producer_loop_end,
+                            PRODUCER_LOOP_STEP,
+                            loop_unroll_factor=STEADY_UNROLL,
                     ):
                         next_kv_count = accum_cnt_kv + 1
                         k_buf_id, k_phase = get_bufidx_phase(next_kv_count, NUM_BUFFERS)
@@ -436,13 +429,9 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         tlx.barrier_wait(k_empties[k_buf_id], k_phase ^ 1)
                         tlx.barrier_expect_bytes(k_fulls[k_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
                         if USE_BM192:
-                            tlx.async_descriptor_load(
-                                desc_k, k_tiles[k_buf_id], [off_hz, kv_idx, 0], k_fulls[k_buf_id]
-                            )
+                            tlx.async_descriptor_load(desc_k, k_tiles[k_buf_id], [off_hz, kv_idx, 0], k_fulls[k_buf_id])
                         else:
-                            tlx.async_descriptor_load(
-                                desc_k, k_tiles[k_buf_id], [k_offset, 0], k_fulls[k_buf_id]
-                            )
+                            tlx.async_descriptor_load(desc_k, k_tiles[k_buf_id], [k_offset, 0], k_fulls[k_buf_id])
 
                         v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
                         previous_kv_idx = kv_idx - PRODUCER_LOOP_STEP
@@ -457,9 +446,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                 v_fulls[v_buf_id],
                             )
                         else:
-                            tlx.async_descriptor_load(
-                                desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id]
-                            )
+                            tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id])
                         accum_cnt_kv = next_kv_count
 
                     v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
@@ -468,13 +455,10 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
                     tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
                     if USE_BM192:
-                        tlx.async_descriptor_load(
-                            desc_v, v_tiles[v_buf_id], [off_hz, final_v_idx, 0], v_fulls[v_buf_id]
-                        )
+                        tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [off_hz, final_v_idx, 0],
+                                                  v_fulls[v_buf_id])
                     else:
-                        tlx.async_descriptor_load(
-                            desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id]
-                        )
+                        tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [v_offset, 0], v_fulls[v_buf_id])
                     accum_cnt_kv += 1
                 else:
                     kv_buf_id, kv_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
@@ -606,9 +590,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # release the K buffer
                 tlx.barrier_arrive(k_empties[k_buf_id], 1)
                 # The single-tile path has completed its final QK read.
-                if (CAUSAL and USE_BM192 and first_kv_idx == lo) or (
-                    not (CAUSAL and USE_BM192) and lo + BLOCK_N == hi
-                ):
+                if (CAUSAL and USE_BM192 and first_kv_idx == lo) or (not (CAUSAL and USE_BM192) and lo + BLOCK_N == hi):
                     tlx.barrier_arrive(q_empties[cid], 1)
 
                 # -- compute m_i and l_i ----
@@ -1156,14 +1138,8 @@ class _attention(torch.autograd.Function):
         assert q.shape[2] % _DEFAULT_BLOCK_M == 0
         o = torch.empty_like(q)
         extra_kern_args = {}
-        use_bm192 = (
-            config is None
-            and q.dtype == torch.bfloat16
-            and q.shape[0] == 4
-            and q.shape[1] == 48
-            and q.shape[2] in (1024, 2048, 4096, 8192)
-            and q.shape[3] == 64
-        )
+        use_bm192 = (config is None and q.dtype == torch.bfloat16 and q.shape[0] == 4 and q.shape[1] == 48
+                     and q.shape[2] in (1024, 2048, 4096, 8192) and q.shape[3] == 64)
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         # Rank-3 descriptors safely truncate BM192's final 128-row output tile.

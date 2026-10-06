@@ -61,6 +61,16 @@ def disable_real_true16_feature(arch):
     return '-real-true16' if arch.startswith('gfx11') else ''
 
 
+_MATRIX_INTRINSIC_RE = re.compile(r"@llvm\.amdgcn\.(?:mfma|smfmac|wmma)\.")
+
+
+def get_amdgpu_codegen_features(arch, llvm_ir, disable_packed_fp32_ops=False):
+    features = [disable_real_true16_feature(arch)]
+    if disable_packed_fp32_ops and arch == "gfx950" and _MATRIX_INTRINSIC_RE.search(llvm_ir):
+        features.append("-packed-fp32-ops")
+    return ",".join(feature for feature in features if feature)
+
+
 def _parse_llvm_fn_attrs(attrs):
     if not isinstance(attrs, str):
         return tuple(attrs)
@@ -119,6 +129,8 @@ class HIPOptions:
     backend_name: str = "hip"
     instrumentation_mode: str = ""
     fpsan_homomorphic_casts: bool = False
+    disable_vector_combine: bool = False
+    disable_packed_fp32_ops: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -680,9 +692,9 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        # gfx950 requires VectorCombine for stable BF16 and FP8 code generation.
+        # Keep VectorCombine on by default for stable gfx950 BF16 and FP8 code generation.
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
-                             disable_vector_combine=options.arch != "gfx950")
+                             disable_vector_combine=options.disable_vector_combine or options.arch != "gfx950")
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -725,7 +737,7 @@ class HIPBackend(BaseBackend):
         flags = _get_codegen_flags(options)
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
-        features = disable_real_true16_feature(options.arch)
+        features = get_amdgpu_codegen_features(options.arch, src, options.disable_packed_fp32_ops)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
         _ = llvm.translate_to_mir(

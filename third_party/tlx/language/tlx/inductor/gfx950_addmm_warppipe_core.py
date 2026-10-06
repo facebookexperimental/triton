@@ -20,6 +20,9 @@ def gfx950_addmm_warppipe_compute_async(
     tail_width,
     stride_ak,
     stride_bk,
+    predrain_prefetch_ptr,
+    predrain_prefetch_mask,
+    PREDRAIN_EPILOGUE_PREFETCH: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     ACC_TYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -91,6 +94,15 @@ def gfx950_addmm_warppipe_compute_async(
         out_dtype=ACC_TYPE,
     )
     tlx.async_load_wait_group(0)
+    if PREDRAIN_EPILOGUE_PREFETCH:
+        prefetched_epilogue = tl.load(
+            predrain_prefetch_ptr,
+            mask=predrain_prefetch_mask,
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        prefetched_epilogue = 0.0
+
     for i in tl.range(
         0,
         NUM_BUFFERS - 1,
@@ -120,13 +132,14 @@ def gfx950_addmm_warppipe_compute_async(
         mask=offs_k[:, None] < tail_width,
         other=0.0,
     )
-    return tl.dot(
+    acc = tl.dot(
         a_tail,
         b_tail,
         acc,
         allow_tf32=ALLOW_TF32,
         out_dtype=ACC_TYPE,
     )
+    return acc, prefetched_epilogue
 
 
 @triton.jit

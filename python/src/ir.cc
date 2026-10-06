@@ -2054,11 +2054,18 @@ void init_triton_ir(py::module_ &m) {
              }
              return self.create<ReduceReturnOp>(return_values);
            })
-      .def("create_scan",
-           [](TritonOpBuilder &self, std::vector<Value> operands, int axis,
-              bool reverse) -> OpState {
-             return self.create<ScanOp>(operands, axis, reverse);
-           })
+      .def(
+          "create_scan",
+          [](TritonOpBuilder &self, std::vector<Value> operands, int axis,
+             bool reverse, const std::string &reductionOrdering) -> OpState {
+            StringAttr orderingAttr;
+            if (!reductionOrdering.empty())
+              orderingAttr = StringAttr::get(self.getBuilder().getContext(),
+                                             reductionOrdering);
+            return self.create<ScanOp>(operands, axis, reverse, orderingAttr);
+          },
+          py::arg("operands"), py::arg("axis"), py::arg("reverse"),
+          py::arg("reduction_ordering") = "")
       .def("create_scan_ret",
            [](TritonOpBuilder &self, py::args args) -> OpState {
              llvm::SmallVector<Value> return_values;

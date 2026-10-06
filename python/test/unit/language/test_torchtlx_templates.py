@@ -2068,6 +2068,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "stride": lambda *a, **k: "1",
             "output_ptr": lambda *a, **k: "out_ptr0",
             "store_output": lambda *a, **k: "# store_output(...)",
+            "prefetch_epilogue": lambda *a, **k: "# prefetch_epilogue(...)",
         }
         tmpl = jinja2.Environment().from_string(source)
         split = tmpl.render(SPLIT_K=2, USE_ASYNC=True, **hooks)
@@ -2078,6 +2079,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
         self.assertIn("base = K_ITERS // SPLIT_K", split)
         self.assertIn("k_lo = split_id * base", split)
         self.assertIn("tl.store(split_k_ws + ws_off, acc", split)
+        self.assertNotIn("prefetch_epilogue", split)
 
         # SPLIT_K == 1 must take the plain data-parallel path: no split-id, no workspace,
         # full-K loop, and store via store_output (not the reduce workspace).
@@ -2085,6 +2087,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
         self.assertNotIn("split_k_ws", nosplit)
         self.assertIn("k_lo = 0", nosplit)
         self.assertIn("store_output", nosplit)
+        self.assertIn("prefetch_epilogue", nosplit)
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_persistent_warppipe_split_k_template_render(self):
@@ -2098,21 +2101,24 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "stride": lambda *a, **k: "1",
             "output_ptr": lambda *a, **k: "out_ptr0",
             "store_output": lambda *a, **k: "# store_output(...)",
+            "prefetch_epilogue": lambda *a, **k: "# prefetch_epilogue(...)",
         }
         tmpl = jinja2.Environment().from_string(source)
-        split = tmpl.render(SPLIT_K=2, **hooks)
-        nosplit = tmpl.render(SPLIT_K=1, **hooks)
+        split = tmpl.render(SPLIT_K=2, USE_ASYNC=True, **hooks)
+        nosplit = tmpl.render(SPLIT_K=1, USE_ASYNC=True, **hooks)
 
         self.assertIn("num_work_items = num_tiles * SPLIT_K", split)
         self.assertIn("split_id = (work_id % SPLIT_K)", split)
         self.assertIn("base = K_ITERS // SPLIT_K", split)
         self.assertIn("k_lo = split_id * base", split)
         self.assertIn("tl.store(split_k_ws + ws_off, acc", split)
+        self.assertNotIn("prefetch_epilogue", split)
 
         self.assertNotIn("split_id = (work_id % SPLIT_K)", nosplit)
         self.assertNotIn("split_k_ws", nosplit)
         self.assertIn("k_lo = 0", nosplit)
         self.assertIn("store_output", nosplit)
+        self.assertIn("prefetch_epilogue", nosplit)
 
 
 class TestInterleaveEpilogue(TestCase):
