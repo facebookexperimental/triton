@@ -28,6 +28,11 @@ on:
         description: "Commit the wheel was built from; the suite is checked out at it"
         required: true
         type: string
+      file_issues:
+        description: "File and close nightly issues; off when backfilling an old night"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -144,7 +149,7 @@ jobs:
 
   report:
     needs: bench
-    if: always() && needs.bench.outputs.failures != '' && needs.bench.outputs.failures != '[]'
+    if: always() && inputs.file_issues && needs.bench.outputs.failures != '' && needs.bench.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -172,7 +177,7 @@ jobs:
 
   reconcile:
     needs: bench
-    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
+    if: always() && inputs.file_issues && (needs.bench.result == 'success' || needs.bench.result == 'failure')
     permissions:
       contents: read
       issues: write

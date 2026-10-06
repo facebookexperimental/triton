@@ -18,6 +18,10 @@ on:
         description: "Commit that version was built from (required when version is set)"
         required: false
         default: ""
+      wheel_release:
+        description: "Backfill: take the wheel from this release (dev = publish_fbtriton_dev.yml's +git<sha> build) and file no issues"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -58,6 +62,7 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SHA: ${{ inputs.sha }}
+          INPUT_WHEEL_RELEASE: ${{ inputs.wheel_release }}
         run: |
           set -euo pipefail
           if [[ -n "${INPUT_VERSION}" ]]; then
@@ -81,11 +86,20 @@ jobs:
           # From the release, not the Pages index: pages.yml republishes the
           # index on the same trigger as this workflow, so it may still lag.
           export VERSION
-          WHEEL_URL=$(gh release view nightly --json assets --jq '.assets[]
-            | select(.name | startswith("fbtriton-" + env.VERSION + "-cp313-cp313-") and endswith("x86_64.whl"))
-            | .url')
+          if [[ -n "${INPUT_WHEEL_RELEASE}" ]]; then
+            [[ "${INPUT_WHEEL_RELEASE}" == "dev" ]] || { echo "wheel_release must be dev"; exit 1; }
+            [[ -n "${INPUT_VERSION}" ]] || { echo "wheel_release needs version and sha"; exit 1; }
+            export GITSFX="+git${SHA:0:8}-cp313-cp313-"
+            WHEEL_URL=$(gh release view dev --json assets --jq '.assets[]
+              | select(.name | startswith("fbtriton-") and contains(env.GITSFX) and endswith("x86_64.whl"))
+              | .url')
+          else
+            WHEEL_URL=$(gh release view nightly --json assets --jq '.assets[]
+              | select(.name | startswith("fbtriton-" + env.VERSION + "-cp313-cp313-") and endswith("x86_64.whl"))
+              | .url')
+          fi
           [[ $(wc -l <<< "${WHEEL_URL}") -eq 1 && -n "${WHEEL_URL}" ]] || {
-            echo "expected one cp313 x86_64 wheel for ${VERSION} on the nightly release, found: ${WHEEL_URL:-none}"
+            echo "expected one cp313 x86_64 wheel for ${VERSION} (${SHA}) on the ${INPUT_WHEEL_RELEASE:-nightly} release, found: ${WHEEL_URL:-none}"
             exit 1
           }
           # Whatever its source (latest.json or a dispatch input), only a main commit is ever checked out downstream.
@@ -115,6 +129,7 @@ jobs:
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
+      file_issues: ${{ inputs.wheel_release == '' }}
 
   h100:
     needs: resolve
@@ -132,6 +147,7 @@ jobs:
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
+      file_issues: ${{ inputs.wheel_release == '' }}
 
   mi350:
     needs: resolve
@@ -149,6 +165,7 @@ jobs:
       version: ${{ needs.resolve.outputs.version }}
       sha: ${{ needs.resolve.outputs.sha }}
       wheel_url: ${{ needs.resolve.outputs.wheel_url }}
+      file_issues: ${{ inputs.wheel_release == '' }}
 
   prune:
     needs: [resolve, b200, h100, mi350]
