@@ -36,8 +36,8 @@ causal or noncausal, a specialized backward shares square32 Q/K/dO
 quantization and materializes FP8 dS for reuse by the Q owner. It also
 supports N8192 noncausal at scale 1.3. Each gradient has a single writer
 and accumulates deterministically in FP32. Whole, aligned storage is
-required. Temporary storage is 128*N*N + 128*(N//32)**2 + 35840*N bytes,
-up to 8 GiB + 288 MiB at N8192, excluding gradients and saved inputs.
+required. Temporary storage is 128*N*N + 128*(N//32)**2 + 34816*N bytes,
+up to 8 GiB + 280 MiB at N8192, excluding gradients and saved inputs.
 Causal calls allocate the same dense workspace. Other configurations use
 the general implementation; allocation or kernel failures are not retried.
 """
@@ -1138,9 +1138,7 @@ class _MXFP8Attention(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, do):
-        from .gfx950_bwd import launch_backward
-        from .gfx950_bwd_shared import can_use_shared_square, launch_backward_shared_square
-        from .gfx950_quant import quantize_backward_operands
+        from .gfx950_bwd_shared import _try_launch_backward_shared_square
 
         q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale = ctx.saved_tensors
         # Autograd may execute after the caller changes the current device.
@@ -1150,9 +1148,13 @@ class _MXFP8Attention(torch.autograd.Function):
             # same hardware-exp training forward. Keep original BF16 V/dO for
             # backward preparation rather than requantizing saved FP8 data.
             shared_args = (q_fp8, k_fp8, q_scale, k_scale, v, do_bf16, out, lse, ctx.sm_scale)
-            if can_use_shared_square(*shared_args, causal=ctx.causal):
-                dq, dk, dv = launch_backward_shared_square(*shared_args, causal=ctx.causal)
+            shared_grads = _try_launch_backward_shared_square(*shared_args, causal=ctx.causal)
+            if shared_grads is not None:
+                dq, dk, dv = shared_grads
                 return dq, dk, dv, None, None
+            from .gfx950_bwd import launch_backward
+            from .gfx950_quant import quantize_backward_operands
+
             (q_dk, q_dk_scale), (k_dq,
                                  k_dq_scale), (v_bwd,
                                                v_scale), (do_fp8,

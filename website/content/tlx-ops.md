@@ -87,11 +87,41 @@ For `B=4, H=32, D=128`, the specialized path supports
 `N=8192, sm_scale=1.3` noncausal. It shares square32 Q/K/dO payloads between
 reduction orientations, fuses backward preparation, and materializes FP8 dS
 once for the dQ consumer. It requires whole, aligned contiguous storage.
-Temporary workspace per call is `128*N*N + 128*(N//32)**2 + 35840*N` bytes,
-up to **8 GiB + 288 MiB at N8192**, excluding gradients and saved inputs.
+Temporary workspace per call is `128*N*N + 128*(N//32)**2 + 34816*N` bytes,
+up to **8 GiB + 280 MiB at N8192**, excluding gradients and saved inputs.
 Causal calls allocate the same dense workspace. Other configurations use the
 general implementation; allocation or kernel failures are not silently retried.
 These are quantized training recipes, not BF16-equivalent gradients.
+
+#### Explicit FP8-input backward boundaries
+
+The gfx950 backend also provides internal entrypoints for the specialized
+shape/scale domain above. These do not change the BF16-only public
+`tlx.ops.flash_attn_mxfp8` interface or add differentiation through quantization.
+
+- **Complete FP8-input backward:** `launch_backward_shared_square_mxfp8`
+  accepts prequantized E4M3 Q/K/V and uint8 E8M0 scales, BF16 dO/O, and the
+  matching FP32 base-2 LSE. It includes dO quantization, FP32
+  `Delta = sum(O * dO)`, K-scale preparation, and both gradient kernels.
+- **Preparation:** `prepare_backward_shared_square_mxfp8` produces the
+  backward dO payload/scales, Delta, and K-scale layout. Delta uses the
+  original BF16 dO, not a dequantized FP8 approximation.
+- **Prequantized core:** `launch_backward_shared_square_mxfp8_core` consumes
+  those prepared tensors and launches the dK/dV and dQ kernels. Its timing
+  excludes preparation and must be labeled separately from complete backward.
+
+Q/K and dO use square32 scales repeated across each group of 32 sequence rows.
+Backward V instead uses **feature32** scales, one E8M0 byte per 32 features
+of each token. `gfx950_quant.quantize_mxfp8(v)` produces this representation
+from a higher-precision V. Forward's `gfx950.quantize_mxfp8_v(v)` uses
+**sequence32** scales and is not interchangeable: changing quantization axes
+is not a scale transpose. The FP8-input entrypoints do not silently convert V.
+
+Prequantized inputs and prepared tensors must belong to the same forward and
+backward invocation. Callers own scale values and that provenance; checks are
+metadata-only. Benchmark reports must state whether Q/K/V quantization is
+upstream work or included in the measured workflow. Moving dO preparation
+outside the timer is a core-only measurement, not an end-to-end speedup.
 
 ## MXFP8 GEMM
 

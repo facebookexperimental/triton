@@ -201,7 +201,11 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
         return torch.autograd.grad(out, inputs, do, retain_graph=True)
 
     with mock.patch.object(gfx950_bwd, "launch_backward", side_effect=AssertionError("unexpected general path")):
-        eager = backward()
+        with mock.patch.object(gfx950_bwd_shared, "_check_shared_square_inputs",
+                               wraps=gfx950_bwd_shared._check_shared_square_inputs) as validate:
+            with mock.patch.object(gfx950_bwd_shared, "_is_gfx950", wraps=gfx950_bwd_shared._is_gfx950) as arch:
+                eager = backward()
+        assert validate.call_count == arch.call_count == 1
         check(eager)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -252,11 +256,14 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
                         # Physical [key,query] blocks wholly above the
                         # causal domain are not initialized or consumed.
                         assert bool((ds_bytes[0, 0, 128:192, :64] == 0x7f).all())
-                        assert bool((workspaces["dss"][0, 0, :2, 4:6] == 255).all())
+                        # Causal scales pack each Q128/K64 record as [4,2]
+                        # query/key groups, despite the capacity-only shape.
+                        dss_records = workspaces["dss"].view(4, 32, n_ctx // 128, n_ctx // 64, 4, 2)
+                        assert bool((dss_records[0, 0, 0, 2, :2, :] == 255).all())
                         # Within diagonal128, even masked key64/query64
                         # blocks are fully written as zeros before consumption.
                         assert bool((ds_bytes[0, 0, 64:128, :64] == 0).all())
-                        assert bool((workspaces["dss"][0, 0, :2, 2:4] != 255).all())
+                        assert bool((dss_records[0, 0, 0, 1, :2, :] != 255).all())
                     check(captured)
                     for actual, ref in zip(captured, eager):
                         torch.testing.assert_close(actual, ref, atol=0, rtol=0)
@@ -264,6 +271,49 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
             stream.synchronize()
             graph.reset()
             workspaces.clear()
+
+
+def test_flash_attn_mxfp8_shared_backward_host_dispatch():
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, 1024, 128)
+    scale_shape = (4, 32, 1024, 4)
+    q, k = [torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn) for _ in range(2)]
+    qs, ks = [torch.empty(scale_shape, device="cuda", dtype=torch.uint8) for _ in range(2)]
+    v, do, out = [torch.empty(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+    args = (q, k, qs, ks, v, do, out, lse, 0.5)
+    result = object()
+
+    # Both routes validate once; only the internal caller owns the device
+    # context. Stub the common launch body, not the metadata checks.
+    with torch.cuda.device(q.device):
+        for entry in (shared._try_launch_backward_shared_square, shared.launch_backward_shared_square):
+            with mock.patch.object(shared, "_launch_backward_shared_square", return_value=result) as launch:
+                with mock.patch.object(shared, "_check_shared_square_inputs",
+                                       wraps=shared._check_shared_square_inputs) as validate:
+                    assert entry(*args) is result
+                assert validate.call_count == launch.call_count == 1
+                assert launch.call_args.args[-2:] == (q.device, shape)
+            # A ValueError from launch is not an admission failure. Neither
+            # it nor a runtime/allocation error may be silently retried.
+            for error in (ValueError("launch failed"), RuntimeError("allocation failed")):
+                with mock.patch.object(shared, "_launch_backward_shared_square", side_effect=error):
+                    with pytest.raises(type(error), match=str(error)):
+                        entry(*args)
+
+        with mock.patch.object(shared, "_launch_backward_shared_square") as launch:
+            assert shared._try_launch_backward_shared_square(*args, causal=1) is None
+            with pytest.raises(ValueError, match="actual bool"):
+                shared.launch_backward_shared_square(*args, causal=1)
+            assert shared._try_launch_backward_shared_square(*args[:-1], 1) is None
+            with pytest.raises(ValueError, match="Python float"):
+                shared.launch_backward_shared_square(*args[:-1], 1)
+            with mock.patch.object(shared, "_is_gfx950", return_value=False):
+                assert shared._try_launch_backward_shared_square(*args) is None
+                with pytest.raises(ValueError, match="gfx950-only"):
+                    shared.launch_backward_shared_square(*args)
+            launch.assert_not_called()
 
 
 def _mxfp8_reference_quantize(x, *, sequence=False, square=False):
@@ -289,6 +339,203 @@ def _mxfp8_reference_quantize(x, *, sequence=False, square=False):
         payload = payload.transpose(-1, -2).contiguous()
         decoded = decoded.transpose(-1, -2).contiguous()
     return payload, byte, decoded
+
+
+def _shared_fp8_boundary_fixture(causal):
+    from triton.tlx.ops import flash_attn_mxfp8
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_quant import quantize_mxfp8
+
+    torch.manual_seed(20)
+    inputs = _qkv((4, 32, 1024, 128), requires_grad=True)
+    do = torch.randn_like(inputs[0]) * .5
+    out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=.5)
+    _, _, v, q8, k8, saved_out, lse, qs, ks = out.grad_fn.saved_tensors
+    # Backward V uses feature32, not forward V's sequence32 quantization.
+    v8, vs = quantize_mxfp8(v, transpose_for_reduction=False)
+    args = (q8, k8, v8, qs, ks, vs, do, saved_out, lse, .5)
+    return inputs, out, args
+
+
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_shared_fp8_boundary_graph(causal):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    inputs, out, args = _shared_fp8_boundary_fixture(causal)
+    q8, k8, v8, qs, ks, vs, do, saved_out, lse, scale = args
+    reference = _sdpa(*inputs, causal, scale)
+    bf16_grads = torch.autograd.grad(reference, inputs, do)
+    legacy = shared.launch_backward_shared_square(q8, k8, qs, ks, inputs[2], do, saved_out, lse, scale, causal=causal)
+    frozen_inputs = tuple(t.clone() for t in args[:-1])
+
+    def equal(a, b):
+        assert a.shape == b.shape and a.dtype == b.dtype and a.is_contiguous() and b.is_contiguous()
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+    def check(grads):
+        for actual, old, ref in zip(grads, legacy, bf16_grads):
+            equal(actual, old)
+            a, b = actual.float(), ref.float()
+            assert bool(a.isfinite().all())
+            assert ((a - b).square().mean() / b.square().mean()).sqrt() < .15
+            assert torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0) >= .98
+
+    # Compare every new preparation output with the unchanged fused producer.
+    vb, do8 = [torch.empty_like(v8) for _ in range(2)]
+    old_vs, dos = [torch.empty_like(vs) for _ in range(2)]
+    kdqs = torch.empty((4, 32, 128, 32), device=v8.device, dtype=torch.uint8)
+    delta = torch.empty_like(lse)
+    shared._prepare_fused[(32, 128)](inputs[2], do, ks, vb, do8, old_vs, dos, kdqs, saved_out, delta, 1024, 128, 32,
+                                     num_warps=4, num_stages=2)
+    equal(v8, vb)
+    equal(vs, old_vs)
+    prepared = shared.prepare_backward_shared_square_mxfp8(ks, do, saved_out, scale, causal=causal)
+    for actual, expected in zip(prepared, (do8, dos, delta, kdqs)):
+        equal(actual, expected)
+    prepared_before = tuple(t.clone() for t in prepared)
+    core_args = (q8, k8, v8, qs, ks, vs, *prepared, lse, scale)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    prep_graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            shared.prepare_backward_shared_square_mxfp8(ks, do, saved_out, scale, causal=causal)
+            stream.synchronize()
+            with torch.cuda.graph(prep_graph, stream=stream):
+                captured_prep = shared.prepare_backward_shared_square_mxfp8(ks, do, saved_out, scale, causal=causal)
+            for _ in range(2):
+                for tensor in captured_prep:
+                    if tensor.dtype == torch.float8_e4m3fn:
+                        tensor.view(torch.uint8).fill_(0x7f)
+                    elif tensor.dtype == torch.uint8:
+                        tensor.fill_(255)
+                    else:
+                        tensor.fill_(float("nan"))
+                prep_graph.replay()
+                stream.synchronize()
+                for actual, expected in zip(captured_prep, prepared_before):
+                    equal(actual, expected)
+    finally:
+        stream.synchronize()
+        prep_graph.reset()
+    entries = ((shared.launch_backward_shared_square_mxfp8, args), (shared.launch_backward_shared_square_mxfp8_core,
+                                                                    core_args))
+    for entry, entry_args in entries:
+        graph = torch.cuda.CUDAGraph()
+        workspaces = {}
+        original_empty = torch.empty
+
+        def observe_empty(*positional, **kwargs):
+            tensor = original_empty(*positional, **kwargs)
+            if tuple(tensor.shape) == (4, 32, 1024, 1024) and tensor.dtype == torch.float8_e4m3fn:
+                assert not workspaces, "expected one captured core"
+                workspaces["ds"] = tensor
+            elif "ds" in workspaces and "dss" not in workspaces:
+                assert tuple(tensor.shape) == (4, 32, 32, 32) and tensor.dtype == torch.uint8
+                workspaces["dss"] = tensor
+            return tensor
+
+        try:
+            with torch.cuda.stream(stream):
+                check(entry(*entry_args, causal=causal))
+                entry(*entry_args, causal=causal)
+                stream.synchronize()
+                with mock.patch.object(shared.torch, "empty", side_effect=observe_empty):
+                    with torch.cuda.graph(graph, stream=stream):
+                        captured = entry(*entry_args, causal=causal)
+                assert set(workspaces) == {"ds", "dss"}
+                for _ in range(2):
+                    workspaces["ds"].view(torch.uint8).fill_(0x7f)
+                    workspaces["dss"].fill_(255)
+                    for grad in captured:
+                        grad.fill_(float("nan"))
+                    graph.replay()
+                    stream.synchronize()
+                    check(captured)
+                    if causal:
+                        assert bool((workspaces["ds"].view(torch.uint8)[0, 0, 128:192, :64] == 0x7f).all())
+                        records = workspaces["dss"].view(4, 32, 8, 16, 4, 2)
+                        assert bool((records[0, 0, 0, 2, :2, :] == 255).all())
+                        assert bool((workspaces["ds"].view(torch.uint8)[0, 0, 64:128, :64] == 0).all())
+                        assert bool((records[0, 0, 0, 1, :2, :] != 255).all())
+        finally:
+            stream.synchronize()
+            graph.reset()
+            workspaces.clear()
+    for actual, expected in zip(args[:-1], frozen_inputs):
+        equal(actual, expected)
+    for actual, expected in zip(prepared, prepared_before):
+        equal(actual, expected)
+
+
+@pytest.mark.parametrize("bad", ("q_dtype", "k_dtype", "v_dtype", "scale_dtype", "forward_v_scale", "strided", "offset",
+                                 "oversized", "cpu", "do_dtype", "out_dtype", "lse_dtype", "causal", "scale"))
+def test_flash_attn_mxfp8_shared_fp8_boundary_rejects_metadata(bad):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, 1024, 128)
+    payload = [torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn) for _ in range(3)]
+    scales = [torch.empty((4, 32, 1024, 4), device="cuda", dtype=torch.uint8) for _ in range(3)]
+    do, out = [torch.empty(shape, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    lse = torch.empty(shape[:-1], device="cuda", dtype=torch.float32)
+    args = [*payload, *scales, do, out, lse, .5]
+    causal = False
+    if bad in ("q_dtype", "k_dtype", "v_dtype"):
+        args[("q_dtype", "k_dtype", "v_dtype").index(bad)] = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    elif bad == "scale_dtype":
+        args[5] = scales[2].float()
+    elif bad == "forward_v_scale":
+        args[5] = torch.empty((4, 32, 32, 128), device="cuda", dtype=torch.uint8)
+    elif bad == "strided":
+        args[2] = torch.empty((4, 32, 1024, 256), device="cuda", dtype=payload[2].dtype)[..., ::2]
+    elif bad in ("offset", "oversized"):
+        backing = torch.empty(payload[2].numel() + 1, device="cuda", dtype=payload[2].dtype)
+        args[2] = (backing[1:] if bad == "offset" else backing[:-1]).view(shape)
+    elif bad == "cpu":
+        args[2] = torch.empty(shape, dtype=payload[2].dtype)
+    elif bad in ("do_dtype", "out_dtype", "lse_dtype"):
+        index = {"do_dtype": 6, "out_dtype": 7, "lse_dtype": 8}[bad]
+        args[index] = args[index].to(torch.float16)
+    elif bad == "causal":
+        causal = 1
+    else:
+        args[-1] = .7
+    with mock.patch.object(shared.torch, "empty", side_effect=AssertionError("invalid input allocated workspace")):
+        with pytest.raises(ValueError):
+            shared.launch_backward_shared_square_mxfp8(*args, causal=causal)
+
+
+@pytest.mark.parametrize("bad", ("prep_scale", "prep_do", "prep_causal", "core_do", "core_delta", "core_kdqs"))
+def test_flash_attn_mxfp8_shared_fp8_split_rejects_metadata(bad):
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, 1024, 128)
+    q8, k8, v8, do8 = [torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn) for _ in range(4)]
+    qs, ks, vs, dos = [torch.empty((4, 32, 1024, 4), device="cuda", dtype=torch.uint8) for _ in range(4)]
+    do, out = [torch.empty(shape, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    delta, lse = [torch.empty(shape[:-1], device="cuda", dtype=torch.float32) for _ in range(2)]
+    kdqs = torch.empty((4, 32, 128, 32), device="cuda", dtype=torch.uint8)
+    if bad.startswith("prep"):
+        entry = shared.prepare_backward_shared_square_mxfp8
+        args, causal = [ks, do, out, .5], False
+        if bad == "prep_scale":
+            args[0] = qs.float()
+        elif bad == "prep_do":
+            args[1] = do8
+        else:
+            causal = 1
+    else:
+        entry = shared.launch_backward_shared_square_mxfp8_core
+        args, causal = [q8, k8, v8, qs, ks, vs, do8, dos, delta, kdqs, lse, .5], False
+        if bad == "core_do":
+            args[6] = do
+        elif bad == "core_delta":
+            args[8] = delta.to(torch.bfloat16)
+        else:
+            args[9] = kdqs.transpose(-1, -2)
+    with mock.patch.object(shared.torch, "empty", side_effect=AssertionError("invalid input allocated workspace")):
+        with pytest.raises(ValueError):
+            entry(*args, causal=causal)
 
 
 def test_flash_attn_mxfp8_gfx950_catalog_buffer_span():
