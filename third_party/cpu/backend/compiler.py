@@ -176,6 +176,7 @@ class CPUBackend(BaseBackend):
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.common.add_licm(pm)
+        passes.ttir.add_uplift_while_to_for(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "make_ttir")
         return mod

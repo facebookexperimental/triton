@@ -646,13 +646,26 @@ LogicalResult ArriveBarrierOp::verify() {
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
-    int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-    if (numCTAs <= 1)
-      return emitOpError("multicast arrive requires num_ctas > 1");
-    if (getCtaMask() > static_cast<uint32_t>(numCTAs - 1))
-      return emitOpError("ctaMask exceeds numCTAs - 1");
+    int physicalNumCTAs = triton::gpu::lookupPhysicalNumCTAs(getOperation());
+    if (physicalNumCTAs <= 1)
+      return emitOpError(
+          "multicast arrive requires more than one CTA per cluster");
+    if (!llvm::isPowerOf2_32(physicalNumCTAs))
+      return emitOpError(
+          "multicast arrive requires a power-of-two physical cluster size");
+    uint32_t ctaMask = getCtaMask();
+    for (int ctaRank = 0; ctaRank < physicalNumCTAs; ++ctaRank) {
+      if ((static_cast<uint32_t>(ctaRank) | ctaMask) >=
+          static_cast<uint32_t>(physicalNumCTAs))
+        return emitOpError(
+            "ctaMask selects a CTA outside the physical cluster");
+    }
+    // Logical multi-CTA programs distribute a barrier across their CTAs.
+    // ctas_per_cga instead runs one program per CTA, so each barrier stays
+    // local even though its arrivals can multicast across the physical cluster.
+    int layoutNumCTAs = triton::gpu::lookupNumCTAs(getOperation());
     auto expectedCGALayout =
-        CGAEncodingAttr::get1DLayout(getContext(), numCTAs);
+        CGAEncodingAttr::get1DLayout(getContext(), layoutNumCTAs);
     if (failed(verifyBarrierCGALayout(*this, getAlloc(), expectedCGALayout,
                                       "multicast barrier")))
       return failure();

@@ -1,0 +1,163 @@
+name: Build Triton wheel
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        type: string
+        required: false
+        default: ''
+    outputs:
+      wheel_url:
+        description: URL-encoded HTTPS URL of the uploaded wheel
+        value: ${{ jobs.build.outputs.wheel_url }}
+      wheel_filename:
+        description: Original wheel filename
+        value: ${{ jobs.build.outputs.wheel_filename }}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-build-wheel-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: 32-core-ubuntu
+    timeout-minutes: 90
+    outputs:
+      wheel_url: ${{ steps.wheel_url.outputs.wheel_url }}
+      wheel_filename: ${{ steps.wheel.outputs.filename }}
+    env:
+      MAX_JOBS: 32
+      CCACHE_DIR: /tmp/fbtriton-ccache
+      CCACHE_MAXSIZE: 2G
+      TRITON_BUILD_WITH_CCACHE: "1"
+      TRITON_BUILD_WITH_CLANG_LLD: "1"
+      TRITON_WHEEL_NAME: fbtriton
+      LDFLAGS: -Wl,--strip-all
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld ccache
+          python3 -m pip install --upgrade uv
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fbtriton-ccache
+          key: ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up build environment
+        env:
+          VIRTUAL_ENV: ${{ runner.temp }}/triton-build-venv
+        run: |
+          uv venv --python 3.12 "${VIRTUAL_ENV}"
+          uv pip install -r python/requirements.txt
+          echo "VIRTUAL_ENV=${VIRTUAL_ENV}" >> "$GITHUB_ENV"
+          echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+
+      - name: Build wheel
+        run: |
+          uv build --wheel --no-build-isolation --out-dir dist/
+          ls -lh dist/
+
+      - name: Validate wheel and prepare artifact
+        id: wheel
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one Triton wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          python3 - "${wheels[0]}" <<'PY'
+          import sys
+          import zipfile
+
+          with zipfile.ZipFile(sys.argv[1]) as wheel:
+              bad_file = wheel.testzip()
+              if bad_file is not None:
+                  sys.exit(f"Corrupt wheel member: {bad_file}")
+          PY
+          uv pip install --no-deps "${wheels[0]}"
+          python3 -I -c 'import triton; print("OK", triton.__version__)'
+
+          artifact_name="run_${GITHUB_RUN_ID}"
+          echo "filename=${wheels[0]##*/}" >> "$GITHUB_OUTPUT"
+          # An explicit S3 prefix overrides the action's name input. Preserve
+          # the artifact name as a directory under that prefix.
+          mkdir -p "s3-artifacts/${artifact_name}"
+          mv "${wheels[0]}" "s3-artifacts/${artifact_name}/"
+          echo "name=${artifact_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wheel to GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.wheel.outputs.name }}
+          path: s3-artifacts/${{ steps.wheel.outputs.name }}/*.whl
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Authenticate with AWS
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_triton_artifacts
+          role-duration-seconds: 18000
+          aws-region: us-east-1
+
+      - name: Upload wheel to S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        id: upload
+        uses: pytorch/test-infra/.github/actions/upload-artifact-s3@main
+        with:
+          name: ${{ steps.wheel.outputs.name }}
+          path: s3-artifacts/*/*.whl
+          s3-bucket: gha-artifacts
+          s3-prefix: tritonci-artifacts
+          retention-days: 14
+          overwrite: "true"
+          if-no-files-found: error
+
+      - name: Export wheel URL
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        id: wheel_url
+        env:
+          UPLOADED_OBJECTS: ${{ steps.upload.outputs.uploaded-objects }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.parse import quote
+
+          uploaded_objects = json.loads(os.environ["UPLOADED_OBJECTS"])
+          if len(uploaded_objects) != 1:
+              raise RuntimeError(f"Expected exactly one uploaded wheel, found {len(uploaded_objects)}")
+          key = next(iter(uploaded_objects))
+          url = f"https://gha-artifacts.s3.us-east-1.amazonaws.com/{quote(key, safe='/')}"
+          print(url)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"wheel_url={url}\n")
+          PY

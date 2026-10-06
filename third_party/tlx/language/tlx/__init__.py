@@ -33,6 +33,7 @@ from .mem_ops import (
     async_store,
     async_descriptor_gather,
     async_descriptor_load,
+    async_descriptor_scatter,
     assume_uniform,
     buffer_atomic_add,
     buffer_load,
@@ -88,6 +89,7 @@ from .mma_ops import (
     release_layout,
     tcgen05_commit,
 )
+from .packed_arith import packed_add4, packed_fma4, packed_mul4, packed_sub4
 from .types import (
     async_token,
     buffered_tensor,
@@ -97,6 +99,8 @@ from .types import (
     CLCPipelineContext,
     DummyRegisterLayoutEncoding,
     layout_encoding,
+    make_tensor_memory_layout,
+    make_tensor_memory_scales_layout,
     mbarrier,
     mbarrier_type,
     nv_mma_layout,
@@ -119,9 +123,11 @@ from .types import (
     tensor_descriptor_ptr,
     tensor_descriptor_ptr_type,
     tensor_memory_layout_encoding,
+    tensor_memory_scales_layout_encoding,
     TMemCTAMode,
 )
 from .utility import (
+    amd_set_wave_sched_mode,
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
@@ -142,8 +148,15 @@ __all__ = [
     # async_tasks
     "async_tasks",
     "async_task",
+    # packed arithmetic
+    "packed_add4",
+    "packed_sub4",
+    "packed_mul4",
+    "packed_fma4",
     # types
     "layout_encoding",
+    "make_tensor_memory_layout",
+    "make_tensor_memory_scales_layout",
     "shared_layout_encoding",
     "swizzled_layout",
     "swizzled_shared_layout_encoding",
@@ -153,6 +166,7 @@ __all__ = [
     "slice_layout",
     "dot_operand_layout",
     "tensor_memory_layout_encoding",
+    "tensor_memory_scales_layout_encoding",
     "TMemCTAMode",
     "nv_mma_layout",
     "nv_mma_shared_layout_encoding",
@@ -215,6 +229,7 @@ __all__ = [
     "amd_descriptor_prefetch_tensor",
     "async_descriptor_gather",
     "async_descriptor_load",
+    "async_descriptor_scatter",
     "async_descriptor_prefetch_tensor",
     "async_descriptor_store",
     "async_descriptor_store_wait",
@@ -250,6 +265,7 @@ __all__ = [
     "release_layout",
     "tcgen05_commit",
     # utility
+    "amd_set_wave_sched_mode",
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",

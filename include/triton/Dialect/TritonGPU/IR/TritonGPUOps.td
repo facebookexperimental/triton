@@ -11,6 +11,7 @@ include "mlir/Dialect/Arith/IR/ArithBase.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
+include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
@@ -46,7 +47,8 @@ def TTG_ConvertLayoutOp
 
 def TTG_RequireLayoutOp
     : TTG_Op<"require_layout", [SameOperandsAndResultShape,
-                                SameOperandsAndResultElementType, Pure]> {
+                                SameOperandsAndResultElementType,
+                                AxisInfoPassthroughTrait, Pure]> {
   let summary = "preserve a user-requested layout boundary";
 
   let description = [{
@@ -55,6 +57,27 @@ def TTG_RequireLayoutOp
     be treated as a transparent cast by layout canonicalization or
     rematerialization. Layout optimization may insert conversions around it, but
     the boundary itself is retired only after those passes have run.
+  }];
+
+  let arguments = (ins TT_Tensor:$src);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
+def TTG_ReleaseLayoutOp
+    : TTG_Op<"release_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType,
+                                AxisInfoPassthroughTrait, Pure]> {
+  let summary = "end a user-requested layout region";
+
+  let description = [{
+    `ttg.release_layout` is a semantic layout boundary produced from a
+    source-level layout release. Layout propagation must not carry the source
+    layout through this operation; the result starts an independently selected
+    layout region. The operation is not a memory fence and is retired only after
+    layout optimization has completed.
   }];
 
   let arguments = (ins TT_Tensor:$src);
@@ -619,6 +642,10 @@ def TTG_LocalAtomicScatterRMWOp
       I32Attr:$axis);
   let results = (outs TT_Tensor:$result);
 
+  let extraClassDeclaration = [{
+    bool isCommutative();
+  }];
+
   let assemblyFormat = [{
     $atomic_rmw_op `,` $dst `[` $indices `]` `,` $values (`,` $mask^)? attr-dict `:`
     functional-type(operands, results)
@@ -863,7 +890,11 @@ def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
 
     The region must contain exactly one block and may not contain nested
     dynamic control flow. Cross-lane operations require `wave_uniform`, which
-    declares that every lane in each wavefront observes the same predicate.
+    declares that every lane in each wavefront observes the same predicate, and
+    no enclosing non-wave-uniform predicate may already have masked lanes.
+    In a multi-wave region, layout conversions under `wave_uniform` must
+    remain warp-local; conversions that lower through CTA shared memory and a
+    barrier are unsupported.
     Reductions spanning multiple warps remain unsupported. Other operations
     with nested regions are rejected. Each init, result, and yielded value at
     a given position must have the same type. A tensor predicate must have the

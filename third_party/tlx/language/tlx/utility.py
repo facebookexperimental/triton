@@ -18,6 +18,29 @@ def is_amd_tdm_target(arch):
     return _amd.supports_tdm(arch)
 
 
+@tl.builtin
+def amd_set_wave_sched_mode(value: tl.constexpr, offset: tl.constexpr = 0, width: tl.constexpr = 2, _semantic=None):
+    """Write a field of ``HW_REG_WAVE_SCHED_MODE`` on gfx12 GPUs.
+
+    ``value``, ``offset``, and ``width`` must be compile-time integers. Each
+    executing wave updates the selected field and preserves the other bits.
+    This emits ``llvm.amdgcn.s.setreg`` and does not configure LLVM's scheduler
+    or its wait insertion. Bits 0..1 select the hardware scheduling mode;
+    bit 2 controls WMMA queuing on gfx1250.
+    """
+    options = _semantic.builder.options
+    if options.backend_name != "hip" or not options.arch.startswith("gfx12"):
+        raise NotImplementedError("tlx.amd_set_wave_sched_mode requires an AMD gfx12 target")
+    value, offset, width = (tl._unwrap_if_constexpr(arg) for arg in (value, offset, width))
+    if any(type(arg) is not int for arg in (value, offset, width)):
+        raise ValueError("value, offset, and width must be constexpr integers")
+    if not 0 <= offset < 32 or not 1 <= width <= 32 - offset:
+        raise ValueError("the register field must fit within 32 bits")
+    if not 0 <= value < 1 << width:
+        raise ValueError("value must fit in the selected register field")
+    _semantic.builder.create_amd_set_wave_sched_mode(value, offset, width)
+
+
 def cuda_parse_arch(arch):
     pattern = r"^sm(\d+)$"
     match = re.fullmatch(pattern, arch)
@@ -31,6 +54,12 @@ def cluster_cta_rank(_semantic=None):
     """
     :return the unique CTA ID within a cluster across all dims
     """
+    if _semantic.builder.options.backend_name == "hip":
+        options = _semantic.builder.options
+        cluster_size = (options.ctas_per_cga or (options.num_ctas, 1, 1))[0]
+        if cluster_size == 1:
+            return _semantic.to_tensor(0)
+        return tl.tensor(_semantic.builder.create_amd_cluster_cta_rank(), tl.int32)
     return tl.tensor(_semantic.builder.create_cluster_cta_rank(), tl.int32)
 
 

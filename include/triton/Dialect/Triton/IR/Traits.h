@@ -114,6 +114,12 @@ public:
 template <typename ConcreteType>
 struct AsyncRegions : public TraitBase<ConcreteType, AsyncRegions> {};
 
+// This trait marks a one-operand, one-result operation that preserves the
+// value's AxisInfo unchanged.
+template <typename ConcreteType>
+struct AxisInfoPassthroughTrait
+    : public TraitBase<ConcreteType, AxisInfoPassthroughTrait> {};
+
 } // namespace OpTrait
 } // namespace mlir
 

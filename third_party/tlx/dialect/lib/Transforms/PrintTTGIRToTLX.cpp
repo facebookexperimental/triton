@@ -60,6 +60,7 @@
 
 #include "IR/Dialect.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -691,6 +692,8 @@ getValueName(Value v,
     // implicit. The float element-type casts are still listed: the block above
     // intercepts them whenever their dtype is nameable, so reaching one here
     // means it is not, and erasing it beats emitting an uncompilable dtype.
+    // amdg.in_thread_transpose is a CDNA variant of ttg.convert_layout that the
+    // AMD backend inserts itself; recompiling the generated TLX re-creates it.
     static const llvm::StringSet<> transparentOps = {
         "ttg.convert_layout",
         "arith.extui",
@@ -709,6 +712,7 @@ getValueName(Value v,
         "tt.broadcast",
         "ttng.user_named_barrier_id",
         "ttng.compiler_named_barrier_id",
+        "amdg.in_thread_transpose",
     };
     if (transparentOps.contains(defOp->getName().getStringRef()) &&
         defOp->getNumOperands() > 0) {
@@ -1037,6 +1041,7 @@ bool shouldSkipOp(
       "tt.broadcast",
       "tt.map_elementwise.return",
       "ttng.tcgen5_global_alloc",
+      "amdg.in_thread_transpose",
   };
   // Emit ttg.memdesc_index as tlx.local_view when a real consumer needs the
   // view (MMA, wait, local_store, loop iter-arg, ...). Skip it when it has no
@@ -2702,26 +2707,17 @@ void printSimplifiedOp(
     }
   }
 
-  // Parsed IR carries the mask as a SchedGroupMask attribute, so only `none`
-  // is named and other masks are flagged rather than guessed at. A plain
-  // IntegerAttr mask shares tlx.amd_sched_barrier's encoding and rides through.
+  // The mask rides through into tlx.amd_sched_barrier as its integer encoding,
+  // whether it is a plain IntegerAttr or a SchedGroupMask enum attribute.
   if (opName == "rocdl.sched.barrier") {
     if (auto m = op->getAttrOfType<IntegerAttr>("mask")) {
       os << "tlx.amd_sched_barrier(" << m.getInt() << ")";
       printLocComment(op, os);
       return;
     }
-    std::string mask;
-    llvm::raw_string_ostream maskOs(mask);
-    if (Attribute a = op->getAttr("mask"))
-      a.print(maskOs);
-    maskOs.flush();
-    // Anchored on the closing bracket, not a substring search: the attribute
-    // prints as `#rocdl<sched_group_mask none>`, and `none` has to be the whole
-    // payload. A bare contains() would also accept a combined mask that merely
-    // mentions it, and `non_mem_non_sideeffect` sits one character away.
-    if (StringRef(mask).ends_with("sched_group_mask none>")) {
-      os << "tlx.amd_sched_barrier(0)";
+    if (auto m = op->getAttrOfType<ROCDL::SchedGroupMaskAttr>("mask")) {
+      os << "tlx.amd_sched_barrier(" << static_cast<uint32_t>(m.getValue())
+         << ")";
       printLocComment(op, os);
       return;
     }

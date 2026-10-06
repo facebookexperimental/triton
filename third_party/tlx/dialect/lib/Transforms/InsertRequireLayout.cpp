@@ -163,6 +163,13 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
+  if (auto requireOp = dyn_cast<ttg::RequireLayoutOp>(op)) {
+    assert(operandIndex == 0 && "RequireLayoutOp only has one operand");
+    auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+    return resultType &&
+           isSupportedDotConstraintEncoding(resultType.getEncoding());
+  }
+
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
@@ -178,6 +185,14 @@ public:
           !isTrackedDotValue(cvt.getResult()))
         return;
       unionLatticeAnchors<DotRewriteLattice>(cvt.getSrc(), cvt.getResult());
+    });
+    top->walk([&](ttg::RequireLayoutOp requireOp) {
+      auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+      if (!isTrackedDotValue(requireOp.getSrc()) || !resultType ||
+          !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+        return;
+      unionLatticeAnchors<DotRewriteLattice>(requireOp.getSrc(),
+                                             requireOp.getResult());
     });
   }
 
@@ -513,30 +528,58 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
   return nullptr;
 }
 
+static bool isDirectlyIndexedBufferView(Value dest, Value root) {
+  Value current = dest;
+  while (current != root) {
+    auto index = current.getDefiningOp<ttg::MemDescIndexOp>();
+    if (!index)
+      return false;
+    current = index.getSrc();
+  }
+  return true;
+}
+
 // For a buffer_load_to_local into a user-pinned padded_shared dst, derive and
 // pin the offset tensor's #linear so the direct-to-LDS write is coalesced (via
 // deduceRegLayoutFromPaddedShared), sparing the author from hand-writing it.
-// Idempotent; only fires for user-pinned padded dsts.
-static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
-                                          triton::ModuleAxisInfoAnalysis &axis,
-                                          OpBuilder &builder) {
-  if (buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>())
-    return;
+// Contiguity hints greater than one are trusted by lowering, so fail unless the
+// layout can be hard-pinned. The default hint keeps the legacy best-effort
+// behavior.
+static LogicalResult
+pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
+                              triton::ModuleAxisInfoAnalysis &axis,
+                              OpBuilder &builder) {
+  bool mustPin = buf.getContiguity() > 1;
+  auto failOrSkip = [&](StringRef reason) -> LogicalResult {
+    if (!mustPin)
+      return success();
+    return buf.emitOpError()
+           << "contiguity > 1 requires a directly indexed user-pinned "
+              "padded_shared destination; "
+           << reason;
+  };
+  if (!mustPin && buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>())
+    return success();
 
   auto destTy = dyn_cast<ttg::MemDescType>(buf.getDest().getType());
-  if (!destTy)
-    return;
-  auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(destTy.getEncoding());
-  if (!pinned)
-    return;
-  auto paddedEnc =
-      dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(pinned.getPinnedLayout());
+  Value root = findMemDescRoot(buf.getDest());
+  auto rootTy = dyn_cast<ttg::MemDescType>(root.getType());
+  if (!destTy || !rootTy)
+    return failOrSkip("destination is not a shared-memory memdesc");
+  if (!isa_and_nonnull<ttg::PinnedEncodingTrait>(rootTy.getEncoding()))
+    return failOrSkip("the root allocation is not user-pinned");
+  if (!isDirectlyIndexedBufferView(buf.getDest(), root))
+    return failOrSkip(
+        "only the allocation itself and memdesc_index views are supported");
+  auto paddedEnc = dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(
+      tlx::getEffectiveEncoding(destTy.getEncoding()));
   if (!paddedEnc)
-    return;
+    return failOrSkip(
+        "the destination view does not retain a padded_shared layout");
 
   auto offsetsTy = cast<RankedTensorType>(buf.getOffsets().getType());
   if (!offsetsTy.getEncoding())
-    return;
+    return failOrSkip("the offsets do not have a concrete layout");
   auto *ctx = buf.getContext();
   auto mod = buf->getParentOfType<ModuleOp>();
 
@@ -545,42 +588,93 @@ static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
   using amdgpu::ISAFamily;
   if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
                           targetFeatures.getISAFamily()))
-    return;
+    return failOrSkip("offset-layout inference is unsupported on this target");
 
-  // loadContig = the per-thread direct-to-LDS width the global reads support,
-  // clamped to a hardware-legal vector size (same signal the async coalescer /
-  // stock AMD buffer path use).
+  // Derive the width from semantic address contiguity, not the offsets'
+  // current per-thread layout. This function is selecting a replacement
+  // layout, so clamping by the old layout's sizePerThread would make a scalar
+  // seed layout impossible to vectorize.
   unsigned elemBitWidth = destTy.getElementTypeBitWidth();
-  unsigned loadContig =
-      mlir::LLVM::AMD::getContiguity(buf.getPtr(), buf.getOffsets(), axis);
+  auto *offsetInfo = axis.getAxisInfo(buf.getOffsets());
+  auto *ptrInfo = axis.getAxisInfo(buf.getPtr());
+  auto paddedOrder = paddedEnc.getOrder();
+  if (paddedOrder.empty() ||
+      paddedOrder.front() >= static_cast<unsigned>(offsetsTy.getRank()))
+    return failOrSkip("the destination padded layout has an invalid order");
+  unsigned dim = paddedOrder.front();
+  unsigned loadContig = 1;
+  if (offsetInfo && ptrInfo) {
+    unsigned offsetContig = offsetInfo->getContiguity(dim);
+    unsigned offsetAlign = offsetInfo->getDivisibility(dim);
+    unsigned elemByteWidth = std::max(elemBitWidth / 8, 1u);
+    unsigned ptrAlign =
+        std::max<unsigned>(ptrInfo->getDivisibility(0) / elemByteWidth, 1);
+    loadContig = std::min(ptrAlign, std::min(offsetContig, offsetAlign));
+    if (Value mask = buf.getMask()) {
+      auto *maskInfo = axis.getAxisInfo(mask);
+      loadContig = maskInfo
+                       ? std::min<unsigned>(
+                             loadContig,
+                             std::max<int64_t>(maskInfo->getConstancy(dim), 1))
+                       : 1;
+    }
+  }
+  unsigned trustedContig = buf.getContiguity();
+  loadContig = std::max(loadContig, trustedContig);
+  unsigned maxPaddedVec = paddedEnc.getMinInterval();
+  if (!targetInfo.supportsDirectToLdsScatter())
+    maxPaddedVec /= targetInfo.getWarpSize();
+  loadContig = std::min(loadContig, maxPaddedVec);
   loadContig = triton::AMD::fitToValidDirectToLdsVecSize(
       loadContig, elemBitWidth, targetInfo);
-  if (loadContig == 0)
-    return;
+  if (loadContig == 0 || loadContig < trustedContig)
+    return failOrSkip(
+        "the requested width is not legal for the destination and target");
 
   unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
   unsigned numWarps = ttg::lookupNumWarps(buf);
-
   auto regLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
       paddedEnc.getLinearComponent(), loadContig, threadsPerWarp, numWarps,
       offsetsTy.getShape(), ttg::getCGALayout(offsetsTy.getEncoding()), ctx);
   if (failed(regLayout)) {
+    if (mustPin)
+      return failOrSkip(
+          "no compatible offset layout can be derived from the destination");
     buf->emitRemark() << "could not infer a coalesced direct-to-LDS offset "
                          "layout from the pinned padded shared layout; check "
                          "that the pinned shared layout is directly loadable";
-    return;
+    return success();
   }
 
   // Pin it (wrap as #tlx.user_layout) so the downstream layout passes anchor it
   // and never rewrite it.
   auto linearEnc = ttg::LinearEncodingAttr::get(ctx, std::move(*regLayout));
-  auto newOffsetsTy =
-      RankedTensorType::get(offsetsTy.getShape(), offsetsTy.getElementType(),
-                            tlx::wrapUserLayout(linearEnc));
+  auto ptrTensorTy = RankedTensorType::get(offsetsTy.getShape(),
+                                           buf.getPtr().getType(), linearEnc);
+  unsigned legalVec = loadContig;
+  if (!mlir::LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrTensorTy, paddedEnc,
+                                           destTy.getAllocShape(), legalVec) ||
+      legalVec != loadContig)
+    return failOrSkip(
+        "the inferred offset layout cannot write directly to the destination");
+  auto pinnedLinearEnc = tlx::wrapUserLayout(linearEnc);
   builder.setInsertionPoint(buf);
-  auto requireOp = tlx::RequireLayoutOp::create(builder, buf.getLoc(),
-                                                newOffsetsTy, buf.getOffsets());
-  buf.getOffsetsMutable().assign(requireOp.getResult());
+  auto pinOperand = [&](Value operand) -> Value {
+    auto type = cast<RankedTensorType>(operand.getType());
+    if (type.getEncoding() == pinnedLinearEnc)
+      return operand;
+    auto pinnedType = RankedTensorType::get(
+        type.getShape(), type.getElementType(), pinnedLinearEnc);
+    return tlx::RequireLayoutOp::create(builder, buf.getLoc(), pinnedType,
+                                        operand)
+        .getResult();
+  };
+  buf.getOffsetsMutable().assign(pinOperand(buf.getOffsets()));
+  if (Value mask = buf.getMask())
+    buf.getMaskMutable().assign(pinOperand(mask));
+  if (Value other = buf.getOther())
+    buf.getOtherMutable().assign(pinOperand(other));
+  return success();
 }
 
 // The identity padded-layout ORDER for a buffer_load_to_local-fed dot operand,
@@ -1121,9 +1215,13 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   // Infer & pin the direct-to-LDS offset layout for buffer_load_to_local ops
   // whose destination alloc is a user-pinned padded_shared layout, so authors
   // pin only the shared layout and the matching offset layout is derived.
-  m.walk([&](amdgpu::BufferLoadToLocalOp buf) {
-    pinInferredBufferOffsetLayout(buf, axisInfo, builder);
+  WalkResult bufferLayoutResult = m.walk([&](amdgpu::BufferLoadToLocalOp buf) {
+    if (failed(pinInferredBufferOffsetLayout(buf, axisInfo, builder)))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
   });
+  if (bufferLayoutResult.wasInterrupted())
+    return failure();
 
   materializeDotUserTensorConstraints(m, builder);
 

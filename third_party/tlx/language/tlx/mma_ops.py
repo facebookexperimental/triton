@@ -147,12 +147,16 @@ def amd_scheduled_mfma(
     no accumulator-lifetime or register-class contract, this operation exposes
     independent native fragment chains in source order.
 
-    With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
-    The operation keeps one SSA chain per output fragment and creates updates
-    in K-major, N-major, M-minor order. LLVM may reschedule independent updates
-    on the transient intrinsic path. With ``initialize=True``, the first native
-    K update starts from zero and the result is ``a @ b``; the supplied
-    accumulator value is ignored.
+    With ``initialize=False``, the operation computes ``acc + a @ b`` over
+    the supplied output tile. It keeps one SSA chain per native output fragment and
+    creates updates in K-major, N-major, M-minor order. LLVM may reschedule
+    independent updates on the transient intrinsic path. With
+    ``initialize=True``, the first native K update of every output fragment
+    starts from zero, ignoring the supplied accumulator values.
+
+    To interleave work between output subtiles, slice the corresponding input
+    panels and use separate accumulator tensors and calls. Commit those chains
+    before joining the subtiles for a consumer of the full output tile.
 
     ``accumulator_role`` changes lowering, not the numerical operation.
     ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
@@ -166,16 +170,23 @@ def amd_scheduled_mfma(
     does not apply these class constraints and leaves physical placement to
     LLVM; use :func:`amd_register_resident` for a hard source residency point.
 
-    The compiler recognizes eligible persistent AGPR accumulator chains ending
-    at ``amd_mfma_commit``. After scheduling and physical register assignment,
-    it repairs source and EXEC hazards and drains outstanding results before
-    any physical AGPR read or overwrite. Unknown dataflow and VGPR accumulators
-    retain conservative waits.
+    On gfx950, the compiler recognizes eligible persistent AGPR or VGPR
+    accumulator chains ending at a matching ``amd_mfma_commit`` boundary.
+    After scheduling and physical register assignment, it repairs source,
+    accumulator, and EXEC hazards and inserts any required waits before
+    physical-register reads or overwrites of outstanding results. Unproven
+    persistent chains and those on other supported targets retain conservative
+    waits.
 
     CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
-    ``accumulator_register_class="vgpr"``. The inputs must be matching rank-two
-    BF16 or F16 dot operands with ``kWidth`` 4 or 8, the accumulator must be
-    rank-two F32 with the corresponding unit-tile MFMA layout, and all active
+    ``accumulator_register_class="vgpr"``. The inputs must be matching BF16 or
+    F16 dot operands with ``kWidth`` 4 or 8, and the accumulator must be F32
+    with the corresponding unit-tile MFMA layout. The logical K dimension must
+    be a positive multiple of both the native instruction K and the dot-operand
+    layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile span two
+    native K fragments. All tensors must have the
+    same rank, either two or three. Rank-three tensors have matching leading
+    batch dimensions distributed over waves, with one batch per wave. All active
     lanes of a wave must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
@@ -209,10 +220,10 @@ def amd_scheduled_mfma(
 def amd_mfma_commit(value, preserve=None, _semantic=None):
     """Apply an MFMA completion boundary and return every value unchanged.
 
-    ``value`` is one F32 MFMA-layout tensor or a nonempty tuple of independent
-    results. An optional BF16 or F16 dot-operand ``preserve`` is threaded
-    through the same boundary. To carry that dependency forward, consume its
-    returned copy. A single value is returned directly; tuples keep the same
+    ``value`` is one rank-two or rank-three F32 MFMA-layout tensor or a nonempty
+    tuple of independent results. An optional BF16 or F16 dot-operand
+    ``preserve`` is threaded through the same boundary. To carry that dependency
+    forward, consume its returned copy. A single value is returned directly; tuples keep the same
     arity; supplying ``preserve`` appends its returned copy to the result.
 
     With ``preserve``, F32 results cross the boundary in VGPRs and the preserved
@@ -277,16 +288,19 @@ def require_layout(
 
 
 @tl.builtin
-def release_layout(x, _semantic=None):
+def release_layout(x, relaxed: tl.constexpr = False, _semantic=None):
     """Release a register tensor's explicit layout for a flexible consumer.
 
-     The returned tensor has the same logical shape and element type as ``x``,
-     but downstream operations may choose their own layout.  Use this at a
-     helper or control-flow boundary when a source-scheduled fragment layout is
-     intentionally local to the preceding region.
-     """
+    The returned tensor has the same logical shape and element type as ``x``,
+    but downstream operations may choose their own layout. With the default
+    ``relaxed=False``, the release remains a strict boundary across layout
+    optimization passes. Set ``relaxed=True`` for implementation-generated
+    releases that layout optimization may remove.
+    """
+    relaxed = tl._unwrap_if_constexpr(relaxed)
+    assert isinstance(relaxed, bool), f"relaxed must be a constexpr bool, got {type(relaxed).__name__}"
     assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
-    handle = _semantic.builder.create_release_layout(x.handle)
+    handle = _semantic.builder.create_release_layout(x.handle, relaxed=relaxed)
     return tl.tensor(handle, x.type)
 
 
@@ -541,8 +555,8 @@ def async_dot(
             A_handle = require_dot_operand_layout(A, 0, mma_layout, _semantic.builder)
         output = _semantic.builder.create_warp_group_dot(A_handle, B_handle, acc, input_precision,
                                                          max_num_imprecise_acc, True)
-        # Release the mma layout for the output to conform to what the user expects
-        output = _semantic.builder.create_release_layout(output)
+        # Keep the result flexible without creating a strict user boundary.
+        output = _semantic.builder.create_release_layout(output, relaxed=True)
         return tl.tensor(output, ret_ty)
 
 

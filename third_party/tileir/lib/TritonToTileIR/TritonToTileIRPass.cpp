@@ -848,6 +848,9 @@ public:
   LogicalResult
   matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (auto ordering = op.getReductionOrderingAttr();
+        ordering && ordering.getValue() != "unordered")
+      return op.emitError("ordered scans are not supported by the TileIR backend");
     SmallVector<Type> newResultTypes;
     auto resConversion = getTypeConverter()->convertTypes(
         op.getResults().getType(), newResultTypes);

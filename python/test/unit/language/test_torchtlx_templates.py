@@ -59,6 +59,11 @@ def is_gfx950() -> bool:
     return current_target().is_gfx950
 
 
+def is_gfx942() -> bool:
+    """True on AMD MI300X (gfx942), where direct-load TorchTLX GEMM runs."""
+    return current_target().is_gfx942
+
+
 def is_hopper() -> bool:
     """True on an H100, where local-buffer retention uses SMEM."""
     return current_target().is_hopper
@@ -294,22 +299,30 @@ class TestLocalBufferRetention(TestCase):
             with config.patch({"triton.tlx_mode": "force"}):
                 self.assertIsNone(LocalBufferRetention.plan_for(node_schedule))
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for(node_schedule)
+                plans = LocalBufferRetention.plans_for(node_schedule)
 
+        self.assertEqual(len(plans), 2)
+        plan = plans[0]
         self.assertIsNotNone(plan)
         self.assertEqual(plan.reduction_numel, 4096)
-        self.assertEqual(plan.reduction_block, 2048)
-        self.assertEqual(plan.num_warps, 4)
-        self.assertEqual(plan.backend_options, (("waves_per_eu", 4), ))
         self.assertEqual(
-            plan.triton_config,
-            {
-                "XBLOCK": 1,
-                "R0_BLOCK": 2048,
-                "num_warps": 4,
-                "num_stages": 1,
-                "waves_per_eu": 4,
-            },
+            [candidate.triton_config for candidate in plans],
+            [
+                {
+                    "XBLOCK": 1,
+                    "R0_BLOCK": 2048,
+                    "num_warps": 4,
+                    "num_stages": 1,
+                    "waves_per_eu": 4,
+                },
+                {
+                    "XBLOCK": 1,
+                    "R0_BLOCK": 4096,
+                    "num_warps": 8,
+                    "num_stages": 1,
+                    "waves_per_eu": 2,
+                },
+            ],
         )
         self.assertEqual(plan.total_bytes, 8192)
         self.assertEqual(len(plan.buffers), 1)
@@ -449,8 +462,8 @@ class TestLocalBufferRetention(TestCase):
     def test_rejects_local_buffer_overflow(self):
         i, r = sympy.symbols("i r", integer=True)
         dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
-        access = MemoryDep("workspace", 16384 * i + r, (i, r), (128, 16384))
-        first_reduction = self._scheduler_node("first_reduction", is_reduction=True, rnumel=16384)
+        access = MemoryDep("workspace", 65536 * i + r, (i, r), (128, 65536))
+        first_reduction = self._scheduler_node("first_reduction", is_reduction=True, rnumel=65536)
         producer = self._scheduler_node("producer", writes=(access, ))
         consumer = self._scheduler_node(
             "consumer",
@@ -459,11 +472,11 @@ class TestLocalBufferRetention(TestCase):
         )
         graph = self._graph_mock()
         graph.get_dtype.return_value = torch.float32
-        graph.get_numel.return_value = dynamic_rows * 16384
+        graph.get_numel.return_value = dynamic_rows * 65536
 
         with V.set_graph_handler(graph), self._on_gfx950():
             with config.patch({"triton.tlx_mode": "allow"}):
-                plan = LocalBufferRetention.plan_for([
+                plans = LocalBufferRetention.plans_for([
                     first_reduction,
                     producer,
                     DisableReduction,
@@ -471,7 +484,7 @@ class TestLocalBufferRetention(TestCase):
                     consumer,
                 ])
 
-        self.assertIsNone(plan)
+        self.assertEqual(plans, ())
 
     def test_rejects_nonmatching_access(self):
         i, r = sympy.symbols("i r", integer=True)
@@ -571,6 +584,19 @@ class TestLocalBufferRetention(TestCase):
 
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_arch_predicates(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        with mock.patch.object(torch.version, "hip", "6.0"), mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
+        ), mock.patch.object(_tlx_registry, "current_target") as target:
+            target.return_value.is_gfx942 = True
+            self.assertIs(_tlx_registry._is_gfx950(), True)
+            self.assertIs(_tlx_registry._is_gfx942(), True)
 
     @staticmethod
     @contextlib.contextmanager
@@ -685,21 +711,58 @@ class TestTLXTemplates(TestCase):
             self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
             self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
 
-        expected_uids = {
+        expected = ([_tlx_mm.gfx942_mm_template.uid] if is_gfx942() else [
             _tlx_mm.gfx950_mm_interwave_template.uid,
             _tlx_mm.gfx950_mm_local_split_u_template.uid,
             _tlx_mm.gfx950_mm_register_template.uid,
             _tlx_mm.gfx950_mm_persistent_template.uid,
-        }
+        ])
         self.assertEqual(
-            [template.uid for template in templates if template.uid in expected_uids],
-            [
-                _tlx_mm.gfx950_mm_interwave_template.uid,
-                _tlx_mm.gfx950_mm_local_split_u_template.uid,
-                _tlx_mm.gfx950_mm_register_template.uid,
-                _tlx_mm.gfx950_mm_persistent_template.uid,
-            ],
+            [template.uid for template in templates if template.uid in expected],
+            expected,
         )
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_gfx942_torch_providers_are_cataloged(self):
+        from triton.language.extra.tlx.inductor import gfx942_torch as gfx942_mm
+        from triton.tlx.ops._catalog import impl_for
+        from triton.tlx.ops.kernels.addmm import gfx942_torch as gfx942_addmm
+
+        mm_impl, _ = impl_for("mm_torchtlx", arch="gfx942")
+        addmm_impl, _ = impl_for("addmm_torchtlx", arch="gfx942")
+
+        self.assertIs(mm_impl, gfx942_mm.mm)
+        self.assertIs(addmm_impl, gfx942_addmm.addmm)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    def test_tlx_gfx942_mm_template_is_selected(self):
+        from triton.language.extra.tlx.inductor import gfx942_torch
+
+        a = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.reset()
+        actual, code = run_and_get_code(lambda x, y: gfx942_torch.mm(x, y, mode="force"), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_gfx942_mm", "\n".join(code))
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    def test_tlx_gfx942_addmm_template_is_selected(self):
+        from triton.tlx.ops.kernels.addmm import gfx942_torch
+
+        bias = torch.randn((512, ), device=GPU_TYPE, dtype=torch.float16)
+        a = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((512, 512), device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.reset()
+        actual, code = run_and_get_code(
+            lambda x, y, z: gfx942_torch.addmm(x, y, z, mode="force"),
+            bias,
+            a,
+            b,
+        )
+
+        torch.testing.assert_close(actual, torch.addmm(bias, a, b), atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_gfx942_addmm", "\n".join(code))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_mm_interwave_rejects_non_gfx950(self):
@@ -1666,6 +1729,65 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(
         not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_refill_wait_prevents_lds_race(self):
+        """Every wave must read an LDS slot before the leading wave refills it."""
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        batch, M, K, N = 7, 1024, 128, 384
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        # Citrine C3: create the inputs directly on the GPU.
+        a = torch.randn(batch, M, K, device=GPU_TYPE, dtype=dtype)
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=dtype)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        heuristic = _tlx_registry.Gfx950BMMWarpPipeConfigHeuristic
+        get_configs = heuristic._get_template_configs_impl
+
+        def _race_config_only(instance, kernel_inputs, op_name):
+            for template_kwargs in get_configs(instance, kernel_inputs, op_name):
+                config_key = tuple(template_kwargs[name] for name in (
+                    "BLOCK_M",
+                    "BLOCK_N",
+                    "BLOCK_K",
+                    "GROUP_M",
+                    "num_warps",
+                    "NUM_BUFFERS",
+                ))
+                if config_key == (128, 128, 32, 8, 8, 3):
+                    yield template_kwargs
+
+        with (
+                mock.patch.object(
+                    heuristic,
+                    "_get_template_configs_impl",
+                    _race_config_only,
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            compiled = torch.compile(bmm)
+            actual, code = run_and_get_code(compiled, a, b)
+            expected = torch.bmm(a.float(), b.float()).to(dtype)
+            torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+            for launch in range(100):
+                with self.subTest(launch=launch):
+                    torch.testing.assert_close(compiled(a, b), expected, atol=2e-2, rtol=2e-2)
+
+        self.assertIn("tlx.async_load", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX shared-A bmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -2001,6 +2123,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "stride": lambda *a, **k: "1",
             "output_ptr": lambda *a, **k: "out_ptr0",
             "store_output": lambda *a, **k: "# store_output(...)",
+            "prefetch_epilogue": lambda *a, **k: "# prefetch_epilogue(...)",
         }
         tmpl = jinja2.Environment().from_string(source)
         split = tmpl.render(SPLIT_K=2, USE_ASYNC=True, **hooks)
@@ -2011,6 +2134,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
         self.assertIn("base = K_ITERS // SPLIT_K", split)
         self.assertIn("k_lo = split_id * base", split)
         self.assertIn("tl.store(split_k_ws + ws_off, acc", split)
+        self.assertNotIn("prefetch_epilogue", split)
 
         # SPLIT_K == 1 must take the plain data-parallel path: no split-id, no workspace,
         # full-K loop, and store via store_output (not the reduce workspace).
@@ -2018,6 +2142,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
         self.assertNotIn("split_k_ws", nosplit)
         self.assertIn("k_lo = 0", nosplit)
         self.assertIn("store_output", nosplit)
+        self.assertIn("prefetch_epilogue", nosplit)
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_persistent_warppipe_split_k_template_render(self):
@@ -2031,21 +2156,24 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "stride": lambda *a, **k: "1",
             "output_ptr": lambda *a, **k: "out_ptr0",
             "store_output": lambda *a, **k: "# store_output(...)",
+            "prefetch_epilogue": lambda *a, **k: "# prefetch_epilogue(...)",
         }
         tmpl = jinja2.Environment().from_string(source)
-        split = tmpl.render(SPLIT_K=2, **hooks)
-        nosplit = tmpl.render(SPLIT_K=1, **hooks)
+        split = tmpl.render(SPLIT_K=2, USE_ASYNC=True, **hooks)
+        nosplit = tmpl.render(SPLIT_K=1, USE_ASYNC=True, **hooks)
 
         self.assertIn("num_work_items = num_tiles * SPLIT_K", split)
         self.assertIn("split_id = (work_id % SPLIT_K)", split)
         self.assertIn("base = K_ITERS // SPLIT_K", split)
         self.assertIn("k_lo = split_id * base", split)
         self.assertIn("tl.store(split_k_ws + ws_off, acc", split)
+        self.assertNotIn("prefetch_epilogue", split)
 
         self.assertNotIn("split_id = (work_id % SPLIT_K)", nosplit)
         self.assertNotIn("split_k_ws", nosplit)
         self.assertIn("k_lo = 0", nosplit)
         self.assertIn("store_output", nosplit)
+        self.assertIn("prefetch_epilogue", nosplit)
 
 
 class TestInterleaveEpilogue(TestCase):

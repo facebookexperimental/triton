@@ -64,7 +64,8 @@ LogicalResult lowerLdStMatrix(
 // where for ctaId, it sets as 1's the positions that are in the same broadcast
 // group
 Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
-                             uint16_t broadcastBits, Value ctaId = {});
+                             uint16_t broadcastBits, Value ctaId = {},
+                             std::optional<int> physicalNumCTAs = std::nullopt);
 
 uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy);
 

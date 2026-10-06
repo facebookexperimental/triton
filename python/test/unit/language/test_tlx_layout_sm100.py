@@ -82,6 +82,7 @@ def _assert_no_layout_residue(ttgir):
     assert "#tlx.user_layout" not in ttgir, "user-layout wrapper encoding leaked into final IR"
     assert "#tlx.no_verify_layout" not in ttgir, "no-verify wrapper encoding leaked into final IR"
     assert "ttg.require_layout" not in ttgir, "require_layout boundary leaked into final IR"
+    assert "ttg.release_layout" not in ttgir, "release_layout boundary leaked into final IR"
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")

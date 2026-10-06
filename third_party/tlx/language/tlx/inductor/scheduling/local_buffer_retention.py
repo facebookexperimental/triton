@@ -58,9 +58,9 @@ class LocalBufferRetentionPolicy:
     round_reduction_block_up: bool = False
 
 
-# These are conservative retention budgets, not hardware capacities. They
-# protect occupancy; larger budgets should be separate MultiKernel candidates
-# so Inductor can benchmark and select them only when profitable.
+# These are conservative retention budgets, not hardware capacities. Larger
+# budgets are separate MultiKernel candidates so Inductor can select them only
+# when profitable.
 _LOCAL_BUFFER_RETENTION_POLICIES = {
     "gfx950": (
         LocalBufferRetentionPolicy(
@@ -68,6 +68,12 @@ _LOCAL_BUFFER_RETENTION_POLICIES = {
             reduction_block_limit=2048,
             num_warps=4,
             backend_options=(("waves_per_eu", 4),),
+        ),
+        LocalBufferRetentionPolicy(
+            max_local_bytes=156 * 1024,
+            reduction_block_limit=4096,
+            num_warps=8,
+            backend_options=(("waves_per_eu", 2),),
         ),
     ),
     "sm90": (

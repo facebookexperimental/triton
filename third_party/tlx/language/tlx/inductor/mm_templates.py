@@ -93,6 +93,23 @@ gfx950_addmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_warppipe"),
 )
 
+# MI300X/gfx942 direct-load GEMM templates.  The source is intentionally shared
+# with the register-resident gfx950 fallback: it is the Inductor form of the
+# direct-load path in tlx.ops.kernels.mm.gfx942 (explicit strides, register
+# operands, tl.dot, and a store_output epilogue).  Separate identities let the
+# registry attach gfx942's measured heuristic to mm and addmm independently.
+gfx942_mm_template = TritonTemplate(
+    name="tlx_gfx942_mm",
+    grid=mm_grid,
+    source="# tlx_gfx942_mm\n" + load_tlx_template("gfx950_mm_register"),
+)
+
+gfx942_addmm_template = TritonTemplate(
+    name="tlx_gfx942_addmm",
+    grid=mm_grid,
+    source="# tlx_gfx942_addmm\n" + load_tlx_template("gfx950_mm_register"),
+)
+
 # gfx950-only inter-wave GEMM candidates derived from the a16w16 tutorial. The
 # kernel is tuned for K-contiguous (column-major) B and also supports
 # N-contiguous B with a layout-specific shared-memory swizzle. Plain mm and
@@ -184,6 +201,15 @@ def _append_tlx_amd(templates, op_name):
 
         uids = {getattr(t, "uid", None) for t in templates}
         if mm_template.uid not in uids:
+            return templates
+        if current_target().is_gfx942:
+            template = (
+                gfx942_mm_template
+                if op_name == "mm"
+                else gfx942_addmm_template
+            )
+            if template.uid not in uids:
+                templates.append(template)
             return templates
         if op_name == "mm":
             for template in (

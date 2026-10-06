@@ -624,7 +624,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
             otherElems, vecStart);
 
       Value loadVal = llLoad(rewriter, loc, ptr, vecTy, pred, falseVal,
-                             multicastMask, cacheMod);
+                             multicastMask, cacheMod, op.getIsVolatile());
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, getTypeConverter()->getIndexType(), ii);
@@ -693,7 +693,14 @@ struct BufferLoadOpConversion
 
     // Get the `other` value (if any)
     SmallVector<Value> otherElems;
-    if (llOther)
+    bool isOtherAllBitsZero = llOther && isZeroConst(op.getOther());
+    if (isOtherAllBitsZero) {
+      auto constantOp = op.getOther().getDefiningOp<arith::ConstantOp>();
+      if (auto denseAttr =
+              dyn_cast<DenseFPElementsAttr>(constantOp.getValueAttr()))
+        isOtherAllBitsZero = denseAttr.getSplatValue<APFloat>().isPosZero();
+    }
+    if (llOther && !isOtherAllBitsZero)
       otherElems =
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
 
@@ -1405,7 +1412,9 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
         member.padInterval = padded.getIntervals()[0];
         member.padAmount = padded.getPaddings()[0];
       }
-      if (targetInfo.supportsMultiCTALaunch())
+      if (!adaptor.getMulticastMasks().empty())
+        member.multicastMask = adaptor.getMulticastMasks()[i];
+      else if (targetInfo.supportsMultiCTALaunch())
         member.multicastMask = LLVM::AMD::emitCtaMulticastMask(
             rewriter, loc, ctaId, member.sharedLayout,
             targetInfo.getMaxMulticastMaskPopcount());
@@ -2111,8 +2120,6 @@ struct BufferStoreOpConversion
 
     unsigned numElems = getTotalElemsPerThread(ptrType);
     unsigned vec = getVectorSize(ptr, offset, axisAnalysisPass);
-    // If the op has a contiguity hint use it to increase the vector size.
-    vec = std::max(vec, op.getContiguity());
 
     // Get the offsets and value
     SmallVector<Value> offsetElems = unpackTensorElements(
@@ -2123,6 +2130,19 @@ struct BufferStoreOpConversion
     // Get the mask
     SmallVector<Value> maskElems =
         getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
+
+    // A trusted hint includes mask uniformity, so apply it after conservative
+    // mask analysis. It still cannot exceed the physical register layout or
+    // AMD's 128-bit buffer-store instruction width.
+    vec = std::max(vec, op.getContiguity());
+    auto valueTensorTy = cast<RankedTensorType>(valueTy);
+    auto order = triton::gpu::getOrder(valueTensorTy);
+    auto contigPerThread = triton::gpu::getContigPerThread(valueTensorTy);
+    assert(!order.empty() && order.front() < contigPerThread.size());
+    vec = std::min(vec, contigPerThread[order.front()]);
+    constexpr unsigned maxStoreVectorBits = 128;
+    unsigned elementBits = std::max(8u, valueElemTy.getIntOrFloatBitWidth());
+    vec = std::min(vec, std::max(1u, maxStoreVectorBits / elementBits));
 
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     MLIRContext *ctx = rewriter.getContext();

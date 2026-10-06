@@ -29,8 +29,6 @@ namespace mlir {
 
 namespace {
 
-using SchedGroupMask = ROCDL::SchedGroupMask;
-
 static LLVM::FenceOp createLocalMMRAFence(OpBuilder &builder, Location loc,
                                           LLVM::AtomicOrdering ordering) {
   Attribute mmra =
@@ -221,7 +219,7 @@ SmallVector<Operation *> Pingponger::genClusterBarrier(OpBuilder &builder,
   auto barrierOp = triton::gpu::BarrierOp::create(
       builder, loc, triton::gpu::AddrSpace::Local);
   auto schedBarrierOp =
-      ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none);
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none);
   return {barrierOp, schedBarrierOp};
 }
 void Pingponger::appendClusterBarrier(OpBuilder &builder, Location loc) {
@@ -433,7 +431,7 @@ void Pingponger::transformOnePPClusters(OpBuilder &builder, Location loc) {
   // sched barrier to prevent memory ops from cross but leave other ops to be
   // scheduled across the barrier.
   auto preDotBar = ROCDL::SchedBarrier::create(
-      builder, loc, SchedGroupMask::non_mem_non_sideeffect);
+      builder, loc, ROCDL::SchedGroupMask::non_mem_non_sideeffect);
   updateOpInsertion(dotLoc);
   appendOp(preDotBar);
 
@@ -441,7 +439,8 @@ void Pingponger::transformOnePPClusters(OpBuilder &builder, Location loc) {
   updateOpInsertion(lLoadOps[0]);
   appendOp(ROCDL::SetPrioOp::create(builder, loc, highPriority));
   moveOpAndPredecessorsUpSameBlock(gLoadOps[0]);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   moveOpAndPredecessorsUpSameBlock(lLoadOps[1]);
   appendOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority));
   moveOpAndPredecessorsUpSameBlock(gLoadOps[1]);
@@ -644,18 +643,22 @@ LogicalResult Pingponger::transformTwoPPClusters(OpBuilder &builder,
   // cycles, sched.barrier prevents backend from canceling the interleaved order
   updateOpInsertion(gLoadOps[1]);
   appendSlicedLoadAB(/*slice=*/0);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(gLoadOps[0]);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendSlicedLoadAB(/*slice=*/1);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(gLoadOps[1]);
   // The first cluster just fits into the two cluster pingpong and cannot
   // include wait of the local_load inserted by the ttg.barrier, using s.barrier
   // instead. backend will schedule the local memory fences later in the dot0
   // cluster.
   appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   // dot0 (1/2)
   appendOpWithPrio(builder, dotSliceOps[0], loc);
@@ -702,9 +705,11 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
   for (auto glop : gLoadOps)
     moveOpAndPredecessorsUpSameBlock(glop);
 
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   // all other ops are placed in the second cluster
   // set unit attr, so it can trigger the second step in the ttg to llvm
@@ -817,16 +822,19 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // ComputeCluster 1
   updateOpInsertion(dotLikeOps[0].getOperation());
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
 
   // MemoryCluster 1
   updateOpInsertion(memoryClusterStartOps[0]);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   if (llvm::isa<ttg::AsyncWaitOp>(memoryClusterStartOps[0])) {
     // Only append a sched barrier because membar adds a barrier after asyncwait
-    appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+    appendOp(
+        ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   } else {
     prependOp(triton::gpu::BarrierOp::create(builder, loc,
                                              triton::gpu::AddrSpace::Local),
@@ -851,24 +859,28 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   //
   // Check note 2 and 3 for details.
   updateOpInsertion(dotLikeOps[1].getOperation());
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
             false);
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::acquire),
             false);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
 
   // MemoryCluster2
   updateOpInsertion(memoryClusterStartOps[1]);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   if (llvm::isa<ttg::AsyncWaitOp>(memoryClusterStartOps[1])) {
     // Only append a sched barrier because membar adds a barrier after asyncwait
-    appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+    appendOp(
+        ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   } else {
     prependOp(triton::gpu::BarrierOp::create(builder, loc,
                                              triton::gpu::AddrSpace::Local),
@@ -890,8 +902,9 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // them into the compute cluster. Instead, we insert s_barrier
   // at the beginning of the loop.
   updateOpInsertion(lastInsertedOp->getBlock()->getTerminator());
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
             false);
@@ -935,7 +948,8 @@ Pingponger::transformTwoClusterWithLocalLoadAndAll(OpBuilder &builder,
 
   moveOpAndPredecessorsUpSameBlock(lLoadOps[0]);
   moveOpAndPredecessorsUpSameBlock(lLoadOps[1]);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   appendOp(asyncCopyOps[0]);
   appendOp(asyncCommitOps[0]);
@@ -943,30 +957,34 @@ Pingponger::transformTwoClusterWithLocalLoadAndAll(OpBuilder &builder,
   // The last point we need to guarantee async_copy has been completed.
   // w0 : local_load 0 - Dot 0                 - local_load 1
   // w1 :              - local_load 0 (*wait 1)- Dot 0
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(newAsyncWaitOp);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   // Give hint to backend so it can interleave instructions better.
   // This tries to interleave 3 SALU instructions per each MFMA
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc,
-                                            SchedGroupMask::mfma_wmma, 1u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc, SchedGroupMask::salu,
-                                            3u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc,
-                                            SchedGroupMask::mfma_wmma, 1u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc, SchedGroupMask::salu,
-                                            3u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc,
-                                            SchedGroupMask::mfma_wmma, 1u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, 1u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::salu, 3u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, 1u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::salu, 3u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, 1u, 0u));
 
   appendOp(asyncCopyOps[1]);
   appendOp(asyncCommitOps[1]);
   moveOpAndPredecessorsUpSameBlock(dotOps[0]);
 
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   return success();
 }

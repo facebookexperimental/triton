@@ -78,43 +78,12 @@ env:
 jobs:
   h100-build:
     if: github.repository_owner == 'facebookexperimental'
-    runs-on: linux-gcp-h100
-    env:
-      CONDA_ENV: meta-triton
-      SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 60
     permissions:
       id-token: write
       contents: read
-      actions: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/fbtriton-ccache
-          key: ccache-${{ github.job }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-
-            ccache-
-      - name: Compile Triton
-        run: |
-          . "${SETUP_SCRIPT}"
-          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
-          install_triton $PWD
-      - name: Build wheel
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv build --wheel --no-build-isolation --out-dir dist/
-          ls -la dist/
-          python3 -c "import glob,sys,zipfile; w=glob.glob('dist/*.whl'); sys.exit('no wheel built') if len(w)!=1 else None; zipfile.ZipFile(w[0]).testzip(); print('wheel ok:', w[0])"
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: triton-wheel-h100-${{ github.sha }}
-          path: dist/*.whl
-          retention-days: 1
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
 
   h100-meta-triton-test:
     needs: h100-build
@@ -143,11 +112,21 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         uses: actions/download-artifact@v4
         with:
-          name: triton-wheel-h100-${{ github.sha }}
+          name: run_${{ github.run_id }}
           path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Download prebuilt Triton wheel from S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          WHEEL_URL: ${{ needs.h100-build.outputs.wheel_url }}
+          WHEEL_FILENAME: ${{ needs.h100-build.outputs.wheel_filename }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+          curl --fail --location --retry 3 \
+            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -225,11 +204,21 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         uses: actions/download-artifact@v4
         with:
-          name: triton-wheel-h100-${{ github.sha }}
+          name: run_${{ github.run_id }}
           path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Download prebuilt Triton wheel from S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          WHEEL_URL: ${{ needs.h100-build.outputs.wheel_url }}
+          WHEEL_FILENAME: ${{ needs.h100-build.outputs.wheel_filename }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+          curl --fail --location --retry 3 \
+            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -341,11 +330,21 @@ jobs:
           sudo nvidia-smi -pm 1
           sudo ldconfig
           nvidia-smi
-      - name: Download prebuilt Triton wheel
+      - name: Download prebuilt Triton wheel from GitHub artifacts
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
         uses: actions/download-artifact@v4
         with:
-          name: triton-wheel-h100-${{ github.sha }}
+          name: run_${{ github.run_id }}
           path: ${{ runner.temp }}/prebuilt-wheel
+      - name: Download prebuilt Triton wheel from S3
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          WHEEL_URL: ${{ needs.h100-build.outputs.wheel_url }}
+          WHEEL_FILENAME: ${{ needs.h100-build.outputs.wheel_filename }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+          curl --fail --location --retry 3 \
+            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
       - name: Install Triton
         run: |
           . "${SETUP_SCRIPT}"

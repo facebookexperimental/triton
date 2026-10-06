@@ -30,7 +30,14 @@ Lowers to `amdg.buffer_load`, which is eventually lowered to `rocdl.raw.ptr.buff
 Store a tensor of values to global memory.
 
 ```python
-tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
+tlx.buffer_store(
+    stored_value,
+    ptr,
+    offsets,
+    mask=None,
+    cache=None,
+    contiguity=1,
+)
 ```
 
 | Argument | Type | Description |
@@ -40,6 +47,42 @@ tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
 | `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
 | `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not written. |
 | `cache` | str, optional | Cache modifier. |
+| `contiguity` | constexpr int | Trusted positive power-of-two lower bound on the number of adjacent elements available for vectorization. Values greater than one require `stored_value` to be pinned with `tlx.require_layout`. |
+
+`contiguity` is a correctness contract, not a best-effort hint. For every group
+of `contiguity` elements owned by one thread, the caller promises that the
+offsets are consecutive, the mask predicate is identical, and the first address
+meets the packed access's alignment. The compiler verifies that the width is a
+positive power of two, divides the number of elements owned by each thread, and
+does not exceed the physical adjacency of the pinned layout; it cannot verify the
+runtime address or mask promises. An incorrect promise can change which
+elements are written.
+
+Pinning `stored_value` anchors the store layout; the store's operand constraint
+keeps offsets and mask in the same encoding. The final instruction width is
+also capped by AMD's 128-bit buffer-store limit. For example, BF16
+`contiguity=16` is emitted as legal eight-element `buffer_store_dwordx4`
+operations. The default `contiguity=1` retains the existing scalar-contract
+behavior.
+
+```python
+store_layout: tl.constexpr = tlx.amd_mfma_layout(
+    version=4,
+    instr_shape=[16, 16, 32],
+    transposed=True,
+    warps_per_cta=[2, 2],
+)
+mask_boundary = mask_boundary - mask_boundary % 4
+mask = offsets < mask_boundary
+values = tlx.require_layout(values, store_layout)
+tlx.buffer_store(
+    values,
+    out_ptr,
+    offsets,
+    mask=mask,
+    contiguity=4,
+)
+```
 
 **Returns**: Nothing.
 

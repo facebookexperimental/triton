@@ -12,6 +12,8 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Metadata.h"
@@ -58,6 +60,52 @@ namespace py = nanobind;
 using namespace llvm;
 
 namespace {
+
+struct ExpandMaskedDivRemPass : RequiredPassInfoMixin<ExpandMaskedDivRemPass> {
+  PreservedAnalyses run(Module &module, ModuleAnalysisManager &) {
+    SmallVector<std::pair<IntrinsicInst *, Instruction::BinaryOps>> intrinsics;
+    for (Function &function : module) {
+      for (BasicBlock &block : function) {
+        for (Instruction &instruction : block) {
+          auto *intrinsic = dyn_cast<IntrinsicInst>(&instruction);
+          if (!intrinsic)
+            continue;
+          switch (intrinsic->getIntrinsicID()) {
+          case Intrinsic::masked_sdiv:
+            intrinsics.emplace_back(intrinsic, Instruction::SDiv);
+            break;
+          case Intrinsic::masked_udiv:
+            intrinsics.emplace_back(intrinsic, Instruction::UDiv);
+            break;
+          case Intrinsic::masked_srem:
+            intrinsics.emplace_back(intrinsic, Instruction::SRem);
+            break;
+          case Intrinsic::masked_urem:
+            intrinsics.emplace_back(intrinsic, Instruction::URem);
+            break;
+          default:
+            break;
+          }
+        }
+      }
+    }
+
+    for (auto [intrinsic, opcode] : intrinsics) {
+      IRBuilder<> builder(intrinsic);
+      Value *dividend = intrinsic->getArgOperand(0);
+      Value *divisor = intrinsic->getArgOperand(1);
+      Value *mask = intrinsic->getArgOperand(2);
+      Value *safeDivisor = builder.CreateSelect(
+          mask, divisor, ConstantInt::get(divisor->getType(), 1));
+      intrinsic->replaceAllUsesWith(
+          builder.CreateBinOp(opcode, dividend, safeDivisor));
+      intrinsic->eraseFromParent();
+    }
+
+    return intrinsics.empty() ? PreservedAnalyses::all()
+                              : PreservedAnalyses::none();
+  }
+};
 
 // Set an LLVM command-line option using addOccurrence (simulates command-line)
 // and return its original value. Using addOccurrence instead of setValue is
@@ -135,7 +183,8 @@ public:
 
 std::unique_ptr<TargetMachine>
 createTargetMachine(llvm::Module *module, std::string proc,
-                    bool enable_fp_fusion, const std::string &features) {
+                    bool enable_fp_fusion, const std::string &features,
+                    const std::string &abi = "") {
   std::string error;
   auto target =
       llvm::TargetRegistry::lookupTarget(module->getTargetTriple(), error);
@@ -146,6 +195,7 @@ createTargetMachine(llvm::Module *module, std::string proc,
   opt.TrapUnreachable = true;
   opt.MCOptions.AsmVerbose = true;
   opt.MCOptions.PreserveAsmComments = true;
+  opt.MCOptions.ABIName = abi;
   std::unique_ptr<llvm::TargetMachine> machine{target->createTargetMachine(
       module->getTargetTriple(), proc, features, opt, llvm::Reloc::PIC_,
       std::nullopt,
@@ -332,10 +382,13 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
   return result;
 }
 
-std::string translateLLVMIRToASM(
-    llvm::Module &module, const std::string &triple, const std::string &proc,
-    const std::string &features, const std::vector<std::string> &flags,
-    bool enable_fp_fusion, bool isObject, bool canonicalizeGEP) {
+std::string translateLLVMIRToASM(llvm::Module &module,
+                                 const std::string &triple,
+                                 const std::string &proc,
+                                 const std::string &features,
+                                 const std::vector<std::string> &flags,
+                                 bool enable_fp_fusion, bool isObject,
+                                 bool canonicalizeGEP, const std::string &abi) {
   using namespace mlir;
 
   // Apply flags
@@ -370,7 +423,8 @@ std::string translateLLVMIRToASM(
   // Set up target information before inlining so target-specific inline
   // compatibility checks use the backend's TTI.
   module.setTargetTriple(Triple(triple));
-  auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features);
+  auto machine =
+      createTargetMachine(&module, proc, enable_fp_fusion, features, abi);
   module.setDataLayout(machine->createDataLayout());
 
   // inline everything
@@ -638,12 +692,12 @@ void init_triton_llvm(py::module_ &m) {
       });
 
   // optimization levels
-  py::class_<llvm::OptimizationLevel>(m, "optimization_level");
-  m.attr("OPTIMIZE_O0") = llvm::OptimizationLevel::O0;
-  m.attr("OPTIMIZE_O1") = llvm::OptimizationLevel::O1;
-  m.attr("OPTIMIZE_O2") = llvm::OptimizationLevel::O2;
-  m.attr("OPTIMIZE_O3") = llvm::OptimizationLevel::O3;
-  // Os and Oz were removed from llvm::OptimizationLevel in LLVM 20+
+  py::enum_<llvm::OptimizationLevel>(m, "optimization_level")
+      .value("OPTIMIZE_O0", llvm::OptimizationLevel::O0)
+      .value("OPTIMIZE_O1", llvm::OptimizationLevel::O1)
+      .value("OPTIMIZE_O2", llvm::OptimizationLevel::O2)
+      .value("OPTIMIZE_O3", llvm::OptimizationLevel::O3)
+      .export_values();
 
   m.def(
       "to_module",
@@ -673,30 +727,33 @@ void init_triton_llvm(py::module_ &m) {
 #endif
   });
 
-  m.def("attach_datalayout", [](llvm::Module *mod, const std::string triple,
-                                const std::string proc,
-                                const std::string features) {
-    std::string error;
-    llvm::Triple targetTriple(triple);
-    auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
-    if (!target) {
-      throw std::runtime_error("target lookup error: " + error);
-    }
-    llvm::TargetOptions opt;
-    // Target machine is only used to create the data layout.
-    std::unique_ptr<llvm::TargetMachine> machine{target->createTargetMachine(
-        targetTriple, proc, features, opt, llvm::Reloc::PIC_, std::nullopt,
-        llvm::CodeGenOptLevel::None)};
-    // set data layout
-    mod->setDataLayout(machine->createDataLayout());
-  });
+  m.def("attach_datalayout",
+        [](llvm::Module *mod, const std::string triple, const std::string proc,
+           const std::string features, const std::string abi) {
+          std::string error;
+          llvm::Triple targetTriple(triple);
+          auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
+          if (!target) {
+            throw std::runtime_error("target lookup error: " + error);
+          }
+          llvm::TargetOptions opt;
+          opt.MCOptions.ABIName = abi;
+          // Target machine is only used to create the data layout.
+          std::unique_ptr<llvm::TargetMachine> machine{
+              target->createTargetMachine(targetTriple, proc, features, opt,
+                                          llvm::Reloc::PIC_, std::nullopt,
+                                          llvm::CodeGenOptLevel::None)};
+          // set data layout
+          mod->setDataLayout(machine->createDataLayout());
+        });
 
   m.def(
       "optimize_module",
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
          bool enable_fp_fusion, bool disable_slp_vectorizer,
-         bool disable_vector_combine, bool scalarize_packed_fops) {
+         bool disable_vector_combine, bool expand_masked_div_rem,
+         bool scalarize_packed_fops) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Check to see if we are passing a list of flags to disable
@@ -733,7 +790,7 @@ void init_triton_llvm(py::module_ &m) {
           // registry name "vector-combine".
           const StringRef kVectorCombinePassName = "VectorCombinePass";
           passInstrCb.registerShouldRunOptionalPassCallback(
-              [kVectorCombinePassName](StringRef passName, Any) {
+              [kVectorCombinePassName](StringRef passName, IRUnitRef) {
                 return passName != kVectorCombinePassName;
               });
           enablePassInstrumentation = true;
@@ -826,6 +883,8 @@ void init_triton_llvm(py::module_ &m) {
           fpm.addPass(InstSimplifyPass());
           mpm.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
         }
+        if (expand_masked_div_rem)
+          mpm.addPass(ExpandMaskedDivRemPass());
         mpm.run(*mod, mam);
       },
       // Mandatory parameters
@@ -837,14 +896,15 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("enable_fp_fusion") = false,
       py::arg("disable_slp_vectorizer") = false,
       py::arg("disable_vector_combine") = false,
+      py::arg("expand_masked_div_rem") = false,
       py::arg("scalarize_packed_fops") = false,
       py::call_guard<py::gil_scoped_release>());
 
   m.def("translate_to_asm",
         [](std::string llvmIR, std::string triple, std::string proc,
            std::string features, std::vector<std::string> flags,
-           bool enable_fp_fusion, bool isObject,
-           bool canonicalizeGEP) -> py::object {
+           bool enable_fp_fusion, bool isObject, bool canonicalizeGEP,
+           std::string abi) -> py::object {
           std::string obj;
           {
             // when allow_threads goes out of scope, gil will be released
@@ -863,7 +923,7 @@ void init_triton_llvm(py::module_ &m) {
             }
             obj = translateLLVMIRToASM(*module, triple, proc, features, flags,
                                        enable_fp_fusion, isObject,
-                                       canonicalizeGEP);
+                                       canonicalizeGEP, abi);
           }
           if (isObject)
             return py::object(py::bytes(obj.c_str(), obj.size()));

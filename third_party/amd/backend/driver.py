@@ -331,6 +331,7 @@ class HIPLauncher(object):
         self.kernel_signature = make_kernel_signature(expanded_signature)
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
+        self.ctas_per_cga = getattr(metadata, "ctas_per_cga", None)
         self.warp_size = metadata.warp_size
         # Check if cooperative groups are supported on the device.
         if self.launch_cooperative_grid:
@@ -347,6 +348,8 @@ class HIPLauncher(object):
 
     def __call__(self, gridX, gridY, gridZ, stream, function, kernel_metadata, launch_metadata, launch_enter_hook,
                  launch_exit_hook, *args):
+        if self.ctas_per_cga is not None and gridX % self.ctas_per_cga[0]:
+            raise ValueError("grid X must be divisible by ctas_per_cga[0]")
         active_driver = triton.runtime.driver.active
 
         def allocate_scratch(size, align, allocator):
@@ -371,7 +374,10 @@ class HIPLauncher(object):
         else:
             profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
-        self.launch(self.launch_cooperative_grid, gridX, gridY, gridZ, stream, function, global_scratch,
+        # The HIP launcher consumes a cluster count and multiplies it by the
+        # packed cluster size. ctas_per_cga's public grid counts physical CTAs.
+        launch_grid_x = gridX // self.ctas_per_cga[0] if self.ctas_per_cga is not None else gridX
+        self.launch(self.launch_cooperative_grid, launch_grid_x, gridY, gridZ, stream, function, global_scratch,
                     profile_scratch, kernel_metadata, launch_metadata, launch_enter_hook, launch_exit_hook,
                     self.warp_size, self.arg_annotations, self.kernel_signature, args)
 

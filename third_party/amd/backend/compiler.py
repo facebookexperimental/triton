@@ -61,6 +61,16 @@ def disable_real_true16_feature(arch):
     return '-real-true16' if arch.startswith('gfx11') else ''
 
 
+_MATRIX_INTRINSIC_RE = re.compile(r"@llvm\.amdgcn\.(?:mfma|smfmac|wmma)\.")
+
+
+def get_amdgpu_codegen_features(arch, llvm_ir, disable_packed_fp32_ops=False):
+    features = [disable_real_true16_feature(arch)]
+    if disable_packed_fp32_ops and arch == "gfx950" and _MATRIX_INTRINSIC_RE.search(llvm_ir):
+        features.append("-packed-fp32-ops")
+    return ",".join(feature for feature in features if feature)
+
+
 def _parse_llvm_fn_attrs(attrs):
     if not isinstance(attrs, str):
         return tuple(attrs)
@@ -92,6 +102,8 @@ class HIPOptions:
     waves_per_eu: int = 0
     num_stages: int = 2
     num_ctas: int = 1
+    # Group independent program CTAs into an x-axis cluster.
+    ctas_per_cga: Tuple[int, int, int] | None = None
     extern_libs: dict = None
     debug: bool = False
     sanitize_overflow: bool = False
@@ -117,6 +129,8 @@ class HIPOptions:
     backend_name: str = "hip"
     instrumentation_mode: str = ""
     fpsan_homomorphic_casts: bool = False
+    disable_vector_combine: bool = False
+    disable_packed_fp32_ops: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -149,6 +163,17 @@ class HIPOptions:
         warp_size = 32 if gfx_major >= 10 else 64
         object.__setattr__(self, "warp_size", warp_size)
         assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
+
+        if self.ctas_per_cga is not None:
+            dims = tuple(self.ctas_per_cga)
+            if (len(dims) != 3 or any(type(dim) is not int for dim in dims) or dims[0] not in (1, 2, 4, 8, 16)
+                    or dims[1:] != (1, 1)):
+                raise ValueError("AMD ctas_per_cga must be (1|2|4|8|16, 1, 1)")
+            if self.num_ctas != 1:
+                raise ValueError("ctas_per_cga requires num_ctas=1: each CTA is an independent program")
+            if dims[0] > 1 and not amd.supports_multi_cta_launch(self.arch):
+                raise ValueError(f"ctas_per_cga > 1 not supported on {self.arch}")
+            object.__setattr__(self, "ctas_per_cga", dims)
 
         if (self.arch == "gfx950") and (self.kpack != 1):
             warnings.warn(
@@ -228,13 +253,16 @@ class HIPBackend(BaseBackend):
     def pack_metadata(self, metadata):
         return (
             metadata.num_warps,
-            metadata.num_ctas,
+            metadata.ctas_per_cga[0] if metadata.ctas_per_cga is not None else metadata.num_ctas,
             metadata.shared,
         )
 
     def get_codegen_implementation(self, options):
 
         def post_ast_lowering(mod):
+            cluster_dims = options.ctas_per_cga or (1, 1, 1)
+            for axis, dim in zip("xyz", cluster_dims):
+                mod.set_attr(f"ttg.cluster-dim-{axis}", ir.builder(mod.context).get_int32_attr(dim))
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
             tlx.tlx_passes.add_triton_tlx_fixup(
@@ -243,7 +271,7 @@ class HIPBackend(BaseBackend):
                 options.num_warps,
                 options.warp_size,
                 options.num_ctas,
-                [1, 1, 1],
+                list(cluster_dims),
             )
             pm.run(mod, "post_ast_lowering")
 
@@ -328,6 +356,8 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, options):
+        for axis, dim in zip("xyz", options.ctas_per_cga or (1, 1, 1)):
+            mod.set_attr(f"ttg.cluster-dim-{axis}", ir.builder(mod.context).get_int32_attr(dim))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.ttir.add_convert_to_ttgpuir(
@@ -359,6 +389,7 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
         tlx.tlx_passes.add_tlx_insert_require_layout(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
 
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
@@ -590,8 +621,8 @@ class HIPBackend(BaseBackend):
         amd.attach_target_triple(llvm_mod)
         target_features = ""
         if knobs.compilation.enable_asan:
-            target_features = "+xnack"
-        llvm.attach_datalayout(llvm_mod, amd.TARGET_TRIPLE, options.arch, target_features)
+            target_features = '+xnack'
+        llvm.attach_datalayout(llvm_mod, amd.TARGET_TRIPLE, options.arch, target_features, "")
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
@@ -610,7 +641,7 @@ class HIPBackend(BaseBackend):
         if not kernel_fn:
             raise RuntimeError("Could not find kernel function")
         kernel_fn.set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
-        cluster_dim = metadata["num_ctas"]
+        cluster_dim = options.ctas_per_cga[0] if options.ctas_per_cga is not None else metadata["num_ctas"]
         kernel_fn.add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
         # warp-specialization mutates num_warps
         total_warps_num = options.num_warps
@@ -661,9 +692,9 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        # gfx950 requires VectorCombine for stable BF16 and FP8 code generation.
+        # Keep VectorCombine on by default for stable gfx950 BF16 and FP8 code generation.
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
-                             disable_vector_combine=options.arch != "gfx950")
+                             disable_vector_combine=options.disable_vector_combine or options.arch != "gfx950")
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -706,7 +737,7 @@ class HIPBackend(BaseBackend):
         flags = _get_codegen_flags(options)
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
-        features = disable_real_true16_feature(options.arch)
+        features = get_amdgpu_codegen_features(options.arch, src, options.disable_packed_fp32_ops)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
         _ = llvm.translate_to_mir(
@@ -741,16 +772,8 @@ class HIPBackend(BaseBackend):
                 knobs.amd.swap_mir_enable_misched,
             )
         else:
-            amdgcn = llvm.translate_to_asm(
-                src,
-                amd.TARGET_TRIPLE,
-                options.arch,
-                features,
-                flags,
-                options.enable_fp_fusion,
-                False,
-                False,
-            )
+            amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, features, flags,
+                                           options.enable_fp_fusion, False, False, "")
         amdgcn = insert_scheduled_mfma_hazard_nops(amdgcn, options.arch)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")

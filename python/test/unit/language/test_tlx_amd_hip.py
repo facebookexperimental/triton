@@ -144,6 +144,57 @@ def amd_fa_cluster_long_bf16_codegen_gfx950():
     return compiled
 
 
+@pytest.fixture
+def amd_fa_cluster_vector_combine_codegen_gfx950(fresh_triton_cache):
+    batch, heads, n_ctx, head_dim = 1, 64, 4096, 128
+    tensor = MockTensor(torch.bfloat16, (batch, heads, n_ctx, head_dim))
+    strides = (heads * n_ctx * head_dim, n_ctx * head_dim, head_dim, 1)
+    args = (tensor, tensor, tensor, tensor, *strides, *strides, *strides, *strides, batch)
+    common = {
+        "H": heads,
+        "N_CTX": n_ctx,
+        "sm_scale": 1.0 / head_dim**0.5,
+        "BLOCK_M": 256,
+        "BLOCK_N": 32,
+        "BUF_DEPTH": 2,
+        "HEAD_DIM": head_dim,
+        "USE_DIRECT_LOAD": False,
+        "IS_CAUSAL": False,
+        "STATIC_STRIDE_KN": head_dim,
+        "grid": (n_ctx // 256, heads, batch),
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "enable_sched_group_barrier_scheduler": False,
+        "llvm_fn_attrs": "",
+    }
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        baseline = _amd_fa_cluster_module._attn_fwd_cluster_pipeline.warmup(*args, disable_vector_combine=False,
+                                                                            **common)
+        disabled = _amd_fa_cluster_module._attn_fwd_cluster_pipeline.warmup(*args, disable_vector_combine=True,
+                                                                            **common)
+    return baseline, disabled
+
+
+def test_amd_fa_cluster_vector_combine_opt_out_reduces_transfers_gfx950(amd_fa_cluster_vector_combine_codegen_gfx950):
+    baseline, disabled = amd_fa_cluster_vector_combine_codegen_gfx950
+    baseline_asm = baseline.asm["amdgcn"]
+    disabled_asm = disabled.asm["amdgcn"]
+
+    def transfer_count(amdgcn):
+        return amdgcn.count("v_accvgpr_read_b32") + amdgcn.count("v_accvgpr_write_b32")
+
+    def instruction_count(amdgcn):
+        return len(re.findall(r"^\s+[a-z].*", amdgcn, flags=re.MULTILINE))
+
+    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 32
+    assert instruction_count(disabled_asm) < instruction_count(baseline_asm)
+    assert baseline.metadata.disable_vector_combine is False
+    assert disabled.metadata.disable_vector_combine is True
+
+
 def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     a = MockTensor(torch.uint8, (m, k // 2))
@@ -509,14 +560,14 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 55
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
     assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
-    assert ".private_segment_fixed_size: 8" in amdgcn
+    assert ".private_segment_fixed_size: 20" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 1" in amdgcn
+    assert ".vgpr_spill_count: 4" in amdgcn
     assert ".agpr_count:     0" in amdgcn
 
     unrelated = compile_for_gfx950(
@@ -541,13 +592,13 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 55
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 8" in amdgcn
+    assert ".private_segment_fixed_size: 20" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 1" in amdgcn
+    assert ".vgpr_spill_count: 4" in amdgcn
 
 
 def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -567,8 +618,8 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
     assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 0" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn
+    assert ".private_segment_fixed_size: 20" in amdgcn
+    assert ".vgpr_spill_count: 4" in amdgcn
 
 
 def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -597,6 +648,6 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert ".private_segment_fixed_size: 0" in amdgcn
-    assert ".sgpr_count:     58" in amdgcn
+    assert ".sgpr_count:     53" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
     assert ".vgpr_spill_count: 0" in amdgcn

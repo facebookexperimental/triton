@@ -114,7 +114,15 @@ def buffer_load(
 
 
 @tl.builtin
-def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=None):
+def buffer_store(
+    stored_value,
+    ptr,
+    offsets,
+    mask=None,
+    cache=None,
+    contiguity=1,
+    _semantic=None,
+):
     """
     AMD buffer store to global memory via a scalar base pointer and a tensor
     of i32 element offsets.
@@ -128,8 +136,20 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
         offsets: Tensor of i32 element offsets.
         mask: Optional bool tensor for predicated stores.
         cache: Optional cache modifier string.
+        contiguity: Trusted positive power-of-two lower bound on contiguous
+            elements available for vectorization. It must divide the number
+            of elements owned by each thread and cannot exceed the physical
+            contiguity of the selected layout. Every vector group must also
+            share one mask predicate. When greater than one, ``stored_value``
+            must first be pinned with ``tlx.require_layout``.
     """
     _verify_buffer_ops(ptr, offsets, mask)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
+    assert (contiguity == 1 or _semantic.builder.has_pinned_layout(stored_value.handle)), (
+        "buffer_store contiguity > 1 requires stored_value to be pinned with tlx.require_layout")
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -145,7 +165,14 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
     mask_handle = mask.handle if mask is not None else None
     cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
-    _semantic.builder.create_buffer_store(stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
+    _semantic.builder.create_buffer_store(
+        stored_value.handle,
+        ptr.handle,
+        offsets.handle,
+        mask_handle,
+        cache_modifier,
+        contiguity,
+    )
 
 
 @tl.builtin
@@ -219,6 +246,7 @@ def buffer_load_to_local(
     mask=None,
     other=None,
     cache_modifier: str = "",
+    contiguity=1,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -232,11 +260,12 @@ def buffer_load_to_local(
     a compile-time error unless the following requirements are met:
     - Each thread's load must reach a supported direct-to-LDS width (32 or 128
       bits, e.g. 2 or 8 fp16 elements). A smaller vectorization cannot be lowered.
-    - The alignment needed for that width must be statically provable.
+    - The alignment needed for that width must be statically provable or
+      guaranteed by `contiguity`.
     - If `mask` is given it must be aligned to the vector width: each group of
-      (vector width) consecutive mask values must be identical. The copy moves
-      each lane's whole vector in one transaction, so a mask whose boundary cannot
-      be proven vector-aligned (e.g. `offs < K` for runtime `K`) cannot lower.
+      (vector width) consecutive mask values must be identical. When analysis
+      cannot prove this for a dynamic boundary, `contiguity` is a trusted
+      assertion that the pointer, offsets, and mask satisfy that width.
 
     Args:
         dest: Destination buffer in shared memory (buffered_tensor).
@@ -245,8 +274,18 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
+        contiguity: Trusted positive power-of-two lower bound on contiguous
+            elements available for vectorization, including mask uniformity.
+            It must divide the number of elements owned by each thread and be
+            legal for the destination shared-memory layout. Values greater
+            than one require ``dest`` to be the allocation itself or a direct
+            ``local_view`` of a user-pinned padded shared-memory layout.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -265,7 +304,7 @@ def buffer_load_to_local(
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
-                                                           other_handle, cache_mod)
+                                                           other_handle, cache_mod, contiguity)
     return tlx.async_token(handle)
 
 
@@ -395,7 +434,7 @@ def local_alloc(
     num: tl.constexpr,
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     reuse: Optional[tlx.buffered_tensor | tlx.storage_alias_spec] = None,
-    layout: Optional[tlx.shared_layout_encoding] = None,
+    layout: Optional[tlx.layout_encoding] = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
@@ -489,22 +528,33 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
             layout_handle = layout.to_ir(_semantic.builder)
     else:
-        if storage != tlx.storage_kind.smem:
-            raise NotImplementedError("User-specified layout encoding is only supported for shared memory (smem)")
         layout = tl._unwrap_if_constexpr(layout)
-        # A CuTe swizzled_layout (Swizzle<B,M,S>) needs the buffer shape to resolve
-        # its perPhase; do it now that shape is known.
-        if isinstance(layout, tlx.swizzled_layout):
-            layout = layout._to_encoding(unwrapped_shape)
-        if not isinstance(layout, tlx.shared_layout_encoding):
-            raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
-        layout_handle = layout.to_ir(_semantic.builder)
-        # This is an explicit, user-pinned layout: wrap it so layout propagation
-        # respects it (does not retag the buffer to satisfy a consumer). The
-        # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
-        if not getattr(layout, "_tlx_default", False):
-            layout._tlx_user_pinned = True
-            layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
+        if storage == tlx.storage_kind.smem:
+            # A CuTe swizzled_layout (Swizzle<B,M,S>) needs the buffer shape to resolve
+            # its perPhase; do it now that shape is known.
+            if isinstance(layout, tlx.swizzled_layout):
+                layout = layout._to_encoding(unwrapped_shape)
+            if not isinstance(layout, tlx.shared_layout_encoding):
+                raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
+            layout_handle = layout.to_ir(_semantic.builder)
+            # This is an explicit, user-pinned layout: wrap it so layout propagation
+            # respects it (does not retag the buffer to satisfy a consumer). The
+            # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
+            if not getattr(layout, "_tlx_default", False):
+                layout._tlx_user_pinned = True
+                layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
+        elif isinstance(
+                layout,
+            (
+                tlx.tensor_memory_layout_encoding,
+                tlx.tensor_memory_scales_layout_encoding,
+            ),
+        ):
+            layout_handle = layout.to_ir(_semantic.builder)
+        else:
+            raise TypeError("`layout` for tensor memory must be a tlx.tensor_memory_layout_encoding "
+                            "or tlx.tensor_memory_scales_layout_encoding, "
+                            f"got {type(layout).__name__}")
 
     alias_handle = None
     shared_buffer_handle = None
@@ -1072,30 +1122,36 @@ def local_load(
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
-        output = _semantic.builder.create_release_layout(load_handle)
+        output = _semantic.builder.create_release_layout(load_handle, relaxed=True)
         return tl.tensor(output, block_type)
     else:
+        is_hip = _semantic.builder.options.backend_name == "hip"
+        synced_via_async_wait = (token is not None or relaxed) and is_hip
+        rematerialize_coordinates = rematerialize_coordinates and is_hip
+        rematerialize_coordinates_group = rematerialize_coordinates_group if is_hip else None
         if layout is not None:
             # Pin the load result to the requested register layout, wrapped as a
             # user layout so remove-layout-conversions anchors it (won't rewrite
             # it to a "preferred" layout). Unlike require_layout, this survives
             # even when the only consumer is layout-flexible.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
-            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None,
-                                                         layoutEncoding=enc)
-        else:
-            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
-        result = tl.tensor(output, block_type)
-        if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
-        if rematerialize_coordinates and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr("tlx.rematerialize_coordinates", _semantic.builder.get_unit_attr())
-        if rematerialize_coordinates_group is not None and _semantic.builder.options.backend_name == "hip":
-            result.handle.set_attr(
-                "tlx.rematerialize_coordinates_group",
-                _semantic.builder.get_int32_attr(rematerialize_coordinates_group),
+            output = _semantic.builder.create_local_load(
+                src.handle,
+                token.handle if token else None,
+                layoutEncoding=enc,
+                syncedViaAsyncWait=synced_via_async_wait,
+                rematerializeCoordinates=rematerialize_coordinates,
+                rematerializeCoordinatesGroup=rematerialize_coordinates_group,
             )
-        return result
+        else:
+            output = _semantic.builder.create_local_load(
+                src.handle,
+                token.handle if token else None,
+                syncedViaAsyncWait=synced_via_async_wait,
+                rematerializeCoordinates=rematerialize_coordinates,
+                rematerializeCoordinatesGroup=rematerialize_coordinates_group,
+            )
+        return tl.tensor(output, block_type)
 
 
 @tl.builtin
@@ -1239,6 +1295,12 @@ def _verify_scale_tmem_copy_shape(src: tlx.buffered_tensor, dst: tlx.buffered_te
     ]
     if rows == 128 and cols % 16 == 0:
         accepted_shapes.append([32 * (cols // 16), 16])
+    # 2CTA scaled MMA stages the full-N B scales into per-CTA 128-row TMEM, so
+    # the 5D blocked source may split the same block count differently across
+    # its rep axes; the copy lowering derives the reps from the source shape.
+    if (len(src_shape) == 5 and src_shape[0] == 1 and src_shape[3:] == [2, 256]
+            and src_shape[1] * src_shape[2] == rep_rows * rep_cols):
+        return
     assert src_shape in accepted_shapes, error_msg
 
 
@@ -1352,12 +1414,12 @@ def local_reinterpret(
     Reinterpret the dtype and shape of a buffered tensor.
 
     When ``layout`` is supplied, the descriptor is also viewed through that
-    explicit shared-memory layout. This is a zero-copy descriptor change used
-    by the Gluon CDNA4 transpose-read path: a row-major rank-3 physical image
-    is loaded by direct-to-LDS and then reinterpreted as a bank-aware rank-2 K
-    tile. With ``pin=False``, the view remains optimizer-flexible instead of
-    becoming a hard ``#tlx.user_layout`` anchor. Without ``layout`` the source
-    layout is preserved for compatibility.
+    explicit memory layout. Shared-memory layouts support the Gluon CDNA4
+    transpose-read path. Tensor memory additionally supports the scales layout
+    for byte transport into typed scaled-MMA operands. With ``pin=False``, an
+    SMEM view remains optimizer-flexible instead of becoming a hard
+    ``#tlx.user_layout`` anchor. Without ``layout`` the source layout is
+    preserved for compatibility.
     """
     layout = tl._unwrap_if_constexpr(layout)
     pin = tl._unwrap_if_constexpr(pin)
@@ -1370,15 +1432,17 @@ def local_reinterpret(
 
     encoding = None
     if layout is not None:
-        assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
-            "TLX local_reinterpret with an explicit layout only supports SMEM")
+        assert isinstance(src, tlx.buffered_tensor)
+        is_smem_layout = src.type.storage == tlx.storage_kind.smem and isinstance(layout, tlx.shared_layout_encoding)
+        is_tmem_scales_layout = (src.type.storage == tlx.storage_kind.tmem
+                                 and isinstance(layout, tlx.tensor_memory_scales_layout_encoding))
+        assert is_smem_layout or is_tmem_scales_layout, (
+            "TLX local_reinterpret only supports explicit shared-memory layouts "
+            "or the tensor-memory scales layout")
         encoding = layout.to_ir(_semantic.builder)
-        # Match local_alloc's explicit-layout contract.  Leaving the result
-        # unwrapped lets layout propagation treat a user-specified
-        # reinterpret view as inferred, and padded sources then fail the
-        # MemDescReinterpret verifier before placeholder layouts are
-        # finalized (user-wrapped padded source versus raw padded result).
-        if pin and not getattr(layout, "_tlx_default", False):
+        # Match local_alloc's explicit-layout contract for SMEM. TMEM scales
+        # already use a concrete hardware encoding and need no user wrapper.
+        if is_smem_layout and pin and not getattr(layout, "_tlx_default", False):
             layout._tlx_user_pinned = True
             encoding = _semantic.builder.make_user_layout_attr(encoding)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
@@ -1545,6 +1609,70 @@ def async_descriptor_gather(
         result_handle,
         pred_handle,
         multicast,
+    )
+
+
+@tl.builtin
+def async_descriptor_scatter(
+    desc: tl.tensor_descriptor_base,
+    source: tlx.buffered_tensor,
+    x_offsets: tl.tensor,
+    y_offset: tl.tensor,
+    _semantic=None,
+) -> None:
+    """Asynchronously scatter rows from shared memory into global memory.
+
+    ``desc`` must describe a 2D tensor with a one-row block. ``x_offsets``
+    selects the destination row for each row of ``source``, while ``y_offset``
+    is the common column offset. Use ``async_descriptor_store_wait`` before
+    reusing the source buffer or consuming the global-memory result.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base), "desc must be a tensor descriptor"
+    arch = _semantic.builder.options.arch
+    try:
+        capability = int(cuda_parse_arch(arch))
+    except (TypeError, ValueError):
+        raise NotImplementedError(
+            f"tlx.async_descriptor_scatter is only available on Blackwell; got arch {arch!r}") from None
+    if capability < 100:
+        raise NotImplementedError(f"tlx.async_descriptor_scatter is only available on Blackwell; got arch {arch!r}")
+
+    assert isinstance(source, tlx.buffered_tensor) and source.type.storage == tlx.storage_kind.smem, (
+        "source must be a buffered tensor in SMEM")
+    assert len(desc.block_shape) == 2, f"descriptor must be 2D, but got block shape {desc.block_shape}"
+    assert int(desc.block_shape[0]) == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
+
+    assert isinstance(x_offsets, tl.tensor) and x_offsets.type.is_block(), "x_offsets must be a tensor"
+    assert len(x_offsets.shape) == 1, f"x_offsets must be 1D, but got shape {x_offsets.shape}"
+    assert x_offsets.dtype in (tl.int16,
+                               tl.int32), (f"x_offsets must have dtype int16 or int32, but got {x_offsets.dtype}")
+
+    source_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in source.shape]
+    block_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in desc.block_shape]
+    num_rows = int(tl._unwrap_if_constexpr(x_offsets.shape[0]))
+    assert source_shape == [num_rows, block_shape[1]
+                            ], (f"source shape must be [{num_rows}, {block_shape[1]}], but got {source_shape}")
+    assert source.dtype == desc.dtype, f"source dtype must match descriptor dtype {desc.dtype}, but got {source.dtype}"
+    assert num_rows >= 8, f"descriptor scatter must have at least 8 rows, but got {num_rows}"
+    assert num_rows % 4 == 0, f"descriptor scatter row count must be a multiple of 4, but got {num_rows}"
+    assert source.dtype.primitive_bitwidth <= 32, (
+        f"descriptor scatter dtype cannot be greater than 32 bits, but got {source.dtype}")
+    min_cols = 32 // source.dtype.primitive_bitwidth * 8
+    assert block_shape[1] >= min_cols, (
+        f"descriptor scatter of {source.dtype} must have at least {min_cols} columns, but got {block_shape[1]}")
+
+    if x_offsets.dtype == tl.int16:
+        x_offsets = _semantic.cast(x_offsets, tl.int32)
+    y_offset = _semantic.to_tensor(y_offset)
+    assert not y_offset.type.is_block() and y_offset.dtype.is_int(), "y_offset must be a scalar integer"
+    y_offset = _semantic.cast(y_offset, tl.int32)
+
+    source_handle = require_nv_mma_shared_layout(source, False, _semantic.builder)
+    _semantic.builder.create_async_TMA_scatter(
+        desc.handle,
+        x_offsets.handle,
+        y_offset.handle,
+        source_handle,
     )
 
 
@@ -1728,6 +1856,7 @@ def async_amd_descriptor_load(
 def async_amd_descriptor_load_fused(
     members,
     cache_modifier: str = "",
+    multicast_masks=None,
     _semantic=None,
 ) -> tlx.async_token:
     """Emit one fused AMD TDM load for two to four members.
@@ -1737,6 +1866,17 @@ def async_amd_descriptor_load_fused(
     :func:`update_tensor_descriptor` before this operation when needed. Member
     hints must be legal, pairwise-disjoint bitmasks. All members share one
     cache modifier.
+
+    ``multicast_masks`` optionally supplies a scalar integer recipient mask
+    for each member in the physical cluster, configured by ``num_ctas`` or
+    ``ctas_per_cga``. Explicit masks override layout-derived multicast.
+    Bit n selects CTA n; zero disables multicast for that member. Each mask
+    must select at most five recipients on gfx1250, including when its value
+    is computed at runtime. Each recipient must issue the same source request
+    to the same LDS offset.
+    The caller must synchronize accesses to destination shared memory across
+    recipient CTAs.
+    Omit the masks to infer multicast from distributed tensor layouts.
     """
     arch = _semantic.builder.options.arch
     assert is_amd_tdm_target(arch), (
@@ -1769,12 +1909,31 @@ def async_amd_descriptor_load_fused(
         dest_handles.append(dest.handle)
         warp_used_hints.append(int(warp_used_hint))
 
+    mask_handles = []
+    multicast_masks = tl._unwrap_if_constexpr(multicast_masks)
+    if multicast_masks is not None:
+        if len(multicast_masks) != len(members):
+            raise ValueError("fused TDM requires one multicast mask per member")
+        options = _semantic.builder.options
+        cluster_size = (options.ctas_per_cga or (options.num_ctas, 1, 1))[0]
+        for mask in multicast_masks:
+            mask = tl._unwrap_if_constexpr(mask)
+            if isinstance(mask, int) and not 0 <= mask < (1 << cluster_size):
+                raise ValueError("multicast mask names a CTA outside the cluster")
+            if isinstance(mask, int) and mask.bit_count() > 5:
+                raise ValueError("multicast masks support at most 5 recipients")
+            mask = _semantic.to_tensor(mask)
+            if mask.type.is_block() or not mask.dtype.is_int():
+                raise TypeError("multicast masks must be scalar integers")
+            mask_handles.append(_semantic.cast(mask, tl.int32).handle)
+
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     token_handle = _semantic.builder.create_async_tdm_fused_copy_global_to_local(
         desc_handles,
         dest_handles,
         warp_used_hints,
         cache,
+        mask_handles,
     )
     return tlx.async_token(token_handle)
 

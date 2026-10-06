@@ -262,7 +262,15 @@
 Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.
 
 ```python
-token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cache_modifier="")
+token = tlx.buffer_load_to_local(
+    dest,
+    ptr,
+    offsets,
+    mask=None,
+    other=None,
+    cache_modifier="",
+    contiguity=1,
+)
 ```
 
 | Argument | Type | Description |
@@ -273,6 +281,7 @@ token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cach
 | `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
 | `other` | tensor or scalar, optional | Value used for masked-out elements. |
 | `cache_modifier` | str, optional | Cache modifier string (default `""`). |
+| `contiguity` | int constexpr, optional | Trusted positive power-of-two lower bound on contiguous elements available for vectorization, including group-uniform `mask` and `other` values (default `1`). |
 
 **Returns**: A `tlx.async_token` that can be used with `tlx.async_load_wait_group()` to synchronize on the completion of the transfer.
 
@@ -282,6 +291,19 @@ Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw
 - **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
 - **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
 - **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
+
+`contiguity=N` is an opt-in correctness contract, not a speculative hint. It
+promises that each per-thread group of `N` offsets is numerically consecutive
+and suitably aligned, and that `mask` and `other`, when present, are uniform
+within each group. `N` must be a positive power of two and divide the number of
+elements owned by each thread. A false promise can change the values loaded.
+
+For `N > 1`, `dest` must be the allocation itself or a direct `local_view` of a
+user-pinned `padded_shared` layout. The compiler derives an offset layout from
+that destination, verifies that it supports an exact direct-to-LDS write, and
+only then pins the offsets, mask, and `other` to the derived layout. An
+incompatible layout is a compilation error. `contiguity=1` retains the default
+best-effort inference behavior.
 
 
 ## TDM descriptor loads
