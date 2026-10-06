@@ -1,0 +1,737 @@
+{
+ "schema_version": "prepared-joint-solution-v1",
+ "provenance": {
+  "model": "paper",
+  "ddg_sha256": "938a953dec1bc79e44c3891e2c451cbe4dcc337751db86e5e4e88c7d6eecf50c",
+  "solver_sources_sha256": "9c996b45262a0ec33fa2af162414801ce24257eb0b09c9bf723acb287e2f95cd",
+  "normalization_u": 300,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 32,
+   "warp_fixed_overhead": 0,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  },
+  "curation_source": {
+   "baseline_graph_sha256": "b556c6a72f8bae5129ad8ccc7ac1067250369789d4a9aa69afb1ebb49b7c2e1d",
+   "curator_sources_sha256": "2bef320b1288ea32a96348ecd50399b7ce2b56b561e74bfd328f90a8dcc7eac4",
+   "ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5"
+  },
+  "experiment_inputs": {
+   "allow_cross_warp": true,
+   "num_warps_override": null,
+   "reg_budget": null
+  },
+  "preparation": {
+   "regime": "prepared",
+   "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+   "curated_ddg_sha256": "938a953dec1bc79e44c3891e2c451cbe4dcc337751db86e5e4e88c7d6eecf50c",
+   "raw_ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5",
+   "assumptions": {
+    "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+    "a2_issue_width": 128,
+    "a2_elementwise_dialects": [
+     "arith",
+     "math"
+    ],
+    "a3_async_tokens_keep_measured_cost": true,
+    "a4_tmem_functional_unit": "TMEM",
+    "b1_cluster_tolerance": [
+     11,
+     10
+    ],
+    "b2_floor_divisor": 32,
+    "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+    "b4_second_objective": "maximize sum(C') at F = F*",
+    "b5_u": 300
+   },
+   "health": {
+    "pool_size": 129,
+    "positive_entries": 112,
+    "collapsed_entries": 18,
+    "collapse_ratio": 0.1607,
+    "survivor_spread": 22.0,
+    "distinct_survivors": [
+     1,
+     2,
+     3,
+     4,
+     7,
+     10,
+     14,
+     22
+    ],
+    "objective_f": 348,
+    "first_stage_sum": 16,
+    "second_stage_sum": 272,
+    "u": 300,
+    "clusters": 16
+   },
+   "b5_u_applied": 300
+  }
+ },
+ "attempts": [
+  {
+   "ii": 1,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 2,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 3,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 4,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 5,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 6,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 7,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 8,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 9,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 10,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 11,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 12,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 13,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 14,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 15,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 16,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 17,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 18,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 19,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 20,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 21,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 22,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 23,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 24,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 25,
+   "L": 55,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.1
+  },
+  {
+   "ii": 25,
+   "L": 56,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.2
+  },
+  {
+   "ii": 25,
+   "L": 57,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.3
+  },
+  {
+   "ii": 25,
+   "L": 58,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.3
+  },
+  {
+   "ii": 25,
+   "L": 59,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.4
+  },
+  {
+   "ii": 25,
+   "L": 60,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.4
+  },
+  {
+   "ii": 25,
+   "L": 61,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.4
+  },
+  {
+   "ii": 25,
+   "L": 62,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.5
+  },
+  {
+   "ii": 25,
+   "L": 63,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.5
+  },
+  {
+   "ii": 25,
+   "L": 64,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.5
+  },
+  {
+   "ii": 25,
+   "L": 65,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.5
+  },
+  {
+   "ii": 25,
+   "L": 66,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.6
+  },
+  {
+   "ii": 25,
+   "L": 67,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.6
+  },
+  {
+   "ii": 25,
+   "L": 68,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.7
+  },
+  {
+   "ii": 25,
+   "L": 69,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.7
+  },
+  {
+   "ii": 25,
+   "L": 70,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.8
+  },
+  {
+   "ii": 25,
+   "L": 71,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 3.0
+  },
+  {
+   "ii": 25,
+   "L": 72,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 2.9
+  },
+  {
+   "ii": 25,
+   "L": 73,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 3.0
+  },
+  {
+   "ii": 25,
+   "L": 74,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 3.0
+  },
+  {
+   "ii": 25,
+   "L": 75,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 3.0
+  },
+  {
+   "ii": 26,
+   "L": 52,
+   "stage": "joint",
+   "result": "sat",
+   "seconds": 4.3
+  }
+ ],
+ "wall_s": 116.9,
+ "status": "sat",
+ "satisfiable": true,
+ "ii": 26,
+ "length": 52,
+ "copies": 2,
+ "horizon": 78,
+ "cycles": {
+  "2": 0,
+  "3": 39,
+  "4": 39,
+  "5": 0,
+  "6": 0,
+  "7": 0,
+  "8": 22,
+  "9": 25,
+  "10": 28,
+  "11": 28,
+  "12": 28,
+  "13": 29,
+  "14": 27,
+  "15": 28,
+  "16": 28,
+  "17": 28,
+  "18": 29,
+  "19": 37,
+  "20": 36,
+  "21": 39,
+  "22": 29,
+  "23": 32,
+  "24": 32,
+  "25": 27,
+  "26": 34,
+  "27": 38,
+  "28": 39,
+  "29": 48,
+  "30": 48,
+  "31": 3,
+  "32": 25,
+  "33": 29,
+  "34": 32,
+  "35": 32,
+  "36": 32,
+  "37": 35,
+  "38": 31,
+  "39": 32,
+  "40": 32,
+  "41": 32,
+  "42": 34,
+  "43": 41,
+  "44": 47,
+  "45": 49,
+  "46": 35,
+  "47": 35,
+  "48": 44,
+  "49": 37,
+  "50": 45,
+  "51": 47,
+  "52": 49,
+  "53": 36,
+  "54": 51
+ },
+ "warp_sets": {
+  "2": [
+   0
+  ],
+  "3": [
+   0
+  ],
+  "4": [
+   31
+  ],
+  "5": [
+   9
+  ],
+  "6": [
+   31
+  ],
+  "7": [
+   14
+  ],
+  "8": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "9": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "10": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "11": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "12": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "13": [
+   7,
+   9,
+   10,
+   11
+  ],
+  "14": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "15": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "16": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "17": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "18": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "19": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "20": [
+   15,
+   22,
+   25,
+   26
+  ],
+  "21": [
+   1
+  ],
+  "22": [
+   7,
+   9,
+   10,
+   11
+  ],
+  "23": [
+   5,
+   6,
+   27,
+   29
+  ],
+  "24": [
+   5,
+   6,
+   27,
+   29
+  ],
+  "25": [
+   5,
+   6,
+   27,
+   29
+  ],
+  "26": [
+   5,
+   6,
+   27,
+   29
+  ],
+  "27": [
+   2,
+   3,
+   6,
+   27
+  ],
+  "28": [
+   24
+  ],
+  "29": [
+   13,
+   28,
+   29,
+   31
+  ],
+  "30": [
+   13,
+   28,
+   29,
+   31
+  ],
+  "31": [
+   24
+  ],
+  "32": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "33": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "34": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "35": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "36": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "37": [
+   13,
+   14,
+   22,
+   31
+  ],
+  "38": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "39": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "40": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "41": [
+   2,
+   28,
+   30,
+   31
+  ],
+  "42": [
+   2,
+   20,
+   28,
+   30
+  ],
+  "43": [
+   2,
+   20,
+   28,
+   30
+  ],
+  "44": [
+   1,
+   10,
+   17,
+   28
+  ],
+  "45": [
+   1
+  ],
+  "46": [
+   13,
+   14,
+   22,
+   31
+  ],
+  "47": [
+   13,
+   14,
+   22,
+   31
+  ],
+  "48": [
+   13,
+   14,
+   22,
+   29
+  ],
+  "49": [
+   16,
+   17,
+   28,
+   29
+  ],
+  "50": [
+   13,
+   14,
+   22,
+   29
+  ],
+  "51": [
+   13,
+   14,
+   22,
+   29
+  ],
+  "52": [
+   17
+  ],
+  "53": [
+   2,
+   20,
+   28,
+   30
+  ],
+  "54": [
+   2,
+   20,
+   28,
+   30
+  ]
+ },
+ "stats": {
+  "normalization_u": 300,
+  "normalization_f": 348,
+  "profile": "paper",
+  "num_asserts": 6964,
+  "T": 78,
+  "num_warp_sets": 18,
+  "warps_used": 25,
+  "num_warps": 25,
+  "physical_warp_budget": 32,
+  "regs_per_warp": 8160,
+  "smem_capacity": 232448,
+  "tmem_capacity": 512,
+  "tmem_value_count": 6,
+  "peak_tmem_cols": 192,
+  "time_variables": 53,
+  "live_variables": 0
+ }
+}

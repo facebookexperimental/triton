@@ -23,6 +23,7 @@ from sched2tlx.schedule_graph import (
     ScheduleLoop,
 )
 from sched2tlx.emitter import (
+    RenderCtx,
     _tmem_alias_groups,
     _tmem_cyclic_occupies,
     _tmem_lifetimes_conflict,
@@ -187,10 +188,67 @@ def test_alias_groups_end_to_end():
     )
 
 
+def _rctx(g):
+    return RenderCtx(graph=g, op_var={}, buffer_var={}, alloc_op_var={}, loop_iv={})
+
+
+def test_alias_groups_serial_program_order():
+    """FA-bwd HEAD_DIM=128 regime: the skewed schedule cycles say the qkT and
+    dQ accumulators overlap ACROSS iterations (cyclic model → no alias, 544
+    TMEM cols → OutOfResources), but the emitter dropped the skew plan for
+    that WG (serial fallback) — so the emitted wg body runs iterations
+    back-to-back and program order [MMA issue .. last tmem_load] is the true
+    lifetime. Passing rctx (which carries the — here empty — skew plan) must
+    recover the alias; an ACCEPTED skew plan for the WG must suppress it."""
+    print("== _tmem_alias_groups serial-WG program order ==")
+    II = 1280
+    # Mirrors sg_hd128_depth2 (absolute-cycle convention): accA = qkT tile,
+    # prod st0@556 / cons st1@1456; accB = dQ tile, prod st1@2547 / cons
+    # st2@3447. Cyclically accB wraps into accA's window → schedule-time model
+    # says conflict.
+    accs = [
+        ("accA", 512, 0, 556, 1, 1456),
+        ("accB", 512, 1, 2547, 2, 3447),
+    ]
+    g = _build(II, accs)
+    check(
+        _tmem_alias_groups(g) == {},
+        "without rctx (schedule-time model) the pair is NOT aliased",
+    )
+    res = _tmem_alias_groups(g, _rctx(g))
+    check(
+        res.get("accA") is not None and res.get("accA") == res.get("accB"),
+        "serial WG: program-order-disjoint accumulators DO alias",
+    )
+    # An accepted skew plan for (loop0, wg0) invalidates program order.
+    rctx = _rctx(g)
+    rctx.skew_plan[(0, 0)] = {"group_of": {}, "n_groups": 2}
+    check(
+        _tmem_alias_groups(g, rctx) == {},
+        "skewed WG falls back to the schedule-time model (no alias)",
+    )
+    # Program order still detects real overlap: interleave the emitted order
+    # to (MMA_C, MMA_D, ld_C, ld_D) — overlapping windows → never aliased.
+    g2 = _build(
+        II,
+        [
+            ("accC", 512, 0, 100, 0, 700),
+            ("accD", 512, 0, 200, 0, 800),
+        ],
+    )
+    n_c_mma, n_c_ld, n_d_mma, n_d_ld = g2.loops[0].schedule.nodes
+    n_c_mma.id, n_d_mma.id, n_c_ld.id, n_d_ld.id = 0, 1, 2, 3
+    check(
+        _tmem_alias_groups(g2, _rctx(g2)) == {},
+        "program-order-overlapping accumulators are NOT aliased",
+    )
+
+
 def main():
     test_cyclic_occupies()
     test_lifetimes_conflict()
     test_alias_groups_end_to_end()
+    test_alias_groups_serial_program_order()
     print("\n=== ALL PASS ===" if ok else "\n=== FAILURES ===")
     return 0 if ok else 1
 
