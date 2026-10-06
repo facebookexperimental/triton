@@ -15,13 +15,13 @@
 module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.tensor_memory_size" = 128 : i32} {
   // CHECK-LABEL: @tcgen5_global_alloc_lowering
   // CHECK: mbarrier.init.shared::cta.b64
-  // CHECK: nvvm.cluster.arrive.relaxed {aligned}
-  // CHECK: nvvm.cluster.wait {aligned}
+  // CHECK: nvvm.cluster.arrive.relaxed aligned
+  // CHECK: nvvm.cluster.wait aligned
   // CHECK: tcgen05.alloc.cta_group::2
   // CHECK: nvvm.barrier
   // CHECK: tcgen05.relinquish_alloc_permit.cta_group::2
-  // CHECK: nvvm.cluster.arrive {aligned}
-  // CHECK: nvvm.cluster.wait {aligned}
+  // CHECK: nvvm.cluster.arrive aligned
+  // CHECK: nvvm.cluster.wait aligned
   // CHECK: tcgen05.dealloc.cta_group::2
   // ALLOC-LABEL: @tcgen5_global_alloc_lowering
   tt.func public @tcgen5_global_alloc_lowering() attributes {noinline = false} {
@@ -52,8 +52,8 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
   // CHECK: llvm.getelementptr
   // CHECK: tcgen05.alloc.cta_group::2
   // CHECK: tcgen05.relinquish_alloc_permit.cta_group::2
-  // CHECK: nvvm.cluster.arrive {aligned}
-  // CHECK: nvvm.cluster.wait {aligned}
+  // CHECK: nvvm.cluster.arrive aligned
+  // CHECK: nvvm.cluster.wait aligned
   // CHECK: tcgen05.dealloc.cta_group::2
   // ALLOC-LABEL: @tcgen5_global_alloc_no_smem_overlap
   tt.func public @tcgen5_global_alloc_no_smem_overlap(%bar: !ttg.memdesc<1xi64, #shared, #smem, mutable>) attributes {noinline = false} {
