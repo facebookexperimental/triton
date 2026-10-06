@@ -163,6 +163,13 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
+  if (auto requireOp = dyn_cast<ttg::RequireLayoutOp>(op)) {
+    assert(operandIndex == 0 && "RequireLayoutOp only has one operand");
+    auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+    return resultType &&
+           isSupportedDotConstraintEncoding(resultType.getEncoding());
+  }
+
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
@@ -178,6 +185,14 @@ public:
           !isTrackedDotValue(cvt.getResult()))
         return;
       unionLatticeAnchors<DotRewriteLattice>(cvt.getSrc(), cvt.getResult());
+    });
+    top->walk([&](ttg::RequireLayoutOp requireOp) {
+      auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+      if (!isTrackedDotValue(requireOp.getSrc()) || !resultType ||
+          !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+        return;
+      unionLatticeAnchors<DotRewriteLattice>(requireOp.getSrc(),
+                                             requireOp.getResult());
     });
   }
 
