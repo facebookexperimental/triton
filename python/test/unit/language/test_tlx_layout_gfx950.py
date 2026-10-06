@@ -1,4 +1,7 @@
 """TLX layout tests -- CDNA4 (gfx950)."""
+import math
+import re
+
 import pytest
 import torch
 import triton
@@ -197,6 +200,69 @@ def test_require_layout_pin_modes_on_cdna4():
     assert "#tlx.no_verify_layout<#linear>" in soft.asm["ttir"]
     assert "#tlx.user_layout" not in soft.asm["ttir"]
     assert "#tlx.user_layout" in hard.asm["ttir"]
+
+
+@triton.jit
+def _wave_local_scratch_reuse_kernel(X, Y, valid_rows, iterations):
+    # Flat offsets are row * 128 + col. The low six thread bits are lanes;
+    # both layouts keep the warp bases [[0, 32], [32, 0]].
+    source: tl.constexpr = tlx.layout(
+        shape=((32, 2, 2, 2), (4, 4, 2)),
+        stride=((128, 4, 32, 4096), (1, 8, 64)),
+    )
+    dest: tl.constexpr = tlx.layout(
+        shape=((4, 16, 2, 2), (8, 2, 2)),
+        stride=((8, 128, 32, 4096), (1, 2048, 64)),
+    )
+    rows = tl.arange(0, 64)[:, None]
+    cols = tl.arange(0, 128)[None, :]
+    base = tl.program_id(0) * 4 * 64 * 128
+    for iteration in range(iterations):
+        for part in tl.static_range(4):
+            offsets = base + part * 64 * 128 + rows * 128 + cols
+            src_offsets = tlx.require_layout(offsets, source)
+            src_mask = tlx.require_layout(tl.broadcast_to(rows < valid_rows, (64, 128)), source)
+            # Preserve source ownership through the load; each thread owns
+            # groups of four contiguous BF16 elements.
+            value = tlx.buffer_load(X, src_offsets, src_mask, other=0, contiguity=4)
+            value = (value.to(tl.float32) + iteration).to(tl.bfloat16)
+            # Both boundaries are hard pins so layout propagation cannot remove
+            # the conversion or change its per-wave scratch partition.
+            value = tlx.require_layout(value, source)
+            converted = tlx.require_layout(value, dest)
+            tl.store(Y + offsets, converted, rows < valid_rows)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("valid_rows", [1, 17, 31, 32, 33, 63, 64])
+@pytest.mark.parametrize("iterations", [1, 3, 11])
+def test_convert_layout_wave_local_scratch_reuse(valid_rows, iterations):
+    # Repeated conversions must order each wave's loads before reusing its
+    # physical scratch partition, including across the runtime loop backedge.
+    shape = (32, 4, 64, 128)
+    count = math.prod(shape)
+    inp_cpu = ((torch.arange(count, dtype=torch.int32) * 17 + 31) % 251 - 125).to(torch.bfloat16).reshape(shape)
+    inp = inp_cpu.to(DEVICE)
+    raw_output = torch.full((count + 128, ), 256, dtype=torch.bfloat16, device=DEVICE)
+    output = raw_output[64:-64].view(shape)
+    compiled = _wave_local_scratch_reuse_kernel[(32, )](inp, output, valid_rows, iterations, num_warps=4)
+
+    expected = torch.full((count + 128, ), 256, dtype=torch.bfloat16)
+    expected[64:-64].view(shape)[:, :, :valid_rows, :] = inp_cpu[:, :, :valid_rows, :] + (iterations - 1)
+    # Every value is an exactly representable BF16 integer. Check valid outputs,
+    # untouched masked rows, and 64-element guards at both ends.
+    torch.testing.assert_close(raw_output.cpu(), expected, atol=0, rtol=0)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+    # Keep this on the wave-local LDS path if conversion lowering changes.
+    asm = compiled.asm["amdgcn"]
+    assert re.search(r"\bds_write", asm)
+    assert re.search(r"\bds_read", asm)
+    assert "call void @llvm.amdgcn.wave.barrier()" in compiled.asm["llir"]
+    # All conversions must reuse one tile's scratch image. Extra conversions
+    # or CTA rendezvous between unrolled parts could hide the reuse hazard;
+    # only the runtime loop backedge may require a CTA barrier.
+    assert compiled.metadata.shared == 64 * 128 * inp.element_size()
+    assert len(re.findall(r"\bs_barrier\b", asm)) <= 1
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")

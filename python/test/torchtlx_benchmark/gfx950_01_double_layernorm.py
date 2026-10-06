@@ -23,15 +23,17 @@ RTOL = 2.0e-2
 M = 1024
 N = 6144
 EPS = 1.0e-5
+SHAPES = ({"m": M, "n": N, "dtype": "fp16"}, )
 
 
 def add_arguments(parser) -> None:
-    parser.add_argument("--n", type=int, default=N)
+    parser.add_argument("--n", type=int)
 
 
 def configure(args) -> None:
     global N
-    N = args.n
+    if args.n is not None:
+        N = args.n
 
 
 def problem() -> str:

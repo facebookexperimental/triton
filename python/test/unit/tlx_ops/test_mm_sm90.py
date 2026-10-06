@@ -11,7 +11,6 @@ from triton.tlx.ops.kernels.mm._shapes import SM90_FOCUS, SYNTHETIC
 
 from mm_test_utils import REL_PRECISION, run_mm_case
 
-
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
 ARCH = "sm90"
@@ -95,7 +94,7 @@ def test_rejects_unknown_space():
 def test_rejects_unaligned_operand():
     from triton.tlx.ops import mm as tlx_mm
 
-    storage = torch.randn((256 * 128 + 1,), device="cuda", dtype=torch.float16)
+    storage = torch.randn((256 * 128 + 1, ), device="cuda", dtype=torch.float16)
     a = storage[1:].view(256, 128)
     _, b = _inputs()
     assert a.is_contiguous() and a.data_ptr() % 16 != 0
@@ -107,7 +106,7 @@ def test_rejects_unaligned_out():
     from triton.tlx.ops import mm as tlx_mm
 
     a, b = _inputs()
-    storage = torch.empty((256 * 256 + 1,), device="cuda", dtype=torch.float16)
+    storage = torch.empty((256 * 256 + 1, ), device="cuda", dtype=torch.float16)
     out = storage[1:].view(256, 256)
     assert out.is_contiguous() and out.data_ptr() % 16 != 0
     with pytest.raises(InvalidInput, match="16-byte-aligned output"):

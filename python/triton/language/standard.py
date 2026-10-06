@@ -351,7 +351,7 @@ def reduce_or(input, axis, keep_dims=False):
 @core._tensor_member_fn
 @jit
 @core._add_scan_docstr("cumsum", dtype_arg="dtype")
-def cumsum(input, axis=0, reverse=False, dtype: core.constexpr = None):
+def cumsum(input, axis=0, reverse=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
     # todo rename this to a generic function name
 
     input = core._promote_bfloat16_to_float32(input)
@@ -360,7 +360,7 @@ def cumsum(input, axis=0, reverse=False, dtype: core.constexpr = None):
     if out_dtype is not None:
         input = input.to(out_dtype)
 
-    return core.associative_scan(input, axis, _sum_combine, reverse)
+    return core.associative_scan(input, axis, _sum_combine, reverse, reduction_ordering=reduction_ordering)
 
 
 # cumprod
@@ -374,10 +374,10 @@ def _prod_combine(a, b):
 @core._tensor_member_fn
 @jit
 @core._add_scan_docstr("cumprod")
-def cumprod(input, axis=0, reverse=False):
+def cumprod(input, axis=0, reverse=False, reduction_ordering: core.constexpr = None):
     # todo rename this to a generic function name
     input = core._promote_bfloat16_to_float32(input)
-    return core.associative_scan(input, axis, _prod_combine, reverse)
+    return core.associative_scan(input, axis, _prod_combine, reverse, reduction_ordering=reduction_ordering)
 
 
 # sort

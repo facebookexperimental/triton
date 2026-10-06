@@ -48,9 +48,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws_cooperative",
         impl="triton.tlx.ops.kernels.mm.sm90:mm",
         dtypes=_FP16,
-        accepts=lambda d: all(
-            s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]
-        ),
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
     ),
     OpSpec(
@@ -92,6 +90,24 @@ CATALOG: tuple[OpSpec, ...] = (
         # LocalSplitU and persistent plans remain FP16-only; the register and
         # general LDS paths also support BF16 and validate their own plans.
         dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="grouped_gemm",
+        arch="sm100",
+        variant="ws",
+        impl="triton.tlx.ops.kernels.grouped_gemm.sm100:grouped_gemm",
+        dtypes=frozenset({"float16"}),
+        accepts=lambda d: all(stride * d["elem_bytes"] % 16 == 0
+                              for stride in d["row_strides"]) and all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="grouped_gemm",
+        arch="gfx950",
+        variant="heuristic",
+        impl="triton.tlx.ops.kernels.grouped_gemm.gfx950:grouped_gemm",
+        dtypes=frozenset({"float16"}),
         requires=frozenset(),
     ),
     OpSpec(
@@ -170,6 +186,16 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset({"tma", "tmem"}),
         supports_backward=True,
+    ),
+    OpSpec(
+        op="flash_attn_mxfp8",
+        arch="gfx950",
+        variant="mfma_mxfp8",
+        impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950:flash_attn_mxfp8",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
+        requires=frozenset(),
+        supports_backward=False,
     ),
     OpSpec(
         op="hstu_attn_dev",

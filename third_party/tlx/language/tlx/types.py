@@ -525,8 +525,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
 @tl.builtin
 def make_tensor_memory_layout(block_m: tl.constexpr, block_n: tl.constexpr, _semantic=None):
     return tensor_memory_layout_encoding.make_default(
-        (tl._unwrap_if_constexpr(block_m), tl._unwrap_if_constexpr(block_n))
-    )
+        (tl._unwrap_if_constexpr(block_m), tl._unwrap_if_constexpr(block_n)))
 
 
 class tensor_memory_scales_layout_encoding:

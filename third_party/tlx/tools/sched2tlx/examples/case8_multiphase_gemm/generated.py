@@ -42,6 +42,13 @@ def triple_gemm_nows(
 
     # ── Phase pool: sibling phases' SMEM rings share bytes ──
     smem_pool = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    # L2's depth-3 ring is declared first: SMEM backing is sized by the
+    # first member's count, and L2 slot 2 overflows a depth-2 backing.
+    # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
+    # inner-loop buf 0: SMEM count=3 (modulo lifetime [556..1145], II=256; phase pool member (smem_pool))
+    L2_smem_0 = tlx.local_alloc((128, 64), tl.bfloat16, 3, reuse=smem_pool)
+    # inner-loop buf 1: SMEM count=3 (modulo lifetime [586..1145], II=256; phase pool member (smem_pool))
+    L2_smem_1 = tlx.local_alloc((64, 128), tl.bfloat16, 3, reuse=smem_pool)
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
     # inner-loop buf 0: SMEM count=2 (modulo lifetime [652..1582], II=512; phase pool member (smem_pool))
     L0_smem_0 = tlx.local_alloc((128, 128), tl.float16, 2, reuse=smem_pool)
@@ -52,11 +59,6 @@ def triple_gemm_nows(
     L1_smem_0 = tlx.local_alloc((128, 128), tl.float16, 2, reuse=smem_pool)
     # inner-loop buf 1: SMEM count=2 (modulo lifetime [682..1582], II=512; phase pool member (smem_pool))
     L1_smem_1 = tlx.local_alloc((128, 128), tl.float16, 2, reuse=smem_pool)
-    # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
-    # inner-loop buf 0: SMEM count=3 (modulo lifetime [556..1145], II=256; phase pool member (smem_pool))
-    L2_smem_0 = tlx.local_alloc((128, 64), tl.bfloat16, 3, reuse=smem_pool)
-    # inner-loop buf 1: SMEM count=3 (modulo lifetime [586..1145], II=256; phase pool member (smem_pool))
-    L2_smem_1 = tlx.local_alloc((64, 128), tl.bfloat16, 3, reuse=smem_pool)
     smem_pool.set_buffer_overlap(tlx.reuse_group(tlx.reuse_group(L0_smem_0, L0_smem_1, group_type=tlx.reuse_group_type.distinct), tlx.reuse_group(L1_smem_0, L1_smem_1, group_type=tlx.reuse_group_type.distinct), tlx.reuse_group(L2_smem_0, L2_smem_1, group_type=tlx.reuse_group_type.distinct), group_type=tlx.reuse_group_type.shared))
     acc_tmem_6 = tlx.local_alloc((128, 128), tl.float32, 1, tlx.storage_kind.tmem)
     acc_tmem_7 = tlx.local_alloc((128, 128), tl.float32, 1, tlx.storage_kind.tmem)

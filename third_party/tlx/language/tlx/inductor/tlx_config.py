@@ -36,7 +36,6 @@ allow_min_speedup: float = float(
     os.environ.get("TORCHINDUCTOR_TLX_ALLOW_MIN_SPEEDUP", "1.0")
 )
 
-
 @contextmanager
 def patch(**kwargs: object) -> Generator[None, None, None]:
     """Context manager to temporarily override TLX config values."""

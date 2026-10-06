@@ -47,14 +47,14 @@ createPinnedRegisterLayoutBoundary(TritonOpBuilder &builder, Value src,
                                    Attribute encoding) {
   auto srcType = cast<RankedTensorType>(src.getType());
   Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
-  auto pinnedType = srcType.cloneWithEncoding(tlx::wrapNoVerifyLayout(
-      tlx::wrapUserLayout(physicalEncoding)));
+  auto pinnedType = srcType.cloneWithEncoding(
+      tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(physicalEncoding)));
   return builder.create<tlx::RequireLayoutOp>(pinnedType, src);
 }
 
 // Producers that already have a concrete register encoding can materialize the
-// durable TTG boundary immediately. Keeping their result wrapper-free avoids
-// hiding physical encodings from strict consumers such as scheduled MFMA.
+// durable TTG boundary immediately. Verification stays deferred through helper
+// inlining until the TLX placeholder resolver removes the layout wrapper.
 static ttg::RequireLayoutOp
 createPinnedProducerLayoutBoundary(TritonOpBuilder &builder, Value src,
                                    Attribute encoding) {
@@ -305,6 +305,11 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false,
           py::arg("late_address_compute") = false)
+      .def("has_pinned_layout",
+           [](TritonOpBuilder &, Value &v) -> bool {
+             auto type = dyn_cast<RankedTensorType>(v.getType());
+             return type && containsPinnedEncoding(type.getEncoding());
+           })
       .def(
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -313,11 +318,10 @@ void init_triton_tlx_ir(py::module_ &m) {
             // user pin with the same SSA boundary used by every other source.
             Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
             auto resultType = RankedTensorType::get(
-                shape, elementType,
-                tlx::wrapNoVerifyLayout(physicalEncoding));
+                shape, elementType, tlx::wrapNoVerifyLayout(physicalEncoding));
             Value result = self.createOrFold<tt::SplatOp>(resultType, scalar);
             return createPinnedProducerLayoutBoundary(self, result,
-                                                        physicalEncoding);
+                                                      physicalEncoding);
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
@@ -397,10 +401,9 @@ void init_triton_tlx_ir(py::module_ &m) {
                 load->setAttr("tlx.rematerialize_coordinates",
                               self.getBuilder().getUnitAttr());
               if (rematerializeCoordinatesGroup)
-                load->setAttr(
-                    "tlx.rematerialize_coordinates_group",
-                    self.getBuilder().getI32IntegerAttr(
-                        *rematerializeCoordinatesGroup));
+                load->setAttr("tlx.rematerialize_coordinates_group",
+                              self.getBuilder().getI32IntegerAttr(
+                                  *rematerializeCoordinatesGroup));
               return load;
             };
 
@@ -416,8 +419,8 @@ void init_triton_tlx_ir(py::module_ &m) {
                 subViewType.getShape(), subViewType.getElementType(),
                 tlx::wrapNoVerifyLayout(physicalEncoding));
             auto load = createLoad(rawType);
-            return createPinnedProducerLayoutBoundary(
-                self, load.getResult(), physicalEncoding);
+            return createPinnedProducerLayoutBoundary(self, load.getResult(),
+                                                      physicalEncoding);
           },
           py::arg("subView"), py::arg("asyncToken").none(),
           py::arg("layoutEncoding") = std::nullopt,
@@ -1068,7 +1071,7 @@ void init_triton_tlx_ir(py::module_ &m) {
             if (!userLayout)
               return loadOp;
             return createPinnedProducerLayoutBoundary(self, loadOp,
-                                                        physicalEncoding);
+                                                      physicalEncoding);
           },
           py::arg("subView"), py::arg("layoutEncoding"),
           py::arg("asyncToken").none(), py::arg("userLayout") = false)
@@ -1695,13 +1698,14 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def(
           "create_buffer_store",
           [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
-             std::optional<Value> mask, tt::CacheModifier cache) {
-            self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                             Value() /*stride*/, cache,
-                                             mask.value_or(Value()));
+             std::optional<Value> mask, tt::CacheModifier cache,
+             uint32_t contiguity) -> OpState {
+            return self.create<ttag::BufferStoreOp>(
+                storedValue, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), contiguity);
           },
           py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
-          py::arg("mask").none(), py::arg("cache"))
+          py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
       .def(
           "create_buffer_atomic_rmw",
           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,

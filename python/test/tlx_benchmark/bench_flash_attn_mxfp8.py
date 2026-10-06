@@ -38,16 +38,32 @@ def shapes(synthetic: bool = False, suites=None) -> list:
     return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
+def _directions(arch) -> tuple[str, ...]:
+    """Backward cases exist only on an arch whose catalog entry implements them.
+
+    gfx950 is forward only. A backward case there fails before launch with
+    UnsupportedBackward, which the nightly perf job records as an error for
+    every shape.
+    """
+    if arch is None:
+        return DIRECTIONS
+    from triton.tlx.ops._catalog import CATALOG
+
+    backward = any(spec.op == OP and spec.arch == arch and spec.supports_backward for spec in CATALOG)
+    return DIRECTIONS if backward else ("fwd", )
+
+
 def cases(synthetic: bool = False, suites=None) -> list[Case]:
+    arch = driver.arch()
     return [
         Case(
             op=OP,
-            arch=driver.arch(),
+            arch=arch,
             dtype=str(DTYPES[entry[5]]).removeprefix("torch."),
             shape=tuple(entry[:5]),
             direction=direction,
             label=label(*entry, direction),
-        ) for entry in shapes(synthetic, suites) for direction in DIRECTIONS
+        ) for entry in shapes(synthetic, suites) for direction in _directions(arch)
     ]
 
 

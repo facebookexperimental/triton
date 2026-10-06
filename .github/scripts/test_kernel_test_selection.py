@@ -43,7 +43,6 @@ def test_classify_kernel_and_tests():
     assert classify("third_party/tlx/tutorials/hstu_self_attn/stubs.py") == "kernel"
     assert classify("third_party/tlx/tutorials/testing/test_correctness.py") == "test"
     assert classify("third_party/tlx/tutorials/test_self_attention_bwd.py") == "test"
-    assert classify("third_party/tlx/tutorials/blackwell-grouped-gemm_test.py") == "test"
     assert classify(HSTU_TEST) == "test"
 
 
