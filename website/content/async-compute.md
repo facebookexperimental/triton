@@ -264,7 +264,7 @@ for k in native_k_fragments:
 
 This source order round-robins a K slice over independent accumulators before
 returning to the same dependency chain. LLVM may still reschedule independent
-instructions on the transient intrinsic path.
+instructions on both intrinsic paths.
 
 To schedule output regions independently, slice the corresponding operands
 and carry a separate accumulator for each region. Each scheduled call updates
@@ -281,7 +281,7 @@ repetition per wave. Matrix shapes and per-wave native fragments must match.
 | Argument | Meaning |
 |----------|---------|
 | `accumulator_role="transient"` | Phase-local chain lowered through LLVM-visible MFMA intrinsics, so LLVM models latency and hazards. |
-| `accumulator_role="persistent"` | Chain carried across phases and lowered through register-constrained, side-effecting inline assembly. |
+| `accumulator_role="persistent"` | Chain carried across phases, using native MFMA intrinsics and side-effecting register-class pins. |
 | `resident_operand=None` | No persistent source operand is selected for AGPR placement. |
 | `resident_operand=0` / `1` | On the persistent path, select `a` / `b` for AGPR placement; the other source uses VGPRs. |
 | `accumulator_register_class=None` | `auto`: persistent work uses AGPR; transient placement is left to LLVM. |
@@ -296,16 +296,13 @@ when a transient source needs an explicit allocation point. Set
 earlier accumulated value will be discarded. When carrying independent output
 subtiles, apply this initialization rule to each accumulator separately.
 
-Because LLVM cannot model the latency or hazards of an MFMA hidden in inline
-assembly, unproven persistent chains retain target-specific input padding and
-per-update result drains. On gfx950, the compiler may defer those drains for a
-proven persistent AGPR or VGPR chain ending at a matching `amd_mfma_commit`
-boundary. After scheduling and register allocation, it repairs source,
-accumulator, and EXEC hazards and inserts any required waits before
-physical-register reads or overwrites of outstanding results. Other supported
-targets retain conservative waits for persistent chains. Those waits and the
-inline-assembly representation are implementation details and should be
-included when comparing the two roles.
+LLVM models MFMA latency and hazards through native intrinsics for both roles.
+Persistent register-class pins use inline assembly without hiding the MFMA
+arithmetic. When results can reach opaque consumers, the compiler adds
+target-specific completion waits. Explicit `amd_mfma_commit` boundaries retain
+their register constraints and waits, including for adjacent commits. Register
+pins constrain allocation at a point; they do not guarantee exact machine
+instruction order or prevent spills.
 
 | Target | MFMA layout | Native instruction shapes | Persistent accumulator |
 |--------|-------------|---------------------------|------------------------|
