@@ -1556,9 +1556,13 @@ def test_amd_gemm_v9_beyond_hotloop_is_deterministic():
     b = torch.randn((N, K), device=DEVICE, dtype=torch.float16).T
     reference = torch.matmul(a, b)
 
+    first = _amd_gemm_v9_beyond_hotloop(a, b)
+    # GEMM implementations can accumulate in a different order. Check
+    # numerical correctness separately from bitwise launch determinism.
+    torch.testing.assert_close(first, reference)
     for _ in range(5):
         actual = _amd_gemm_v9_beyond_hotloop(a, b)
-        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+        torch.testing.assert_close(actual, first, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=["fp16"])

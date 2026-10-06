@@ -882,14 +882,14 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 //===----------------------------------------------------------------------===//
 
 def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
-  let summary = "Execute source-scheduled independent native MFMA fragments";
+  let summary = "Execute native MFMA fragments with explicit lifetime contracts";
   let description = [{
-    Computes the full per-wave Cartesian product of the native
-    fragments in `a` and `b`, replacing every corresponding fragment in `acc`.
-    Native instructions are emitted in
-    K-major, N-major, M-minor order. This round-robins each K slice over the
-    independent output fragments before returning to an accumulator dependency
-    chain, while preserving one SSA chain per output fragment.
+    Computes the full per-wave Cartesian product of the native fragments in
+    `a` and `b`, replacing every corresponding fragment in `acc`. Native
+    MFMA intrinsics are created in K-major, N-major, M-minor order. This
+    round-robins each K slice over the independent output fragments before
+    returning to an accumulator dependency chain, while preserving one SSA
+    chain per output fragment. LLVM determines the final instruction schedule.
 
     On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
     `rhs` and selects an input to constrain to AGPRs; the other input uses
@@ -902,15 +902,14 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     selects AGPRs, while an explicit class supports kernels whose persistent
     accumulator sets intentionally occupy complementary register classes. The
     transient intrinsic path leaves physical accumulator placement to LLVM.
-    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
-    drain, so any AGPR accumulator request is rejected, including persistent
-    `auto`: a persistent accumulator must request `vgpr`.
-    `initialize` starts the updated native accumulators from zero.
-    To interleave work between output subtiles, use separate operations with
-    explicit input panels and independent accumulator tensors. Commit those
-    chains before joining their results into a larger output tile.
-    Completion of transient result fragments is represented separately by
-    `mfma_commit`.
+    CDNA3 retains its VGPR-only accumulator contract and rejects any AGPR
+    accumulator request, including persistent `auto`: a persistent accumulator
+    must request `vgpr`.
+    `initialize` starts the native accumulators from zero. To interleave work
+    between output subtiles, use separate operations with explicit input panels
+    and independent accumulator tensors. Commit those chains before joining
+    their results into a larger output tile. Completion of transient result
+    fragments is represented separately by `mfma_commit`.
 
     An AGPR-resident accumulator must not reach an `mfma_commit` that also
     carries a live dot operand: that boundary constrains its F32 results to
@@ -918,9 +917,31 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     boundary's hazard padding. Lowering reports this whenever the producing
     `scheduled_mfma` is visible from the commit.
 
-    All active lanes of a wave must execute this operation uniformly. This is
-    an explicit source contract because LLVM inline assembly cannot represent
-    a convergent-call attribute on the pinned compiler revision.
+    Both accumulator roles lower arithmetic to native ROCDL MFMA intrinsics.
+    Persistent operand register classes are constrained with inline
+    assembly. Persistent accumulator tuples are pinned after all K updates;
+    nonconstant input accumulators are also pinned before the updates when
+    `initialize` is false. These side-effecting accumulator pins constrain
+    compiler-side ordering. Kernel chains with only native consumers and no
+    calls retain empty pins that provide no hardware wait. If a persistent
+    result reaches opaque inline assembly or an unmodeled escape, including
+    through potentially aliasing memory reloads, without a sufficient explicit
+    `mfma_commit`, affected result pins include a target-specific completion
+    wait. Non-kernel helpers and functions with remaining calls conservatively
+    complete every persistent result at its pin, including unused fragments.
+
+    Functions containing persistent MFMAs also prefix nonempty opaque inline
+    assembly with the largest required completion delay in that function. This
+    includes pure assembly and writers unrelated to the result: register reuse
+    can otherwise overlap an MFMA's in-flight accesses after a result becomes
+    dead or partially unused. Keeping the delay inside the assembly preserves
+    it through LLVM scheduling. Empty register pins and compiler-owned commits
+    retain their separate handling. These conservative rules may add redundant
+    waits around opaque code; MFMA arithmetic remains native, and the waits are
+    not memory fences.
+
+    All active lanes of a wave must execute this operation uniformly. This
+    source contract covers the native arithmetic and register-pinning boundaries.
 
     The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
     CDNA4. Operands and accumulator must have matching rank two or three.

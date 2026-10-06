@@ -3,11 +3,15 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -15,239 +19,14 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
-#include <type_traits>
-
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/AMDGPUAddrSpace.h"
+#include <type_traits>
 
 using mlir::triton::amdgpu::ISAFamily;
 using ::mlir::triton::gpu::MemDescType;
 
 namespace {
-
-constexpr StringLiteral kMfmaRepairHazardsAfterRaAttr =
-    "ttg.amdg.scheduled_mfma.repair_hazards_after_ra";
-constexpr StringLiteral kMfmaDeferResultDrainAttr =
-    "ttg.amdg.scheduled_mfma.defer_result_drain";
-constexpr StringLiteral kMfmaCommitDrainCoveredAttr =
-    "ttg.amdg.mfma_commit.drain_covered";
-
-// `auto` derives storage from the role alone, identically on every target.
-// Targets that cannot honor it reject it in the verifier.
-static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
-  StringRef storage = op.getAccumulatorRegisterClass();
-  if (storage != "auto")
-    return storage;
-  return op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
-}
-
-static std::optional<StringRef>
-getModeledPersistentAccumulatorClass(triton::amdgpu::ScheduledMfmaOp op) {
-  auto accTy = op.getAcc().getType();
-  auto mfma = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
-  if (!mfma || mfma.getVersion() != 4)
-    return std::nullopt;
-  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
-  bool hasModeledGfx950Shape = instrShape == ArrayRef<unsigned>({16, 16, 32}) ||
-                               instrShape == ArrayRef<unsigned>({32, 32, 16});
-  if (!hasModeledGfx950Shape || op.getAccumulatorRole() != "persistent")
-    return std::nullopt;
-  StringRef accumulatorClass = resolveAccumulatorStorage(op);
-  if (accumulatorClass != "agpr" && accumulatorClass != "vgpr")
-    return std::nullopt;
-  return accumulatorClass;
-}
-
-static bool commitEmitsAccumulatorClass(triton::amdgpu::MfmaCommitOp commit,
-                                        StringRef accumulatorClass) {
-  bool hasLiveDependency = false;
-  for (Value input : commit.getInputs()) {
-    Type elementType = cast<RankedTensorType>(input.getType()).getElementType();
-    if (elementType.isF32())
-      continue;
-    if (!elementType.isBF16() && !elementType.isF16())
-      return false;
-    hasLiveDependency = true;
-  }
-  return accumulatorClass == (hasLiveDependency ? "vgpr" : "agpr");
-}
-
-// Return true when every finite CFG path starting in `block` executes one of
-// the proven completion boundaries. Revisiting an active block is a loop
-// backedge; its exits are checked by the original visit.
-static bool allPathsFromBlockReachCommit(
-    Block *block, const llvm::DenseSet<Operation *> &commits,
-    llvm::DenseSet<Block *> &active, llvm::DenseSet<Block *> &proven) {
-  if (proven.contains(block))
-    return true;
-  if (!active.insert(block).second)
-    return true;
-
-  for (Operation &op : *block) {
-    if (commits.contains(&op)) {
-      active.erase(block);
-      proven.insert(block);
-      return true;
-    }
-  }
-
-  Operation *terminator = block->getTerminator();
-  if (terminator->getNumSuccessors() == 0) {
-    active.erase(block);
-    return false;
-  }
-  for (Block *successor : terminator->getSuccessors()) {
-    if (!allPathsFromBlockReachCommit(successor, commits, active, proven)) {
-      active.erase(block);
-      return false;
-    }
-  }
-  active.erase(block);
-  proven.insert(block);
-  return true;
-}
-
-static bool
-allPathsAfterRootReachCommit(Value root,
-                             const llvm::DenseSet<Operation *> &commits) {
-  Operation *producer = root.getDefiningOp();
-  if (!producer)
-    return false;
-
-  for (Operation *op = producer->getNextNode(); op; op = op->getNextNode()) {
-    if (commits.contains(op))
-      return true;
-  }
-
-  Operation *terminator = producer->getBlock()->getTerminator();
-  if (terminator->getNumSuccessors() == 0)
-    return false;
-  llvm::DenseSet<Block *> active;
-  llvm::DenseSet<Block *> proven;
-  for (Block *successor : terminator->getSuccessors()) {
-    if (!allPathsFromBlockReachCommit(successor, commits, active, proven))
-      return false;
-  }
-  return true;
-}
-
-static bool blockCanReach(Block *source, Block *target) {
-  SmallVector<Block *> worklist{source};
-  llvm::DenseSet<Block *> visited;
-  while (!worklist.empty()) {
-    Block *block = worklist.pop_back_val();
-    if (!visited.insert(block).second)
-      continue;
-    if (block == target)
-      return true;
-    llvm::append_range(worklist, block->getSuccessors());
-  }
-  return false;
-}
-
-static bool
-blockArgumentHasOnlyChainInputs(BlockArgument argument,
-                                const llvm::DenseSet<Value> &chainValues,
-                                Block *chainRootBlock) {
-  Block *block = argument.getOwner();
-  bool sawIncomingValue = false;
-  for (Block *predecessor : block->getPredecessors()) {
-    auto branch = dyn_cast<BranchOpInterface>(predecessor->getTerminator());
-    if (!branch)
-      return false;
-    for (auto [successorIndex, successor] :
-         llvm::enumerate(branch->getSuccessors())) {
-      if (successor != block)
-        continue;
-      SuccessorOperands operands = branch.getSuccessorOperands(successorIndex);
-      if (argument.getArgNumber() < operands.getProducedOperandCount())
-        return false;
-      unsigned forwardedIndex =
-          argument.getArgNumber() - operands.getProducedOperandCount();
-      ValueRange forwarded = operands.getForwardedOperands();
-      if (forwardedIndex >= forwarded.size())
-        return false;
-      if (!chainValues.contains(forwarded[forwardedIndex])) {
-        // A loop header may be seeded before the chain root ever executes.
-        // Other non-chain inputs are unsafe once the root can reach their edge.
-        if (blockCanReach(chainRootBlock, predecessor))
-          return false;
-      }
-      sawIncomingValue = true;
-    }
-  }
-  return sawIncomingValue;
-}
-
-// Persistent scheduled MFMAs use inline assembly, so LLVM cannot infer their
-// source and destination hazards. Prove that a persistent result remains
-// inside one linear, register-class-stable accumulator chain until an explicit
-// completion boundary that emits the same class.
-// Eligible MFMAs are marked for exact post-RA input-hazard repair. A dataflow
-// fork fails closed and every control-flow path must reach a commit. The final
-// post-RA repair drains any physical register access introduced while lowering
-// a proven CFG edge before it reads or overwrites the accumulator result.
-static bool hasLinearMfmaChainToCommit(
-    Value root, StringRef accumulatorClass,
-    llvm::DenseSet<Value> *provenCommitInputs = nullptr) {
-  SmallVector<Value> worklist{root};
-  llvm::DenseSet<Value> visited;
-  llvm::DenseSet<Operation *> commits;
-  llvm::DenseSet<Value> commitInputs;
-  while (!worklist.empty()) {
-    Value value = worklist.pop_back_val();
-    if (!visited.insert(value).second)
-      continue;
-    // A destructive accumulator update is safe to defer only when no copy of
-    // the not-yet-drained result can escape to another consumer.
-    if (!value.hasOneUse() &&
-        !triton::AMD::hasMutuallyExclusiveSuccessorUses(value))
-      return false;
-
-    for (OpOperand &use : value.getUses()) {
-      Operation *user = use.getOwner();
-      if (auto next = dyn_cast<triton::amdgpu::ScheduledMfmaOp>(user)) {
-        std::optional<StringRef> nextClass =
-            getModeledPersistentAccumulatorClass(next);
-        if (next.getAcc() != value || !nextClass ||
-            *nextClass != accumulatorClass)
-          return false;
-        worklist.push_back(next.getResult());
-        continue;
-      }
-      if (auto commit = dyn_cast<triton::amdgpu::MfmaCommitOp>(user)) {
-        if (!commitEmitsAccumulatorClass(commit, accumulatorClass))
-          return false;
-        commits.insert(commit);
-        commitInputs.insert(value);
-        continue;
-      }
-      if (auto branch = dyn_cast<BranchOpInterface>(user)) {
-        // Only model the direct branches emitted by SCF-to-CF for the tuned
-        // runtime-loop path. Other branch interfaces fail closed.
-        if (!isa<cf::BranchOp, cf::CondBranchOp>(user))
-          return false;
-        std::optional<BlockArgument> successorArgument =
-            branch.getSuccessorBlockArgument(use.getOperandNumber());
-        if (!successorArgument)
-          return false;
-        worklist.push_back(*successorArgument);
-        continue;
-      }
-      return false;
-    }
-  }
-  for (Value value : visited) {
-    auto argument = dyn_cast<BlockArgument>(value);
-    if (argument && !blockArgumentHasOnlyChainInputs(
-                        argument, visited, root.getDefiningOp()->getBlock()))
-      return false;
-  }
-  if (commits.empty() || !allPathsAfterRootReachCommit(root, commits))
-    return false;
-  if (provenCommitInputs)
-    provenCommitInputs->insert(commitInputs.begin(), commitInputs.end());
-  return true;
-}
 
 static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
                                              LLVM::AtomicOrdering ordering,
@@ -953,144 +732,16 @@ static FailureOr<int> getMfmaDrainWaitStates(ISAFamily isaFamily,
   return failure();
 }
 
-static FailureOr<int> getMfmaResultDrainWaitStates(Value value,
-                                                   ISAFamily isaFamily) {
-  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());
-  if (!tensorTy || !tensorTy.getElementType().isF32())
-    return failure();
-  auto mfma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
-      tensorTy.getEncoding());
-  if (!mfma)
-    return failure();
-  return getMfmaDrainWaitStates(isaFamily, mfma.getInstrShape());
-}
-
-static FailureOr<int>
-getMfmaCommitFullDrainWaitStates(triton::amdgpu::MfmaCommitOp op,
-                                 ISAFamily isaFamily) {
-  int maxWaitStates = 0;
-  bool sawMfmaResult = false;
-  for (Value input : op.getInputs()) {
-    auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
-    if (!tensorTy || !tensorTy.getElementType().isF32())
-      continue;
-    FailureOr<int> waitStates = getMfmaResultDrainWaitStates(input, isaFamily);
-    if (failed(waitStates))
-      return failure();
-    sawMfmaResult = true;
-    maxWaitStates = std::max(maxWaitStates, *waitStates);
-  }
-  if (!sawMfmaResult)
-    return failure();
-  return maxWaitStates;
-}
-
-static bool isAgprResidentDotOperand(Value value) {
-  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());
-  if (!tensorTy || (!tensorTy.getElementType().isBF16() &&
-                    !tensorTy.getElementType().isF16()))
-    return false;
-  auto dot = dyn_cast_or_null<triton::gpu::DotOperandEncodingAttr>(
-      tensorTy.getEncoding());
-  auto mfma = dot ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent())
-                  : triton::gpu::AMDMfmaEncodingAttr();
-  if (!dot || !mfma || mfma.getVersion() != 4 ||
-      !llvm::is_contained({4u, 8u}, dot.getKWidth()))
-    return false;
-  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
-  if (instrShape != ArrayRef<unsigned>({16, 16, 32}) &&
-      instrShape != ArrayRef<unsigned>({32, 32, 16}))
-    return false;
-  auto resident = value.getDefiningOp<triton::amdgpu::RegisterResidentOp>();
-  return resident && resident.getRegisterClass() == "agpr";
-}
-
-static bool doesPreviousCommitCoverDrain(
-    triton::amdgpu::MfmaCommitOp second, ISAFamily isaFamily,
-    const llvm::DenseSet<Value> &provenAgprCommitInputs,
-    const llvm::DenseSet<Value> &provenVgprCommitInputs) {
-  auto first =
-      dyn_cast_or_null<triton::amdgpu::MfmaCommitOp>(second->getPrevNode());
-  if (!first || first->getBlock() != second->getBlock())
-    return false;
-
-  for (Value input : first.getInputs()) {
-    auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
-    if (!tensorTy || !tensorTy.getElementType().isF32() ||
-        !provenAgprCommitInputs.contains(input))
-      return false;
-  }
-  FailureOr<int> firstMaxWaitStates =
-      getMfmaCommitFullDrainWaitStates(first, isaFamily);
-  if (failed(firstMaxWaitStates))
-    return false;
-
-  bool sawPreservedDotOperand = false;
-  for (Value input : second.getInputs()) {
-    auto tensorTy = dyn_cast<RankedTensorType>(input.getType());
-    if (!tensorTy)
-      return false;
-    if (!tensorTy.getElementType().isF32()) {
-      if (!isAgprResidentDotOperand(input))
-        return false;
-      sawPreservedDotOperand = true;
-      continue;
-    }
-    if (!provenVgprCommitInputs.contains(input))
-      return false;
-  }
-  FailureOr<int> secondMaxWaitStates =
-      getMfmaCommitFullDrainWaitStates(second, isaFamily);
-  if (failed(secondMaxWaitStates))
-    return false;
-
-  return sawPreservedDotOperand && *firstMaxWaitStates >= *secondMaxWaitStates;
-}
-
-struct ScheduledMfmaAsmInfo {
-  StringRef asmMnemonic;
-  // `_1k`: the gfx90a+ bf16 set taking 4 bf16/lane instead of 2, declared as
-  // packed i16, so operands need a bitcast.
-  bool intrinsicOperandsAreI16;
-};
-
-static FailureOr<ScheduledMfmaAsmInfo>
-getScheduledMfmaAsmInfo(StringRef intrinsicName) {
-  if (intrinsicName == ROCDL::mfma_f32_32x32x16_f16::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x16_f16", false};
-  if (intrinsicName == ROCDL::mfma_f32_32x32x16_bf16::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x16_bf16", false};
-  if (intrinsicName == ROCDL::mfma_f32_16x16x32_f16::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x32_f16", false};
-  if (intrinsicName == ROCDL::mfma_f32_16x16x32_bf16::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x32_bf16", false};
-  if (intrinsicName == ROCDL::mfma_f32_32x32x8f16::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x8_f16", false};
-  if (intrinsicName == ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x8_bf16", true};
-  if (intrinsicName == ROCDL::mfma_f32_16x16x16f16::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x16_f16", false};
-  if (intrinsicName == ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName())
-    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x16_bf16", true};
-  return failure();
-}
-
 struct ScheduledMfmaLoweringInfo {
-  // Mnemonic only; the inline-asm path appends the operand list.
-  StringRef asmMnemonic;
   StringRef intrinsicName;
   // K elements one lane feeds into a single MFMA; sets fragment width.
   int64_t kBase;
-  // Padding before each inline-asm MFMA
-  int inputWaitStates;
-  // Padding after the last MFMA
-  int drainWaitStates;
-  // Operands must be bitcast to i16 vectors for the `_1k` intrinsics.
+  // The gfx90a+ bf16 `_1k` intrinsics take packed i16 vectors.
   bool intrinsicOperandsAreI16;
 };
 
 static FailureOr<ScheduledMfmaLoweringInfo>
-getScheduledMfmaLoweringInfo(Location loc, ISAFamily isaFamily,
+getScheduledMfmaLoweringInfo(Location loc,
                              triton::gpu::AMDMfmaEncodingAttr mfma,
                              Type aElemType, Type bElemType) {
   // Reuse the backend-wide intrinsic table so this path cannot drift from the
@@ -1102,28 +753,19 @@ getScheduledMfmaLoweringInfo(Location loc, ISAFamily isaFamily,
   if (failed(intrinsic))
     return failure();
 
-  FailureOr<ScheduledMfmaAsmInfo> asmInfo =
-      getScheduledMfmaAsmInfo(intrinsic->name);
-  if (failed(asmInfo))
-    return failure();
-
-  FailureOr<int> drainWaitStates =
-      getMfmaDrainWaitStates(isaFamily, instrShape);
-  if (failed(drainWaitStates))
-    return failure();
-
-  return ScheduledMfmaLoweringInfo{asmInfo->asmMnemonic,
-                                   intrinsic->name,
+  bool intrinsicOperandsAreI16 =
+      intrinsic->name == ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName() ||
+      intrinsic->name == ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName();
+  return ScheduledMfmaLoweringInfo{intrinsic->name,
                                    static_cast<int64_t>(intrinsic->kBase),
-                                   /*inputWaitStates=*/4,
-                                   *drainWaitStates,
-                                   asmInfo->intrinsicOperandsAreI16};
+                                   intrinsicOperandsAreI16};
 }
 
 static FailureOr<Value>
 constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
                                    ConversionPatternRewriter &rewriter,
-                                   Location loc) {
+                                   Location loc, bool hasSideEffects = false,
+                                   LLVM::InlineAsmOp *pin = nullptr) {
   auto fragmentTy = cast<VectorType>(fragment.getType());
   unsigned elementBitWidth =
       getIntOrFloatOrPtrBitWidth(fragmentTy.getElementType());
@@ -1142,9 +784,11 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
   std::string constraints = outputConstraint.str() + ",0";
   auto identity = LLVM::InlineAsmOp::create(
       rewriter, loc, registerVectorTy, ValueRange{packed}, "", constraints,
-      /*has_side_effects=*/false,
+      hasSideEffects,
       /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
       operandAttrs);
+  if (pin)
+    *pin = identity;
   Value constrained = b.bitcast(identity->getResult(0), fragmentTy);
   return constrained;
 }
@@ -1171,50 +815,241 @@ static std::string mfmaWaitStateAsm(int waitStates) {
   return "s_nop 15\ns_nop " + std::to_string(waitStates - 16 - 1);
 }
 
-// Drain the MFMA pipeline before `fragment` is read by anything else.
-//
-// The scheduled-MFMA lowering emits `v_mfma_*` inside an `asm sideeffect`
-// block so it can pin the accumulator's register class. AMDGPU's hazard
-// recognizer matches on `SIInstrInfo::isMAI()` and therefore cannot see an
-// MFMA hidden inside `INLINEASM`: it never inserts the mandatory wait states
-// between the MFMA writing its destination and the first consumer reading it.
-// (The `transient` path lowers to the ROCDL intrinsic and gets them for free --
-// LLVM emits e.g. `s_nop 7` before a `buffer_store` of a 16x16x32 result.)
-// Without this drain the consumer reads the destination registers before the
-// MFMA has written them, yielding garbage or NaN.
-//
-// This is emitted once per accumulator chain, not per MFMA: back-to-back MFMAs
-// forwarding srcC need no padding, so the chain itself is not serialized.
-//
-// `waitStates` mirrors LLVM's target-specific
-// MFMA*WritesAGPRAccVgprReadWaitStates requirement.
-static FailureOr<Value>
-drainMfmaPipeline(Value fragment, StringRef registerClass, int waitStates,
-                  ConversionPatternRewriter &rewriter, Location loc) {
-  auto fragmentTy = cast<VectorType>(fragment.getType());
-  unsigned elementBitWidth =
-      getIntOrFloatOrPtrBitWidth(fragmentTy.getElementType());
-  int64_t totalBitWidth = fragmentTy.getNumElements() * elementBitWidth;
-  if (totalBitWidth <= 0 || totalBitWidth % 32 != 0)
-    return failure();
+// LLVM can forward a stored MFMA destination into a later load, including by
+// promoting private allocations. Preserve that dependency in the consumer
+// analysis even though the lowered IR has no SSA edge between store and load.
+class MfmaMemoryForwarding {
+public:
+  explicit MfmaMemoryForwarding(LLVM::LLVMFuncOp function)
+      : function(function), aliases(function) {
+    function.walk([&](Operation *op) {
+      if (!isa_and_nonnull<LLVM::LLVMDialect>(op->getDialect()) ||
+          op->getNumRegions() || isa<LLVM::InlineAsmOp>(op))
+        return;
+      // Inline assembly's hidden memory accesses cannot be promoted into SSA;
+      // its explicit register operands are handled by the normal value walk.
+      // Missing effect interfaces (e.g. masked loads) remain conservative.
+      auto effects = dyn_cast<MemoryEffectOpInterface>(op);
+      if (!effects || effects.hasEffect<MemoryEffects::Read>())
+        readers.push_back(op);
+    });
+  }
 
-  std::string waitAsm = mfmaWaitStateAsm(waitStates);
-  auto registerVectorTy = vec_ty(i32_ty, totalBitWidth / 32);
-  TritonLLVMOpBuilder b(loc, rewriter);
-  Value packed = b.bitcast(fragment, registerVectorTy);
-  auto *ctx = rewriter.getContext();
-  auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
-  // Tie the result to the input so the drain stays on the accumulator's SSA
-  // chain and keeps the accumulator in its pinned register class.
-  std::string constraints =
-      (registerClass == "agpr" ? std::string("=a") : std::string("=v")) + ",0";
-  auto drain = LLVM::InlineAsmOp::create(
-      rewriter, loc, registerVectorTy, ValueRange{packed}, waitAsm, constraints,
-      /*has_side_effects=*/true,
-      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-      ArrayAttr::get(ctx, {}));
-  Value drained = b.bitcast(drain->getResult(0), fragmentTy);
-  return drained;
+  // Returns true for a memory escape that needs completion, otherwise appends
+  // possible reloads. Cache edges once per store, shared by all result pins.
+  bool appendReloads(LLVM::StoreOp store, SmallVectorImpl<Value> &worklist) {
+    auto [it, inserted] = forwarding.try_emplace(store);
+    auto &uses = it->second;
+    if (inserted) {
+      // Kernels are unreferenced external definitions. Callable helpers can
+      // expose stored values to an inlined caller outside this local walk.
+      uses.escapes =
+          function.getLinkage() != LLVM::Linkage::External ||
+          !SymbolTable::symbolKnownUseEmpty(function, function->getParentOp());
+      for (Operation *reader : readers) {
+        if (!mayExecuteAfter(reader, store))
+          continue;
+        if (auto load = dyn_cast<LLVM::LoadOp>(reader)) {
+          if (!disjointAddressSpaces(store.getAddr(), load.getAddr()) &&
+              !aliases.alias(store.getAddr(), load.getAddr()).isNo())
+            uses.loads.push_back(load.getResult());
+        } else if (aliases.getModRef(reader, store.getAddr()).isRef()) {
+          // Calls, copies, and unmodeled reads can expose the stored bytes
+          // after inlining or memory optimization. Do not lose that path.
+          uses.escapes = true;
+        }
+      }
+    }
+    llvm::append_range(worklist, uses.loads);
+    return uses.escapes;
+  }
+
+private:
+  bool mayExecuteAfter(Operation *reader, Operation *store) {
+    // Flat CFG reachability does not model region exits or enclosing loops.
+    if (reader->getParentRegion() != &function.getBody() ||
+        store->getParentRegion() != &function.getBody())
+      return true;
+    Block *from = store->getBlock();
+    Block *to = reader->getBlock();
+    // isReachable starts at successors, so reaching the same block requires
+    // a real backedge. Acyclic epilogue stores cannot feed earlier loads.
+    return (from == to && store->isBeforeInBlock(reader)) ||
+           from->isReachable(to);
+  }
+
+  static bool disjointAddressSpaces(Value lhs, Value rhs) {
+    unsigned a = cast<LLVM::LLVMPointerType>(lhs.getType()).getAddressSpace();
+    unsigned b = cast<LLVM::LLVMPointerType>(rhs.getType()).getAddressSpace();
+    // Only global, shared, and private are pairwise disjoint. Flat, constant,
+    // and buffer/resource spaces must not be excluded by their number alone.
+    auto isDistinctSpace = [](unsigned space) {
+      return llvm::is_contained({llvm::AMDGPUAS::GLOBAL_ADDRESS,
+                                 llvm::AMDGPUAS::LOCAL_ADDRESS,
+                                 llvm::AMDGPUAS::PRIVATE_ADDRESS},
+                                space);
+    };
+    return a != b && isDistinctSpace(a) && isDistinctSpace(b);
+  }
+
+  struct ForwardedUses {
+    SmallVector<Value> loads;
+    bool escapes = false;
+  };
+  LLVM::LLVMFuncOp function;
+  AliasAnalysis aliases;
+  SmallVector<Operation *> readers;
+  DenseMap<Operation *, ForwardedUses> forwarding;
+};
+
+// Native consumers are visible to LLVM's hazard recognizer, but an instruction
+// in inline asm is not. Follow result identities through the lowered IR because
+// LLVM can fold even arithmetic (for example, adding zero) back to the MFMA
+// destination. A later MFMA starts a new chain with its own result pin.
+// Strengthen an explicit commit reached by a persistent result instead of
+// draining every producer separately. Keep its register constraints: a live
+// operand handoff can complete the results without moving them into AGPRs.
+static bool needsOpaqueConsumerDrain(
+    Operation *pin, int requiredWait,
+    DenseMap<Operation *, int> &commitWaitStates,
+    DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>>
+        &memoryForwarding) {
+  SmallVector<Value> worklist(pin->getResults());
+  llvm::SmallDenseSet<Value, 16> visited;
+  // Visit all paths even after finding an escape, so commit strengthening
+  // does not depend on use-list order. The escape still guards this root.
+  bool needsDrain = false;
+  auto appendRegionSuccessors = [&](RegionBranchOpInterface branch,
+                                    RegionBranchPoint point, OpOperand &use) {
+    RegionBranchSuccessorMapping mapping;
+    branch.getSuccessorOperandInputMapping(mapping, point);
+    auto found = mapping.find(&use);
+    if (found != mapping.end())
+      llvm::append_range(worklist, found->second);
+  };
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *consumer = use.getOwner();
+      if (consumer->getName().getStringRef().starts_with("rocdl.mfma."))
+        continue;
+
+      if (auto inlineAsm = dyn_cast<LLVM::InlineAsmOp>(consumer)) {
+        auto commit = commitWaitStates.find(consumer);
+        if (commit != commitWaitStates.end()) {
+          if (commit->second < requiredWait) {
+            inlineAsm.setAsmString(mfmaWaitStateAsm(requiredWait));
+            commit->second = requiredWait;
+          }
+          // Only this value path is complete. Other uses can bypass the
+          // boundary and still require a guard at the producer.
+          continue;
+        } else if (!inlineAsm.getAsmString().empty()) {
+          needsDrain = true;
+          continue;
+        }
+        llvm::append_range(worklist, consumer->getResults());
+        continue;
+      }
+
+      // Calls and returns can hide a consumer outside this conversion. Invoke
+      // also implements BranchOpInterface, so check it before CFG forwarding.
+      if (isa<LLVM::CallOp, LLVM::CallIntrinsicOp, LLVM::InvokeOp,
+              LLVM::ReturnOp>(consumer)) {
+        needsDrain = true;
+        continue;
+      }
+
+      if (auto store = dyn_cast<LLVM::StoreOp>(consumer)) {
+        if (use.getOperandNumber() != 0)
+          continue;
+        auto function = store->getParentOfType<LLVM::LLVMFuncOp>();
+        if (!function) {
+          needsDrain = true;
+          continue;
+        }
+        auto &memory = memoryForwarding[function];
+        if (!memory)
+          memory = std::make_unique<MfmaMemoryForwarding>(function);
+        if (memory->appendReloads(store, worklist))
+          needsDrain = true;
+        continue;
+      }
+
+      if (auto branch = dyn_cast<BranchOpInterface>(consumer)) {
+        for (unsigned i = 0; i < consumer->getNumSuccessors(); ++i) {
+          SuccessorOperands operands = branch.getSuccessorOperands(i);
+          OperandRange forwarded = operands.getForwardedOperands();
+          if (forwarded.empty())
+            continue;
+          unsigned begin = forwarded.getBeginOperandIndex();
+          unsigned index = use.getOperandNumber();
+          if (index >= begin && index - begin < forwarded.size())
+            worklist.push_back(consumer->getSuccessor(i)->getArgument(
+                operands.getProducedOperandCount() + index - begin));
+        }
+        continue;
+      }
+
+      // warp_predicate has capture-only regions and no region branch
+      // interface. Its init values bypass the body on inactive lanes.
+      if (auto predicate = dyn_cast<triton::gpu::WarpPredicateOp>(consumer)) {
+        unsigned index = use.getOperandNumber();
+        if (index != 0)
+          worklist.push_back(predicate.getResult(index - 1));
+        continue;
+      }
+      if (auto yield = dyn_cast<triton::gpu::PredicateYieldOp>(consumer)) {
+        worklist.push_back(
+            yield->getParentOp()->getResult(use.getOperandNumber()));
+        continue;
+      }
+
+      // This includes warp_specialize partition captures and warp_yield, as
+      // well as SCF loop-carried values and conditional results.
+      if (auto branch = dyn_cast<RegionBranchOpInterface>(consumer)) {
+        appendRegionSuccessors(branch, RegionBranchPoint::parent(), use);
+        continue;
+      }
+      if (auto terminator =
+              dyn_cast<RegionBranchTerminatorOpInterface>(consumer)) {
+        auto parent =
+            dyn_cast<RegionBranchOpInterface>(consumer->getParentOp());
+        if (!parent) {
+          needsDrain = true;
+          continue;
+        }
+        appendRegionSuccessors(parent, RegionBranchPoint(terminator), use);
+        continue;
+      }
+
+      // Aggregates, vector operations, casts, selects, and native arithmetic
+      // can all preserve the destination through LLVM optimization.
+      if (consumer->getNumRegions() == 0 &&
+          (isa_and_nonnull<LLVM::LLVMDialect, ROCDL::ROCDLDialect>(
+               consumer->getDialect()) ||
+           isa<UnrealizedConversionCastOp>(consumer))) {
+        if (isa_and_nonnull<LLVM::LLVMDialect>(consumer->getDialect())) {
+          auto effects = dyn_cast<MemoryEffectOpInterface>(consumer);
+          // Masked/scattered stores and other unmodeled writers cannot be
+          // treated as dead ends just because they have no SSA results.
+          if (!effects || effects.hasEffect<MemoryEffects::Write>()) {
+            needsDrain = true;
+            continue;
+          }
+        }
+        llvm::append_range(worklist, consumer->getResults());
+        continue;
+      }
+
+      // An unmodeled operation or region may let the destination escape.
+      needsDrain = true;
+    }
+  }
+  return needsDrain;
 }
 
 class RematerializedRangeOpConversion
@@ -1444,6 +1279,15 @@ static LogicalResult verifyMfmaVersionMatchesTarget(
   return success();
 }
 
+// `auto` derives storage from the role alone, identically on every target.
+// Targets that cannot honor it reject it in the verifier.
+static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
+  StringRef storage = op.getAccumulatorRegisterClass();
+  if (storage != "auto")
+    return storage;
+  return op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
+}
+
 // Return the first accumulator reaching this boundary that its producer pinned
 // into AGPRs, or null if none is provably AGPR-resident.
 static triton::amdgpu::ScheduledMfmaOp
@@ -1460,6 +1304,218 @@ findAgprResidentAccumulator(triton::amdgpu::MfmaCommitOp op, size_t &index) {
   return nullptr;
 }
 
+// Prove register-class-stable inputs without looking through an uncompleted
+// native MFMA. Persistent result pins terminate the walk, including at loop
+// backedges; unknown producers and cycles consisting only of forwarding fail
+// closed. Constants can seed an accumulator before its first update.
+static bool hasPinnedCommitInput(Value value, StringRef outputConstraint,
+                                 const AMD::ScheduledMfmaLoweringState &state,
+                                 ConversionPatternRewriter &rewriter,
+                                 bool accumulator,
+                                 llvm::DenseSet<Value> &active, bool &sawPin) {
+  if (!active.insert(value).second)
+    return false;
+  auto finish = [&](bool result) {
+    active.erase(value);
+    return result;
+  };
+  auto recurse = [&](Value input) {
+    return hasPinnedCommitInput(input, outputConstraint, state, rewriter,
+                                accumulator, active, sawPin);
+  };
+  // CFG operands can still reference source values pending dialect-conversion
+  // replacement. Follow the compiler's mapping, never infer a result pin from
+  // a source op or an IR attribute. An unmapped materialization fails closed.
+  if (isa<RankedTensorType>(value.getType()) &&
+      !value.getDefiningOp<UnrealizedConversionCastOp>()) {
+    Value converted = rewriter.getRemappedValue(value);
+    return finish(converted && converted != value && recurse(converted));
+  }
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    bool sawIncoming = false;
+    for (Block *predecessor : argument.getOwner()->getPredecessors()) {
+      auto branch = dyn_cast<BranchOpInterface>(predecessor->getTerminator());
+      if (!branch)
+        return finish(false);
+      for (auto [index, successor] : llvm::enumerate(branch->getSuccessors())) {
+        if (successor != argument.getOwner())
+          continue;
+        SuccessorOperands operands = branch.getSuccessorOperands(index);
+        unsigned arg = argument.getArgNumber();
+        unsigned produced = operands.getProducedOperandCount();
+        ValueRange forwarded = operands.getForwardedOperands();
+        if (arg < produced || arg - produced >= forwarded.size() ||
+            !recurse(forwarded[arg - produced]))
+          return finish(false);
+        sawIncoming = true;
+      }
+    }
+    return finish(sawIncoming);
+  }
+  Operation *producer = value.getDefiningOp();
+  if (!producer)
+    return finish(false);
+  if (auto assembly = dyn_cast<LLVM::InlineAsmOp>(producer)) {
+    if (!assembly.getAsmString().empty())
+      return finish(false);
+    SmallVector<StringRef> constraints;
+    assembly.getConstraints().split(constraints, ',');
+    unsigned groups = 1;
+    if (auto tuple = dyn_cast<LLVM::LLVMStructType>(value.getType()))
+      groups = tuple.getBody().size();
+    if (constraints.size() != 2 * groups)
+      return finish(false);
+    for (unsigned index = 0; index < groups; ++index)
+      if (constraints[index] != outputConstraint ||
+          constraints[groups + index] != std::to_string(index))
+        return finish(false);
+    if (accumulator && !llvm::any_of(state.resultPins, [&](auto pin) {
+          return pin.first == producer;
+        }))
+      return finish(false);
+    sawPin = true;
+    return finish(true);
+  }
+  if (auto extract = dyn_cast<LLVM::ExtractValueOp>(producer)) {
+    Value container = extract.getContainer();
+    while (auto insert = container.getDefiningOp<LLVM::InsertValueOp>()) {
+      if (insert.getPosition() == extract.getPosition())
+        return finish(recurse(insert.getValue()));
+      container = insert.getContainer();
+    }
+    return finish(recurse(container));
+  }
+  if (auto extract = dyn_cast<LLVM::ExtractElementOp>(producer))
+    return finish(recurse(extract.getVector()));
+  if (auto insert = dyn_cast<LLVM::InsertValueOp>(producer))
+    return finish(recurse(insert.getContainer()) && recurse(insert.getValue()));
+  if (auto insert = dyn_cast<LLVM::InsertElementOp>(producer))
+    return finish(recurse(insert->getOperand(0)) &&
+                  recurse(insert->getOperand(1)));
+  if (isa<LLVM::BitcastOp, UnrealizedConversionCastOp>(producer))
+    return finish(producer->getNumOperands() == 1 &&
+                  recurse(producer->getOperand(0)));
+  return finish(isa<LLVM::ConstantOp, LLVM::UndefOp>(producer));
+}
+
+static bool canAnchorAdjacentCommit(
+    triton::amdgpu::MfmaCommitOp first, triton::amdgpu::MfmaCommitOp second,
+    ValueRange firstInputs, ValueRange secondInputs,
+    const AMD::ScheduledMfmaLoweringState &state,
+    ConversionPatternRewriter &rewriter, const AMD::TargetInfo &targetInfo) {
+  if (targetInfo.getArch() != "gfx950" || !second ||
+      first->getNextNode() != second.getOperation())
+    return false;
+  int firstWait = 0;
+  int secondWait = 0;
+  bool secondHasAccumulator = false;
+  bool secondHasOperand = false;
+  DominanceInfo dominance(first->getParentOp());
+  auto prove = [&](Value source, Value converted, bool isSecond) {
+    auto tensor = cast<RankedTensorType>(source.getType());
+    bool accumulator = tensor.getElementType().isF32();
+    auto mfma =
+        dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(tensor.getEncoding());
+    if (accumulator) {
+      if (!mfma || mfma.getVersion() != 4)
+        return false;
+      FailureOr<int> wait = getMfmaDrainWaitStates(targetInfo.getISAFamily(),
+                                                   mfma.getInstrShape());
+      if (failed(wait))
+        return false;
+      int &required = isSecond ? secondWait : firstWait;
+      required = std::max(required, *wait);
+      secondHasAccumulator |= isSecond;
+    } else {
+      auto dot =
+          dyn_cast<triton::gpu::DotOperandEncodingAttr>(tensor.getEncoding());
+      auto parent =
+          dot ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent())
+              : triton::gpu::AMDMfmaEncodingAttr();
+      if (!isSecond || !parent || parent.getVersion() != 4)
+        return false;
+      secondHasOperand = true;
+    }
+    if (!dominance.dominates(converted, first.getOperation()))
+      return false;
+    llvm::DenseSet<Value> active;
+    bool sawPin = false;
+    StringRef constraint = accumulator && isSecond ? "=v" : "=a";
+    return hasPinnedCommitInput(converted, constraint, state, rewriter,
+                                accumulator, active, sawPin) &&
+           sawPin;
+  };
+  for (auto [source, converted] : llvm::zip(first.getInputs(), firstInputs))
+    if (!prove(source, converted, false))
+      return false;
+  for (auto [source, converted] : llvm::zip(second.getInputs(), secondInputs))
+    if (!prove(source, converted, true))
+      return false;
+  return secondHasAccumulator && secondHasOperand && firstWait >= secondWait;
+}
+
+// Recognize only a compiler-owned boundary whose complete input tuple is the
+// register-class-identical suffix returned by an earlier combined boundary.
+// This is an SSA dependency through the full delay, not an adjacency fact.
+static LLVM::InlineAsmOp
+getAnchoringCommit(LLVM::InlineAsmOp second,
+                   const DenseMap<Operation *, int> &commits) {
+  LLVM::InlineAsmOp first;
+  unsigned begin = 0;
+  for (auto [index, input] : llvm::enumerate(second.getOperands())) {
+    auto extract = input.getDefiningOp<LLVM::ExtractValueOp>();
+    if (!extract || extract.getPosition().size() != 1)
+      return nullptr;
+    auto producer = extract.getContainer().getDefiningOp<LLVM::InlineAsmOp>();
+    if (!producer || !commits.contains(producer))
+      return nullptr;
+    if (!first) {
+      first = producer;
+      begin = extract.getPosition().front();
+    }
+    if (producer != first || extract.getPosition().front() != begin + index)
+      return nullptr;
+  }
+  if (!first || begin == 0 || first->getBlock() != second->getBlock() ||
+      !first->isBeforeInBlock(second) ||
+      begin + second.getNumOperands() != first.getNumOperands())
+    return nullptr;
+  for (Operation *op = first->getNextNode(); op != second.getOperation();
+       op = op->getNextNode())
+    if (!isa<LLVM::ExtractValueOp>(op))
+      return nullptr;
+  SmallVector<StringRef> firstConstraints;
+  SmallVector<StringRef> secondConstraints;
+  first.getConstraints().split(firstConstraints, ',');
+  second.getConstraints().split(secondConstraints, ',');
+  auto isTiedCommit = [](ArrayRef<StringRef> constraints, unsigned count) {
+    if (constraints.size() != 2 * count + 1 ||
+        constraints.back() != "~{memory}")
+      return false;
+    for (unsigned index = 0; index < count; ++index)
+      if (constraints[count + index] != std::to_string(index))
+        return false;
+    return true;
+  };
+  if (!isTiedCommit(firstConstraints, first.getNumOperands()) ||
+      !isTiedCommit(secondConstraints, second.getNumOperands()))
+    return nullptr;
+  for (unsigned index = 0; index < begin; ++index)
+    if (firstConstraints[index] != "=a")
+      return nullptr;
+  bool sawVgpr = false;
+  bool sawAgpr = false;
+  for (unsigned index = 0; index < second.getNumOperands(); ++index) {
+    StringRef constraint = secondConstraints[index];
+    if ((constraint != "=v" && constraint != "=a") ||
+        firstConstraints[begin + index] != constraint)
+      return nullptr;
+    sawVgpr |= constraint == "=v";
+    sawAgpr |= constraint == "=a";
+  }
+  return sawVgpr && sawAgpr ? first : nullptr;
+}
+
 class MfmaCommitOpConversion
     : public ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp> {
 public:
@@ -1467,10 +1523,11 @@ public:
 
   MfmaCommitOpConversion(const LLVMTypeConverter &converter,
                          const AMD::TargetInfo &targetInfo,
+                         AMD::ScheduledMfmaLoweringState &scheduledMfmaState,
                          PatternBenefit benefit)
       : ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp>(converter,
                                                              benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), scheduledMfmaState(scheduledMfmaState) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::MfmaCommitOp op, OpAdaptor adaptor,
@@ -1493,6 +1550,44 @@ public:
     auto *ctx = rewriter.getContext();
     auto typeConverter = getTypeConverter();
     TritonLLVMOpBuilder b(loc, rewriter);
+
+    // Capture adjacency before replacing either source operation. Anchor the
+    // complete second tuple as tied outputs of the first full-delay boundary;
+    // adjacency alone cannot stop its pure native MFMA producers from sinking.
+    auto second =
+        dyn_cast_or_null<triton::amdgpu::MfmaCommitOp>(op->getNextNode());
+    DominanceInfo dominance(op->getParentOp());
+    bool canRemapSecond =
+        targetInfo.getArch() == "gfx950" && second &&
+        llvm::all_of(op.getInputs(),
+                     [](Value input) {
+                       return cast<RankedTensorType>(input.getType())
+                           .getElementType()
+                           .isF32();
+                     }) &&
+        llvm::any_of(second.getInputs(),
+                     [](Value input) {
+                       return !cast<RankedTensorType>(input.getType())
+                                   .getElementType()
+                                   .isF32();
+                     }) &&
+        llvm::all_of(second.getInputs(), [&](Value input) {
+          return dominance.dominates(input, op.getOperation());
+        });
+    SmallVector<Value> secondInputs;
+    bool shareDrain =
+        canRemapSecond &&
+        succeeded(
+            rewriter.getRemappedValues(second.getInputs(), secondInputs)) &&
+        canAnchorAdjacentCommit(op, second, adaptor.getInputs(), secondInputs,
+                                scheduledMfmaState, rewriter, targetInfo);
+    SmallVector<Value> sources(op.getInputs());
+    SmallVector<Value> convertedInputs(adaptor.getInputs());
+    unsigned firstInputCount = sources.size();
+    if (shareDrain) {
+      llvm::append_range(sources, second.getInputs());
+      llvm::append_range(convertedInputs, secondInputs);
+    }
 
     auto packGroups =
         [&](Value value, RankedTensorType tensorTy, unsigned registersPerGroup,
@@ -1544,8 +1639,8 @@ public:
                 "dot operand. The AGPR read is materialized ahead of this "
                 "boundary's hazard padding; pin the accumulator with "
                 "accumulator_register_class=\"vgpr\"";
-    for (auto [source, converted] :
-         llvm::zip(op.getInputs(), adaptor.getInputs())) {
+    for (auto [inputIndex, source] : llvm::enumerate(sources)) {
+      Value converted = convertedInputs[inputIndex];
       auto tensorTy = cast<RankedTensorType>(source.getType());
       Type elementVectorTy;
       Type registerVectorTy;
@@ -1557,7 +1652,8 @@ public:
             cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
         ArrayRef<unsigned> instr = mfma.getInstrShape();
         registersPerGroup = instr[0] * instr[1] / warpSize;
-        outputConstraint = hasLiveDependency ? "=v" : "=a";
+        outputConstraint =
+            hasLiveDependency || inputIndex >= firstInputCount ? "=v" : "=a";
       } else {
         auto dot =
             cast<triton::gpu::DotOperandEncodingAttr>(tensorTy.getEncoding());
@@ -1610,17 +1706,23 @@ public:
         targetInfo.getISAFamily() == ISAFamily::CDNA4 && hasLiveDependency;
     int waitStates = 6;
     if (!useGfx950LiveDependencyHandoff) {
-      FailureOr<int> drainWaitStates =
-          getMfmaCommitFullDrainWaitStates(op, targetInfo.getISAFamily());
-      if (failed(drainWaitStates))
-        return rewriter.notifyMatchFailure(
-            op, "commit boundary carries an MFMA layout with no modeled "
-                "result-read hazard requirement");
-      waitStates = *drainWaitStates;
+      waitStates = 0;
+      for (Value input : op.getInputs()) {
+        auto tensorTy = cast<RankedTensorType>(input.getType());
+        if (!tensorTy.getElementType().isF32())
+          continue;
+        auto mfma =
+            cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+        FailureOr<int> drainWaitStates = getMfmaDrainWaitStates(
+            targetInfo.getISAFamily(), mfma.getInstrShape());
+        if (failed(drainWaitStates))
+          return rewriter.notifyMatchFailure(
+              op, "commit boundary carries an MFMA layout with no modeled "
+                  "result-read hazard requirement");
+        waitStates = std::max(waitStates, *drainWaitStates);
+      }
     }
-    std::string waitAsm = op->hasAttr(kMfmaCommitDrainCoveredAttr)
-                              ? std::string()
-                              : mfmaWaitStateAsm(waitStates);
+    std::string waitAsm = mfmaWaitStateAsm(waitStates);
 
     Type resultTy = outputTypes.front();
     if (outputTypes.size() != 1)
@@ -1640,14 +1742,66 @@ public:
                  : b.extract_val(outputTypes[index], constrained, index);
     };
 
+    // Retain the second boundary's original register classes, tuple, memory
+    // clobber, and side effects. Its operands are exclusively values returned
+    // after the first delay, so no copy can read an uncompleted original dV.
+    SmallVector<Value> secondGroups;
+    Value secondConstrained;
+    size_t secondFirstGroup =
+        shareDrain ? firstGroupIndices[firstInputCount] : 0;
+    if (shareDrain) {
+      SmallVector<Type> secondOutputTypes;
+      std::string secondConstraints;
+      for (size_t input = firstInputCount; input < sources.size(); ++input) {
+        StringRef constraint = cast<RankedTensorType>(sources[input].getType())
+                                       .getElementType()
+                                       .isF32()
+                                   ? "=v"
+                                   : "=a";
+        for (size_t group = 0; group < inputGroups[input].size(); ++group) {
+          size_t index = firstGroupIndices[input] + group;
+          if (!secondConstraints.empty())
+            secondConstraints += ",";
+          secondConstraints += constraint;
+          secondGroups.push_back(getConstrainedGroup(index));
+          secondOutputTypes.push_back(outputTypes[index]);
+        }
+      }
+      for (size_t index = 0; index < secondGroups.size(); ++index)
+        secondConstraints += "," + std::to_string(index);
+      secondConstraints += ",~{memory}";
+      Type secondResultTy = secondOutputTypes.front();
+      if (secondOutputTypes.size() != 1)
+        secondResultTy =
+            LLVM::LLVMStructType::getLiteral(ctx, secondOutputTypes);
+      auto secondAsm = LLVM::InlineAsmOp::create(
+          rewriter, second.getLoc(), secondResultTy, secondGroups, waitAsm,
+          secondConstraints, /*has_side_effects=*/true,
+          /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+          operandAttrs);
+      secondConstrained = secondAsm.getRes();
+      // Keep this boundary recognizable until every reaching root has been
+      // analyzed and both delays have been strengthened by the finalizer.
+      scheduledMfmaState.commitWaitStates[secondAsm] = waitStates;
+    }
+
     SmallVector<Value> results;
     for (size_t inputIndex = 0; inputIndex < inputGroups.size(); ++inputIndex) {
       SmallVector<Value> elements;
       Type elementVectorTy = elementVectorTypes[inputIndex];
       auto vectorTy = cast<VectorType>(elementVectorTy);
       for (size_t group = 0; group < inputGroups[inputIndex].size(); ++group) {
-        Value registerGroup =
-            getConstrainedGroup(firstGroupIndices[inputIndex] + group);
+        size_t groupIndex = firstGroupIndices[inputIndex] + group;
+        Value registerGroup;
+        if (shareDrain && inputIndex >= firstInputCount) {
+          size_t index = groupIndex - secondFirstGroup;
+          registerGroup = secondGroups.size() == 1
+                              ? secondConstrained
+                              : b.extract_val(outputTypes[groupIndex],
+                                              secondConstrained, index);
+        } else {
+          registerGroup = getConstrainedGroup(groupIndex);
+        }
         Value elementGroup = b.bitcast(registerGroup, elementVectorTy);
         for (int64_t index = 0; index < vectorTy.getNumElements(); ++index)
           elements.push_back(b.extract_element(vectorTy.getElementType(),
@@ -1655,14 +1809,19 @@ public:
       }
       results.push_back(packTensorElements(
           loc, typeConverter, elements, rewriter,
-          cast<RankedTensorType>(op.getOutputs()[inputIndex].getType())));
+          cast<RankedTensorType>(sources[inputIndex].getType())));
     }
-    rewriter.replaceOp(op, results);
+    if (shareDrain)
+      rewriter.replaceOp(second,
+                         ValueRange(results).drop_front(firstInputCount));
+    rewriter.replaceOp(op, ValueRange(results).take_front(firstInputCount));
+    scheduledMfmaState.commitWaitStates[inlineAsm] = waitStates;
     return success();
   }
 
 private:
   const AMD::TargetInfo &targetInfo;
+  AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
 };
 
 class ScheduledMfmaOpConversion
@@ -1672,10 +1831,11 @@ public:
 
   ScheduledMfmaOpConversion(const LLVMTypeConverter &converter,
                             const AMD::TargetInfo &targetInfo,
+                            AMD::ScheduledMfmaLoweringState &scheduledMfmaState,
                             PatternBenefit benefit)
       : ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaOp>(converter,
                                                                 benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), scheduledMfmaState(scheduledMfmaState) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::ScheduledMfmaOp op, OpAdaptor adaptor,
@@ -1691,8 +1851,7 @@ public:
       return failure();
     ArrayRef<unsigned> instrShape = mfma.getInstrShape();
     FailureOr<ScheduledMfmaLoweringInfo> maybeInfo =
-        getScheduledMfmaLoweringInfo(loc, targetInfo.getISAFamily(), mfma,
-                                     aTy.getElementType(),
+        getScheduledMfmaLoweringInfo(loc, mfma, aTy.getElementType(),
                                      bTy.getElementType());
     if (failed(maybeInfo))
       return op.emitOpError(
@@ -1755,32 +1914,48 @@ public:
     StringRef bStorage = op.getResidentOperand() == "rhs" ? "agpr" : "vgpr";
     StringRef accumulatorStorage = resolveAccumulatorStorage(op);
 
-    auto inputConstraint = [](StringRef registerClass) -> StringRef {
-      return registerClass == "agpr" ? "a" : "v";
-    };
     Value zeroFragment;
-    if (op.getAccumulatorRole() == "transient" && op.getInitialize()) {
+    if (op.getInitialize()) {
       Attribute zeroAttr = rewriter.getZeroAttr(accElemTy);
       auto zeroElements =
           DenseElementsAttr::get(cast<ShapedType>(fragmentTy), zeroAttr);
       zeroFragment =
           LLVM::ConstantOp::create(rewriter, loc, fragmentTy, zeroElements);
     }
-    auto *ctx = rewriter.getContext();
-    auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
-    auto operandAttrs = ArrayAttr::get(ctx, {});
-    bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
-    bool repairHazardsAfterRa = op->hasAttr(kMfmaRepairHazardsAfterRaAttr);
-    bool resultNeedsDrain = !op->hasAttr(kMfmaDeferResultDrainAttr);
+    bool isPersistent = op.getAccumulatorRole() == "persistent";
+    bool orderOperandPins =
+        scheduledMfmaState.operandOrderEligibleOps.contains(op.getOperation());
+    int drainWaitStates = 0;
+    if (isPersistent) {
+      FailureOr<int> requiredWait =
+          getMfmaDrainWaitStates(targetInfo.getISAFamily(), instrShape);
+      if (failed(requiredWait))
+        return rewriter.notifyMatchFailure(
+            op, "persistent MFMA layout has no modeled result-read hazard "
+                "requirement");
+      drainWaitStates = *requiredWait;
+    }
+    bool pinAccumulatorInput = isPersistent && !op.getInitialize() &&
+                               !matchPattern(op.getAcc(), m_Constant());
 
     SmallVector<Value> updatedFragments = accumulatorFragments;
-    // Keep one SSA chain per output fragment while making source order
-    // explicit across the grid. Round-robin the K slices over independent
-    // output fragments so persistent inline-assembly chains expose enough
-    // distance between dependent MFMAs. Native intrinsics expose transient
-    // chains to AMDGPU's MFMA hazard recognizer and machine scheduler. Direct
-    // inline assembly preserves the requested register class for persistent
-    // chains.
+    if (pinAccumulatorInput) {
+      for (Value &fragment : updatedFragments) {
+        FailureOr<Value> constrainedC = constrainMfmaFragmentRegisterClass(
+            fragment, accumulatorStorage, rewriter, loc,
+            /*hasSideEffects=*/true);
+        if (failed(constrainedC))
+          return rewriter.notifyMatchFailure(
+              op, "native MFMA accumulator must pack into complete 32-bit "
+                  "registers");
+        fragment = *constrainedC;
+      }
+    }
+
+    // Keep one SSA chain per output fragment and retain K/N/M source order.
+    // Native intrinsics expose every chain to AMDGPU's hazard recognizer and
+    // scheduler. Empty C/D pins constrain persistent storage at the boundaries
+    // of the grid; the arithmetic itself stays visible to LLVM.
     for (int64_t k = 0; k < numRepK; ++k) {
       for (int64_t n = 0; n < numRepN; ++n) {
         for (int64_t m = 0; m < numRepM; ++m) {
@@ -1788,114 +1963,72 @@ public:
           Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
-          // The MFMA inline asm below already constrains ordinary operands to
-          // VGPRs.  Pre-constrain only the resident-operand path, where one
-          // input must be moved to AGPRs before issuing the instruction.
-          if (!useLatencyAwareIntrinsic &&
-              (aStorage == "agpr" || bStorage == "agpr")) {
+          if (isPersistent) {
+            LLVM::InlineAsmOp pinA, pinB;
             FailureOr<Value> constrainedA = constrainMfmaFragmentRegisterClass(
-                operandA, aStorage, rewriter, loc);
+                operandA, aStorage, rewriter, loc, /*hasSideEffects=*/false,
+                &pinA);
             FailureOr<Value> constrainedB = constrainMfmaFragmentRegisterClass(
-                operandB, bStorage, rewriter, loc);
+                operandB, bStorage, rewriter, loc, /*hasSideEffects=*/false,
+                &pinB);
             if (failed(constrainedA) || failed(constrainedB))
               return rewriter.notifyMatchFailure(
                   op, "native MFMA operands must pack into complete 32-bit "
                       "registers");
+            // Share repeated fragments through CSE, then order the surviving
+            // pins only when both original operands came entirely from LDS.
+            if (orderOperandPins)
+              for (LLVM::InlineAsmOp pin : {pinA, pinB})
+                pin->setAttr(triton::AMD::kScheduledMfmaOperandPinAttrName,
+                             rewriter.getUnitAttr());
             operandA = *constrainedA;
             operandB = *constrainedB;
           }
-          StringRef aRegisterClass = aStorage;
-          StringRef bRegisterClass = bStorage;
-          if (mfma.getIsTransposed()) {
+          if (mfma.getIsTransposed())
             std::swap(operandA, operandB);
-            std::swap(aRegisterClass, bRegisterClass);
-          }
 
-          bool zeroThisInstruction = op.getInitialize() && k == 0;
-          if (useLatencyAwareIntrinsic) {
-            if (info.intrinsicOperandsAreI16) {
-              auto packedTy = vec_ty(i16_ty, info.kBase);
-              operandA = b.bitcast(operandA, packedTy);
-              operandB = b.bitcast(operandB, packedTy);
-            }
-            OperationState loweredOp(loc, info.intrinsicName);
-            loweredOp.addTypes(fragmentTy);
-            Value intrinsicAcc = zeroThisInstruction ? zeroFragment : current;
-            loweredOp.addOperands({operandA, operandB, intrinsicAcc});
-            loweredOp.addAttribute("cbsz", rewriter.getI32IntegerAttr(0));
-            loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
-            // For `blgp`: f64 MFMA uses negation flags, while other MFMA ops
-            // use B-lane permutation flags.
-            Attribute blgpAttr =
-                cast<VectorType>(fragmentTy).getElementType().isF64()
-                    ? Attribute(ROCDL::MFMANegModifierAttr::get(
-                          rewriter.getContext(), ROCDL::MFMANegModifier::none))
-                    : Attribute(ROCDL::MFMAPermBAttr::get(
-                          rewriter.getContext(), ROCDL::MFMAPermB::none));
-            loweredOp.addAttribute("blgp", blgpAttr);
-            current = rewriter.create(loweredOp)->getResult(0);
-          } else {
-            // A tied AGPR accumulator and a resident A/B source need distinct
-            // registers. Early-clobber also exposes their simultaneous demand
-            // to LLVM's minimum AGPR allocation, which otherwise omits numbered
-            // tied inputs. A zero-initialized instruction may reuse source
-            // AGPRs because it does not read the accumulator.
-            bool tiedResidentAgpr =
-                !zeroThisInstruction &&
-                (aRegisterClass == "agpr" || bRegisterClass == "agpr");
-            StringRef outputConstraint = accumulatorStorage == "agpr"
-                                             ? (tiedResidentAgpr ? "=&a" : "=a")
-                                             : "=&v";
-            std::string constraints = outputConstraint.str();
-            constraints += "," + inputConstraint(aRegisterClass).str();
-            constraints += "," + inputConstraint(bRegisterClass).str();
-            SmallVector<Value> asmOperands{operandA, operandB};
-            if (!zeroThisInstruction) {
-              asmOperands.push_back(current);
-              constraints += ",0";
-            }
-            // Inline assembly hides MFMA hazards from LLVM. For an
-            // automatically proven persistent accumulator chain, preserve a
-            // marker
-            // so the backend can inspect the final physical registers and add
-            // only the residual wait after scheduling and register allocation.
-            // Unproven chains retain the conservative pre-MFMA padding.
-            std::string mfmaAsm = info.asmMnemonic.str() + " $0, $1, $2, ";
-            if (repairHazardsAfterRa)
-              mfmaAsm = "; triton_amd_scheduled_mfma\n" + mfmaAsm;
-            else
-              mfmaAsm = mfmaWaitStateAsm(info.inputWaitStates) + "\n" + mfmaAsm;
-            mfmaAsm += zeroThisInstruction ? "0" : "$0";
-            auto inlineAsm = LLVM::InlineAsmOp::create(
-                rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
-                /*has_side_effects=*/true,
-                /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-                operandAttrs);
-            current = inlineAsm->getResult(0);
+          if (info.intrinsicOperandsAreI16) {
+            auto packedTy = vec_ty(i16_ty, info.kBase);
+            operandA = b.bitcast(operandA, packedTy);
+            operandB = b.bitcast(operandB, packedTy);
           }
-          updatedFragments[accumulatorIndex] = current;
+          OperationState loweredOp(loc, info.intrinsicName);
+          loweredOp.addTypes(fragmentTy);
+          bool zeroThisInstruction = op.getInitialize() && k == 0;
+          Value intrinsicAcc = zeroThisInstruction ? zeroFragment : current;
+          loweredOp.addOperands({operandA, operandB, intrinsicAcc});
+          loweredOp.addAttribute("cbsz", rewriter.getI32IntegerAttr(0));
+          loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
+          // For `blgp`: f64 MFMA uses negation flags, while other MFMA ops
+          // use B-lane permutation flags.
+          Attribute blgpAttr =
+              cast<VectorType>(fragmentTy).getElementType().isF64()
+                  ? Attribute(ROCDL::MFMANegModifierAttr::get(
+                        rewriter.getContext(), ROCDL::MFMANegModifier::none))
+                  : Attribute(ROCDL::MFMAPermBAttr::get(
+                        rewriter.getContext(), ROCDL::MFMAPermB::none));
+          loweredOp.addAttribute("blgp", blgpAttr);
+          updatedFragments[accumulatorIndex] =
+              rewriter.create(loweredOp)->getResult(0);
         }
       }
     }
 
-    if (!useLatencyAwareIntrinsic && resultNeedsDrain) {
-      // The consumer is unknown at this point, so use the target-specific
-      // result-read requirement from `getMfmaDrainWaitStates`. Sizing the drain
-      // for the worst consumer keeps it sufficient on its own, rather than
-      // relying on the next MFMA's input padding to make up a shortfall. A
-      // proven accumulator-only chain moves this drain to mfma_commit.
-      for (int64_t n = 0; n < numRepN; ++n) {
-        for (int64_t m = 0; m < numRepM; ++m) {
-          int64_t accumulatorIndex = m * numRepN + n;
-          FailureOr<Value> drained = drainMfmaPipeline(
-              updatedFragments[accumulatorIndex], accumulatorStorage,
-              info.drainWaitStates, rewriter, loc);
-          if (failed(drained))
-            return rewriter.notifyMatchFailure(
-                op, "MFMA accumulator fragment must pack into complete 32-bit "
-                    "registers");
-          updatedFragments[accumulatorIndex] = *drained;
-        }
+    SmallVector<LLVM::InlineAsmOp> resultPins;
+    if (isPersistent) {
+      for (Value &fragment : updatedFragments) {
+        // Anchor each completed K chain to side-effect ordering while keeping
+        // its arithmetic in native MFMAs.
+        LLVM::InlineAsmOp pin;
+        FailureOr<Value> constrainedD = constrainMfmaFragmentRegisterClass(
+            fragment, accumulatorStorage, rewriter, loc,
+            /*hasSideEffects=*/true, &pin);
+        if (failed(constrainedD))
+          return rewriter.notifyMatchFailure(
+              op,
+              "native MFMA result must pack into complete 32-bit registers");
+        fragment = *constrainedD;
+        resultPins.push_back(pin);
       }
     }
 
@@ -1912,11 +2045,14 @@ public:
     Value result = packTensorElements(loc, typeConverter, elements, rewriter,
                                       op.getResult().getType());
     rewriter.replaceOp(op, result);
+    for (LLVM::InlineAsmOp pin : resultPins)
+      scheduledMfmaState.resultPins.emplace_back(pin, drainWaitStates);
     return success();
   }
 
 private:
   const AMD::TargetInfo &targetInfo;
+  AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
 };
 
 class BarrierOpConversion
@@ -2092,51 +2228,111 @@ private:
 
 } // namespace
 
-void mlir::triton::AMD::inferScheduledMfmaHazards(
-    ModuleOp mod, const TargetInfo &targetInfo) {
-  bool isModeledTarget = targetInfo.getArch() == "gfx950";
-  mod.walk([](triton::amdgpu::MfmaCommitOp op) {
-    op->removeAttr(kMfmaCommitDrainCoveredAttr);
-  });
+void mlir::triton::AMD::finalizeScheduledMfmaLowering(
+    const ScheduledMfmaLoweringState &state) {
+  SmallVector<std::pair<Operation *, int>> needsDrain;
+  DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>> memoryForwarding;
+  DenseMap<Operation *, int> functionWaitStates;
+  DenseMap<Operation *, bool> functionNeedsDrain;
+  // Shared commits take the largest requirement among their reaching roots.
+  // Transient-only handoffs have no persistent result pin and keep their
+  // original delay. This deliberately also strengthens persistent commits
+  // whose outputs have only native consumers or no consumers.
+  DenseMap<Operation *, int> commitWaitStates = state.commitWaitStates;
+  auto isNativeInstruction = [](StringRef name) {
+    // These lower to native instructions on the supported targets. Exp2 is
+    // also emitted as a direct LLVM call by the elementwise conversion.
+    return llvm::is_contained(
+        {"llvm.amdgcn.perm", "llvm.amdgcn.permlane16.swap",
+         "llvm.amdgcn.permlane32.swap", "llvm.amdgcn.readfirstlane",
+         "llvm.amdgcn.ds.permute", "llvm.amdgcn.ds.bpermute",
+         "llvm.amdgcn.raw.ptr.buffer.atomic.fadd", "llvm.amdgcn.wave.barrier",
+         "llvm.amdgcn.exp2.f32", "llvm.exp2.f32"},
+        name);
+  };
+  for (auto [pin, requiredWait] : state.resultPins) {
+    auto function = pin->getParentOfType<LLVM::LLVMFuncOp>();
+    bool crossesCallBoundary = !function;
+    if (function) {
+      auto entry = functionNeedsDrain.try_emplace(function);
+      bool &needsFunctionDrain = entry.first->second;
+      if (entry.second) {
+        // Callable helpers must complete before returning. Kernels have no
+        // symbol uses and external linkage at this conversion stage.
+        needsFunctionDrain = function.getLinkage() != LLVM::Linkage::External ||
+                             !SymbolTable::symbolKnownUseEmpty(
+                                 function, function->getParentOp());
+        function.walk([&](Operation *op) {
+          // Coroutine intrinsics can introduce calls or helper functions in
+          // LLVM's later coroutine lowering despite having dedicated MLIR ops.
+          if (isa<LLVM::InvokeOp>(op) ||
+              op->getName().getStringRef().starts_with("llvm.intr.coro."))
+            needsFunctionDrain = true;
+          if (auto call = dyn_cast<LLVM::CallOp>(op)) {
+            auto callee = call.getCallee();
+            if (!callee || !isNativeInstruction(*callee))
+              needsFunctionDrain = true;
+          }
+          if (auto call = dyn_cast<LLVM::CallIntrinsicOp>(op)) {
+            // Unknown intrinsics may lower to calls (including some amdgcn
+            // intrinsics), so keep their boundary covered conservatively.
+            if (!isNativeInstruction(call.getIntrin()))
+              needsFunctionDrain = true;
+          }
+        });
+      }
+      crossesCallBoundary = needsFunctionDrain;
+      int &waitStates = functionWaitStates[function];
+      waitStates = std::max(waitStates, requiredWait);
+    }
+    // A call can reuse registers even without consuming the MFMA result. Keep
+    // its full destination tuple live until completion on either side of a
+    // call/return, including when LLVM moves otherwise independent operations.
+    if (crossesCallBoundary ||
+        needsOpaqueConsumerDrain(pin, requiredWait, commitWaitStates,
+                                 memoryForwarding))
+      needsDrain.emplace_back(pin, requiredWait);
+  }
 
-  llvm::DenseSet<Value> provenAgprCommitInputs;
-  llvm::DenseSet<Value> provenVgprCommitInputs;
-  mod.walk([&](triton::amdgpu::ScheduledMfmaOp op) {
-    // These are compiler-owned facts. Clear any attributes supplied by input
-    // IR before recomputing them, so textual TTGIR cannot bypass this proof.
-    op->removeAttr(kMfmaRepairHazardsAfterRaAttr);
-    op->removeAttr(kMfmaDeferResultDrainAttr);
+  // A dead destination can be reused by an unrelated inline-assembly output
+  // while its native MFMA is still in flight. SSA consumer analysis cannot see
+  // that physical-register WAW hazard (or a reused source's WAR hazard).
+  // Keep completion inside the opaque instruction sequence: pure assembly can
+  // move across other operations during LLVM optimization. Function scope also
+  // covers backedges and values or partial fragments eliminated later by LLVM.
+  // Empty register pins and compiler-owned commits emit no register writes.
+  // The latter retain their separately modeled completion contract.
+  for (auto [function, waitStates] : functionWaitStates) {
+    std::string completion = mfmaWaitStateAsm(waitStates) + "\n";
+    function->walk([&](LLVM::InlineAsmOp assembly) {
+      if (assembly.getAsmString().empty() ||
+          commitWaitStates.contains(assembly))
+        return;
+      assembly.setAsmString(completion + assembly.getAsmString().str());
+    });
+  }
 
-    std::optional<StringRef> accumulatorClass =
-        getModeledPersistentAccumulatorClass(op);
-    llvm::DenseSet<Value> provenCommitInputs;
-    if (!isModeledTarget || !accumulatorClass ||
-        !hasLinearMfmaChainToCommit(op.getResult(), *accumulatorClass,
-                                    &provenCommitInputs))
-      return;
-    op->setAttr(kMfmaRepairHazardsAfterRaAttr, UnitAttr::get(mod.getContext()));
-    op->setAttr(kMfmaDeferResultDrainAttr, UnitAttr::get(mod.getContext()));
-    llvm::DenseSet<Value> &classCommitInputs = *accumulatorClass == "agpr"
-                                                   ? provenAgprCommitInputs
-                                                   : provenVgprCommitInputs;
-    classCommitInputs.insert(provenCommitInputs.begin(),
-                             provenCommitInputs.end());
-  });
+  // Analyze every root before changing result pins: otherwise an upgraded pin
+  // could appear to be an opaque consumer of a different root. Commits remain
+  // recognizable by their map entries while their delays are strengthened.
+  for (auto [pin, requiredWait] : needsDrain)
+    cast<LLVM::InlineAsmOp>(pin).setAsmString(mfmaWaitStateAsm(requiredWait));
 
-  if (!isModeledTarget)
-    return;
-  mod.walk([&](triton::amdgpu::MfmaCommitOp op) {
-    if (doesPreviousCommitCoverDrain(op, targetInfo.getISAFamily(),
-                                     provenAgprCommitInputs,
-                                     provenVgprCommitInputs))
-      op->setAttr(kMfmaCommitDrainCoveredAttr, UnitAttr::get(mod.getContext()));
-  });
+  // Consumer analysis and opaque/call guards are unchanged. Only now can an
+  // explicitly anchored second boundary share the finalized first delay.
+  for (auto [op, waitStates] : commitWaitStates) {
+    auto second = cast<LLVM::InlineAsmOp>(op);
+    auto first = getAnchoringCommit(second, commitWaitStates);
+    if (first && commitWaitStates.lookup(first) >= waitStates)
+      second.setAsmString("");
+  }
 }
 
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfo &targetInfo, PatternBenefit benefit,
-    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups,
+    ScheduledMfmaLoweringState &scheduledMfmaState) {
   PatternBenefit transBenefit = PatternBenefit(benefit.getBenefit() + 1);
   PatternBenefit barrierBenefit = PatternBenefit(benefit.getBenefit() + 1);
 
@@ -2152,7 +2348,7 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
   patterns.add<RegisterResidentOpConversion, RegisterClassAnchorOpConversion>(
       typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
-      typeConverter, targetInfo, transBenefit);
+      typeConverter, targetInfo, scheduledMfmaState, transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(
       typeConverter, targetInfo, barrierBenefit);
 }

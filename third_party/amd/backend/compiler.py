@@ -765,6 +765,8 @@ class HIPBackend(BaseBackend):
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.convert.add_reconcile_unrealized_casts(pm)
+        # Share operand pins through CSE, then retain their ordering in LLVM.
+        amd.passes.ttgpuir.add_finalize_scheduled_mfma_operands(pm)
         try:
             pm.run(mod, "make_llir")
         finally:
