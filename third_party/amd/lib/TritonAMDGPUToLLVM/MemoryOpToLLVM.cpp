@@ -1826,15 +1826,13 @@ public:
             loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
             // For `blgp`: f64 MFMA uses negation flags, while other MFMA ops
             // use B-lane permutation flags.
-            MLIRContext *ctx = rewriter.getContext();
-            if (cast<VectorType>(fragmentTy).getElementType().isF64()) {
-              loweredOp.addAttribute("blgp",
-                                     ROCDL::MFMANegModifierAttr::get(
-                                         ctx, ROCDL::MFMANegModifier::none));
-            } else {
-              loweredOp.addAttribute("blgp", ROCDL::MFMAPermBAttr::get(
-                                                 ctx, ROCDL::MFMAPermB::none));
-            }
+            Attribute blgpAttr =
+                cast<VectorType>(fragmentTy).getElementType().isF64()
+                    ? Attribute(ROCDL::MFMANegModifierAttr::get(
+                          rewriter.getContext(), ROCDL::MFMANegModifier::none))
+                    : Attribute(ROCDL::MFMAPermBAttr::get(
+                          rewriter.getContext(), ROCDL::MFMAPermB::none));
+            loweredOp.addAttribute("blgp", blgpAttr);
             current = rewriter.create(loweredOp)->getResult(0);
           } else {
             // A tied AGPR accumulator and a resident A/B source need distinct
