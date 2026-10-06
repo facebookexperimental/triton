@@ -29,6 +29,22 @@ option(TRITON_ENABLE_Z3_JOINT_SOLVER "Enable the native Z3 joint modulo schedule
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 set(TRITON_VERSION "" CACHE STRING "Triton version string (passed from setup.py)")
 
+# Keep the CPU backend build hermetic by preferring the pinned SLEEF submodule.
+# The vendored CPU backend still supports TRITON_SLEEF_SOURCE_DIR overrides and
+# FetchContent for standalone/online builds.
+set(TRITON_BUNDLED_SLEEF_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sleef")
+if(EXISTS "${TRITON_BUNDLED_SLEEF_SOURCE_DIR}/CMakeLists.txt")
+  if(NOT TRITON_SLEEF_SOURCE_DIR)
+    set(TRITON_SLEEF_SOURCE_DIR "${TRITON_BUNDLED_SLEEF_SOURCE_DIR}"
+        CACHE PATH "Use a local SLEEF source checkout" FORCE)
+  endif()
+elseif(TRITON_OFFLINE_BUILD AND "cpu" IN_LIST TRITON_CODEGEN_BACKENDS)
+  message(FATAL_ERROR
+    "The CPU backend requires the pinned SLEEF submodule in offline builds. "
+    "Run `git submodule update --init third_party/sleef`.")
+endif()
+
 set(TRITON_CACHE_PATH "" CACHE PATH "Path to triton cache")
 set(TRITON_LLVM_SYSTEM_SUFFIX "" CACHE STRING "Path to LLVM system suffix")
 set(LLVM_SYSPATH "" CACHE PATH "Path to system LLVM installation")

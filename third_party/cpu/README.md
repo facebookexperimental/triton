@@ -59,8 +59,12 @@ On each promo, also sync this directory to the latest triton-cpu:
    triton-cpu and must be reconciled with fbtriton's side on every sync.
 3. Keep the LLVM revision in agreement. Both fbtriton and triton-cpu build
    on upstream Triton and its pinned LLVM.
-4. Keep the SLEEF revision in `CMakeLists.txt` in sync. CMake fetches the
-   pinned revision; offline builds must provide `TRITON_SLEEF_SOURCE_DIR`.
+4. Keep the SLEEF revision in `CMakeLists.txt` and the pinned
+   `third_party/sleef` submodule revision in sync. The top-level build uses the
+   submodule automatically. Initialize it with
+   `git submodule update --init third_party/sleef`; standalone online builds
+   can still use CMake's fetch, and explicit source checkouts can still use
+   `TRITON_SLEEF_SOURCE_DIR`.
 
 ## In-tree integration (outside this directory)
 
