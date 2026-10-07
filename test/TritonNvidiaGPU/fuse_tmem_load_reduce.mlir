@@ -401,3 +401,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_ws3}>>
   }
 }
+
+// -----
+
+// AutoWS partition: before AllocateWarpGroups resolves them, a tensor
+// partition's `requestedRegisters` entry is the -1 "even share of the leftover
+// registers" sentinel, not a register limit. It must not block the fusion.
+
+#blocked_ws_reg = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#tmem_ws_reg = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_load_reduce_fuse_in_partition_with_requested_registers
+  // CHECK: %{{.+}}, %[[RED:.+]] = ttng.tmem_load {{.*}}redOp = #ttng.redOp<max>
+  // CHECK-NOT: "tt.reduce"
+  tt.func public @tmem_load_reduce_fuse_in_partition_with_requested_registers(%arg0: !ttg.memdesc<128x128xf32, #tmem_ws_reg, #ttng.tensor_memory>) {
+    ttg.warp_specialize(%arg0) attributes {requestedRegisters = array<i32: -1>, warpGroupStartIds = array<i32: 4>}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%tmem: !ttg.memdesc<128x128xf32, #tmem_ws_reg, #ttng.tensor_memory>) num_warps(4) {
+      %0 = ttng.tmem_load %tmem : !ttg.memdesc<128x128xf32, #tmem_ws_reg, #ttng.tensor_memory> -> tensor<128x128xf32, #blocked_ws_reg>
+      %1 = "tt.reduce"(%0) <{axis = 1 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %2 = arith.maxnumf %lhs, %rhs : f32
+        tt.reduce.return %2 : f32
+      }) : (tensor<128x128xf32, #blocked_ws_reg>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_ws_reg}>>
+      "test.keep"(%1) : (tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_ws_reg}>>) -> ()
+      ttg.warp_return
+    } : (!ttg.memdesc<128x128xf32, #tmem_ws_reg, #ttng.tensor_memory>) -> ()
+    tt.return
+  }
+}
