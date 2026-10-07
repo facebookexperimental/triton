@@ -42,6 +42,17 @@ pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
 
 GFX950 = GPUTarget("hip", "gfx950", 64)
 
+# The public CMake wheel keeps a lane-offset VGPR live where the fbcode Buck
+# build of the same LLVM revision spills it. That spill adds one scratch
+# store/reload, its required waitcnt, and one 4-byte frame slot. Keep these
+# correlated signatures paired so that no unobserved combination is accepted.
+# Tuples are (waitcnts, scratch loads, scratch stores, private-segment bytes,
+# VGPR spills).
+_A4W4_STANDARD_SCALE_RESOURCE_SIGNATURES = {
+    (54, 3, 3, 16, 3),
+    (55, 4, 4, 20, 4),
+}
+
 
 def compile_for_target(fn, signature, constexprs, target):
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
@@ -51,6 +62,21 @@ def compile_for_target(fn, signature, constexprs, target):
 def compile_for_gfx950(fn, signature, constexprs):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX950)
+
+
+def _a4w4_resource_signature(amdgcn):
+
+    def metadata_value(name):
+        [value] = re.findall(rf"^\s*\.{name}:\s+(\d+)\s*$", amdgcn, re.MULTILINE)
+        return int(value)
+
+    return (
+        len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)),
+        len(re.findall(r"^\s*scratch_load_dword\b", amdgcn, re.MULTILINE)),
+        len(re.findall(r"^\s*scratch_store_dword\b", amdgcn, re.MULTILINE)),
+        metadata_value("private_segment_fixed_size"),
+        metadata_value("vgpr_spill_count"),
+    )
 
 
 def _compile_register_staged_bmm_gfx950(m, n, k, kernel_spec):
@@ -560,14 +586,12 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 55
+    assert _a4w4_resource_signature(amdgcn) in _A4W4_STANDARD_SCALE_RESOURCE_SIGNATURES
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
     assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
-    assert ".private_segment_fixed_size: 20" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 4" in amdgcn
     assert ".agpr_count:     0" in amdgcn
 
     unrelated = compile_for_gfx950(
@@ -592,13 +616,11 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 55
+    assert _a4w4_resource_signature(amdgcn) in _A4W4_STANDARD_SCALE_RESOURCE_SIGNATURES
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 20" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 4" in amdgcn
 
 
 def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -618,8 +640,9 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
     assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 20" in amdgcn
-    assert ".vgpr_spill_count: 4" in amdgcn
+    # Preshuffling removes enough scale-handling pressure to keep this path
+    # spill-free in both the public CMake and fbcode Buck builds.
+    assert _a4w4_resource_signature(amdgcn) == (65, 0, 0, 0, 0)
 
 
 def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
