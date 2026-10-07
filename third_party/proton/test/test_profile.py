@@ -1008,7 +1008,8 @@ def test_deactivate(tmp_path: pathlib.Path, device: str):
     proton.deactivate(session_id)
     torch.randn((10, 10), device=device)
     proton.activate(session_id)
-    torch.zeros((10, 10), device=device)
+    # Not torch.zeros: it lowers to cudaMemsetAsync, which launches no kernel.
+    torch.ones((10, 10), device=device)
     proton.deactivate(session_id)
     proton.finalize()
     with temp_file.open() as f:
