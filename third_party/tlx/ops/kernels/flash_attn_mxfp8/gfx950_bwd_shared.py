@@ -381,15 +381,29 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
 def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D: tl.constexpr,
                   BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr = False, PEEL: tl.constexpr = False,
-                  NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False):
+                  NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False, XCD_KEY_TILES: tl.constexpr = 0):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     tl.static_assert(not SEQ_K_CONTIG, 'Shared-LDS specialization requires ordinary contiguous payloads')
     tl.static_assert(D == 128 and BM == 64 and (BN == 64) and NATIVE and (not RELAXED) and (not PEEL))
     tl.static_assert(EVEN_N, 'Unmasked DS export requires complete 128-row tiles')
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
-    key_tile = tl.program_id(1)
-    head = tl.program_id(0).to(tl.int64)
+    if XCD_KEY_TILES:
+        # Interleave eight 32-owner chunks, as in gfx950 grouped GEMM.
+        # Key-fast logical owners share a head within each chunk, grouping
+        # Q/dO accesses. The host enables this only for qualified N4096/N8192 NC.
+        heads: tl.constexpr = 128
+        xcds: tl.constexpr = 8
+        chunk: tl.constexpr = 32
+        group: tl.constexpr = xcds * chunk
+        tl.static_assert(not CAUSAL and (heads * XCD_KEY_TILES) % group == 0)
+        physical = tl.program_id(0) + heads * tl.program_id(1)
+        logical = (physical // group) * group + (physical % xcds) * chunk + (physical // xcds) % chunk
+        head = (logical // XCD_KEY_TILES).to(tl.int64)
+        key_tile = logical % XCD_KEY_TILES
+    else:
+        key_tile = tl.program_id(1)
+        head = tl.program_id(0).to(tl.int64)
     keys = key_tile * BN + tl.arange(0, BN)
     d = tl.arange(0, D)
     base = head * N * D
@@ -719,8 +733,8 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     # scales directly; no directional exports or second Delta launch.
     _bwd_kv_owner.run(q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds, dss, D=128,
                       BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True,
-                      RELAXED=False, num_warps=2, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0,
-                      grid=(128, n // 64), warmup=False)
+                      RELAXED=False, XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0), num_warps=2,
+                      num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
     _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
                        num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                        warmup=False)
