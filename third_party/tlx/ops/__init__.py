@@ -32,7 +32,8 @@ Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can follow
-`mm`.
+`mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
+configs are measurably faster; pass `space="heuristic"` for a fast first call.
 
 An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch. A forward-only implementation raises
@@ -45,7 +46,7 @@ from __future__ import annotations
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev",
+    "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev",
     "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward",
     "InvalidInput"
 ]
@@ -84,6 +85,85 @@ def mm(a, b, *, out=None, space="heuristic"):
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
+
+
+def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
+    if sf_layout == "natural":
+        expected_a, expected_b = (M, K // 32), (N, K // 32)
+        if a_scale.shape != expected_a or b_scale.shape != expected_b:
+            raise InvalidInput("tlx.ops.mm_mxfp8 natural scales must have exact shapes "
+                               f"a_scale={expected_a}, b_scale={expected_b}; got "
+                               f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
+        return
+    if sf_layout != "cublas_blocked":
+        raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural' or 'cublas_blocked'; "
+                           f"got {sf_layout!r}")
+    # M, N and K are 128-aligned, so the 128x4 atoms need no padding.
+    if a_scale.numel() != M * K // 32 or b_scale.numel() != N * K // 32:
+        raise InvalidInput("tlx.ops.mm_mxfp8 cublas_blocked scales must contain exactly "
+                           f"{M * K // 32} a-scale and {N * K // 32} b-scale bytes; "
+                           f"got {a_scale.numel()} and {b_scale.numel()}")
+
+
+def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+    """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
+
+    ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
+    (K-major, as for a linear weight); M, N and K must be multiples of 128.
+    Each run of 32 values along K has one E8M0 scale. ``sf_layout="natural"``
+    takes ``[M, K // 32]`` and ``[N, K // 32]`` scales; ``"cublas_blocked"``
+    takes the swizzled byte layout returned by torchao's
+    ``MXTensor.to_mx(..., is_swizzled_scales=True)``. A supplied ``out`` is
+    returned by identity. Forward-only.
+
+    ``space`` defaults to "full" (autotune; the first call per shape compiles
+    and benchmarks the pruned space). "heuristic" launches one shape-picked
+    config without autotuning.
+    """
+    import torch
+
+    tensors = (a, a_scale, b, b_scale)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects tensor inputs")
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects rank-2 a and b; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    M, K = a.shape
+    N, b_k = b.shape
+    if b_k != K:
+        raise InvalidInput("tlx.ops.mm_mxfp8 reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if min(M, N, K) <= 0 or M % 128 or N % 128 or K % 128:
+        raise InvalidInput("tlx.ops.mm_mxfp8 requires positive M, N and K divisible by 128; "
+                           f"got M={M}, N={N}, K={K}")
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects E4M3 a and b; "
+                           f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
+    if a_scale.dtype != torch.float8_e8m0fnu or b_scale.dtype != torch.float8_e8m0fnu:
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects E8M0 a_scale and b_scale; "
+                           f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs to be contiguous")
+    if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors[1:]):
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs on the same CUDA device; "
+                           f"got {[tensor.device for tensor in tensors]}")
+    _check_mm_mxfp8_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise InvalidInput("tlx.ops.mm_mxfp8 expects out to be a tensor or None")
+        if out.shape != (M, N) or out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
+            raise InvalidInput("tlx.ops.mm_mxfp8 out must be contiguous BF16 [M, N] on a's device; "
+                               f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+        if any(torch._C._overlaps(out, tensor) for tensor in tensors):
+            raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
+    if space not in ("heuristic", "full"):
+        raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space!r}")
+
+    fn, spec = impl_for("mm_mxfp8", device=a.device)
+    tma_tensors = tensors if out is None else (*tensors, out)
+    check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
+    check_backward(spec, *tensors, out)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
 
 
 def grouped_gemm(group_a, group_b):

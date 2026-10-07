@@ -36,6 +36,7 @@ Implemented today:
 
 ```
 mm/sm100.py
+mm_mxfp8/sm100.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
@@ -49,6 +50,7 @@ Current kernel selections for the rest of the catalog:
 ```
 kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
+    mm_mxfp8/             sm100.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
@@ -67,6 +69,32 @@ kernels/
     cross_attention/      sm100.py
     bmm_shared_a/         gfx950.py
 ```
+
+## MXFP8 GEMM
+
+```python
+out = triton.tlx.ops.mm_mxfp8(a, a_scale, b, b_scale, out=None, sf_layout="natural", space="full")
+```
+
+Computes `a @ b.T` from contiguous E4M3 `a` `[M, K]` and `b` `[N, K]` with one
+E8M0 scale per 32 K values, returning contiguous BF16 `[M, N]`. `M`, `N` and
+`K` must be multiples of 128. This is a forward-only SM100 operation promoted
+from `tutorials/blackwell_gemm_ws_mxfp8.py`.
+
+- `sf_layout="natural"`: `a_scale` is `[M, K // 32]` and `b_scale` is
+  `[N, K // 32]`; they are packed into the blocked layout on every call.
+- `sf_layout="cublas_blocked"`: scales are already in the cuBLAS 128x4 atom
+  layout, e.g. torchao's `MXTensor.to_mx(..., is_swizzled_scales=True).scale`,
+  and must contain exactly `M * K // 32` and `N * K // 32` bytes.
+- `space="full"` (default) autotunes over 1-/2-CTA, split-K, overlapped-
+  accumulator and pipeline-depth configs; the first call per shape compiles and
+  benchmarks the pruned space. When all of B fits in shared memory next to at
+  least four A stages (small N and K), it also tries a B-resident family: B is
+  loaded once per CTA, each tile computes a whole 128 x N row so A is read from
+  DRAM once, and the epilogue uses async TMA stores. `space="heuristic"`
+  launches one shape-picked config without autotuning.
+- A supplied `out` must be contiguous, non-overlapping BF16 `[M, N]` on
+  `a.device` and is returned by identity.
 
 ## MXFP8 grouped GEMM
 
