@@ -118,12 +118,6 @@ unsigned getVectorSize(Value ptr, Value offset,
 
 Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t);
 
-// Returns true if we can perform coalesced write from the source encoding to
-// the destination encoding.
-bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
-                                      const LinearLayout &srcToSharedLayout,
-                                      unsigned threadsPerWarp);
-
 // Splits a direct-to-LDS copy of |srcLayout| into |sharedLayout| into one
 // radix-2 copy per odd register value o, written from element
 // |slabOffsets|[o]; returns that copy's register-to-offset layout.
