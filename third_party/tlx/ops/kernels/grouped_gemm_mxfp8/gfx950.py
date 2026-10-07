@@ -709,8 +709,8 @@ def grouped_gemm_mxfp8(
         # Natural scales are repacked anyway, so pack them in the K_MAJOR order the
         # gfx950 kernel reads with one ds_read_b32; blocked inputs stay zero-copy.
         k_major = sf_layout == "natural" and n % 128 == 0
-        x_scale_5d, w_scale_5d = prepare_scales(
-            x_scale, w_scale, gm=gm, g=g, n=n, k=k, sf_layout=sf_layout, k_major_chunks=k_major)
+        x_scale_5d, w_scale_5d = prepare_scales(x_scale, w_scale, gm=gm, g=g, n=n, k=k, sf_layout=sf_layout,
+                                                k_major_chunks=k_major)
         launch_sms = props.multi_processor_count if num_sms is None else num_sms
         if launch_sms <= 0:
             raise ValueError("num_sms must be positive")
@@ -718,7 +718,7 @@ def grouped_gemm_mxfp8(
         if config:
             cfg.update(config)
 
-        _mxfp8_grouped_gemm_kernel[(launch_sms,)](
+        _mxfp8_grouped_gemm_kernel[(launch_sms, )](
             x,
             w,
             out,

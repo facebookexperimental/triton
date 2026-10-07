@@ -19,12 +19,8 @@ TAIL_SHAPES = tuple(
         (2, 2, 100, False),
         (2, 2, 150, False),
         (1, 1, 150, True),
-    )
-)
-BOUNDARY_SHAPES = tuple(
-    FlashAttentionShape(1, 1, context, 128, False, "bf16")
-    for context in (256, 257, 320)
-)
+    ))
+BOUNDARY_SHAPES = tuple(FlashAttentionShape(1, 1, context, 128, False, "bf16") for context in (256, 257, 320))
 # Causal tails past the non-persistent cutoff, so the unpadded persistent path runs.
 CAUSAL_TAIL_SHAPES = (
     FlashAttentionShape(2, 2, 600, 128, True, "bf16"),
@@ -32,16 +28,13 @@ CAUSAL_TAIL_SHAPES = (
     FlashAttentionShape(1, 1, 320, 64, True, "bf16"),
 )
 FWD_SHAPES = tuple(
-    dict.fromkeys(
-        (
-            *CORRECTNESS_SHAPES,
-            *(shape._replace(dtype="bf16") for shape in SYNTHETIC),
-            *TAIL_SHAPES,
-            *BOUNDARY_SHAPES,
-            *CAUSAL_TAIL_SHAPES,
-        )
-    )
-)
+    dict.fromkeys((
+        *CORRECTNESS_SHAPES,
+        *(shape._replace(dtype="bf16") for shape in SYNTHETIC),
+        *TAIL_SHAPES,
+        *BOUNDARY_SHAPES,
+        *CAUSAL_TAIL_SHAPES,
+    )))
 BWD_SHAPES = tuple(
     dict.fromkeys((
         *CORRECTNESS_SHAPES,
@@ -249,9 +242,7 @@ def test_flash_attn_rejects_mismatched_sequence_lengths():
         (64, 64, False, False),
     ),
 )
-def test_flash_attn_non_persistent_dispatch_policy(
-    N_CTX, HEAD_DIM, requires_grad, expected
-):
+def test_flash_attn_non_persistent_dispatch_policy(N_CTX, HEAD_DIM, requires_grad, expected):
     from triton.tlx.ops.kernels.flash_attn.sm90 import _should_use_non_persistent
 
     q, k, v = _qkv(

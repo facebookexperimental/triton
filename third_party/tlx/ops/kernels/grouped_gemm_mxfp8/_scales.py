@@ -57,9 +57,7 @@ def _view_blocked_scale(
         required *= extent
     flat = _as_uint8_scale(scale).view(-1)
     if flat.numel() < required:
-        raise ValueError(
-            f"cublas_blocked scale has {flat.numel()} bytes; expected at least {required}"
-        )
+        raise ValueError(f"cublas_blocked scale has {flat.numel()} bytes; expected at least {required}")
     return flat[:required].view(shape)
 
 
@@ -89,9 +87,7 @@ def prepare_scales(
 
     if sf_layout == "natural":
         if x_scale.ndim != 2 or x_scale.shape[0] < gm or x_scale.shape[1] < k_groups:
-            raise ValueError(
-                "natural x_scale must be a 2D tensor covering [GM, K // 32]"
-            )
+            raise ValueError("natural x_scale must be a 2D tensor covering [GM, K // 32]")
         x_scale_5d = _swizzle_scale_to_5d(
             x_scale[:gm, :k_groups],
             batch=1,
@@ -102,9 +98,7 @@ def prepare_scales(
             k_major_chunks=k_major_chunks,
         )
         if w_scale.numel() != g * n * k_groups:
-            raise ValueError(
-                "natural w_scale must contain exactly G * N * (K // 32) scales"
-            )
+            raise ValueError("natural w_scale must contain exactly G * N * (K // 32) scales")
         w_scale_5d = _swizzle_scale_to_5d(
             w_scale,
             batch=g,
@@ -124,7 +118,5 @@ def prepare_scales(
             (g, n_chunks, k_chunks, 2, 256),
         )
     else:
-        raise ValueError(
-            f"unsupported sf_layout {sf_layout!r}; expected 'natural' or 'cublas_blocked'"
-        )
+        raise ValueError(f"unsupported sf_layout {sf_layout!r}; expected 'natural' or 'cublas_blocked'")
     return x_scale_5d, w_scale_5d
