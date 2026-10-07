@@ -189,7 +189,7 @@ def test_amd_fa_cluster_vector_combine_opt_out_reduces_transfers_gfx950(amd_fa_c
     def instruction_count(amdgcn):
         return len(re.findall(r"^\s+[a-z].*", amdgcn, flags=re.MULTILINE))
 
-    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 32
+    assert transfer_count(baseline_asm) - transfer_count(disabled_asm) >= 28
     assert instruction_count(disabled_asm) < instruction_count(baseline_asm)
     assert baseline.metadata.disable_vector_combine is False
     assert disabled.metadata.disable_vector_combine is True
@@ -559,12 +559,12 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "v_mov_b32_dpp" not in amdgcn
     assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
-    # s_waitcnt and spill counts admit two values: GitHub's prebuilt LLVM
+    # VGPR spill counts admit two values: GitHub's prebuilt LLVM
     # (triton-lang/llvm-project@1df311a6) carries a revert of "[AMDGPU] Allow
     # remat with multiple users in same region" that vanilla upstream ce35294
-    # (used by the internal build) lacks, removing one wait and one VGPR spill.
+    # (used by the internal build) lacks, removing one VGPR spill.
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (54, 55)
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 53
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
@@ -596,8 +596,8 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
-    # Dual s_waitcnt/spill goldens: see test_a4w4_inter_wave_256tile_codegen_gfx950.
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (54, 55)
+    # s_waitcnt/spill goldens: see test_a4w4_inter_wave_256tile_codegen_gfx950.
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 53
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0

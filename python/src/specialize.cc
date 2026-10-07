@@ -3090,7 +3090,7 @@ bool visit_make_tensordesc_args(PyObject *arg, PyObject *sig,
   Py_ssize_t sig_len = PyTuple_Size(sig);
   if (sig_len < 0)
     return false;
-  assert(sig_len == arg_len || !"Invalid signature");
+  assert(sig_len == arg_len || (false && "Invalid signature"));
   Py_ssize_t len = arg_len;
 
   for (Py_ssize_t i = 0; i < len; ++i) {
