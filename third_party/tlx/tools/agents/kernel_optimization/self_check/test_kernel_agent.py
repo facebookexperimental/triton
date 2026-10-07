@@ -1742,7 +1742,7 @@ class HarnessTest(unittest.TestCase):
         gfx942 = infer_kernel_path(repository, "mm", "gfx942")
         self.assertEqual(gfx942.name, "gfx942.py")
         self.assertEqual(infer_kernel_path(repository, "mm", "B200").name, "sm100.py")
-        self.assertEqual(len(production_cases("mm", "gfx942_all")), 27)
+        self.assertEqual(len(production_cases("mm", "gfx942_all")), 81)
         self.assertEqual(
             _tuning_symbols(gfx942.read_text()), ("_configs", "heuristic_config")
         )
@@ -1776,7 +1776,7 @@ class HarnessTest(unittest.TestCase):
                 op = _install_candidate(candidate, arch)
                 self.assertEqual(op(a, b, space="full"), (marker, "full"))
 
-    def test_mm_heuristic_benchmark_reuses_full_space_oracle(self) -> None:
+    def test_mm_heuristic_benchmark_remeasures_oracle_winner(self) -> None:
         import torch
 
         from ..decision_maker.tuning_harnesses import mm
@@ -1807,10 +1807,15 @@ class HarnessTest(unittest.TestCase):
             patch.object(mm, "_inputs", return_value=(tensor, tensor)),
             patch.object(mm.torch.cuda, "synchronize"),
             patch.object(mm, "_measure", return_value=[10.0, 10.0]),
+            patch.object(
+                mm,
+                "_oracle_winner",
+                return_value=lambda: artifact["op"](tensor, tensor, space="full"),
+            ),
         ):
             result = mm.benchmark(artifact, {"case_id": "a"}, 10)
 
-        self.assertEqual(spaces, ["heuristic"])
+        self.assertEqual(spaces, ["full", "heuristic"])
         self.assertEqual(result["metrics"]["full_space_parity"], 1.0)
 
     def test_benchmark_metrics_are_attached_to_verification(self) -> None:

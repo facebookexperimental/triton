@@ -67,6 +67,7 @@ def run_tuning(
     commit_message: str | None,
     vcs: str,
     initial_source: str | None = None,
+    device_environments: tuple[dict[str, str], ...] = (),
 ) -> tuple[int, dict[str, Any]]:
     kernel_path = infer_kernel_path(repository, op, arch)
     original_source = initial_source if initial_source is not None else kernel_path.read_text()
@@ -91,6 +92,15 @@ def run_tuning(
         guidance="Measure the fixed full configuration space.",
     )
     oracle_path = output_dir / "full_space_oracle.json"
+    if device_environments:
+        oracle_target = replace(
+            oracle_target,
+            environment={
+                **oracle_target.environment,
+                "TLX_AGENT_DEVICE_POOL": json.dumps(device_environments),
+                "TLX_AGENT_CHECKPOINT_DIR": str((output_dir / "oracle_cases").resolve()),
+            },
+        )
     print(f"[tlx-agent] measuring full-space oracle for {len(cases)} shapes", flush=True)
     oracle = SubprocessHarness(
         harness_path,
@@ -102,9 +112,16 @@ def run_tuning(
         budget.benchmark_repetitions,
         profile=False,
     )
-    if not oracle.correct or any(case.timing is None for case in oracle.cases):
-        raise RuntimeError("full-space oracle failed correctness or produced no timing")
     oracle_path.write_text(json.dumps(to_json_value(oracle), indent=2, sort_keys=True) + "\n")
+    failed = [
+        f"{case.case_id}: {case.verification.diagnostics or 'no timing'}"
+        for case in oracle.cases
+        if not case.verification.passed or case.timing is None
+    ]
+    if failed:
+        raise RuntimeError(
+            "full-space oracle failed for:\n  " + "\n  ".join(failed)
+        )
     print(f"[tlx-agent] saved full-space oracle to {oracle_path}", flush=True)
 
     heuristic_target = _phase_target(
@@ -134,6 +151,11 @@ def run_tuning(
         environment={
             **heuristic_target.environment,
             "TLX_AGENT_FULL_SPACE_ORACLE": str(oracle_path.resolve()),
+            **(
+                {"TLX_AGENT_DEVICE_POOL": json.dumps(device_environments)}
+                if device_environments
+                else {}
+            ),
         },
     )
     heuristic_budget = replace(budget, max_rounds=heuristic_rounds, min_speedup=1.0)

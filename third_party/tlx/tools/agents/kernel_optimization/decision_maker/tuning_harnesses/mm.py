@@ -93,7 +93,7 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
 def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     a, b = _inputs(case, artifact["device"])
     try:
-        expected = torch.matmul(a, b)
+        expected = _reference_matmul(a, b)
         tolerance = 8e-3 if a.dtype == torch.bfloat16 else 1e-3
         if artifact["phase"] == "search_space":
             spaces = ("heuristic", "full")
@@ -109,17 +109,30 @@ def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     return {"passed": True}
 
 
+def _reference_matmul(a, b, *, max_rows: int = 65536):
+    """Avoid rocBLAS's incorrect final row on very tall, narrow GEMMs."""
+    if a.shape[0] <= max_rows:
+        return torch.matmul(a, b)
+    expected = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
+    for row in range(0, a.shape[0], max_rows):
+        expected[row:row + max_rows] = torch.matmul(a[row:row + max_rows], b)
+    return expected
+
+
 def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) -> dict[str, Any]:
     a, b = _inputs(case, artifact["device"])
     if artifact["phase"] == "heuristic":
         oracle = artifact["oracle_cases"].get(case["case_id"])
         if oracle is None or oracle.get("timing") is None:
             raise RuntimeError(f"full-space oracle has no timing for {case['case_id']}")
-        full_samples = [float(value) for value in oracle["timing"]["samples_us"]]
         oracle_metrics = oracle["verification"].get("metrics", {})
         config_rows = list(oracle_metrics.get("top_full_configs", []))
         full_config_count = int(oracle_metrics.get("full_config_count", 0))
         full_best_config = str(oracle_metrics.get("full_best_config", ""))
+        full = _oracle_winner(artifact, a, b, full_best_config)
+        full()
+        torch.cuda.synchronize()
+        full_samples = _measure(full, repetitions)
     else:
         full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
         full_tuners: dict[str, Any] = {}
@@ -235,6 +248,24 @@ def _selected_heuristic_config(artifact: Mapping[str, Any], a, b) -> str:
     else:
         configs = heuristic(*shape)
     return _format_config(configs[0]) if len(configs) == 1 else ""
+
+
+def _oracle_winner(artifact: Mapping[str, Any], a, b, winner: str):
+    module = artifact.get("module")
+    if module is None or not winner:
+        raise RuntimeError("full-space oracle did not record its winning config")
+    expected = winner.split(": ", 1)[-1]
+    shape = (a.shape[0], b.shape[1], a.shape[1])
+    enable_local_split_u = bool(module._precheck_local_split_u(a, b, None))
+    tuner = module._tuned("full", shape, enable_local_split_u)
+    selected = [config for config in tuner.configs if _format_config(config) == expected]
+    if len(selected) != 1:
+        raise RuntimeError(f"could not resolve oracle winner {winner!r}")
+    tuner.configs = selected
+    cache = getattr(tuner, "cache", None)
+    if cache is not None:
+        cache.clear()
+    return lambda: artifact["op"](a, b, space="full")
 
 
 def _best_configs(tuners: Mapping[str, Any]) -> str:
