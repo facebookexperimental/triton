@@ -246,6 +246,16 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=False,
     ),
     OpSpec(
+        op="flash_attn_varlen",
+        arch="gfx950",
+        variant="mfma_interleaved",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950:flash_attn_varlen",
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        requires=frozenset(),
+        supports_backward=False,
+    ),
+    OpSpec(
         op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
