@@ -33,6 +33,16 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+from .gfx950_varlen_bwd import (
+    _bm32_load_dq_k,
+    _bm32_load_score_prefix,
+    _bm32_load_stat_half,
+    _bm32_qdo_stage_slice,
+    _store_dq_bm32_native,
+    _varlen_gqa_dq_bm32,
+    _varlen_gqa_phase_bm32,
+)
+
 # Public equal-head correctness contract for this submission. The kernels
 # have broader D128 and D256 families internally, but these are the two MHA
 # tuples validated end-to-end on gfx950.
@@ -1163,6 +1173,7 @@ def _attn_bwd_gqa_front(
     P_ND_LAYOUT: tl.constexpr,
     Q_OUT_LAYOUT: tl.constexpr,
     UPDATE_DV_FIRST_HALF: tl.constexpr = True,
+    MASK_CAUSAL: tl.constexpr = None,
 ):
     """Publish current dS to LDS and optionally update the first dV fragments."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
@@ -1212,7 +1223,8 @@ def _attn_bwd_gqa_front(
         n_m_blocks: tl.constexpr = N // BLOCK_M
         m_block = step % n_m_blocks
         query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
-        if query_fragment < BLOCK_N // BLOCK_M:
+        mask_this_tile = query_fragment < BLOCK_N // BLOCK_M if MASK_CAUSAL is None else MASK_CAUSAL
+        if mask_this_tile:
             offs_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
             offs_m = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
             valid = offs_n[:, None] <= offs_m[None, :]
@@ -1689,6 +1701,8 @@ def _attn_bwd_gqa_phase(
     DIRECT_DK: tl.constexpr,
     REDIRECT_DUMMY_DQ: tl.constexpr,
     Q_BATCH_FITS_BUFFER: tl.constexpr,
+    MASK_CAUSAL: tl.constexpr = None,
+    PHASE_IGLP: tl.constexpr = -1,
 ):
     """Run one absolute outer-step phase with direct dK or the lagged bridge.
 
@@ -1740,6 +1754,7 @@ def _attn_bwd_gqa_phase(
         QT_LAYOUT,
         P_ND_LAYOUT,
         Q_OUT_LAYOUT,
+        MASK_CAUSAL=MASK_CAUSAL,
     )
     dv = _attn_bwd_gqa_dv_fragmented_half(
         dv_lhs,
@@ -1802,6 +1817,8 @@ def _attn_bwd_gqa_phase(
     dk = tlx.require_layout(dk, MMA_ND, pin=False)
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
+    if PHASE_IGLP >= 0:
+        tlx.amd_iglp_opt(PHASE_IGLP)
     tl.debug_barrier()
     return dk, dv, v_operand
 
@@ -1825,8 +1842,16 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr = 1,
+    PHASE_IGLP: tl.constexpr = -1,
+    PEEL_CAUSAL: tl.constexpr = False,
 ):
-    """Four-wave outer64 causal/full GQA backward bridge."""
+    """Four-wave outer64 causal/full GQA backward bridge.
+
+    KV_SPLITS partitions the mapped query heads among independent owners.
+    Split owners read the original K/V tensors and publish FP32 dK/dV partials;
+    the caller reduces those partials once before converting to BF16 outputs.
+    """
     tl.static_assert(D == 128)
     tl.static_assert(BLOCK_M == 16)
     tl.static_assert(BLOCK_N == 256)
@@ -1836,6 +1861,12 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     # Keep adjacent workgroups on different KV heads for the same batch and
     # N tile to improve the dQ atomic/cache locality of the GQA bridge.
     off_h_kv = tl.program_id(0)
+    # Only Q/dQ head mapping uses the virtual HK * KV_SPLITS topology.
+    # Original K/V addresses and batch strides continue to use HK.
+    original_kv_head = off_h_kv // KV_SPLITS
+    tl.static_assert(KV_SPLITS >= 1)
+    tl.static_assert((HQ // HK) % KV_SPLITS == 0)
+    tl.static_assert(not PEEL_CAUSAL or (IS_CAUSAL and HQ == HK and KV_SPLITS == 1))
     pid_n = tl.program_id(1)
     off_z = tl.program_id(2)
     OUTER_M: tl.constexpr = 64
@@ -2089,20 +2120,27 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     if kv_batch_fits_buffer:
         K = K + kv_batch_base
         V = V + kv_batch_base
-        DK = DK + kv_batch_base
-        DV = DV + kv_batch_base
-        kv_offset_base = off_h_kv * N * D
+        if KV_SPLITS == 1:
+            DK = DK + kv_batch_base
+            DV = DV + kv_batch_base
+        kv_offset_base = original_kv_head * N * D
         kv_tile_n = pid_n * BLOCK_N
     else:
-        kv_program_base = kv_batch_base + (off_h_kv.to(tl.int64) * N + pid_n.to(tl.int64) * BLOCK_N) * D
+        kv_program_base = kv_batch_base + (original_kv_head.to(tl.int64) * N + pid_n.to(tl.int64) * BLOCK_N) * D
         # The tile offsets are aligned by D=128 elements. Preserve a concrete
         # byte-alignment proof so direct-to-LDS vectorization remains legal.
         K = tl.multiple_of(K + kv_program_base, buffer_base_alignment_bytes)
         V = tl.multiple_of(V + kv_program_base, buffer_base_alignment_bytes)
-        DK = tl.multiple_of(DK + kv_program_base, buffer_base_alignment_bytes)
-        DV = tl.multiple_of(DV + kv_program_base, buffer_base_alignment_bytes)
+        if KV_SPLITS == 1:
+            DK = tl.multiple_of(DK + kv_program_base, buffer_base_alignment_bytes)
+            DV = tl.multiple_of(DV + kv_program_base, buffer_base_alignment_bytes)
         kv_offset_base = 0
         kv_tile_n = 0
+    if KV_SPLITS > 1:
+        partial_program_base = (
+            (off_z.to(tl.int64) * HK * KV_SPLITS + off_h_kv.to(tl.int64)) * N + pid_n.to(tl.int64) * BLOCK_N) * D
+        DK = tl.multiple_of(DK + partial_program_base, buffer_base_alignment_bytes)
+        DV = tl.multiple_of(DV + partial_program_base, buffer_base_alignment_bytes)
     k_offsets = kv_offset_base + (kv_tile_n + k_n) * D + k_d_base + raw_v[None, None, :]
     k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
     k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
@@ -2123,7 +2161,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
         pid_n,
         0,
         HQ,
-        HK,
+        HK * KV_SPLITS,
         N,
         D,
         BLOCK_M,
@@ -2147,7 +2185,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
         pid_n,
         1,
         HQ,
-        HK,
+        HK * KV_SPLITS,
         N,
         D,
         BLOCK_M,
@@ -2191,8 +2229,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     n_outer_blocks: tl.constexpr = N // OUTER_M
     first_outer_block = pid_n * (BLOCK_N // OUTER_M) if IS_CAUSAL else 0
     active_outer_blocks = n_outer_blocks - first_outer_block
-    total_outer_steps = (HQ // HK) * active_outer_blocks
-    continuous_bridge: tl.constexpr = HQ == HK
+    total_outer_steps = (HQ // (HK * KV_SPLITS)) * active_outer_blocks
+    continuous_bridge: tl.constexpr = HQ == HK * KV_SPLITS
     if continuous_bridge:
         # Seed delayed dQ so MHA phase 0 can use the steady bridge.  The dummy
         # zero dQ is redirected to the first tile and leaves it unchanged.
@@ -2204,83 +2242,49 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
 
     # MHA carries delayed dQ across outer64 boundaries.  Grouped-query shapes
     # retain the per-group prologue/drain, which better overlaps Q/dO refill.
-    for outer_step in tl.range(0, total_outer_steps, loop_unroll_factor=1):
-        outer_stage = outer_step % 2
-        group_idx = outer_step // active_outer_blocks
-        outer_block = first_outer_block + outer_step % active_outer_blocks
-        global_outer_step = group_idx * n_outer_blocks + outer_block
-        q_outer = tlx.local_view(q_buffers, outer_stage)
-        do_outer = tlx.local_view(do_buffers, outer_stage)
-        lse_outer = tlx.local_view(lse_buffers, outer_stage)
-        delta_outer = tlx.local_view(delta_buffers, outer_stage)
-        q_tiles = tlx.local_reinterpret(
-            q_outer,
-            tl.bfloat16,
-            [4, BLOCK_M, D],
-            layout=qdo_slice_smem_layout,
-        )
-        do_tiles = tlx.local_reinterpret(
-            do_outer,
-            tl.bfloat16,
-            [4, BLOCK_M, D],
-            layout=qdo_slice_smem_layout,
-        )
-        lse_tiles = tlx.local_reinterpret(
-            lse_outer,
-            tl.float32,
-            [4, BLOCK_M],
-            layout=stats_slice_smem_layout,
-        )
-        delta_tiles = tlx.local_reinterpret(
-            delta_outer,
-            tl.float32,
-            [4, BLOCK_M],
-            layout=stats_slice_smem_layout,
-        )
-        # Phase 0 publishes stage 0.  MHA consumes seeded/prior stage 1;
-        # grouped-query shapes use direct dK and drain at the outer boundary.
-        phase0: tl.constexpr = 0
-        dk, dv, v_operand = _attn_bwd_gqa_phase(
-            q_tiles,
-            do_tiles,
-            lse_tiles,
-            delta_tiles,
-            ds_buffers,
-            k_buffer,
-            k_resident_lo,
-            k_resident_mid,
-            k_resident_band6,
-            v_operand,
-            dk,
-            dv,
-            DQ_ACC,
-            off_h_kv,
-            pid_n,
-            global_outer_step,
-            phase0,
-            SM_SCALE,
-            HQ,
-            HK,
-            N,
-            D,
-            BLOCK_M,
-            BLOCK_N,
-            IS_CAUSAL,
-            mma_nm,
-            mma_nd,
-            mma_md,
-            k_nm_layout,
-            qt_layout,
-            p_nd_layout,
-            q_out_layout,
-            ds_md_layout,
-            k_md_layout,
-            not continuous_bridge,
-            continuous_bridge,
-            q_batch_fits_buffer,
-        )
-
-        for phase in tl.range(1, 4, loop_unroll_factor=1):
+    # The first BLOCK_N query rows intersect this KV tile's diagonal. Later
+    # rows see the complete KV tile, so causal MHA can omit the per-phase mask
+    # branch there. Keep one async ring and delayed-dQ chain across both regions.
+    peel_causal: tl.constexpr = PEEL_CAUSAL
+    for region in tl.static_range(2 if peel_causal else 1):
+        region_begin = 0 if region == 0 else BLOCK_N // OUTER_M
+        region_end = BLOCK_N // OUTER_M if peel_causal and region == 0 else total_outer_steps
+        for outer_step in tl.range(region_begin, region_end, loop_unroll_factor=1):
+            outer_stage = outer_step % 2
+            group_idx = outer_step // active_outer_blocks
+            outer_block = first_outer_block + outer_step % active_outer_blocks
+            global_outer_step = group_idx * n_outer_blocks + outer_block
+            q_outer = tlx.local_view(q_buffers, outer_stage)
+            do_outer = tlx.local_view(do_buffers, outer_stage)
+            lse_outer = tlx.local_view(lse_buffers, outer_stage)
+            delta_outer = tlx.local_view(delta_buffers, outer_stage)
+            q_tiles = tlx.local_reinterpret(
+                q_outer,
+                tl.bfloat16,
+                [4, BLOCK_M, D],
+                layout=qdo_slice_smem_layout,
+            )
+            do_tiles = tlx.local_reinterpret(
+                do_outer,
+                tl.bfloat16,
+                [4, BLOCK_M, D],
+                layout=qdo_slice_smem_layout,
+            )
+            lse_tiles = tlx.local_reinterpret(
+                lse_outer,
+                tl.float32,
+                [4, BLOCK_M],
+                layout=stats_slice_smem_layout,
+            )
+            delta_tiles = tlx.local_reinterpret(
+                delta_outer,
+                tl.float32,
+                [4, BLOCK_M],
+                layout=stats_slice_smem_layout,
+            )
+            # Phase 0 publishes stage 0.  MHA consumes seeded/prior stage 1;
+            # grouped-query shapes use direct dK and drain at the outer boundary.
+            phase0: tl.constexpr = 0
             dk, dv, v_operand = _attn_bwd_gqa_phase(
                 q_tiles,
                 do_tiles,
@@ -2298,10 +2302,10 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 off_h_kv,
                 pid_n,
                 global_outer_step,
-                phase,
+                phase0,
                 SM_SCALE,
                 HQ,
-                HK,
+                HK * KV_SPLITS,
                 N,
                 D,
                 BLOCK_M,
@@ -2316,66 +2320,111 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 q_out_layout,
                 ds_md_layout,
                 k_md_layout,
-                False,
-                False,
+                not continuous_bridge,
+                continuous_bridge,
                 q_batch_fits_buffer,
+                MASK_CAUSAL=(region == 0) if peel_causal else None,
+                PHASE_IGLP=PHASE_IGLP,
             )
 
-        _attn_bwd_gqa_issue_qdo_async(
-            q_outer,
-            do_outer,
-            lse_outer,
-            delta_outer,
-            Q,
-            DO,
-            LSE,
-            Delta,
-            off_h_kv,
-            pid_n,
-            outer_step + 2,
-            HQ,
-            HK,
-            N,
-            D,
-            BLOCK_M,
-            BLOCK_N,
-            OUTER_M,
-            qdo_async_layout,
-            stats_async_layout,
-            q_batch_fits_buffer,
-            IS_CAUSAL,
-        )
-        if not continuous_bridge:
-            # Grouped-query reuse makes this drain useful work while the next
-            # Q/dO/stats refill is in flight.
-            dq, v_operand = _attn_bwd_gqa_dq(
-                tlx.local_view(ds_buffers, 1),
-                k_buffer,
-                k_resident_lo,
-                k_resident_mid,
-                k_resident_band6,
-                v_operand,
-                mma_md,
-                ds_md_layout,
-                k_md_layout,
-                k_nm_layout,
-            )
-            _attn_bwd_gqa_store_dq_native(
-                dq,
-                DQ_ACC,
+            for phase in tl.range(1, 4, loop_unroll_factor=1):
+                dk, dv, v_operand = _attn_bwd_gqa_phase(
+                    q_tiles,
+                    do_tiles,
+                    lse_tiles,
+                    delta_tiles,
+                    ds_buffers,
+                    k_buffer,
+                    k_resident_lo,
+                    k_resident_mid,
+                    k_resident_band6,
+                    v_operand,
+                    dk,
+                    dv,
+                    DQ_ACC,
+                    off_h_kv,
+                    pid_n,
+                    global_outer_step,
+                    phase,
+                    SM_SCALE,
+                    HQ,
+                    HK * KV_SPLITS,
+                    N,
+                    D,
+                    BLOCK_M,
+                    BLOCK_N,
+                    IS_CAUSAL,
+                    mma_nm,
+                    mma_nd,
+                    mma_md,
+                    k_nm_layout,
+                    qt_layout,
+                    p_nd_layout,
+                    q_out_layout,
+                    ds_md_layout,
+                    k_md_layout,
+                    False,
+                    False,
+                    q_batch_fits_buffer,
+                    MASK_CAUSAL=(region == 0) if peel_causal else None,
+                    PHASE_IGLP=PHASE_IGLP,
+                )
+
+            _attn_bwd_gqa_issue_qdo_async(
+                q_outer,
+                do_outer,
+                lse_outer,
+                delta_outer,
+                Q,
+                DO,
+                LSE,
+                Delta,
                 off_h_kv,
-                global_outer_step * 4 + 3,
-                SM_SCALE,
+                pid_n,
+                outer_step + 2,
                 HQ,
-                HK,
+                HK * KV_SPLITS,
                 N,
                 D,
                 BLOCK_M,
-                mma_md,
+                BLOCK_N,
+                OUTER_M,
+                qdo_async_layout,
+                stats_async_layout,
                 q_batch_fits_buffer,
+                IS_CAUSAL,
             )
-        tlx.async_load_wait_group(2)
-        tl.debug_barrier()
+            if not continuous_bridge:
+                # Grouped-query reuse makes this drain useful work while the next
+                # Q/dO/stats refill is in flight.
+                dq, v_operand = _attn_bwd_gqa_dq(
+                    tlx.local_view(ds_buffers, 1),
+                    k_buffer,
+                    k_resident_lo,
+                    k_resident_mid,
+                    k_resident_band6,
+                    v_operand,
+                    mma_md,
+                    ds_md_layout,
+                    k_md_layout,
+                    k_nm_layout,
+                )
+                _attn_bwd_gqa_store_dq_native(
+                    dq,
+                    DQ_ACC,
+                    off_h_kv,
+                    global_outer_step * 4 + 3,
+                    SM_SCALE,
+                    HQ,
+                    HK * KV_SPLITS,
+                    N,
+                    D,
+                    BLOCK_M,
+                    mma_md,
+                    q_batch_fits_buffer,
+                )
+            tlx.async_load_wait_group(2)
+            tl.debug_barrier()
 
     if continuous_bridge:
         # Only the last MHA dS has no following dK with which to braid dQ.
@@ -2401,7 +2450,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
             N // BLOCK_M - 1,
             SM_SCALE,
             HQ,
-            HK,
+            HK * KV_SPLITS,
             N,
             D,
             BLOCK_M,
@@ -2410,8 +2459,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
         )
     tlx.async_load_wait_group(0)
 
-    # Store the unique dK/dV tile after every query head in the group has
-    # contributed.
+    # Store this owner's dK/dV tile after its assigned query heads contribute.
+    # Split owners keep FP32 through the separate final reduction.
     dk = tlx.require_layout(dk, mma_nd, pin=False)
     dv = tlx.require_layout(dv, mma_nd, pin=False)
     dk = tl.reshape(dk, (2, 2, 2, 2, 16, D))
@@ -2421,9 +2470,12 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     dk = dk * SM_SCALE
     store_n = kv_tile_n + tlx.rematerialized_range(0, BLOCK_N, 30)
     store_d = tlx.rematerialized_range(0, D, 31)
-    key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
+    if KV_SPLITS > 1:
+        key_offsets = (store_n[:, None] - kv_tile_n) * D + store_d[None, :]
+    else:
+        key_offsets = kv_offset_base + store_n[:, None] * D + store_d[None, :]
     key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
-    tlx.buffer_store(dk.to(tl.bfloat16), DK, key_offsets)
+    tlx.buffer_store(dk.to(DK.dtype.element_ty), DK, key_offsets)
 
     # dK is dead before constructing the dV view, so its temporary registers
     # are available to the dV epilogue.
@@ -2431,7 +2483,291 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     dv = tl.permute(dv, (0, 3, 1, 2, 4, 5))
     dv = tl.reshape(dv, (BLOCK_N, D))
     dv = tlx.require_layout(dv, kv_native_layout, pin=False)
-    tlx.buffer_store(dv.to(tl.bfloat16), DV, key_offsets)
+    tlx.buffer_store(dv.to(DV.dtype.element_ty), DV, key_offsets)
+
+
+@triton.jit
+def _dense_bwd_issue_qdo_bm32_async(q_dst, do_dst, lse_dst, delta_dst, Q, DO, LSE, Delta, q_start, q_len, q_head,
+                                    outer_block, TOTAL_Q, D: tl.constexpr, BLOCK_M: tl.constexpr,
+                                    ASYNC_LAYOUT: tl.constexpr, STATS_ASYNC_LAYOUT: tl.constexpr,
+                                    ZERO_FILL_QDO: tl.constexpr = False, base_q_head=0,
+                                    REUSE_HEAD_BASE: tl.constexpr = False):
+    outer_slice = tl.arange(0, 1)
+    rows = outer_block * BLOCK_M + outer_slice[:, None] * BLOCK_M + tl.arange(0, BLOCK_M)[None, :]
+    dims = tl.arange(0, D)
+    valid = tl.broadcast_to((rows < q_len)[:, :, None], (1, BLOCK_M, D))
+    valid = tlx.require_layout(valid, ASYNC_LAYOUT, pin=False)
+    head_delta = q_head - base_q_head
+    qdo_base = q_head.to(tl.int64) * TOTAL_Q * D
+    offsets = (rows[:, :, None] * D + dims[None, None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, ASYNC_LAYOUT, pin=False)
+    if (outer_block + 1) * BLOCK_M > q_len:
+        tlx.local_store(q_dst, tl.zeros((1, BLOCK_M, D), tl.bfloat16))
+        tlx.local_store(do_dst, tl.zeros((1, BLOCK_M, D), tl.bfloat16))
+        tl.debug_barrier()
+    qdo_zero = tlx.zeros((1, BLOCK_M, D), tl.bfloat16, layout=ASYNC_LAYOUT) if ZERO_FILL_QDO else None
+    q_token = tlx.buffer_load_to_local(q_dst, tl.multiple_of(Q + qdo_base, 16), offsets, mask=valid, other=qdo_zero)
+    tlx.async_load_commit_group([q_token])
+    stats_i = tl.arange(0, 64)
+    stats_zero = tlx.zeros((64, ), tl.float32, layout=STATS_ASYNC_LAYOUT)
+    stats_rows = outer_block * BLOCK_M + stats_i
+    stats_valid = tlx.require_layout((stats_i < BLOCK_M) & (stats_rows < q_len), STATS_ASYNC_LAYOUT, pin=False)
+    if REUSE_HEAD_BASE:
+        lse_offsets = tlx.require_layout((stats_rows + head_delta * TOTAL_Q).to(tl.int32), STATS_ASYNC_LAYOUT,
+                                         pin=False)
+        delta_offsets = tlx.require_layout((stats_rows + head_delta * TOTAL_Q).to(tl.int32), STATS_ASYNC_LAYOUT,
+                                           pin=False)
+    else:
+        lse_offsets = tlx.require_layout(stats_rows.to(tl.int32), STATS_ASYNC_LAYOUT, pin=False)
+        delta_offsets = tlx.require_layout(stats_rows.to(tl.int32), STATS_ASYNC_LAYOUT, pin=False)
+    if REUSE_HEAD_BASE:
+        lse_token = tlx.buffer_load_to_local(lse_dst, LSE + base_q_head * TOTAL_Q + q_start, lse_offsets,
+                                             mask=stats_valid, other=stats_zero)
+        delta_token = tlx.buffer_load_to_local(delta_dst, Delta + base_q_head * TOTAL_Q, delta_offsets,
+                                               mask=stats_valid, other=stats_zero)
+    else:
+        lse_token = tlx.buffer_load_to_local(lse_dst, LSE + q_head * TOTAL_Q + q_start, lse_offsets, mask=stats_valid,
+                                             other=stats_zero)
+        delta_token = tlx.buffer_load_to_local(delta_dst, Delta + q_head * TOTAL_Q, delta_offsets, mask=stats_valid,
+                                               other=stats_zero)
+    do_token = tlx.buffer_load_to_local(do_dst, tl.multiple_of(DO + qdo_base, 16), offsets, mask=valid, other=qdo_zero)
+    tlx.async_load_commit_group([lse_token, delta_token, do_token])
+
+
+@triton.jit
+def _dense_bwd_dkdv_dq_bm32_kernel(Q, K, V, DO, LSE, Delta, DQ_ACC, DK, DV, SM_SCALE: tl.constexpr, TOTAL_Q,
+                                   TOTAL_Q_PADDED, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+                                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Process masked BN256 KV owners in BM32 phases with two native BM16 dQ chains."""
+    tl.static_assert(D == 128)
+    tl.static_assert(BLOCK_M == 32)
+    tl.static_assert(BLOCK_N == 256)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert(HQ // HKV > 1)
+    off_z = tl.program_id(2)
+    kv_head_split = tl.program_id(0)
+    kv_head = kv_head_split
+    split = 0
+    group_size: tl.constexpr = HQ // HKV
+    heads_per_split: tl.constexpr = group_size
+    kv_global_start = tl.program_id(1) * BLOCK_N
+    q_start = 0
+    q_scratch_start = 0
+    q_len = TOTAL_Q
+    kv_valid_rows = BLOCK_N
+    outer_blocks = TOTAL_Q // BLOCK_M
+    total_outer_steps = heads_per_split * outer_blocks
+    first_q_head = kv_head * group_size + split * heads_per_split
+    Q += off_z.to(tl.int64) * HQ * TOTAL_Q * D
+    DO += off_z.to(tl.int64) * HQ * TOTAL_Q * D
+    LSE += off_z.to(tl.int64) * HQ * TOTAL_Q
+    Delta += off_z.to(tl.int64) * HQ * TOTAL_Q
+    K += off_z.to(tl.int64) * HKV * TOTAL_Q * D
+    V += off_z.to(tl.int64) * HKV * TOTAL_Q * D
+    DQ_ACC += off_z.to(tl.int64) * HQ * TOTAL_Q * D
+    DK += off_z.to(tl.int64) * HKV * TOTAL_Q * D
+    DV += off_z.to(tl.int64) * HKV * TOTAL_Q * D
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                               warps_per_cta=[4, 1])
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
+                                               warps_per_cta=[4, 1])
+    mma_md: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+                                               warps_per_cta=[1, 4])
+    k_nm_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    qt_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_nd_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=8)
+    q_out_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=8)
+    ds_md_layout: tl.constexpr = tlx.dot_operand_layout(0, mma_md, k_width=8)
+    k_md_layout: tl.constexpr = tlx.dot_operand_layout(1, mma_md, k_width=8)
+    qdo_async_layout: tl.constexpr = tlx.layout(shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+                                                stride=((8, 16, 32, 128, 64, 512, 256, 1024), (1, 2, 4, 2048)))
+    stats_async_layout: tl.constexpr = tlx.layout(shape=((64, 4), ()), stride=((1, 0), ()))
+    stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(offset_bases=[[1], [2], [4], [8], [16], [32]],
+                                                                        block_bases=[], alignment=16)
+    qdo_smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)], [[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 0, 32], [0, 1, 0],
+                                  [0, 0, 64], [0, 4, 0], [0, 2, 0], [0, 8, 0], [0, 16, 0]], [1, BLOCK_M, D])
+    qdo_slice_smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32), (1024, 16)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [1, 0], [0, 64], [4, 0], [2, 0], [8, 0], [16, 0]],
+        [BLOCK_M, D])
+    ds_smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [[1, 0], [2, 0], [0, 1], [0, 2], [4, 0], [0, 8], [8, 0], [0, 32], [0, 16], [0, 4], [0, 64], [0, 128], [16, 0]],
+        [BLOCK_M, BLOCK_N])
+    k_raw_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [1, 0, 0], [2, 0, 0],
+                      [4, 0, 0], [8, 0, 0], [16, 0, 0], [32, 0, 0], [64, 0, 0], [128, 0, 0]], block_bases=[],
+        alignment=16)
+    k_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 64], [1, 0], [2, 0], [4, 0], [8, 64], [0, 16], [0, 32],
+                      [16, 0], [32, 0], [64, 0], [128, 0]], block_bases=[], alignment=16)
+    k_raw_async_layout: tl.constexpr = tlx.layout(shape=((64, 4), (8, 8, 2)), stride=((8, 512), (1, 2048, 16384)))
+    kv_native_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2, 2)),
+        stride=((128, 256, 512, 1024, 8192, 4, 2048, 4096), (1, 2, 8, 16, 32, 64, 16384)))
+    k_raw_buffer = tlx.local_alloc((BLOCK_N, D // 8, 8), tl.bfloat16, 1, layout=k_raw_smem_layout)
+    k_buffer = tlx.local_reinterpret(tlx.local_view(k_raw_buffer, 0), tl.bfloat16, [BLOCK_N, D], layout=k_smem_layout)
+    q_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    do_buffers = tlx.local_alloc((1, BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    ds_buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.bfloat16, 1, layout=ds_smem_layout)
+    lse_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
+    delta_buffers = tlx.local_alloc((64, ), tl.float32, 2, layout=stats_smem_layout)
+    raw_n = tl.arange(0, BLOCK_N)
+    raw_dg = tl.arange(0, D // 8)
+    raw_v = tl.arange(0, 8)
+    k_phys = raw_n[:, None, None] * D + raw_dg[None, :, None] * 8
+    k_d_base = k_phys & 8 | (k_phys >> 9 & 3) << 4 | ((k_phys >> 4 ^ k_phys >> 8) & 1) << 6
+    k_n = k_phys >> 5 & 7 | (k_phys >> 8 & 1) << 3 | (k_phys >> 11 & 15) << 4
+    kv_tile_base = (kv_head.to(tl.int64) * TOTAL_Q + kv_global_start) * D
+    k_ptr = tl.multiple_of(K + kv_tile_base, 16)
+    v_ptr = tl.multiple_of(V + kv_tile_base, 16)
+    k_offsets = (k_n * D + k_d_base + raw_v[None, None, :]).to(tl.int32)
+    k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
+    k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
+    k_offsets = tlx.require_layout(k_offsets, k_raw_async_layout, pin=False)
+    k_valid = tl.broadcast_to(k_n < kv_valid_rows, (BLOCK_N, D // 8, 8))
+    k_valid = tlx.require_layout(k_valid, k_raw_async_layout, pin=False)
+    k_zero = tlx.zeros((BLOCK_N, D // 8, 8), tl.bfloat16, layout=k_raw_async_layout)
+    k_token = tlx.buffer_load_to_local(tlx.local_view(k_raw_buffer, 0), k_ptr, k_offsets, mask=k_valid, other=k_zero)
+    tlx.async_load_commit_group([k_token])
+    _dense_bwd_issue_qdo_bm32_async(tlx.local_view(q_buffers, 0), tlx.local_view(do_buffers, 0),
+                                    tlx.local_view(lse_buffers, 0), tlx.local_view(delta_buffers, 0), Q, DO, LSE, Delta,
+                                    q_start, q_len, first_q_head, 0, TOTAL_Q, D, BLOCK_M, qdo_async_layout,
+                                    stats_async_layout, base_q_head=first_q_head, REUSE_HEAD_BASE=heads_per_split == 2)
+    second_step = tl.minimum(1, total_outer_steps - 1)
+    second_group = second_step // outer_blocks
+    second_outer = second_step % outer_blocks
+    _dense_bwd_issue_qdo_bm32_async(tlx.local_view(q_buffers, 1), tlx.local_view(do_buffers,
+                                                                                 1), tlx.local_view(lse_buffers, 1),
+                                    tlx.local_view(delta_buffers, 1), Q, DO, LSE, Delta, q_start, q_len,
+                                    first_q_head + second_group, second_outer, TOTAL_Q, D, BLOCK_M, qdo_async_layout,
+                                    stats_async_layout, base_q_head=first_q_head, REUSE_HEAD_BASE=heads_per_split == 2)
+    tlx.async_load_wait_group(2)
+    tl.debug_barrier()
+    k_prefix32 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [BLOCK_N, 32]), layout=k_nm_layout, relaxed=True)
+    k_prefix32 = tlx.require_layout(k_prefix32, k_nm_layout, pin=True)
+    dq_k_band0_panel0 = _bm32_load_dq_k(k_buffer, 0, 0, k_md_layout)
+    dq_k_band0_panel0 = tlx.require_layout(dq_k_band0_panel0, k_md_layout, pin=True)
+    dq_k_band0_panel0 = tlx.amd_register_resident(dq_k_band0_panel0, register_class='agpr', registers_per_group=4)
+    dq_k_band0_panel1 = _bm32_load_dq_k(k_buffer, 0, 1, k_md_layout)
+    dq_k_band0_panel1 = tlx.require_layout(dq_k_band0_panel1, k_md_layout, pin=True)
+    dq_k_band0_panel1 = tlx.amd_register_resident(dq_k_band0_panel1, register_class='agpr', registers_per_group=4)
+    dq_k_band1_panel0 = _bm32_load_dq_k(k_buffer, 1, 0, k_md_layout)
+    dq_k_band1_panel0 = tlx.require_layout(dq_k_band1_panel0, k_md_layout, pin=True)
+    dq_k_band1_panel0 = tlx.amd_register_resident(dq_k_band1_panel0, register_class='agpr', registers_per_group=4)
+    dq_k_band1_panel1 = _bm32_load_dq_k(k_buffer, 1, 1, k_md_layout)
+    dq_k_band1_panel1 = tlx.require_layout(dq_k_band1_panel1, k_md_layout, pin=True)
+    dq_k_band1_panel1 = tlx.amd_register_resident(dq_k_band1_panel1, register_class='agpr', registers_per_group=4)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    v_offsets = (offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+    v_offsets = tlx.require_layout(v_offsets, k_nm_layout, pin=False)
+    v_valid = tl.broadcast_to((offs_n < kv_valid_rows)[:, None], (BLOCK_N, D))
+    v_valid = tlx.require_layout(v_valid, k_nm_layout, pin=False)
+    v_zero = tlx.zeros((BLOCK_N, D), tl.bfloat16, layout=k_nm_layout)
+    v_operand = tlx.buffer_load(v_ptr, v_offsets, mask=v_valid, other=v_zero)
+    v_operand = tlx.require_layout(v_operand, k_nm_layout, pin=False)
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    DQ_ACC = DQ_ACC + q_scratch_start * D
+    stats_layout: tl.constexpr = tlx.slice_layout(mma_nm, 0)
+    initial_q_slice = _bm32_qdo_stage_slice(q_buffers, 0, qdo_slice_smem_layout)
+    initial_do_slice = _bm32_qdo_stage_slice(do_buffers, 0, qdo_slice_smem_layout)
+    initial_lse_tile = tlx.local_view(lse_buffers, 0)
+    initial_delta_tile = tlx.local_view(delta_buffers, 0)
+    lse0 = _bm32_load_stat_half(initial_lse_tile, 0, stats_layout)
+    lse1 = _bm32_load_stat_half(initial_lse_tile, 1, stats_layout)
+    delta0 = _bm32_load_stat_half(initial_delta_tile, 0, stats_layout, BASE_OFFSET=0)
+    delta1 = _bm32_load_stat_half(initial_delta_tile, 1, stats_layout, BASE_OFFSET=0)
+    q0 = _bm32_load_score_prefix(initial_q_slice, 0, qt_layout)
+    q1 = _bm32_load_score_prefix(initial_q_slice, 1, qt_layout)
+    do0 = _bm32_load_score_prefix(initial_do_slice, 0, qt_layout)
+    do1 = _bm32_load_score_prefix(initial_do_slice, 1, qt_layout)
+    lse0 = tl.inline_asm_elementwise('v_mul_f32_e32 $0, 0x3fb8aa3b, $1;', '=v,v', [lse0], dtype=tl.float32,
+                                     is_pure=True, pack=1)
+    lse1 = tl.inline_asm_elementwise('v_mul_f32_e32 $0, 0x3fb8aa3b, $1;', '=v,v', [lse1], dtype=tl.float32,
+                                     is_pure=True, pack=1)
+    for outer_step in tl.range(0, total_outer_steps, loop_unroll_factor=1):
+        outer_stage = outer_step % 2
+        group_index = outer_step // outer_blocks
+        outer_block = outer_step % outer_blocks
+        q_head = first_q_head + group_index
+        q_outer = tlx.local_view(q_buffers, outer_stage)
+        do_outer = tlx.local_view(do_buffers, outer_stage)
+        lse_outer = tlx.local_view(lse_buffers, outer_stage)
+        delta_outer = tlx.local_view(delta_buffers, outer_stage)
+        q_tiles = tlx.local_reinterpret(q_outer, tl.bfloat16, [1, BLOCK_M, D], layout=qdo_slice_smem_layout)
+        do_tiles = tlx.local_reinterpret(do_outer, tl.bfloat16, [1, BLOCK_M, D], layout=qdo_slice_smem_layout)
+        dq_base = (q_head.to(tl.int64) * TOTAL_Q_PADDED * D).to(tl.int32)
+        dk, dv, v_operand = _varlen_gqa_phase_bm32(q_tiles, do_tiles, tlx.local_view(ds_buffers, 0), k_buffer,
+                                                   k_prefix32, v_operand, dk, dv, outer_block, lse0, lse1, delta0,
+                                                   delta1, q0, q1, do0, do1, q_len, SM_SCALE, D, BLOCK_M, BLOCK_N,
+                                                   mma_nm, mma_nd, k_nm_layout, qt_layout, p_nd_layout, q_out_layout)
+        next_step = (outer_step + 2) % total_outer_steps
+        next_group = next_step // outer_blocks
+        next_outer = next_step % outer_blocks
+        _dense_bwd_issue_qdo_bm32_async(q_outer, do_outer, lse_outer, delta_outer, Q, DO, LSE, Delta, q_start, q_len,
+                                        first_q_head + next_group, next_outer, TOTAL_Q, D, BLOCK_M, qdo_async_layout,
+                                        stats_async_layout, ZERO_FILL_QDO=True, base_q_head=first_q_head,
+                                        REUSE_HEAD_BASE=heads_per_split == 2)
+        next_stage = outer_stage ^ 1
+        next_q_slice = _bm32_qdo_stage_slice(q_buffers, next_stage, qdo_slice_smem_layout)
+        next_do_slice = _bm32_qdo_stage_slice(do_buffers, next_stage, qdo_slice_smem_layout)
+        next_lse_tile = tlx.local_view(lse_buffers, next_stage)
+        next_delta_tile = tlx.local_view(delta_buffers, next_stage)
+        dq_lo, dq_hi, v_operand, next_lse0, next_lse1, next_delta0, next_delta1, next_q0, next_q1, next_do0, next_do1 = _varlen_gqa_dq_bm32(
+            tlx.local_view(ds_buffers, 0), k_buffer, dq_k_band0_panel0, dq_k_band0_panel1, dq_k_band1_panel0,
+            dq_k_band1_panel1, v_operand, next_q_slice, next_do_slice, next_lse_tile, next_delta_tile, mma_md,
+            ds_md_layout, k_md_layout, k_nm_layout, qt_layout, stats_layout, DELTA_OFFSET=0, LSE_PRESCALED=False)
+        _store_dq_bm32_native(dq_lo, dq_hi, DQ_ACC, dq_base, q_len, outer_block, SM_SCALE, D, mma_md, MASK_ROWS=True)
+        tlx.async_load_wait_group(2)
+        tl.debug_barrier()
+        lse0, lse1 = (next_lse0, next_lse1)
+        delta0, delta1 = (next_delta0, next_delta1)
+        q0, q1 = (next_q0, next_q1)
+        do0, do1 = (next_do0, next_do1)
+    tlx.async_load_wait_group(0)
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    dk = tl.reshape(dk, (2, 2, 2, 2, 16, D))
+    dk = tl.permute(dk, (0, 3, 1, 2, 4, 5))
+    dk = tl.reshape(dk, (BLOCK_N, D))
+    dk = tlx.require_layout(dk, kv_native_layout, pin=False)
+    dk *= SM_SCALE
+    dv = tl.reshape(dv, (2, 2, 2, 2, 16, D))
+    dv = tl.permute(dv, (0, 3, 1, 2, 4, 5))
+    dv = tl.reshape(dv, (BLOCK_N, D))
+    dv = tlx.require_layout(dv, kv_native_layout, pin=False)
+    store_n = tlx.rematerialized_range(0, BLOCK_N, 30)
+    store_d = tlx.rematerialized_range(0, D, 31)
+    partial_base = ((kv_head.to(tl.int64)) * TOTAL_Q + kv_global_start) * D
+    output_ptr = tl.multiple_of(DK + partial_base, 16)
+    output_v_ptr = tl.multiple_of(DV + partial_base, 16)
+    output_offsets = (store_n[:, None] * D + store_d[None, :]).to(tl.int32)
+    output_offsets = tlx.require_layout(output_offsets, kv_native_layout, pin=False)
+    output_mask = tl.broadcast_to((store_n < kv_valid_rows)[:, None], (BLOCK_N, D))
+    output_mask = tlx.require_layout(output_mask, kv_native_layout, pin=False)
+    tlx.buffer_store(dk.to(DK.dtype.element_ty), output_ptr, output_offsets, mask=output_mask)
+    tlx.buffer_store(dv.to(DV.dtype.element_ty), output_v_ptr, output_offsets, mask=output_mask)
+
+
+def _run_bwd_d128_gqa_bm32(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, dispatch):
+    """Dense noncausal BM32 owner with the landed native varlen schedule."""
+    batch, hq, n_ctx, head_dim = q.shape
+    hk = k.shape[1]
+    assert n_ctx >= 256 and n_ctx % 256 == 0 and (head_dim == 128)
+    assert hq > hk and hq % hk == 0 and (hq * n_ctx * head_dim <= 1 << 30)
+    _dense_bwd_dkdv_dq_bm32_kernel[hk, n_ctx // 256,
+                                   batch](q, k, v, do, lse, delta, dq_acc, dk, dv, SM_SCALE=sm_scale, TOTAL_Q=n_ctx,
+                                          TOTAL_Q_PADDED=n_ctx, HQ=hq, HKV=hk, D=head_dim, BLOCK_M=dispatch.block_m,
+                                          BLOCK_N=dispatch.block_n, num_warps=dispatch.num_warps,
+                                          num_stages=dispatch.num_stages,
+                                          matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim)
+    dispatch.convert_entry[triton.cdiv(n_ctx, dispatch.convert_block_m),
+                           batch * hq](dq_acc, dq, N=n_ctx, D=head_dim, BLOCK_M=dispatch.convert_block_m,
+                                       num_warps=dispatch.convert_num_warps,
+                                       matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim)
 
 
 @triton.jit
@@ -3787,13 +4123,37 @@ class _D128InterleavedDispatch:
     sink_insts_to_avoid_spills: bool = False
     regclass_priority_trumps_globalness: bool = False
     reverse_local_assignment: bool = False
+    kv_splits: int = 1
+    phase_iglp: int = -1
+    peel_causal: bool = False
 
 
-def _select_d128_interleaved_dispatch():
+def _select_d128_interleaved_dispatch(q_shape=None, k_shape=None, causal=False):
     regalloc = _d128_regalloc_options()
+    main_entry = _attn_bwd_dkdv_dq_d128_gqa_kernel
+    block_m = 16
+    kv_splits, phase_iglp, peel_causal = 1, -1, False
+    if q_shape is not None and k_shape is not None:
+        q_shape, k_shape = tuple(q_shape), tuple(k_shape)
+        if len(q_shape) == 4 and len(k_shape) == 4:
+            batch, hq, n_ctx, head_dim = q_shape
+            if k_shape[0] == batch and k_shape[2:] == (n_ctx, head_dim):
+                hk = k_shape[1]
+                if batch == 16 and head_dim == 128:
+                    if hq == hk == 16:
+                        if causal and n_ctx in (4096, 8192, 16384):
+                            phase_iglp, peel_causal = 3, True
+                        elif not causal and n_ctx == 4096:
+                            phase_iglp = 3
+                    elif hq == 64 and hk == 8:
+                        if causal and n_ctx in (2048, 4096):
+                            kv_splits = 4
+                        elif not causal and n_ctx == 8192 and not any(regalloc.values()):
+                            main_entry = _dense_bwd_dkdv_dq_bm32_kernel
+                            block_m = 32
     return _D128InterleavedDispatch(
-        main_entry=_attn_bwd_dkdv_dq_d128_gqa_kernel,
-        block_m=16,
+        main_entry=main_entry,
+        block_m=block_m,
         block_n=256,
         num_warps=4,
         num_stages=1,
@@ -3801,8 +4161,34 @@ def _select_d128_interleaved_dispatch():
         convert_entry=_attn_bwd_dq_native_convert_kernel,
         convert_block_m=128,
         convert_num_warps=4,
+        kv_splits=kv_splits,
+        phase_iglp=phase_iglp,
+        peel_causal=peel_causal,
         **regalloc,
     )
+
+
+@triton.jit
+def _attn_bwd_gqa_reduce_dkdv(
+    DK_PART,
+    DV_PART,
+    DK,
+    DV,
+    ELEMENTS,
+    ND: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Reduce contiguous head-owner partials in FP32, then convert once."""
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    part_base = (idx // ND) * KV_SPLITS * ND + idx % ND
+    dk = tl.full((BLOCK, ), 0, tl.float32)
+    dv = tl.full((BLOCK, ), 0, tl.float32)
+    for split in tl.static_range(KV_SPLITS):
+        dk += tl.load(DK_PART + part_base + split * ND, idx < ELEMENTS, 0)
+        dv += tl.load(DV_PART + part_base + split * ND, idx < ELEMENTS, 0)
+    tl.store(DK + idx, dk.to(DK.dtype.element_ty), idx < ELEMENTS)
+    tl.store(DV + idx, dv.to(DV.dtype.element_ty), idx < ELEMENTS)
 
 
 def _run_bwd_d128_gqa(
@@ -3822,8 +4208,18 @@ def _run_bwd_d128_gqa(
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
     assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
-    dispatch = _select_d128_interleaved_dispatch()
-    dispatch.main_entry[(hk, triton.cdiv(n_ctx, dispatch.block_n), batch)](
+    dispatch = _select_d128_interleaved_dispatch(q.shape, k.shape, causal)
+    if dispatch.main_entry is _dense_bwd_dkdv_dq_bm32_kernel:
+        assert not causal
+        _run_bwd_d128_gqa_bm32(q, k, v, do, lse, delta, dq_acc, dq, dk, dv, sm_scale, dispatch)
+        return
+    kv_splits = dispatch.kv_splits
+    assert kv_splits >= 1 and (hq // hk) % kv_splits == 0
+    dk_out, dv_out = dk, dv
+    if kv_splits > 1:
+        dk = torch.empty((batch, hk * kv_splits, n_ctx, head_dim), device=k.device, dtype=torch.float32)
+        dv = torch.empty_like(dk)
+    dispatch.main_entry[(hk * kv_splits, triton.cdiv(n_ctx, dispatch.block_n), batch)](
         q,
         k,
         v,
@@ -3841,6 +4237,9 @@ def _run_bwd_d128_gqa(
         D=head_dim,
         BLOCK_M=dispatch.block_m,
         BLOCK_N=dispatch.block_n,
+        KV_SPLITS=kv_splits,
+        PHASE_IGLP=dispatch.phase_iglp,
+        PEEL_CAUSAL=dispatch.peel_causal,
         num_warps=dispatch.num_warps,
         num_stages=dispatch.num_stages,
         matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim,
@@ -3863,6 +4262,19 @@ def _run_bwd_d128_gqa(
         num_warps=dispatch.convert_num_warps,
         matrix_instr_nonkdim=dispatch.matrix_instr_nonkdim,
     )
+
+    if kv_splits > 1:
+        _attn_bwd_gqa_reduce_dkdv[(triton.cdiv(dk_out.numel(), 1024), )](
+            dk,
+            dv,
+            dk_out,
+            dv_out,
+            ELEMENTS=dk_out.numel(),
+            ND=n_ctx * head_dim,
+            KV_SPLITS=kv_splits,
+            BLOCK=1024,
+            num_warps=4,
+        )
 
 
 @triton.jit
