@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 
 namespace ttg = mlir::triton::gpu;
@@ -53,7 +54,7 @@ std::optional<unsigned> getBarrierCount(ttg::LocalAllocOp alloc) {
   return static_cast<unsigned>(shape.front());
 }
 
-Region *getWarpSpecializePartition(Operation *op) {
+Region *getWarpSpecializeTaskRegion(Operation *op) {
   for (Region *region = op->getParentRegion(); region;) {
     Operation *parent = region->getParentOp();
     // A top-level region (ModuleOp's) has no parent op. Any barrier not
@@ -64,10 +65,25 @@ Region *getWarpSpecializePartition(Operation *op) {
       return nullptr;
     if (isa<ttg::WarpSpecializePartitionsOp>(parent))
       return region;
+    if (auto warpSpecialize = dyn_cast<ttg::WarpSpecializeOp>(parent)) {
+      if (region == &warpSpecialize.getDefaultRegion())
+        return region;
+    }
     region = parent->getParentRegion();
   }
   return nullptr;
 }
+
+ttg::WarpSpecializeOp getWarpSpecializeOwner(Region *taskRegion) {
+  if (auto warpSpecialize =
+          dyn_cast<ttg::WarpSpecializeOp>(taskRegion->getParentOp()))
+    return warpSpecialize;
+  auto partitions =
+      cast<ttg::WarpSpecializePartitionsOp>(taskRegion->getParentOp());
+  return partitions.getParentOp();
+}
+
+using ttg::resolveWarpSpecializeCapture;
 
 bool isWarpUniformValue(Value value, llvm::SmallDenseSet<Value> &visiting) {
   if (!visiting.insert(value).second)
@@ -102,13 +118,13 @@ bool isWarpUniformValue(Value value, llvm::SmallDenseSet<Value> &visiting) {
 }
 
 bool isWarpUniform(Operation *op) {
-  Region *partition = getWarpSpecializePartition(op);
-  if (!partition)
+  Region *taskRegion = getWarpSpecializeTaskRegion(op);
+  if (!taskRegion)
     return false;
   for (Operation *parent = op->getParentOp();
-       parent && parent != partition->getParentOp();
+       parent && parent != taskRegion->getParentOp();
        parent = parent->getParentOp()) {
-    // Only a loop is entered by every warp in the partition. Anything else --
+    // Only a loop is entered by every warp in the partition; anything else --
     // scf.if, scf.while, scf.index_switch, an unstructured cf.cond_br region --
     // may run for a subset, and a promoted named barrier would then wait on
     // warps that never arrive. Allow-list rather than deny-list: a deny-list
@@ -157,10 +173,11 @@ bool sameLoopBound(Value lhs, Value rhs,
 }
 
 bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
-  Region *arrivePartition = getWarpSpecializePartition(arrive);
-  Region *waitPartition = getWarpSpecializePartition(wait);
+  Region *arrivePartition = getWarpSpecializeTaskRegion(arrive);
+  Region *waitPartition = getWarpSpecializeTaskRegion(wait);
   if (!arrivePartition || !waitPartition || arrivePartition == waitPartition ||
-      arrivePartition->getParentOp() != waitPartition->getParentOp())
+      getWarpSpecializeOwner(arrivePartition) !=
+          getWarpSpecializeOwner(waitPartition))
     return false;
 
   auto getLoops = [](Operation *op, Region *partition) {
@@ -190,6 +207,16 @@ bool haveMatchingLoopNests(Operation *arrive, Operation *wait) {
     inductionVars[arriveLoop.getInductionVar()] = waitLoop.getInductionVar();
   }
   return true;
+}
+
+// Null (unpredicated) counts as always-true, preserving the previous behavior
+// of rejecting only present predicates.
+bool isAlwaysTrue(Value pred) {
+  if (!pred)
+    return true;
+  auto constant = pred.getDefiningOp<arith::ConstantOp>();
+  auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : nullptr;
+  return value && !value.getValue().isZero();
 }
 
 void traceBarrierUses(Value value, Value index, BarrierCandidate &candidate) {
@@ -246,6 +273,7 @@ void traceBarrierUses(Value value, Value index, BarrierCandidate &candidate) {
 std::optional<unsigned> getStaticSlot(Value index, unsigned numBarriers) {
   if (!index)
     return numBarriers == 1 ? std::optional<unsigned>(0) : std::nullopt;
+  index = resolveWarpSpecializeCapture(index);
   APInt value;
   if (!matchPattern(index, m_ConstantInt(&value)))
     return std::nullopt;
@@ -272,81 +300,135 @@ bool coversEverySlot(const RangeT &uses, unsigned numBarriers) {
 // every slot as long as the index stays in range -- which holds since it
 // already indexes the same N-slot mbarrier allocation.
 template <typename RangeT>
-bool hasValidSlotSelection(const RangeT &uses, unsigned numBarriers) {
-  if (uses.size() == 1 && uses.front().index) {
-    APInt value;
-    if (!matchPattern(uses.front().index, m_ConstantInt(&value)))
-      return true;
+bool mapUsesToSlots(const RangeT &uses, unsigned numBarriers,
+                    SmallVectorImpl<SmallVector<Operation *>> &slotOps,
+                    Value &dynamicIndex) {
+  slotOps.clear();
+  slotOps.resize(numBarriers);
+  SmallVector<Operation *> dynamicOps;
+  for (const auto &use : uses) {
+    std::optional<unsigned> slot = getStaticSlot(use.index, numBarriers);
+    auto typedOp = use.op;
+    Operation *op = typedOp.getOperation();
+    if (slot) {
+      if (dynamicIndex)
+        return false;
+      slotOps[*slot].push_back(op);
+      continue;
+    }
+    // A null index names no slot on a multi-slot allocation; getStaticSlot
+    // already accepted the single-slot case above. Unindexed multi-slot uses
+    // are also verifier-illegal, so this is defense in depth.
+    if (!use.index)
+      return false;
+    Value resolvedIndex = resolveWarpSpecializeCapture(use.index);
+    if (!dynamicIndex)
+      dynamicIndex = resolvedIndex;
+    else if (dynamicIndex != resolvedIndex)
+      return false;
+    dynamicOps.push_back(op);
   }
-  return coversEverySlot(uses, numBarriers);
+  if (!dynamicOps.empty()) {
+    if (llvm::any_of(slotOps,
+                     [](const auto &ops) { return !ops.empty(); }))
+      return false;
+    for (auto &ops : slotOps)
+      ops.append(dynamicOps);
+  }
+  return true;
 }
 
-std::optional<unsigned> getParticipantCount(BarrierCandidate &candidate) {
+// An arrive with no matching wait is only safe as a priming arrive: with no
+// enclosing loop between it and its task region it executes exactly once, so
+// its single extra arrival matches the mbarrier phase it pre-completes. A
+// loop-nested unmatched arrive would contribute a trip-count-dependent number
+// of extra arrivals and over-release the named barrier.
+static bool isPrimingArrive(Operation *arrive) {
+  Region *task = getWarpSpecializeTaskRegion(arrive);
+  if (!task)
+    return false;
+  for (Operation *parent = arrive->getParentOp();
+       parent && parent != task->getParentOp();
+       parent = parent->getParentOp()) {
+    if (isa<scf::ForOp, scf::WhileOp>(parent))
+      return false;
+  }
+  return true;
+}
+
+struct BarrierPlan {
+  unsigned numThreads;
+  SmallVector<unsigned> activeSlots;
+};
+
+std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
   if (candidate.hasUnknownUse ||
       !coversEverySlot(candidate.inits, candidate.numBarriers) ||
       (!candidate.invalidations.empty() &&
-       !coversEverySlot(candidate.invalidations, candidate.numBarriers)) ||
-      !hasValidSlotSelection(candidate.arrives, candidate.numBarriers) ||
-      !hasValidSlotSelection(candidate.waits, candidate.numBarriers))
+       !coversEverySlot(candidate.invalidations, candidate.numBarriers)))
     return std::nullopt;
 
   for (const auto &use : candidate.arrives) {
     ttng::ArriveBarrierOp arrive = use.op;
-    if (arrive.getPerThread() || arrive.isMulticast() || arrive.getPred() ||
+    if (arrive.getPerThread() || arrive.isMulticast() ||
+        !isAlwaysTrue(arrive.getPred()) ||
         !isWarpUniform(arrive))
       return std::nullopt;
   }
   for (const auto &use : candidate.waits) {
     ttng::WaitBarrierOp wait = use.op;
-    if (wait.getPred() || !wait.getDeps().empty() || !isWarpUniform(wait))
+    APInt phase;
+    // A nonzero constant phase is initially satisfied and does not rendezvous
+    // with the first arrive, so replacing it with a named barrier can deadlock.
+    // Resolve the capture first: a phase defined outside the partition arrives
+    // as a block argument, which would not match and would let exactly that
+    // deadlock through.
+    Value waitPhase = resolveWarpSpecializeCapture(wait.getPhase());
+    if (!isAlwaysTrue(wait.getPred()) || !wait.getDeps().empty() ||
+        !isWarpUniform(wait) ||
+        (matchPattern(waitPhase, m_ConstantInt(&phase)) && !phase.isZero()))
       return std::nullopt;
   }
 
-  Region *arrivePartition = getWarpSpecializePartition(candidate.arrives[0].op);
-  Region *waitPartition = getWarpSpecializePartition(candidate.waits[0].op);
-  // Arrives and waits must live in different warp-specialize partitions. This
-  // also rejects the both-nullptr case: a barrier used entirely outside any
-  // partition has no warp-group structure to size the named barrier from.
-  if (arrivePartition == waitPartition)
-    return std::nullopt;
-  if (llvm::any_of(candidate.arrives,
-                   [arrivePartition](const auto &use) {
-                     return getWarpSpecializePartition(use.op) !=
-                            arrivePartition;
-                   }) ||
-      llvm::any_of(candidate.waits, [waitPartition](const auto &use) {
-        return getWarpSpecializePartition(use.op) != waitPartition;
-      }))
+  SmallVector<SmallVector<Operation *>> arrivesBySlot;
+  SmallVector<SmallVector<Operation *>> waitsBySlot;
+  Value arriveIndex;
+  Value waitIndex;
+  if (!mapUsesToSlots(candidate.arrives, candidate.numBarriers,
+                      arrivesBySlot, arriveIndex) ||
+      !mapUsesToSlots(candidate.waits, candidate.numBarriers, waitsBySlot,
+                      waitIndex) ||
+      arriveIndex != waitIndex)
     return std::nullopt;
 
-  if (llvm::any_of(candidate.arrives,
-                   [&](const auto &use) {
-                     return !haveMatchingLoopNests(use.op,
-                                                   candidate.waits.front().op);
-                   }) ||
-      llvm::any_of(candidate.waits, [&](const auto &use) {
-        return !haveMatchingLoopNests(candidate.arrives.front().op, use.op);
-      }))
-    return std::nullopt;
+  auto isCompatiblePair = [&](const auto &arriveUse, const auto &waitUse) {
+    auto arriveSlot = getStaticSlot(arriveUse.index, candidate.numBarriers);
+    auto waitSlot = getStaticSlot(waitUse.index, candidate.numBarriers);
+    return (!arriveSlot || !waitSlot || arriveSlot == waitSlot) &&
+           haveMatchingLoopNests(arriveUse.op, waitUse.op);
+  };
+
+  for (const auto &waitUse : candidate.waits) {
+    if (llvm::none_of(candidate.arrives, [&](const auto &arriveUse) {
+          return isCompatiblePair(arriveUse, waitUse);
+        }))
+      return std::nullopt;
+  }
+
+  for (const auto &arriveUse : candidate.arrives) {
+    bool hasMatchingWait =
+        llvm::any_of(candidate.waits, [&](const auto &waitUse) {
+          return isCompatiblePair(arriveUse, waitUse);
+        });
+    if (!hasMatchingWait && !isPrimingArrive(arriveUse.op))
+      return std::nullopt;
+  }
 
   SmallVector<uint32_t> initCounts(candidate.numBarriers);
   for (const auto &use : candidate.inits) {
     auto init = use.op;
     initCounts[*getStaticSlot(use.index, candidate.numBarriers)] =
         init.getCount();
-  }
-  for (const auto &use : candidate.arrives) {
-    auto arrive = use.op;
-    if (std::optional<unsigned> slot =
-            getStaticSlot(use.index, candidate.numBarriers)) {
-      if (arrive.getCount() != initCounts[*slot])
-        return std::nullopt;
-      continue;
-    }
-    uint32_t arriveCount = arrive.getCount();
-    if (llvm::any_of(initCounts,
-                     [&](uint32_t count) { return arriveCount != count; }))
-      return std::nullopt;
   }
 
   auto isCTALocal = [](auto op) {
@@ -366,12 +448,95 @@ std::optional<unsigned> getParticipantCount(BarrierCandidate &candidate) {
 
   unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(
       candidate.alloc->getParentOfType<ModuleOp>());
-  unsigned numThreads = (ttg::lookupNumWarps(candidate.arrives[0].op) +
-                         ttg::lookupNumWarps(candidate.waits[0].op)) *
-                        threadsPerWarp;
-  if (numThreads == 0)
+  unsigned numThreads = 0;
+  SmallVector<unsigned> activeSlots;
+  // One owner for the whole allocation: checking per slot would let different
+  // slots resolve to different `warp_specialize` ops as long as their thread
+  // counts coincide.
+  ttg::WarpSpecializeOp warpSpecialize;
+  auto checkWarpSpecialize = [&](Region *task) {
+    ttg::WarpSpecializeOp owner = getWarpSpecializeOwner(task);
+    if (!warpSpecialize)
+      warpSpecialize = owner;
+    return owner == warpSpecialize;
+  };
+  for (unsigned slot = 0; slot < candidate.numBarriers; ++slot) {
+    const auto &arrives = arrivesBySlot[slot];
+    const auto &waits = waitsBySlot[slot];
+    if (arrives.empty() && waits.empty())
+      continue;
+    if (arrives.empty() || waits.empty())
+      return std::nullopt;
+
+    struct TaskArrives {
+      uint32_t count;
+      bool hasLooped = false;
+      bool hasPriming = false;
+    };
+    SmallVector<std::pair<Region *, TaskArrives>> arriveTasks;
+    for (Operation *arriveOp : arrives) {
+      Region *task = getWarpSpecializeTaskRegion(arriveOp);
+      if (!task)
+        return std::nullopt;
+      uint32_t count = cast<ttng::ArriveBarrierOp>(arriveOp).getCount();
+      // Same-task arrives share one accounting entry, so a second loop-nested
+      // arrive would contribute uncounted arrivals and over-release the named
+      // barrier. Allow only the priming shape alongside it: one unlooped
+      // arrive, which executes exactly once.
+      bool priming = isPrimingArrive(arriveOp);
+      auto it = llvm::find_if(arriveTasks, [task](auto &entry) {
+        return entry.first == task;
+      });
+      if (it == arriveTasks.end()) {
+        arriveTasks.push_back({task, {count, !priming, priming}});
+        continue;
+      }
+      if (it->second.count != count)
+        return std::nullopt;
+      if (priming ? it->second.hasPriming : it->second.hasLooped)
+        return std::nullopt;
+      if (priming)
+        it->second.hasPriming = true;
+      else
+        it->second.hasLooped = true;
+    }
+    uint32_t totalArrivalCount = 0;
+    llvm::SmallDenseSet<Region *> arriveTaskSet;
+    for (const auto &[task, info] : arriveTasks) {
+      arriveTaskSet.insert(task);
+      totalArrivalCount += info.count;
+    }
+    if (totalArrivalCount != initCounts[slot])
+      return std::nullopt;
+
+    llvm::SmallDenseSet<Region *> waitTaskSet;
+    for (Operation *wait : waits) {
+      Region *task = getWarpSpecializeTaskRegion(wait);
+      if (!task || arriveTaskSet.contains(task))
+        return std::nullopt;
+      waitTaskSet.insert(task);
+    }
+
+    unsigned slotThreads = 0;
+    for (Region *task : arriveTaskSet) {
+      if (!checkWarpSpecialize(task))
+        return std::nullopt;
+      slotThreads += ttg::lookupNumWarps(task) * threadsPerWarp;
+    }
+    for (Region *task : waitTaskSet) {
+      if (!checkWarpSpecialize(task))
+        return std::nullopt;
+      slotThreads += ttg::lookupNumWarps(task) * threadsPerWarp;
+    }
+    if (slotThreads == 0 ||
+        (numThreads != 0 && slotThreads != numThreads))
+      return std::nullopt;
+    numThreads = slotThreads;
+    activeSlots.push_back(slot);
+  }
+  if (activeSlots.empty())
     return std::nullopt;
-  return numThreads;
+  return BarrierPlan{numThreads, std::move(activeSlots)};
 }
 
 void eraseBarrierStorage(BarrierCandidate &candidate) {
@@ -401,7 +566,6 @@ void eraseBarrierStorage(BarrierCandidate &candidate) {
   // them and a later dead slot is never reached.
   llvm::MapVector<ttg::WarpSpecializePartitionsOp, llvm::SmallDenseSet<Value>>
       capturedByPartitions;
-
   for (auto [partitions, captured] : candidate.captures)
     capturedByPartitions[partitions].insert(captured);
 
@@ -433,20 +597,53 @@ void eraseBarrierStorage(BarrierCandidate &candidate) {
     candidate.alloc.erase();
 }
 
-Value createSelectedNamedBarrierId(OpBuilder &builder, Location loc,
-                                   ArrayRef<int32_t> ids, Value index) {
+// Loop depth is partition-relative: only scf.for loops between the op and its
+// warp-specialize partition count. A loop around the whole warp_specialize op
+// is invisible here, so such a candidate can tie with a genuinely unnested one.
+unsigned getLoopDepth(const BarrierCandidate &candidate) {
+  auto depth = [](Operation *op) {
+    unsigned result = 0;
+    Region *partition = getWarpSpecializeTaskRegion(op);
+    if (!partition)
+      return result;
+    for (Operation *parent = op->getParentOp();
+         parent && parent != partition->getParentOp();
+         parent = parent->getParentOp()) {
+      if (isa<scf::ForOp>(parent))
+        ++result;
+    }
+    return result;
+  };
+
+  unsigned result = 0;
+  for (const auto &use : candidate.arrives)
+    result = std::max(result, depth(use.op));
+  for (const auto &use : candidate.waits)
+    result = std::max(result, depth(use.op));
+  return result;
+}
+
+Value createSelectedNamedBarrierId(
+    OpBuilder &builder, Location loc,
+    ArrayRef<std::optional<int32_t>> idsBySlot, Value index) {
   // A single handle needs no selection: the loop below would start at index
   // -1, emit nothing, and return it, but say so directly.
-  if (ids.size() == 1)
-    return createCompilerNamedBarrierId(builder, loc, ids.front());
-  if (std::optional<unsigned> slot = getStaticSlot(index, ids.size()))
-    return createCompilerNamedBarrierId(builder, loc, ids[*slot]);
+  if (idsBySlot.size() == 1) {
+    assert(idsBySlot.front() && "expected an ID for every active slot");
+    return createCompilerNamedBarrierId(builder, loc, *idsBySlot.front());
+  }
+  if (std::optional<unsigned> slot = getStaticSlot(index, idsBySlot.size())) {
+    assert(idsBySlot[*slot] && "expected an ID for every active slot");
+    return createCompilerNamedBarrierId(builder, loc, *idsBySlot[*slot]);
+  }
 
   SmallVector<Value> handles;
-  for (int32_t id : ids)
-    handles.push_back(createCompilerNamedBarrierId(builder, loc, id));
+  for (std::optional<int32_t> id : idsBySlot) {
+    assert(id && "dynamic indices require every slot to be active");
+    handles.push_back(createCompilerNamedBarrierId(builder, loc, *id));
+  }
   Value selected = handles.back();
-  for (int32_t slot = static_cast<int32_t>(ids.size()) - 2; slot >= 0; --slot) {
+  for (int32_t slot = static_cast<int32_t>(idsBySlot.size()) - 2; slot >= 0; --slot) {
     Value slotValue =
         arith::ConstantIntOp::create(builder, loc, index.getType(), slot);
     Value isSlot = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
@@ -457,13 +654,31 @@ Value createSelectedNamedBarrierId(OpBuilder &builder, Location loc,
   return selected;
 }
 
-void promoteBarrier(BarrierCandidate &candidate, ArrayRef<int32_t> ids,
+void promoteBarrier(BarrierCandidate &candidate,
+                    ArrayRef<std::optional<int32_t>> idsBySlot,
                     unsigned numThreads) {
+  // `createSelectedNamedBarrierId` only asserts that a referenced slot has an
+  // ID, which is compiled out in release builds and would dereference an empty
+  // optional. Check every use up front: this rewrite mutates as it walks, so
+  // bailing partway would leave the barrier half promoted.
+  auto slotIdsAvailable = [&](Value index) {
+    if (std::optional<unsigned> slot = getStaticSlot(index, idsBySlot.size()))
+      return idsBySlot[*slot].has_value();
+    return llvm::all_of(idsBySlot,
+                        [](std::optional<int32_t> id) { return id.has_value(); });
+  };
+  for (const auto &use : candidate.arrives)
+    if (!slotIdsAvailable(use.index))
+      return;
+  for (const auto &use : candidate.waits)
+    if (!slotIdsAvailable(use.index))
+      return;
+
   for (const auto &use : candidate.arrives) {
     ttng::ArriveBarrierOp arrive = use.op;
     OpBuilder builder(arrive);
-    Value namedId =
-        createSelectedNamedBarrierId(builder, arrive.getLoc(), ids, use.index);
+    Value namedId = createSelectedNamedBarrierId(
+        builder, arrive.getLoc(), idsBySlot, use.index);
     Value count =
         arith::ConstantIntOp::create(builder, arrive.getLoc(), numThreads, 32);
     ttng::NamedBarrierArriveOp::create(builder, arrive.getLoc(), namedId,
@@ -473,8 +688,8 @@ void promoteBarrier(BarrierCandidate &candidate, ArrayRef<int32_t> ids,
   for (const auto &use : candidate.waits) {
     ttng::WaitBarrierOp wait = use.op;
     OpBuilder builder(wait);
-    Value namedId =
-        createSelectedNamedBarrierId(builder, wait.getLoc(), ids, use.index);
+    Value namedId = createSelectedNamedBarrierId(builder, wait.getLoc(),
+                                                  idsBySlot, use.index);
     Value count =
         arith::ConstantIntOp::create(builder, wait.getLoc(), numThreads, 32);
     ttng::NamedBarrierWaitOp::create(builder, wait.getLoc(), namedId, count);
@@ -498,23 +713,55 @@ public:
     if (failed(tryEnsureWarpSpecializeBarrierIds(module, allocator)))
       return;
 
-    SmallVector<ttg::LocalAllocOp> allocs;
+    struct RankedCandidate {
+      BarrierCandidate candidate;
+      unsigned numThreads;
+      SmallVector<unsigned> activeSlots;
+      unsigned loopDepth;
+      unsigned ordinal;
+    };
+
+    SmallVector<RankedCandidate, 0> candidates;
+    unsigned ordinal = 0;
     module.walk([&](ttg::LocalAllocOp alloc) {
-      if (getBarrierCount(alloc))
-        allocs.push_back(alloc);
+      std::optional<unsigned> numBarriers = getBarrierCount(alloc);
+      if (!numBarriers)
+        return;
+      BarrierCandidate candidate(alloc, *numBarriers);
+      traceBarrierUses(alloc.getResult(), Value(), candidate);
+      std::optional<BarrierPlan> plan = getBarrierPlan(candidate);
+      if (!plan)
+        return;
+      unsigned loopDepth = getLoopDepth(candidate);
+      candidates.push_back({std::move(candidate), plan->numThreads,
+                            std::move(plan->activeSlots), loopDepth,
+                            ordinal++});
     });
 
-    for (ttg::LocalAllocOp alloc : allocs) {
-      unsigned numBarriers = *getBarrierCount(alloc);
-      BarrierCandidate candidate(alloc, numBarriers);
-      traceBarrierUses(alloc.getResult(), Value(), candidate);
-      std::optional<unsigned> numThreads = getParticipantCount(candidate);
-      if (!numThreads)
-        continue;
-      std::optional<SmallVector<int32_t>> ids = allocator.allocate(numBarriers);
+    llvm::stable_sort(
+        candidates, [](const RankedCandidate &lhs, const RankedCandidate &rhs) {
+          if (lhs.loopDepth != rhs.loopDepth)
+            return lhs.loopDepth > rhs.loopDepth;
+          if (lhs.activeSlots.size() != rhs.activeSlots.size())
+            return lhs.activeSlots.size() < rhs.activeSlots.size();
+          return lhs.ordinal < rhs.ordinal;
+        });
+
+    // Candidates are validated before any promotion runs and promoted later in
+    // ranked order. This is safe because each candidate's recorded IR hangs off
+    // its own alloc, so one candidate's cleanup cannot erase IR another
+    // recorded; shared partition ops only lose capture operands, which cleanup
+    // resolves by value rather than by stored index.
+    for (RankedCandidate &ranked : candidates) {
+      std::optional<SmallVector<int32_t>> ids =
+          allocator.allocate(ranked.activeSlots.size());
       if (!ids)
         continue;
-      promoteBarrier(candidate, *ids, *numThreads);
+      SmallVector<std::optional<int32_t>> idsBySlot(
+          ranked.candidate.numBarriers);
+      for (auto [slot, id] : llvm::zip(ranked.activeSlots, *ids))
+        idsBySlot[slot] = id;
+      promoteBarrier(ranked.candidate, idsBySlot, ranked.numThreads);
     }
   }
 };
