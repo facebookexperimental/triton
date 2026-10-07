@@ -1562,6 +1562,16 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
       privatizeHelperForCall(callOp, callee, "_tlxpin");
       changed = true;
     }
+    // View inference can resolve a deferred layout to a concrete encoding
+    // during this sweep. Its users (including arith casts) and helper return
+    // ABIs must then participate in the same fixpoint: they were still
+    // encoding-free when the initial concrete reconciliation ran.
+    if (failed(synchronizeConcreteHelperABI(mod, changed)) ||
+        failed(reconcileEncodingUniformOps(mod, changed)) ||
+        failed(reconcileDotLayouts(mod, changed)) ||
+        failed(reconcileRegionCarriedLayouts(mod, changed)) ||
+        failed(reconcileWarpPredicateLayouts(mod, changed)))
+      return failure();
   }
   return success();
 }

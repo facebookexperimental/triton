@@ -1098,6 +1098,8 @@ def local_load(
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
     layout = tl._unwrap_if_constexpr(layout)
+    relaxed = tl._unwrap_if_constexpr(relaxed)
+    assert isinstance(relaxed, bool), f"relaxed must be a constexpr bool, got {type(relaxed).__name__}"
     rematerialize_coordinates = tl._unwrap_if_constexpr(rematerialize_coordinates)
     rematerialize_coordinates_group = tl._unwrap_if_constexpr(rematerialize_coordinates_group)
     assert isinstance(rematerialize_coordinates, bool), ("rematerialize_coordinates must be a constexpr bool, got "
