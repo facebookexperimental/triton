@@ -1427,6 +1427,43 @@ def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
     assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
 
 
+@triton.jit
+def _buffer_load_to_local_contiguity_subslice_kernel(x_ptr):
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(512, 16)],
+        [32, 16],
+        order=[1, 0],
+    )
+    k = tl.arange(0, 32)
+    m = tl.arange(0, 16)
+    offsets = (k[:, None] * 16 + m[None, :]).to(tl.int32)
+    buffer = tlx.local_alloc((32, 16), tl.bfloat16, 1, layout=shared_layout)
+    destination = tlx.local_slice(
+        tlx.local_view(buffer, 0),
+        [0, 0],
+        [32, 16],
+    )
+    tlx.buffer_load_to_local(
+        destination,
+        x_ptr,
+        offsets,
+        contiguity=2,
+    )
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_subslice_gfx950():
+    compiled = compile_for_gfx950(
+        _buffer_load_to_local_contiguity_subslice_kernel,
+        signature={"x_ptr": "*bf16"},
+        constexprs={},
+    )
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 2" in ttgir
+    assert re.search(r"^\s*buffer_load_[^\n]*\blds\s*$", compiled.asm["amdgcn"], re.MULTILINE)
+
+
 @pytest.mark.parametrize("contiguity", [0, 3, True], ids=["zero", "non-power-of-two", "bool"])
 def test_buffer_load_to_local_rejects_invalid_contiguity_gfx950(contiguity):
     with pytest.raises(CompilationError, match="contiguity must be a positive power of two"):
@@ -1458,7 +1495,7 @@ def _buffer_load_to_local_unpinned_contiguity_kernel(x_ptr):
 def test_buffer_load_to_local_contiguity_rejects_unpinned_destination_gfx950():
     with pytest.raises(
             RuntimeError,
-            match="contiguity > 1 requires a directly indexed user-pinned padded_shared destination",
+            match="contiguity > 1 requires a supported view of a user-pinned padded_shared destination",
     ):
         compile_for_gfx950(
             _buffer_load_to_local_unpinned_contiguity_kernel,
@@ -4922,14 +4959,14 @@ def test_d64_direct_launch_uses_dispatch_ownership(monkeypatch):
 
 
 def test_varlen_d128_address_space_requires_i32_offsets():
-    # One D128 BF16 head fits at most 2**30 elements in the signed i32
-    # byte-offset range used by AMD buffer instructions.
-    max_tokens = 2**23
+    max_bf16_tokens = 2**23
+    max_fp32_tokens = 2**22
 
     amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-        total_q=max_tokens - 15,
-        total_kv=max_tokens,
+        total_q=max_bf16_tokens - 15,
+        total_kv=max_bf16_tokens,
         batch=1,
+        max_q=max_bf16_tokens,
         q_heads=1,
         kv_heads=1,
         dq_atomic_fp32=False,
@@ -4938,17 +4975,29 @@ def test_varlen_d128_address_space_requires_i32_offsets():
     with pytest.raises(ValueError, match="KV tensor size exceeds the signed 32-bit byte-offset range"):
         amd_fa_varlen_bwd._validate_i32_buffer_offsets(
             total_q=1,
-            total_kv=max_tokens + 1,
+            total_kv=max_bf16_tokens + 1,
             batch=1,
+            max_q=1,
             q_heads=1,
+            kv_heads=1,
+            dq_atomic_fp32=False,
+        )
+    with pytest.raises(ValueError, match="Q tensor size exceeds the signed 32-bit byte-offset range"):
+        amd_fa_varlen_bwd._validate_i32_buffer_offsets(
+            total_q=1,
+            total_kv=1,
+            batch=1,
+            max_q=max_bf16_tokens // 3 + 1,
+            q_heads=3,
             kv_heads=1,
             dq_atomic_fp32=False,
         )
     with pytest.raises(ValueError, match="padded dQ size exceeds the signed 32-bit byte-offset range"):
         amd_fa_varlen_bwd._validate_i32_buffer_offsets(
-            total_q=max_tokens - 14,
+            total_q=max_bf16_tokens - 14,
             total_kv=1,
             batch=1,
+            max_q=1,
             q_heads=1,
             kv_heads=1,
             dq_atomic_fp32=False,
@@ -4956,11 +5005,11 @@ def test_varlen_d128_address_space_requires_i32_offsets():
 
     # FP32 dQ scratch reaches the same signed byte-offset limit at half as
     # many elements as the BF16 path.
-    max_fp32_tokens = 2**22
     amd_fa_varlen_bwd._validate_i32_buffer_offsets(
         total_q=max_fp32_tokens - 15,
         total_kv=1,
         batch=1,
+        max_q=1,
         q_heads=1,
         kv_heads=1,
         dq_atomic_fp32=True,
@@ -4970,6 +5019,7 @@ def test_varlen_d128_address_space_requires_i32_offsets():
             total_q=max_fp32_tokens - 14,
             total_kv=1,
             batch=1,
+            max_q=1,
             q_heads=1,
             kv_heads=1,
             dq_atomic_fp32=True,
@@ -4978,6 +5028,7 @@ def test_varlen_d128_address_space_requires_i32_offsets():
         total_q=max_fp32_tokens - 31,
         total_kv=1,
         batch=1,
+        max_q=1,
         q_heads=1,
         kv_heads=1,
         dq_atomic_fp32=True,
@@ -4988,6 +5039,7 @@ def test_varlen_d128_address_space_requires_i32_offsets():
             total_q=max_fp32_tokens - 30,
             total_kv=1,
             batch=1,
+            max_q=1,
             q_heads=1,
             kv_heads=1,
             dq_atomic_fp32=True,

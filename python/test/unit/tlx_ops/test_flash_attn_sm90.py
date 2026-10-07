@@ -3,16 +3,51 @@
 import pytest
 import torch
 from triton._internal_testing import is_hopper
-from triton.tlx.ops.kernels.flash_attn._shapes import CORRECTNESS_SHAPES, SYNTHETIC
+from triton.tlx.ops.kernels.flash_attn._shapes import (
+    CORRECTNESS_SHAPES,
+    FlashAttentionShape,
+    SYNTHETIC,
+)
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="requires an sm90 GPU")
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
-FWD_SHAPES = tuple(dict.fromkeys((*CORRECTNESS_SHAPES, *(shape._replace(dtype="bf16") for shape in SYNTHETIC))))
+TAIL_SHAPES = tuple(
+    FlashAttentionShape(batch, heads, context, 128, causal, dtype)
+    for dtype in ("fp16", "bf16")
+    for batch, heads, context, causal in (
+        (2, 2, 100, False),
+        (2, 2, 150, False),
+        (1, 1, 150, True),
+    )
+)
+BOUNDARY_SHAPES = tuple(
+    FlashAttentionShape(1, 1, context, 128, False, "bf16")
+    for context in (256, 257, 320)
+)
+# Causal tails past the non-persistent cutoff, so the unpadded persistent path runs.
+CAUSAL_TAIL_SHAPES = (
+    FlashAttentionShape(2, 2, 600, 128, True, "bf16"),
+    FlashAttentionShape(1, 1, 200, 64, True, "bf16"),
+    FlashAttentionShape(1, 1, 320, 64, True, "bf16"),
+)
+FWD_SHAPES = tuple(
+    dict.fromkeys(
+        (
+            *CORRECTNESS_SHAPES,
+            *(shape._replace(dtype="bf16") for shape in SYNTHETIC),
+            *TAIL_SHAPES,
+            *BOUNDARY_SHAPES,
+            *CAUSAL_TAIL_SHAPES,
+        )
+    )
+)
 BWD_SHAPES = tuple(
     dict.fromkeys((
         *CORRECTNESS_SHAPES,
         *(shape._replace(dtype="bf16") for shape in SYNTHETIC if shape.head_dim == 64 and shape.batch == 1),
+        *TAIL_SHAPES,
+        *CAUSAL_TAIL_SHAPES,
     )))
 
 
@@ -40,8 +75,8 @@ def _sdpa(q, k, v, causal, scale=None):
 def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn
 
-    if N_CTX % 128 or HEAD_DIM not in (64, 128):
-        pytest.skip(f"sm90 takes N_CTX % 128 == 0 and HEAD_DIM 64/128, got {N_CTX}x{HEAD_DIM}")
+    if HEAD_DIM not in (64, 128):
+        pytest.skip(f"sm90 takes HEAD_DIM 64/128, got {HEAD_DIM}")
     dtype = DTYPES[dtype_name]
     torch.manual_seed(0)
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype)
@@ -63,8 +98,8 @@ def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
 def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn
 
-    if N_CTX % 128 or HEAD_DIM not in (64, 128):
-        pytest.skip(f"sm90 takes N_CTX % 128 == 0 and HEAD_DIM 64/128, got {N_CTX}x{HEAD_DIM}")
+    if HEAD_DIM not in (64, 128):
+        pytest.skip(f"sm90 takes HEAD_DIM 64/128, got {HEAD_DIM}")
     dtype = DTYPES[dtype_name]
     torch.manual_seed(0)
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=True)
@@ -176,12 +211,58 @@ def test_flash_attn_d64_causal_diagonal(dtype):
 
 
 @pytest.mark.parametrize("N_CTX", (64, 192, 320))
-def test_flash_attn_rejects_partial_block_m(N_CTX):
+def test_flash_attn_d64_partial_block_m(N_CTX):
     from triton.tlx.ops import flash_attn
 
+    torch.manual_seed(0)
     q, k, v = _qkv(1, 1, N_CTX, 64, torch.bfloat16)
-    with pytest.raises(AssertionError):
+    out = flash_attn(q, k, v, causal=False, space="smoke")
+    torch.testing.assert_close(out, _sdpa(q, k, v, False), atol=4e-2, rtol=0)
+
+
+def test_flash_attn_rejects_mismatched_sequence_lengths():
+    from triton.tlx.ops import flash_attn
+    from triton.tlx.ops.kernels.flash_attn.sm90 import attention
+
+    q = _qkv(1, 1, 100, 128, torch.bfloat16)[0]
+    k, v = _qkv(1, 1, 150, 128, torch.bfloat16)[1:]
+    with pytest.raises(ValueError, match="equal Q/K/V shapes"):
         flash_attn(q, k, v, causal=False, space="smoke")
+    with pytest.raises(ValueError, match="equal Q/K/V shapes"):
+        attention(q, k, v, 0.5)
+
+
+@pytest.mark.parametrize(
+    "N_CTX,HEAD_DIM,requires_grad,expected",
+    (
+        (100, 128, False, True),
+        (150, 128, False, True),
+        (192, 128, False, True),
+        (256, 128, False, False),
+        (257, 128, False, True),
+        (400, 128, False, True),
+        (511, 128, False, True),
+        (512, 128, False, False),
+        (513, 128, False, False),
+        (2000, 128, False, False),
+        (100, 128, True, False),
+        (64, 64, False, False),
+    ),
+)
+def test_flash_attn_non_persistent_dispatch_policy(
+    N_CTX, HEAD_DIM, requires_grad, expected
+):
+    from triton.tlx.ops.kernels.flash_attn.sm90 import _should_use_non_persistent
+
+    q, k, v = _qkv(
+        1,
+        1,
+        N_CTX,
+        HEAD_DIM,
+        torch.bfloat16,
+        requires_grad=requires_grad,
+    )
+    assert _should_use_non_persistent(q, k, v, None) is expected
 
 
 def test_flash_attn_rejects_d32():

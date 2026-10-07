@@ -103,6 +103,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="mm_mxfp8",
+        arch="sm100",
+        variant="ws_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp8.sm100:mm_mxfp8",
+        dtypes=frozenset({"float8_e4m3fn"}),
+        # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
+        accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
         op="grouped_gemm_mxfp8",
         arch="sm100",
         variant="ws_persistent_mxfp8",

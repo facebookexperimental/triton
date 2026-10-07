@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import tempfile
@@ -360,6 +361,7 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("num_warps * 32 * num_arrivals", prompt)
         self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+        self.assertNotIn("# Blackwell Overlapping TMEM Accumulators", prompt)
 
     def test_codex_prompt_selects_only_general_amd_skill_by_default(self) -> None:
         guidance = "Preserve runtime scale behavior."
@@ -390,6 +392,7 @@ class ScoringTest(unittest.TestCase):
                 self.assertIn("Trusted built-in target optimization knowledge", prompt)
                 self.assertIn("# TLX Layout Conversion Efficiency", prompt)
                 self.assertIn("# AMD Kernel Optimization", prompt)
+                self.assertIn("# gfx9 Codegen Patterns", prompt)
                 self.assertNotIn("# AMD TLX Attention Optimization", prompt)
                 self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
                 self.assertNotIn("HSTU", prompt)
@@ -407,8 +410,72 @@ class ScoringTest(unittest.TestCase):
                 )
                 self.assertLess(
                     prompt.index("# AMD Kernel Optimization"),
+                    prompt.index("# gfx9 Codegen Patterns"),
+                )
+                self.assertLess(
+                    prompt.index("# gfx9 Codegen Patterns"),
                     prompt.index("Frozen target-specific optimization guidance"),
                 )
+
+    def test_codex_prompt_gates_gfx9_codegen_patterns_by_architecture(self) -> None:
+        expectations = (
+            ("hip", "gfx942", True),
+            ("rocm", "mi355x", True),
+            ("hip", "gfx1201", False),
+            ("cuda", "blackwell", False),
+        )
+        for backend, architecture, expected in expectations:
+            with self.subTest(backend=backend, architecture=architecture):
+                request = KernelOptimizationRequest(
+                    kernel_source="VALUE = 1\n",
+                    harness_path=Path(__file__),
+                    cases=(InputCase("target", {}),),
+                    target=KernelTarget(backend, architecture),
+                    output_dir=Path("/tmp/tlx-agent-test"),
+                )
+                prompt = _build_prompt(
+                    request,
+                    CandidateContext(1, 0, request.kernel_source, _performance(("target", 100.0)), ()),
+                )
+                self.assertEqual("# gfx9 Codegen Patterns" in prompt, expected)
+
+    def test_codex_prompt_includes_amdgcn_findings_without_artifact_paths(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget("hip", "gfx950"),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+        finding = (
+            "loop boundary: 8 scratch reloads are each followed by s_waitcnt vmcnt(0) "
+            "after 32 global/buffer stores"
+        )
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="target",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((100.0, 100.0, 100.0)),
+                    profile={
+                        "level": "summary",
+                        "amdgcn_isa": {
+                            "resources": {"vgpr_spills": 37},
+                            "hot_loop": {"ds_read_by_width": {"u8": 24}},
+                            "findings": [finding],
+                            "artifacts": {"amdgcn": "/tmp/secret/kernel.amdgcn"},
+                        },
+                    },
+                ),
+            )
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(1, 0, request.kernel_source, performance, ()),
+        )
+        self.assertIn(finding, prompt)
+        self.assertIn("'vgpr_spills': 37", prompt)
+        self.assertNotIn("/tmp/secret/kernel.amdgcn", prompt)
 
     def test_codex_prompt_selects_explicit_amd_attention_skill(self) -> None:
         target = KernelTarget(
@@ -1735,6 +1802,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(first.source, "LATENCY_US = 80\nCORRECT = True\n")
         self.assertEqual(second.source, "LATENCY_US = 60\nCORRECT = True\n")
 
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
     def test_infers_mm_kernel_and_production_suite(self) -> None:
         from ..decision_maker.tuning_harnesses import mm as mm_harness
 
@@ -1760,6 +1828,7 @@ class HarnessTest(unittest.TestCase):
             self.assertTrue(result["success"], result.get("diagnostics"))
             result["artifact"]["directory"].cleanup()
 
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
     def test_mm_tuning_harness_routes_through_public_op(self) -> None:
         from types import SimpleNamespace
 

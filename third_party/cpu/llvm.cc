@@ -1,3 +1,4 @@
+#include "triton/Tools/LLVMOptions.h"
 #include "triton/Tools/Sys/GetEnv.h"
 
 #include "llvm/ADT/SmallString.h"
@@ -35,6 +36,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace py = nanobind;
 
@@ -60,14 +62,6 @@ void initializeHostTarget() {
   // LLVM's global thread pool is not fork-safe. Triton kernels are small, so
   // disabling LLVM's internal parallelism also avoids unnecessary overhead.
   llvm::parallel::strategy = llvm::hardware_concurrency(1);
-}
-
-void setLLVMBooleanOption(const std::string &name, bool value) {
-  auto options = llvm::cl::getRegisteredOptions();
-  auto it = options.find(name);
-  if (it == options.end())
-    return;
-  it->second->addOccurrence(1, name, value ? "true" : "false");
 }
 
 std::unique_ptr<llvm::TargetMachine>
@@ -98,8 +92,10 @@ createHostTargetMachine(llvm::Module &module, bool enableFpFusion,
 
 std::string translateHostLLVMIRToASM(llvm::Module &module, bool enableFpFusion,
                                      bool enableFastMath) {
+  using Setting = mlir::triton::tools::ScopedLLVMOptions::Setting;
+  std::vector<Setting> settings;
   if (mlir::triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP"))
-    setLLVMBooleanOption("print-after-all", true);
+    settings.emplace_back("print-after-all", "true");
 
   bool disableLLVMOpt = mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
@@ -108,9 +104,10 @@ std::string translateHostLLVMIRToASM(llvm::Module &module, bool enableFpFusion,
       llvm::SmallVector<llvm::StringRef, 3> flags;
       llvm::StringRef(flagList).split(flags, ',');
       for (llvm::StringRef flag : flags)
-        setLLVMBooleanOption(flag.str(), true);
+        settings.emplace_back(flag.str(), "true");
     }
   }
+  mlir::triton::tools::ScopedLLVMOptions optionScope(settings);
 
   for (llvm::Function &function : module.functions())
     if (!function.hasFnAttribute(llvm::Attribute::NoInline))

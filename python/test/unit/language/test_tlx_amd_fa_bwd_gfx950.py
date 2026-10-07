@@ -333,6 +333,7 @@ def _make_varlen_d128_reference_case(
     kv_heads,
     seed,
     causal=False,
+    window_size=0,
     strided_v=False,
     sm_scale=None,
 ):
@@ -380,6 +381,11 @@ def _make_varlen_d128_reference_case(
                 query_positions = torch.arange(q_length, device="cuda")
                 key_positions = torch.arange(kv_length, device="cuda")
                 scores = scores.masked_fill(key_positions[None, :] > query_positions[:, None], float("-inf"))
+                if window_size > 0:
+                    scores = scores.masked_fill(
+                        key_positions[None, :] + window_size <= query_positions[:, None],
+                        float("-inf"),
+                    )
             lse_tile = torch.logsumexp(scores, dim=1)
             p = torch.exp(scores - lse_tile[:, None])
             out_tile = (p @ v_tile).to(torch.bfloat16)
@@ -1530,8 +1536,45 @@ def _make_seeded_extend_attention_lengths(batch, max_context, seed):
 
 def test_varlen_d128_backward_api_defaults_to_noncausal():
     causal = inspect.signature(amd_fa_varlen_bwd.fa_varlen_backward).parameters["causal"]
+    window_size = inspect.signature(amd_fa_varlen_bwd.fa_varlen_backward).parameters["window_size"]
 
     assert causal.default is False
+    assert window_size.default == 0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("window_size", "causal", "error", "message"),
+    (
+        pytest.param(1.5, True, TypeError, "window_size must be int", id="non-integer"),
+        pytest.param(-1, True, ValueError, "window_size must be non-negative", id="negative"),
+        pytest.param(1, False, ValueError, "window_size requires causal=True", id="noncausal-positive"),
+    ),
+)
+def test_varlen_d128_backward_rejects_invalid_window_size(window_size, causal, error, message):
+    case = _make_varlen_d128_reference_case(
+        [16],
+        [16],
+        q_heads=1,
+        kv_heads=1,
+        seed=549,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    with pytest.raises(error, match=message):
+        amd_fa_varlen_bwd.fa_varlen_backward(
+            q,
+            k,
+            v,
+            out,
+            do,
+            lse,
+            plan,
+            scale,
+            causal=causal,
+            window_size=window_size,
+        )
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1645,6 +1688,7 @@ def test_varlen_d128_fp32_dq_padding_falls_back_at_i32_boundary():
         total_q=total_q,
         total_kv=1,
         batch=batch,
+        max_q=total_q,
         q_heads=q_heads,
         kv_heads=1,
         dq_atomic_fp32=True,
@@ -1654,6 +1698,7 @@ def test_varlen_d128_fp32_dq_padding_falls_back_at_i32_boundary():
         total_q=total_q,
         total_kv=1,
         batch=batch,
+        max_q=total_q,
         q_heads=q_heads,
         kv_heads=1,
         dq_atomic_fp32=False,
@@ -1664,6 +1709,7 @@ def test_varlen_d128_fp32_dq_padding_falls_back_at_i32_boundary():
             total_q=total_q,
             total_kv=1,
             batch=batch,
+            max_q=total_q,
             q_heads=q_heads,
             kv_heads=1,
             dq_atomic_fp32=True,
@@ -1696,6 +1742,8 @@ def test_varlen_d128_kv_partial_workspace_shapes():
         pytest.param([7, 31, 65], [33, 257, 7], 2, 2, (0, 0), id="mha-mixed-full-tail"),
         pytest.param([1, 17], [1, 127], 2, 2, (0, 0), id="mha-all-tail"),
         pytest.param([16, 32], [128, 256], 2, 2, (0, 0), id="mha-all-full"),
+        pytest.param([17, 17, 17], [257, 257, 257], 2, 2, (0, 0), id="mha-uniform-interleaved"),
+        pytest.param([192, 192], [192, 192], 2, 2, (0, 0), id="mha-uniform-interleaved-padding"),
         pytest.param([1, 17], [1, 96], 4, 4, (0, 0), id="mha-k96-all-tail"),
         pytest.param([1, 17, 33], [96, 224, 128], 4, 4, (0, 0), id="mha-tail-96"),
         pytest.param([1, 17, 33], [97, 225, 128], 4, 4, (0, 0), id="mha-tail-97"),
@@ -1759,6 +1807,36 @@ def test_varlen_d128_interleaved_lengths_gfx950(q_lengths, kv_lengths, q_heads, 
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_fp32_dq_accumulation_accuracy_gfx950():
+    # The BF16 packed-atomic baseline reaches about 1.4e-2 relative-L2 here
+    # because each dQ element accumulates contributions from 128 KV tiles.
+    # FP32 accumulation must remain below the 1e-2 accuracy requirement.
+    q_lengths = [16]
+    kv_lengths = [16384]
+    case = _make_varlen_d128_reference_case(
+        q_lengths,
+        kv_lengths,
+        q_heads=1,
+        kv_heads=1,
+        seed=431,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(
+        cu_q,
+        cu_kv,
+        q.shape[0],
+        k.shape[0],
+        max(q_lengths),
+        max(kv_lengths),
+    )
+
+    dq, _dk, _dv = amd_fa_varlen_bwd.fa_varlen_backward(q, k, v, out, do, lse, plan, scale, dq_atomic_fp32=True)
+    relative_l2 = torch.linalg.vector_norm(dq.float() - expected[0].float()) / torch.linalg.vector_norm(
+        expected[0].float())
+    assert relative_l2.item() < 1e-2, relative_l2.item()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_varlen_d128_causal_mha_boundaries_gfx950():
     lengths = [1, 15, 16, 17, 127, 128, 129, 255, 256, 257]
     case = _make_varlen_d128_reference_case(
@@ -1778,6 +1856,202 @@ def test_varlen_d128_causal_mha_boundaries_gfx950():
         assert torch.isfinite(result).all(), name
         relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
             reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("length", "split_dq"),
+    ((8191, False), (8192, True)),
+    ids=("below-boundary-atomic", "at-boundary-q-owner"),
+)
+def test_varlen_d128_causal_window_split_dq_gfx950(length, split_dq):
+    core_kernel = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
+    owner_kernel = amd_fa_varlen_bwd._varlen_bwd_dq_owner_kernel
+    core_kernel.device_caches.clear()
+    owner_kernel.device_caches.clear()
+    lengths = [length]
+    window_size = 257
+    case = _make_varlen_d128_reference_case(
+        lengths,
+        lengths,
+        q_heads=1,
+        kv_heads=1,
+        seed=543,
+        causal=True,
+        window_size=window_size,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=True,
+        dq_atomic_fp32=True,
+        window_size=window_size,
+    )
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    core_objects = tuple(core_kernel.device_caches[device][0].values())
+    assert core_objects
+    if split_dq:
+        owner_objects = tuple(owner_kernel.device_caches[device][0].values())
+        assert len(owner_objects) == 1
+        for compiled in (*core_objects, *owner_objects):
+            _assert_scratch_free("split_dq", compiled)
+            assert not re.search(r"\b\w*atomic\w*\b", compiled.asm["amdgcn"])
+    else:
+        assert not owner_kernel.device_caches[device][0]
+        assert all("buffer_atomic_add_f32" in compiled.asm["amdgcn"] for compiled in core_objects)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_causal_window_split_dq_ragged_multihead_strided_v_gfx950(monkeypatch):
+    core_kernel = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
+    owner_kernel = amd_fa_varlen_bwd._varlen_bwd_dq_owner_kernel
+    core_kernel.device_caches.clear()
+    owner_kernel.device_caches.clear()
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_SPLIT_DQ_MIN_AVERAGE_Q", 1)
+    lengths = [513, 769]
+    window_size = 257
+    case = _make_varlen_d128_reference_case(
+        lengths,
+        lengths,
+        q_heads=2,
+        kv_heads=2,
+        seed=548,
+        causal=True,
+        window_size=window_size,
+        strided_v=True,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    assert v.stride() == (3 * 2 * 128, 128, 1)
+    assert not v.is_contiguous()
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=True,
+        dq_atomic_fp32=True,
+        window_size=window_size,
+    )
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        assert torch.isfinite(result).all(), name
+        relative_l2 = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+            reference.float())
+        assert relative_l2.item() < 1e-2, (name, relative_l2.item())
+
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    core_objects = tuple(core_kernel.device_caches[device][0].values())
+    owner_objects = tuple(owner_kernel.device_caches[device][0].values())
+    assert core_objects
+    assert len(owner_objects) == 1
+    for compiled in (*core_objects, *owner_objects):
+        _assert_scratch_free("split_dq_ragged_multihead_strided_v", compiled)
+        assert not re.search(r"\b\w*atomic\w*\b", compiled.asm["amdgcn"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_varlen_d128_causal_window_ragged_uses_atomic_gfx950():
+    core_kernel = amd_fa_varlen_bwd._varlen_bwd_interleaved_kernel
+    owner_kernel = amd_fa_varlen_bwd._varlen_bwd_dq_owner_kernel
+    core_kernel.device_caches.clear()
+    owner_kernel.device_caches.clear()
+    # Average Q length is just above 8192, while max Q is just over 2x average.
+    lengths = [16385, 4096, 4096]
+    window_size = 257
+    total = sum(lengths)
+    shape = (total, 1, 128)
+    q = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    out = torch.zeros_like(q)
+    do = torch.zeros_like(q)
+    lse = torch.zeros((1, total), dtype=torch.float32, device="cuda")
+    cu_q = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    cu_kv = cu_q.clone()
+    scale = 128**-0.5
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=True,
+        dq_atomic_fp32=True,
+        window_size=window_size,
+    )
+
+    for name, result in zip(("dq", "dk", "dv"), actual, strict=True):
+        assert torch.count_nonzero(result).item() == 0, name
+
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    assert not owner_kernel.device_caches[device][0]
+    core_objects = tuple(core_kernel.device_caches[device][0].values())
+    assert len(core_objects) == 2
+    assert all("buffer_atomic_add_f32" in compiled.asm["amdgcn"] for compiled in core_objects)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("window_size", (129, 2**31 - 1, 2**31))
+def test_varlen_d128_causal_oversized_window_is_full_causal_gfx950(window_size):
+    lengths = [65, 129]
+    case = _make_varlen_d128_reference_case(
+        lengths,
+        lengths,
+        q_heads=2,
+        kv_heads=2,
+        seed=546,
+        causal=True,
+    )
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    actual = amd_fa_varlen_bwd.fa_varlen_backward(
+        q,
+        k,
+        v,
+        out,
+        do,
+        lse,
+        plan,
+        scale,
+        causal=True,
+        window_size=window_size,
+    )
+
+    for name, result, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True):
+        relative_l2 = (torch.linalg.vector_norm(result.float() - reference.float()) /
+                       torch.linalg.vector_norm(reference.float()))
         assert relative_l2.item() < 1e-2, (name, relative_l2.item())
 
 

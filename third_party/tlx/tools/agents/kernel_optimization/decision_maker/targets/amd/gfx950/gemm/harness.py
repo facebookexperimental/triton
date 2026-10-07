@@ -19,6 +19,7 @@ if str(_AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_DIR))
 
 from profiling.amd_att import collect_fb_att  # noqa: E402
+from profiling.amdgcn_isa import collect_amdgcn_isa  # noqa: E402
 from profiling.rocm_profiler import (  # noqa: E402
     collect_rocprofv3,
     filter_extreme_timing_outliers,
@@ -135,7 +136,7 @@ def profile(
     if not bool(case.get("parameters", {}).get("profile", True)):
         result["diagnostics"] = ["rocprofv3 skipped for this case"]
         return result
-    if not {"rocprofv3", "fb_att"}.intersection(tools):
+    if not {"rocprofv3", "fb_att", "amdgcn_isa"}.intersection(tools):
         result["diagnostics"] = ["no supported AMD profiler was requested"]
         return result
     artifacts_dir_raw = request.get("artifacts_dir")
@@ -168,13 +169,13 @@ def profile(
                 launches=10,
             ),
         )
+    rocprof = result.get("rocprofv3", {})
+    summary = rocprof.get("summary", {}) if isinstance(rocprof, Mapping) else {}
+    kernel_filter = str(
+        case.get("parameters", {}).get("profile_kernel", "")
+        or summary.get("dominant_kernel", "")
+    ).removesuffix(".kd")
     if "fb_att" in tools:
-        rocprof = result.get("rocprofv3", {})
-        summary = rocprof.get("summary", {}) if isinstance(rocprof, Mapping) else {}
-        kernel_filter = str(
-            case.get("parameters", {}).get("profile_kernel", "")
-            or summary.get("dominant_kernel", "")
-        ).removesuffix(".kd")
         if kernel_filter:
             result["fb_att"] = collect_fb_att(
                 _profile_workload_command(
@@ -193,6 +194,24 @@ def profile(
         else:
             result["fb_att"] = {
                 "error": "fb_att requires a dominant kernel from rocprofv3"
+            }
+    if "amdgcn_isa" in tools:
+        if kernel_filter:
+            result["amdgcn_isa"] = collect_amdgcn_isa(
+                _profile_workload_command(
+                    source_path,
+                    case_path,
+                    device,
+                    burn_seconds=0.0,
+                    launches=1,
+                ),
+                artifacts_dir,
+                kernel_filter=kernel_filter,
+                timeout_seconds=600.0,
+            )
+        else:
+            result["amdgcn_isa"] = {
+                "error": "amdgcn_isa requires a dominant kernel from rocprofv3"
             }
     return result
 

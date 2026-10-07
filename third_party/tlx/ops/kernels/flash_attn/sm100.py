@@ -2776,7 +2776,7 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks(exclusive=True):
+    with tlx.async_tasks(exclusive=True, less_reg_mma=True):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0
@@ -3389,7 +3389,7 @@ class _attention(torch.autograd.Function):
         q, k, v, o, M = ctx.saved_tensors
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert o.is_contiguous() and do.is_contiguous()
-        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
