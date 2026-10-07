@@ -208,17 +208,17 @@ def _check_grouped_gemm_mxfp8_out(out, tensors, *, GM, N, device):
 
 
 def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout="natural"):
-    """Run a forward-only SM100 grouped GEMM over pre-quantized MXFP8 inputs.
+    """Run a forward-only SM100 or gfx950 grouped GEMM over pre-quantized MXFP8 inputs.
 
     ``x`` is contiguous ``[GM, K]`` and ``w`` is contiguous ``[G, N, K]``
     or packed ``[G * N, K]`` E4M3 data. Natural E8M0 scales match those
     logical data shapes with a final ``K // 32`` dimension. CuBLAS-blocked
     scales are rank-2 opaque byte tensors with exact 128x4-atom storage.
 
-    ``split_sizes`` stays on device: the SM100 kernel validates that values are
+    ``split_sizes`` stays on device: the kernel validates that values are
     nonnegative, every prefix is 128-aligned, and the final sum is ``GM``.
     The BF16 result has shape ``[GM, N]``; a supplied ``out`` is returned by
-    identity. ``num_sms`` defaults to all SMs on ``x.device``.
+    identity. ``num_sms`` defaults to all SMs (CUs on AMD) on ``x.device``.
     """
     import torch
 
