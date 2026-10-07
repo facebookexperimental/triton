@@ -360,6 +360,7 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("num_warps * 32 * num_arrivals", prompt)
         self.assertNotIn("# NVIDIA Persistent Pipeline Efficiency", prompt)
         self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+        self.assertNotIn("# Blackwell Overlapping TMEM Accumulators", prompt)
 
     def test_codex_prompt_selects_only_general_amd_skill_by_default(self) -> None:
         guidance = "Preserve runtime scale behavior."
