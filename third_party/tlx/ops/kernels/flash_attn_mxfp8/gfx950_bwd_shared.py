@@ -707,12 +707,27 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     n = shape[2]
     feature_scale_shape = (4, 32, n, 4)
     sequence_scale_shape = (4, 32, 128, n // 32)
-    vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
-    do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
-    vs = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device)
-    dos = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device)
-    kdqs = torch.empty(sequence_scale_shape, dtype=torch.uint8, device=device)
-    delta = torch.empty(shape[:-1], dtype=torch.float32, device=device)
+    # Repeated measurements favor packing at N1024; preserve the original
+    # allocation path for larger shapes.
+    if n == 1024:
+        # Private per-call arena: payloads, then scales and FP32 Delta. Every
+        # boundary is 16-byte aligned for the admitted N1024 shape.
+        payload_bytes = 128 * n * 128
+        scale_bytes = 128 * n * 4
+        arena = torch.empty((2 * payload_bytes + 4 * scale_bytes, ), dtype=torch.uint8, device=device)
+        vb = arena.narrow(0, 0, payload_bytes).view(torch.float8_e4m3fn).view(shape)
+        do8 = arena.narrow(0, payload_bytes, payload_bytes).view(torch.float8_e4m3fn).view(shape)
+        vs = arena.narrow(0, 2 * payload_bytes, scale_bytes).view(feature_scale_shape)
+        dos = arena.narrow(0, 2 * payload_bytes + scale_bytes, scale_bytes).view(feature_scale_shape)
+        kdqs = arena.narrow(0, 2 * payload_bytes + 2 * scale_bytes, scale_bytes).view(sequence_scale_shape)
+        delta = arena.narrow(0, 2 * payload_bytes + 3 * scale_bytes, scale_bytes).view(torch.float32).view(shape[:-1])
+    else:
+        vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+        do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+        vs = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device)
+        dos = torch.empty(feature_scale_shape, dtype=torch.uint8, device=device)
+        kdqs = torch.empty(sequence_scale_shape, dtype=torch.uint8, device=device)
+        delta = torch.empty(shape[:-1], dtype=torch.float32, device=device)
     # Never cap or reinterpret the whole DS allocation as range32.
     # Kernels use i64 head bases and bounded per-head i32 offsets.
     # For causal calls the producer starts at floor(key_start/128)*128,

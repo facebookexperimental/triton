@@ -212,10 +212,14 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
         graph = torch.cuda.CUDAGraph()
         workspaces = {}
         original_empty = torch.empty
+        arena_bytes = 2 * (128 * n_ctx * 128) + 4 * (128 * n_ctx * 4)
 
         def observe_empty(*allocation_args, **kwargs):
             tensor = original_empty(*allocation_args, **kwargs)
-            if tuple(tensor.shape) == (4, 32, n_ctx, n_ctx) and tensor.dtype == torch.float8_e4m3fn:
+            if tuple(tensor.shape) == (arena_bytes, ) and tensor.dtype == torch.uint8:
+                assert "arena" not in workspaces, "expected one private preparation arena"
+                workspaces["arena"] = tensor
+            elif tuple(tensor.shape) == (4, 32, n_ctx, n_ctx) and tensor.dtype == torch.float8_e4m3fn:
                 assert "ds" not in workspaces, "expected exactly one captured backward"
                 workspaces["ds"] = tensor
             elif "ds" in workspaces and "dss" not in workspaces:
@@ -240,11 +244,15 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
                 with mock.patch.object(gfx950_bwd_shared.torch, "empty", side_effect=observe_empty):
                     with torch.cuda.graph(graph, stream=stream):
                         captured = backward()
-                assert set(workspaces) == {"ds", "dss"}
+                assert set(workspaces) == ({"arena", "ds", "dss"} if n_ctx == 1024 else {"ds", "dss"})
                 for _ in range(2):
                     # Poison before each replay, outside the captured graph.
                     # E4M3 byte0x7f and E8M0 byte255 represent NaN. Every
                     # consumed workspace value must come from this replay.
+                    # Also poison both private payloads, their scales, and
+                    # FP32 Delta. Views retain this storage for graph replay.
+                    if n_ctx == 1024:
+                        workspaces["arena"].fill_(255)
                     workspaces["ds"].view(torch.uint8).fill_(0x7f)
                     workspaces["dss"].fill_(255)
                     for grad in captured:
@@ -271,6 +279,73 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
             stream.synchronize()
             graph.reset()
             workspaces.clear()
+
+
+@pytest.mark.parametrize("n_ctx", (1024, 2048, 4096, 8192))
+def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
+    """Check the actual launch allocation contract without compiling kernels."""
+    from triton import knobs
+    from triton._C.libtriton import native_specialize_impl
+    from triton.backends.amd.compiler import HIPBackend
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, n_ctx, 128)
+    packed = n_ctx == 1024
+    preparation_allocations = 1 if packed else 6
+    original_empty = torch.empty
+    allocations = []
+
+    def allocate(allocation_shape, *, dtype, device):
+        # Materialize preparation storage on CPU. DS and gradients can be
+        # large, and mocked launchers need only their metadata.
+        actual_device = "cpu" if len(allocations) < preparation_allocations else "meta"
+        tensor = original_empty(allocation_shape, dtype=dtype, device=actual_device)
+        allocations.append(tensor)
+        return tensor
+
+    with mock.patch.object(shared.torch, "empty", side_effect=allocate):
+        with mock.patch.object(shared._prepare_fused, "run") as prepare:
+            with mock.patch.object(shared._bwd_kv_owner, "run"):
+                with mock.patch.object(shared._bwd_q_consume, "run"):
+                    gradients = shared._launch_backward_shared_square(*([object()] * 8), 0.5, False,
+                                                                      torch.device("cpu"), shape)
+    assert len(allocations) == preparation_allocations + 5  # Preparation, DS, DSS, and three outputs.
+    args = prepare.call_args.args
+    private = (*args[3:8], args[9])  # V8, dO8, VS, dOS, KDQS, Delta.
+    expected_shapes = (shape, shape, (4, 32, n_ctx, 4), (4, 32, n_ctx, 4), (4, 32, 128, n_ctx // 32), shape[:-1])
+    expected_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.uint8, torch.uint8, torch.uint8, torch.float32)
+    if not packed:
+        assert all(tensor is allocated for tensor, allocated in zip(private, allocations[:6]))
+        assert len({tensor.untyped_storage().data_ptr() for tensor in private}) == 6
+    offset = 0
+    byte_views = []
+    with mock.patch.object(knobs.amd, "use_buffer_ops", True):
+        for index, (tensor, expected_shape, dtype) in enumerate(zip(private, expected_shapes, expected_dtypes)):
+            assert tuple(tensor.shape) == expected_shape and tensor.dtype == dtype
+            assert tensor.is_contiguous() and tensor.device.type == "cpu"
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if packed:
+                arena = allocations[0]
+                assert tensor.untyped_storage().data_ptr() == arena.data_ptr()
+                assert tensor.data_ptr() == arena.data_ptr() + offset
+                assert tensor.untyped_storage().nbytes() == arena.numel() < 2**31
+            else:
+                assert tensor.storage_offset() == 0
+                assert tensor.untyped_storage().data_ptr() == tensor.data_ptr()
+                assert tensor.untyped_storage().nbytes() == tensor_bytes < 2**31
+            assert tensor.data_ptr() % 16 == 0
+            _, attributes = native_specialize_impl(HIPBackend, tensor, False, True, True)
+            assert "D" in attributes and "S" in attributes
+            byte_view = tensor.view(torch.uint8).reshape(-1)
+            byte_view[0] = byte_view[-1] = index + 1
+            byte_views.append(byte_view)
+            offset += tensor_bytes
+    assert offset == 34816 * n_ctx
+    if packed:
+        assert offset == allocations[0].numel()
+    for index, byte_view in enumerate(byte_views):
+        assert int(byte_view[0]) == int(byte_view[-1]) == index + 1
+    assert all(gradient is allocation for gradient, allocation in zip(gradients, allocations[-3:]))
 
 
 def test_flash_attn_mxfp8_shared_backward_host_dispatch():
