@@ -69,7 +69,7 @@ def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr,
 @constexpr_function
 def _preparation_arena_layout(n):
     """Byte offsets for two FP8 payloads, three E8M0 scales and FP32 Delta."""
-    assert n == 1024
+    assert n in (1024, 2048)
     payload_bytes = 128 * n * 128
     scale_bytes = 128 * n * 4
     # Each scale stores 128*n*4 bytes. Delta stores 128*n FP32 values.
@@ -80,7 +80,7 @@ def _preparation_arena_layout(n):
     return (*offsets, total_bytes)
 
 
-_PREPARATION_ARENA_BYTES = _preparation_arena_layout(1024)[-1]
+_PREPARATION_ARENA_BYTES = {n: _preparation_arena_layout(n)[-1] for n in (1024, 2048)}
 
 
 @triton.jit
@@ -760,9 +760,9 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     feature_scale_shape = (4, 32, n, 4)
     sequence_scale_shape = (4, 32, 128, n // 32)
     # Derive preparation pointers inside JIT kernels instead of creating
-    # Torch views. Keep this private per-call arena restricted to N1024.
-    if n == 1024:
-        arena = torch.empty((_PREPARATION_ARENA_BYTES, ), dtype=torch.uint8, device=device)
+    # Torch views. Restrict the private per-call arena to N1024/N2048.
+    if n in _PREPARATION_ARENA_BYTES:
+        arena = torch.empty((_PREPARATION_ARENA_BYTES[n], ), dtype=torch.uint8, device=device)
     else:
         vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
         do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
@@ -784,7 +784,7 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
-    if n == 1024:
+    if n in _PREPARATION_ARENA_BYTES:
         # N stays runtime in both reduction kernels; ARENA_N only fixes
         # preparation byte offsets. Arithmetic, grids and owners are unchanged.
         _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4, num_stages=2,

@@ -244,14 +244,14 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
                 with mock.patch.object(gfx950_bwd_shared.torch, "empty", side_effect=observe_empty):
                     with torch.cuda.graph(graph, stream=stream):
                         captured = backward()
-                assert set(workspaces) == ({"arena", "ds", "dss"} if n_ctx == 1024 else {"ds", "dss"})
+                assert set(workspaces) == ({"arena", "ds", "dss"} if n_ctx in (1024, 2048) else {"ds", "dss"})
                 for _ in range(2):
                     # Poison before each replay, outside the captured graph.
                     # E4M3 byte0x7f and E8M0 byte255 represent NaN. Every
                     # consumed workspace value must come from this replay.
                     # Also poison both private payloads, their scales, and
                     # FP32 Delta. Views retain this storage for graph replay.
-                    if n_ctx == 1024:
+                    if n_ctx in (1024, 2048):
                         workspaces["arena"].fill_(255)
                     workspaces["ds"].view(torch.uint8).fill_(0x7f)
                     workspaces["dss"].fill_(255)
@@ -290,7 +290,7 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
 
     shape = (4, 32, n_ctx, 128)
-    packed = n_ctx == 1024
+    packed = n_ctx in (1024, 2048)
     preparation_allocations = 1 if packed else 6
     original_empty = torch.empty
     allocations = []
@@ -337,7 +337,7 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
             for start, end, dtype, expected_shape in zip(offsets, offsets[1:], expected_dtypes, expected_shapes)
         ]
         with pytest.raises(AssertionError):
-            shared._preparation_arena_layout(2048)
+            shared._preparation_arena_layout(4096)
     else:
         private = (*args[3:8], args[9])  # V8, dO8, VS, dOS, KDQS, Delta.
     if not packed:
