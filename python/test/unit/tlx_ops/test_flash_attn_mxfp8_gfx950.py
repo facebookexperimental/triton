@@ -548,61 +548,90 @@ def test_flash_attn_mxfp8_shared_backward_live_metadata(n_ctx, causal):
             assert admit() == (device, shape)
 
 
-@pytest.mark.parametrize("n_ctx", (1024, 2048))
-@pytest.mark.parametrize("qk_format", (False, True))
-def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_format):
+@pytest.mark.parametrize(
+    "n_ctx,qk_format,plan_kind",
+    [(n, fmt, "ordinary") for n in (1024, 2048) for fmt in (False, True)]
+    + [(1024, True, "inline"), (1024, True, "partial")],
+)
+def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_format, plan_kind):
+    from contextlib import ExitStack
     from types import SimpleNamespace
     from triton import knobs
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
 
     device = torch.device("cuda:2")
     globals_dict = {"value": 7}
+    names = {
+        "ordinary": ("_prepare_fused_arena", "_bwd_kv_owner_arena", "_bwd_q_consume_arena"),
+        "inline": ("_bwd_kv_owner_inline_arena", "_bwd_q_consume_arena"),
+        "partial": ("_prepare_do_arena", "_bwd_kv_owner_partial_arena", "_bwd_q_consume_arena"),
+    }[plan_kind]
     jits = [
         SimpleNamespace(device_caches={}, pre_run_hooks=[], launch_metadata=None, debug=False, hash="source",
-                        used_global_vals={("value", 0): (7, globals_dict)}) for _ in range(3)
+                        used_global_vals={("value", 0): (7, globals_dict)}) for _ in names
     ]
-    kernels = [mock.MagicMock(spec=shared.CompiledKernel) for _ in range(3)]
+    kernels = [mock.MagicMock(spec=shared.CompiledKernel) for _ in names]
     for jit, kernel in zip(jits, kernels):
         kernel.src = SimpleNamespace(fn=jit)
         kernel._compile_iq_acf_cubin = None
         jit.device_caches[device.index] = ({"compiled-key": kernel}, {}, None, None, None)
 
-    with mock.patch.object(shared, "_prepare_fused_arena", jits[0]):
-        with mock.patch.object(shared, "_bwd_kv_owner_arena", jits[1]):
-            with mock.patch.object(shared, "_bwd_q_consume_arena", jits[2]):
-                with mock.patch.object(shared, "_ARENA_LAUNCH_PLANS", {}):
-                    with mock.patch.object(shared, "_arena_launch_controls", return_value=True) as controls:
-                        shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels, qk_format)
-                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5, not qk_format) is None
-                        shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels, not qk_format)
-                        assert len(shared._ARENA_LAUNCH_PLANS) == 2
-                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is not None
-                        assert shared._arena_launch_plan(device, n_ctx, False,
-                                                         0.5) == tuple(kernel.__getitem__.return_value
-                                                                       for kernel in kernels)
-                        assert shared._arena_launch_plan(torch.device("cuda:3"), n_ctx, False, 0.5) is None
-                        assert shared._arena_launch_plan(device, n_ctx, True, 0.5) is None
-                        assert shared._arena_launch_plan(device, n_ctx, False, 1.3) is None
-                        controls.return_value = False
-                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
-                        controls.return_value = True
-                        for jit in jits:
-                            jit.pre_run_hooks.append(lambda: None)
-                            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
-                            jit.pre_run_hooks.clear()
-                            jit.hash = "changed source"
-                            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
-                            jit.hash = "source"
-                            old_cache = jit.device_caches[device.index]
-                            jit.device_caches.clear()
-                            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
-                            jit.device_caches[device.index] = old_cache
-                        globals_dict["value"] = 8
-                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
-                        globals_dict["value"] = 7
-                        assert shared._arena_launch_plan(device, n_ctx, False,
-                                                         0.5) == tuple(kernel.__getitem__.return_value
-                                                                       for kernel in kernels)
+    def remember(fmt=qk_format):
+        if plan_kind == "ordinary":
+            shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels, fmt)
+        else:
+            getattr(shared, "_remember_" + plan_kind + "_arena_launch_plan")(device, n_ctx, 0.5, kernels)
+
+    def plan(selected_device=device, n=n_ctx, scale=0.5, fmt=qk_format):
+        if plan_kind == "ordinary":
+            return shared._arena_launch_plan(selected_device, n, False, scale, fmt)
+        return getattr(shared, "_" + plan_kind + "_arena_launch_plan")(selected_device, n, scale)
+
+    with ExitStack() as stack:
+        for name, jit in zip(names, jits):
+            stack.enter_context(mock.patch.object(shared, name, jit))
+        stack.enter_context(mock.patch.object(shared, "_ARENA_LAUNCH_PLANS", {}))
+        controls = stack.enter_context(mock.patch.object(shared, "_arena_launch_controls", return_value=True))
+        remember()
+        if plan_kind == "ordinary":
+            assert plan(fmt=not qk_format) is None
+            remember(not qk_format)
+            assert len(shared._ARENA_LAUNCH_PLANS) == 2
+            assert shared._arena_launch_plan(device, n_ctx, True, 0.5, qk_format) is None
+        else:
+            other = "partial" if plan_kind == "inline" else "inline"
+            assert getattr(shared, "_" + other + "_arena_launch_plan")(device, n_ctx, 0.5) is None
+        expected = tuple(kernel.__getitem__.return_value for kernel in kernels)
+        assert plan() == expected
+        assert plan(selected_device=torch.device("cuda:3")) is None
+        assert plan(scale=1.3) is None
+        controls.return_value = False
+        assert plan() is None
+        controls.return_value = True
+        for jit in jits:
+            jit.pre_run_hooks.append(lambda: None)
+            assert plan() is None
+            jit.pre_run_hooks.clear()
+            jit.hash = "changed source"
+            assert plan() is None
+            jit.hash = "source"
+            old_cache = jit.device_caches[device.index]
+            jit.device_caches.clear()
+            assert plan() is None
+            jit.device_caches[device.index] = old_cache
+        globals_dict["value"] = 8
+        assert plan() is None
+        globals_dict["value"] = 7
+        assert plan() == expected
+        if plan_kind == "partial":
+            key = (device.index, n_ctx, False, 0.5, ("partial_saved_qk_arena", 1))
+            original = shared._ARENA_LAUNCH_PLANS[key]
+            shared._ARENA_LAUNCH_PLANS[key] = original[:2]
+            assert plan() is None
+            shared._ARENA_LAUNCH_PLANS[key] = original
+            replacement = SimpleNamespace(**vars(jits[1]))
+            with mock.patch.object(shared, "_bwd_kv_owner_partial_arena", replacement):
+                assert plan() is None
 
     # Controls are tested independently of the mocked validity metadata.
     with mock.patch.object(shared, "get_cache_invalidating_env_vars", return_value={}):
@@ -636,8 +665,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         inputs[:4] = [
             torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="meta", dtype=torch.uint8), None, None, None
         ]
-    inline_prepare = qk_format and n_ctx == 1024
-    jits = ((shared._bwd_kv_owner_inline_arena, shared._bwd_q_consume_arena) if inline_prepare else
+    partial_prepare = qk_format and n_ctx == 1024
+    jits = ((shared._prepare_do_arena, shared._bwd_kv_owner_partial_arena, shared._bwd_q_consume_arena) if partial_prepare else
             (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     # Populate real transitive source hashes without compiling or using a GPU.
     assert all(jit.cache_key for jit in jits)
@@ -666,20 +695,26 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         warm = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs)
         assert all(first is not second for first, second in zip(cold, warm))
-        kv_index = 0 if inline_prepare else 1
+        kv_index = 1
         kv_args = kernels[kv_index].__getitem__.return_value.call_args.args
         query_args = kernels[-1].__getitem__.return_value.call_args.args
-        assert kv_args[5] is query_args[1] is allocations[4]
         assert query_args[0] is inputs[0 if qk_format else 1]
-        assert query_args[2] is warm[0] and kv_args[6] is warm[1] and kv_args[7] is warm[2]
+        assert query_args[2] is warm[0]
         assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128, qk_format)
         assert kv_args[0] is inputs[0]
-        if inline_prepare:
-            assert all(actual is expected for actual, expected in zip(kv_args[1:5], inputs[4:8]))
-            assert kv_args[10:] == (n_ctx, 128, 64, 64)
-            arguments = (kv_args, query_args)
-            expected_tensors = 11
+        if partial_prepare:
+            prepare_args = kernels[0].__getitem__.return_value.call_args.args
+            assert prepare_args[0] is inputs[5] and prepare_args[1] is inputs[6]
+            assert prepare_args[2] is kv_args[3] is query_args[1] is allocations[4]
+            assert prepare_args[3:] == (n_ctx, 128, 32)
+            assert kv_args[1] is inputs[4] and kv_args[2] is inputs[7]
+            assert kv_args[4] is warm[1] and kv_args[5] is warm[2]
+            assert kv_args[8:] == (n_ctx, 128, 64, 64)
+            arguments = (prepare_args, kv_args, query_args)
+            expected_tensors = 12
         else:
+            assert kv_args[5] is query_args[1] is allocations[4]
+            assert kv_args[6] is warm[1] and kv_args[7] is warm[2]
             prepare_args = kernels[0].__getitem__.return_value.call_args.args
             assert prepare_args[4] is kv_args[5]
             assert prepare_args[5:] == (n_ctx, 128, 32, qk_format)
@@ -695,8 +730,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         # A supported source edit invalidates each caller's hash. The live
         # real JIT objects must reject a retained compiled plan afterward.
         with mock.patch.object(jits[kv_index], "hash", None):
-            if inline_prepare:
-                assert shared._inline_arena_launch_plan(device, n_ctx, 0.5) is None
+            if partial_prepare:
+                assert shared._partial_arena_launch_plan(device, n_ctx, 0.5) is None
             else:
                 assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is None
         kernels[kv_index].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
@@ -720,7 +755,7 @@ def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(qk_format):
         inputs[:4] = [
             torch.empty(shared._saved_qk_arena_layout(1024)[-1], device="meta", dtype=torch.uint8), None, None, None
         ]
-    jits = ((shared._bwd_kv_owner_inline_arena, shared._bwd_q_consume_arena) if qk_format else
+    jits = ((shared._prepare_do_arena, shared._bwd_kv_owner_partial_arena, shared._bwd_q_consume_arena) if qk_format else
             (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     kernels = []
     for jit in jits:
@@ -757,7 +792,7 @@ def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(qk_format):
         assert all(kernel._run.call_args_list[0].args[3] == 101 for kernel in kernels)
         assert all(kernel._run.call_args_list[1].args[3] == 202 for kernel in kernels)
         assert all(a is not b for a, b in zip(first, second))
-        arena_index = 14 if qk_format else 13
+        arena_index = 11 if qk_format else 13
         assert kernels[0]._run.call_args_list[0].args[arena_index] is not kernels[0]._run.call_args_list[1].args[
             arena_index]
         kernels[0 if qk_format else 1]._run.side_effect = RuntimeError("modeled runner failure")
@@ -1121,6 +1156,52 @@ def test_flash_attn_mxfp8_shared_inline_prepare_matches_fused(fixture):
         stream.synchronize()
         graph.reset()
     for tensor, original in zip(inputs, frozen):
+        equal_bytes(tensor, original)
+
+    # Exercise the actual N1024 producer with all existing numerical fixtures.
+    partial_inputs = tuple(tensor.repeat(1, 1, 16, 1) for tensor in (v, do, out, ks))
+    partial_frozen = tuple(tensor.clone() for tensor in partial_inputs)
+    partial_v, partial_do, partial_out, partial_ks = partial_inputs
+    arena_bytes = shared._PREPARATION_ARENA_BYTES[1024]
+    expected_arena = torch.empty((arena_bytes, ), device=v.device, dtype=torch.uint8)
+    actual_arena = torch.empty_like(expected_arena)
+    shared._prepare_fused_arena[(32, 6)](partial_v, partial_do, partial_ks, partial_out, expected_arena,
+                                         1024, 128, 32, QK_FORMAT=False, num_warps=4, num_stages=2)
+    offsets = shared._preparation_arena_layout(1024)
+    selected = ((1, 6 * 1024 * 128), (3, 6 * 1024 * 4), (5, 6 * 1024 * 4))
+
+    def partial_probe():
+        shared._prepare_do_arena[(32, 6)](partial_do, partial_out, actual_arena, 1024, 128, 32,
+                                           num_warps=2, num_stages=1)
+
+    def check_partial():
+        for index, length in selected:
+            equal_bytes(actual_arena.narrow(0, offsets[index], length),
+                        expected_arena.narrow(0, offsets[index], length))
+        for index in (0, 2, 4):
+            assert bool((actual_arena.narrow(0, offsets[index], 16) == 255).all())
+
+    actual_arena.fill_(255)
+    partial_probe()
+    check_partial()
+    partial_stream = torch.cuda.Stream()
+    partial_stream.wait_stream(torch.cuda.current_stream())
+    partial_graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(partial_stream):
+            partial_probe()
+            partial_stream.synchronize()
+            with torch.cuda.graph(partial_graph, stream=partial_stream):
+                partial_probe()
+            for _ in range(2):
+                actual_arena.fill_(255)
+                partial_graph.replay()
+                partial_stream.synchronize()
+                check_partial()
+    finally:
+        partial_stream.synchronize()
+        partial_graph.reset()
+    for tensor, original in zip(partial_inputs, partial_frozen):
         equal_bytes(tensor, original)
 
 
