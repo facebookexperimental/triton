@@ -88,6 +88,28 @@ def _preparation_arena_layout(n):
 _PREPARATION_ARENA_BYTES = {n: _preparation_arena_layout(n)[-1] for n in (1024, 2048)}
 
 
+@constexpr_function
+def _backward_arena_layout(n):
+    """Disjoint byte regions for preparation, dense dS and its square scales."""
+    ds_offset = _preparation_arena_layout(n)[-1]
+    dss_offset = ds_offset + 128 * n * n
+    total_bytes = dss_offset + 128 * (n // 32)**2
+    assert ds_offset % 16 == dss_offset % 16 == total_bytes % 16 == 0 and total_bytes < 2**31
+    return ds_offset, dss_offset, total_bytes
+
+
+_BACKWARD_ARENA_BYTES = {n: _backward_arena_layout(n)[-1] for n in (1024, 2048)}
+
+
+@triton.jit
+def _backward_arena_segments(Arena, ARENA_N: tl.constexpr):
+    tl.static_assert(Arena.dtype.element_ty == tl.uint8)
+    offsets: tl.constexpr = _backward_arena_layout(ARENA_N)
+    ds = (Arena + offsets[0]).to(tl.pointer_type(tl.float8e4nv))
+    dss = Arena + offsets[1]
+    return ds, dss
+
+
 @triton.jit
 def _preparation_arena_segments(Arena, ARENA_N: tl.constexpr):
     tl.static_assert(Arena.dtype.element_ty == tl.uint8)
@@ -640,17 +662,19 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
 
 
 @triton.jit
-def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, DS, DSS, ARENA_N: tl.constexpr, D: tl.constexpr,
+def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr):
     vb, do8, vs, dos, _, delta = _preparation_arena_segments(Arena, ARENA_N)
+    DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN, CAUSAL,
                   SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False)
 
 
 @triton.jit
-def _bwd_q_consume_arena(DS, DSS, K, Arena, DQ, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr, BM: tl.constexpr,
+def _bwd_q_consume_arena(K, Arena, DQ, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr, BM: tl.constexpr,
                          BK: tl.constexpr, CAUSAL: tl.constexpr, HEADS: tl.constexpr):
     _, _, _, _, kdqs, _ = _preparation_arena_segments(Arena, ARENA_N)
+    DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_q_consume(DS, DSS, K, kdqs, DQ, N, sm_scale, D, BM, BK, CAUSAL, HEADS)
 
 
@@ -825,10 +849,10 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     n = shape[2]
     feature_scale_shape = (4, 32, n, 4)
     sequence_scale_shape = (4, 32, 128, n // 32)
-    # Derive preparation pointers inside JIT kernels instead of creating
-    # Torch views. Restrict the private per-call arena to N1024/N2048.
+    # Derive temporary pointers inside JIT kernels instead of creating Torch
+    # views. Each N1024/N2048 call owns preparation, DS and DSS in one arena.
     if n in _PREPARATION_ARENA_BYTES:
-        arena = torch.empty((_PREPARATION_ARENA_BYTES[n], ), dtype=torch.uint8, device=device)
+        arena = torch.empty((_BACKWARD_ARENA_BYTES[n], ), dtype=torch.uint8, device=device)
     else:
         vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
         do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
@@ -841,11 +865,12 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     # For causal calls the producer starts at floor(key_start/128)*128,
     # writing both query64 tiles (including fine-diagonal masked zeros).
     # The query128 consumer reads only these initialized DS/DSS blocks.
-    ds = torch.empty((4, 32, n, n), dtype=torch.float8_e4m3fn, device=device)
     # Capacity is square32 in both modes. Causal physical scale records are
     # [4, 32, n // 128, n // 64, 4, 2]; each key64 owner writes one full
     # eight-byte record across its two query64 visits, without shared words.
-    dss = torch.empty((4, 32, n // 32, n // 32), dtype=torch.uint8, device=device)
+    if n not in _PREPARATION_ARENA_BYTES:
+        ds = torch.empty((4, 32, n, n), dtype=torch.float8_e4m3fn, device=device)
+        dss = torch.empty((4, 32, n // 32, n // 32), dtype=torch.uint8, device=device)
     dq = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
@@ -863,18 +888,18 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
             stream = driver.active.get_current_stream(device.index)
             # Pass the complete original ABI, including constexpr positions.
             prepare(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, stream=stream)
-            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss, n, 128, 64, 64, causal,
+            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, causal,
                stream=stream)
-            query(ds, dss, k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, stream=stream)
+            query(k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, stream=stream)
         else:
             # N stays runtime in both reduction kernels; ARENA_N only fixes
             # preparation byte offsets. Cold JIT errors propagate unchanged.
             prepare = _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4,
                                                num_stages=2, grid=(n // 32, 128), warmup=False)
-            kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss,
+            kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale,
                                          ARENA_N=n, D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1,
                                          matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
-            query = _bwd_q_consume_arena.run(ds, dss, k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
+            query = _bwd_q_consume_arena.run(k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
                                              CAUSAL=causal, HEADS=128, num_warps=4, num_stages=1,
                                              matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                                              warmup=False)

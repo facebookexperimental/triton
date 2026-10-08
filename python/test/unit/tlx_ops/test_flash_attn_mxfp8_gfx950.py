@@ -212,12 +212,12 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
         graph = torch.cuda.CUDAGraph()
         workspaces = {}
         original_empty = torch.empty
-        arena_bytes = 2 * (128 * n_ctx * 128) + 4 * (128 * n_ctx * 4)
+        arena_bytes = gfx950_bwd_shared._BACKWARD_ARENA_BYTES.get(n_ctx)
 
         def observe_empty(*allocation_args, **kwargs):
             tensor = original_empty(*allocation_args, **kwargs)
             if tuple(tensor.shape) == (arena_bytes, ) and tensor.dtype == torch.uint8:
-                assert "arena" not in workspaces, "expected one private preparation arena"
+                assert "arena" not in workspaces, "expected one private backward arena"
                 workspaces["arena"] = tensor
             elif tuple(tensor.shape) == (4, 32, n_ctx, n_ctx) and tensor.dtype == torch.float8_e4m3fn:
                 assert "ds" not in workspaces, "expected exactly one captured backward"
@@ -244,7 +244,15 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
                 with mock.patch.object(gfx950_bwd_shared.torch, "empty", side_effect=observe_empty):
                     with torch.cuda.graph(graph, stream=stream):
                         captured = backward()
-                assert set(workspaces) == ({"arena", "ds", "dss"} if n_ctx in (1024, 2048) else {"ds", "dss"})
+                assert set(workspaces) == ({"arena"} if n_ctx in (1024, 2048) else {"ds", "dss"})
+                if n_ctx in (1024, 2048):
+                    ds_offset, dss_offset, total_bytes = gfx950_bwd_shared._backward_arena_layout(n_ctx)
+                    # Test-only views expose the JIT pointer regions for the
+                    # causal untouched-region checks below.
+                    workspaces["ds"] = workspaces["arena"].narrow(0, ds_offset, dss_offset - ds_offset).view(
+                        torch.float8_e4m3fn).view(4, 32, n_ctx, n_ctx)
+                    workspaces["dss"] = workspaces["arena"].narrow(0, dss_offset, total_bytes - dss_offset).view(
+                        4, 32, n_ctx // 32, n_ctx // 32)
                 for _ in range(2):
                     # Poison before each replay, outside the captured graph.
                     # E4M3 byte0x7f and E8M0 byte255 represent NaN. Every
@@ -296,8 +304,8 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
     allocations = []
 
     def allocate(allocation_shape, *, dtype, device):
-        # Materialize preparation storage on CPU. DS and gradients can be
-        # large, and mocked launchers need only their metadata.
+        # Materialize temporary storage on CPU to check byte-region bounds.
+        # Only region endpoints are touched; output metadata can use meta.
         actual_device = "cpu" if len(allocations) < preparation_allocations else "meta"
         tensor = original_empty(allocation_shape, dtype=dtype, device=actual_device)
         allocations.append(tensor)
@@ -320,16 +328,18 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
                                 gradients = shared._launch_backward_shared_square(*([object()] * 8), 0.5, False,
                                                                                   torch.device("cpu"), shape)
                                 assert allocations[0].data_ptr() != first_arena.data_ptr()
-    assert len(allocations) == preparation_allocations + 5  # Preparation, DS, DSS, and three outputs.
+    assert len(allocations) == (4 if packed else 11)
     args = prepare.call_args.args
     expected_shapes = (shape, shape, (4, 32, n_ctx, 4), (4, 32, n_ctx, 4), (4, 32, 128, n_ctx // 32), shape[:-1])
     expected_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.uint8, torch.uint8, torch.uint8, torch.float32)
     if packed:
         arena = allocations[0]
-        assert args[4] is kv.call_args.args[5] is query.call_args.args[3] is arena
+        assert args[4] is kv.call_args.args[5] is query.call_args.args[1] is arena
         assert kv.call_args.kwargs["ARENA_N"] == query.call_args.kwargs["ARENA_N"] == n_ctx
         assert arena.dtype == torch.uint8 and arena.ndim == 1 and arena.storage_offset() == 0
-        offsets = shared._preparation_arena_layout(n_ctx)
+        offsets = (*shared._preparation_arena_layout(n_ctx)[:-1], *shared._backward_arena_layout(n_ctx))
+        expected_shapes += ((4, 32, n_ctx, n_ctx), (4, 32, n_ctx // 32, n_ctx // 32))
+        expected_dtypes += (torch.float8_e4m3fn, torch.uint8)
         assert offsets[-1] == arena.numel()
         # These test-only views model the JIT's typed pointer segments.
         private = [
@@ -366,7 +376,7 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
             byte_view[0] = byte_view[-1] = index + 1
             byte_views.append(byte_view)
             offset += tensor_bytes
-    assert offset == 34816 * n_ctx
+    assert offset == 34816 * n_ctx + (128 * n_ctx * n_ctx + 128 * (n_ctx // 32)**2 if packed else 0)
     if packed:
         assert offset == allocations[0].numel()
     for index, byte_view in enumerate(byte_views):
@@ -536,13 +546,12 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx):
         prepare_args = kernels[0].__getitem__.return_value.call_args.args
         kv_args = kernels[1].__getitem__.return_value.call_args.args
         query_args = kernels[2].__getitem__.return_value.call_args.args
-        assert prepare_args[4] is kv_args[5] is query_args[3] is allocations[6]
-        assert kv_args[10] is query_args[0] is allocations[7]
-        assert kv_args[11] is query_args[1] is allocations[8]
-        assert query_args[4] is warm[0] and kv_args[6] is warm[1] and kv_args[7] is warm[2]
+        assert prepare_args[4] is kv_args[5] is query_args[1] is allocations[4]
+        assert query_args[0] is inputs[1]
+        assert query_args[2] is warm[0] and kv_args[6] is warm[1] and kv_args[7] is warm[2]
         assert prepare_args[5:] == (n_ctx, 128, 32)
-        assert kv_args[12:] == (n_ctx, 128, 64, 64, False)
-        assert query_args[7:] == (n_ctx, 128, 128, 64, False, 128)
+        assert kv_args[10:] == (n_ctx, 128, 64, 64, False)
+        assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128)
         assert all(kernel.__getitem__.call_count == 1 for kernel in kernels)
         assert all(kernel.__getitem__.return_value.call_args.kwargs == {"stream": 101} for kernel in kernels)
         # A supported source edit invalidates each caller's hash. The live
