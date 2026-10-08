@@ -663,26 +663,27 @@ def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16,
             or not (sm_scale == 0.5 or (sm_scale == 1.3 and n == 8192 and not causal))):
         raise ValueError("Shared-square backward requires Python float sm_scale=0.5, or N8192 noncausal at 1.3")
     scale_shape = (4, 32, n, 4)
+    payload_bytes = 4 * 32 * n * 128
+    scale_bytes = 4 * 32 * n * 4
     specs = (
-        ("q_fp8", q_fp8, shape, torch.float8_e4m3fn),
-        ("k_fp8", k_fp8, shape, torch.float8_e4m3fn),
-        ("q_scale", q_scale, scale_shape, torch.uint8),
-        ("k_scale", k_scale, scale_shape, torch.uint8),
-        ("v_bf16", v_bf16, shape, torch.bfloat16),
-        ("do_bf16", do_bf16, shape, torch.bfloat16),
-        ("out_bf16", out_bf16, shape, torch.bfloat16),
-        ("lse", lse, shape[:-1], torch.float32),
+        ("q_fp8", q_fp8, shape, torch.float8_e4m3fn, payload_bytes),
+        ("k_fp8", k_fp8, shape, torch.float8_e4m3fn, payload_bytes),
+        ("q_scale", q_scale, scale_shape, torch.uint8, scale_bytes),
+        ("k_scale", k_scale, scale_shape, torch.uint8, scale_bytes),
+        ("v_bf16", v_bf16, shape, torch.bfloat16, 2 * payload_bytes),
+        ("do_bf16", do_bf16, shape, torch.bfloat16, 2 * payload_bytes),
+        ("out_bf16", out_bf16, shape, torch.bfloat16, 2 * payload_bytes),
+        ("lse", lse, shape[:-1], torch.float32, scale_bytes),
     )
     device = q_fp8.device
-    for name, tensor, expected_shape, dtype in specs:
-        if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided
-                or tuple(tensor.shape) != expected_shape or tensor.dtype != dtype or tensor.device != device
-                or not tensor.is_contiguous() or tensor.storage_offset() != 0 or tensor.is_conj() or tensor.is_neg()):
+    for name, tensor, expected_shape, dtype, expected_bytes in specs:
+        if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided or tensor.shape != expected_shape
+                or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous()
+                or tensor.storage_offset() != 0 or tensor.is_conj() or tensor.is_neg()):
             raise ValueError("Invalid shared-square tensor metadata: " + name)
         storage = tensor.untyped_storage()
         data_ptr = tensor.data_ptr()
-        if (storage.nbytes() != tensor.numel() * tensor.element_size() or data_ptr != storage.data_ptr()
-                or data_ptr % 16 != 0):
+        if (storage.nbytes() != expected_bytes or data_ptr != storage.data_ptr() or data_ptr % 16 != 0):
             raise ValueError("Whole, 16-byte-aligned storage required: " + name)
     return device, shape
 

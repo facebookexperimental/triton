@@ -374,6 +374,59 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
     assert all(gradient is allocation for gradient, allocation in zip(gradients, allocations[-3:]))
 
 
+@pytest.mark.parametrize("n_ctx", (1024, 2048, 4096, 8192))
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_shared_backward_live_metadata(n_ctx, causal):
+    """Admission rechecks each tensor even when its identity is unchanged."""
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, n_ctx, 128)
+    scale_shape = (4, 32, n_ctx, 4)
+    device = torch.device("cuda:0")
+    metadata = ((shape, torch.float8_e4m3fn, 1), (shape, torch.float8_e4m3fn, 1), (scale_shape, torch.uint8, 1),
+                (scale_shape, torch.uint8, 1), (shape, torch.bfloat16, 2), (shape, torch.bfloat16, 2),
+                (shape, torch.bfloat16, 2), (shape[:-1], torch.float32, 4))
+    tensors = []
+    for index, (tensor_shape, dtype, item_bytes) in enumerate(metadata):
+        tensor = mock.Mock(spec=torch.Tensor)
+        tensor.shape, tensor.dtype, tensor.device, tensor.layout = torch.Size(
+            tensor_shape), dtype, device, torch.strided
+        tensor.is_contiguous.return_value = True
+        tensor.storage_offset.return_value = 0
+        tensor.is_conj.return_value = tensor.is_neg.return_value = False
+        tensor.numel.side_effect = tensor.element_size.side_effect = AssertionError("redundant tensor metadata")
+        tensor.data_ptr.return_value = (index + 1) * 16
+        elements = 1
+        for extent in tensor_shape:
+            elements *= extent
+        tensor.untyped_storage.return_value.nbytes.return_value = elements * item_bytes
+        tensor.untyped_storage.return_value.data_ptr.return_value = tensor.data_ptr.return_value
+        tensors.append(tensor)
+
+    def admit():
+        return shared._check_shared_square_inputs(*tensors, 0.5, causal)
+
+    assert admit() == (device, shape)
+    for tensor in tensors:
+        storage = tensor.untyped_storage.return_value
+        for target, attribute, invalid_value in (
+            (tensor, "shape", torch.Size((*tensor.shape[:-1], tensor.shape[-1] + 1))),
+            (tensor.storage_offset, "return_value", 1),
+            (tensor.is_contiguous, "return_value", False),
+            (tensor.is_conj, "return_value", True),
+            (tensor.is_neg, "return_value", True),
+            (storage.nbytes, "return_value", storage.nbytes.return_value + 1),
+            (storage.data_ptr, "return_value", storage.data_ptr.return_value + 16),
+            (tensor.data_ptr, "return_value", tensor.data_ptr.return_value + 1),
+        ):
+            original = getattr(target, attribute)
+            setattr(target, attribute, invalid_value)
+            with pytest.raises(ValueError):
+                admit()
+            setattr(target, attribute, original)
+            assert admit() == (device, shape)
+
+
 def test_flash_attn_mxfp8_shared_backward_host_dispatch():
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
 
