@@ -28,8 +28,11 @@ class TLX_Op<string mnemonic, list<Trait> traits = []> :
 // storage_alias_spec<tmem>) must NOT be merged by CSE -- doing so collapses
 // separate reuse groups into one, tripping the "duplicate set_buffer_overlap"
 // check and corrupting size/offset computation. This matters once storage-alias
-// lowering runs after CSE (i.e. after layout propagation).
-def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", []> {
+// lowering runs after CSE (i.e. after layout propagation). Declaring an
+// allocation memory effect keeps each op distinct (not CSE-able) while still
+// allowing dead-spec elimination.
+def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec",
+                                    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Define a storage alias specification";
 
   let description = [{
