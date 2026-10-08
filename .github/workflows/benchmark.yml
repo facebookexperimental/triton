@@ -1,4 +1,4 @@
-name: TritonBench
+name: FBTriton Benchmarking
 
 on:
   workflow_dispatch:
@@ -8,6 +8,11 @@ on:
         type: string
         required: true
         default: nightly
+      benchmark_arguments:
+        description: Additional command-line arguments for each benchmark suite (both sides)
+        type: string
+        required: false
+        default: ''
       tritonbench_ref:
         description: TritonBench commit or ref used for both sides
         type: string
@@ -87,6 +92,7 @@ jobs:
       side: a
       device: ${{ inputs.side_a_device }}
       benchmarks: ${{ inputs.benchmarks }}
+      benchmark_arguments: ${{ inputs.benchmark_arguments }}
       tritonbench_ref: ${{ inputs.tritonbench_ref }}
       triton_repository: ${{ inputs.side_a_triton }}
       triton_commit: ${{ needs.build-side-a.outputs.commit }}
@@ -102,6 +108,7 @@ jobs:
       side: b
       device: ${{ inputs.side_b_device == 'same-as-a' && inputs.side_a_device || inputs.side_b_device }}
       benchmarks: ${{ inputs.benchmarks }}
+      benchmark_arguments: ${{ inputs.benchmark_arguments }}
       tritonbench_ref: ${{ inputs.tritonbench_ref }}
       triton_repository: ${{ inputs.side_b_triton || inputs.side_a_triton }}
       triton_commit: ${{ needs.build-side-b.outputs.commit }}
