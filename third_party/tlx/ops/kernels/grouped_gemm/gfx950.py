@@ -375,12 +375,10 @@ def _grouped_gemm_tile_generic(
     if HAS_K_TAIL and n_full * BLOCK_SIZE_K < gk:
         k_start = n_full * BLOCK_SIZE_K
         k_mask = offs_k < gk - k_start
-        a_t = tl.load(
-            a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]), mask=k_mask[None, :], other=0.0
-        )
-        b_t = tl.load(
-            b_ptr + (k_start + offs_k[:, None]) + offs_bn[None, :] * stride_bn, mask=k_mask[:, None], other=0.0
-        )
+        a_t = tl.load(a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]), mask=k_mask[None, :],
+                      other=0.0)
+        b_t = tl.load(b_ptr + (k_start + offs_k[:, None]) + offs_bn[None, :] * stride_bn, mask=k_mask[:, None],
+                      other=0.0)
         acc = tl.dot(a_t, b_t, acc, allow_tf32=False)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -675,8 +673,7 @@ def _pick_config(shapes, device):
                     "TILE_MODE": 1,
                     "NUM_STAGES": stages,
                 },
-            )
-        )
+            ))
 
     # c[0] = predicted throughput
     # c[1] = arithmetic intensity
@@ -748,7 +745,7 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
         previous_env = _setup_env()
         try:
             with torch.cuda.device(device):
-                grouped_gemm_kernel[(NUM_SM,)](
+                grouped_gemm_kernel[(NUM_SM, )](
                     d_a_ptrs,
                     d_b_ptrs,
                     d_c_ptrs,
@@ -771,7 +768,7 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
                     matrix_instr_nonkdim=16,
                     # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
                     # v_accvgpr moves around each mfma)
-                    llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+                    llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
                 )
         finally:
             _teardown_env(previous_env)

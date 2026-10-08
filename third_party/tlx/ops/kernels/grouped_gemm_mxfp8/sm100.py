@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.runtime import _allocation
+from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
 
 _BLOCK_SIZE_M = 128
 _BLOCK_SIZE_N = 256
@@ -903,97 +904,6 @@ def _mxfp8_grouped_gemm_kernel(  # noqa: C901
                 )
 
 
-def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
-    return scale.view(torch.uint8)
-
-
-def _swizzle_scale_to_5d(
-    scale: torch.Tensor,
-    *,
-    batch: int,
-    rows: int,
-    outer_chunks: int,
-    k_groups: int,
-    k_chunks: int,
-) -> torch.Tensor:
-    """Pack natural E8M0 scales using the cuBLAS 128x4 byte swizzle."""
-    scale = _as_uint8_scale(scale).reshape(batch, rows, k_groups)
-    padded_rows = outer_chunks * 128
-    padded_cols = k_chunks * 4
-    if rows != padded_rows or k_groups != padded_cols:
-        padded = scale.new_zeros((batch, padded_rows, padded_cols))
-        padded[:, :rows, :k_groups] = scale
-        scale = padded
-
-    # row = row_group * 32 + row_lane. Flattening the last three axes after
-    # this permutation gives dest = row_lane * 16 + row_group * 4 + col.
-    swizzled = (scale.view(batch, outer_chunks, 4, 32, k_chunks, 4).permute(0, 1, 4, 3, 2, 5).contiguous())
-    return swizzled.view(batch, outer_chunks, k_chunks, 2, 256)
-
-
-def _view_blocked_scale(
-    scale: torch.Tensor,
-    shape: tuple[int, int, int, int, int],
-) -> torch.Tensor:
-    required = 1
-    for extent in shape:
-        required *= extent
-    flat = _as_uint8_scale(scale).view(-1)
-    if flat.numel() < required:
-        raise ValueError(f"cublas_blocked scale has {flat.numel()} bytes; expected at least {required}")
-    return flat[:required].view(shape)
-
-
-def _prepare_scales(
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    *,
-    gm: int,
-    g: int,
-    n: int,
-    k: int,
-    sf_layout: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    k_groups = k // _VEC_SIZE
-    k_chunks = _cdiv(k_groups, 4)
-    m_chunks = _cdiv(gm, 128)
-    n_chunks = _cdiv(n, 128)
-
-    if sf_layout == "natural":
-        if x_scale.ndim != 2 or x_scale.shape[0] < gm or x_scale.shape[1] < k_groups:
-            raise ValueError("natural x_scale must be a 2D tensor covering [GM, K // 32]")
-        x_scale_5d = _swizzle_scale_to_5d(
-            x_scale[:gm, :k_groups],
-            batch=1,
-            rows=gm,
-            outer_chunks=m_chunks,
-            k_groups=k_groups,
-            k_chunks=k_chunks,
-        )
-        if w_scale.numel() != g * n * k_groups:
-            raise ValueError("natural w_scale must contain exactly G * N * (K // 32) scales")
-        w_scale_5d = _swizzle_scale_to_5d(
-            w_scale,
-            batch=g,
-            rows=n,
-            outer_chunks=n_chunks,
-            k_groups=k_groups,
-            k_chunks=k_chunks,
-        )
-    elif sf_layout == "cublas_blocked":
-        x_scale_5d = _view_blocked_scale(
-            x_scale,
-            (1, m_chunks, k_chunks, 2, 256),
-        )
-        w_scale_5d = _view_blocked_scale(
-            w_scale,
-            (g, n_chunks, k_chunks, 2, 256),
-        )
-    else:
-        raise ValueError(f"unsupported sf_layout {sf_layout!r}; expected 'natural' or 'cublas_blocked'")
-    return x_scale_5d, w_scale_5d
-
-
 @contextlib.contextmanager
 def _tma_descriptor_allocator(device: torch.device) -> Iterator[None]:
     """Install the descriptor workspace allocator only for this launch context."""
@@ -1065,7 +975,7 @@ def grouped_gemm_mxfp8(
         elif (out.shape != (gm, n) or out.dtype != torch.bfloat16 or out.device != device or not out.is_contiguous()):
             raise ValueError("out must be contiguous BF16 [GM, N] on x's device")
 
-        x_scale_5d, w_scale_5d = _prepare_scales(
+        x_scale_5d, w_scale_5d = prepare_scales(
             x_scale,
             w_scale,
             gm=gm,
