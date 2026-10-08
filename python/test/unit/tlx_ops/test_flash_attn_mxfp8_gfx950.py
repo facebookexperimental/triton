@@ -207,6 +207,13 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
                 eager = backward()
         assert validate.call_count == arch.call_count == 1
         check(eager)
+        if n_ctx in (1024, 2048):
+            # Compare packed preparation with the original FP8 stores using
+            # identical saved inputs before graph capture.
+            with mock.patch.object(gfx950_bwd_shared, "_PREPARATION_ARENA_BYTES", {}):
+                original_stores = backward()
+            for actual, original in zip(eager, original_stores):
+                assert torch.equal(actual.view(torch.uint8), original.view(torch.uint8))
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
@@ -752,6 +759,15 @@ def test_flash_attn_mxfp8_shared_fp8_boundary_graph(causal):
                                      num_warps=4, num_stages=2)
     equal(v8, vb)
     equal(vs, old_vs)
+    # Check every byte written by the arena's packed producer against the
+    # original quantization and reduction, including its scale metadata.
+    original_prep = (vb, do8, old_vs, dos, kdqs, delta)
+    packed_prep = tuple(torch.empty_like(tensor) for tensor in original_prep)
+    pvb, pdo8, pvs, pdos, pkdqs, pdelta = packed_prep
+    shared._prepare_fused[(32, 128)](inputs[2], do, ks, pvb, pdo8, pvs, pdos, pkdqs, saved_out, pdelta, 1024, 128, 32,
+                                     PACKED_STORES=True, num_warps=4, num_stages=2)
+    for actual, expected in zip(packed_prep, original_prep):
+        equal(actual, expected)
     prepared = shared.prepare_backward_shared_square_mxfp8(ks, do, saved_out, scale, causal=causal)
     for actual, expected in zip(prepared, (do8, dos, delta, kdqs)):
         equal(actual, expected)

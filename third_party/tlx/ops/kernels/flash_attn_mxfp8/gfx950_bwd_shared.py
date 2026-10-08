@@ -41,8 +41,46 @@ from .gfx950_quant import _decode_scale, _quantize_store, _scale_exponent
 
 
 @triton.jit
-def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr, D: tl.constexpr,
-                   BLOCK_N: tl.constexpr):
+def _store_prepared_payload_packed(payload, Y, head, group, N: tl.constexpr):
+    # Preserve the quantizer's eight contiguous converted bytes per thread.
+    # Two row groups cover the same complete 32x128 tile without an LDS exchange.
+    tl.static_assert(payload.shape[0] == 32 and payload.shape[1] == 128)
+    tl.static_assert(payload.dtype == tl.float8e4nv)
+    byte_layout: tl.constexpr = tlx.layout(shape=((16, 4, 4), (8, 2)), stride=((8, 128, 512), (1, 2048)))
+    bits = tlx.require_layout(payload.to(tl.uint8, bitcast=True), byte_layout, pin=True)
+    low8, high8 = tl.split(bits.reshape(32, 64, 2))
+    pairs = low8.to(tl.uint16) | (high8.to(tl.uint16) << 8)
+    low16, high16 = tl.split(pairs.reshape(32, 32, 2))
+    quads = low16.to(tl.uint32) | (high16.to(tl.uint32) << 16)
+    low32, high32 = tl.split(quads.reshape(32, 16, 2))
+    words = low32.to(tl.uint64) | (high32.to(tl.uint64) << 32)
+    word_layout: tl.constexpr = tlx.layout(shape=((16, 4, 4), (1, 2)), stride=((1, 16, 64), (1, 256)))
+    words = tlx.require_layout(words, word_layout, pin=True)
+    linear = tlx.require_layout(tl.arange(0, 32 * 16).reshape(32, 16), word_layout, pin=True)
+    rows = group * 32 + linear // 16
+    offsets = (head * N + group * 32) * 16 + linear
+    tl.store(Y.to(tl.pointer_type(tl.uint64)) + offsets, words, rows < N)
+
+
+@triton.jit
+def _quantize_prepared_feature_store_packed(x, Y, S, head, rows, group, N: tl.constexpr, D: tl.constexpr,
+                                            BLOCK_N: tl.constexpr):
+    # Exact feature32 recipe from _quantize_store; only payload storage changes.
+    tl.static_assert(D == 128 and BLOCK_N == 32)
+    grouped = x.reshape(BLOCK_N, D // 32, 32)
+    amax = tl.max(tl.abs(grouped), 2)
+    exponent = _scale_exponent(amax)
+    inv_scale = _decode_scale(exponent, RECIPROCAL=True)
+    scaled = grouped * inv_scale[:, :, None]
+    y = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv).reshape(BLOCK_N, D)
+    _store_prepared_payload_packed(y, Y, head, group, N)
+    sd = tl.arange(0, D // 32)
+    tl.store(S + (head * N + rows[:, None]) * (D // 32) + sd[None, :], exponent.to(tl.uint8), rows[:, None] < N)
+
+
+@triton.jit
+def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr,
+                   PACKED_STORES: tl.constexpr = False):
     tl.static_assert(D == 128 and BLOCK_N == 32)
     head = tl.program_id(1).to(tl.int64)
     group = tl.program_id(0)
@@ -51,7 +89,10 @@ def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr,
     offsets = (head * N + rows[:, None]) * D + d[None, :]
     valid = rows[:, None] < N
     v = tl.load(V + offsets, valid, 0).to(tl.float32)
-    _quantize_store(v, VB, VS, head, rows, N, D, False, BLOCK_N)
+    if PACKED_STORES:
+        _quantize_prepared_feature_store_packed(v, VB, VS, head, rows, group, N, D, BLOCK_N)
+    else:
+        _quantize_store(v, VB, VS, head, rows, N, D, False, BLOCK_N)
     do = tl.load(DO + offsets, valid, 0).to(tl.float32)
     o = tl.load(O + offsets, valid, 0).to(tl.float32)
     delta_layout: tl.constexpr = tlx.layout(shape=((16, 4, 4), (8, 2)), stride=((8, 128, 512), (1, 2048)))
@@ -62,7 +103,10 @@ def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr,
     exponent = _scale_exponent(tl.max(tl.max(tl.abs(square), 2), 0))
     inverse = _decode_scale(exponent, RECIPROCAL=True)
     payload = tl.clamp(square * inverse[None, :, None], -448., 448.).to(tl.float8e4nv)
-    tl.store(DO8 + offsets, payload.reshape(32, D), valid)
+    if PACKED_STORES:
+        _store_prepared_payload_packed(payload.reshape(32, D), DO8, head, group, N)
+    else:
+        tl.store(DO8 + offsets, payload.reshape(32, D), valid)
     feature_offsets = (head * N + rows[:, None]) * (D // 32) + tl.arange(0, D // 32)[None, :]
     tl.store(DOS + feature_offsets, tl.broadcast_to(exponent[None, :], (32, D // 32)).to(tl.uint8), valid)
     saved_offsets = (head * N + group * 32) * (D // 32) + d // 32
@@ -126,7 +170,7 @@ def _preparation_arena_segments(Arena, ARENA_N: tl.constexpr):
 @triton.jit
 def _prepare_fused_arena(V, DO, KS, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr):
     vb, do8, vs, dos, kdqs, delta = _preparation_arena_segments(Arena, N)
-    _prepare_fused(V, DO, KS, vb, do8, vs, dos, kdqs, O, delta, N, D, BLOCK_N)
+    _prepare_fused(V, DO, KS, vb, do8, vs, dos, kdqs, O, delta, N, D, BLOCK_N, PACKED_STORES=True)
 
 
 @constexpr_function
@@ -888,16 +932,15 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
             stream = driver.active.get_current_stream(device.index)
             # Pass the complete original ABI, including constexpr positions.
             prepare(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, stream=stream)
-            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, causal,
-               stream=stream)
+            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, causal, stream=stream)
             query(k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, stream=stream)
         else:
             # N stays runtime in both reduction kernels; ARENA_N only fixes
             # preparation byte offsets. Cold JIT errors propagate unchanged.
             prepare = _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4,
                                                num_stages=2, grid=(n // 32, 128), warmup=False)
-            kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale,
-                                         ARENA_N=n, D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1,
+            kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
+                                         D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1,
                                          matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
             query = _bwd_q_consume_arena.run(k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
                                              CAUSAL=causal, HEADS=128, num_warps=4, num_stages=1,
