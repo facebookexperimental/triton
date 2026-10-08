@@ -2438,8 +2438,12 @@ void init_triton_env_vars(py::module_ &m) {
   m.def("get_cache_invalidating_env_vars",
         []() -> std::map<std::string, std::string> {
           std::map<std::string, std::string> ret;
+          std::lock_guard<std::mutex> lock(triton::tools::getenv_mutex);
           for (const auto &envVar : CACHE_INVALIDATING_ENV_VARS) {
-            auto strVal = triton::tools::getStrEnv(envVar);
+            // Names come from the recognized set; copy each value under the
+            // same lock used by getStrEnv without validating the name again.
+            const char *cstr = std::getenv(envVar.c_str());
+            auto strVal = cstr ? std::string(cstr) : "";
             if (strVal.empty())
               continue;
             auto boolV = triton::tools::isEnvValueBool(strVal);

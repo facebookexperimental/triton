@@ -125,6 +125,57 @@ def test_scalarize_packed_fops_invalidates_cache(monkeypatch):
     assert enabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "true"
 
 
+@pytest.mark.parametrize("value, expected", [
+    (None, None),
+    ("", None),
+    ("ON", "true"),
+    ("TrUE", "true"),
+    ("1", "true"),
+    ("OFF", "false"),
+    ("FaLsE", "false"),
+    ("0", "false"),
+    (" true", " true"),
+    ("false ", "false "),
+    ("01", "01"),
+    ("plugin/path", "plugin/path"),
+    ("plugin/\u00e9", "plugin/\u00e9"),
+])
+def test_cache_invalidating_env_vars_live_putenv(value, expected, monkeypatch):
+    name = "TRITON_LLVM_DEBUG_ONLY"
+    monkeypatch.setenv(name, "python-view")
+    try:
+        if value is None:
+            os.unsetenv(name)
+        else:
+            os.putenv(name, value)
+        # Direct native environment updates leave Python's mapping unchanged.
+        assert os.environ[name] == "python-view"
+        values = get_cache_invalidating_env_vars()
+        if expected is None:
+            assert name not in values
+        else:
+            assert values[name] == expected
+    finally:
+        # Restore the native value before monkeypatch restores the Python view.
+        os.putenv(name, os.environ[name])
+    assert get_cache_invalidating_env_vars()[name] == "python-view"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Byte environment values require POSIX")
+@pytest.mark.parametrize("value", [b"\xff", b"prefix\x80", b"\xc3"])
+def test_cache_invalidating_env_vars_non_utf8(value, monkeypatch):
+    name = "TRITON_LLVM_DEBUG_ONLY"
+    monkeypatch.setenv(name, "restored-value")
+    try:
+        os.putenv(name.encode(), value)
+        assert os.environ[name] == "restored-value"
+        with pytest.raises(UnicodeDecodeError):
+            get_cache_invalidating_env_vars()
+    finally:
+        os.putenv(name, os.environ[name])
+    assert get_cache_invalidating_env_vars()[name] == "restored-value"
+
+
 @pytest.mark.parametrize("truthy, falsey", [("1", "0"), ("true", "false"), ("True", "False"), ("TRUE", "FALSE"),
                                             ("y", "n"), ("YES", "NO"), ("ON", "OFF")])
 def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
