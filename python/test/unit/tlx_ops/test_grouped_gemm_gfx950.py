@@ -216,6 +216,50 @@ def test_grouped_gemm(label, shape_spec):
         torch.testing.assert_close(output, a @ b, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("operand", ["a", "b"])
+def test_grouped_gemm_generic_large_row_offsets(operand):
+    from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _grouped_gemm_tile_generic
+
+    block = 128
+    # Only the final tile executes. Its row*K offsets exceed signed i32.
+    outer = 32768 + block
+    k = 65536 + 8
+    m, n = (outer, 8) if operand == "a" else (block, outer)
+    pid_m, pid_n = (outer // block - 1, 0) if operand == "a" else (0, outer // block - 1)
+    a = torch.empty((m, k), device="cuda", dtype=torch.float16)
+    b_rows = torch.empty((n, k), device="cuda", dtype=torch.float16)
+    large_tile = a[-block:] if operand == "a" else b_rows[-block:]
+    other = b_rows if operand == "a" else a
+    large_tile.zero_()
+    large_tile[:, -8:].fill_(0.25)
+    other.fill_(0.25)
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+
+    _grouped_gemm_tile_generic[(1, )](
+        pid_m,
+        pid_n,
+        a,
+        b_rows.T,
+        out,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        BLOCK_SIZE_M=block,
+        BLOCK_SIZE_N=block,
+        BLOCK_SIZE_K=64,
+        NUM_STAGES=2,
+        HAS_K_TAIL=True,
+        num_warps=8,
+    )
+    tile = out[-block:] if operand == "a" else out[:, -block:]
+    # Eight nonzero K-tail products, each 0.25 * 0.25.
+    torch.testing.assert_close(tile, torch.full_like(tile, 0.5), atol=0, rtol=0)
+
+
 @pytest.mark.skipif(len(_gfx950_device_indices()) < 2, reason="Requires two gfx950 GPUs")
 def test_grouped_gemm_uses_input_device_and_restores_current_device():
     from triton.tlx.ops import grouped_gemm

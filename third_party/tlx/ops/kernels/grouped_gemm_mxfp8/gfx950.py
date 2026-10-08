@@ -443,8 +443,9 @@ def _generic_tile(
     K_MAJOR: tl.constexpr,
 ):
     """Compiler-pipelined tile for problems too small to fill the CUs at 256x256."""
-    lm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m_size
-    nn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    # Widen row indices before multiplying by data and scale strides.
+    lm = ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m_size).to(tl.int64)
+    nn = ((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N).to(tl.int64)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
     a_ptrs = a_ptr + lm[:, None] * K + offs_k[None, :]
@@ -464,7 +465,7 @@ def _generic_tile(
         sa_ptrs += 512
         sb_ptrs += 512
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     tl.store(
         c_ptr + offs_cm[:, None] * N + offs_cn[None, :],

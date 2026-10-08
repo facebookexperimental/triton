@@ -351,8 +351,9 @@ def _grouped_gemm_tile_generic(
     axis 0, the dot consumes it with no transpose, and the K-tail is a plain
     axis-0 mask.
     """
-    offs_am = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn
+    # Widen row indices before stride multiplication, including the K-tail reloads.
+    offs_am = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M).to(tl.int64)
+    offs_bn = ((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn).to(tl.int64)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :]
@@ -381,7 +382,7 @@ def _grouped_gemm_tile_generic(
                       other=0.0)
         acc = tl.dot(a_t, b_t, acc, allow_tf32=False)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c = acc.to(c_ptr.dtype.element_ty)
     tl.store(

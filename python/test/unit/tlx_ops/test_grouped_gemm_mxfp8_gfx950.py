@@ -163,6 +163,58 @@ def test_grouped_gemm_mxfp8_gfx950_numerics(config, split_sizes, n, k):
     _assert_correct(_call_backend(inputs, config), reference)
 
 
+@pytest.mark.parametrize("operand", ["a", "b"])
+def test_grouped_gemm_mxfp8_gfx950_generic_large_row_offsets(operand):
+    from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
+    from triton.tlx.ops.kernels.grouped_gemm_mxfp8.gfx950 import _generic_tile
+
+    block = 128
+    # Only the final tile executes. Its first row*K offset is exactly 2**31.
+    outer = 32768 + block
+    k = 65536
+    m, n = (outer, 8) if operand == "a" else (block, outer)
+    pid_m, pid_n = (outer // block - 1, 0) if operand == "a" else (0, outer // block - 1)
+    x_bytes = torch.empty((m, k), device="cuda", dtype=torch.uint8)
+    w_bytes = torch.empty((1, n, k), device="cuda", dtype=torch.uint8)
+    # E4M3 1.0 is encoded as 0x38; only accessed rows need initialization.
+    if operand == "a":
+        x_bytes[-block:].fill_(0x38)
+        w_bytes.fill_(0x38)
+    else:
+        x_bytes.fill_(0x38)
+        w_bytes[:, -block:].fill_(0x38)
+    x = x_bytes.view(torch.float8_e4m3fn)
+    w = w_bytes.view(torch.float8_e4m3fn)
+    x_scale = torch.full((m, k // 32), 127, device="cuda", dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    w_scale = torch.full((1, n, k // 32), 127, device="cuda", dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    k_major = n % 128 == 0
+    xs, ws = prepare_scales(x_scale, w_scale, gm=m, g=1, n=n, k=k, sf_layout="natural", k_major_chunks=k_major)
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+
+    _generic_tile[(1, )](
+        pid_m,
+        pid_n,
+        x,
+        w,
+        out,
+        xs,
+        ws,
+        0,
+        m,
+        n,
+        k,
+        k // block,
+        BLOCK_SIZE_M=block,
+        BLOCK_SIZE_N=block,
+        BLOCK_SIZE_K=block,
+        NUM_STAGES=2,
+        K_MAJOR=k_major,
+        num_warps=8,
+    )
+    tile = out[-block:] if operand == "a" else out[:, -block:]
+    torch.testing.assert_close(tile, torch.full_like(tile, k), atol=0, rtol=0)
+
+
 @_ENGINES
 @pytest.mark.parametrize(
     ("weight_rank", "n"),
