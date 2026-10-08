@@ -1,4 +1,4 @@
-from typing import Sequence, List, TypeVar, Tuple, Callable
+from typing import Optional, Sequence, List, TypeVar, Tuple, Callable
 import math
 from triton.language.semantic import TritonSemantic
 from . import _core as ttgl
@@ -186,6 +186,20 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         ret_ty = ttgl.distributed_type(input.type.scalar, shape, input.type.layout)
         handle = self.builder.create_broadcast(input.handle, ret_ty.to_ir(self.builder))
         return self.tensor(handle, ret_ty)
+
+    def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,
+             padding_option: str, cache_modifier: str, eviction_policy: str, is_volatile: bool,
+             latency: Optional[int]) -> TensorTy:
+        result = super().load(ptr, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy,
+                              is_volatile, latency)
+        # Triton's load builds a layout-less result type; propagate the
+        # pointer's distributed layout so downstream layout-sensitive ops
+        # (broadcast, cat, fp4_to_fp, ...) see a distributed tensor.
+        if ptr.type.is_block() and isinstance(ptr.type, ttgl.distributed_type):
+            result = self.tensor(
+                result.handle, ttgl.distributed_type(result.type.scalar, result.type.get_block_shapes(),
+                                                     ptr.type.layout))
+        return result
 
     def broadcast_impl_value(self, lhs: TensorTy, rhs: TensorTy) -> TensorTy:
         lhs_ty = lhs.type
