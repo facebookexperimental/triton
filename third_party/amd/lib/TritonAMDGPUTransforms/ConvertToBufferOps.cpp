@@ -514,6 +514,10 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
   mlir::LogicalResult
   matchAndRewrite(SourceOp op, PatternRewriter &rewriter) const override {
     LDBG("Try to convert: " << op);
+    if (op.getIsVolatile()) {
+      return rewriter.notifyMatchFailure(
+          op, "volatile access cannot use buffer ops");
+    }
     Value ptr = op.getOperand(0);
 
     // BufferLoadOp cannot represent volatile semantics. Keep volatile
