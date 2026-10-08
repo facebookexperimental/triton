@@ -294,6 +294,12 @@
 - **Fix**: inside `ttg.warp_specialize`, wrap `ttg.local_store` in `scf.if %pred`, the same way descriptor loads and stores are handled. Outside WS the early return is kept, since the store there targets a pipeliner-owned buffer.
 - **Tests**: `test_autows_addmm.py::test_autows_addmm_tma_store_short_trip_count` (num_warps 4/8; 25-27% of elements wrong without the fix). `ws_single_partition_else_hstu_bwd.mlir` now gets result-less `scf.if` wrappers around its stage-0 `local_store`s, so its `CHECK-NOT: scf.if` was narrowed to `= scf.if`.
 
+### 40. Guard-channel operand-D tmem_store commit tagged with the MMA's task → MMA races the accumulator init (2026-10-07, fixed)
+- **Symptom**: Silent wrong answers in a persistent autoWS GEMM with `K == BLOCK_K` whose epilogue adds a TMA-loaded value (a 1-D bias or a 2-D residual). Whole output tiles equal the addend alone, nondeterministically. A pointer-loaded addend, `k_tiles > 1`, and OSS WS are correct. Reached from Inductor with `ENABLE_TMA_LOAD_FOR_TEMPLATE_EPILOGUE=1`.
+- **Root cause** (`WSCodePartition.cpp`, `insertAsyncComm`): `TritonCombineOps` folds `dot + addend` into `dot(a, b, addend)`, so the epilogue partition `tmem_store`s the addend into the accumulator and the MMA accumulates onto it. With the addend coming through a TMA channel, the `tmem_store` and the epilogue `tmem_load` land in different tasks, a guard channel exists, and the operand-D guard path finishes with the builder's task ids on the MMA. The generic `ProducerCommit` for the `tmem_store` -> MMA channel then inherits the MMA's task, so commit and wait are both in the gemm task and `WSLowerToken` drops them as a same-partition pair. Nothing orders the MMA after the `tmem_store`; when the MMA wins, the `tmem_store` overwrites its result.
+- **Fix**: set the builder to the channel's producer task right before emitting the `ProducerCommit`.
+- **Tests**: `ws_code_partition_operand_d_tma_init_commit.mlir` (both `tmem_store` commits in task 0, a gemm-task wait before the MMA; the commit lands in task 1 without the fix). `test_autows_addmm.py::test_autows_addmm_tma_bias_single_k_tile[64-128]` (43% mismatched without the fix).
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
