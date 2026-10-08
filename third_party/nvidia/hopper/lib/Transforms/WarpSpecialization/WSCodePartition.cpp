@@ -4474,6 +4474,13 @@ void insertAsyncComm(
             LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
             producerCommitPoint->dump();
           });
+          // The commit belongs to the producer task. Don't inherit the task
+          // ids the builder was last left with: the guard-channel operand-D
+          // path above leaves them on the consuming MMA, and a commit tagged
+          // with the consumer's task is dropped as a same-partition pair when
+          // tokens are lowered, so the MMA no longer waits for the
+          // tmem_store.
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
           builder.setInsertionPointAfter(producerCommitPoint);
           builder.setLoopScheduleInfoFromOp(producerCommitPoint);
           auto commitOp =
