@@ -1,11 +1,12 @@
-"""gfx950 MXFP8 Flash Attention forward.
+"""gfx950 MXFP8 Flash Attention.
 
-BF16 ``(Z, H, N_CTX, HEAD_DIM)`` in, BF16 out; forward only. The quantization
-is Blackwell's: Q and K are E4M3 with an E8M0 scale per 32x32 block (32 rows
+BF16 ``(Z, H, N_CTX, HEAD_DIM)`` in, BF16 out. Following the gfx950 forward
+implementation, Q and K are E4M3 with an E8M0 scale per 32x32 block (32 rows
 by 32 head elements), V is E4M3 with an E8M0 scale per 32 keys of each head
 column, and the softmax probabilities P get an E8M0 scale per 32 keys of each
 row, all by RCEIL of the block max. Q is quantized unscaled, and sm_scale *
 log2(e) multiplies the scores. Both MFMAs are scaled.
+The Blackwell public wrapper also uses 32x32 groups for Q/K.
 
 Non-causal runs a persistent two-warp-group ping-pong kernel (256x128 tiles,
 8 warps, Q/K/V staged in LDS by direct copies, K/V double buffered). It feeds
@@ -25,12 +26,31 @@ that bias, so after the normalization P is between about 4% low and 2% high,
 within the error of rounding P to E4M3 (up to 6.25%).
 ``_launch_quantized(..., fast_exp=False)`` runs the kernel with the hardware
 exp instead.
+
+Training uses the hardware-exp loop kernel and saves its base-2 logsumexp
+before P quantization. Backward uses native scaled MFMA for all five unique
+products, fixed-scale P and transpose-compatible 32x32 dS quantization.
+The general path uses separate Q and KV owners that recompute QK and dP.
+For contiguous B4/H32/D128 MHA at scale 0.5 and N=1024/2048/4096/8192,
+causal or noncausal, a specialized backward shares square32 Q/K/dO
+quantization and materializes FP8 dS for reuse by the Q owner. It also
+supports N8192 noncausal at scale 1.3. Each gradient has a single writer
+and accumulates deterministically in FP32. Whole, aligned storage is
+required. Temporary storage is 128*N*N + 128*(N//32)**2 + 34816*N bytes,
+up to 8 GiB + 280 MiB at N8192, excluding gradients and saved inputs.
+Causal calls allocate the same dense workspace. Other configurations use
+the general implementation; allocation or kernel failures are not retried.
 """
 
+import math
+
 import torch
+from torch.autograd.function import once_differentiable
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+
+from .gfx950_quant import _decode_scale, _scale_exponent
 
 _FP8 = torch.float8_e4m3fn
 _LOG2E = 1.4426950408889634
@@ -38,12 +58,12 @@ _HEAD_DIM = 128
 _NUM_CUS = 256  # gfx950 as one whole device (compute partition SPX)
 
 
-def _default_config(causal, n_ctx):
+def _default_config(causal, n_ctx, *, training=False):
     # Measured on gfx950, B=4 H=32 D=128. The ping-pong kernel is built around
     # its tiles and 8 warps and pipelines by hand (no num_stages), so it takes
     # only the non-causal lengths its block_m divides; the loop kernel takes
     # causal and the rest.
-    if not causal and n_ctx % 256 == 0:
+    if not causal and n_ctx % 256 == 0 and not training:
         return {"pingpong": True, "block_m": 256, "block_n": 128, "num_warps": 8}
     if causal:
         return {"pingpong": False, "block_m": 128, "block_n": 64, "num_warps": 4, "num_stages": 2}
@@ -52,10 +72,8 @@ def _default_config(causal, n_ctx):
 
 @triton.jit
 def _mx_scale(amax):
-    # E8M0 byte of RCEIL(amax * fp32(1 / 448)), 0 for amax 0: the rule of
-    # Blackwell's quantizers (cvt.rp.satfinite.ue8m0x2.f32) below its top byte,
-    # which BF16 data and P's block maxes stay far from.
-    return ((amax * (1.0 / 448.0)).to(tl.int32, bitcast=True) + 0x7FFFFF) >> 23
+    # Keep the result signed for the subsequent (byte - 127) exponent.
+    return _scale_exponent(amax).to(tl.int32)
 
 
 @triton.jit
@@ -66,8 +84,9 @@ def _quantize_mxfp8_kernel(X, Out, Scale, stride_xz, stride_xh, stride_xn, strid
     # and E4M3 data x / 2**(byte - 127). PACK_K writes the scales in
     # quantize_mxfp8_head's pack_k order. The outputs are read once, by the
     # attention kernel, so the stores stream past the caches.
-    pid_bh = tl.program_id(1)
-    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Tensor bases can exceed signed-i32 offsets even when one tile is small.
+    pid_bh = tl.program_id(1).to(tl.int64)
+    offs_n = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_b = tl.arange(0, HEAD_DIM // 32)
     rows = offs_n[:, None] < N_CTX
@@ -76,7 +95,7 @@ def _quantize_mxfp8_kernel(X, Out, Scale, stride_xz, stride_xh, stride_xn, strid
         offs_d[None, :] * stride_xd, mask=rows, other=0.0).to(tl.float32)
     x = tl.reshape(x, (BLOCK_N // 32, 32, HEAD_DIM // 32, 32))
     byte = _mx_scale(tl.max(tl.max(tl.abs(x), 3), 1))
-    inv = ((254 - byte) << 23).to(tl.float32, bitcast=True)
+    inv = _decode_scale(byte, RECIPROCAL=True)
     q = tl.clamp(x * inv[:, None, :, None], -448.0, 448.0).to(tl.float8e4nv)
     tl.store(Out + (pid_bh * N_CTX + offs_n[:, None]) * HEAD_DIM + offs_d[None, :], tl.reshape(q, (BLOCK_N, HEAD_DIM)),
              mask=rows, cache_modifier=".cs")
@@ -90,8 +109,8 @@ def _quantize_mxfp8_kernel(X, Out, Scale, stride_xz, stride_xh, stride_xn, strid
 
 def quantize_mxfp8_head(x, *, pack_k=False):
     """E4M3 data and E8M0 scales of a ``[Z, H, N_CTX, HEAD_DIM]`` tensor with
-    a scale per 32x32 block (32 rows by 32 head elements), as Blackwell
-    quantizes Q and K. The scales are ``[Z, H, N_CTX, HEAD_DIM // 32]``, each
+    a scale per 32x32 block (32 rows by 32 head elements). The scales are
+    ``[Z, H, N_CTX, HEAD_DIM // 32]``, each
     row holding its block's. ``pack_k`` orders K's scales as the non-causal
     kernel reads them: per 64 keys, word ``32 * b + k`` holds keys ``k`` and
     ``k + 32`` at d-block ``b`` of both head-dim halves."""
@@ -135,11 +154,12 @@ def _fa_loop(
     NUM_STAGES: tl.constexpr,
     MASK_N: tl.constexpr,
     CAUSAL_MASK: tl.constexpr,
+    NEGATIVE_SCALE: tl.constexpr,
 ):
     offs_d = tl.arange(0, HEAD_DIM)
     offs_s = tl.arange(0, SCALE_K)
     for start_n in tl.range(lo, hi, BLOCK_N, num_stages=NUM_STAGES):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
+        offs_n = start_n.to(tl.int64) + tl.arange(0, BLOCK_N)
         if MASK_N:
             n_mask = offs_n < N_CTX
             k = tl.load(k_ptr + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn, mask=n_mask[None, :],
@@ -156,26 +176,36 @@ def _fa_loop(
         vb_mask = offs_vb[None, :] < tl.cdiv(N_CTX, 32)
         vs = tl.load(vs_ptr + offs_vb[None, :] * stride_vsn + offs_d[:, None], mask=vb_mask, other=127)
         qk = tl.dot_scaled(q, q_scale, "e4m3", k, ks, "e4m3", fast_math=True)
+        if NEGATIVE_SCALE:
+            # Multiplication reverses extrema for a negative scale. Scale
+            # first, then apply the mask in logit units before reducing max.
+            qk = qk * qk_scale
         if CAUSAL_MASK or MASK_N:
             valid = offs_m[:, None] >= offs_n[None, :] if CAUSAL_MASK else offs_m[:, None] < N_CTX
             if MASK_N:
                 valid = valid & (offs_n[None, :] < N_CTX)
             if CAUSAL_MASK:
                 valid = valid & (offs_m[:, None] < N_CTX)
-            qk = tl.where(valid, qk, -1.0e6)
+            qk = tl.where(valid, qk, -float("inf") if NEGATIVE_SCALE else -1.0e6)
         # qk_scale takes the scores to log2 units: the block maxima are scaled
         # directly, each score inside the exp argument.
         qk = tl.reshape(qk, (BLOCK_M, BLOCK_N // 32, 32))
-        tmax = tl.max(qk, 2) * qk_scale
+        if NEGATIVE_SCALE:
+            tmax = tl.max(qk, 2)
+        else:
+            tmax = tl.max(qk, 2) * qk_scale
         m_ij = tl.maximum(m_i, tl.max(tmax, 1))
         # P to MXFP8: a block's max P is exp2(its max score - m).
         # The scale's exponent joins the exp argument, so P comes out divided by it.
         byte = _mx_scale(tl.math.exp2(tmax - m_ij[:, None]))
-        p = tl.math.exp2(qk * qk_scale - (m_ij[:, None] + (byte - 127).to(tl.float32))[:, :, None])
+        if NEGATIVE_SCALE:
+            p = tl.math.exp2(qk - (m_ij[:, None] + (byte - 127).to(tl.float32))[:, :, None])
+        else:
+            p = tl.math.exp2(qk * qk_scale - (m_ij[:, None] + (byte - 127).to(tl.float32))[:, :, None])
         if CAUSAL_MASK or MASK_N:
             p = tl.where(tl.reshape(valid, (BLOCK_M, BLOCK_N // 32, 32)), p, 0)
         alpha = tl.math.exp2(m_i - m_ij)
-        l_ij = tl.sum(tl.sum(p, 2) * (byte << 23).to(tl.float32, bitcast=True), 1)
+        l_ij = tl.sum(tl.sum(p, 2) * _decode_scale(byte), 1)
         acc = acc * alpha[:, None]
         p = tl.reshape(p, (BLOCK_M, BLOCK_N)).to(tl.float8e4nv)
         acc = tl.dot_scaled(p, byte.to(tl.uint8), "e4m3", v, vs, "e4m3", acc=acc, fast_math=True)
@@ -193,6 +223,7 @@ def _mxfp8_fa_fwd(
     Ks,
     Vs,
     Out,
+    LSE,
     stride_qb,
     stride_qh,
     stride_qm,
@@ -227,11 +258,13 @@ def _mxfp8_fa_fwd(
     NUM_STAGES: tl.constexpr,
     CAUSAL: tl.constexpr,
     EVEN_N: tl.constexpr,
+    SAVE_LSE: tl.constexpr,
+    NEGATIVE_SCALE: tl.constexpr,
 ):
     SCALE_K: tl.constexpr = HEAD_DIM // 32
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
+    start_m = tl.program_id(0).to(tl.int64)
+    off_hz = tl.program_id(1).to(tl.int64)
     off_z = off_hz // H
     off_h = off_hz % H
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -253,18 +286,22 @@ def _mxfp8_fa_fwd(
     if CAUSAL:
         acc, l_i, m_i = _fa_loop(acc, l_i, m_i, q, q_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, stride_kn, stride_kd,
                                  stride_ksn, stride_vn, stride_vd, stride_vsn, offs_m, 0, start_m * BLOCK_M, N_CTX,
-                                 qk_scale, HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, False, False)
+                                 qk_scale, HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, False, False,
+                                 NEGATIVE_SCALE)
         diag_hi = tl.minimum(start_m * BLOCK_M + BLOCK_M, N_CTX)
         acc, l_i, m_i = _fa_loop(acc, l_i, m_i, q, q_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, stride_kn, stride_kd,
                                  stride_ksn, stride_vn, stride_vd, stride_vsn, offs_m, start_m * BLOCK_M, diag_hi,
-                                 N_CTX, qk_scale, HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, True, True)
+                                 N_CTX, qk_scale, HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, True, True,
+                                 NEGATIVE_SCALE)
     else:
         acc, l_i, m_i = _fa_loop(acc, l_i, m_i, q, q_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, stride_kn, stride_kd,
                                  stride_ksn, stride_vn, stride_vd, stride_vsn, offs_m, 0, N_CTX, N_CTX, qk_scale,
-                                 HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, not EVEN_N, False)
+                                 HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, not EVEN_N, False, NEGATIVE_SCALE)
     out = tl.where(l_i[:, None] > 0, acc / l_i[:, None], 0)
     tl.store(Out + off_z * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
              out.to(tl.bfloat16), mask=row_mask[:, None])
+    if SAVE_LSE:
+        tl.store(LSE + off_hz * N_CTX + offs_m, m_i + tl.log2(l_i), row_mask)
 
 
 # Padded LDS layouts the AMD pipeliner picks for these FP8 dot operands with
@@ -343,7 +380,7 @@ def _p_scales(tmax, FAST_EXP: tl.constexpr):
     # of row r from lane r % 32 + 32b: pinned there, as P carries them across
     # the loop (left free they get a blocked layout and an LDS round trip).
     halves: tl.constexpr = tlx.layout(shape=((32, 2, tmax.shape[0] // 32), (1, )), stride=((2, 1, 64), (1, )))
-    return tlx.require_layout(byte.to(tl.uint8), halves), (byte << 23).to(tl.float32, bitcast=True)
+    return tlx.require_layout(byte.to(tl.uint8), halves), _decode_scale(byte)
 
 
 @triton.jit
@@ -400,8 +437,8 @@ def _block_sums(t):
 def _scale_row_sums(t0, t1, p0, p1, l_i):
     # l_i [row, block half] plus P's row sums per block half: 2**(byte - 127)
     # times the unscaled sums t0, t1 of P's two key halves.
-    f0 = (p0[1].to(tl.int32) << 23).to(tl.float32, bitcast=True)
-    f1 = (p1[1].to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    f0 = _decode_scale(p0[1])
+    f1 = _decode_scale(p1[1])
     return l_i + _block_sums(t0) * f0 + _block_sums(t1) * f1
 
 
@@ -741,13 +778,13 @@ def _mxfp8_fa_fwd_pingpong(
     c_qk = C / qk_scale
 
     k_off = offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn
-    v_off = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+    v_off = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd.to(tl.int64)
     ks_off = offs_n[:, None] * stride_ksn // 4
     q_off = offs_mm[:, None] * stride_qm + offs_hd[None, :] * stride_qd
     qs_off = offs_mm[:, None] * stride_qsm // 4
-    k_step = BLOCK_N * stride_kn
-    v_step = BLOCK_N * stride_vn
-    ks_step = BLOCK_N * stride_ksn // 4
+    k_step = BLOCK_N * tl.full((), stride_kn, tl.int64)
+    v_step = BLOCK_N * tl.full((), stride_vn, tl.int64)
+    ks_step = BLOCK_N * tl.full((), stride_ksn, tl.int64) // 4
     k_n1 = HN * stride_kn
     v_n1 = HN * stride_vn
     ks_n1 = HN * stride_ksn // 4
@@ -768,8 +805,8 @@ def _mxfp8_fa_fwd_pingpong(
     qsa = tlx.local_alloc((BLOCK_M, 1), tl.int32, 1)
 
     # First item: Q, then K(0) into buffer 1, then K(1) and V(0) into buffer 0.
-    start_m = base % n_m
-    off_hz = base // n_m
+    start_m = (base % n_m).to(tl.int64)
+    off_hz = (base // n_m).to(tl.int64)
     q_base = (off_hz // H) * stride_qb + (off_hz % H) * stride_qh + start_m * BLOCK_M * stride_qm
     qs_base = ((off_hz // H) * stride_qsb + (off_hz % H) * stride_qsh + start_m * BLOCK_M * stride_qsm) // 4
     k_ptr = K + (off_hz // H) * stride_kb + (off_hz % H) * stride_kh + k_off
@@ -787,8 +824,8 @@ def _mxfp8_fa_fwd_pingpong(
 
     for w in tl.range(0, n_mine, num_stages=1):
         item = base + w * stride_item
-        start_m = item % n_m
-        off_hz = item // n_m
+        start_m = (item % n_m).to(tl.int64)
+        off_hz = (item // n_m).to(tl.int64)
         off_z = off_hz // H
         off_h = off_hz % H
         k_ptr = K + off_z * stride_kb + off_h * stride_kh + k_off
@@ -851,8 +888,8 @@ def _mxfp8_fa_fwd_pingpong(
         # and first tiles behind the rest of this epilogue (the last item
         # re-copies its own, which nothing reads).
         nxt = tl.where(w + 1 < n_mine, item + stride_item, item)
-        n_start = nxt % n_m
-        n_hz = nxt // n_m
+        n_start = (nxt % n_m).to(tl.int64)
+        n_hz = (nxt // n_m).to(tl.int64)
         nq_base = (n_hz // H) * stride_qb + (n_hz % H) * stride_qh + n_start * BLOCK_M * stride_qm
         nqs_base = ((n_hz // H) * stride_qsb + (n_hz % H) * stride_qsh + n_start * BLOCK_M * stride_qsm) // 4
         nk_ptr = K + (n_hz // H) * stride_kb + (n_hz % H) * stride_kh + k_off
@@ -890,8 +927,8 @@ def _quantize_mxfp8_v_kernel(V, Out, Scale, stride_vb, stride_vh, stride_vn, str
     # _quantize_mxfp8_kernel's rule. TRANSPOSED writes quantize_mxfp8_v's
     # transposed layout; otherwise [key, head] data and [key block, head]
     # scales.
-    pid_bh = tl.program_id(1)
-    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    pid_bh = tl.program_id(1).to(tl.int64)
+    offs_n = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     if TRANSPOSED:
         src_n = (offs_n & ~20) | (((offs_n >> 2) & 1) << 4) | (((offs_n >> 4) & 1) << 2)
@@ -904,7 +941,7 @@ def _quantize_mxfp8_v_kernel(V, Out, Scale, stride_vb, stride_vh, stride_vn, str
     # The relabeling permutes keys within each 32-key block, so blocks keep their keys.
     x = tl.reshape(x, (BLOCK_N // 32, 32, HEAD_DIM))
     byte = _mx_scale(tl.max(tl.abs(x), 1))
-    inv = ((254 - byte) << 23).to(tl.float32, bitcast=True)
+    inv = _decode_scale(byte, RECIPROCAL=True)
     q = tl.reshape(tl.clamp(x * inv[:, None, :], -448.0, 448.0).to(tl.float8e4nv), (BLOCK_N, HEAD_DIM))
     s = byte.to(tl.uint8)
     if TRANSPOSED:
@@ -948,17 +985,23 @@ def quantize_mxfp8_v(v, *, transposed=False):
     return out, scale
 
 
-def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True):
+def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True,
+                      return_lse=False):
     """Launch on already-quantized inputs: ``q_fp8`` and ``q_scale`` from
     ``quantize_mxfp8_head(q)``, K from ``quantize_mxfp8_head(k,
     pack_k=pingpong)`` and V from ``quantize_mxfp8_v(v, transposed=pingpong)``,
     with ``pingpong`` from ``_default_config``. On the ping-pong path,
     ``fast_exp`` computes P with a linear-mantissa exp2 bit trick;
-    ``fast_exp=False`` uses the hardware exp."""
+    ``fast_exp=False`` uses the hardware exp. ``return_lse=True`` selects
+    the hardware-exp loop kernel and returns ``(output, base2_lse)``; it
+    requires unpacked K scales and non-transposed V, regardless of causal.
+    Nonpositive scales also require that loop-kernel layout."""
+    if not math.isfinite(sm_scale):
+        raise ValueError("gfx950 flash_attn_mxfp8 expects a finite sm_scale")
     batch, heads, n_ctx, _ = q_fp8.shape
     qk_scale = sm_scale * _LOG2E
     out = torch.empty(q_fp8.shape, device=q_fp8.device, dtype=torch.bfloat16)
-    cfg = _default_config(causal, n_ctx)
+    cfg = _default_config(causal, n_ctx, training=return_lse or sm_scale <= 0)
     if cfg["pingpong"]:
         # Each row's four E8M0 bytes are read as one int32, and V's scale words
         # are addressed with K's offsets.
@@ -1025,6 +1068,7 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         _mxfp8_fa_fwd_pingpong[grid](*args, **kwargs)
         return out
     grid = (triton.cdiv(n_ctx, cfg["block_m"]), batch * heads)
+    lse = torch.empty((batch, heads, n_ctx), device=q_fp8.device, dtype=torch.float32) if return_lse else None
     v_scale = v_scale.contiguous()
     _mxfp8_fa_fwd[grid](
         q_fp8,
@@ -1034,6 +1078,7 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         k_scale,
         v_scale,
         out,
+        lse,
         q_fp8.stride(0),
         q_fp8.stride(1),
         q_fp8.stride(2),
@@ -1068,11 +1113,61 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         NUM_STAGES=cfg["num_stages"],
         CAUSAL=causal,
         EVEN_N=(n_ctx % cfg["block_n"] == 0),
+        SAVE_LSE=return_lse,
+        NEGATIVE_SCALE=sm_scale < 0,
         num_warps=cfg["num_warps"],
         num_stages=1,
         llvm_fn_attrs=(("amdgpu-ieee", "false"), ),
     )
-    return out
+    return (out, lse) if return_lse else out
+
+
+class _MXFP8Attention(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, q, k, v, sm_scale, causal):
+        q_fp8, q_scale = quantize_mxfp8_head(q)
+        k_fp8, k_scale = quantize_mxfp8_head(k)
+        v_fp8, v_scale = quantize_mxfp8_v(v)
+        out, lse = _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, return_lse=True)
+        ctx.save_for_backward(q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale)
+        ctx.sm_scale = sm_scale
+        ctx.causal = causal
+        return out
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, do):
+        from .gfx950_bwd_shared import _try_launch_backward_shared_square
+
+        q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale = ctx.saved_tensors
+        # Autograd may execute after the caller changes the current device.
+        with torch.cuda.device(q.device):
+            do_bf16 = do.to(torch.bfloat16).contiguous()
+            # Saved Q/K have unpacked square32 scales; O/LSE come from the
+            # same hardware-exp training forward. Keep original BF16 V/dO for
+            # backward preparation rather than requantizing saved FP8 data.
+            shared_args = (q_fp8, k_fp8, q_scale, k_scale, v, do_bf16, out, lse, ctx.sm_scale)
+            shared_grads = _try_launch_backward_shared_square(*shared_args, causal=ctx.causal)
+            if shared_grads is not None:
+                dq, dk, dv = shared_grads
+                return dq, dk, dv, None, None
+            from .gfx950_bwd import launch_backward
+            from .gfx950_quant import quantize_backward_operands
+
+            (q_dk, q_dk_scale), (k_dq,
+                                 k_dq_scale), (v_bwd,
+                                               v_scale), (do_fp8,
+                                                          do_scale), (do_dv, do_dv_scale) = (quantize_backward_operands(
+                                                              q, k, v, do_bf16, transpose_storage=True))
+            dq = torch.empty_like(q)
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+            delta = torch.empty_like(lse)
+            launch_backward(do_fp8, do_dv, q_fp8, q_dk, k_fp8, k_dq, v_bwd, out, lse, q_scale, q_dk_scale, k_scale,
+                            k_dq_scale, v_scale, do_scale, do_dv_scale, ctx.sm_scale, do_bf16, dq, dk, dv, delta,
+                            causal=ctx.causal)
+        return dq, dk, dv, None, None
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
@@ -1080,11 +1175,17 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     del space
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
+    if not math.isfinite(sm_scale):
+        from triton.tlx.ops import InvalidInput
+
+        raise InvalidInput("gfx950 flash_attn_mxfp8 expects a finite sm_scale")
     if q.dtype != torch.bfloat16:
         raise ValueError(f"gfx950 flash_attn_mxfp8 expects bf16, got {q.dtype}")
     if q.shape[-1] != _HEAD_DIM:
         raise ValueError(f"gfx950 flash_attn_mxfp8 expects head dim {_HEAD_DIM}")
-    pingpong = _default_config(causal, q.shape[2])["pingpong"]
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
+        return _MXFP8Attention.apply(q, k, v, sm_scale, causal)
+    pingpong = _default_config(causal, q.shape[2], training=sm_scale <= 0)["pingpong"]
     q_fp8, q_scale = quantize_mxfp8_head(q)
     k_fp8, k_scale = quantize_mxfp8_head(k, pack_k=pingpong)
     v_fp8, v_scale = quantize_mxfp8_v(v, transposed=pingpong)

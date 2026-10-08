@@ -5099,6 +5099,8 @@ def _local_load_kernel(
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    RELAXED: tl.constexpr,
+    LAYOUT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -5110,7 +5112,7 @@ def _local_load_kernel(
     tlx.async_load_commit_group([tok])
     tlx.async_load_wait_group(0)
 
-    x = tlx.local_load(buf0)
+    x = tlx.local_load(buf0, layout=LAYOUT, relaxed=RELAXED)
     tl.store(output_ptr + offs, x, mask=mask)
 
 
@@ -5461,15 +5463,22 @@ def test_async_load_gather_transpose_compiles_gfx950(device):
     assert re.search(r"(buffer_load_dwordx4.*lds|global_load_lds_dwordx4)", compiled.asm["amdgcn"])
 
 
-def test_local_load_compiles_gfx950(device):
+@pytest.mark.parametrize("relaxed", [False, True])
+@pytest.mark.parametrize("with_layout", [False, True])
+def test_local_load_compiles_gfx950(device, relaxed, with_layout):
     """local_load after async_wait should compile and produce local_load in TTGIR."""
     compiled = compile_for_gfx950(
         _local_load_kernel,
         signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"},
-        constexprs={"BLOCK_SIZE": 64},
+        constexprs={
+            "BLOCK_SIZE": 64,
+            "RELAXED": relaxed,
+            "LAYOUT": tlx.layout(shape=((64, 4), ()), stride=((1, 0), ())) if with_layout else None,
+        },
     )
     ttgir = compiled.asm["ttgir"]
     assert "local_load" in ttgir
+    assert ("ttg.amdg.syncedViaAsyncWait = true" in ttgir) is relaxed
 
 
 def test_local_load_with_token_compiles_gfx950(device):

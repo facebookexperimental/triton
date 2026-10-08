@@ -26,9 +26,13 @@ SmallVector<int, 2> DecomposeScaledBlocked::getTransposeOrder(int rank) {
 LogicalResult
 DecomposeScaledBlocked::matchAndRewrite(DotScaledOp scaledDotOp,
                                         PatternRewriter &rewriter) const {
-  if (isa_and_nonnull<MmaEncodingTrait>(
+  // This fallback constructs dot operands with the result encoding as their
+  // parent. Only a blocked parent is supported here; native MMA layouts and
+  // deferred/custom layouts must retain their own lowering contract.
+  if (!isa_and_nonnull<BlockedEncodingAttr>(
           scaledDotOp.getResult().getType().getEncoding()))
-    return failure();
+    return rewriter.notifyMatchFailure(scaledDotOp,
+                                       "expected blocked result encoding");
 
   // Types
   auto computeType = getComputeType(scaledDotOp.getAElemType(),
