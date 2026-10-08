@@ -634,7 +634,11 @@ def _tlx_flash_attention_backward(native_kernel, dispatch_keys, grad_out, query,
     resolved_scale = 128**-0.5 if scale is None else scale
     error = _varlen_support_error(grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
                                   dropout_p, is_causal, resolved_scale, window_size_left, window_size_right)
-    if error is not None or not _is_varlen_performance_validated(query, key, cum_seq_q, max_q, max_k, is_causal):
+    if error is not None:
+        return native()
+    # Check bases that normalization reuses. Fresh contiguous copies have aligned bases.
+    admission_tensors = (value, logsumexp, *(tensor for tensor in (out, grad_out) if tensor.is_contiguous()))
+    if not _is_varlen_performance_validated(query, key, cum_seq_q, max_q, max_k, is_causal, tensors=admission_tensors):
         return native()
     with torch.cuda.device(query.device):
         # Offset values determine correctness as well as compact workspace
@@ -652,11 +656,11 @@ def _tlx_flash_attention_backward(native_kernel, dispatch_keys, grad_out, query,
                 return native()
         except (TypeError, ValueError):
             return native()
-        # Match ATen's normalization for expanded upstream gradients.
-        tlx_out, tlx_grad_out = out.contiguous(), grad_out.contiguous()
         if not _is_varlen_performance_validated(query, key, cum_seq_q, max_q, max_k, is_causal, q_offsets, k_offsets,
-                                                (value, tlx_out, tlx_grad_out, logsumexp)):
+                                                admission_tensors):
             return native()
+        # Match ATen's normalization after exact workload admission.
+        tlx_out, tlx_grad_out = out.contiguous(), grad_out.contiguous()
         # Preparation compiles/launches schedule kernels. Their errors must
         # propagate, just like errors from the backward kernels below.
         plan = gfx950_varlen_bwd._prepare_varlen_backward(cum_seq_q, cum_seq_k,

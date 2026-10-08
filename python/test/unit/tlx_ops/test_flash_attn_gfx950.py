@@ -102,6 +102,128 @@ def test_varlen_provider_reuses_validated_offsets(shared_offsets):
     assert validate_inputs.call_args.args[4].is_contiguous()
 
 
+@pytest.fixture
+def varlen_host_case(monkeypatch):
+    from triton.tlx import pytorch as provider
+
+    q = torch.empty((96, 2, 128), dtype=torch.bfloat16)
+    k = torch.empty((192, 2, 128), dtype=q.dtype)
+    v = torch.empty_like(k)
+    out = torch.arange(q.numel(), dtype=q.dtype).view(2, 96, 128).transpose(0, 1)
+    grad_out = torch.ones((), dtype=q.dtype).expand_as(q)
+    lse = torch.empty((2, 96), dtype=torch.float32)
+    cu_q = torch.tensor([0, 32, 96], dtype=torch.int32)
+    cu_k = torch.tensor([0, 64, 192], dtype=torch.int32)
+    signature = (tuple(q.shape), tuple(k.shape), 2, 64, 128, False)
+    monkeypatch.setattr(provider, "_PERFORMANCE_VALIDATED_VARLEN_SIGNATURES", {
+        signature: "22c09c3283a266bfb0745905f4d1a625bdbeedd59a3ece10c333921b3b163b3b",
+    })
+    return [grad_out, q, k, v, out, lse, cu_q, cu_k, 64, 128, 0.0, False, object(), object()]
+
+
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("reason", ("different_lengths", "shifted_v", "shifted_lse", "shifted_out", "shifted_grad"))
+def test_varlen_provider_rejection_avoids_normalization(monkeypatch, varlen_host_case, reason):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = varlen_host_case
+    if reason == "different_lengths":
+        args[6] = torch.tensor([0, 64, 96], dtype=torch.int32)
+    else:
+        index = {"shifted_v": 3, "shifted_lse": 5, "shifted_out": 4, "shifted_grad": 0}[reason]
+        tensor = args[index]
+        args[index] = torch.empty(tensor.numel() + 1, dtype=tensor.dtype)[1:].view_as(tensor)
+        assert args[index].is_contiguous()
+        assert args[index].data_ptr() % provider._REQUIRED_BASE_ALIGNMENT_BYTES
+
+    contiguous = torch.Tensor.contiguous
+    normalization_calls = []
+
+    def observe_contiguous(tensor, *call_args, **kwargs):
+        if tensor is args[0] or tensor is args[4]:
+            normalization_calls.append(tensor)
+        return contiguous(tensor, *call_args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", observe_contiguous)
+    native_result = object()
+    native_kernel = mock.Mock()
+    native_kernel.call_boxed.return_value = native_result
+    dispatch_keys = object()
+    kwargs = {"scale": 0.25, "window_size_left": -1, "window_size_right": -1}
+    with (
+            mock.patch.object(provider, "_varlen_support_error", return_value=None),
+            mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(gfx950_varlen_bwd, "_prepare_varlen_backward") as prepare,
+            mock.patch.object(gfx950_varlen_bwd, "fa_varlen_backward") as backward,
+    ):
+        actual = provider._tlx_flash_attention_backward(native_kernel, dispatch_keys, *args, **kwargs)
+
+    assert actual is native_result
+    assert not normalization_calls
+    prepare.assert_not_called()
+    backward.assert_not_called()
+    native_kernel.call_boxed.assert_called_once()
+    actual_args = native_kernel.call_boxed.call_args.args
+    assert actual_args[0] is dispatch_keys
+    assert all(actual is original for actual, original in zip(actual_args[1:], args, strict=True))
+    assert native_kernel.call_boxed.call_args.kwargs == kwargs
+
+
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("shifted_bases", (False, True))
+def test_varlen_provider_admission_normalizes_strided_inputs(monkeypatch, varlen_host_case, shifted_bases):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    args = varlen_host_case
+    if shifted_bases:
+        out = torch.empty(args[4].numel() + 1, dtype=args[4].dtype)[1:].view(2, 96, 128).transpose(0, 1)
+        out.copy_(args[4])
+        args[4] = out
+        args[0] = torch.tensor([0.0, 3.0], dtype=out.dtype)[1:].expand_as(out)
+        assert all(tensor.data_ptr() % provider._REQUIRED_BASE_ALIGNMENT_BYTES for tensor in (args[0], args[4]))
+    assert not args[0].is_contiguous()
+    assert not args[4].is_contiguous()
+
+    contiguous = torch.Tensor.contiguous
+    normalization_calls = []
+
+    def observe_contiguous(tensor, *call_args, **kwargs):
+        if tensor is args[0] or tensor is args[4]:
+            normalization_calls.append(tensor)
+        return contiguous(tensor, *call_args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", observe_contiguous)
+    gradients = (torch.empty_like(args[1]), torch.empty_like(args[2]), torch.empty_like(args[3]))
+    native_kernel = mock.Mock()
+    with (
+            mock.patch.object(provider, "_varlen_support_error", return_value=None),
+            mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(gfx950_varlen_bwd, "_validate_cu_seqlens_metadata"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_validate_offsets"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_build_compact_schedules"),
+            mock.patch.object(gfx950_varlen_bwd, "_validate_backward_inputs") as validate_inputs,
+            mock.patch.object(gfx950_varlen_bwd, "fa_varlen_backward", return_value=gradients) as backward,
+    ):
+        actual = provider._tlx_flash_attention_backward(native_kernel, object(), *args)
+
+    assert actual is gradients
+    native_kernel.call_boxed.assert_not_called()
+    assert len(normalization_calls) == 2
+    assert normalization_calls[0] is args[4]
+    assert normalization_calls[1] is args[0]
+    for normalized, original in zip(backward.call_args.args[3:5], (args[4], args[0]), strict=True):
+        assert normalized.is_contiguous()
+        assert normalized.data_ptr() % provider._REQUIRED_BASE_ALIGNMENT_BYTES == 0
+        assert normalized.data_ptr() != original.data_ptr()
+        torch.testing.assert_close(normalized, original)
+    assert backward.call_args.args[3] is validate_inputs.call_args.args[3]
+    assert backward.call_args.args[4] is validate_inputs.call_args.args[4]
+
+
 @contextlib.contextmanager
 def _varlen_provider():
     from triton.tlx import pytorch as provider
@@ -146,7 +268,7 @@ def test_varlen_provider_routes_fp32_backward_gfx950(monkeypatch, causal, gqa, e
     reference = torch.ops.aten._flash_attention_backward(*args, **kwargs)
     # Exercise the real operator adapter independently of which production
     # benchmark signatures have earned transparent routing.
-    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args: True, raising=False)
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: True, raising=False)
     calls = []
     original = gfx950_varlen_bwd.fa_varlen_backward
 
@@ -175,7 +297,7 @@ def test_varlen_provider_empty_sequence_uses_native_gfx950(monkeypatch):
 
     args = _varlen_aten_case(empty=True)
     reference = torch.ops.aten._flash_attention_backward(*args)
-    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args: True, raising=False)
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: True, raising=False)
 
     def unexpected(*args, **kwargs):
         raise AssertionError("unsupported empty sequence reached TLX")
@@ -201,7 +323,7 @@ def test_varlen_provider_preserves_native_fallback_gfx950(monkeypatch, reason):
     args = _varlen_aten_case(causal=reason == "causal_gqa", gqa=reason == "causal_gqa")
     kwargs = {"window_size_left": 16, "window_size_right": 16} if reason == "window" else {}
     reference = torch.ops.aten._flash_attention_backward(*args, **kwargs)
-    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args: reason != "unmeasured")
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: reason != "unmeasured")
     if reason == "deterministic":
         monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     if reason == "capture":
@@ -228,7 +350,7 @@ def test_varlen_provider_does_not_retry_kernel_failure_gfx950(monkeypatch, stage
     from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
     args = _varlen_aten_case()
-    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args: True)
+    monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args, **kwargs: True)
 
     def fail(*args, **kwargs):
         raise error_type("varlen kernel failure")
