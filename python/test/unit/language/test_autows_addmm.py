@@ -508,6 +508,75 @@ def test_autows_addmm_tma_bias_single_k_tile(K, BLOCK_N):
 
 
 @triton.jit
+def addmm_kernel_tma_bias_subtiled_ws(
+    bias_ptr,
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Persistent addmm whose epilogue is split into two subtiles, each adding
+    a bias slice read with a 1-D TMA load."""
+    SUB: tl.constexpr = BLOCK_SIZE_N // 2
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = tl.cdiv(M, BLOCK_SIZE_M) * num_pid_n
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    a_desc = tl.make_tensor_descriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = tl.make_tensor_descriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = tl.make_tensor_descriptor(C, [M, N], [N, 1], [BLOCK_SIZE_M, SUB])
+    bias_desc = tl.make_tensor_descriptor(bias_ptr, [N], [1], [SUB])
+    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, flatten=False, warp_specialize=True,
+                            data_partition_factor=1, separate_epilogue_store=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, ki * BLOCK_SIZE_K])
+            b = b_desc.load([pid_n * BLOCK_SIZE_N, ki * BLOCK_SIZE_K])
+            accumulator += tl.dot(a, b.T)
+        acc0, acc1 = tl.split(tl.permute(tl.reshape(accumulator, (BLOCK_SIZE_M, 2, SUB)), (0, 2, 1)))
+        for i in tl.static_range(2):
+            sub = acc0 if i == 0 else acc1
+            offs_n = pid_n * BLOCK_SIZE_N + i * SUB
+            bias = bias_desc.load([offs_n])[None, :]
+            c_desc.store([pid_m * BLOCK_SIZE_M, offs_n], (sub + bias.to(tl.float32)).to(tl.bfloat16))
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_autows_addmm_tma_bias_subtiled_epilogue():
+    """The epilogue reads each bias slice from a two-slot TMA ring with a
+    local_load and then hands the slot back to the load partition. The next
+    TMA load writes through the async proxy, so the release needs a proxy
+    fence; without it CTAs with three or more tiles add a later tile's bias."""
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 64
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        M, N, K = 5588, 8192, 64
+        torch.manual_seed(0)
+        bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+        num_tiles = triton.cdiv(M, BLOCK_M) * (N // BLOCK_N)
+        ref_out = (A.double() @ B.double().T + bias.double()).to(torch.bfloat16)
+        # The race is timing dependent, so run the kernel a few times.
+        for _ in range(3):
+            C = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+            kernel = addmm_kernel_tma_bias_subtiled_ws[(min(NUM_SMS,
+                                                            num_tiles), )](bias, A, B, C, M, N, K, BLOCK_M, BLOCK_N,
+                                                                           BLOCK_K, NUM_SMS, num_warps=8, num_stages=2)
+            assert "ttg.warp_specialize" in kernel.asm["ttgir"], "Expected warp specialization in IR"
+            torch.testing.assert_close(C, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@triton.jit
 def addmm_kernel_tma_store_bias_ws(
     bias_ptr,
     A,

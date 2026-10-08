@@ -29,6 +29,12 @@ namespace tt = mlir::triton;
 constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
     "ttg.atomic_broadcast_copies";
 
+// Set on a ConsumerReleaseOp whose consumers read the buffer with a generic
+// SMEM load (local_load). Token lowering fences such a release when the
+// producer refills the buffer through the async proxy (TMA).
+constexpr llvm::StringLiteral kGenericSmemReadsAttrName =
+    "ttg.ws_generic_smem_reads";
+
 // Strip every warp-specialization metadata attribute that AutoWS stamps on
 // ops/loops. Every graceful-reject path must call this so the downstream
 // tritongpu-pipeline pass sees a plain, compilable non-WS kernel; a leftover WS
