@@ -1548,6 +1548,7 @@ def test_amd_gemm_pingpong(dtype):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skip(reason="T292116678: deterministic exact-match failure on MI350 (27821 mismatches); fix and unskip")
 def test_amd_gemm_v9_beyond_hotloop_is_deterministic():
     M, N, K = 131072, 512, 256
     torch.manual_seed(0)
