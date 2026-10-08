@@ -1540,6 +1540,122 @@ def test_varlen_d128_plan_tightens_provable_schedule_capacities(q_lengths, kv_le
     amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
 
 
+def _mock_varlen_plan_device_kernels(monkeypatch):
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_validate_cu_seqlens_metadata", mock.Mock())
+    validate = mock.MagicMock()
+    build = mock.MagicMock()
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_validate_offsets", validate)
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_build_compact_schedules", build)
+    return validate.__getitem__.return_value, build.__getitem__.return_value
+
+
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths", "shared_offsets", "expected_capacities"),
+    (
+        pytest.param([17, 31, 40], [33, 129, 7], False, (7, 1, 3, 3), id="mixed"),
+        pytest.param([16, 32], [128, 256], False, (3, 3, 0, 2), id="all-full"),
+        pytest.param([1, 17], [1, 127], False, (3, 0, 2, 2), id="all-tail"),
+        pytest.param([17, 31, 40], [17, 31, 40], False, (7, 0, 3, 3), id="equal-separate"),
+        pytest.param([17, 31, 40], [17, 31, 40], True, (7, 0, 3, 3), id="equal-shared"),
+    ),
+)
+def test_varlen_d128_plan_reuses_host_metadata_host(monkeypatch, q_lengths, kv_lengths, shared_offsets,
+                                                    expected_capacities):
+    validate, build = _mock_varlen_plan_device_kernels(monkeypatch)
+    read = mock.Mock(side_effect=AssertionError("host metadata must avoid offset reads"))
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_read_cu_seqlens", read)
+    q_offsets = [0, *itertools.accumulate(q_lengths)]
+    kv_offsets = [0, *itertools.accumulate(kv_lengths)]
+    cu_q = torch.tensor(list(itertools.chain.from_iterable((offset, -1) for offset in q_offsets)),
+                        dtype=torch.int32)[::2]
+    cu_kv = cu_q if shared_offsets else torch.tensor(
+        list(itertools.chain.from_iterable((offset, -1) for offset in kv_offsets)), dtype=torch.int32)[::2]
+
+    plan = amd_fa_varlen_bwd._prepare_varlen_backward(cu_q, cu_kv,
+                                                      host_metadata=(q_offsets, q_lengths, kv_offsets, kv_lengths))
+
+    read.assert_not_called()
+    assert plan.cu_seqlens_q.is_contiguous() and plan.cu_seqlens_k.is_contiguous()
+    assert plan.cu_seqlens_q.data_ptr() != cu_q.data_ptr()
+    assert plan.cu_seqlens_k.data_ptr() != cu_kv.data_ptr()
+    assert (plan.cu_seqlens_q is plan.cu_seqlens_k) is shared_offsets
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (sum(q_lengths), sum(kv_lengths), max(q_lengths),
+                                                                      max(kv_lengths))
+    assert plan.batch == len(q_lengths)
+    assert plan.qk_offsets_equal is (q_offsets == kv_offsets)
+    assert (
+        plan.q_block_sequence.numel(),
+        plan.full_kv_block_sequence.numel(),
+        plan.tail_kv_block_sequence.numel(),
+        plan.wide_kv_start.numel(),
+    ) == expected_capacities
+    assert plan.wide_task_count == expected_capacities[-1]
+    validate.assert_called_once()
+    build.assert_called_once()
+    assert validate.call_args.args[:2] == (plan.cu_seqlens_q, plan.cu_seqlens_k)
+    assert build.call_args.args[:2] == (plan.cu_seqlens_q, plan.cu_seqlens_k)
+    cu_q.zero_()
+    cu_kv.zero_()
+    assert plan.cu_seqlens_q.tolist() == q_offsets
+    assert plan.cu_seqlens_k.tolist() == kv_offsets
+
+
+@pytest.mark.parametrize("shared_offsets", (False, True))
+def test_varlen_d128_plan_reads_owned_offsets_host(monkeypatch, shared_offsets):
+    _mock_varlen_plan_device_kernels(monkeypatch)
+    offsets = [0, 17, 48]
+    cu_q = torch.tensor([0, -1, 17, -1, 48, -1], dtype=torch.int32)[::2]
+    cu_kv = cu_q if shared_offsets else cu_q.clone()
+    read = mock.Mock(wraps=amd_fa_varlen_bwd._read_cu_seqlens)
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_read_cu_seqlens", read)
+
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    assert read.call_count == (1 if shared_offsets else 2)
+    assert read.call_args_list[0].args[1] is plan.cu_seqlens_q
+    if not shared_offsets:
+        assert read.call_args_list[1].args[1] is plan.cu_seqlens_k
+    assert plan.cu_seqlens_q.is_contiguous() and plan.cu_seqlens_k.is_contiguous()
+    assert plan.cu_seqlens_q.data_ptr() != cu_q.data_ptr()
+    assert plan.cu_seqlens_k.data_ptr() != cu_kv.data_ptr()
+    assert (plan.cu_seqlens_q is plan.cu_seqlens_k) is shared_offsets
+    assert plan.qk_offsets_equal is True
+    cu_q.zero_()
+    cu_kv.zero_()
+    assert plan.cu_seqlens_q.tolist() == plan.cu_seqlens_k.tolist() == offsets
+
+
+def test_varlen_d128_plan_host_metadata_compact_prefix_host(monkeypatch):
+    _mock_varlen_plan_device_kernels(monkeypatch)
+    read = mock.Mock(side_effect=AssertionError("host metadata must avoid offset reads"))
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_read_cu_seqlens", read)
+    q_offsets = [0, *itertools.accumulate(_H12_DS_Q_LENGTHS)]
+    kv_offsets = [0, *itertools.accumulate(_H12_DS_KV_LENGTHS)]
+    cu_q = torch.tensor(q_offsets, dtype=torch.int32)
+    cu_kv = torch.tensor(kv_offsets, dtype=torch.int32)
+
+    plan = amd_fa_varlen_bwd._prepare_varlen_backward(
+        cu_q, cu_kv, host_metadata=(q_offsets, _H12_DS_Q_LENGTHS, kv_offsets, _H12_DS_KV_LENGTHS))
+
+    expected = _packed_ds_offsets(_H12_DS_Q_LENGTHS, _H12_DS_KV_LENGTHS)
+    assert plan.packed_ds_prefix.dtype is torch.int64
+    assert plan.packed_ds_prefix.tolist() == expected
+    assert plan.packed_ds_head_elements == expected[-1]
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (50754, 100696, 5662, 10414)
+    assert plan.wide_task_count == sum((length + 255) // 256 for length in _H12_DS_KV_LENGTHS)
+    read.assert_not_called()
+
+
+@pytest.mark.parametrize("token_metadata", ((17, None, None, None), (17, 33, 17, 33)))
+def test_varlen_d128_plan_rejects_combined_host_metadata_host(monkeypatch, token_metadata):
+    _mock_varlen_plan_device_kernels(monkeypatch)
+    cu_q = torch.tensor([0, 17], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 33], dtype=torch.int32)
+    with pytest.raises(ValueError, match="host offset metadata cannot be combined with token metadata"):
+        amd_fa_varlen_bwd._prepare_varlen_backward(cu_q, cu_kv, *token_metadata,
+                                                   host_metadata=([0, 17], [17], [0, 33], [33]))
+
+
 def _make_seeded_extend_attention_lengths(batch, max_context, seed):
     generator = torch.Generator()
     generator.manual_seed(seed)

@@ -53,6 +53,55 @@ def test_varlen_provider_admission_requires_measured_workload(monkeypatch, case)
     assert admitted is (case == "measured")
 
 
+@pytest.mark.usefixtures("flash_attention_registry")
+@pytest.mark.parametrize("shared_offsets", (False, True))
+def test_varlen_provider_reuses_validated_offsets(shared_offsets):
+    from triton.tlx import pytorch as provider
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    q = torch.empty((96, 2, 128), dtype=torch.bfloat16)
+    k = q if shared_offsets else torch.empty((192, 2, 128), dtype=q.dtype)
+    v, out = torch.empty_like(k), torch.empty_like(q)
+    grad_out = torch.ones((), dtype=q.dtype).expand_as(q)
+    lse = torch.empty((2, 96), dtype=torch.float32)
+    cu_q = torch.tensor([0, 32, 96], dtype=torch.int32)
+    cu_k = cu_q if shared_offsets else torch.tensor([0, 64, 192], dtype=torch.int32)
+    gradients = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
+    native_kernel = mock.Mock()
+
+    # Run host planning with CPU tensors and replace device-only operations.
+    with (
+            mock.patch.object(provider, "_varlen_support_error", return_value=None),
+            mock.patch.object(provider, "_is_varlen_performance_validated", return_value=True),
+            mock.patch.object(torch.cuda, "device", return_value=contextlib.nullcontext()),
+            mock.patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            mock.patch.object(gfx950_varlen_bwd, "_validate_cu_seqlens_metadata"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_validate_offsets"),
+            mock.patch.object(gfx950_varlen_bwd, "_varlen_build_compact_schedules"),
+            mock.patch.object(gfx950_varlen_bwd, "_read_cu_seqlens", wraps=gfx950_varlen_bwd._read_cu_seqlens) as reads,
+            mock.patch.object(gfx950_varlen_bwd, "_validate_backward_inputs") as validate_inputs,
+            mock.patch.object(gfx950_varlen_bwd, "fa_varlen_backward", return_value=gradients),
+    ):
+        actual = provider._tlx_flash_attention_backward(native_kernel, object(), grad_out, q, k, v, out, lse, cu_q,
+                                                        cu_k, 128, 256, 0.0, False, None, None)
+
+    assert actual is gradients
+    native_kernel.call_boxed.assert_not_called()
+    assert reads.call_count == (1 if shared_offsets else 2)
+    assert reads.call_args_list[0].args == ("cum_seq_q", cu_q)
+    if not shared_offsets:
+        assert reads.call_args_list[1].args == ("cum_seq_k", cu_k)
+    plan = validate_inputs.call_args.args[6]
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (96, 96 if shared_offsets else 192, 64,
+                                                                      64 if shared_offsets else 128)
+    assert plan.qk_offsets_equal is shared_offsets
+    for planned, original in ((plan.cu_seqlens_q, cu_q), (plan.cu_seqlens_k, cu_k)):
+        assert planned.data_ptr() != original.data_ptr()
+        torch.testing.assert_close(planned, original)
+    assert (plan.cu_seqlens_q is plan.cu_seqlens_k) is shared_offsets
+    assert validate_inputs.call_args.args[4].is_contiguous()
+
+
 @contextlib.contextmanager
 def _varlen_provider():
     from triton.tlx import pytorch as provider
@@ -106,9 +155,13 @@ def test_varlen_provider_routes_fp32_backward_gfx950(monkeypatch, causal, gqa, e
         return original(*args, **kwargs)
 
     monkeypatch.setattr(gfx950_varlen_bwd, "fa_varlen_backward", observe)
-    with _varlen_provider():
+    with (
+            mock.patch.object(gfx950_varlen_bwd, "_read_cu_seqlens", wraps=gfx950_varlen_bwd._read_cu_seqlens) as reads,
+            _varlen_provider(),
+    ):
         actual = torch.ops.aten._flash_attention_backward(*args, **kwargs)
     assert calls == [True]
+    assert reads.call_count == (1 if causal else 2)
     for result, expected in zip(actual, reference, strict=True):
         error = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(expected.float())
         assert error.item() < 1e-2
@@ -159,7 +212,7 @@ def test_varlen_provider_preserves_native_fallback_gfx950(monkeypatch, reason):
     def unexpected(*args, **kwargs):
         raise AssertionError("unsupported call prepared a TLX plan")
 
-    monkeypatch.setattr(gfx950_varlen_bwd, "prepare_varlen_backward", unexpected)
+    monkeypatch.setattr(gfx950_varlen_bwd, "_prepare_varlen_backward", unexpected)
     with _varlen_provider():
         actual = torch.ops.aten._flash_attention_backward(*args, **kwargs)
     for result, expected in zip(actual, reference, strict=True):
@@ -180,7 +233,7 @@ def test_varlen_provider_does_not_retry_kernel_failure_gfx950(monkeypatch, stage
     def fail(*args, **kwargs):
         raise error_type("varlen kernel failure")
 
-    name = "fa_varlen_backward" if stage == "backward" else "prepare_varlen_backward"
+    name = "fa_varlen_backward" if stage == "backward" else "_prepare_varlen_backward"
     monkeypatch.setattr(gfx950_varlen_bwd, name, fail)
     with _varlen_provider(), pytest.raises(error_type, match="varlen kernel failure"):
         torch.ops.aten._flash_attention_backward(*args)

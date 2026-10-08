@@ -659,7 +659,8 @@ def _tlx_flash_attention_backward(native_kernel, dispatch_keys, grad_out, query,
             return native()
         # Preparation compiles/launches schedule kernels. Their errors must
         # propagate, just like errors from the backward kernels below.
-        plan = gfx950_varlen_bwd.prepare_varlen_backward(cum_seq_q, cum_seq_k)
+        plan = gfx950_varlen_bwd._prepare_varlen_backward(cum_seq_q, cum_seq_k,
+                                                          host_metadata=(q_offsets, q_lengths, k_offsets, k_lengths))
         try:
             gfx950_varlen_bwd._validate_backward_inputs(query, key, value, tlx_out, tlx_grad_out, logsumexp, plan,
                                                         resolved_scale, is_causal, dq_atomic_fp32=True)

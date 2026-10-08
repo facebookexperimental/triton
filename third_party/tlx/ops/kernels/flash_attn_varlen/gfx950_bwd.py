@@ -262,6 +262,23 @@ def prepare_varlen_backward(
     storage. The metadata-supplied path requires contiguous offsets so its
     validation and schedule kernels can address them directly.
     """
+    return _prepare_varlen_backward(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, max_seqlen_q, max_seqlen_k)
+
+
+def _prepare_varlen_backward(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    total_q: int | None = None,
+    total_kv: int | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    *,
+    host_metadata: tuple[list[int], list[int], list[int], list[int]] | None = None,
+) -> VarlenBackwardPlan:
+    """Reuse validated host offsets and lengths when available.
+
+    Host metadata must match the supplied offset tensors.
+    """
     if cu_seqlens_q.device != cu_seqlens_k.device:
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be on the same device")
     _validate_cu_seqlens_metadata("cu_seqlens_q", cu_seqlens_q)
@@ -271,16 +288,21 @@ def prepare_varlen_backward(
 
     metadata = (total_q, total_kv, max_seqlen_q, max_seqlen_k)
     legacy_path = all(value is None for value in metadata)
+    if host_metadata is not None and not legacy_path:
+        raise ValueError("host offset metadata cannot be combined with token metadata")
     if legacy_path:
         shared_offsets = cu_seqlens_q is cu_seqlens_k
         cu_seqlens_q = cu_seqlens_q.detach().clone(memory_format=torch.contiguous_format)
         cu_seqlens_k = (cu_seqlens_q if shared_offsets else cu_seqlens_k.detach().clone(
             memory_format=torch.contiguous_format))
-        q_offsets, q_lengths = _read_cu_seqlens("cu_seqlens_q", cu_seqlens_q)
-        if shared_offsets:
-            k_offsets, k_lengths = q_offsets, q_lengths
+        if host_metadata is not None:
+            q_offsets, q_lengths, k_offsets, k_lengths = host_metadata
         else:
-            k_offsets, k_lengths = _read_cu_seqlens("cu_seqlens_k", cu_seqlens_k)
+            q_offsets, q_lengths = _read_cu_seqlens("cu_seqlens_q", cu_seqlens_q)
+            if shared_offsets:
+                k_offsets, k_lengths = q_offsets, q_lengths
+            else:
+                k_offsets, k_lengths = _read_cu_seqlens("cu_seqlens_k", cu_seqlens_k)
         total_q = q_offsets[-1]
         total_kv = k_offsets[-1]
         max_seqlen_q = max(q_lengths)
