@@ -90,7 +90,7 @@ def _varlen_aten_case(*, causal=False, gqa=False, empty=False, expanded_grad=Fal
                          ((False, False, False), (False, True, False), (True, False, True)))
 def test_varlen_provider_routes_fp32_backward_gfx950(monkeypatch, causal, gqa, expanded_grad):
     from triton.tlx import pytorch as provider
-    from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
     args = _varlen_aten_case(causal=causal, gqa=gqa, expanded_grad=expanded_grad)
     kwargs = {"window_size_left": -1, "window_size_right": 0 if causal else -1}
@@ -118,7 +118,7 @@ def test_varlen_provider_routes_fp32_backward_gfx950(monkeypatch, causal, gqa, e
 @pytest.mark.usefixtures("flash_attention_registry")
 def test_varlen_provider_empty_sequence_uses_native_gfx950(monkeypatch):
     from triton.tlx import pytorch as provider
-    from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
     args = _varlen_aten_case(empty=True)
     reference = torch.ops.aten._flash_attention_backward(*args)
@@ -143,7 +143,7 @@ def test_varlen_provider_empty_sequence_uses_native_gfx950(monkeypatch):
 @pytest.mark.parametrize("reason", ("unmeasured", "deterministic", "causal_gqa", "window", "capture"))
 def test_varlen_provider_preserves_native_fallback_gfx950(monkeypatch, reason):
     from triton.tlx import pytorch as provider
-    from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
     args = _varlen_aten_case(causal=reason == "causal_gqa", gqa=reason == "causal_gqa")
     kwargs = {"window_size_left": 16, "window_size_right": 16} if reason == "window" else {}
@@ -172,7 +172,7 @@ def test_varlen_provider_preserves_native_fallback_gfx950(monkeypatch, reason):
 @pytest.mark.parametrize("error_type", (RuntimeError, TypeError, ValueError))
 def test_varlen_provider_does_not_retry_kernel_failure_gfx950(monkeypatch, stage, error_type):
     from triton.tlx import pytorch as provider
-    from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
     args = _varlen_aten_case()
     monkeypatch.setattr(provider, "_is_varlen_performance_validated", lambda *args: True)

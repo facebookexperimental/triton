@@ -232,14 +232,14 @@ CATALOG: tuple[OpSpec, ...] = (
         op="prepare_flash_attn_varlen_backward",
         arch="gfx950",
         variant="host_validated",
-        impl="triton.tlx.ops.kernels.flash_attn.gfx950_varlen_bwd:prepare_varlen_backward",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:prepare_varlen_backward",
         dtypes=frozenset({"int32"}),
     ),
     OpSpec(
         op="flash_attn_varlen_backward",
         arch="gfx950",
         variant="prepared",
-        impl="triton.tlx.ops.kernels.flash_attn.gfx950_varlen_bwd:fa_varlen_backward",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:fa_varlen_backward",
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128,
         # Explicit first-order gradients; differentiating this op is unsupported.

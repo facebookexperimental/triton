@@ -20,7 +20,7 @@ from unittest import mock
 import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd as amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as amd_fa_varlen_bwd
 from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _select_d64_dispatch,
@@ -3496,7 +3496,7 @@ def test_public_varlen_bwd_prepared_capture_replay_gfx950():
 
 def test_varlen_bwd_tutorial_compatibility_shim():
     from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd as tutorial_bwd
-    from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
     for name in (
             "VarlenBackwardPlan",

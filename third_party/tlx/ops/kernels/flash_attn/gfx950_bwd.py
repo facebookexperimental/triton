@@ -33,7 +33,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from .gfx950_varlen_bwd import (
+from ..flash_attn_varlen.gfx950_bwd import (
     _bm32_load_dq_k,
     _bm32_load_score_prefix,
     _bm32_load_stat_half,

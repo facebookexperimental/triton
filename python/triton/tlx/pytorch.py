@@ -17,7 +17,8 @@ from typing import Any
 
 import torch
 
-from triton.tlx.ops.kernels.flash_attn import gfx950_bwd, gfx950_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
 
 PROVIDER_NAME = "TLX_GFX950_BWD"
 _D64_ROUTE = "d64"

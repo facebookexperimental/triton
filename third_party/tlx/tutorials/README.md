@@ -107,7 +107,7 @@ correctness/performance driver.
 ## Packed variable-length FlashAttention backward
 
 The packaged implementation in
-[`../ops/kernels/flash_attn/gfx950_varlen_bwd.py`](../ops/kernels/flash_attn/gfx950_varlen_bwd.py)
+[`../ops/kernels/flash_attn_varlen/gfx950_bwd.py`](../ops/kernels/flash_attn_varlen/gfx950_bwd.py)
 exposes packed BF16 THD backward with head dimension 128 on gfx950 through
 `triton.tlx.ops`. Non-causal mode supports MHA/GQA with `Hq % Hkv == 0`;
 causal mode supports MHA self-attention with identical Q/KV cumulative offsets

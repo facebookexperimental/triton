@@ -40,7 +40,7 @@ from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
 )
 import math
-from triton.tlx.ops.kernels.flash_attn import gfx950_varlen_bwd as amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as amd_fa_varlen_bwd
 from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _D64DQLaunch,
