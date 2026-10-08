@@ -12,11 +12,11 @@ on:
         type: string
         required: true
       benchmarks:
-        description: Comma-separated TritonBench suites
+        description: Comma-separated benchmark names under benchmarks/<name>/run.py
         type: string
         required: true
       benchmark_arguments:
-        description: Additional command-line arguments for each benchmark suite
+        description: Command-line arguments passed to each benchmark runner
         type: string
         required: false
         default: ''
@@ -79,11 +79,11 @@ jobs:
           ref: ${{ inputs.tritonbench_ref }}
           submodules: recursive
 
-      - name: Checkout benchmark runner
+      - name: Checkout benchmark runners
         uses: actions/checkout@v6
         with:
           path: benchmark-runner
-          sparse-checkout: benchmarks/tritonbench
+          sparse-checkout: benchmarks
 
       # TritonBench uses the source checkout for commit metadata, not building.
       - name: Checkout benchmarked Triton commit
@@ -191,10 +191,32 @@ jobs:
           set -euo pipefail
           # shellcheck source=/dev/null
           . "${SETUP_SCRIPT}"
-          python "${GITHUB_WORKSPACE}/benchmark-runner/benchmarks/tritonbench/run.py" \
-            --benchmarks "${BENCHMARKS}" \
-            --benchmark-arguments="${BENCHMARK_ARGUMENTS}" \
-            --tritonbench-dir "${GITHUB_WORKSPACE}"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import shlex
+          import subprocess
+          import sys
+
+          benchmarks = [name.strip() for name in os.environ["BENCHMARKS"].split(",")]
+          if not any(benchmarks):
+              sys.exit("No benchmarks specified")
+          arguments = shlex.split(os.environ["BENCHMARK_ARGUMENTS"])
+          benchmark_root = Path(os.environ["GITHUB_WORKSPACE"]) / "benchmark-runner" / "benchmarks"
+          status = 0
+          for name in benchmarks:
+              runner = benchmark_root / name / "run.py"
+              if not re.fullmatch(r"[a-zA-Z0-9_]+", name) or not runner.is_file():
+                  print(f"Unknown benchmark: {name}", file=sys.stderr)
+                  status = 1
+                  continue
+              print(f"Running benchmark: {name}", flush=True)
+              result = subprocess.run([sys.executable, str(runner), *arguments])
+              if result.returncode:
+                  status = 1
+          sys.exit(status)
+          PY
 
       - name: Collect results
         if: always()

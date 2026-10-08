@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       benchmarks:
-        description: Comma-separated TritonBench suites to run
+        description: Comma-separated benchmark names under benchmarks/<name>/run.py
         type: string
         required: true
-        default: nightly
+        default: tritonbench
       benchmark_arguments:
-        description: Additional command-line arguments for each benchmark suite (both sides)
+        description: Command-line arguments passed to each benchmark runner (both sides)
         type: string
         required: false
         default: ''
