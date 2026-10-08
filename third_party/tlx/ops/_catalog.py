@@ -30,6 +30,7 @@ class OpSpec:
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
     supports_backward: bool = False
+    default_space: str = "heuristic"  # used when the caller passes space=None
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -50,6 +51,8 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
+        # The full space is only 8 configs (seconds to tune) and beats the heuristic on tall shapes.
+        default_space="full",
     ),
     OpSpec(
         op="mm",
