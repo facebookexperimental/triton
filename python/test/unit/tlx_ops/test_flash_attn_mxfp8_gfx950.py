@@ -636,7 +636,9 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         inputs[:4] = [
             torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="meta", dtype=torch.uint8), None, None, None
         ]
-    jits = (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena)
+    inline_prepare = qk_format and n_ctx == 1024
+    jits = ((shared._bwd_kv_owner_inline_arena, shared._bwd_q_consume_arena) if inline_prepare else
+            (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     # Populate real transitive source hashes without compiling or using a GPU.
     assert all(jit.cache_key for jit in jits)
     kernels = [mock.MagicMock(spec=shared.CompiledKernel) for _ in jits]
@@ -664,35 +666,47 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         warm = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs)
         assert all(first is not second for first, second in zip(cold, warm))
-        prepare_args = kernels[0].__getitem__.return_value.call_args.args
-        kv_args = kernels[1].__getitem__.return_value.call_args.args
-        query_args = kernels[2].__getitem__.return_value.call_args.args
-        assert prepare_args[4] is kv_args[5] is query_args[1] is allocations[4]
+        kv_index = 0 if inline_prepare else 1
+        kv_args = kernels[kv_index].__getitem__.return_value.call_args.args
+        query_args = kernels[-1].__getitem__.return_value.call_args.args
+        assert kv_args[5] is query_args[1] is allocations[4]
         assert query_args[0] is inputs[0 if qk_format else 1]
         assert query_args[2] is warm[0] and kv_args[6] is warm[1] and kv_args[7] is warm[2]
-        assert prepare_args[5:] == (n_ctx, 128, 32, qk_format)
-        assert kv_args[10:] == (n_ctx, 128, 64, 64, False, qk_format)
         assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128, qk_format)
-        actual_tensors = sum(
-            isinstance(arg, torch.Tensor) for args in (prepare_args, kv_args, query_args) for arg in args)
-        assert actual_tensors == (13 if qk_format else 16)
         assert kv_args[0] is inputs[0]
-        if qk_format:
-            assert kv_args[1:4] == (None, None, None)
-            assert prepare_args[2] is query_args[0] is inputs[0]
+        if inline_prepare:
+            assert all(actual is expected for actual, expected in zip(kv_args[1:5], inputs[4:8]))
+            assert kv_args[10:] == (n_ctx, 128, 64, 64)
+            arguments = (kv_args, query_args)
+            expected_tensors = 11
+        else:
+            prepare_args = kernels[0].__getitem__.return_value.call_args.args
+            assert prepare_args[4] is kv_args[5]
+            assert prepare_args[5:] == (n_ctx, 128, 32, qk_format)
+            assert kv_args[10:] == (n_ctx, 128, 64, 64, False, qk_format)
+            arguments = (prepare_args, kv_args, query_args)
+            expected_tensors = 13 if qk_format else 16
+            if qk_format:
+                assert kv_args[1:4] == (None, None, None)
+                assert prepare_args[2] is query_args[0] is inputs[0]
+        assert sum(isinstance(arg, torch.Tensor) for args in arguments for arg in args) == expected_tensors
         assert all(kernel.__getitem__.call_count == 1 for kernel in kernels)
         assert all(kernel.__getitem__.return_value.call_args.kwargs == {"stream": 101} for kernel in kernels)
         # A supported source edit invalidates each caller's hash. The live
         # real JIT objects must reject a retained compiled plan afterward.
-        with mock.patch.object(jits[1], "hash", None):
-            assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is None
-        kernels[1].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
+        with mock.patch.object(jits[kv_index], "hash", None):
+            if inline_prepare:
+                assert shared._inline_arena_launch_plan(device, n_ctx, 0.5) is None
+            else:
+                assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is None
+        kernels[kv_index].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
         with pytest.raises(RuntimeError, match="compiled launch failed"):
             shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs), "compiled launch errors must not retry JIT"
 
 
-def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream():
+@pytest.mark.parametrize("qk_format", (False, True))
+def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(qk_format):
     """Use actual public compiled runners with CPU-modeled launch handles."""
     from contextlib import ExitStack
     from types import SimpleNamespace
@@ -702,7 +716,12 @@ def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream():
     shape = (4, 32, 1024, 128)
     device = torch.device("cuda:2")
     inputs = [torch.empty(shape, device="meta") for _ in range(8)]
-    jits = (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena)
+    if qk_format:
+        inputs[:4] = [
+            torch.empty(shared._saved_qk_arena_layout(1024)[-1], device="meta", dtype=torch.uint8), None, None, None
+        ]
+    jits = ((shared._bwd_kv_owner_inline_arena, shared._bwd_q_consume_arena) if qk_format else
+            (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     kernels = []
     for jit in jits:
         kernel = shared.CompiledKernel.__new__(shared.CompiledKernel)
@@ -730,19 +749,21 @@ def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream():
         for jit, kernel in zip(jits, kernels):
             stack.enter_context(mock.patch.object(jit, "device_caches", {2: ({"compiled-key": kernel}, )}))
             stack.enter_context(mock.patch.object(jit, "run", return_value=kernel))
-        shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
-        first = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+        shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+        first = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         active.stream = 202
-        second = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+        second = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         assert active.get_current_stream.call_count == 2
         assert all(kernel._run.call_args_list[0].args[3] == 101 for kernel in kernels)
         assert all(kernel._run.call_args_list[1].args[3] == 202 for kernel in kernels)
         assert all(a is not b for a, b in zip(first, second))
-        assert kernels[0]._run.call_args_list[0].args[13] is not kernels[0]._run.call_args_list[1].args[13]
-        kernels[1]._run.side_effect = RuntimeError("modeled runner failure")
+        arena_index = 14 if qk_format else 13
+        assert kernels[0]._run.call_args_list[0].args[arena_index] is not kernels[0]._run.call_args_list[1].args[
+            arena_index]
+        kernels[0 if qk_format else 1]._run.side_effect = RuntimeError("modeled runner failure")
         with pytest.raises(RuntimeError, match="modeled runner failure"):
-            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
-        assert kernels[2]._run.call_count == 2, "a failed producer must not launch its consumer"
+            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+        assert kernels[-1]._run.call_count == 2, "a failed producer must not launch its consumer"
 
 
 def test_flash_attn_mxfp8_shared_backward_compiled_runner_current_stream():
@@ -999,6 +1020,108 @@ def _shared_fp8_boundary_fixture(causal):
     v8, vs = quantize_mxfp8(v, transpose_for_reduction=False)
     args = (q8, k8, v8, qs, ks, vs, do, saved_out, lse, .5)
     return inputs, out, args
+
+
+@pytest.mark.parametrize("fixture", ("random", "boundary", "extreme"))
+def test_flash_attn_mxfp8_shared_inline_prepare_matches_fused(fixture):
+    """Compare inline preparation bytes with the unchanged fused producer."""
+    import triton
+    import triton.language as tl
+    import triton.language.extra.tlx as tlx
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+    from triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950_bwd_shared import (
+        _inline_prepare_do32,
+        _inline_prepare_v64,
+        _store_inline_kdqs,
+    )
+
+    @triton.jit
+    def inline_prepare_probe(V, DO, O, KS, VB, DO8, VS, DOS, KDQS, Delta, N: tl.constexpr, D: tl.constexpr):
+        tl.static_assert(N == 64 and D == 128)
+        head = tl.program_id(0).to(tl.int64)
+        base = head * N * D
+        rows = tl.arange(0, 64)
+        features = tl.arange(0, D)
+        groups = tl.arange(0, 4)
+        value, vscale = _inline_prepare_v64(V, base, rows, D)
+        do0, delta0, word0 = _inline_prepare_do32(DO, O, base, 0, D)
+        do1, delta1, word1 = _inline_prepare_do32(DO, O, base, 32, D)
+        offsets = base + rows[:, None] * D + features[None, :]
+        tl.store(VB + offsets, tlx.release_layout(value))
+        tl.store(DO8 + offsets, tl.cat(do0, do1, dim=0))
+        scale_offsets = (head * N + rows[:, None]) * 4 + groups[None, :]
+        tl.store(VS + scale_offsets, tlx.release_layout(vscale).to(tl.uint8))
+        scale0 = tl.broadcast_to(((word0 >> (groups * 8)) & 255)[None, :], (32, 4))
+        scale1 = tl.broadcast_to(((word1 >> (groups * 8)) & 255)[None, :], (32, 4))
+        tl.store(DOS + scale_offsets, tl.cat(scale0, scale1, dim=0).to(tl.uint8))
+        tl.store(Delta + head * N + rows, tl.cat(delta0, delta1, dim=0))
+        _store_inline_kdqs(KS, KDQS, head, 0, N)
+
+    torch.manual_seed(20)
+    shape = (2, 3, 64, 128)
+    v, do, out = [(torch.randn(shape, device="cuda") * .5).to(torch.bfloat16) for _ in range(3)]
+    if fixture == "boundary":
+        # Give each feature32 group a separate scale-transition maximum.
+        maxima = torch.tensor([0., .8671875, .875, .87890625], device="cuda", dtype=torch.bfloat16)
+        signs = torch.tensor([1., -1.], device="cuda", dtype=torch.bfloat16).repeat(64)
+        row = maxima.repeat_interleave(32) * signs
+        do = row[None, None, None, :].expand(shape).contiguous()
+        do[:, :, 32:] = do[:, :, 32:].flip(-1)
+        factors = torch.tensor([2**-8, 1., 2**8, 2**16], device="cuda", dtype=torch.bfloat16)
+        v = (do * factors.repeat_interleave(32)).contiguous()
+    elif fixture == "extreme":
+        # Include signed zero, BF16 subnormals, product underflow, and overflow.
+        bits = torch.tensor([
+            0x0000, 0x8000, 0x0001, 0x8001, 0x0080, 0x8080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc0,
+            0xffc0, 0x3e80, 0xbe80
+        ], device="cuda", dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+        do = bits.repeat(4)[None, None, :, None].expand(shape).contiguous()
+        out = do.clone()
+        v = do.flip(-2).contiguous()
+    ks = torch.randint(115, 135, (2, 3, 2, 4), device="cuda", dtype=torch.uint8).repeat_interleave(32, -2)
+    inputs = (v, do, out, ks)
+    frozen = tuple(tensor.clone() for tensor in inputs)
+    expected = (torch.empty_like(v, dtype=torch.float8_e4m3fn), torch.empty_like(do, dtype=torch.float8_e4m3fn),
+                torch.empty_like(ks), torch.empty_like(ks),
+                torch.empty((2, 3, 128, 2), device=v.device,
+                            dtype=torch.uint8), torch.empty(shape[:-1], device=v.device, dtype=torch.float32))
+    vb, do8, vs, dos, kdqs, delta = expected
+    shared._prepare_fused[(2, 6)](v, do, ks, vb, do8, vs, dos, kdqs, out, delta, 64, 128, 32, PACKED_STORES=True,
+                                  num_warps=4, num_stages=2)
+    actual = tuple(torch.empty_like(tensor) for tensor in expected)
+
+    def probe():
+        inline_prepare_probe[(6, )](v, do, out, ks, *actual, 64, 128, num_warps=2, num_stages=1,
+                                    matrix_instr_nonkdim=32)
+
+    def equal_bytes(left, right):
+        assert left.shape == right.shape and left.dtype == right.dtype
+        assert torch.equal(left.view(torch.uint8), right.view(torch.uint8))
+
+    probe()
+    for tensor, reference in zip(actual, expected):
+        equal_bytes(tensor, reference)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            probe()
+            stream.synchronize()
+            with torch.cuda.graph(graph, stream=stream):
+                probe()
+            for _ in range(2):
+                for tensor in actual:
+                    tensor.view(torch.uint8).fill_(255)
+                graph.replay()
+                stream.synchronize()
+                for tensor, reference in zip(actual, expected):
+                    equal_bytes(tensor, reference)
+    finally:
+        stream.synchronize()
+        graph.reset()
+    for tensor, original in zip(inputs, frozen):
+        equal_bytes(tensor, original)
 
 
 @pytest.mark.parametrize("causal", (False, True))
