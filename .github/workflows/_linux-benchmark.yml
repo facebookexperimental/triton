@@ -1,0 +1,217 @@
+name: Linux TritonBench
+
+on:
+  workflow_call:
+    inputs:
+      side:
+        description: Benchmark side (a or b); distinguishes environments and artifacts
+        type: string
+        required: true
+      device:
+        description: GPU runner (h100, b200, or mi350)
+        type: string
+        required: true
+      benchmarks:
+        description: Comma-separated TritonBench suites
+        type: string
+        required: true
+      tritonbench_ref:
+        description: TritonBench commit or ref
+        type: string
+        default: main
+      triton_repository:
+        description: Repository the wheel was built from
+        type: string
+        required: true
+      triton_commit:
+        description: Resolved commit the wheel was built from
+        type: string
+        required: true
+      wheel_url:
+        description: Prebuilt Python 3.12 Triton wheel URL from build.yml
+        type: string
+        required: true
+      wheel_filename:
+        description: Original wheel filename from build.yml
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ${{ fromJSON('{"h100":"linux-gcp-h100","b200":"nvidia-dgx-b200","mi350":"linux-fb-triton-mi350-1"}')[inputs.device] }}
+    timeout-minutes: 240
+    # Avoid measuring both sides concurrently on the same GPU runner pool.
+    concurrency:
+      group: ${{ github.workflow }}-benchmark-${{ inputs.device }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORKSPACE_DIR: /workspace
+      CONDA_ENV: triton-side-${{ inputs.side }}
+      RUNNER_TYPE: ${{ inputs.device }}
+      TORCH_VERSION: '2.14.0'
+      TORCH_INDEX: ${{ inputs.device == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
+      TRITONBENCH_TRITON_REPO: ${{ inputs.triton_repository }}
+      TRITONBENCH_TRITON_COMMIT: ${{ inputs.triton_commit }}
+      TRITONBENCH_TRITON_COMMIT_HASH: ${{ inputs.triton_commit }}
+      TRITONBENCH_TRITON_INSTALL_DIR: ${{ github.workspace }}/triton
+      WHEEL_URL: ${{ inputs.wheel_url }}
+      WHEEL_FILENAME: ${{ inputs.wheel_filename }}
+      BENCHMARKS: ${{ inputs.benchmarks }}
+      BENCHMARK_SIDE: ${{ inputs.side }}
+      BENCHMARK_DEVICE: ${{ inputs.device }}
+    steps:
+      - name: Checkout TritonBench
+        uses: actions/checkout@v6
+        with:
+          repository: meta-pytorch/tritonbench
+          ref: ${{ inputs.tritonbench_ref }}
+          submodules: recursive
+
+      # TritonBench uses the source checkout for commit metadata, not building.
+      - name: Checkout benchmarked Triton commit
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.triton_repository }}
+          ref: ${{ inputs.triton_commit }}
+          path: triton
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+
+      - name: Prepare benchmark environment
+        env:
+          SETUP_SCRIPT: ${{ runner.temp }}/benchmark-${{ inputs.side }}-setup.sh
+          VIRTUAL_ENV: ${{ runner.temp }}/benchmark-${{ inputs.side }}-venv
+        run: |
+          set -euo pipefail
+          echo "SETUP_SCRIPT=${SETUP_SCRIPT}" >> "${GITHUB_ENV}"
+          echo "VIRTUAL_ENV=${VIRTUAL_ENV}" >> "${GITHUB_ENV}"
+          uv venv --python 3.12 --clear "${VIRTUAL_ENV}"
+          printf 'source %q/bin/activate\n' "${VIRTUAL_ENV}" > "${SETUP_SCRIPT}"
+          # shellcheck source=/dev/null
+          . "${SETUP_SCRIPT}"
+          uv pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX}"
+          uv pip install numpy
+          mkdir -p "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}"
+          curl --fail --location --retry 3 \
+            --output "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}" "${WHEEL_URL}"
+          uv pip uninstall triton fbtriton pytorch-triton pytorch-triton-rocm triton-rocm
+          uv pip install --no-deps "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}"
+
+      - name: Set up TritonBench dependencies
+        run: |
+          set -eo pipefail
+          # shellcheck source=/dev/null
+          . "${SETUP_SCRIPT}"
+          if [[ "${BENCHMARK_DEVICE}" == mi350 ]]; then
+            bash .ci/tritonbench/setup-rocm-path.sh
+          else
+            bash .ci/tritonbench/setup-nvidia-path.sh
+          fi
+          bash .ci/tritonbench/install-pytorch-source.sh
+          # shellcheck source=/dev/null
+          . "${SETUP_SCRIPT}"
+          python install.py --all
+          # Dependencies may install a competing Triton distribution. The
+          # benchmark must use the wheel produced by this side's build job.
+          uv pip uninstall triton fbtriton pytorch-triton pytorch-triton-rocm triton-rocm
+          uv pip install --no-deps "${RUNNER_TEMP}/benchmark-wheel-${BENCHMARK_SIDE}/${WHEEL_FILENAME}"
+          python - <<'PY'
+          import torch
+          import triton
+
+          print(f"torch: {torch.__version__} ({torch.__file__})")
+          print(f"triton: {triton.__version__} ({triton.__file__})")
+          assert torch.cuda.is_available(), "No GPU available to PyTorch"
+          print(f"GPU: {torch.cuda.get_device_name()}")
+          PY
+
+      - name: Tune NVIDIA GPU
+        if: inputs.device != 'mi350'
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+
+      - name: Record benchmark inputs
+        run: |
+          # shellcheck source=/dev/null
+          . "${SETUP_SCRIPT}"
+          mkdir -p benchmark-output
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          import torch
+          import triton
+
+          metadata = {
+              "side": os.environ["BENCHMARK_SIDE"],
+              "device": os.environ["BENCHMARK_DEVICE"],
+              "triton_repository": os.environ["TRITONBENCH_TRITON_REPO"],
+              "triton_commit": os.environ["TRITONBENCH_TRITON_COMMIT_HASH"],
+              "triton_version": triton.__version__,
+              "wheel_url": os.environ["WHEEL_URL"],
+              "tritonbench_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "torch_version": torch.__version__,
+              "gpu": torch.cuda.get_device_name(),
+              "benchmarks": os.environ["BENCHMARKS"],
+          }
+          Path("benchmark-output/metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("```json\n" + json.dumps(metadata, indent=2) + "\n```\n")
+          PY
+
+      - name: Run benchmarks
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . "${SETUP_SCRIPT}"
+          [[ -n "${BENCHMARKS//[[:space:]]/}" ]] || { echo "::error::No benchmark suites specified"; exit 1; }
+          IFS=',' read -r -a suites <<< "${BENCHMARKS}"
+          status=0
+          for suite in "${suites[@]}"; do
+            suite="${suite//[[:space:]]/}"
+            if [[ ! "${suite}" =~ ^[a-zA-Z0-9_]+$ || ! -f "benchmarks/${suite}/run.py" ]]; then
+              echo "::error::Unknown benchmark suite: ${suite}"
+              status=1
+              continue
+            fi
+            bash .ci/tritonbench/run-benchmark.sh "${suite}" --conda-env "${CONDA_ENV}" || status=1
+          done
+          exit "${status}"
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p benchmark-output
+          if [[ -d .benchmarks ]]; then
+            cp -r .benchmarks/. benchmark-output/
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tritonbench-side-${{ inputs.side }}-${{ inputs.device }}-${{ github.run_attempt }}
+          path: benchmark-output/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Restore NVIDIA GPU
+        if: always() && inputs.device != 'mi350'
+        run: |
+          sudo nvidia-smi -pm 0 || true
+          sudo ldconfig
+          nvidia-smi
