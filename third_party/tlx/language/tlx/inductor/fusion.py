@@ -12,6 +12,9 @@ Usage:
 import logging
 from typing import Any, TYPE_CHECKING
 
+import torch
+from torch.utils._ordered_set import OrderedSet
+
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.scheduler import BaseSchedulerNode
@@ -32,6 +35,68 @@ def _is_tlx_choice(choice: Any) -> bool:
     if hasattr(choice, "name") and isinstance(choice.name, str):
         return "tlx_" in choice.name
     return False
+
+
+def _uses_tma_epilogue_store(annotations: dict[str, Any]) -> bool:
+    """Whether a choice or template buffer, by its KernelTemplateChoice
+    annotation, is a TLX template storing its epilogue through TMA."""
+    ktc = annotations.get("ktc")
+    if ktc is None or not getattr(ktc.template, "name", "").startswith("tlx_"):
+        return False
+    return bool(ktc.params.to_kwargs().get("TMA_EPILOGUE_STORE", 0))
+
+
+def tma_epilogue_store_fusion_unsupported(
+    node1: "BaseSchedulerNode", node2: "BaseSchedulerNode"
+) -> bool:
+    """Whether node2 can't be an epilogue of a TLX template that may store it
+    through TMA_EPILOGUE_STORE. That path stores exactly one buffer, the last
+    epilogue result, through a row-major [M, N] TMA descriptor whose staging
+    tile is budgeted at the template's dtype."""
+    from torch._inductor import ir
+    from torch._inductor.scheduler import OutputNode
+    from torch._inductor.virtualized import V
+
+    if not node1.is_template():
+        return False
+    template = node1.get_template_node()
+    caller = getattr(template, "_render_caller", None)
+    if caller is not None:
+        candidates = [caller]
+    elif isinstance(template, ir.MultiTemplateBuffer):
+        candidates = template.choices
+    else:
+        candidates = [template]
+    if not any(_uses_tma_epilogue_store(c.annotations) for c in candidates):
+        return False
+
+    fused = OrderedSet(node1.get_nodes()) | OrderedSet(node2.get_nodes())
+    live = [
+        buf
+        for buf in (*node1.get_outputs(), *node2.get_outputs())
+        if any(
+            isinstance(use.node, OutputNode) or use.node not in fused
+            for use in buf.users
+        )
+    ]
+    if len(live) != 1 or live[0].get_name() == template.get_name():
+        return True
+    layout = live[0].node.get_layout()
+    offset = (
+        layout.view.get_layout().offset
+        if isinstance(layout, ir.NonOwningLayout)
+        else layout.offset
+    )
+    itemsize = layout.dtype.itemsize
+    aligned = V.graph.sizevars.statically_known_multiple_of
+    return (
+        list(layout.size) != list(template.get_size())
+        or layout.stride[-1] != 1
+        or layout.dtype == torch.bool
+        or not aligned(layout.stride[0] * itemsize, 16)
+        or not aligned(offset * itemsize, 16)
+        or itemsize > template.get_dtype().itemsize
+    )
 
 
 def _has_split_k(multi_node: "ir.MultiTemplateBuffer") -> bool:
