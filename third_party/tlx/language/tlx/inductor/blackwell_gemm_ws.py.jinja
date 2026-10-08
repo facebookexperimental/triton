@@ -96,7 +96,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
         {{output_ptr()}}.dtype.element_ty,
         NUM_EPILOGUE_SMEM_BUFFERS,
     )
-    stride_cm = {{stride(None, 0)}}
+    stride_cm = {{output_stride(0)}}
     desc_c = tl.make_tensor_descriptor(
         {{output_ptr()}}, shape=[M, N], strides=[stride_cm, 1],
         block_shape=[BLOCK_M_SPLIT, slice_size])
@@ -270,7 +270,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
                 {{compute_epilogue(("offs_am_0", "offs_cn"), "result", result_name="fused_c", indent_width=16, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
                 c_smem = c_smem_buffers[0]
                 tlx.async_descriptor_store_wait(1)
-                tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                tlx.local_store(c_smem, fused_c.to({{output_ptr()}}.dtype.element_ty))
                 tlx.fence_async_shared()
                 tlx.async_descriptor_store(desc_c, c_smem, [offs_am_0, offs_cn], eviction_policy="evict_first")
 
@@ -283,7 +283,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
                 {{compute_epilogue(("offs_am_1", "offs_cn"), "result", result_name="fused_c", indent_width=16, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
                 c_smem = c_smem_buffers[1]
                 tlx.async_descriptor_store_wait(1)
-                tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                tlx.local_store(c_smem, fused_c.to({{output_ptr()}}.dtype.element_ty))
                 tlx.fence_async_shared()
                 tlx.async_descriptor_store(desc_c, c_smem, [offs_am_1, offs_cn], eviction_policy="evict_first")
 
@@ -297,7 +297,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
                     {{compute_epilogue(("offs_am_0", "offs_cn"), "result", result_name="fused_c", indent_width=20, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
                     c_smem = c_smem_buffers[0]
                     tlx.async_descriptor_store_wait(1)
-                    tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                    tlx.local_store(c_smem, fused_c.to({{output_ptr()}}.dtype.element_ty))
                     tlx.fence_async_shared()
                     tlx.async_descriptor_store(desc_c, c_smem, [offs_am_0, offs_cn], eviction_policy="evict_first")
 
@@ -309,7 +309,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
                     {{compute_epilogue(("offs_am_1", "offs_cn"), "result", result_name="fused_c", indent_width=20, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
                     c_smem = c_smem_buffers[1]
                     tlx.async_descriptor_store_wait(1)
-                    tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                    tlx.local_store(c_smem, fused_c.to({{output_ptr()}}.dtype.element_ty))
                     tlx.fence_async_shared()
                     tlx.async_descriptor_store(desc_c, c_smem, [offs_am_1, offs_cn], eviction_policy="evict_first")
 {% else %}
@@ -332,7 +332,7 @@ from triton.tlx.ops.kernels.mm._sm100_core import (
                         {{compute_epilogue(("offs_am", "offs_cn"), "result", result_name="fused_c", indent_width=24, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
                         c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % NUM_EPILOGUE_SMEM_BUFFERS]
                         tlx.async_descriptor_store_wait(1)
-                        tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                        tlx.local_store(c_smem, fused_c.to({{output_ptr()}}.dtype.element_ty))
                         tlx.fence_async_shared()
                         tlx.async_descriptor_store(desc_c, c_smem, [offs_am, offs_cn], eviction_policy="evict_first")
 {% else %}

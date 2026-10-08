@@ -986,6 +986,48 @@ class TestTLXTemplates(TestCase):
             self.assertIn("B_ROW_MAJOR : tl.constexpr = False", code_str)
 
     @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("benchmark_fusion", (False, True))
+    @parametrize("case", ("live_output", "two_outputs", "chain_output", "wider_dtype", "fp8_output"))
+    def test_tlx_matmul_ws_tma_epilogue_store(self, case: str, benchmark_fusion: bool):
+        """TMA_EPILOGUE_STORE stores one buffer, the fused epilogue's result, in the
+        output's dtype. Epilogues that need any other buffer stored must not fuse."""
+        cases = {
+            "live_output": lambda o: (o * 2, o),
+            "two_outputs": lambda o: (o * 2, o * 3),
+            "chain_output": lambda o: (o * 2, o * 2 + 1),
+            "wider_dtype": lambda o: (o.float(), ),
+            "fp8_output": lambda o: (o.to(torch.float8_e4m3fn), ),
+        }
+
+        def fn(a, b):
+            return cases[case](torch.mm(a, b))
+
+        # The heuristic picks SPLIT_K=1 and TMA_EPILOGUE_STORE=1 for this shape.
+        M, K, N = 5139, 256, 512
+        a = torch.randn((M, K), dtype=torch.bfloat16, device=GPU_TYPE)
+        b = torch.randn((K, N), dtype=torch.bfloat16, device=GPU_TYPE)
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "benchmark_epilogue_fusion": benchmark_fusion,
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(fn), a, b)
+
+        self.assertIn("tlx.async_descriptor_store(desc_c", "\n".join(code))
+        expected = [e.to(x.dtype).float() for e, x in zip(cases[case](torch.mm(a.float(), b.float())), actual)]
+        # An unstored or mis-stored output is off by O(100); output rounding is
+        # <= 0.5 for bf16 and one e4m3 step (12.5%) for fp8.
+        rtol = 0.13 if case == "fp8_output" else 0.02
+        torch.testing.assert_close([x.float() for x in actual], expected, atol=0.5, rtol=rtol)
+
+    @unittest.skipIf(
         not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX inter-wave mm template",
     )

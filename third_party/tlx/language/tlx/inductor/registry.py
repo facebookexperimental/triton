@@ -2381,6 +2381,7 @@ from torch._inductor.codegen.triton import (
     BlockPtrOptions,
     DeferredLine,
     TensorDescriptorOptions,
+    texpr,
 )
 from torch._inductor.codegen.common import IndentedBuffer
 from .codegen import codegen_async_tma_store
@@ -3042,12 +3043,27 @@ def _tlx_output_ptr(self):  # type: ignore[no-untyped-def]
     (set by codegen_template_body via _final_output_name) so TMA descriptors
     write directly to the fused output.
     """
-    name = getattr(self, "_final_output_name", self.output_node.get_name())
-    return self.args.output(name)
+    return self.args.output(_tlx_final_output_node(self).get_name())
+
+
+def _tlx_final_output_node(self):  # type: ignore[no-untyped-def]
+    name = getattr(self, "_final_output_name", None)
+    return V.graph.get_buffer(name) if name is not None else self.output_node
 
 
 _tlx_output_ptr.__name__ = "output_ptr"
 TritonTemplateKernel.output_ptr = _tlx_output_ptr  # type: ignore[method-assign]
+
+
+def _tlx_output_stride(self, index):  # type: ignore[no-untyped-def]
+    """Stride of the buffer output_ptr() points at, e.g. a fused epilogue
+    writing a cat slot whose rows are wider than the GEMM output."""
+    stride = _tlx_final_output_node(self).get_stride()[index]
+    return texpr(self.rename_indexing(stride))
+
+
+_tlx_output_stride.__name__ = "output_stride"
+TritonTemplateKernel.output_stride = _tlx_output_stride  # type: ignore[attr-defined]
 
 
 def _tlx_get_compute_epilogue_subgraph_name(self, i):  # type: ignore[no-untyped-def]
@@ -3329,10 +3345,12 @@ def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=Fal
     ):
         self._register_extra_template_env_fns(self.prefetch_epilogue)
 
-    # Register compute_epilogue and output_ptr as extra template env functions
-    # so they're available in the jinja template.
+    # Register compute_epilogue, output_ptr and output_stride as extra template
+    # env functions so they're available in the jinja template.
     if getattr(self, "async_tma_store", False):
-        self._register_extra_template_env_fns(self.compute_epilogue, self.output_ptr)
+        self._register_extra_template_env_fns(
+            self.compute_epilogue, self.output_ptr, self.output_stride
+        )
     elif getattr(self, "_tlx_split_k", 1) > 1:
         # split-K writes partials to split_k_ws and never store_output()s, so the
         # output arg would be pruned from the kernel signature -- but the autotuning
