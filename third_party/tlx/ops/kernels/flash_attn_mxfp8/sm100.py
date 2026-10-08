@@ -1,6 +1,7 @@
 """Blackwell MXFP8 Flash Attention forward and backward implementation."""
 
 import math
+import os
 
 import torch
 import triton
@@ -49,6 +50,9 @@ def _mxf8_host_descriptor_pre_hook(nargs):
     nargs["desc_v_scale"].block_shape = [1, REP_HEAD, REP_N, 2, 256]
 
 
+# Opt-in ExpCast-FP8 P encode (no MUFU exp2 for P); see _softmax_inner_loop.
+_P_EXPCAST = os.environ.get("TLX_FA_MXFP8_EXPCAST", "") == "1"
+
 # TODO: Tune. These are just copied
 mxfp8_configs = [
     triton.Config(
@@ -64,6 +68,7 @@ mxfp8_configs = [
             "GROUP_SIZE_N": 1,
             "RESCALE_OPT": True,
             "UNROLL_KV": False,
+            "P_EXPCAST": _P_EXPCAST,
         },
         num_stages=1,
         num_warps=4,
@@ -174,6 +179,42 @@ def _apply_causal_mask(qk, col_limit, BLOCK_N: tl.constexpr, TRANSPOSED: tl.cons
 
 
 @triton.jit
+def _expcast_e4m3x4(x, addend, mult):
+    """E4M3 code = RNE(x * mult + addend - 1024), clamped below at 0, packed 4 per register (no MUFU, no F2FP.E4M3)."""
+    # code + 1024 lies in [1024, 2048) where f16 ulp is 1: the f16 cvt rounds to the integer code in the
+    # low byte, and max with 1024 maps negative, -inf and NaN to code 0.
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 xc_a01, xc_a23, xc_c01, xc_c23, xc_m2, xc_z01, xc_z23;
+            .reg .f32 xc_z0, xc_z1, xc_z2, xc_z3;
+            .reg .b32 xc_h01, xc_h23, xc_lo;
+            mov.b64 xc_a01, {$1, $2};
+            mov.b64 xc_a23, {$3, $4};
+            mov.b64 xc_c01, {$5, $6};
+            mov.b64 xc_c23, {$7, $8};
+            mov.b64 xc_m2, {$9, $9};
+            fma.rn.f32x2 xc_z01, xc_a01, xc_m2, xc_c01;
+            fma.rn.f32x2 xc_z23, xc_a23, xc_m2, xc_c23;
+            mov.b64 {xc_z0, xc_z1}, xc_z01;
+            mov.b64 {xc_z2, xc_z3}, xc_z23;
+            cvt.rn.f16x2.f32 xc_h01, xc_z1, xc_z0;
+            cvt.rn.f16x2.f32 xc_h23, xc_z3, xc_z2;
+            mov.b32 xc_lo, 0x64006400;
+            max.f16x2 xc_h01, xc_h01, xc_lo;
+            max.f16x2 xc_h23, xc_h23, xc_lo;
+            prmt.b32 $0, xc_h01, xc_h23, 0x6420;
+        }
+        """,
+        "=r,f,f,f,f,f,f,f,f,f,f,f,f",
+        [x, addend, mult],
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _softmax_inner_loop(
     qk_empties,
     qk_fulls,
@@ -200,9 +241,12 @@ def _softmax_inner_loop(
     STAGE: tl.constexpr,
     SHARE_SCALE_BUFFERS: tl.constexpr = False,
     RESCALE_OPT: tl.constexpr = False,
+    P_EXPCAST: tl.constexpr = False,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
     NUM_BLOCKS: tl.constexpr = BLOCK_N // VEC_SIZE
+    if P_EXPCAST:
+        tl.static_assert(out_dtype == tl.float8e4nv)
 
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
@@ -251,28 +295,48 @@ def _softmax_inner_loop(
             m_scaled = m_ij * qk_scale
         else:
             m_scaled = m_ij
-        qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
-        p_i = tl.math.exp2(qk)
+        if P_EXPCAST:
+            # ExpCast-FP8 (arXiv 2609.15810) with the MX block scale kept: the E4M3 byte read as an integer is
+            # ~8*log2(v) + 56, so code = RNE(8*(u - e) + 56 + beta) with u = log2(p) and e the block's E8M0
+            # exponent. beta = -0.3443 centres the error of 1 + f vs 2^f; per-element ratio to exact p is in
+            # [0.929, 1.075]. e = ceil(u_max - log2(448)) matches the baseline RCEIL scale and keeps code <= 126.
+            block_u = block_maxes * qk_scale - m_scaled[:, None]
+            e_blk = tl.minimum(tl.maximum(tl.math.ceil(block_u - 8.807354922057604), -127.0), 127.0)
+            addend = (1079.6557 - 8.0 * m_scaled[:, None]) - 8.0 * e_blk
+            p_fp8_3d = _expcast_e4m3x4(qk_reshaped, tl.reshape(addend, [BLOCK_M_SPLIT, NUM_BLOCKS, 1]), qk_scale * 8.0)
+            e_int = e_blk.to(tl.int32)
+            p_scale = (e_int + 127).to(tl.uint8)
+            # l sums the decoded P, keeping numerator and denominator consistent.
+            blk_sum = tl.sum(p_fp8_3d.to(tl.float32), 2)
+            l_ij = tl.sum(blk_sum * ((e_int + 127) << 23).to(tl.float32, bitcast=True), 1)
 
-        # Derive block amax from pre-computed block maxes via monotonicity
-        # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
-        # ops per row in the MXFP8 conversion.
-        block_amax = tl.math.exp2(block_maxes * qk_scale - m_scaled[:, None])
+            tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
+            tlx.local_store(tlx.local_view(p_tiles, cid), tl.reshape(p_fp8_3d, [BLOCK_M_SPLIT, BLOCK_N]))
+            tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
+            tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
+        else:
+            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+            p_i = tl.math.exp2(qk)
 
-        # Compute row sum before p_empties wait: if MMA is still doing the
-        # previous PV GEMM, the wait stalls — fill that time with the sum.
-        l_ij = tl.sum(p_i, 1)
+            # Derive block amax from pre-computed block maxes via monotonicity
+            # of exp2: max(exp2(x)) == exp2(max(x)), avoiding 128 max(abs())
+            # ops per row in the MXFP8 conversion.
+            block_amax = tl.math.exp2(block_maxes * qk_scale - m_scaled[:, None])
 
-        tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
-        p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
-            p_i,
-            block_amax,
-            VEC_SIZE,
-            out_dtype,
-        )
-        tlx.local_store(tlx.local_view(p_tiles, cid), p_fp8)
-        tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
-        tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
+            # Compute row sum before p_empties wait: if MMA is still doing the
+            # previous PV GEMM, the wait stalls — fill that time with the sum.
+            l_ij = tl.sum(p_i, 1)
+
+            tlx.barrier_wait(tlx.local_view(p_empties, cid), qk_phase ^ 1)
+            p_fp8, p_scale = _to_mxfp8_block_with_block_amax(
+                p_i,
+                block_amax,
+                VEC_SIZE,
+                out_dtype,
+            )
+            tlx.local_store(tlx.local_view(p_tiles, cid), p_fp8)
+            tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
+            tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
         l_i = l_i * alpha + l_ij
         m_i = m_ij
@@ -315,6 +379,7 @@ def _softmax_task_tile(
     GROUP_SIZE_N: tl.constexpr,
     SHARE_SCALE_BUFFERS: tl.constexpr,
     RESCALE_OPT: tl.constexpr,
+    P_EXPCAST: tl.constexpr = False,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // 2
     start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
@@ -360,6 +425,7 @@ def _softmax_task_tile(
             STAGE=4 - STAGE,
             SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
             RESCALE_OPT=RESCALE_OPT,
+            P_EXPCAST=P_EXPCAST,
         )
 
     if STAGE & 2:
@@ -389,6 +455,7 @@ def _softmax_task_tile(
             STAGE=2,
             SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
             RESCALE_OPT=RESCALE_OPT,
+            P_EXPCAST=P_EXPCAST,
         )
 
     _, phase = get_bufidx_phase(tile_count, 1)
@@ -554,6 +621,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                       GROUP_SIZE_N: tl.constexpr,  #
                       RESCALE_OPT: tl.constexpr,  #
                       UNROLL_KV: tl.constexpr = False,  #
+                      P_EXPCAST: tl.constexpr = False,  #
                       ):
     """
     This kernel is adapted from the Blackwell FA kernel for MXFP8.
@@ -870,6 +938,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
                     GROUP_SIZE_N=GROUP_SIZE_N,
                     SHARE_SCALE_BUFFERS=SHARE_SCALE_BUFFERS,
                     RESCALE_OPT=RESCALE_OPT,
+                    P_EXPCAST=P_EXPCAST,
                 )
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
