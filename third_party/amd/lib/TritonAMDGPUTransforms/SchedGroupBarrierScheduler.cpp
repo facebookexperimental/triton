@@ -14,17 +14,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonAMDGPUTransforms/SchedulingAttributes.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_TRITONAMDGPUSCHEDGROUPBARRIERSCHEDULER
+#define GEN_PASS_DEF_TRITONAMDGPUINTRAWAVEPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 } // namespace mlir
 
@@ -40,7 +47,12 @@ enum : int32_t {
   kMaskVMEMRead = 1 << 5,
   kMaskDSRead = 1 << 8,
   kMaskDSWrite = 1 << 9,
+  kMaskLDSDMA = 1 << 11,
 };
+
+constexpr StringLiteral kIntraWaveMarker = "triton.intra_wave_pipeline.marker";
+constexpr StringLiteral kIntraWaveLabel = "triton.intra_wave_pipeline.label";
+constexpr StringLiteral kIntraWavePair = "triton.intra_wave_pipeline.pair";
 
 // --- "pretend it is decomposed": machine-instruction counts per TTGIR op -----
 // The hint interface counts MACHINE instructions, so every op must be priced
@@ -108,6 +120,16 @@ static unsigned accessCount(Type ty, unsigned accessBytes) {
       std::max<unsigned>(1, rt.getElementType().getIntOrFloatBitWidth() / 8);
   unsigned bytes = std::max(1u, elems * eb);
   return std::max(1u, (bytes + accessBytes - 1) / accessBytes);
+}
+
+static unsigned bytesPerThread(Type ty) {
+  auto rt = dyn_cast<RankedTensorType>(ty);
+  if (!rt)
+    return 0;
+  unsigned elems = triton::gpu::getTotalElemsPerThread(rt);
+  unsigned elemBytes =
+      std::max<unsigned>(1, rt.getElementType().getIntOrFloatBitWidth() / 8);
+  return elems * elemBytes;
 }
 
 static unsigned dsReadCountOf(Operation *op) {
@@ -229,9 +251,32 @@ static VMEMPrice priceVMEM(Operation *op,
   if (auto load = dyn_cast<triton::amdgpu::BufferLoadOp>(op))
     return priceBufferAccess(load.getPtr(), load.getOffsets(),
                              load.getContiguity(), axisInfo);
-  if (auto load = dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op))
-    return priceBufferAccess(load.getPtr(), load.getOffsets(),
-                             load.getContiguity(), axisInfo);
+  if (auto load = dyn_cast<triton::amdgpu::BufferLoadToLocalOp>(op)) {
+    VMEMPrice price = priceBufferAccess(load.getPtr(), load.getOffsets(),
+                                        load.getContiguity(), axisInfo);
+    auto dstTy = load.getDest().getType();
+    auto padded =
+        dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(dstTy.getEncoding());
+    auto target = triton::amdgpu::TargetFeatures::fromModuleOp(
+        op->getParentOfType<ModuleOp>());
+    if (padded && !target.supportsDirectToLdsScatter()) {
+      // Direct-to-LDS lowering clamps a padded destination's vector width so
+      // padding is inserted only at wave boundaries. Mirror that clamp here;
+      // otherwise one TTGIR copy may be priced as one dwordx4 even though it
+      // lowers to four buffer_load_dword instructions, and the requested MFMA
+      // cover cannot be materialized by the machine scheduler.
+      unsigned elemBits = triton::getPointeeBitWidth(load.getPtr().getType());
+      unsigned elemBytes = std::max(1u, elemBits / 8);
+      unsigned requestedVec = std::max(1u, price.accessBytes / elemBytes);
+      unsigned paddedVec = padded.getMinInterval() / target.getWarpSize();
+      unsigned loweredVec = std::max(1u, std::min(requestedVec, paddedVec));
+      auto offsetTy = cast<RankedTensorType>(load.getOffsets().getType());
+      unsigned elems = triton::gpu::getTotalElemsPerThread(offsetTy);
+      price.count = std::max(1u, (elems + loweredVec - 1) / loweredVec);
+      price.accessBytes = loweredVec * elemBytes;
+    }
+    return price;
+  }
   // The tile is the DESTINATION memdesc for buffer_load_to_local; operand(0)
   // is the base pointer.
   for (Value r : op->getResults()) {
@@ -259,6 +304,811 @@ static VMEMPrice priceVMEM(Operation *op,
     }
   return {/*count=*/1, /*accessBytes=*/16};
 }
+
+struct IntraWaveStage {
+  StringAttr label;
+  std::optional<int64_t> pair;
+  Operation *begin;
+  Operation *end;
+  SmallVector<Operation *> ops;
+};
+
+struct IntraWaveStageCounts {
+  unsigned mfma = 0;
+  unsigned memory = 0;
+};
+
+struct IntraWaveOpChunk {
+  SmallVector<Operation *> ops;
+  int32_t machineMask = 0;
+  unsigned machineCount = 0;
+  unsigned serviceCycles = 0;
+};
+
+static SmallVector<unsigned> distributeUniformly(unsigned itemCount,
+                                                 unsigned budget) {
+  assert(itemCount && "cannot distribute a budget over no items");
+  SmallVector<unsigned> shares;
+  shares.reserve(itemCount);
+  for (unsigned index = 0; index < itemCount; ++index) {
+    uint64_t begin = static_cast<uint64_t>(index) * budget;
+    uint64_t end = static_cast<uint64_t>(index + 1) * budget;
+    shares.push_back(end / itemCount - begin / itemCount);
+  }
+  return shares;
+}
+
+static void materializeIntraWaveMachinePair(OpBuilder &builder, Location loc,
+                                            int32_t memoryMask,
+                                            unsigned computeCount,
+                                            int64_t window, unsigned syncId) {
+  auto memoryGroup = ROCDL::SchedGroupBarrier::create(
+      builder, loc, static_cast<ROCDL::SchedGroupMask>(memoryMask), 1, syncId);
+  memoryGroup->setAttr(triton::AMD::kIntraWavePipelineWindowAttr,
+                       builder.getI32IntegerAttr(window));
+  if (!computeCount)
+    return;
+  auto computeGroup = ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, computeCount, syncId);
+  computeGroup->setAttr(triton::AMD::kIntraWavePipelineWindowAttr,
+                        builder.getI32IntegerAttr(window));
+}
+
+static void materializeIntraWaveChunkPair(OpBuilder &builder, Location loc,
+                                          const IntraWaveOpChunk &memoryChunk,
+                                          unsigned computeCount, int64_t window,
+                                          unsigned syncId) {
+  assert(memoryChunk.machineCount && "memory chunk has no machine operation");
+  unsigned quotient = computeCount / memoryChunk.machineCount;
+  unsigned remainder = computeCount % memoryChunk.machineCount;
+  for (unsigned index = 0; index < memoryChunk.machineCount; ++index)
+    materializeIntraWaveMachinePair(builder, loc, memoryChunk.machineMask,
+                                    quotient + (index < remainder ? 1 : 0),
+                                    window, syncId);
+}
+
+// Estimate issue-pipeline occupancy, not end-to-end result latency.  The
+// resulting values are used only to divide a fixed, user-selected MFMA budget
+// inside one already-proven-independent window.
+//
+// The ratios mirror the useful part of the gfx950 Gluon LLIR scheduler:
+//   * MI16 and MI32 MFMAs occupy 16 and 32 cycles respectively;
+//   * LDS traffic consumes cycles proportional to bytes on the shared LDS
+//     issue path;
+//   * a 128-bit VMEM instruction receives two MI16-equivalent issue slots,
+//     scaled down with its actual vector width. This intentionally models
+//     issue occupancy rather than full memory latency: assigning the latter
+//     here starts every future load too early and raises register pressure.
+// Exact dependencies and the window boundary remain hard constraints, so a
+// cost-model error changes only the distribution inside the window.
+static unsigned
+intraWaveServiceCycles(Operation *op, int32_t mask, unsigned machineCount,
+                       triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+  if (mask == kMaskMFMA) {
+    auto resultTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!resultTy)
+      return 0;
+    auto mma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
+        resultTy.getEncoding());
+    if (!mma || mma.getInstrShape().empty())
+      return 0;
+    unsigned instrM = mma.getInstrShape()[0];
+    unsigned cycles = instrM == 32 ? 32 : instrM == 16 ? 16 : 0;
+    return cycles * machineCount;
+  }
+
+  if (mask == kMaskDSRead)
+    return bytesPerThread(op->getResult(0).getType());
+  if (mask == kMaskDSWrite) {
+    auto store = cast<triton::gpu::LocalStoreOp>(op);
+    return bytesPerThread(store.getSrc().getType());
+  }
+  if (mask == kMaskVMEMRead || mask == kMaskLDSDMA) {
+    VMEMPrice price = priceVMEM(op, axisInfo);
+    // A dwordx4 load occupies two MI16-equivalent issue slots, with narrower
+    // accesses scaled proportionally. Preserve that ratio for MI32 by
+    // normalizing below.
+    return price.count * std::max(4u, price.accessBytes) * 2;
+  }
+  return 0;
+}
+
+// Paired stages describe independent work that may be interleaved.  Reject a
+// dataflow edge in either direction instead of relying on the machine
+// scheduler to discover that the requested group order is impossible.  This
+// direct-edge check is sufficient because every producer and consumer inside
+// either region is present in its stage set: a transitive path must cross the
+// stage boundary through one such edge. Control flow is already rejected.
+static bool intraWaveStagesAreIndependent(const IntraWaveStage &first,
+                                          const IntraWaveStage &second) {
+  llvm::DenseSet<Operation *> firstOps(first.ops.begin(), first.ops.end());
+  llvm::DenseSet<Operation *> secondOps(second.ops.begin(), second.ops.end());
+  auto dependsOn = [](ArrayRef<Operation *> consumers,
+                      const llvm::DenseSet<Operation *> &producers) {
+    return llvm::any_of(consumers, [&](Operation *consumer) {
+      return llvm::any_of(consumer->getOperands(), [&](Value operand) {
+        Operation *producer = operand.getDefiningOp();
+        return producer && producers.contains(producer);
+      });
+    });
+  };
+  return !dependsOn(second.ops, firstOps) && !dependsOn(first.ops, secondOps);
+}
+
+static bool isIntraWaveMarker(Operation *op) {
+  return op->hasAttr(kIntraWaveMarker);
+}
+
+static void clearIntraWaveMarker(Operation *op) {
+  op->removeAttr(kIntraWaveMarker);
+  op->removeAttr(kIntraWaveLabel);
+  op->removeAttr(kIntraWavePair);
+}
+
+static std::optional<std::pair<int32_t, unsigned>>
+priceIntraWaveOp(Operation *op, triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+  if (isa<triton::DotOp, triton::DotScaledOp, triton::amdgpu::ScheduledMfmaOp>(
+          op))
+    return std::pair<int32_t, unsigned>{kMaskMFMA, mfmaCountOf(op)};
+  if (isa<triton::gpu::LocalLoadOp>(op))
+    return std::pair<int32_t, unsigned>{kMaskDSRead, dsReadCountOf(op)};
+  if (isa<triton::gpu::LocalStoreOp>(op))
+    return std::pair<int32_t, unsigned>{kMaskDSWrite, dsWriteCountOf(op)};
+  if (isa<triton::gpu::AsyncCopyGlobalToLocalOp,
+          triton::amdgpu::BufferLoadToLocalOp>(op)) {
+    VMEMPrice price = priceVMEM(op, axisInfo);
+    return std::pair<int32_t, unsigned>{kMaskLDSDMA, price.count};
+  }
+  if (isa<triton::amdgpu::BufferLoadOp, triton::LoadOp>(op)) {
+    VMEMPrice price = priceVMEM(op, axisInfo);
+    return std::pair<int32_t, unsigned>{kMaskVMEMRead, price.count};
+  }
+  return std::nullopt;
+}
+
+static LogicalResult
+collectIntraWaveStages(Block *block, SmallVectorImpl<IntraWaveStage> &stages) {
+  std::optional<IntraWaveStage> active;
+  for (Operation &op : *block) {
+    auto marker = op.getAttrOfType<StringAttr>(kIntraWaveMarker);
+    if (!marker) {
+      if (active)
+        active->ops.push_back(&op);
+      continue;
+    }
+
+    auto label = op.getAttrOfType<StringAttr>(kIntraWaveLabel);
+    if (!label) {
+      op.emitError("malformed intra-wave pipeline marker");
+      return failure();
+    }
+    std::optional<int64_t> pair;
+    if (auto pairAttr = op.getAttrOfType<IntegerAttr>(kIntraWavePair))
+      pair = pairAttr.getInt();
+    if (marker.getValue() == "begin") {
+      if (active) {
+        op.emitError("nested intra-wave pipeline stages are not supported");
+        return failure();
+      }
+      active.emplace(IntraWaveStage{label, pair, &op, nullptr, {}});
+      continue;
+    }
+    if (marker.getValue() != "end") {
+      op.emitError("unknown intra-wave pipeline marker kind");
+      return failure();
+    }
+    if (!active || active->label != label) {
+      op.emitError("intra-wave pipeline end does not match its begin marker");
+      return failure();
+    }
+    if (active->pair != pair) {
+      op.emitError("intra-wave stage begin/end markers disagree on pair");
+      return failure();
+    }
+    active->end = &op;
+    stages.push_back(std::move(*active));
+    active.reset();
+  }
+  if (active) {
+    active->begin->emitError("unterminated intra-wave pipeline stage");
+    return failure();
+  }
+  return success();
+}
+
+static LogicalResult
+countIntraWaveStage(const IntraWaveStage &stage,
+                    triton::AMD::ModuleAxisInfoAnalysis &axisInfo,
+                    IntraWaveStageCounts &counts) {
+  for (Operation *op : stage.ops) {
+    if (op->getNumRegions() != 0) {
+      op->emitError("control flow inside an intra-wave pipeline stage is not "
+                    "supported");
+      return failure();
+    }
+    if (auto load = dyn_cast<triton::LoadOp>(op);
+        load && load.getIsVolatile()) {
+      op->emitError("intra-wave pipeline stage does not support volatile "
+                    "loads");
+      return failure();
+    }
+    if (isa<ROCDL::SchedBarrier, ROCDL::SchedGroupBarrier, ROCDL::IglpOpt,
+            ROCDL::SetPrioOp, ROCDL::SBarrierOp>(op)) {
+      op->emitError("intra-wave pipeline stage does not support existing "
+                    "scheduling directives");
+      return failure();
+    }
+    if (isa<triton::gpu::AsyncCommitGroupOp>(op)) {
+      op->emitError(
+          "intra-wave pipeline stage does not support async commit groups");
+      return failure();
+    }
+    auto priced = priceIntraWaveOp(op, axisInfo);
+    if (!priced) {
+      if (!isMemoryEffectFree(op)) {
+        op->emitError("unsupported side effect inside an intra-wave pipeline "
+                      "stage");
+        return failure();
+      }
+      continue;
+    }
+    auto [mask, count] = *priced;
+    if (mask == kMaskMFMA) {
+      counts.mfma += count;
+      continue;
+    }
+    counts.memory += count;
+  }
+  return success();
+}
+
+// Partition one unpaired mixed window into independent memory and compute
+// streams. Priced operations are the anchors. Pure operations that consume an
+// anchor follow that stream; pure setup that feeds exactly one stream moves
+// with it. Setup shared by both streams remains at the source boundary. Any
+// cross-stream dataflow fails closed instead of turning a scheduling hint into
+// an illegal reorder.
+static LogicalResult
+partitionMixedIntraWaveStage(const IntraWaveStage &mixed,
+                             triton::AMD::ModuleAxisInfoAnalysis &axisInfo,
+                             IntraWaveStage &memory, IntraWaveStage &compute) {
+  constexpr unsigned kMemoryStream = 1;
+  constexpr unsigned kComputeStream = 2;
+  llvm::DenseMap<Operation *, unsigned> positions;
+  for (auto [index, op] : llvm::enumerate(mixed.ops)) {
+    // Writes carry ordering through memory rather than SSA. Keep those in the
+    // explicit two-region API until alias dependence can be proven; accepting
+    // them here can move an LDS overwrite ahead of the MFMA that consumes the
+    // old stage.
+    if (isa<triton::gpu::LocalStoreOp, triton::gpu::AsyncCopyGlobalToLocalOp,
+            triton::amdgpu::BufferLoadToLocalOp>(op)) {
+      op->emitError("one-region intra-wave interleaving supports "
+                    "only read-only memory operations");
+      return failure();
+    }
+    positions[op] = index;
+  }
+
+  SmallVector<unsigned> upstream(mixed.ops.size(), 0);
+  SmallVector<unsigned> downstream(mixed.ops.size(), 0);
+  for (auto [index, op] : llvm::enumerate(mixed.ops)) {
+    if (auto priced = priceIntraWaveOp(op, axisInfo)) {
+      unsigned stream =
+          priced->first == kMaskMFMA ? kComputeStream : kMemoryStream;
+      upstream[index] = stream;
+      downstream[index] = stream;
+    }
+  }
+
+  // Propagate anchor reachability backward to pure address/layout setup.
+  for (int64_t index = mixed.ops.size() - 1; index >= 0; --index) {
+    Operation *op = mixed.ops[index];
+    for (Value result : op->getResults()) {
+      for (OpOperand &use : result.getUses()) {
+        auto position = positions.find(use.getOwner());
+        if (position != positions.end())
+          upstream[index] |= upstream[position->second];
+      }
+    }
+  }
+
+  // Propagate anchor reachability forward to result transforms and users.
+  for (auto [index, op] : llvm::enumerate(mixed.ops)) {
+    for (Value operand : op->getOperands()) {
+      auto position = positions.find(operand.getDefiningOp());
+      if (position != positions.end())
+        downstream[index] |= downstream[position->second];
+    }
+  }
+
+  memory = mixed;
+  compute = mixed;
+  memory.ops.clear();
+  compute.ops.clear();
+  for (auto [index, op] : llvm::enumerate(mixed.ops)) {
+    unsigned stream = upstream[index] | downstream[index];
+    bool sharedSetup = upstream[index] == (kMemoryStream | kComputeStream) &&
+                       downstream[index] == 0;
+    if (stream == (kMemoryStream | kComputeStream) && !sharedSetup) {
+      op->emitError("one-region intra-wave window contains dataflow between "
+                    "its memory and MFMA streams");
+      return failure();
+    }
+    if (stream == kMemoryStream)
+      memory.ops.push_back(op);
+    else if (stream == kComputeStream)
+      compute.ops.push_back(op);
+    // Pure setup feeding both streams has upstream==3 and downstream==0. It
+    // is intentionally kept in place rather than cloned or assigned above.
+  }
+  return success();
+}
+
+// Split a stage at the operations that lower to the requested machine class.
+// Assign pure setup/transform operations by SSA reachability rather than only
+// by source adjacency. Earlier canonicalization may legally hoist the address
+// calculations for every local_load ahead of all loads; attaching that whole
+// prefix to the first load would recreate a long-lived address burst. An op
+// with an anchor predecessor stays with that producer; otherwise it follows
+// the earliest anchor it feeds. Preserving order inside each resulting chunk
+// makes the later merge a stable topological reorder.
+static FailureOr<SmallVector<IntraWaveOpChunk>>
+chunkIntraWaveStage(const IntraWaveStage &stage, bool computeStage,
+                    triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+  llvm::DenseMap<Operation *, unsigned> positions;
+  for (auto [index, op] : llvm::enumerate(stage.ops))
+    positions[op] = index;
+
+  SmallVector<IntraWaveOpChunk> chunks;
+  SmallVector<std::optional<unsigned>> anchors(stage.ops.size());
+  for (auto [index, op] : llvm::enumerate(stage.ops)) {
+    auto priced = priceIntraWaveOp(op, axisInfo);
+    if (!priced)
+      continue;
+    auto [mask, count] = *priced;
+    if ((mask == kMaskMFMA) != computeStage)
+      continue;
+
+    IntraWaveOpChunk chunk;
+    chunk.machineMask = mask;
+    chunk.machineCount = count;
+    chunk.serviceCycles = intraWaveServiceCycles(op, mask, count, axisInfo);
+    anchors[index] = chunks.size();
+    chunks.push_back(std::move(chunk));
+  }
+
+  if (chunks.empty()) {
+    stage.begin->emitError("intra-wave pipeline stage has no schedulable "
+                           "machine-operation anchor");
+    return failure();
+  }
+  SmallVector<std::optional<unsigned>> lowerBounds(stage.ops.size());
+  SmallVector<std::optional<unsigned>> upperBounds(stage.ops.size());
+
+  // The latest anchor in an operation's transitive operand slice is its
+  // earliest legal chunk.
+  for (auto [index, op] : llvm::enumerate(stage.ops)) {
+    if (anchors[index])
+      lowerBounds[index] = anchors[index];
+    for (Value operand : op->getOperands()) {
+      auto position = positions.find(operand.getDefiningOp());
+      if (position == positions.end() || !lowerBounds[position->second])
+        continue;
+      unsigned lower = *lowerBounds[position->second];
+      if (!lowerBounds[index] || lower > *lowerBounds[index])
+        lowerBounds[index] = lower;
+    }
+  }
+
+  // The earliest anchor transitively consuming an operation is its latest
+  // useful chunk. This recovers per-load address setup even when that setup
+  // was hoisted ahead of every load in the coarse source region.
+  for (int64_t index = stage.ops.size() - 1; index >= 0; --index) {
+    Operation *op = stage.ops[index];
+    if (anchors[index])
+      upperBounds[index] = anchors[index];
+    for (Value result : op->getResults()) {
+      for (OpOperand &use : result.getUses()) {
+        auto position = positions.find(use.getOwner());
+        if (position == positions.end() || !upperBounds[position->second])
+          continue;
+        unsigned upper = *upperBounds[position->second];
+        if (!upperBounds[index] || upper < *upperBounds[index])
+          upperBounds[index] = upper;
+      }
+    }
+  }
+
+  unsigned precedingAnchor = 0;
+  bool hasPrecedingAnchor = false;
+  for (auto [index, op] : llvm::enumerate(stage.ops)) {
+    unsigned chunkIndex;
+    if (anchors[index]) {
+      chunkIndex = *anchors[index];
+      precedingAnchor = chunkIndex;
+      hasPrecedingAnchor = true;
+    } else if (lowerBounds[index]) {
+      chunkIndex = *lowerBounds[index];
+      if (upperBounds[index] && chunkIndex > *upperBounds[index]) {
+        op->emitError("intra-wave pipeline stage is not topologically "
+                      "chunkable");
+        return failure();
+      }
+    } else if (upperBounds[index]) {
+      chunkIndex = *upperBounds[index];
+    } else {
+      // Dead or region-independent pure setup is kept near its source
+      // position. Such operations do not constrain the cross-stage merge.
+      chunkIndex = hasPrecedingAnchor ? precedingAnchor : 0;
+    }
+    chunks[chunkIndex].ops.push_back(op);
+  }
+  return chunks;
+}
+
+// Preserve source-level operand granularity first, then let each source anchor
+// subdivide its cover according to the number of machine instructions it
+// lowers to. This avoids giving a B operand twice the register-lifetime budget
+// of an A operand merely because the B read uses two narrower DS instructions.
+static SmallVector<unsigned>
+computeIntraWaveChunkCovers(ArrayRef<IntraWaveOpChunk> memoryChunks,
+                            ArrayRef<IntraWaveOpChunk> computeChunks,
+                            unsigned mfmaCount) {
+  SmallVector<unsigned> covers;
+  covers.reserve(memoryChunks.size());
+
+  // A homogeneous source window retains the original equal-per-source policy.
+  // Besides preserving existing schedules, this is the right abstraction for
+  // repeated fragments of one operand: a source local_load lowering to two
+  // narrow DS reads should not receive twice the lifetime budget of a source
+  // local_load lowering to one wide read.
+  bool mixedPipelines = llvm::any_of(memoryChunks, [&](const auto &chunk) {
+    return chunk.machineMask != memoryChunks.front().machineMask;
+  });
+  if (!mixedPipelines)
+    return distributeUniformly(memoryChunks.size(), mfmaCount);
+
+  unsigned mfmaCycles = 0;
+  for (const IntraWaveOpChunk &chunk : computeChunks) {
+    if (!chunk.machineCount || !chunk.serviceCycles)
+      continue;
+    mfmaCycles = chunk.serviceCycles / chunk.machineCount;
+    break;
+  }
+  if (!mfmaCycles) {
+    // Unknown instruction shape: fail back to the previously validated equal
+    // distribution instead of applying an uncalibrated target model.
+    return distributeUniformly(memoryChunks.size(), mfmaCount);
+  }
+
+  // Convert each memory anchor's issue cost into an MFMA demand. Reads need
+  // distance before their result is consumed, while writes also need issue
+  // bandwidth and must not be collapsed into the following global load. For
+  // MI16 this gives a one-MFMA slot to a 16-byte LDS write and about four to a
+  // buffer_load_dwordx4 before proportional apportionment.
+  //
+  // When demand exceeds the available compute, reserve one cover per read
+  // whenever the budget permits, then prefix-apportion the remainder. When
+  // demand fits, fill the complete window as well: clustering that compute at
+  // the tail would issue every future load early and lengthen all of their live
+  // ranges at once. Distribute that surplus evenly across active anchors.
+  SmallVector<unsigned> demands;
+  demands.reserve(memoryChunks.size());
+  uint64_t totalDemand = 0;
+  for (const IntraWaveOpChunk &chunk : memoryChunks) {
+    unsigned demand = llvm::divideCeil(chunk.serviceCycles, mfmaCycles);
+    demands.push_back(demand);
+    totalDemand += demand;
+  }
+  if (!totalDemand) {
+    return distributeUniformly(memoryChunks.size(), mfmaCount);
+  }
+
+  unsigned activeAnchors =
+      llvm::count_if(demands, [](unsigned demand) { return demand != 0; });
+  if (mfmaCount < activeAnchors) {
+    // With fewer compute instructions than memory anchors, latency-weighted
+    // apportionment starves the cheaper anchors (usually LDS writes) and
+    // clusters them ahead of the longer-latency VMEM stream. That increases
+    // the number of simultaneously live prefetched operands. Spread the
+    // scarce cover across source anchors first; zero-cover anchors are then
+    // bundled with their nearest covered neighbor below. Latency weighting
+    // becomes useful only after every active source anchor can receive one
+    // cover instruction.
+    SmallVector<unsigned> activeShares =
+        distributeUniformly(activeAnchors, mfmaCount);
+    covers.assign(memoryChunks.size(), 0);
+    unsigned activeIndex = 0;
+    for (unsigned index = 0; index < demands.size(); ++index)
+      if (demands[index])
+        covers[index] = activeShares[activeIndex++];
+    return covers;
+  }
+  if (totalDemand <= mfmaCount) {
+    covers = demands;
+    SmallVector<unsigned> surplus =
+        distributeUniformly(activeAnchors, mfmaCount - totalDemand);
+    unsigned activeIndex = 0;
+    for (unsigned index = 0; index < demands.size(); ++index)
+      if (demands[index])
+        covers[index] += surplus[activeIndex++];
+    return covers;
+  }
+
+  uint64_t budget = mfmaCount;
+  if (budget >= activeAnchors) {
+    // Reserve one cover for every active memory operation before distributing
+    // the remaining latency budget. Pure proportional apportionment can round
+    // a short operation down to zero beside a wider one. Reserving future
+    // shares also prevents a greedy walk from starving the tail of the window.
+    covers.assign(memoryChunks.size(), 0);
+    for (auto [index, demand] : llvm::enumerate(demands))
+      covers[index] = demand != 0;
+
+    uint64_t remainingBudget = budget - activeAnchors;
+    uint64_t remainingDemand = totalDemand - activeAnchors;
+    if (!remainingBudget || !remainingDemand)
+      return covers;
+
+    uint64_t prefixDemand = 0;
+    for (unsigned index = 0; index < demands.size(); ++index) {
+      uint64_t demand = demands[index] - (demands[index] != 0);
+      uint64_t begin = prefixDemand * remainingBudget / remainingDemand;
+      prefixDemand += demand;
+      uint64_t end = prefixDemand * remainingBudget / remainingDemand;
+      covers[index] += end - begin;
+    }
+    return covers;
+  }
+
+  uint64_t prefixDemand = 0;
+  for (unsigned index = 0; index < memoryChunks.size(); ++index) {
+    uint64_t begin = prefixDemand * budget / totalDemand;
+    prefixDemand += demands[index];
+    uint64_t end = prefixDemand * budget / totalDemand;
+    covers.push_back(end - begin);
+  }
+  return covers;
+}
+
+// Materialize the same fine-grained order that users previously had to spell
+// with two source regions per load. The two stage orders remain unchanged;
+// only their independent chunks are merged. Reordering before LLVM lowering
+// is important because scheduling-group constraints alone do not shorten the
+// virtual-register live ranges seen by register allocation.
+static void interleaveIntraWaveStages(ArrayRef<IntraWaveOpChunk> memoryChunks,
+                                      ArrayRef<IntraWaveOpChunk> computeChunks,
+                                      ArrayRef<unsigned> chunkCovers,
+                                      Operation *insertBefore, int64_t window,
+                                      unsigned &nextSyncId) {
+  unsigned desiredComputeCount = 0;
+  unsigned scheduledComputeCount = 0;
+  unsigned computeChunkIndex = 0;
+  SmallVector<const IntraWaveOpChunk *> pendingMemory;
+
+  auto moveChunk = [&](const IntraWaveOpChunk &chunk) {
+    for (Operation *op : chunk.ops)
+      op->moveBefore(insertBefore);
+  };
+  // All chunks belong to one user-selected, dependency-proven scheduling
+  // window. Keep them in one scheduling-group pipeline so LLVM can realize
+  // the complete memory/compute cadence without turning every source anchor
+  // into a separate hard completion boundary. The outer source markers remain
+  // the hard boundary of the window.
+  unsigned syncId = nextSyncId++;
+  for (unsigned memoryIndex = 0; memoryIndex < memoryChunks.size();
+       ++memoryIndex) {
+    const IntraWaveOpChunk &memoryChunk = memoryChunks[memoryIndex];
+    unsigned cover = chunkCovers[memoryIndex];
+    moveChunk(memoryChunk);
+    desiredComputeCount += cover;
+    while (computeChunkIndex < computeChunks.size() &&
+           scheduledComputeCount < desiredComputeCount) {
+      const IntraWaveOpChunk &computeChunk = computeChunks[computeChunkIndex++];
+      moveChunk(computeChunk);
+      scheduledComputeCount += computeChunk.machineCount;
+    }
+    // A zero-cover memory anchor belongs to the next covered anchor. Do not
+    // insert an artificial scheduling boundary between them: when there are
+    // fewer MFMAs than source loads this reconstructs a multi-load/one-MFMA
+    // window, and for publication pipelines it can pair an LDS write with the
+    // following global read.
+    bool hasFollowingMemory = memoryIndex + 1 < memoryChunks.size();
+    if (!cover && hasFollowingMemory) {
+      pendingMemory.push_back(&memoryChunk);
+      continue;
+    }
+
+    // Materialize each reconstructed memory/compute bundle where its
+    // operations now live. A shared sync ID preserves their ordered pipeline;
+    // the bundles do not need an additional full scheduling barrier between
+    // adjacent anchors inside the same proven-independent window.
+    OpBuilder builder(insertBefore);
+    for (const IntraWaveOpChunk *memory : pendingMemory)
+      materializeIntraWaveChunkPair(builder, insertBefore->getLoc(), *memory,
+                                    /*computeCount=*/0, window, syncId);
+    pendingMemory.clear();
+    materializeIntraWaveChunkPair(builder, insertBefore->getLoc(), memoryChunk,
+                                  cover, window, syncId);
+  }
+  assert(pendingMemory.empty() && "unterminated intra-wave memory bundle");
+  while (computeChunkIndex < computeChunks.size())
+    moveChunk(computeChunks[computeChunkIndex++]);
+}
+
+static LogicalResult materializeIntraWaveWindow(
+    const IntraWaveStage &memoryStage, const IntraWaveStage &computeStage,
+    const IntraWaveStageCounts &computeCounts, Operation *insertBefore,
+    int64_t window, unsigned &nextSyncId,
+    triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+  FailureOr<SmallVector<IntraWaveOpChunk>> memoryChunks =
+      chunkIntraWaveStage(memoryStage, /*computeStage=*/false, axisInfo);
+  FailureOr<SmallVector<IntraWaveOpChunk>> computeChunks =
+      chunkIntraWaveStage(computeStage, /*computeStage=*/true, axisInfo);
+  if (failed(memoryChunks) || failed(computeChunks))
+    return failure();
+  SmallVector<unsigned> chunkCovers = computeIntraWaveChunkCovers(
+      *memoryChunks, *computeChunks, computeCounts.mfma);
+
+  // A one-anchor window is already at source granularity. Larger windows are
+  // reconstructed as fine memory/compute chunks before register allocation.
+  if (memoryChunks->size() > 1 && computeChunks->size() > 1) {
+    interleaveIntraWaveStages(*memoryChunks, *computeChunks, chunkCovers,
+                              insertBefore, window, nextSyncId);
+    return success();
+  }
+
+  OpBuilder builder(insertBefore);
+  for (auto [memoryChunk, chunkCover] : llvm::zip(*memoryChunks, chunkCovers)) {
+    unsigned syncId = nextSyncId++;
+    materializeIntraWaveChunkPair(builder, insertBefore->getLoc(), memoryChunk,
+                                  chunkCover, window, syncId);
+  }
+  return success();
+}
+
+static LogicalResult
+materializeIntraWaveWindows(ModuleOp mod,
+                            triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+  SmallVector<Block *> markedBlocks;
+  mod.walk([&](Operation *op) {
+    if (!isIntraWaveMarker(op))
+      return;
+    Block *block = op->getBlock();
+    if (!llvm::is_contained(markedBlocks, block))
+      markedBlocks.push_back(block);
+  });
+
+  unsigned nextSyncId = 1;
+  int64_t nextWindow = 0;
+  for (Block *block : markedBlocks) {
+    SmallVector<IntraWaveStage> stages;
+    if (failed(collectIntraWaveStages(block, stages)))
+      return failure();
+
+    for (unsigned i = 0; i < stages.size();) {
+      IntraWaveStage &first = stages[i];
+      IntraWaveStageCounts firstCounts;
+      if (failed(countIntraWaveStage(first, axisInfo, firstCounts)))
+        return failure();
+
+      // An unpaired region is a complete mixed window. The pair attribute is
+      // the unambiguous discriminator between this form and the explicit
+      // two-region form; do not infer the form from the operation mix.
+      if (!first.pair) {
+        if (!firstCounts.mfma || !firstCounts.memory) {
+          first.begin->emitError(
+              "an unpaired intra-wave pipeline region must contain both "
+              "memory and MFMA work");
+          return failure();
+        }
+        IntraWaveStage memoryStage;
+        IntraWaveStage computeStage;
+        if (failed(partitionMixedIntraWaveStage(first, axisInfo, memoryStage,
+                                                computeStage)))
+          return failure();
+        IntraWaveStageCounts memoryCounts;
+        IntraWaveStageCounts computeCounts;
+        if (failed(countIntraWaveStage(memoryStage, axisInfo, memoryCounts)) ||
+            failed(countIntraWaveStage(computeStage, axisInfo, computeCounts)))
+          return failure();
+        if (!memoryCounts.memory || memoryCounts.mfma || !computeCounts.mfma ||
+            computeCounts.memory ||
+            !intraWaveStagesAreIndependent(memoryStage, computeStage)) {
+          first.begin->emitError(
+              "one-region intra-wave window requires independent memory and "
+              "MFMA streams");
+          return failure();
+        }
+        if (failed(materializeIntraWaveWindow(
+                memoryStage, computeStage, computeCounts, first.end,
+                nextWindow++, nextSyncId, axisInfo)))
+          return failure();
+        clearIntraWaveMarker(first.begin);
+        clearIntraWaveMarker(first.end);
+        ++i;
+        continue;
+      }
+
+      if (i + 1 == stages.size()) {
+        first.begin->emitError(
+            "a paired intra-wave pipeline window must contain exactly two "
+            "adjacent regions");
+        return failure();
+      }
+      IntraWaveStage &second = stages[i + 1];
+      if (!second.pair || first.pair != second.pair) {
+        first.begin->emitError(
+            "adjacent paired intra-wave regions must use the same pair");
+        return failure();
+      }
+      if (first.end->getNextNode() != second.begin) {
+        first.begin->emitError(
+            "paired intra-wave pipeline regions must be adjacent");
+        return failure();
+      }
+      int64_t window = nextWindow++;
+      IntraWaveStageCounts secondCounts;
+      if (failed(countIntraWaveStage(second, axisInfo, secondCounts)))
+        return failure();
+      if (!intraWaveStagesAreIndependent(first, second)) {
+        first.begin->emitError(
+            "intra-wave pipeline stages must be dataflow-independent");
+        return failure();
+      }
+
+      IntraWaveStageCounts *compute = nullptr;
+      IntraWaveStageCounts *memory = nullptr;
+      if (firstCounts.mfma && !firstCounts.memory && secondCounts.memory &&
+          !secondCounts.mfma) {
+        compute = &firstCounts;
+        memory = &secondCounts;
+      } else if (secondCounts.mfma && !secondCounts.memory &&
+                 firstCounts.memory && !firstCounts.mfma) {
+        compute = &secondCounts;
+        memory = &firstCounts;
+      } else {
+        first.begin->emitError(
+            "an intra-wave pipeline window requires one MFMA-only stage and "
+            "one memory-only stage");
+        return failure();
+      }
+
+      IntraWaveStage *computeStage = compute == &firstCounts ? &first : &second;
+      IntraWaveStage *memoryStage = memory == &firstCounts ? &first : &second;
+      if (failed(materializeIntraWaveWindow(*memoryStage, *computeStage,
+                                            *compute, second.end, window,
+                                            nextSyncId, axisInfo)))
+        return failure();
+
+      // Retain the outer markers as hard scheduling boundaries, but erase the
+      // two inner markers so LLVM may interleave the paired regions. The group
+      // sizes are the complete user-selected regions; no operations outside
+      // the window are borrowed to satisfy a latency heuristic.
+      clearIntraWaveMarker(first.begin);
+      clearIntraWaveMarker(second.end);
+
+      // The stage boundary markers inside the window must disappear: retaining
+      // either would forbid precisely the cross-region scheduling requested by
+      // the source. The outer two markers remain as ordinary sched barriers.
+      first.end->erase();
+      second.begin->erase();
+      i += 2;
+    }
+  }
+  return success();
+}
+
+struct TritonAMDGPUIntraWavePipelinePass
+    : public impl::TritonAMDGPUIntraWavePipelineBase<
+          TritonAMDGPUIntraWavePipelinePass> {
+  void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    triton::AMD::ModuleAxisInfoAnalysis axisInfo(mod);
+    if (failed(materializeIntraWaveWindows(mod, axisInfo)))
+      signalPassFailure();
+  }
+};
 
 struct TritonAMDGPUSchedGroupBarrierSchedulerPass
     : public impl::TritonAMDGPUSchedGroupBarrierSchedulerBase<
@@ -290,8 +1140,13 @@ struct TritonAMDGPUSchedGroupBarrierSchedulerPass
       else if (isa<triton::gpu::LocalStoreOp>(op))
         annotate(op, kMaskDSWrite, dsWriteCountOf(op));
       else if (isa<triton::gpu::AsyncCopyGlobalToLocalOp,
-                   triton::amdgpu::BufferLoadToLocalOp,
-                   triton::amdgpu::BufferLoadOp, triton::LoadOp>(op)) {
+                   triton::amdgpu::BufferLoadToLocalOp>(op)) {
+        VMEMPrice price = priceVMEM(op, axisInfo);
+        unsigned bytes = std::min(price.accessBytes, 16u);
+        unsigned cover = std::max(
+            1u, (static_cast<unsigned>(mfmaPerDwordx4) * bytes + 15u) / 16u);
+        annotate(op, kMaskLDSDMA, price.count, cover);
+      } else if (isa<triton::amdgpu::BufferLoadOp, triton::LoadOp>(op)) {
         VMEMPrice price = priceVMEM(op, axisInfo);
         // Keep the measured dwordx4 schedule as the calibration point, then
         // scale the MFMA cover with the actual lowering width. This avoids

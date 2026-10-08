@@ -627,6 +627,11 @@ class HIPBackend(BaseBackend):
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        # Consume explicit tlx.warp_pipeline_stage(scope="intra_wave")
+        # regions. This pass is
+        # inert for kernels without those markers and deliberately does not
+        # reuse the inter-wave cond_barrier lowering above.
+        amd.passes.ttgpuir.add_intra_wave_pipeline(pm)
         if options.enable_sched_group_barrier_scheduler:
             amd.passes.ttgpuir.add_sched_group_barrier_scheduler(
                 pm,
@@ -906,11 +911,9 @@ class HIPBackend(BaseBackend):
         if knobs.amd.swap_mir_enable_misched and not knobs.amd.swap_mir:
             raise ValueError("TRITON_SWAP_MIR_ENABLE_MISCHED requires TRITON_SWAP_MIR to be set")
         if knobs.amd.swap_mir:
-            amdgcn = llvm.translate_mir_to_asm(
-                os.path.join(knobs.amd.swap_mir, dump_file_id + ".txt"),
-                target_triple,
-                options.arch, features, flags, options.enable_fp_fusion, False,
-                knobs.amd.swap_mir_enable_misched)
+            amdgcn = llvm.translate_mir_to_asm(os.path.join(knobs.amd.swap_mir, dump_file_id + ".txt"), target_triple,
+                                               options.arch, features, flags, options.enable_fp_fusion, False,
+                                               knobs.amd.swap_mir_enable_misched)
         else:
             disable_llvm_opt = knobs.getenv_bool("DISABLE_LLVM_OPT", False)
             disabled_passes = ""

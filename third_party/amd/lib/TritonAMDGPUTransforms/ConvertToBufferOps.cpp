@@ -516,6 +516,14 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
     LDBG("Try to convert: " << op);
     Value ptr = op.getOperand(0);
 
+    // BufferLoadOp cannot represent volatile semantics. Keep volatile
+    // tt.load operations on the generic lowering path instead of silently
+    // dropping the attribute during conversion.
+    if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
+      if (op.getIsVolatile())
+        return rewriter.notifyMatchFailure(op, "volatile load");
+    }
+
     if (canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
       Value tensorPtr = addPtrOp.getPtr();
