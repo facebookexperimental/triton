@@ -167,13 +167,17 @@ static void expandLoops(ModuleOp moduleOp) {
   };
 
   SmallVector<scf::ForOp> loops;
-  bool hasWarpSpec = false;
-  moduleOp->walk([&](scf::ForOp forOp) {
-    if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
-      hasWarpSpec = true;
-    loops.push_back(forOp);
-  });
+  moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  // TRITON_USE_META_WS stays set when AutoWS bails out, leaving plain loops.
+  // Peeling their epilogue would predicate last-stage ops the generic
+  // predicator cannot handle (e.g. Hopper ttng.warp_group_dot), so the metaWS
+  // epilogue handling only applies to kernels that were warp-specialized.
+  bool metaWSPeeling = metaWS && moduleOp
+                                     ->walk([](triton::gpu::WarpSpecializeOp) {
+                                       return WalkResult::interrupt();
+                                     })
+                                     .wasInterrupted();
   // The partition-type filter below exists to prune the loops that the extra
   // ScheduleLoops re-run re-staged. That re-run only happens on the 2-CTA path
   // (see CUDABackend.make_ttgir). On the 1-CTA path every partition loop still
@@ -219,9 +223,9 @@ static void expandLoops(ModuleOp moduleOp) {
     }
     triton::PipeliningOption options;
     bool useCustomMetaWSEpilogue =
-        metaWS && needsCustomMetaWSEpiloguePeeling(forOp);
+        metaWSPeeling && needsCustomMetaWSEpiloguePeeling(forOp);
     options.supportDynamicLoops = true;
-    options.peelEpilogue = metaWS && !useCustomMetaWSEpilogue;
+    options.peelEpilogue = metaWSPeeling && !useCustomMetaWSEpilogue;
     options.predicateFn = wrapInMaskOp;
     options.getScheduleFn =
         [&](scf::ForOp forOp,
@@ -240,7 +244,7 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if (metaWS)
+    if (metaWSPeeling)
       customEpiloguePeeling = useCustomMetaWSEpilogue;
 
     if (keepPredicateStage || customEpiloguePeeling) {
