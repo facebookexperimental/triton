@@ -51,6 +51,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 from .gfx950_quant import _decode_scale, _scale_exponent
+from .gfx950_bwd_shared import _saved_qk_arena_segments
 
 _FP8 = torch.float8_e4m3fn
 _LOG2E = 1.4426950408889634
@@ -123,6 +124,18 @@ def quantize_mxfp8_head(x, *, pack_k=False):
                                                         x.stride(3), h, n, HEAD_DIM=d, BLOCK_N=64, PACK_K=pack_k,
                                                         num_warps=4)
     return quant, scale
+
+
+@triton.jit
+def _quantize_saved_qk_arena(X, Arena, stride_xz, stride_xh, stride_xn, stride_xd, ARENA_N: tl.constexpr,
+                             KEY: tl.constexpr):
+    q, k, qs, ks = _saved_qk_arena_segments(Arena, ARENA_N)
+    if KEY:
+        out, scale = k, ks
+    else:
+        out, scale = q, qs
+    _quantize_mxfp8_kernel(X, out, scale, stride_xz, stride_xh, stride_xn, stride_xd, 32, ARENA_N, HEAD_DIM=128,
+                           BLOCK_N=64, PACK_K=False)
 
 
 @triton.jit
@@ -1122,15 +1135,88 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
     return (out, lse) if return_lse else out
 
 
+def _forward_helper_contract(function):
+    return (function, function.__code__, function.__defaults__, tuple((function.__kwdefaults__ or {}).items()))
+
+
+_PUBLIC_QK_ARENA_LENGTHS = (1024, 2048)
+_PUBLIC_QK_FORWARD_HELPERS = tuple(
+    (name, _forward_helper_contract(globals()[name]))
+    for name in ("quantize_mxfp8_head", "quantize_mxfp8_v", "_launch_quantized", "_default_config"))
+_PUBLIC_QK_JIT_HELPERS = tuple(
+    (name, globals()[name], globals()[name].src)
+    for name in ("_quantize_mxfp8_kernel", "_mxfp8_fa_fwd", "_mx_scale", "_decode_scale", "_scale_exponent"))
+
+
+def _can_save_public_qk_arena(q, k, v, sm_scale, causal):
+    from .gfx950_bwd_shared import _arena_launch_controls, _is_gfx950
+
+    if (type(causal) is not bool or type(sm_scale) is not float or sm_scale != 0.5 or _FP8 != torch.float8_e4m3fn
+            or _HEAD_DIM != 128 or any(type(tensor) is not torch.Tensor for tensor in (q, k, v))):
+        return False
+    shape = tuple(q.shape)
+    if len(shape) != 4 or shape[:2] != (4, 32) or shape[2] not in _PUBLIC_QK_ARENA_LENGTHS or shape[3] != 128:
+        return False
+    if any(tensor.shape != shape or tensor.dtype != torch.bfloat16 or tensor.device != q.device
+           or tensor.layout != torch.strided or not tensor.is_contiguous() or tensor.is_conj() or tensor.is_neg()
+           for tensor in (q, k, v)):
+        return False
+    # Keep originally unsupported V storage on the separate-tensor path.
+    # Saved-tensor hooks may later restore valid dense offset views; those
+    # remain supported by the general backward after fresh metadata checks.
+    storage = v.untyped_storage()
+    pointer = v.data_ptr()
+    if (v.storage_offset() != 0 or storage.nbytes() != 256 * shape[2] * 128 or pointer != storage.data_ptr()
+            or pointer % 16 != 0 or not _arena_launch_controls()):
+        return False
+    for name, expected in _PUBLIC_QK_FORWARD_HELPERS:
+        current = globals()[name]
+        if (current is not expected[0] or current.__code__ is not expected[1]
+                or current.__defaults__ is not expected[2]):
+            return False
+        keywords = current.__kwdefaults__
+        if keywords is None:
+            keywords = {}
+        if (type(keywords) is not dict or len(keywords) != len(expected[3])
+                or any(key not in keywords or type(keywords[key]) is not type(value) or keywords[key] != value
+                       for key, value in expected[3])):
+            return False
+    for name, expected, source in _PUBLIC_QK_JIT_HELPERS:
+        current = globals()[name]
+        if (current is not expected or current.src != source or current.pre_run_hooks
+                or current.launch_metadata is not None or current.debug):
+            return False
+    return q.device.type == "cuda" and _is_gfx950(q.device)
+
+
 class _MXFP8Attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, sm_scale, causal):
-        q_fp8, q_scale = quantize_mxfp8_head(q)
-        k_fp8, k_scale = quantize_mxfp8_head(k)
+        from .gfx950_bwd_shared import (_SAVED_QK_ARENA_FORMAT, _check_saved_qk_arena, _saved_qk_arena_layout,
+                                        _saved_qk_arena_views)
+
+        packed = _can_save_public_qk_arena(q, k, v, sm_scale, causal)
+        if packed:
+            n = q.shape[2]
+            arena = torch.empty((_saved_qk_arena_layout(n)[-1], ), device=q.device, dtype=torch.uint8)
+            _check_saved_qk_arena(arena, q.device, n)
+            for tensor, key in ((q, False), (k, True)):
+                _quantize_saved_qk_arena[(n // 64, 128)](tensor, arena, *tensor.stride(), ARENA_N=n, KEY=key,
+                                                         num_warps=4)
+            # These controlled views exist only for the unchanged forward.
+            q_fp8, k_fp8, q_scale, k_scale = _saved_qk_arena_views(arena, n)
+        else:
+            q_fp8, q_scale = quantize_mxfp8_head(q)
+            k_fp8, k_scale = quantize_mxfp8_head(k)
         v_fp8, v_scale = quantize_mxfp8_v(v)
         out, lse = _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, return_lse=True)
-        ctx.save_for_backward(q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale)
+        if packed:
+            ctx.save_for_backward(q, k, v, arena, out, lse)
+            ctx.saved_format = _SAVED_QK_ARENA_FORMAT
+        else:
+            ctx.save_for_backward(q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale)
+            ctx.saved_format = None
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         return out
@@ -1138,9 +1224,18 @@ class _MXFP8Attention(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, do):
-        from .gfx950_bwd_shared import _try_launch_backward_shared_square
+        from .gfx950_bwd_shared import (_SAVED_QK_ARENA_FORMAT, _check_saved_qk_backward_tensors, _saved_qk_arena_views,
+                                        _try_launch_backward_shared_square)
 
-        q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale = ctx.saved_tensors
+        if ctx.saved_format == _SAVED_QK_ARENA_FORMAT:
+            q, k, v, qk_arena, out, lse = ctx.saved_tensors
+            if qk_arena.device != q.device or q.shape != k.shape or q.shape != v.shape:
+                raise ValueError("Saved Q/K arena must match the live input device and shape")
+            q_fp8, k_fp8, q_scale, k_scale = qk_arena, None, None, None
+        elif ctx.saved_format is None:
+            q, k, v, q_fp8, k_fp8, out, lse, q_scale, k_scale = ctx.saved_tensors
+        else:
+            raise ValueError("Unknown MXFP8 saved tensor format")
         # Autograd may execute after the caller changes the current device.
         with torch.cuda.device(q.device):
             do_bf16 = do.to(torch.bfloat16).contiguous()
@@ -1152,6 +1247,11 @@ class _MXFP8Attention(torch.autograd.Function):
             if shared_grads is not None:
                 dq, dk, dv = shared_grads
                 return dq, dk, dv, None, None
+            if ctx.saved_format == _SAVED_QK_ARENA_FORMAT:
+                # General fallback uses controlled views only after fresh
+                # whole-arena checks, never the separate shared admission.
+                _check_saved_qk_backward_tensors(qk_arena, v, do_bf16, out, lse, allow_views=True)
+                q_fp8, k_fp8, q_scale, k_scale = _saved_qk_arena_views(qk_arena, q.shape[2])
             from .gfx950_bwd import launch_backward
             from .gfx950_quant import quantize_backward_operands
 

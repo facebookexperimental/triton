@@ -39,6 +39,55 @@ from triton.runtime.jit import _CACHE_STATS_ON, constexpr_function
 
 from .gfx950_quant import _decode_scale, _quantize_store, _scale_exponent
 
+_SAVED_QK_ARENA_FORMAT = ("public_saved_qk_arena", 1)
+
+
+@constexpr_function
+def _saved_qk_arena_layout(n):
+    """Invocation-private saved square32 Q/K payloads and unpacked scales."""
+    assert n in (1024, 2048)
+    payload_bytes = 128 * n * 128
+    scale_bytes = 128 * n * 4
+    offsets = (0, payload_bytes, 2 * payload_bytes, 2 * payload_bytes + scale_bytes)
+    total_bytes = 2 * payload_bytes + 2 * scale_bytes
+    assert all(offset % 16 == 0 for offset in offsets) and total_bytes % 16 == 0 and total_bytes < 2**31
+    return (*offsets, total_bytes)
+
+
+@triton.jit
+def _saved_qk_arena_segments(Arena, ARENA_N: tl.constexpr):
+    tl.static_assert(Arena.dtype.element_ty == tl.uint8)
+    offsets: tl.constexpr = _saved_qk_arena_layout(ARENA_N)
+    q = (Arena + offsets[0]).to(tl.pointer_type(tl.float8e4nv))
+    k = (Arena + offsets[1]).to(tl.pointer_type(tl.float8e4nv))
+    return q, k, Arena + offsets[2], Arena + offsets[3]
+
+
+def _check_saved_qk_arena(arena, device, n):
+    if n not in (1024, 2048):
+        raise ValueError("Saved Q/K arena requires N1024/2048")
+    expected_bytes = _saved_qk_arena_layout(n)[-1]
+    if (not isinstance(arena, torch.Tensor) or arena.layout != torch.strided or arena.shape != (expected_bytes, )
+            or arena.dtype != torch.uint8 or arena.device != device or not arena.is_contiguous()
+            or arena.storage_offset() != 0 or arena.is_conj() or arena.is_neg()):
+        raise ValueError("Invalid saved Q/K arena metadata")
+    storage = arena.untyped_storage()
+    pointer = arena.data_ptr()
+    if storage.nbytes() != expected_bytes or pointer != storage.data_ptr() or pointer % 16 != 0:
+        raise ValueError("Whole, 16-byte-aligned saved Q/K arena required")
+
+
+def _saved_qk_arena_views(arena, n):
+    """Controlled views; callers must freshly validate the whole arena first."""
+    q, k, qs, ks, total = _saved_qk_arena_layout(n)
+    payload_bytes = k - q
+    scale_bytes = ks - qs
+    shape = (4, 32, n, 128)
+    scale_shape = (4, 32, n, 4)
+    return (arena.narrow(0, q, payload_bytes).view(torch.float8_e4m3fn).view(shape),
+            arena.narrow(0, k, payload_bytes).view(torch.float8_e4m3fn).view(shape),
+            arena.narrow(0, qs, scale_bytes).view(scale_shape), arena.narrow(0, ks, total - ks).view(scale_shape))
+
 
 @triton.jit
 def _store_prepared_payload_packed(payload, Y, head, group, N: tl.constexpr):
@@ -168,7 +217,10 @@ def _preparation_arena_segments(Arena, ARENA_N: tl.constexpr):
 
 
 @triton.jit
-def _prepare_fused_arena(V, DO, KS, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr):
+def _prepare_fused_arena(V, DO, KS, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr,
+                         QK_FORMAT: tl.constexpr = False):
+    if QK_FORMAT:
+        _, _, _, KS = _saved_qk_arena_segments(KS, N)
     vb, do8, vs, dos, kdqs, delta = _preparation_arena_segments(Arena, N)
     _prepare_fused(V, DO, KS, vb, do8, vs, dos, kdqs, O, delta, N, D, BLOCK_N, PACKED_STORES=True)
 
@@ -707,7 +759,10 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
 
 @triton.jit
 def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
-                        BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr):
+                        BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, QK_FORMAT: tl.constexpr = False):
+    if QK_FORMAT:
+        tl.static_assert(K is None and QS is None and KS is None)
+        Q, K, QS, KS = _saved_qk_arena_segments(Q, ARENA_N)
     vb, do8, vs, dos, _, delta = _preparation_arena_segments(Arena, ARENA_N)
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN, CAUSAL,
@@ -716,7 +771,9 @@ def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: 
 
 @triton.jit
 def _bwd_q_consume_arena(K, Arena, DQ, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr, BM: tl.constexpr,
-                         BK: tl.constexpr, CAUSAL: tl.constexpr, HEADS: tl.constexpr):
+                         BK: tl.constexpr, CAUSAL: tl.constexpr, HEADS: tl.constexpr, QK_FORMAT: tl.constexpr = False):
+    if QK_FORMAT:
+        _, K, _, _ = _saved_qk_arena_segments(K, ARENA_N)
     _, _, _, _, kdqs, _ = _preparation_arena_segments(Arena, ARENA_N)
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_q_consume(DS, DSS, K, kdqs, DQ, N, sm_scale, D, BM, BK, CAUSAL, HEADS)
@@ -744,10 +801,11 @@ def _arena_launch_controls():
     return True
 
 
-def _arena_launch_plan(device, n, causal, sm_scale):
+def _arena_launch_plan(device, n, causal, sm_scale, qk_format=False):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return None
-    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, causal, sm_scale))
+    format_key = _SAVED_QK_ARENA_FORMAT if qk_format else ("legacy_shared_square", 0)
+    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, causal, sm_scale, format_key))
     if plan is None:
         return None
     for current, entry in zip((_prepare_fused_arena, _bwd_kv_owner_arena, _bwd_q_consume_arena), plan):
@@ -763,7 +821,7 @@ def _arena_launch_plan(device, n, causal, sm_scale):
     return tuple(entry[5] for entry in plan)
 
 
-def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled):
+def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled, qk_format=False):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return
     entries = []
@@ -780,7 +838,8 @@ def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled):
         # JIT source edits require callers' hashes/caches to be invalidated,
         # as documented by JITCallable._unsafe_update_src. Track that contract.
         entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
-    _ARENA_LAUNCH_PLANS[(device.index, n, causal, sm_scale)] = tuple(entries)
+    format_key = _SAVED_QK_ARENA_FORMAT if qk_format else ("legacy_shared_square", 0)
+    _ARENA_LAUNCH_PLANS[(device.index, n, causal, sm_scale, format_key)] = tuple(entries)
 
 
 def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
@@ -822,6 +881,47 @@ def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16,
     return device, shape
 
 
+def _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse, *, allow_views=False):
+    """Fresh arena admission; general backward also accepts dense offset views."""
+    if not isinstance(v_bf16, torch.Tensor) or v_bf16.device.type != "cuda":
+        raise ValueError("Shared-square backward requires GPU tensors")
+    shape = tuple(v_bf16.shape)
+    if len(shape) != 4 or shape[:2] != (4, 32) or shape[2] not in (1024, 2048) or shape[3] != 128:
+        raise ValueError("Saved Q/K arena requires B4/H32/D128 and N1024/2048")
+    device = v_bf16.device
+    n = shape[2]
+    _check_saved_qk_arena(qk_arena, device, n)
+    payload_bytes = 128 * n * 128
+    specs = (("v_bf16", v_bf16, shape, torch.bfloat16, 2 * payload_bytes), ("do_bf16", do_bf16, shape, torch.bfloat16,
+                                                                            2 * payload_bytes),
+             ("out_bf16", out_bf16, shape, torch.bfloat16, 2 * payload_bytes), ("lse", lse, shape[:-1], torch.float32,
+                                                                                128 * n * 4))
+    for name, tensor, expected_shape, dtype, expected_bytes in specs:
+        if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided or tensor.shape != expected_shape
+                or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous()
+                or (not allow_views and tensor.storage_offset() != 0) or tensor.is_conj() or tensor.is_neg()):
+            raise ValueError("Invalid shared-square tensor metadata: " + name)
+        storage = tensor.untyped_storage()
+        pointer = tensor.data_ptr()
+        if allow_views:
+            offset_bytes = tensor.storage_offset() * (4 if dtype == torch.float32 else 2)
+            if (offset_bytes < 0 or storage.nbytes() < offset_bytes + expected_bytes
+                    or pointer != storage.data_ptr() + offset_bytes):
+                raise ValueError("Invalid dense saved tensor storage: " + name)
+        elif (storage.nbytes() != expected_bytes or pointer != storage.data_ptr() or pointer % 16 != 0):
+            raise ValueError("Whole, 16-byte-aligned storage required: " + name)
+    return device, shape
+
+
+def _check_shared_square_qk_arena_inputs(qk_arena, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
+    """Eligibility plus fresh admission for the private public-autograd format."""
+    if type(causal) is not bool:
+        raise ValueError("Shared-square backward requires an actual bool causal flag")
+    if type(sm_scale) is not float or not math.isfinite(sm_scale) or sm_scale != 0.5:
+        raise ValueError("Saved Q/K arena requires Python float sm_scale=0.5")
+    return _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse)
+
+
 def _is_gfx950(device):
     if torch.version.hip is None:
         return False
@@ -847,13 +947,23 @@ def _try_launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, d
     and launch share one invocation; no validation result is cached across
     calls. Allocation and kernel errors must propagate, not trigger fallback.
     """
+    qk_format = k_fp8 is None and q_scale is None and k_scale is None
     try:
-        device, shape = _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse,
-                                                    sm_scale, causal)
+        if qk_format:
+            device, shape = _check_shared_square_qk_arena_inputs(q_fp8, v_bf16, do_bf16, out_bf16, lse, sm_scale,
+                                                                 causal)
+            if shape[2] not in _PREPARATION_ARENA_BYTES:
+                return None
+        else:
+            device, shape = _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse,
+                                                        sm_scale, causal)
     except ValueError:
         return None
     if not _is_gfx950(device):
         return None
+    if qk_format:
+        return _launch_backward_shared_square(q_fp8, None, None, None, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal,
+                                              device, shape, qk_format=True)
     return _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale,
                                           causal, device, shape)
 
@@ -888,9 +998,11 @@ def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf1
 
 
 def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal,
-                                   device, shape):
+                                   device, shape, qk_format=False):
     """Launch after metadata/architecture checks, inside the input device context."""
     n = shape[2]
+    if qk_format and n not in _PREPARATION_ARENA_BYTES:
+        raise ValueError("Saved Q/K arena requires the private backward arena")
     feature_scale_shape = (4, 32, n, 4)
     sequence_scale_shape = (4, 32, 128, n // 32)
     # Derive temporary pointers inside JIT kernels instead of creating Torch
@@ -923,31 +1035,38 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
         # Every input was admitted in this call. Subclasses retain normal JIT
         # specialization because they may override tensor metadata access.
         ordinary_inputs = all(
-            type(tensor) is torch.Tensor for tensor in (q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse))
-        plan = _arena_launch_plan(device, n, causal, sm_scale) if ordinary_inputs else None
+            type(tensor) is torch.Tensor
+            for tensor in (q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse)
+            if tensor is not None)
+        plan = _arena_launch_plan(device, n, causal, sm_scale, qk_format) if ordinary_inputs else None
+        saved_ks = q_fp8 if qk_format else k_scale
+        saved_k = q_fp8 if qk_format else k_fp8
         if plan is not None:
             prepare, kv, query = plan
             # Resolve one invocation-local stream for this producer/consumer
             # chain. The cached public runners contain only kernels and grids.
             stream = driver.active.get_current_stream(device.index)
             # Pass the complete original ABI, including constexpr positions.
-            prepare(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, stream=stream)
-            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, causal, stream=stream)
-            query(k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, stream=stream)
+            prepare(v_bf16, do_bf16, saved_ks, out_bf16, arena, n, 128, 32, qk_format, stream=stream)
+            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, causal, qk_format,
+               stream=stream)
+            query(saved_k, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, qk_format, stream=stream)
         else:
             # N stays runtime in both reduction kernels; ARENA_N only fixes
             # preparation byte offsets. Cold JIT errors propagate unchanged.
-            prepare = _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4,
-                                               num_stages=2, grid=(n // 32, 128), warmup=False)
+            prepare = _prepare_fused_arena.run(v_bf16, do_bf16, saved_ks, out_bf16, arena, n, 128, 32,
+                                               QK_FORMAT=qk_format, num_warps=4, num_stages=2, grid=(n // 32, 128),
+                                               warmup=False)
             kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
-                                         D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1,
-                                         matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
-            query = _bwd_q_consume_arena.run(k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
-                                             CAUSAL=causal, HEADS=128, num_warps=4, num_stages=1,
+                                         D=128, BM=64, BN=64, CAUSAL=causal, QK_FORMAT=qk_format, num_warps=2,
+                                         num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64),
+                                         warmup=False)
+            query = _bwd_q_consume_arena.run(saved_k, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
+                                             CAUSAL=causal, HEADS=128, QK_FORMAT=qk_format, num_warps=4, num_stages=1,
                                              matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                                              warmup=False)
             if ordinary_inputs:
-                _remember_arena_launch_plan(device, n, causal, sm_scale, (prepare, kv, query))
+                _remember_arena_launch_plan(device, n, causal, sm_scale, (prepare, kv, query), qk_format)
     else:
         _prepare_fused.run(v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32, num_warps=4,
                            num_stages=2, grid=(n // 32, 128), warmup=False)

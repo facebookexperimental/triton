@@ -29,6 +29,23 @@ def _sdpa(q, k, v, causal, scale):
     )
 
 
+def _mxfp8_saved_square_inputs(out, *, whole=False):
+    """Test adapter; the separate-tensor public API still requires whole storage."""
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    saved = out.grad_fn.saved_tensors
+    if len(saved) == 6:
+        q, k, v, arena, saved_out, lse = saved
+        assert out.grad_fn.saved_format == shared._SAVED_QK_ARENA_FORMAT
+        shared._check_saved_qk_arena(arena, q.device, q.shape[2])
+        q8, k8, qs, ks = shared._saved_qk_arena_views(arena, q.shape[2])
+        if whole:
+            q8, k8, qs, ks = (tensor.clone() for tensor in (q8, k8, qs, ks))
+        return q, k, v, q8, k8, saved_out, lse, qs, ks
+    assert out.grad_fn.saved_format is None and len(saved) == 9
+    return saved
+
+
 @pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM,causal,dtype_name", CORRECTNESS_SHAPES)
 def test_flash_attn_mxfp8_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn_mxfp8
@@ -166,7 +183,7 @@ def _has_two_gfx950_devices():
 )
 def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scale):
     from triton.tlx.ops import flash_attn_mxfp8
-    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd, gfx950_bwd_shared
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950, gfx950_bwd, gfx950_bwd_shared
 
     torch.manual_seed(20)
     inputs = _qkv((4, 32, n_ctx, 128), requires_grad=True)
@@ -174,7 +191,8 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
     out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
     reference = _sdpa(*inputs, causal, scale)
     expected = torch.autograd.grad(reference, inputs, do)
-    _, _, v, q8, k8, saved_out, lse, qs, ks = out.grad_fn.saved_tensors
+    original_general = gfx950_bwd.launch_backward
+    _, _, v, q8, k8, saved_out, lse, qs, ks = _mxfp8_saved_square_inputs(out, whole=True)
     args = (q8, k8, qs, ks, v, do, saved_out, lse, scale)
     assert gfx950_bwd_shared.can_use_shared_square(*args, causal=causal)
     assert not gfx950_bwd_shared.can_use_shared_square(*args, causal=1)
@@ -201,19 +219,105 @@ def test_flash_attn_mxfp8_shared_backward_dispatch_and_graph(n_ctx, causal, scal
         return torch.autograd.grad(out, inputs, do, retain_graph=True)
 
     with mock.patch.object(gfx950_bwd, "launch_backward", side_effect=AssertionError("unexpected general path")):
-        with mock.patch.object(gfx950_bwd_shared, "_check_shared_square_inputs",
-                               wraps=gfx950_bwd_shared._check_shared_square_inputs) as validate:
+        validator = ("_check_shared_square_qk_arena_inputs" if n_ctx in (1024, 2048) else "_check_shared_square_inputs")
+        with mock.patch.object(gfx950_bwd_shared, validator, wraps=getattr(gfx950_bwd_shared, validator)) as validate:
             with mock.patch.object(gfx950_bwd_shared, "_is_gfx950", wraps=gfx950_bwd_shared._is_gfx950) as arch:
                 eager = backward()
         assert validate.call_count == arch.call_count == 1
         check(eager)
         if n_ctx in (1024, 2048):
-            # Compare packed preparation with the original FP8 stores using
-            # identical saved inputs before graph capture.
+            # Independently force the original forward and nonarena BN64
+            # backward. Check all four saved byte regions and O/LSE first.
+            with mock.patch.object(gfx950, "_PUBLIC_QK_ARENA_LENGTHS", ()):
+                original_out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+            original_saved = _mxfp8_saved_square_inputs(original_out)
+            packed_saved = _mxfp8_saved_square_inputs(out)
+            assert len(out.grad_fn.saved_tensors) == 6
+            assert len(original_out.grad_fn.saved_tensors) == 9
+            for index in (3, 4, 5, 6, 7, 8):
+                assert torch.equal(packed_saved[index].view(torch.uint8), original_saved[index].view(torch.uint8))
             with mock.patch.object(gfx950_bwd_shared, "_PREPARATION_ARENA_BYTES", {}):
-                original_stores = backward()
+                original_stores = torch.autograd.grad(original_out, inputs, do, retain_graph=True)
             for actual, original in zip(eager, original_stores):
                 assert torch.equal(actual.view(torch.uint8), original.view(torch.uint8))
+            del original_out, original_saved, packed_saved, original_stores
+
+            # Hooks must own all six real saved tensors, including the arena.
+            packed_shapes = []
+
+            def pack(tensor):
+                packed_shapes.append((tuple(tensor.shape), tensor.dtype))
+                return tensor.detach().clone()
+
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor.clone()):
+                hooked_out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+            assert len(packed_shapes) == 6
+            assert packed_shapes[3] == ((gfx950_bwd_shared._saved_qk_arena_layout(n_ctx)[-1], ), torch.uint8)
+            hooked = torch.autograd.grad(hooked_out, inputs, do, retain_graph=True)
+            for actual, expected_bytes in zip(hooked, eager):
+                assert torch.equal(actual.view(torch.uint8), expected_bytes.view(torch.uint8))
+            del hooked_out, hooked
+
+            versioned_out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+            with torch.no_grad():
+                versioned_out.grad_fn.saved_tensors[3][0].add_(1)
+            with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+                torch.autograd.grad(versioned_out, inputs, do)
+            del versioned_out
+
+            def offset_hook(tensor):
+                # Restore a valid dense view with natural, not 16-byte,
+                # alignment. The whole uint8 Q/K arena stays strict.
+                if tensor.dtype == torch.uint8 or tensor.dtype == torch.float8_e4m3fn:
+                    return tensor.clone()
+                storage = torch.empty(tensor.numel() + 3, device=tensor.device, dtype=tensor.dtype)
+                restored = storage[1:1 + tensor.numel()].view_as(tensor)
+                restored.copy_(tensor)
+                return restored
+
+            with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor.detach().clone(), offset_hook):
+                fallback_out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+                with mock.patch.object(gfx950, "_PUBLIC_QK_ARENA_LENGTHS", ()):
+                    fallback_original = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+            with mock.patch.object(gfx950_bwd, "launch_backward", new=original_general):
+                restored = torch.autograd.grad(fallback_out, inputs, do, retain_graph=True)
+                original_restored = torch.autograd.grad(fallback_original, inputs, do, retain_graph=True)
+            for actual, original in zip(restored, original_restored):
+                assert torch.equal(actual.view(torch.uint8), original.view(torch.uint8))
+            del fallback_out, fallback_original, restored, original_restored
+
+            def invalid_arena_hook(tensor):
+                if tensor.dtype != torch.uint8 or tensor.ndim != 1:
+                    return tensor.clone()
+                storage = torch.empty(tensor.numel() + 1, device=tensor.device, dtype=tensor.dtype)
+                storage[1:].copy_(tensor)
+                return storage[1:]
+
+            with torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor.detach().clone(), invalid_arena_hook):
+                malformed_out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=scale)
+            with mock.patch.object(gfx950_bwd_shared, "_saved_qk_arena_views",
+                                   side_effect=AssertionError("invalid arena reached views")):
+                with pytest.raises(ValueError, match="arena"):
+                    torch.autograd.grad(malformed_out, inputs, do)
+            del malformed_out
+
+            streams = (torch.cuda.Stream(), torch.cuda.Stream())
+            concurrent = []
+            for current in streams:
+                current.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(current):
+                    leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+                    concurrent_out = flash_attn_mxfp8(*leaves, causal=causal, sm_scale=scale)
+                    grads = torch.autograd.grad(concurrent_out, leaves, do, retain_graph=True)
+                    concurrent.append((concurrent_out, grads))
+            for current in streams:
+                current.synchronize()
+            arenas = [current_out.grad_fn.saved_tensors[3] for current_out, _ in concurrent]
+            assert arenas[0].data_ptr() != arenas[1].data_ptr()
+            for _, grads in concurrent:
+                for actual, original in zip(grads, eager):
+                    assert torch.equal(actual.view(torch.uint8), original.view(torch.uint8))
+            del concurrent, arenas
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
@@ -445,7 +549,8 @@ def test_flash_attn_mxfp8_shared_backward_live_metadata(n_ctx, causal):
 
 
 @pytest.mark.parametrize("n_ctx", (1024, 2048))
-def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx):
+@pytest.mark.parametrize("qk_format", (False, True))
+def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_format):
     from types import SimpleNamespace
     from triton import knobs
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
@@ -467,7 +572,11 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx):
             with mock.patch.object(shared, "_bwd_q_consume_arena", jits[2]):
                 with mock.patch.object(shared, "_ARENA_LAUNCH_PLANS", {}):
                     with mock.patch.object(shared, "_arena_launch_controls", return_value=True) as controls:
-                        shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels)
+                        shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels, qk_format)
+                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5, not qk_format) is None
+                        shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels, not qk_format)
+                        assert len(shared._ARENA_LAUNCH_PLANS) == 2
+                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is not None
                         assert shared._arena_launch_plan(device, n_ctx, False,
                                                          0.5) == tuple(kernel.__getitem__.return_value
                                                                        for kernel in kernels)
@@ -514,7 +623,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx):
 
 
 @pytest.mark.parametrize("n_ctx", (1024, 2048))
-def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx):
+@pytest.mark.parametrize("qk_format", (False, True))
+def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_format):
     from contextlib import ExitStack
     from types import SimpleNamespace
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
@@ -522,6 +632,10 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx):
     device = torch.device("cuda:2")
     shape = (4, 32, n_ctx, 128)
     inputs = [torch.empty(shape, device="meta") for _ in range(8)]
+    if qk_format:
+        inputs[:4] = [
+            torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="meta", dtype=torch.uint8), None, None, None
+        ]
     jits = (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena)
     # Populate real transitive source hashes without compiling or using a GPU.
     assert all(jit.cache_key for jit in jits)
@@ -546,28 +660,35 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx):
             kernel._compile_iq_acf_cubin = None
             stack.enter_context(mock.patch.object(jit, "device_caches", {2: ({"compiled-key": kernel}, )}))
             runs.append(stack.enter_context(mock.patch.object(jit, "run", return_value=kernel)))
-        cold = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
-        warm = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+        cold = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+        warm = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs)
         assert all(first is not second for first, second in zip(cold, warm))
         prepare_args = kernels[0].__getitem__.return_value.call_args.args
         kv_args = kernels[1].__getitem__.return_value.call_args.args
         query_args = kernels[2].__getitem__.return_value.call_args.args
         assert prepare_args[4] is kv_args[5] is query_args[1] is allocations[4]
-        assert query_args[0] is inputs[1]
+        assert query_args[0] is inputs[0 if qk_format else 1]
         assert query_args[2] is warm[0] and kv_args[6] is warm[1] and kv_args[7] is warm[2]
-        assert prepare_args[5:] == (n_ctx, 128, 32)
-        assert kv_args[10:] == (n_ctx, 128, 64, 64, False)
-        assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128)
+        assert prepare_args[5:] == (n_ctx, 128, 32, qk_format)
+        assert kv_args[10:] == (n_ctx, 128, 64, 64, False, qk_format)
+        assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128, qk_format)
+        actual_tensors = sum(
+            isinstance(arg, torch.Tensor) for args in (prepare_args, kv_args, query_args) for arg in args)
+        assert actual_tensors == (13 if qk_format else 16)
+        assert kv_args[0] is inputs[0]
+        if qk_format:
+            assert kv_args[1:4] == (None, None, None)
+            assert prepare_args[2] is query_args[0] is inputs[0]
         assert all(kernel.__getitem__.call_count == 1 for kernel in kernels)
         assert all(kernel.__getitem__.return_value.call_args.kwargs == {"stream": 101} for kernel in kernels)
         # A supported source edit invalidates each caller's hash. The live
         # real JIT objects must reject a retained compiled plan afterward.
         with mock.patch.object(jits[1], "hash", None):
-            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+            assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is None
         kernels[1].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
         with pytest.raises(RuntimeError, match="compiled launch failed"):
-            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs), "compiled launch errors must not retry JIT"
 
 
@@ -642,6 +763,159 @@ def test_flash_attn_mxfp8_shared_backward_compiled_runner_current_stream():
             runner("second call")
     assert kernel.run.call_args_list[0].args[3] == 101
     assert kernel.run.call_args_list[1].args[3] == 202
+
+
+@pytest.mark.parametrize("n_ctx", (1024, 2048))
+@pytest.mark.parametrize("offset", (1, 8))
+def test_flash_attn_mxfp8_public_qk_arena_admission(n_ctx, offset):
+    """Real CPU storage proves strict arena and general dense-view contracts."""
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    shape = (4, 32, n_ctx, 128)
+    elements = 128 * n_ctx * 128
+    arena = torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="cpu", dtype=torch.uint8)
+    whole = torch.empty(shape, device="cpu", dtype=torch.bfloat16)
+    whole_lse = torch.empty(shape[:-1], device="cpu", dtype=torch.float32)
+    view = torch.empty(elements + offset + 3, device="cpu", dtype=torch.bfloat16)[offset:offset + elements].view(shape)
+    view_lse = torch.empty(128 * n_ctx + offset + 3, device="cpu",
+                           dtype=torch.float32)[offset:offset + 128 * n_ctx].view(shape[:-1])
+    device = torch.device("cuda:2")
+    with mock.patch.object(torch.Tensor, "device", property(lambda tensor: device)):
+        assert shared._check_saved_qk_backward_tensors(arena, whole, whole, whole, whole_lse) == (device, shape)
+        with pytest.raises(ValueError, match="metadata"):
+            shared._check_saved_qk_backward_tensors(arena, view, view, view, view_lse)
+        assert shared._check_saved_qk_backward_tensors(arena, view, view, view, view_lse,
+                                                       allow_views=True) == (device, shape)
+        bad_arena = torch.empty(arena.numel() + 1, device="cpu", dtype=torch.uint8)[1:]
+        for allow_views in (False, True):
+            with pytest.raises(ValueError, match="arena"):
+                shared._check_saved_qk_backward_tensors(bad_arena, whole, whole, whole, whole_lse,
+                                                        allow_views=allow_views)
+        with mock.patch.object(shared, "_is_gfx950", return_value=True):
+            with mock.patch.object(shared, "_launch_backward_shared_square", return_value="launched") as launch:
+                assert shared._try_launch_backward_shared_square(arena, None, None, None, whole, whole, whole,
+                                                                 whole_lse, 0.5) == "launched"
+                assert launch.call_args.kwargs == {"qk_format": True}
+                for slots in ((None, whole, None), (whole, None, None), (None, None, whole)):
+                    assert shared._try_launch_backward_shared_square(arena, *slots, whole, whole, whole, whole_lse,
+                                                                     0.5) is None
+                launch.side_effect = RuntimeError("allocation failed")
+                with pytest.raises(RuntimeError, match="allocation failed"):
+                    shared._try_launch_backward_shared_square(arena, None, None, None, whole, whole, whole, whole_lse,
+                                                              0.5)
+        regions = shared._saved_qk_arena_views(arena, n_ctx)
+        offsets = shared._saved_qk_arena_layout(n_ctx)
+        for index, region in enumerate(regions):
+            assert region.data_ptr() == arena.data_ptr() + offsets[index]
+            byte_view = region.view(torch.uint8).reshape(-1)
+            byte_view[0] = byte_view[-1] = index + 1
+        for index, region in enumerate(regions):
+            byte_view = region.view(torch.uint8).reshape(-1)
+            assert int(byte_view[0]) == int(byte_view[-1]) == index + 1
+
+
+def test_flash_attn_mxfp8_public_qk_arena_fallback_validation():
+    """Fallback checks precede view derivation and preserve valid offset inputs."""
+    from contextlib import ExitStack, nullcontext
+    from types import SimpleNamespace
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950, gfx950_bwd, gfx950_bwd_shared as shared, gfx950_quant
+
+    n_ctx = 1024
+    shape = (4, 32, n_ctx, 128)
+    device = torch.device("cuda:2")
+    q = torch.empty(shape, device="cpu", dtype=torch.bfloat16)
+    view = torch.empty(q.numel() + 3, device="cpu", dtype=q.dtype)[1:1 + q.numel()].view(shape)
+    lse = torch.empty(128 * n_ctx + 3, device="cpu", dtype=torch.float32)[1:1 + 128 * n_ctx].view(shape[:-1])
+    arena = torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="cpu", dtype=torch.uint8)
+    ctx = SimpleNamespace(saved_format=shared._SAVED_QK_ARENA_FORMAT, saved_tensors=(q, q, view, arena, view, lse),
+                          sm_scale=0.5, causal=False)
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(torch.Tensor, "device", property(lambda tensor: device)))
+        stack.enter_context(mock.patch.object(torch.cuda, "device", lambda device: nullcontext()))
+        stack.enter_context(mock.patch.object(shared, "_try_launch_backward_shared_square", return_value=None))
+        views = stack.enter_context(
+            mock.patch.object(shared, "_saved_qk_arena_views", wraps=shared._saved_qk_arena_views))
+        quantize = stack.enter_context(
+            mock.patch.object(gfx950_quant, "quantize_backward_operands", return_value=((object(), object()), ) * 5))
+        launch = stack.enter_context(mock.patch.object(gfx950_bwd, "launch_backward"))
+        gradients = gfx950._MXFP8Attention.backward(ctx, view)
+        assert len(gradients) == 5 and gradients[-2:] == (None, None)
+        assert views.call_count == quantize.call_count == launch.call_count == 1
+        assert quantize.call_args.args[:3] == (q, q, view)
+        saved = ctx.saved_tensors
+        for bad_index, malformed in ((3, arena[1:]), (4, view.transpose(-1, -2)), (5, lse.to(torch.bfloat16))):
+            changed = list(saved)
+            changed[bad_index] = malformed
+            ctx.saved_tensors = tuple(changed)
+            with pytest.raises(ValueError):
+                gfx950._MXFP8Attention.backward(ctx, view)
+            assert views.call_count == quantize.call_count == launch.call_count == 1
+        ctx.saved_tensors = saved
+        launch.side_effect = RuntimeError("general launch failed")
+        with pytest.raises(RuntimeError, match="general launch failed"):
+            gfx950._MXFP8Attention.backward(ctx, view)
+        ctx.saved_format = ("unknown", 99)
+        with pytest.raises(ValueError, match="Unknown"):
+            gfx950._MXFP8Attention.backward(ctx, view)
+
+
+def test_flash_attn_mxfp8_public_qk_arena_live_helpers():
+    """Changes to live producer controls retain the original quantizer route."""
+    from contextlib import ExitStack
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950, gfx950_bwd_shared as shared
+
+    inputs = tuple(torch.empty((4, 32, 1024, 128), device="meta", dtype=torch.bfloat16) for _ in range(3))
+    device = torch.device("cuda:2")
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(torch.Tensor, "device", property(lambda tensor: device)))
+        stack.enter_context(mock.patch.object(shared, "_is_gfx950", return_value=True))
+        controls = stack.enter_context(mock.patch.object(shared, "_arena_launch_controls", return_value=True))
+
+        def selected():
+            return gfx950._can_save_public_qk_arena(*inputs, 0.5, False)
+
+        assert selected()
+        controls.return_value = False
+        assert not selected()
+        controls.return_value = True
+        for helper_name, expected in gfx950._PUBLIC_QK_FORWARD_HELPERS:
+            helper = getattr(gfx950, helper_name)
+            with mock.patch.object(gfx950, helper_name, lambda *args, **kwargs: None):
+                assert not selected()
+            code, defaults, kwdefaults = helper.__code__, helper.__defaults__, helper.__kwdefaults__
+            try:
+                helper.__code__ = (lambda *args: None).__code__
+                assert not selected()
+            finally:
+                helper.__code__ = code
+            try:
+                helper.__defaults__ = ("changed", )
+                assert not selected()
+            finally:
+                helper.__defaults__ = defaults
+            keywords = dict(expected[3])
+            keywords[0] = False  # Legal Python metadata with incomparable key types.
+            try:
+                helper.__kwdefaults__ = keywords
+                assert not selected()
+            finally:
+                helper.__kwdefaults__ = kwdefaults
+            assert selected()
+        for name, jit, _ in gfx950._PUBLIC_QK_JIT_HELPERS:
+            for attribute, changed in (("pre_run_hooks", [lambda: None]), ("launch_metadata", lambda *args: None),
+                                       ("debug", True), ("_src", jit.src + "\n# changed")):
+                with mock.patch.object(jit, attribute, changed):
+                    assert not selected()
+            assert getattr(gfx950, name) is jit
+        with mock.patch.object(gfx950, "_FP8", torch.float8_e5m2):
+            assert not selected()
+        assert not gfx950._can_save_public_qk_arena(*inputs, 0.5, 1)
+        assert not gfx950._can_save_public_qk_arena(*inputs, 0.7, False)
+
+        class Subclass(torch.Tensor):
+            pass
+
+        assert not gfx950._can_save_public_qk_arena(inputs[0].as_subclass(Subclass), *inputs[1:], 0.5, False)
 
 
 def test_flash_attn_mxfp8_shared_backward_host_dispatch():
@@ -720,7 +994,7 @@ def _shared_fp8_boundary_fixture(causal):
     inputs = _qkv((4, 32, 1024, 128), requires_grad=True)
     do = torch.randn_like(inputs[0]) * .5
     out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=.5)
-    _, _, v, q8, k8, saved_out, lse, qs, ks = out.grad_fn.saved_tensors
+    _, _, v, q8, k8, saved_out, lse, qs, ks = _mxfp8_saved_square_inputs(out, whole=True)
     # Backward V uses feature32, not forward V's sequence32 quantization.
     v8, vs = quantize_mxfp8(v, transpose_for_reduction=False)
     args = (q8, k8, v8, qs, ks, vs, do, saved_out, lse, .5)
@@ -729,7 +1003,23 @@ def _shared_fp8_boundary_fixture(causal):
 
 @pytest.mark.parametrize("causal", (False, True))
 def test_flash_attn_mxfp8_shared_fp8_boundary_graph(causal):
-    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950, gfx950_bwd_shared as shared
+
+    # Compile and execute the exact new public Q/K wrappers on zero squares
+    # and adjacent BF16 values around the RCEIL scale boundary at 448/512.
+    boundary = torch.tensor([0., 0., .8671875, .875, .87890625, -.875, -.87890625, 2**-15], device="cuda",
+                            dtype=torch.bfloat16).repeat(4 * 32 * 1024 * 128 // 8).view(4, 32, 1024, 128)
+    boundary[:, :, :32, :32] = 0
+    saved_arena = torch.empty(shared._saved_qk_arena_layout(1024)[-1], device=boundary.device, dtype=torch.uint8)
+    for key, operand in ((False, boundary), (True, boundary.flip(-1).contiguous())):
+        gfx950._quantize_saved_qk_arena[(16, 128)](operand, saved_arena, *operand.stride(), ARENA_N=1024, KEY=key,
+                                                   num_warps=4)
+        old_payload, old_scale = gfx950.quantize_mxfp8_head(operand)
+        regions = shared._saved_qk_arena_views(saved_arena, 1024)
+        payload, exponent = (regions[1], regions[3]) if key else (regions[0], regions[2])
+        assert torch.equal(payload.view(torch.uint8), old_payload.view(torch.uint8))
+        assert torch.equal(exponent, old_scale)
+    del boundary, saved_arena, regions, payload, exponent, old_payload, old_scale
 
     inputs, out, args = _shared_fp8_boundary_fixture(causal)
     q8, k8, v8, qs, ks, vs, do, saved_out, lse, scale = args
