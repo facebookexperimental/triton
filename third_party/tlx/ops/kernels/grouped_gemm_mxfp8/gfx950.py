@@ -29,6 +29,8 @@ from triton.tlx.ops.kernels.grouped_gemm.gfx950 import (
 from triton.tlx.ops.kernels.grouped_gemm_mxfp8._scales import prepare_scales
 
 _BLOCK_K = 128
+# AMD buffer descriptors expose at most this many bytes from each scalar base.
+_MAX_BUFFER_BYTES = (1 << 31) - 2
 
 # [128, 4] E8M0 scale slice (flat r * 4 + c): each lane copies one row's 4
 # contiguous bytes, so direct-to-LDS issues 32-bit copies. The two extra thread
@@ -161,8 +163,8 @@ def _quad_tile(
             (offs_r[:, None] % 32) * 16 + (offs_r[:, None] // 32) * 4 + sc_cols[None, :] + opaque_zero * 256,
             _SCALE_COPY_LAYOUT)
 
-    row_top = (pid_m * BLOCK_SIZE_M) % m_size
-    row_bot = (pid_m * BLOCK_SIZE_M + HALF_M) % m_size
+    row_top = (pid_m.to(tl.int64) * BLOCK_SIZE_M) % m_size
+    row_bot = (pid_m.to(tl.int64) * BLOCK_SIZE_M + HALF_M) % m_size
     a_top_base = a_ptr + row_top.to(tl.int64) * K
     a_bot_base = a_ptr + row_bot.to(tl.int64) * K
     a_top_off = tile_off
@@ -173,8 +175,8 @@ def _quad_tile(
     sa_bot_off = sc_off
 
     if N_ALIGNED:
-        col_left = (pid_n * BLOCK_SIZE_N) % N
-        col_right = (pid_n * BLOCK_SIZE_N + HALF_N) % N
+        col_left = (pid_n.to(tl.int64) * BLOCK_SIZE_N) % N
+        col_right = (pid_n.to(tl.int64) * BLOCK_SIZE_N + HALF_N) % N
         b_left_base = b_ptr + col_left.to(tl.int64) * K
         b_right_base = b_ptr + col_right.to(tl.int64) * K
         b_left_off = tile_off
@@ -184,17 +186,23 @@ def _quad_tile(
         sb_left_off = sc_off
         sb_right_off = sc_off
     else:
-        # A ragged N tail can straddle a 128-row weight block: wrap per row.
-        n_left = (pid_n * BLOCK_SIZE_N + offs_r) % N
-        n_right = (pid_n * BLOCK_SIZE_N + HALF_N + offs_r) % N
-        b_left_base = b_ptr
-        b_right_base = b_ptr
-        b_left_off = n_left[:, None] * K + offs_k[None, :]
-        b_right_off = n_right[:, None] * K + offs_k[None, :]
-        sb_left_base = bs_ptr
-        sb_right_base = bs_ptr
-        sb_left_off = tlx.require_layout(_scale_offsets(n_left, k_chunks, False), _SCALE_COPY_LAYOUT)
-        sb_right_off = tlx.require_layout(_scale_offsets(n_right, k_chunks, False), _SCALE_COPY_LAYOUT)
+        # Rebase each ragged half at its aligned first column. Invalid columns
+        # read that first column and are discarded by the output mask. Scales
+        # already have padding to a whole 128-row atom.
+        col_left = pid_n.to(tl.int64) * BLOCK_SIZE_N
+        col_right = col_left + HALF_N
+        col_left = tl.where(col_left < N, col_left, 0)
+        col_right = tl.where(col_right < N, col_right, 0)
+        b_left_base = b_ptr + col_left * K
+        b_right_base = b_ptr + col_right * K
+        left_rows = tl.where(offs_r < N - col_left, offs_r, 0)
+        right_rows = tl.where(offs_r < N - col_right, offs_r, 0)
+        b_left_off = left_rows[:, None] * K + offs_k[None, :]
+        b_right_off = right_rows[:, None] * K + offs_k[None, :]
+        sb_left_base = bs_ptr + (col_left // 128) * k_chunks * 512
+        sb_right_base = bs_ptr + (col_right // 128) * k_chunks * 512
+        sb_left_off = sc_off
+        sb_right_off = sc_off
 
     kb1: tl.constexpr = BLOCK_SIZE_K
     ka = tl.zeros([], dtype=tl.int32)
@@ -396,9 +404,9 @@ def _quad_tile(
         acc_tr = tl.dot_scaled(a_top_t, sa_t_t, "e4m3", b_right_t, sb_r_t, "e4m3", acc_tr)
         acc_br = tl.dot_scaled(a_bot_t, sa_b_t, "e4m3", b_right_t, sb_r_t, "e4m3", acc_br)
 
-    offs_cm_top = pid_m * BLOCK_SIZE_M + tl.arange(0, HALF_M)
+    offs_cm_top = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, HALF_M)
     offs_cm_bot = offs_cm_top + HALF_M
-    offs_cn_left = pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)
+    offs_cn_left = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, HALF_N)
     offs_cn_right = offs_cn_left + HALF_N
     tl.store(
         c_ptr + offs_cm_top[:, None] * N + offs_cn_left[None, :],
@@ -444,8 +452,8 @@ def _generic_tile(
 ):
     """Compiler-pipelined tile for problems too small to fill the CUs at 256x256."""
     # Widen row indices before multiplying by data and scale strides.
-    lm = ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m_size).to(tl.int64)
-    nn = ((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N).to(tl.int64)
+    lm = (pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m_size
+    nn = (pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
     a_ptrs = a_ptr + lm[:, None] * K + offs_k[None, :]
@@ -465,8 +473,8 @@ def _generic_tile(
         sa_ptrs += 512
         sb_ptrs += 512
 
-    offs_cm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_cm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     tl.store(
         c_ptr + offs_cm[:, None] * N + offs_cn[None, :],
         acc.to(tl.bfloat16),
@@ -500,7 +508,7 @@ def _mxfp8_grouped_gemm_kernel(
     K_MAJOR: tl.constexpr,
 ):
     """Persistent XCD-remapped scheduler over the concatenated per-group tile space."""
-    pid = chiplet_transform_chunked(tl.program_id(0), NUM_SM, NUM_XCDS, XCD_CHUNK)
+    pid = chiplet_transform_chunked(tl.program_id(0), NUM_SM, NUM_XCDS, XCD_CHUNK).to(tl.int64)
     k_chunks = K // BLOCK_SIZE_K
 
     if TILE_MODE == 0:
@@ -548,12 +556,12 @@ def _mxfp8_grouped_gemm_kernel(
             smem_sb_right = tlx.local_alloc((HALF_N, BLOCK_SIZE_K // 32), dt_s, 2)
 
     tile_idx = pid
-    last_problem_end = 0
-    running_m = 0
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    last_problem_end = tl.full((), 0, tl.int64)
+    running_m = tl.full((), 0, tl.int64)
+    num_n_tiles = tl.cdiv(N.to(tl.int64), BLOCK_SIZE_N)
 
     for g in range(G):
-        m_size = tl.load(split_sizes_ptr + g)
+        m_size = tl.load(split_sizes_ptr + g).to(tl.int64)
         _device_trap_if((m_size < 0) | (running_m % 128 != 0) | (running_m + m_size > M))
         m_start = running_m
         num_m_tiles = tl.cdiv(m_size, BLOCK_SIZE_M)
@@ -599,7 +607,7 @@ def _mxfp8_grouped_gemm_kernel(
                     BLOCK_SIZE_N=BLOCK_SIZE_N,
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     N_ALIGNED=N_ALIGNED,
-                    opaque_zero=tile_idx // 0x7FFFFFFF,
+                    opaque_zero=(tile_idx // 0x7FFFFFFFFFFFFFFF).to(tl.int32),
                     K_MAJOR=K_MAJOR,
                 )
             else:
@@ -630,10 +638,10 @@ def _mxfp8_grouped_gemm_kernel(
     _device_trap_if(running_m != M)
 
 
-def _pick_config(gm: int, n: int, nsm: int) -> dict[str, int]:
-    """Quadrant engine when 256x256 tiles fill the machine, else a smaller generic tile."""
+def _pick_config(gm: int, n: int, nsm: int, *, k: int, allow_quad: bool = True) -> dict[str, int]:
+    """Use quadrants when tiles fill the machine and each half fits its buffer descriptor."""
     quad_tiles = _cdiv(gm, 256) * _cdiv(n, 256)
-    if quad_tiles >= nsm:
+    if allow_quad and quad_tiles >= nsm and 128 * k <= _MAX_BUFFER_BYTES:
         return {
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_N": 256,
@@ -715,9 +723,15 @@ def grouped_gemm_mxfp8(
         launch_sms = props.multi_processor_count if num_sms is None else num_sms
         if launch_sms <= 0:
             raise ValueError("num_sms must be positive")
-        cfg = _pick_config(gm, n, launch_sms)
+        cfg = _pick_config(gm, n, launch_sms, k=k)
         if config:
             cfg.update(config)
+        # Direct-to-LDS needs a bounded byte span and provable pointer alignment.
+        # Generic loads use full 64-bit addresses and support shifted storage.
+        quad_safe = 128 * k <= _MAX_BUFFER_BYTES and all(tensor.data_ptr() % 16 == 0
+                                                         for tensor in (x, w, x_scale_5d, w_scale_5d))
+        if cfg["TILE_MODE"] == 0 and not quad_safe:
+            cfg = _pick_config(gm, n, launch_sms, k=k, allow_quad=False)
 
         _mxfp8_grouped_gemm_kernel[(launch_sms, )](
             x,

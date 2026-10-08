@@ -7,9 +7,13 @@ from unittest import mock
 
 import pytest
 import torch
+import triton
+import triton.language as tl
+import triton.language.extra.tlx as tlx
 
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops.kernels.grouped_gemm._shapes import CORRECTNESS_SHAPES
+from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _grouped_gemm_tile
 
 
 def _gfx950_device_indices():
@@ -258,6 +262,130 @@ def test_grouped_gemm_generic_large_row_offsets(operand):
     tile = out[-block:] if operand == "a" else out[:, -block:]
     # Eight nonzero K-tail products, each 0.25 * 0.25.
     torch.testing.assert_close(tile, torch.full_like(tile, 0.5), atol=0, rtol=0)
+
+
+@triton.jit
+def _grouped_gemm_quadrant_test_tile(a, b, c, m, n, k, pid_m, pid_n, INPUT_CONTIGUITY: tl.constexpr = 8):
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
+        [128, 64],
+    )
+    a_top = tlx.local_alloc((128, 64), tl.float16, 2, layout=layout)
+    a_bot = tlx.local_alloc((128, 64), tl.float16, 2, layout=layout)
+    b_left = tlx.local_alloc((128, 64), tl.float16, 2, layout=layout)
+    b_right = tlx.local_alloc((128, 64), tl.float16, 2, layout=layout)
+    _grouped_gemm_tile(pid_m, pid_n, a, b, c, m, n, k, k, k, n, a_top, a_bot, b_left, b_right, BLOCK_SIZE_M=256,
+                       BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, NUM_BUFFERS=2, HAS_K_TAIL=True,
+                       INPUT_CONTIGUITY=INPUT_CONTIGUITY)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("operand", ["a", "b"])
+def test_grouped_gemm_quadrant_large_input_offsets(operand, monkeypatch):
+    block = 256
+    # The final tile exceeds the old descriptor's 2 GiB byte range. The final
+    # ragged tile also checks clamping across the second half and the K tail.
+    outer = 32768 + block - 17
+    k = 65536 + 8
+    m, n = (outer, 129) if operand == "a" else (129, outer)
+    pid_m, pid_n = (128, 0) if operand == "a" else (0, 128)
+    a = torch.empty((m, k), device="cuda", dtype=torch.float16)
+    b = torch.empty((n, k), device="cuda", dtype=torch.float16)
+    large = a[32768:] if operand == "a" else b[32768:]
+    other = b if operand == "a" else a
+    large.zero_()
+    large[:, -8:].fill_(0.25)
+    other.fill_(0.25)
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    _grouped_gemm_quadrant_test_tile[(1, )](a, b, out, m, n, k, pid_m, pid_n, num_warps=8, matrix_instr_nonkdim=16,
+                                            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+    tile = out[32768:] if operand == "a" else out[:, 32768:]
+    torch.testing.assert_close(tile, torch.full_like(tile, 0.5), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+def test_grouped_gemm_quadrant_large_output_offsets(monkeypatch):
+    m, n, k = 32768 + 256 - 17, 65536, 136
+    a = torch.ones((m, k), device="cuda", dtype=torch.float16)
+    b = torch.ones((n, k), device="cuda", dtype=torch.float16)
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    _grouped_gemm_quadrant_test_tile[(1, )](a, b, out, m, n, k, 128, 0, num_warps=8, matrix_instr_nonkdim=16,
+                                            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+    tile = out[32768:, :256]
+    torch.testing.assert_close(tile, torch.full_like(tile, k), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("k", [130, 131])
+@pytest.mark.parametrize("wide_scheduler", [False, True])
+def test_grouped_gemm_quadrant_input_alignment(k, wide_scheduler):
+    from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _CONFIG, _make_grouped_gemm_args, _perf_fn
+
+    group_a, group_b = _make_groups([(257, 257, k)])
+    args = _make_grouped_gemm_args(group_a, group_b, config=_CONFIG)
+    *launch_args, cfg, outputs = args
+    assert cfg["TILE_MODE"] == (0 if k % 2 == 0 else 1)
+    assert cfg["INPUT_CONTIGUITY"] == (2 if k % 2 == 0 else 1)
+    cfg["WIDE_SCHEDULER"] = wide_scheduler
+    _perf_fn(*launch_args, cfg)
+    torch.testing.assert_close(outputs[0], group_a[0] @ group_b[0], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("storage_offset", [1, 2])
+def test_grouped_gemm_shifted_input_alignment(storage_offset):
+    from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _CONFIG, _make_grouped_gemm_args, _perf_fn
+
+    m, n, k = 257, 257, 136
+    a = torch.randn(m * k + storage_offset, device="cuda", dtype=torch.float16)[storage_offset:].reshape(m, k)
+    b = torch.randn(n * k + storage_offset, device="cuda", dtype=torch.float16)[storage_offset:].reshape(n, k).T
+    *args, cfg, outputs = _make_grouped_gemm_args([a], [b], config=_CONFIG)
+    assert cfg["INPUT_CONTIGUITY"] == storage_offset
+    assert cfg["TILE_MODE"] == (1 if storage_offset == 1 else 0)
+    _perf_fn(*args, cfg)
+    torch.testing.assert_close(outputs[0], a @ b, atol=1e-2, rtol=1e-2)
+
+
+def test_grouped_gemm_quadrant_buffer_span_falls_back():
+    from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _pick_config
+
+    with mock.patch("triton.tlx.ops.kernels.grouped_gemm.gfx950._num_sms", return_value=256):
+        # Check the last even stride that fits, then the first one that does not.
+        assert _pick_config([(4096, 4096, (1 << 22) - 2)] * 16, torch.device("cpu"))["TILE_MODE"] == 0
+        assert _pick_config([(4096, 4096, 1 << 22)] * 16, torch.device("cpu"))["TILE_MODE"] == 1
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+def test_grouped_gemm_quadrant_buffer_span_fallback_correctness():
+    from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _CONFIG, _make_grouped_gemm_args, _perf_fn
+
+    m, n, k = 256, 8, 1 << 22
+    a = torch.zeros((m, k), device="cuda", dtype=torch.float16)
+    a[:, -8:].fill_(0.25)
+    b = torch.full((n, k), 0.25, device="cuda", dtype=torch.float16).T
+    *args, cfg, outputs = _make_grouped_gemm_args([a], [b], config=_CONFIG)
+    assert cfg["TILE_MODE"] == 1
+    _perf_fn(*args, cfg)
+    # A direct-to-LDS descriptor clips the final vector in the last row.
+    torch.testing.assert_close(outputs[0], torch.full_like(outputs[0], 0.5), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("m,n,wide_scheduler", [(32768, 32768, False), ((1 << 31) - 1, (1 << 31) - 1, True)])
+def test_grouped_gemm_large_metadata_config(m, n, wide_scheduler):
+    from triton.tlx.ops.kernels.grouped_gemm.gfx950 import _make_grouped_gemm_args
+
+    # Meta tensors check descriptor and tile-count boundaries without allocating
+    # or computing the full matrices. Every dimension still fits signed i32.
+    a = torch.empty((m, 8), device="meta", dtype=torch.float16)
+    b = torch.empty((n, 8), device="meta", dtype=torch.float16).T
+    with mock.patch("triton.tlx.ops.kernels.grouped_gemm.gfx950._num_sms", return_value=256):
+        *_, cfg, _ = _make_grouped_gemm_args([a], [b])
+    assert cfg["WIDE_SCHEDULER"] is wide_scheduler
+    assert cfg["WIDE_OUTPUT"]
+    assert cfg["REBASE_INPUTS"] is (m > 32768)
 
 
 @pytest.mark.skipif(len(_gfx950_device_indices()) < 2, reason="Requires two gfx950 GPUs")
