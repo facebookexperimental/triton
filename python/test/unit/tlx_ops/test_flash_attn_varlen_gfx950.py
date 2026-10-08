@@ -86,6 +86,82 @@ def test_flash_attn_varlen_heads(heads, kv_heads, dtype):
     _check([300, 700, 64], [300, 700, 64], True, heads=heads, kv_heads=kv_heads, dtype=dtype, sm_scale=0.05)
 
 
+def test_flash_attn_varlen_split_plan():
+    from triton.tlx.ops.kernels.flash_attn_varlen.gfx950 import MAX_PARTIALS, _run_length, _split_plan
+
+    assert _split_plan(1, 16, 256)[0] > 0 and _split_plan(10, 16, 256)[0] > 0
+    assert _split_plan(13, 19, 256) == (0, 19, 1)
+    for bh in range(1, 40):
+        for num_m_blocks in range(1, 40):
+            split, items_per_bh, max_splits = _split_plan(bh, num_m_blocks, 256)
+            if split:
+                splits = [m // split + 1 for m in range(num_m_blocks)]
+                assert items_per_bh == sum(splits) and max_splits == max(splits)
+                assert _run_length(bh * items_per_bh, max_splits) <= 32
+                assert bh * (items_per_bh - num_m_blocks) <= MAX_PARTIALS
+
+
+@pytest.mark.parametrize(
+    "lengths,heads,kv_heads",
+    [([1000], 1, 1), ([1000] * 10, 1, 1), ([1200] * 10, 1, 1), ([700, 1200, 950, 801, 1100, 760, 1000], 1, 1),
+     ([1000, 640], 4, 2)],
+)
+def test_flash_attn_varlen_causal_split(lengths, heads, kv_heads):
+    """Causal shapes whose query tiles are split by key range and merged."""
+    torch.manual_seed(20)
+    _check(lengths, lengths, True, heads=heads, kv_heads=kv_heads)
+
+
+def _split_inputs(lengths, n=1):
+    q, k, v = (torch.randn(n, sum(lengths), 1, 128, device="cuda", dtype=torch.float16) for _ in range(3))
+    return q, k, v, _cu(lengths)
+
+
+def test_flash_attn_varlen_split_repeat_and_graph():
+    """The per-tile counters return to zero after each launch, eager or replayed."""
+    from triton.tlx.ops import flash_attn_varlen
+
+    torch.manual_seed(20)
+    lengths = [1000] * 10
+    q, k, v, cu = _split_inputs(lengths, 3)
+    eager = [flash_attn_varlen(q[i], k[i], v[i], cu, cu, 1000, 1000, causal=True) for i in range(3)]
+    for _ in range(3):
+        torch.testing.assert_close(flash_attn_varlen(q[0], k[0], v[0], cu, cu, 1000, 1000, causal=True), eager[0],
+                                   atol=0, rtol=0)
+    sq, sk, sv = q[0].clone(), k[0].clone(), v[0].clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = flash_attn_varlen(sq, sk, sv, cu, cu, 1000, 1000, causal=True)
+    for i in (1, 2, 0, 1):
+        sq.copy_(q[i])
+        sk.copy_(k[i])
+        sv.copy_(v[i])
+        graph.replay()
+        torch.testing.assert_close(out, eager[i], atol=0, rtol=0)
+
+
+def test_flash_attn_varlen_split_streams():
+    """Launches on two streams at once use separate counters."""
+    from triton.tlx.ops import flash_attn_varlen
+
+    torch.manual_seed(20)
+    lengths = [1000] * 4
+    q, k, v, cu = _split_inputs(lengths, 2)
+    expected = [flash_attn_varlen(q[i], k[i], v[i], cu, cu, 1000, 1000, causal=True) for i in range(2)]
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+    outs = [[], []]
+    for _ in range(20):
+        for i, s in enumerate(streams):
+            with torch.cuda.stream(s):
+                outs[i].append(flash_attn_varlen(q[i], k[i], v[i], cu, cu, 1000, 1000, causal=True))
+    torch.cuda.synchronize()
+    for i in range(2):
+        for out in outs[i]:
+            torch.testing.assert_close(out, expected[i], atol=0, rtol=0)
+
+
 def test_flash_attn_varlen_strided_qkv():
     """Q/K/V as head slices of one packed `(tokens, 3 * heads, 128)` projection."""
     from triton.tlx.ops import flash_attn_varlen
