@@ -67,6 +67,42 @@ def _prepare_fused(V, DO, KS, VB, DO8, VS, DOS, KDQS, O, Delta, N: tl.constexpr,
 
 
 @constexpr_function
+def _preparation_arena_layout(n):
+    """Byte offsets for two FP8 payloads, three E8M0 scales and FP32 Delta."""
+    assert n == 1024
+    payload_bytes = 128 * n * 128
+    scale_bytes = 128 * n * 4
+    # Each scale stores 128*n*4 bytes. Delta stores 128*n FP32 values.
+    offsets = (0, payload_bytes, 2 * payload_bytes, 2 * payload_bytes + scale_bytes,
+               2 * payload_bytes + 2 * scale_bytes, 2 * payload_bytes + 3 * scale_bytes)
+    total_bytes = 2 * payload_bytes + 4 * scale_bytes
+    assert all(offset % 16 == 0 for offset in offsets) and total_bytes % 16 == 0 and total_bytes < 2**31
+    return (*offsets, total_bytes)
+
+
+_PREPARATION_ARENA_BYTES = _preparation_arena_layout(1024)[-1]
+
+
+@triton.jit
+def _preparation_arena_segments(Arena, ARENA_N: tl.constexpr):
+    tl.static_assert(Arena.dtype.element_ty == tl.uint8)
+    offsets: tl.constexpr = _preparation_arena_layout(ARENA_N)
+    vb = (Arena + offsets[0]).to(tl.pointer_type(tl.float8e4nv))
+    do8 = (Arena + offsets[1]).to(tl.pointer_type(tl.float8e4nv))
+    vs = Arena + offsets[2]
+    dos = Arena + offsets[3]
+    kdqs = Arena + offsets[4]
+    delta = (Arena + offsets[5]).to(tl.pointer_type(tl.float32))
+    return vb, do8, vs, dos, kdqs, delta
+
+
+@triton.jit
+def _prepare_fused_arena(V, DO, KS, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr):
+    vb, do8, vs, dos, kdqs, delta = _preparation_arena_segments(Arena, N)
+    _prepare_fused(V, DO, KS, vb, do8, vs, dos, kdqs, O, delta, N, D, BLOCK_N)
+
+
+@constexpr_function
 def _stage_layout(COLS):
     # gfx950 has64 LDS banks. Keep16B chunks and XOR row bits above
     # those already selected by the row stride: perPhase=256/COLS.
@@ -598,6 +634,21 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
     tl.store(DQ + out, dq * sm_scale)
 
 
+@triton.jit
+def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, DS, DSS, ARENA_N: tl.constexpr, D: tl.constexpr,
+                        BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr):
+    vb, do8, vs, dos, _, delta = _preparation_arena_segments(Arena, ARENA_N)
+    _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN, CAUSAL,
+                  SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False)
+
+
+@triton.jit
+def _bwd_q_consume_arena(DS, DSS, K, Arena, DQ, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr, BM: tl.constexpr,
+                         BK: tl.constexpr, CAUSAL: tl.constexpr, HEADS: tl.constexpr):
+    _, _, _, _, kdqs, _ = _preparation_arena_segments(Arena, ARENA_N)
+    _bwd_q_consume(DS, DSS, K, kdqs, DQ, N, sm_scale, D, BM, BK, CAUSAL, HEADS)
+
+
 def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
     """Metadata-only admission; this never reads payload or scale values."""
     if type(causal) is not bool:
@@ -707,20 +758,10 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     n = shape[2]
     feature_scale_shape = (4, 32, n, 4)
     sequence_scale_shape = (4, 32, 128, n // 32)
-    # Repeated measurements favor packing at N1024; preserve the original
-    # allocation path for larger shapes.
+    # Derive preparation pointers inside JIT kernels instead of creating
+    # Torch views. Keep this private per-call arena restricted to N1024.
     if n == 1024:
-        # Private per-call arena: payloads, then scales and FP32 Delta. Every
-        # boundary is 16-byte aligned for the admitted N1024 shape.
-        payload_bytes = 128 * n * 128
-        scale_bytes = 128 * n * 4
-        arena = torch.empty((2 * payload_bytes + 4 * scale_bytes, ), dtype=torch.uint8, device=device)
-        vb = arena.narrow(0, 0, payload_bytes).view(torch.float8_e4m3fn).view(shape)
-        do8 = arena.narrow(0, payload_bytes, payload_bytes).view(torch.float8_e4m3fn).view(shape)
-        vs = arena.narrow(0, 2 * payload_bytes, scale_bytes).view(feature_scale_shape)
-        dos = arena.narrow(0, 2 * payload_bytes + scale_bytes, scale_bytes).view(feature_scale_shape)
-        kdqs = arena.narrow(0, 2 * payload_bytes + 2 * scale_bytes, scale_bytes).view(sequence_scale_shape)
-        delta = arena.narrow(0, 2 * payload_bytes + 3 * scale_bytes, scale_bytes).view(torch.float32).view(shape[:-1])
+        arena = torch.empty((_PREPARATION_ARENA_BYTES, ), dtype=torch.uint8, device=device)
     else:
         vb = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
         do8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
@@ -742,17 +783,30 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
-    _prepare_fused.run(v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32, num_warps=4,
-                       num_stages=2, grid=(n // 32, 128), warmup=False)
-    # The KV owner reuses Q/dO payloads and their saved/prepared square32
-    # scales directly; no directional exports or second Delta launch.
-    _bwd_kv_owner.run(q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds, dss, D=128,
-                      BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True,
-                      RELAXED=False, XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0), num_warps=2,
-                      num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
-    _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
-                       num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
-                       warmup=False)
+    if n == 1024:
+        # N stays runtime in both reduction kernels; ARENA_N only fixes
+        # preparation byte offsets. Arithmetic, grids and owners are unchanged.
+        _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4, num_stages=2,
+                                 grid=(n // 32, 128), warmup=False)
+        _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss, ARENA_N=n,
+                                D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1, matrix_instr_nonkdim=32,
+                                waves_per_eu=0, grid=(128, n // 64), warmup=False)
+        _bwd_q_consume_arena.run(ds, dss, k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64, CAUSAL=causal,
+                                 HEADS=128, num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0,
+                                 grid=(n // 128, 128), warmup=False)
+    else:
+        _prepare_fused.run(v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32, num_warps=4,
+                           num_stages=2, grid=(n // 32, 128), warmup=False)
+        # The KV owner reuses Q/dO payloads and their saved/prepared square32
+        # scales directly; no directional exports or second Delta launch.
+        _bwd_kv_owner.run(q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds, dss,
+                          D=128, BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False,
+                          NATIVE=True, RELAXED=False,
+                          XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0), num_warps=2, num_stages=1,
+                          matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
+        _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
+                           num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
+                           warmup=False)
     return dq, dk, dv
 
 

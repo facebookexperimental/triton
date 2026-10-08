@@ -303,17 +303,43 @@ def test_flash_attn_mxfp8_shared_backward_arena_storage(n_ctx):
         allocations.append(tensor)
         return tensor
 
+    prepare_entry = shared._prepare_fused_arena if packed else shared._prepare_fused
+    kv_entry = shared._bwd_kv_owner_arena if packed else shared._bwd_kv_owner
+    q_entry = shared._bwd_q_consume_arena if packed else shared._bwd_q_consume
     with mock.patch.object(shared.torch, "empty", side_effect=allocate):
-        with mock.patch.object(shared._prepare_fused, "run") as prepare:
-            with mock.patch.object(shared._bwd_kv_owner, "run"):
-                with mock.patch.object(shared._bwd_q_consume, "run"):
-                    gradients = shared._launch_backward_shared_square(*([object()] * 8), 0.5, False,
-                                                                      torch.device("cpu"), shape)
+        with mock.patch.object(prepare_entry, "run") as prepare:
+            with mock.patch.object(kv_entry, "run") as kv:
+                with mock.patch.object(q_entry, "run") as query:
+                    with mock.patch.object(torch.Tensor, "narrow", side_effect=AssertionError("host narrow")):
+                        with mock.patch.object(torch.Tensor, "view", side_effect=AssertionError("host view")):
+                            gradients = shared._launch_backward_shared_square(*([object()] * 8), 0.5, False,
+                                                                              torch.device("cpu"), shape)
+                            if packed:
+                                first_arena = allocations[0]
+                                allocations.clear()
+                                gradients = shared._launch_backward_shared_square(*([object()] * 8), 0.5, False,
+                                                                                  torch.device("cpu"), shape)
+                                assert allocations[0].data_ptr() != first_arena.data_ptr()
     assert len(allocations) == preparation_allocations + 5  # Preparation, DS, DSS, and three outputs.
     args = prepare.call_args.args
-    private = (*args[3:8], args[9])  # V8, dO8, VS, dOS, KDQS, Delta.
     expected_shapes = (shape, shape, (4, 32, n_ctx, 4), (4, 32, n_ctx, 4), (4, 32, 128, n_ctx // 32), shape[:-1])
     expected_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.uint8, torch.uint8, torch.uint8, torch.float32)
+    if packed:
+        arena = allocations[0]
+        assert args[4] is kv.call_args.args[5] is query.call_args.args[3] is arena
+        assert kv.call_args.kwargs["ARENA_N"] == query.call_args.kwargs["ARENA_N"] == n_ctx
+        assert arena.dtype == torch.uint8 and arena.ndim == 1 and arena.storage_offset() == 0
+        offsets = shared._preparation_arena_layout(n_ctx)
+        assert offsets[-1] == arena.numel()
+        # These test-only views model the JIT's typed pointer segments.
+        private = [
+            arena.narrow(0, start, end - start).view(dtype).view(expected_shape)
+            for start, end, dtype, expected_shape in zip(offsets, offsets[1:], expected_dtypes, expected_shapes)
+        ]
+        with pytest.raises(AssertionError):
+            shared._preparation_arena_layout(2048)
+    else:
+        private = (*args[3:8], args[9])  # V8, dO8, VS, dOS, KDQS, Delta.
     if not packed:
         assert all(tensor is allocated for tensor, allocated in zip(private, allocations[:6]))
         assert len({tensor.untyped_storage().data_ptr() for tensor in private}) == 6
