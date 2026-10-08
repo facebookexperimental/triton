@@ -1,0 +1,116 @@
+name: FBTriton Benchmarking
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmarks:
+        description: Comma-separated benchmark names under benchmarks/<name>/run.py
+        type: string
+        required: true
+        default: tritonbench
+      benchmark_arguments:
+        description: Command-line arguments passed to each benchmark runner (both sides)
+        type: string
+        required: false
+        default: ''
+      tritonbench_ref:
+        description: TritonBench commit or ref used for both sides
+        type: string
+        required: true
+        default: main
+      side_a_triton:
+        description: Side A Triton repository (owner/repo)
+        type: string
+        required: true
+        default: facebookexperimental/triton
+      side_a_commit:
+        description: Side A Triton commit or ref
+        type: string
+        required: true
+        default: main
+      side_a_device:
+        description: Side A GPU runner
+        type: choice
+        required: true
+        default: h100
+        options:
+          - h100
+          - b200
+          - mi350
+      side_b_triton:
+        description: Side B repository (blank uses side A; leave both B repo and commit blank to skip)
+        type: string
+        required: false
+        default: ''
+      side_b_commit:
+        description: Side B commit or ref (blank uses main when B repo is set)
+        type: string
+        required: false
+        default: ''
+      side_b_device:
+        description: Side B GPU runner (used only when side B is enabled)
+        type: choice
+        required: true
+        default: same-as-a
+        options:
+          - same-as-a
+          - h100
+          - b200
+          - mi350
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-side-a:
+    name: Build side A
+    uses: ./.github/workflows/build.yml
+    with:
+      repository: ${{ inputs.side_a_triton }}
+      ref: ${{ inputs.side_a_commit }}
+      build_id: side-a
+
+  build-side-b:
+    name: Build side B
+    if: inputs.side_b_triton != '' || inputs.side_b_commit != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      repository: ${{ inputs.side_b_triton || inputs.side_a_triton }}
+      ref: ${{ inputs.side_b_commit || 'main' }}
+      build_id: side-b
+
+  benchmark-side-a:
+    name: Benchmark side A
+    needs: build-side-a
+    uses: ./.github/workflows/_linux-benchmark.yml
+    with:
+      side: a
+      device: ${{ inputs.side_a_device }}
+      benchmarks: ${{ inputs.benchmarks }}
+      benchmark_arguments: ${{ inputs.benchmark_arguments }}
+      tritonbench_ref: ${{ inputs.tritonbench_ref }}
+      triton_repository: ${{ inputs.side_a_triton }}
+      triton_commit: ${{ needs.build-side-a.outputs.commit }}
+      wheel_url: ${{ needs.build-side-a.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build-side-a.outputs.wheel_filename }}
+
+  benchmark-side-b:
+    name: Benchmark side B
+    needs: build-side-b
+    if: inputs.side_b_triton != '' || inputs.side_b_commit != ''
+    uses: ./.github/workflows/_linux-benchmark.yml
+    with:
+      side: b
+      device: ${{ inputs.side_b_device == 'same-as-a' && inputs.side_a_device || inputs.side_b_device }}
+      benchmarks: ${{ inputs.benchmarks }}
+      benchmark_arguments: ${{ inputs.benchmark_arguments }}
+      tritonbench_ref: ${{ inputs.tritonbench_ref }}
+      triton_repository: ${{ inputs.side_b_triton || inputs.side_a_triton }}
+      triton_commit: ${{ needs.build-side-b.outputs.commit }}
+      wheel_url: ${{ needs.build-side-b.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build-side-b.outputs.wheel_filename }}

@@ -4,12 +4,25 @@ on:
   workflow_dispatch:
   workflow_call:
     inputs:
+      repository:
+        description: Triton repository to build (owner/repo; defaults to this repository)
+        type: string
+        required: false
+        default: ''
       ref:
         description: Git ref to build
         type: string
         required: false
         default: ''
+      build_id:
+        description: Unique identifier for multiple wheel builds in one workflow run
+        type: string
+        required: false
+        default: ''
     outputs:
+      commit:
+        description: Resolved Git commit used to build the wheel
+        value: ${{ jobs.build.outputs.commit }}
       wheel_url:
         description: URL-encoded HTTPS URL of the uploaded wheel
         value: ${{ jobs.build.outputs.wheel_url }}
@@ -22,7 +35,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ${{ github.workflow }}-build-wheel-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-build-wheel-${{ inputs.build_id || 'default' }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -30,6 +43,7 @@ jobs:
     runs-on: 32-core-ubuntu
     timeout-minutes: 90
     outputs:
+      commit: ${{ steps.checkout.outputs.commit }}
       wheel_url: ${{ steps.wheel_url.outputs.wheel_url }}
       wheel_filename: ${{ steps.wheel.outputs.filename }}
     env:
@@ -42,8 +56,10 @@ jobs:
       LDFLAGS: -Wl,--strip-all
     steps:
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
 
@@ -62,8 +78,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/fbtriton-ccache
-          key: ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          key: ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.repository || github.repository }}-${{ steps.checkout.outputs.commit }}
           restore-keys: |
+            ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.repository || github.repository }}-
             ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Compute build dependency cache keys
@@ -72,16 +89,21 @@ jobs:
           llvm_file="cmake/llvm-info.json"
           amd_file="cmake/amd-llvm-info.json"
 
-          # Check if files exist before proceeding
-          if [[ ! -f "$llvm_file" || ! -f "$amd_file" ]]; then
-            echo "Error: Required dependency files are missing."
+          # Upstream Triton uses llvm-hash.txt and has no separate AMD LLVM.
+          if [[ ! -f "$llvm_file" ]]; then
+            llvm_file="cmake/llvm-hash.txt"
+          fi
+          if [[ ! -f "$llvm_file" ]]; then
+            echo "Error: LLVM dependency manifest is missing."
             exit 1
           fi
 
-          # Both manifests carry their hash + build_number; key off the content
-          # hash so any LLVM or AMD codegen bump invalidates the cache.
-          echo "llvm=$(sha256sum $llvm_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
-          echo "amd=$(sha256sum $amd_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+          echo "llvm=$(sha256sum "$llvm_file" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          if [[ -f "$amd_file" ]]; then
+            echo "amd=$(sha256sum "$amd_file" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "amd=none" >> "$GITHUB_OUTPUT"
+          fi
         shell: bash
       - name: Restore build dependencies
         id: restore-build-deps-cache
@@ -89,8 +111,7 @@ jobs:
         with:
           # Prebuilt outputs of llvm-build.yml and amd-codegen-llvm-build.yml,
           # downloaded into the Triton cache dir by build_helpers during the
-          # wheel build. Every wheel ships the AMD backend, so every build
-          # needs both trees.
+          # wheel build. Meta builds need both trees; upstream only needs LLVM.
           path: |
             ~/.triton/llvm
             ~/.triton/amd
@@ -121,6 +142,8 @@ jobs:
       - name: Validate wheel and prepare artifact
         id: wheel
         shell: bash
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
         run: |
           shopt -s nullglob
           wheels=(dist/*.whl)
@@ -141,6 +164,9 @@ jobs:
           python3 -I -c 'import triton; print("OK", triton.__version__)'
 
           artifact_name="run_${GITHUB_RUN_ID}"
+          if [[ -n "${BUILD_ID}" ]]; then
+            artifact_name+="_${GITHUB_RUN_ATTEMPT}_${BUILD_ID}"
+          fi
           echo "filename=${wheels[0]##*/}" >> "$GITHUB_OUTPUT"
           # An explicit S3 prefix overrides the action's name input. Preserve
           # the artifact name as a directory under that prefix.
