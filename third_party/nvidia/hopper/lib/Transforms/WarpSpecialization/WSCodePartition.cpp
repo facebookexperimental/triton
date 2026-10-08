@@ -2618,14 +2618,15 @@ void insertAsyncComm(
   DenseMap<Operation *, BlockArgument> perTileProducerTokenCache;
 
   // Channels whose consuming MMA had its completion arrival elided by the
-  // whole-TMEM-overwrite proof below. Every channel of a reuse group shares
-  // one CommChannel (see createToken), so `consumerBarriers` is pooled across
-  // the group: removing an arrival is only safe if no other channel in the
-  // group later waits on that barrier. The reuse-sync paths do exactly that
-  // when their partner's consumer is a gen5 MMA, and the partner is chosen
-  // after this decision has been made, so it cannot be pre-checked here. Keep
-  // the set and reject the pairing where it would be used, rather than
-  // emitting a wait on an arrival that no longer happens.
+  // whole-TMEM-overwrite or cross-task result proof below. Every channel of a
+  // reuse group shares one CommChannel (see createToken), so
+  // `consumerBarriers` is pooled across the group: removing an arrival is only
+  // safe if no other channel in the group later waits on that barrier. The
+  // reuse-sync paths do exactly that when their partner's consumer is a gen5
+  // MMA, and the partner is chosen after this decision has been made, so it
+  // cannot be pre-checked here. Keep the set and reject the pairing where it
+  // would be used, rather than emitting a wait on an arrival that no longer
+  // happens.
   DenseSet<Channel *> elidedCompletionArrival;
 
   // Go through each channel group.
@@ -2859,8 +2860,27 @@ void insertAsyncComm(
           before->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
       auto afterCluster =
           after->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
-      if (!beforeStage || !afterStage || !beforeCluster || !afterCluster)
-        return false;
+      if (!beforeStage || !afterStage || !beforeCluster || !afterCluster) {
+        // A one-stage loop is not software-pipelined, so its source order is
+        // also its execution order. Such loops intentionally carry no
+        // loop.stage/loop.cluster annotations, but the reuse-cycle proof is
+        // still valid. Fail closed for partial annotations and loops that may
+        // still be pipelined.
+        if (beforeStage || afterStage || beforeCluster || afterCluster)
+          return false;
+        auto beforeLoop = before->getParentOfType<scf::ForOp>();
+        auto afterLoop = after->getParentOfType<scf::ForOp>();
+        if (!beforeLoop || beforeLoop != afterLoop)
+          return false;
+        auto numStages = beforeLoop->getAttrOfType<IntegerAttr>(
+            mlir::triton::kNumStagesAttrName);
+        if (!numStages || numStages.getInt() != 1)
+          return false;
+        if (logicalIterDistance != 0)
+          return logicalIterDistance > 0;
+        return before->getBlock() == after->getBlock() &&
+               appearsBefore(before, after);
+      }
 
       int64_t kernelIterDistance =
           logicalIterDistance + afterStage.getInt() - beforeStage.getInt();
@@ -3992,12 +4012,17 @@ void insertAsyncComm(
         // below: a guard channel supplies the tmem_load -> tmem_store
         // dependency through its own token, takes a different emission path
         // entirely, and never consults this result. Folding it in keeps the
-        // two mechanisms explicitly exclusive and skips the sibling scan when
-        // it could not matter.
+        // two mechanisms explicitly exclusive.
+        //
+        // A relocated producer-acquire or a paired backward channel does not
+        // disable the scan. Both only choose where desyncMMAv5Op places this
+        // channel's EMPTY wait and which MMA carries its completion. When the
+        // proof holds, that wait and arrival are dropped wherever they would
+        // have been placed, so the proof composes with both.
         bool orderedByWholeTmemOverwrite = false;
-        if (!hasGuardChannel && addCompletionBarrier &&
-            !producerAcquireForChannelLoop && !backwardChannelForLoop &&
-            reuseGrp2 >= 0 && isa<ttng::TMEMStoreOp>(headProducer)) {
+        Channel *wholeTmemOverwriteOwner = nullptr;
+        if (!hasGuardChannel && addCompletionBarrier && reuseGrp2 >= 0 &&
+            isa<ttng::TMEMStoreOp>(headProducer)) {
           auto *group = config->getGroup(reuseGrp2);
           auto masterRange = getTmemColumnRange(masterChannel);
           auto producerLoop = headProducer->getParentOfType<scf::ForOp>();
@@ -4055,6 +4080,7 @@ void insertAsyncComm(
                 !appearsBefore(ownerMma.getOperation(), ownerLoad))
               continue;
             orderedByWholeTmemOverwrite = true;
+            wholeTmemOverwriteOwner = sibling;
             LLVM_DEBUG({
               LDBG("operand publication channel " << masterChannel->uniqID
                                                   << " is ordered by whole "
@@ -4062,6 +4088,68 @@ void insertAsyncComm(
                                                   << sibling->uniqID
                                                   << "; skip redundant "
                                                      "producer-acquire");
+            });
+            break;
+          }
+        }
+
+        // A single-buffered SMEM publication also needs no loop-carried EMPTY
+        // edge when another cross-task result channel closes the cycle. HSTU
+        // backward's dS handoff is the canonical shape:
+        //
+        //   gemm task:    dK(i) ... dP(i + 1)
+        //   compute task: dP load(i + 1) ... dS store(i + 1)
+        //
+        // The dP FULL edge orders its MMA before the compute load. Together
+        // with same-task program order on both sides, that makes the next dS
+        // overwrite occur after the previous dK consumed the buffer. Keep the
+        // proof narrow: one SMEM slot, local-store producer, MMA consumer, and
+        // an explicit cross-task MMA-to-TMEM-load channel in the same loop.
+        bool orderedByCrossTaskResultCycle = false;
+        if (!hasGuardChannel && addCompletionBarrier &&
+            masterChannel->channelKind == DataChannelKind::SMEMAlloc &&
+            masterChannel->getNumBuffers() == 1 &&
+            isa<ttg::LocalStoreOp>(headProducer)) {
+          auto producerLoop = headProducer->getParentOfType<scf::ForOp>();
+          for (Channel *sibling : orderedChannels) {
+            if (sibling == masterChannel || sibling->defunct ||
+                sibling->channelKind != DataChannelKind::TMEMAlloc)
+              continue;
+            auto siblingMma =
+                dyn_cast_or_null<ttng::MMAv5OpInterface>(sibling->getSrcOp());
+            Operation *siblingLoad = sibling->getDstOp();
+            if (!siblingMma ||
+                !isa_and_nonnull<ttng::TMEMLoadOp>(siblingLoad) ||
+                siblingMma.getOperation() == mmaOp.getOperation() ||
+                withSameTask(siblingMma.getOperation(), siblingLoad))
+              continue;
+            if (!producerLoop ||
+                siblingLoad->getParentOfType<scf::ForOp>() != producerLoop ||
+                siblingMma->getParentOfType<scf::ForOp>() != producerLoop ||
+                mmaOp->getParentOfType<scf::ForOp>() != producerLoop)
+              continue;
+            // Same-task program order only orders operations that both
+            // execute. Requiring one block keeps either end from sitting under
+            // an scf.if that skips it, which would break the cycle.
+            if (siblingMma->getBlock() != mmaOp->getBlock() ||
+                siblingLoad->getBlock() != headProducer->getBlock() ||
+                !withSameTask(mmaOp.getOperation(),
+                              siblingMma.getOperation()) ||
+                !withSameTask(siblingLoad, headProducer) ||
+                !appearsBefore(siblingLoad, headProducer))
+              continue;
+            if (!orderedByPipelineSchedule(mmaOp.getOperation(),
+                                           siblingMma.getOperation(),
+                                           /*logicalIterDistance=*/1) ||
+                !orderedByPipelineSchedule(siblingLoad, headProducer,
+                                           /*logicalIterDistance=*/0))
+              continue;
+            orderedByCrossTaskResultCycle = true;
+            LLVM_DEBUG({
+              LDBG("SMEM publication channel "
+                   << masterChannel->uniqID
+                   << " is ordered by cross-task result channel "
+                   << sibling->uniqID << "; skip redundant producer-acquire");
             });
             break;
           }
@@ -4175,12 +4263,23 @@ void insertAsyncComm(
             // writer lets a correction task race the remaining MMAs.
             completionMmaOverride = backwardChannelForLoop->getSrcOp();
           }
-          if (orderedByWholeTmemOverwrite) {
+          if (orderedByWholeTmemOverwrite || orderedByCrossTaskResultCycle) {
             // Record that this channel's consuming MMA no longer arrives on
             // the group's shared consumerBarrier, so a later reuse-sync
             // pairing that would wait on it is caught instead of hanging.
             elidedCompletionArrival.insert(masterChannel);
-            // The whole-overwrite chain already closes the reuse cycle, so
+            // The same proof also subsumes the intra-iteration WAR edge from
+            // the owner's synchronous load to this store. Without clearing
+            // it, the token loop below leaves a self-satisfied wait directly
+            // between those same-task operations even though the matching MMA
+            // completion was removed above. The cross-task result proof has no
+            // such edge to clear: its sibling is a TMEM channel and cannot be
+            // in this SMEM channel's reuse group, so any remaining reuse sync
+            // waits on another channel's barrier that this proof leaves intact.
+            if (orderedByWholeTmemOverwrite &&
+                earlyChannelForReuseSync == wholeTmemOverwriteOwner)
+              earlyChannelForReuseSync = nullptr;
+            // The proved dependency chain already closes the reuse cycle, so
             // this channel needs neither an empty wait before publication nor
             // a matching completion arrival on the consuming MMA. Keep the
             // MMA asynchronous for its remaining channels.
@@ -4322,7 +4421,7 @@ void insertAsyncComm(
                         "intra-iteration reuse sync would wait on channel ") +
                     llvm::Twine(earlyChannelForReuseSync->uniqID) +
                     "'s consumer barrier, but its completion arrival was "
-                    "elided by the whole-TMEM-overwrite proof");
+                    "elided by a reuse-cycle proof");
               Value cbar =
                   getBarrierForPipelineStage(builder, cbIt->second, bufferIdx);
               Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
@@ -4392,7 +4491,7 @@ void insertAsyncComm(
                         "wrap-around reuse sync would wait on channel ") +
                     llvm::Twine(wrapCh->uniqID) +
                     "'s consumer barrier, but its completion arrival was "
-                    "elided by the whole-TMEM-overwrite proof");
+                    "elided by a reuse-cycle proof");
               Value cbar =
                   getBarrierForPipelineStage(builder, wcbIt->second, bufferIdx);
               Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
