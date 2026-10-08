@@ -34,6 +34,7 @@ import triton.language.extra.tlx as tlx
 from triton import knobs
 from triton._C.libtriton import get_cache_invalidating_env_vars
 from triton.compiler import CompiledKernel
+from triton.runtime import driver
 from triton.runtime.jit import _CACHE_STATS_ON, constexpr_function
 
 from .gfx950_quant import _decode_scale, _quantize_store, _scale_exponent
@@ -682,7 +683,7 @@ def _arena_launch_plan(device, n, causal, sm_scale):
     if plan is None:
         return None
     for current, entry in zip((_prepare_fused_arena, _bwd_kv_owner_arena, _bwd_q_consume_arena), plan):
-        jit, cache_key, kernel, source_hash, globals_used = entry
+        jit, cache_key, kernel, source_hash, globals_used, runner = entry
         cache = jit.device_caches.get(device.index)
         if (jit is not current or jit.pre_run_hooks or jit.launch_metadata is not None or jit.debug
                 or jit.hash != source_hash or cache is None or cache[0].get(cache_key) is not kernel
@@ -691,14 +692,15 @@ def _arena_launch_plan(device, n, causal, sm_scale):
         for name, value, namespace in globals_used:
             if name not in namespace or namespace[name] != value:
                 return None
-    return tuple(entry[2] for entry in plan)
+    return tuple(entry[5] for entry in plan)
 
 
 def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return
     entries = []
-    for jit, kernel in zip((_prepare_fused_arena, _bwd_kv_owner_arena, _bwd_q_consume_arena), compiled):
+    grids = ((n // 32, 128, 1), (128, n // 64, 1), (n // 128, 128, 1))
+    for jit, kernel, grid in zip((_prepare_fused_arena, _bwd_kv_owner_arena, _bwd_q_consume_arena), compiled, grids):
         cache = jit.device_caches.get(device.index)
         if (not isinstance(kernel, CompiledKernel) or cache is None or jit.pre_run_hooks
                 or jit.launch_metadata is not None or jit.debug or kernel.src.fn is not jit):
@@ -709,7 +711,7 @@ def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled):
         globals_used = tuple((name, value, namespace) for (name, _), (value, namespace) in jit.used_global_vals.items())
         # JIT source edits require callers' hashes/caches to be invalidated,
         # as documented by JITCallable._unsafe_update_src. Track that contract.
-        entries.append((jit, cache_key, kernel, jit.hash, globals_used))
+        entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
     _ARENA_LAUNCH_PLANS[(device.index, n, causal, sm_scale)] = tuple(entries)
 
 
@@ -856,12 +858,14 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
         plan = _arena_launch_plan(device, n, causal, sm_scale) if ordinary_inputs else None
         if plan is not None:
             prepare, kv, query = plan
-            # The public compiled runner resolves the current stream each time.
+            # Resolve one invocation-local stream for this producer/consumer
+            # chain. The cached public runners contain only kernels and grids.
+            stream = driver.active.get_current_stream(device.index)
             # Pass the complete original ABI, including constexpr positions.
-            prepare[(n // 32, 128, 1)](v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32)
-            kv[(128, n // 64, 1)](q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss, n, 128, 64,
-                                  64, causal)
-            query[(n // 128, 128, 1)](ds, dss, k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128)
+            prepare(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, stream=stream)
+            kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss, n, 128, 64, 64, causal,
+               stream=stream)
+            query(ds, dss, k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, stream=stream)
         else:
             # N stays runtime in both reduction kernels; ARENA_N only fixes
             # preparation byte offsets. Cold JIT errors propagate unchanged.
