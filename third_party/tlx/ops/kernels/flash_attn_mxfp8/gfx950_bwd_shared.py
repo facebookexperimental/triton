@@ -458,7 +458,8 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr, PEEL: tl.constexpr, NATIVE: tl.constexpr,
                   RELAXED: tl.constexpr, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head,
-                  base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr):
+                  base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr,
+                  PACK_P_EARLY: tl.constexpr = False):
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
     export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
@@ -494,10 +495,15 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                        tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
     delta = _load_metadata(deltamem[SLOT])
     ds = tl.where(valid, p * (dp - delta[None, :]), 0.0)
+    if PACK_P_EARLY:
+        # P has no FP32 consumers after dS is formed.
+        p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
+        ps = tl.full((BN, BM // 32), 119, tl.uint8)
     ds8, dsk, unused_compact_exponent = _quantize_ds_square(ds, BN, BM)
     dsk = _lhs_scale_kv64(dsk)
-    p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
-    ps = tl.full((BN, BM // 32), 119, tl.uint8)
+    if not PACK_P_EARLY:
+        p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
+        ps = tl.full((BN, BM // 32), 119, tl.uint8)
     if SEQ_K_CONTIG:
         dodv = _load_rhs_kv64(dodvmem[SLOT], True, NATIVE, RELAXED)
     else:
@@ -540,7 +546,8 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
 def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D: tl.constexpr,
                   BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr = False, PEEL: tl.constexpr = False,
-                  NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False, XCD_KEY_TILES: tl.constexpr = 0):
+                  NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False, XCD_KEY_TILES: tl.constexpr = 0,
+                  PACK_P_EARLY: tl.constexpr = False):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     tl.static_assert(not SEQ_K_CONTIG, 'Shared-LDS specialization requires ordinary contiguous payloads')
     tl.static_assert(D == 128 and BM == 64 and (BN == 64) and NATIVE and (not RELAXED) and (not PEEL))
@@ -594,47 +601,47 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin, 0,
-                               True, PACK_DSS=CAUSAL)
+                               True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin + 64,
-                               1, begin < N - 128, PACK_DSS=CAUSAL)
+                               1, begin < N - 128, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
         for pair_start in range(begin + 128, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                                   pair_start, 0, True, PACK_DSS=CAUSAL)
+                                   pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                                   pair_start + 64, 1, True, PACK_DSS=CAUSAL)
+                                   pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
         if begin < N - 128:
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                                   N - 128, 0, True, PACK_DSS=CAUSAL)
+                                   N - 128, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                                   N - 64, 1, False, PACK_DSS=CAUSAL)
+                                   N - 64, 1, False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
     else:
         for pair_start in range(begin, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                                   pair_start, 0, True, PACK_DSS=CAUSAL)
+                                   pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                                   pair_start + 64, 1, True, PACK_DSS=CAUSAL)
+                                   pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 128, 0,
-                               True, PACK_DSS=CAUSAL)
+                               True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 64, 1,
-                               False, PACK_DSS=CAUSAL)
+                               False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY)
     out = base + keys[:, None] * D + d[None, :]
     tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
     tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
@@ -766,7 +773,8 @@ def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: 
     vb, do8, vs, dos, _, delta = _preparation_arena_segments(Arena, ARENA_N)
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN, CAUSAL,
-                  SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False)
+                  SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
+                  PACK_P_EARLY=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048))
 
 
 @triton.jit
