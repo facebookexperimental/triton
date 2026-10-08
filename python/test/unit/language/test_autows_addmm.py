@@ -478,14 +478,16 @@ def addmm_kernel_tma_bias_ws(
         c_desc.store([pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], (accumulator + bias.to(tl.float32)).to(tl.bfloat16))
 
 
-@pytest.mark.parametrize("BLOCK_N", [128])
+@pytest.mark.parametrize("BLOCK_N", [128, 32])
 @pytest.mark.parametrize("K", [64, 128])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_autows_addmm_tma_bias_single_k_tile(K, BLOCK_N):
     """With a single K tile the bias is folded into the MMA: the epilogue
     partition stores the TMA-loaded bias into the TMEM accumulator and the
     MMA accumulates onto it. The MMA must wait for that store, or the output
-    tile is just the bias."""
+    tile is just the bias. A 32-wide bf16 bias tile is 64 bytes, so its TMA
+    landing buffer must also stay single-buffered (TMA needs 128-byte aligned
+    destinations)."""
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         BLOCK_M, BLOCK_K = 128, 64
