@@ -20,7 +20,9 @@ choosing another space. `mm` and `addmm` also accept `out=` for implementations
 that support a preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
-any op that offers one, so that a first call stays interactive. Measured on
+any op that offers one, so that a first call stays interactive. The exception
+is `mm` on sm90, whose full space is only 8 configs; it defaults to "full".
+Measured on
 B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache (348 configs
 compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
@@ -52,15 +54,15 @@ __all__ = [
 ]
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space=None):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     This op is currently forward-only.
 
-    Defaults to a single analytically chosen config so the first call stays
-    interactive. Pass `space="full"` to implementations that expose a full
-    autotune space; unsupported spaces raise `InvalidInput`. See the module
-    docstring.
+    `space=None` uses the implementation's default: "full" on sm90, otherwise
+    a single analytically chosen config so the first call stays interactive.
+    Pass `space="full"` to implementations that expose a full autotune space;
+    unsupported spaces raise `InvalidInput`. See the module docstring.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -82,6 +84,8 @@ def mm(a, b, *, out=None, space="heuristic"):
         check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
                      row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
     check_backward(spec, a, b)
+    if space is None:
+        space = spec.default_space
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
