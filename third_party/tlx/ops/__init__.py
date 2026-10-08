@@ -46,9 +46,9 @@ from __future__ import annotations
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev",
-    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward",
-    "InvalidInput"
+    "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
+    "flash_attn_varlen", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput"
 ]
 
 
@@ -427,6 +427,42 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
     return fn(q, k, v, causal, sm_scale, space=space)
+
+
+def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False):
+    """Forward-only attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
+
+    Sequence ``b`` owns query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and
+    key/value rows ``cu_seqlens_k[b]:cu_seqlens_k[b + 1]``; both offset tensors
+    are int32 ``(batch + 1,)``. ``max_seqlen_q`` must bound every query length
+    (it sizes the grid); ``max_seqlen_k`` is accepted for flash-attn API
+    parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
+    Causal masking is bottom-right aligned: query ``i`` sees keys
+    ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
+    `sm_scale` defaults to `HEAD_DIM ** -0.5`. Returns the output only (no
+    log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
+    uninitialized.
+    """
+    import torch
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects rank-3 (tokens, heads, head_dim) Q/K/V tensors")
+    if k.shape != v.shape or q.shape[2] != k.shape[2] or q.shape[1] % k.shape[1] != 0:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects K/V of identical shape, Q's head dim, and a head count "
+                           f"dividing Q's; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects Q/K/V to have the same dtype")
+    if q.stride(2) != 1 or k.stride(2) != 1 or v.stride(2) != 1:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects unit-stride head dims")
+    if (cu_seqlens_q.ndim != 1 or cu_seqlens_q.shape != cu_seqlens_k.shape or cu_seqlens_q.shape[0] < 1
+            or cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32):
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects int32 (batch + 1,) cu_seqlens_q and cu_seqlens_k")
+    if any(t.device != q.device for t in (k, v, cu_seqlens_q, cu_seqlens_k)):
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects all tensors on one device")
+    fn, spec = impl_for("flash_attn_varlen", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
+    check_backward(spec, q, k, v)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
 
 
 def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,

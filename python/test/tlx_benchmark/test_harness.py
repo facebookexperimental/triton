@@ -700,6 +700,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.bmm._shapes",
         "triton.tlx.ops.kernels.flash_attn._shapes",
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes",
+        "triton.tlx.ops.kernels.flash_attn_varlen._shapes",
         "triton.tlx.ops.kernels.hstu_attn._shapes",
         "triton.tlx.ops.kernels.kda._shapes",
         "triton.tlx.ops.kernels.kda._prefill_shapes",
@@ -734,6 +735,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_1", ),
         },
+        "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.hstu_attn._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": (),
@@ -807,6 +809,7 @@ BENCH_MODULES = (
     "bench_addmm",
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
+    "bench_flash_attn_varlen",
     "bench_hstu_attn",
     "bench_kda",
     "bench_kda_decode",

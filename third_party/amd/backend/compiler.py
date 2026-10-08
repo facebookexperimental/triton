@@ -83,13 +83,40 @@ def get_amd_codegen_revision() -> str:
     return _load_amd_codegen(get_amd_codegen_path()).triton_amdgpu_revision().decode("utf-8")
 
 
+_NAMED_BARRIER_INTRINSICS = (
+    "llvm.amdgcn.s.barrier.init",
+    "llvm.amdgcn.s.barrier.signal.var",
+    "llvm.amdgcn.s.barrier.join",
+    "llvm.amdgcn.s.wakeup.barrier",
+    "llvm.amdgcn.s.get.named.barrier.state",
+)
+
+
+def _upgrade_legacy_named_barrier_address_spaces(src: str) -> str:
+    upgraded = src.replace('addrspace(3) global target("amdgcn.named.barrier"',
+                           'addrspace(15) global target("amdgcn.named.barrier"')
+    for intrinsic in _NAMED_BARRIER_INTRINSICS:
+        upgraded = upgraded.replace(f"@{intrinsic}(ptr addrspace(3)", f"@{intrinsic}(ptr addrspace(15)")
+    return upgraded
+
+
 def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,
                    disable_optimization: bool, canonicalize_gep: bool, disabled_passes: str, dump_ir: bool,
                    enable_timing: bool) -> str:
     library = _load_amd_codegen(get_amd_codegen_path())
-    # Serialize with Triton's LLVM: newer backends support older bitcode,
-    # whereas textual IR has no backwards-compatibility guarantee.
-    llvm_bitcode = llvm.to_bitcode(src)
+    upgraded_src = _upgrade_legacy_named_barrier_address_spaces(src)
+    if upgraded_src == src:
+        # Serialize with Triton's LLVM: newer backends support older bitcode,
+        # whereas textual IR has no backwards-compatibility guarantee.
+        # Express fusion permission in the IR because newer LLVM versions no
+        # longer honor TargetOptions::AllowFPOpFusion during code generation.
+        llvm_ir = llvm.to_bitcode(src, enable_fp_fusion)
+    else:
+        # LLVM commit 5bf967cb132b changed named-barrier intrinsic operands from
+        # address space 3 to 15. The bitcode reader rejects the legacy signature
+        # before the standalone code generator can upgrade the module, so send
+        # the narrowly upgraded module as text.
+        llvm_ir = upgraded_src.encode("utf-8")
     options = _AMDGPUCodegenOptions(
         1,
         triple.encode("utf-8"),
@@ -107,8 +134,8 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
     assembly = ctypes.c_void_p()
     assembly_size = ctypes.c_size_t()
     error = ctypes.c_void_p()
-    status = library.triton_amdgpu_compile(llvm_bitcode, len(llvm_bitcode), ctypes.byref(options),
-                                           ctypes.byref(assembly), ctypes.byref(assembly_size), ctypes.byref(error))
+    status = library.triton_amdgpu_compile(llvm_ir, len(llvm_ir), ctypes.byref(options), ctypes.byref(assembly),
+                                           ctypes.byref(assembly_size), ctypes.byref(error))
     if status:
         message = ctypes.string_at(error).decode("utf-8") if error.value else "unknown AMD code-generation failure"
         if error.value:
@@ -627,6 +654,11 @@ class HIPBackend(BaseBackend):
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        # Consume explicit tlx.warp_pipeline_stage(scope="intra_wave")
+        # regions. This pass is
+        # inert for kernels without those markers and deliberately does not
+        # reuse the inter-wave cond_barrier lowering above.
+        amd.passes.ttgpuir.add_intra_wave_pipeline(pm)
         if options.enable_sched_group_barrier_scheduler:
             amd.passes.ttgpuir.add_sched_group_barrier_scheduler(
                 pm,
@@ -906,11 +938,9 @@ class HIPBackend(BaseBackend):
         if knobs.amd.swap_mir_enable_misched and not knobs.amd.swap_mir:
             raise ValueError("TRITON_SWAP_MIR_ENABLE_MISCHED requires TRITON_SWAP_MIR to be set")
         if knobs.amd.swap_mir:
-            amdgcn = llvm.translate_mir_to_asm(
-                os.path.join(knobs.amd.swap_mir, dump_file_id + ".txt"),
-                target_triple,
-                options.arch, features, flags, options.enable_fp_fusion, False,
-                knobs.amd.swap_mir_enable_misched)
+            amdgcn = llvm.translate_mir_to_asm(os.path.join(knobs.amd.swap_mir, dump_file_id + ".txt"), target_triple,
+                                               options.arch, features, flags, options.enable_fp_fusion, False,
+                                               knobs.amd.swap_mir_enable_misched)
         else:
             disable_llvm_opt = knobs.getenv_bool("DISABLE_LLVM_OPT", False)
             disabled_passes = ""

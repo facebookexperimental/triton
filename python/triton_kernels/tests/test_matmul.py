@@ -618,7 +618,9 @@ def _test_op(m, n, k, split_k, do_gather, do_scatter, inner_expt_opt, do_gamma, 
         )
         ref_y = upcast_from_mxfp_torch(ref_y, ref_scale, target_dtype=ref_target_dtype, axis=-1)
     maxtol, rmstol = None, None
-    if c_dtype.is_nvfp4 and a_dtype.is_nvfp4 and b_dtype.is_nvfp4:
+    # A value near an e2m1 rounding boundary can land one FP4 step away from the
+    # reference (e.g. 4 vs 6), a 50% error on that element.
+    if c_dtype.is_nvfp4:
         maxtol, rmstol = 6e-1, 4e-2
     elif c_dtype.has_mx_scale:
         maxtol, rmstol = 4e-1, 4e-2
