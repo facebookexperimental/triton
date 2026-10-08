@@ -25,12 +25,16 @@ there is no global workspace cache, hidden stream or allocation-failure retry.
 """
 
 import math
+import os
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.runtime.jit import constexpr_function
+from triton import knobs
+from triton._C.libtriton import get_cache_invalidating_env_vars
+from triton.compiler import CompiledKernel
+from triton.runtime.jit import _CACHE_STATS_ON, constexpr_function
 
 from .gfx950_quant import _decode_scale, _quantize_store, _scale_exponent
 
@@ -649,6 +653,66 @@ def _bwd_q_consume_arena(DS, DSS, K, Arena, DQ, N, sm_scale, ARENA_N: tl.constex
     _bwd_q_consume(DS, DSS, K, kdqs, DQ, N, sm_scale, D, BM, BK, CAUSAL, HEADS)
 
 
+# Only compiled kernels and their JIT validity metadata are retained. Input
+# tensors, temporary allocations, pointers and streams always belong to a call.
+_ARENA_LAUNCH_PLANS = {}
+
+
+def _arena_launch_controls():
+    # A direct compiled launch skips JIT hooks and option binding. Use normal
+    # JIT for instrumentation and any non-default compiler/runtime controls.
+    if (_CACHE_STATS_ON or not knobs.propagate_env or knobs.runtime.interpret or knobs.runtime.debug
+            or knobs.runtime.sanitize_overflow or knobs.runtime.launch_enter_hook or knobs.runtime.launch_exit_hook
+            or knobs.runtime.kernel_load_start_hook or knobs.runtime.kernel_load_end_hook
+            or knobs.runtime.kernel_unload_hook or knobs.runtime.jit_cache_hook is not None
+            or knobs.runtime.jit_post_compile_hook is not None or knobs.runtime.add_stages_inspection_hook is not None
+            or knobs.compilation.listener is not None or knobs.compilation.always_compile or knobs.compilation.override
+            or knobs.compilation.dump_ir or knobs.compilation.instrumentation_mode
+            or any(vars(group)
+                   for group in (knobs.compilation, knobs.language, knobs.amd)) or get_cache_invalidating_env_vars()
+            or os.environ.get("TRITON_COMPILE_IQ_APPLY") or os.environ.get("TRITON_COMPILE_IQ_COLLECT")):
+        return False
+    return True
+
+
+def _arena_launch_plan(device, n, causal, sm_scale):
+    if device.type != "cuda" or device.index is None or not _arena_launch_controls():
+        return None
+    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, causal, sm_scale))
+    if plan is None:
+        return None
+    for current, entry in zip((_prepare_fused_arena, _bwd_kv_owner_arena, _bwd_q_consume_arena), plan):
+        jit, cache_key, kernel, source_hash, globals_used = entry
+        cache = jit.device_caches.get(device.index)
+        if (jit is not current or jit.pre_run_hooks or jit.launch_metadata is not None or jit.debug
+                or jit.hash != source_hash or cache is None or cache[0].get(cache_key) is not kernel
+                or getattr(kernel, "_compile_iq_acf_cubin", None) is not None):
+            return None
+        for name, value, namespace in globals_used:
+            if name not in namespace or namespace[name] != value:
+                return None
+    return tuple(entry[2] for entry in plan)
+
+
+def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled):
+    if device.type != "cuda" or device.index is None or not _arena_launch_controls():
+        return
+    entries = []
+    for jit, kernel in zip((_prepare_fused_arena, _bwd_kv_owner_arena, _bwd_q_consume_arena), compiled):
+        cache = jit.device_caches.get(device.index)
+        if (not isinstance(kernel, CompiledKernel) or cache is None or jit.pre_run_hooks
+                or jit.launch_metadata is not None or jit.debug or kernel.src.fn is not jit):
+            return
+        cache_key = next((key for key, cached in cache[0].items() if cached is kernel), None)
+        if cache_key is None:
+            return
+        globals_used = tuple((name, value, namespace) for (name, _), (value, namespace) in jit.used_global_vals.items())
+        # JIT source edits require callers' hashes/caches to be invalidated,
+        # as documented by JITCallable._unsafe_update_src. Track that contract.
+        entries.append((jit, cache_key, kernel, jit.hash, globals_used))
+    _ARENA_LAUNCH_PLANS[(device.index, n, causal, sm_scale)] = tuple(entries)
+
+
 def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
     """Metadata-only admission; this never reads payload or scale values."""
     if type(causal) is not bool:
@@ -785,16 +849,33 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
     if n in _PREPARATION_ARENA_BYTES:
-        # N stays runtime in both reduction kernels; ARENA_N only fixes
-        # preparation byte offsets. Arithmetic, grids and owners are unchanged.
-        _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4, num_stages=2,
-                                 grid=(n // 32, 128), warmup=False)
-        _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss, ARENA_N=n,
-                                D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1, matrix_instr_nonkdim=32,
-                                waves_per_eu=0, grid=(128, n // 64), warmup=False)
-        _bwd_q_consume_arena.run(ds, dss, k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64, CAUSAL=causal,
-                                 HEADS=128, num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0,
-                                 grid=(n // 128, 128), warmup=False)
+        # Every input was admitted in this call. Subclasses retain normal JIT
+        # specialization because they may override tensor metadata access.
+        ordinary_inputs = all(
+            type(tensor) is torch.Tensor for tensor in (q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse))
+        plan = _arena_launch_plan(device, n, causal, sm_scale) if ordinary_inputs else None
+        if plan is not None:
+            prepare, kv, query = plan
+            # The public compiled runner resolves the current stream each time.
+            # Pass the complete original ABI, including constexpr positions.
+            prepare[(n // 32, 128, 1)](v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32)
+            kv[(128, n // 64, 1)](q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss, n, 128, 64,
+                                  64, causal)
+            query[(n // 128, 128, 1)](ds, dss, k_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128)
+        else:
+            # N stays runtime in both reduction kernels; ARENA_N only fixes
+            # preparation byte offsets. Cold JIT errors propagate unchanged.
+            prepare = _prepare_fused_arena.run(v_bf16, do_bf16, k_scale, out_bf16, arena, n, 128, 32, num_warps=4,
+                                               num_stages=2, grid=(n // 32, 128), warmup=False)
+            kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ds, dss,
+                                         ARENA_N=n, D=128, BM=64, BN=64, CAUSAL=causal, num_warps=2, num_stages=1,
+                                         matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
+            query = _bwd_q_consume_arena.run(ds, dss, k_fp8, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
+                                             CAUSAL=causal, HEADS=128, num_warps=4, num_stages=1,
+                                             matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
+                                             warmup=False)
+            if ordinary_inputs:
+                _remember_arena_launch_plan(device, n, causal, sm_scale, (prepare, kv, query))
     else:
         _prepare_fused.run(v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32, num_warps=4,
                            num_stages=2, grid=(n // 32, 128), warmup=False)

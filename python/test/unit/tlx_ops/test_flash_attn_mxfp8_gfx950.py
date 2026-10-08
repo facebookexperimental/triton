@@ -427,6 +427,146 @@ def test_flash_attn_mxfp8_shared_backward_live_metadata(n_ctx, causal):
             assert admit() == (device, shape)
 
 
+@pytest.mark.parametrize("n_ctx", (1024, 2048))
+def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx):
+    from types import SimpleNamespace
+    from triton import knobs
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    device = torch.device("cuda:2")
+    globals_dict = {"value": 7}
+    jits = [
+        SimpleNamespace(device_caches={}, pre_run_hooks=[], launch_metadata=None, debug=False, hash="source",
+                        used_global_vals={("value", 0): (7, globals_dict)}) for _ in range(3)
+    ]
+    kernels = [mock.MagicMock(spec=shared.CompiledKernel) for _ in range(3)]
+    for jit, kernel in zip(jits, kernels):
+        kernel.src = SimpleNamespace(fn=jit)
+        kernel._compile_iq_acf_cubin = None
+        jit.device_caches[device.index] = ({"compiled-key": kernel}, {}, None, None, None)
+
+    with mock.patch.object(shared, "_prepare_fused_arena", jits[0]):
+        with mock.patch.object(shared, "_bwd_kv_owner_arena", jits[1]):
+            with mock.patch.object(shared, "_bwd_q_consume_arena", jits[2]):
+                with mock.patch.object(shared, "_ARENA_LAUNCH_PLANS", {}):
+                    with mock.patch.object(shared, "_arena_launch_controls", return_value=True) as controls:
+                        shared._remember_arena_launch_plan(device, n_ctx, False, 0.5, kernels)
+                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5) == tuple(kernels)
+                        assert shared._arena_launch_plan(torch.device("cuda:3"), n_ctx, False, 0.5) is None
+                        assert shared._arena_launch_plan(device, n_ctx, True, 0.5) is None
+                        assert shared._arena_launch_plan(device, n_ctx, False, 1.3) is None
+                        controls.return_value = False
+                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+                        controls.return_value = True
+                        for jit in jits:
+                            jit.pre_run_hooks.append(lambda: None)
+                            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+                            jit.pre_run_hooks.clear()
+                            jit.hash = "changed source"
+                            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+                            jit.hash = "source"
+                            old_cache = jit.device_caches[device.index]
+                            jit.device_caches.clear()
+                            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+                            jit.device_caches[device.index] = old_cache
+                        globals_dict["value"] = 8
+                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+                        globals_dict["value"] = 7
+                        assert shared._arena_launch_plan(device, n_ctx, False, 0.5) == tuple(kernels)
+
+    # Controls are tested independently of the mocked validity metadata.
+    with mock.patch.object(shared, "get_cache_invalidating_env_vars", return_value={}):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            assert shared._arena_launch_controls()
+            with knobs.compilation.scope():
+                knobs.compilation.always_compile = True
+                assert not shared._arena_launch_controls()
+            with knobs.runtime.scope():
+                knobs.runtime.debug = True
+                assert not shared._arena_launch_controls()
+            with knobs.runtime.scope():
+                knobs.runtime.jit_cache_hook = lambda **kwargs: None
+                assert not shared._arena_launch_controls()
+            with knobs.compilation.scope():
+                knobs.compilation.instrumentation_mode = "test instrumentation"
+                assert not shared._arena_launch_controls()
+
+
+@pytest.mark.parametrize("n_ctx", (1024, 2048))
+def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx):
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    device = torch.device("cuda:2")
+    shape = (4, 32, n_ctx, 128)
+    inputs = [torch.empty(shape, device="meta") for _ in range(8)]
+    jits = (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena)
+    # Populate real transitive source hashes without compiling or using a GPU.
+    assert all(jit.cache_key for jit in jits)
+    kernels = [mock.MagicMock(spec=shared.CompiledKernel) for _ in jits]
+    original_empty = torch.empty
+    allocations = []
+
+    def allocate(allocation_shape, *, dtype, device):
+        tensor = original_empty(allocation_shape, dtype=dtype, device="meta")
+        allocations.append(tensor)
+        return tensor
+
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(shared, "_arena_launch_controls", return_value=True))
+        stack.enter_context(mock.patch.object(shared, "_ARENA_LAUNCH_PLANS", {}))
+        stack.enter_context(mock.patch.object(shared.torch, "empty", side_effect=allocate))
+        runs = []
+        for jit, kernel in zip(jits, kernels):
+            kernel.src = SimpleNamespace(fn=jit)
+            kernel._compile_iq_acf_cubin = None
+            stack.enter_context(mock.patch.object(jit, "device_caches", {2: ({"compiled-key": kernel}, )}))
+            runs.append(stack.enter_context(mock.patch.object(jit, "run", return_value=kernel)))
+        cold = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+        warm = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+        assert all(run.call_count == 1 for run in runs)
+        assert all(first is not second for first, second in zip(cold, warm))
+        prepare_args = kernels[0].__getitem__.return_value.call_args.args
+        kv_args = kernels[1].__getitem__.return_value.call_args.args
+        query_args = kernels[2].__getitem__.return_value.call_args.args
+        assert prepare_args[4] is kv_args[5] is query_args[3] is allocations[6]
+        assert kv_args[10] is query_args[0] is allocations[7]
+        assert kv_args[11] is query_args[1] is allocations[8]
+        assert query_args[4] is warm[0] and kv_args[6] is warm[1] and kv_args[7] is warm[2]
+        assert prepare_args[5:] == (n_ctx, 128, 32)
+        assert kv_args[12:] == (n_ctx, 128, 64, 64, False)
+        assert query_args[7:] == (n_ctx, 128, 128, 64, False, 128)
+        # A supported source edit invalidates each caller's hash. The live
+        # real JIT objects must reject a retained compiled plan afterward.
+        with mock.patch.object(jits[1], "hash", None):
+            assert shared._arena_launch_plan(device, n_ctx, False, 0.5) is None
+        kernels[1].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
+        with pytest.raises(RuntimeError, match="compiled launch failed"):
+            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape)
+        assert all(run.call_count == 1 for run in runs), "compiled launch errors must not retry JIT"
+
+
+def test_flash_attn_mxfp8_shared_backward_compiled_runner_current_stream():
+    from types import SimpleNamespace
+    from triton import knobs
+    from triton.runtime import driver
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
+
+    active = SimpleNamespace(get_current_device=lambda: 2, get_current_stream=lambda device: active.stream, stream=101)
+    kernel = SimpleNamespace(_init_handles=lambda: None, _dispatcher=None, launch_metadata=lambda *args: None,
+                             run=mock.Mock(), function=object(), packed_metadata=())
+    with mock.patch.object(driver, "_active", active):
+        with knobs.nvidia.scope():
+            knobs.nvidia.use_triton_dispatcher = False
+            runner = shared.CompiledKernel.__getitem__(kernel, (32, 128, 1))
+            runner("first call")
+            active.stream = 202
+            runner("second call")
+    assert kernel.run.call_args_list[0].args[3] == 101
+    assert kernel.run.call_args_list[1].args[3] == 202
+
+
 def test_flash_attn_mxfp8_shared_backward_host_dispatch():
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
 
