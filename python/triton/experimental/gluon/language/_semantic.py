@@ -187,11 +187,9 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         handle = self.builder.create_broadcast(input.handle, ret_ty.to_ir(self.builder))
         return self.tensor(handle, ret_ty)
 
-    def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,
-             padding_option: str, cache_modifier: str, eviction_policy: str, is_volatile: bool,
-             latency: Optional[int]) -> TensorTy:
-        result = super().load(ptr, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy,
-                              is_volatile, latency)
+    def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], cache_modifier: str,
+             eviction_policy: str, is_volatile: bool, latency: Optional[int]) -> TensorTy:
+        result = super().load(ptr, mask, other, cache_modifier, eviction_policy, is_volatile, latency)
         # Triton's load builds a layout-less result type; propagate the
         # pointer's distributed layout so downstream layout-sensitive ops
         # (broadcast, cat, fp4_to_fp, ...) see a distributed tensor.
