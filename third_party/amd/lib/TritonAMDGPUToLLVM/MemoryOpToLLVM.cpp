@@ -21,8 +21,8 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <type_traits>
 
 using mlir::triton::amdgpu::ISAFamily;

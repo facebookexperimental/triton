@@ -236,4 +236,3 @@ def test_gfx1250_gl_fma_packed(dtype, packed_inst):
     assert asm.count(packed_inst) == NUM_PACKED, asm
     assert "v_fma_f32" not in asm
     assert "v_dual_fma" not in asm
-
