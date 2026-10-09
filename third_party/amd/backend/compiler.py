@@ -14,8 +14,6 @@ import functools
 import warnings
 from pathlib import Path
 
-from .amdgc_hazard_repair import insert_scheduled_mfma_hazard_nops
-
 MAX_INT_32 = 2**31 - 1
 
 
@@ -964,7 +962,6 @@ class HIPBackend(BaseBackend):
                 dump_ir=knobs.getenv_bool("LLVM_IR_ENABLE_DUMP", False),
                 enable_timing=knobs.getenv_bool("LLVM_ENABLE_TIMING", False),
             )
-        amdgcn = insert_scheduled_mfma_hazard_nops(amdgcn, options.arch)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
