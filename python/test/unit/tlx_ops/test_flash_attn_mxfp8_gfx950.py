@@ -551,7 +551,7 @@ def test_flash_attn_mxfp8_shared_backward_live_metadata(n_ctx, causal):
 @pytest.mark.parametrize(
     "n_ctx,qk_format,plan_kind",
     [(n, fmt, "ordinary") for n in (1024, 2048) for fmt in (False, True)]
-    + [(1024, True, "inline"), (1024, True, "partial"), (2048, True, "causal_partial")],
+    + [(1024, True, "partial"), (2048, True, "causal_partial")],
 )
 def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_format, plan_kind):
     from contextlib import ExitStack
@@ -563,7 +563,6 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_for
     globals_dict = {"value": 7}
     names = {
         "ordinary": ("_prepare_fused_arena", "_bwd_kv_owner_arena", "_bwd_q_consume_arena"),
-        "inline": ("_bwd_kv_owner_inline_arena", "_bwd_q_consume_arena"),
         "partial": ("_prepare_do_arena", "_bwd_kv_owner_partial_arena", "_bwd_q_consume_arena"),
         "causal_partial": ("_prepare_do_arena", "_bwd_kv_owner_causal_partial_arena", "_bwd_q_consume_arena"),
     }[plan_kind]
@@ -600,7 +599,7 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_for
             assert len(shared._ARENA_LAUNCH_PLANS) == 2
             assert shared._arena_launch_plan(device, n_ctx, True, 0.5, qk_format) is None
         else:
-            other = "partial" if plan_kind in ("inline", "causal_partial") else "inline"
+            other = "partial" if plan_kind == "causal_partial" else "causal_partial"
             assert getattr(shared, "_" + other + "_arena_launch_plan")(device, n_ctx, 0.5) is None
             if plan_kind == "causal_partial":
                 assert shared._causal_partial_arena_launch_plan(device, 1024, 0.5) is None

@@ -513,17 +513,6 @@ def _inline_prepare_v64(V, base, keys, D: tl.constexpr):
 
 
 @triton.jit
-def _stage_inline_q(qmem, lsemem, Q, LSE, base, head, start, N, SLOT: tl.constexpr):
-    copy_layout: tl.constexpr = tlx.layout(shape=((64, 2), (1, )), stride=((1, 0), (0, )))
-    rows = start + tl.arange(0, 64)
-    metadata_offsets = tlx.require_layout(rows.to(tl.int32), copy_layout, pin=True)
-    tlx.buffer_load_to_local(lsemem[SLOT], LSE + head.to(tl.int64) * N, metadata_offsets)
-    offsets = rows[:, None] * 128 + tl.arange(0, 128)[None, :]
-    tlx.buffer_load_to_local(qmem[SLOT], Q + base, offsets, True, 0.0)
-    tlx.async_load_commit_group()
-
-
-@triton.jit
 def _store_inline_kdqs(KS, KDQS, head, key_tile, N):
     # Each key64 owner writes two columns of the existing preparation ABI.
     d = tl.arange(0, 128)
@@ -532,117 +521,6 @@ def _store_inline_kdqs(KS, KDQS, head, key_tile, N):
     value = tl.load(KS + saved_offsets)
     offsets = (head * 128 + d[:, None]) * (N // 32) + groups[None, :]
     tl.store(KDQS + offsets, value)
-
-
-@triton.jit
-def _compute_inline_tile(Q, DO, O, QS, LSE, N, sm_scale, DS_EXPORT, DSS_EXPORT, D: tl.constexpr, BM: tl.constexpr,
-                         BN: tl.constexpr, qmem, domem, lsemem, k, v, ks, vs, dk, dv, head, base, key_tile, start,
-                         SLOT: tl.constexpr, PREFETCH: tl.constexpr):
-    export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
-                                                   warps_per_cta=[2, 1])
-    export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
-    native_rhs: tl.constexpr = tlx.dot_operand_layout(1, export_mma, k_width=16)
-    q_words = _load_rhs_words(QS, head, start, N)
-    tlx.async_load_wait_group(0)
-    tlx.workgroup_barrier()
-    if PREFETCH:
-        _stage_inline_q(qmem, lsemem, Q, LSE, base, head, start + BM, N, 1 - SLOT)
-    q = _load_rhs_kv64(qmem[SLOT], True, True, False)
-    qs = _decode_rhs_head(q_words)
-    scores = tlx.release_layout(
-        tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
-                       tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
-                       tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
-    lse = _load_metadata(lsemem[SLOT])
-    logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
-    p = tl.exp2(logits)
-    tlx.amd_iglp_opt(3)
-    # Prepare original BF16 dO and O after the score computation.
-    do0, delta0, word0 = _inline_prepare_do32(DO, O, base, start, D)
-    do1, delta1, word1 = _inline_prepare_do32(DO, O, base, start + 32, D)
-    payload = tl.cat(do0, do1, dim=0)
-    delta = tl.cat(delta0, delta1, dim=0)
-    word_layout: tl.constexpr = tlx.layout(shape=((64, 2), (2, )), stride=((0, 0), (1, )))
-    do_words = tlx.require_layout(tl.join(word0, word1), word_layout, pin=True)
-    tlx.local_store(domem[0], payload)
-    tlx.workgroup_barrier()
-    do = _load_rhs_kv64(domem[0], True, True, False)
-    dos = _decode_rhs_head(do_words)
-    dp = tlx.release_layout(
-        tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
-                       tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
-                       tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
-    delta = tlx.require_layout(delta, tlx.slice_layout(export_mma, 0), pin=False)
-    ds = p * (dp - delta[None, :])
-    p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
-    ps = tl.full((BN, BM // 32), 119, tl.uint8)
-    ds8, dsk, _ = _quantize_ds_square(ds, BN, BM)
-    dsk = _lhs_scale_kv64(dsk)
-    dodv = _load_rhs_kv64(domem[0], False, True, False)
-    dodvs = _decode_rhs_late(do_words)
-    # LLVM 850a2b1b: mask-zero ends the head IGLP scheduling region.
-    tlx.amd_sched_barrier(0)
-    dv = tlx.dot_scaled(tlx.require_layout(p8, export_layout, pin=False), _lhs_scale_kv64(ps), 'e4m3',
-                        tlx.require_layout(dodv, native_rhs, pin=False), dodvs, 'e4m3',
-                        tlx.require_layout(dv, export_mma, pin=False))
-    qdk = _load_rhs_kv64(qmem[SLOT], False, True, False)
-    qdks = _decode_rhs_late(q_words)
-    dk = tlx.dot_scaled(tlx.require_layout(ds8, export_layout, pin=False), _lhs_scale_kv64(dsk), 'e4m3',
-                        tlx.require_layout(qdk, native_rhs, pin=False), qdks, 'e4m3',
-                        tlx.require_layout(dk, export_mma, pin=False))
-    export_base = head * N * N
-    export_rows = tlx.require_layout(tl.arange(0, BN), tlx.slice_layout(export_layout, 1), pin=False)
-    export_cols = tlx.require_layout(tl.arange(0, BM), tlx.slice_layout(export_layout, 0), pin=False)
-    export_keys = key_tile * BN + export_rows
-    export_queries = start + export_cols
-    export_key_column = tlx.require_layout(export_keys[:, None], export_layout, pin=True)
-    export_query_row = tlx.require_layout(export_queries[None, :], export_layout, pin=True)
-    export_offsets = (export_key_column * N + export_query_row).to(tl.int32)
-    export_offsets = tlx.require_layout(export_offsets, export_layout, pin=False)
-    export_value = tlx.require_layout(ds8, export_layout, pin=False)
-    tlx.buffer_store(export_value, DS_EXPORT + export_base, export_offsets)
-    _store_ds_scale_native(DSS_EXPORT, dsk, head, key_tile * BN, start, N)
-    # Complete both dO reads before the next tile overwrites its LDS slot.
-    tlx.workgroup_barrier()
-    return (dk, dv)
-
-
-@triton.jit
-def _bwd_kv_owner_inline_arena(QK, V, DO, O, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
-                               BM: tl.constexpr, BN: tl.constexpr):
-    """Prepare fresh BF16 operands inside each noncausal key64 owner."""
-    tl.static_assert(ARENA_N == 1024 and D == 128 and BM == 64 and BN == 64)
-    Q, K, QS, KS = _saved_qk_arena_segments(QK, ARENA_N)
-    _, _, _, _, kdqs, _ = _preparation_arena_segments(Arena, ARENA_N)
-    DS, DSS = _backward_arena_segments(Arena, ARENA_N)
-    head = tl.program_id(0).to(tl.int64)
-    key_tile = tl.program_id(1)
-    keys = key_tile * BN + tl.arange(0, BN)
-    base = head * N * D
-    v, vs = _inline_prepare_v64(V, base, keys, D)
-    k = _load_resident_kv64(K, base, keys, N, D, True)
-    ks = _load_scale_native(KS, head, key_tile * BN, N, 64, 4, False, False)
-    _store_inline_kdqs(KS, kdqs, head, key_tile, N)
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
-    dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
-    dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
-    shared_layout: tl.constexpr = _stage_layout(D)
-    qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
-    domem = tlx.local_alloc((BM, D), tl.float8e4nv, 1, layout=shared_layout)
-    lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=tlx.swizzled_layout(0, 1, 1, order=[0]))
-    _stage_inline_q(qmem, lsemem, Q, LSE, base, head, 0, N, 0)
-    for pair_start in range(0, N - 128, 128):
-        dk, dv = _compute_inline_tile(Q, DO, O, QS, LSE, N, sm_scale, DS, DSS, D, BM, BN, qmem, domem, lsemem, k, v, ks,
-                                      vs, dk, dv, head, base, key_tile, pair_start, 0, True)
-        dk, dv = _compute_inline_tile(Q, DO, O, QS, LSE, N, sm_scale, DS, DSS, D, BM, BN, qmem, domem, lsemem, k, v, ks,
-                                      vs, dk, dv, head, base, key_tile, pair_start + 64, 1, True)
-    dk, dv = _compute_inline_tile(Q, DO, O, QS, LSE, N, sm_scale, DS, DSS, D, BM, BN, qmem, domem, lsemem, k, v, ks, vs,
-                                  dk, dv, head, base, key_tile, N - 128, 0, True)
-    dk, dv = _compute_inline_tile(Q, DO, O, QS, LSE, N, sm_scale, DS, DSS, D, BM, BN, qmem, domem, lsemem, k, v, ks, vs,
-                                  dk, dv, head, base, key_tile, N - 64, 1, False)
-    offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
-    tl.store(DK + offsets, dk * sm_scale)
-    tl.store(DV + offsets, dv)
 
 
 @triton.jit
@@ -1225,43 +1103,6 @@ def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled, qk_format
         entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
     format_key = _SAVED_QK_ARENA_FORMAT if qk_format else ("legacy_shared_square", 0)
     _ARENA_LAUNCH_PLANS[(device.index, n, causal, sm_scale, format_key)] = tuple(entries)
-
-
-def _inline_arena_launch_plan(device, n, sm_scale):
-    if device.type != "cuda" or device.index is None or not _arena_launch_controls():
-        return None
-    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, False, sm_scale, ("inline_saved_qk_arena", 1)))
-    if plan is None:
-        return None
-    for current, entry in zip((_bwd_kv_owner_inline_arena, _bwd_q_consume_arena), plan):
-        jit, cache_key, kernel, source_hash, globals_used, runner = entry
-        cache = jit.device_caches.get(device.index)
-        if (jit is not current or jit.pre_run_hooks or jit.launch_metadata is not None or jit.debug
-                or jit.hash != source_hash or cache is None or cache[0].get(cache_key) is not kernel
-                or getattr(kernel, "_compile_iq_acf_cubin", None) is not None):
-            return None
-        for name, value, namespace in globals_used:
-            if name not in namespace or namespace[name] != value:
-                return None
-    return tuple(entry[5] for entry in plan)
-
-
-def _remember_inline_arena_launch_plan(device, n, sm_scale, compiled):
-    if device.type != "cuda" or device.index is None or not _arena_launch_controls():
-        return
-    entries = []
-    grids = ((128, n // 64, 1), (n // 128, 128, 1))
-    for jit, kernel, grid in zip((_bwd_kv_owner_inline_arena, _bwd_q_consume_arena), compiled, grids):
-        cache = jit.device_caches.get(device.index)
-        if (not isinstance(kernel, CompiledKernel) or cache is None or jit.pre_run_hooks
-                or jit.launch_metadata is not None or jit.debug or kernel.src.fn is not jit):
-            return
-        cache_key = next((key for key, cached in cache[0].items() if cached is kernel), None)
-        if cache_key is None:
-            return
-        globals_used = tuple((name, value, namespace) for (name, _), (value, namespace) in jit.used_global_vals.items())
-        entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
-    _ARENA_LAUNCH_PLANS[(device.index, n, False, sm_scale, ("inline_saved_qk_arena", 1))] = tuple(entries)
 
 
 def _partial_arena_launch_plan(device, n, sm_scale):
