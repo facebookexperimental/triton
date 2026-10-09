@@ -297,6 +297,7 @@ earlier accumulated value will be discarded. When carrying independent output
 subtiles, apply this initialization rule to each accumulator separately.
 
 LLVM models MFMA latency and hazards through native intrinsics for both roles.
+The compiler no longer runs a separate Python pass to repair MFMA assembly hazards.
 Persistent register-class pins use inline assembly without hiding the MFMA
 arithmetic. When results can reach opaque consumers, the compiler adds
 target-specific completion waits. Explicit `amd_mfma_commit` boundaries retain
