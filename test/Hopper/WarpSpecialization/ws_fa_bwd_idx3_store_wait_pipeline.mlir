@@ -199,7 +199,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttng.async_tma_store_token_wait %15   {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.async.token loc(#loc215)
       %curr_m_99 = arith.addi %curr_m_35, %c64_i32 {async_task_id = array<i32: 0, 2>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : i32 loc(#loc216)
       scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %curr_m_99, %true, %qkT_55, %dpT_71, %dv_64, %dk_76, %dq_80 : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token loc(#loc164)
-    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.scheduled_max_stage = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 202000 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32} loc(#loc219)
+    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.scheduled_max_stage = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 206096 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32} loc(#loc219)
     %dv_21, %dv_22 = ttng.tmem_load %dv[%curr_m#4] {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear> loc(#loc188)
     %dk_23, %dk_24 = ttng.tmem_load %dk[%curr_m#5] {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear> loc(#loc189)
     %dvs = tt.reshape %dv_21 {async_task_id = array<i32: 3>} : tensor<128x128xf32, #linear> -> tensor<128x2x64xf32, #linear7> loc(#loc217)
@@ -417,22 +417,25 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 #loc225 = loc(callsite(#loc46 at #loc222))
 
 
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=202000" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=PLANNER
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=202000" --nvgpu-test-annotate-tma-store-waits --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=ANNOTATE
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=202000" --nvgpu-test-annotate-tma-store-waits --nvgpu-test-tma-store-token-wait-reorder --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=REORDER
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=202000" --nvgpu-test-annotate-tma-store-waits --nvgpu-test-tma-store-token-wait-reorder --nvgpu-tma-store-token-wait-lowering --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=LOWER
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=206096" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=PLANNER
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=206096" --nvgpu-test-annotate-tma-store-waits --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=ANNOTATE
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=206096" --nvgpu-test-annotate-tma-store-waits --nvgpu-test-tma-store-token-wait-reorder --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=REORDER
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=206096" --nvgpu-test-annotate-tma-store-waits --nvgpu-test-tma-store-token-wait-reorder --nvgpu-tma-store-token-wait-lowering --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=LOWER
 
 // Generated from FA backward config idx 3 immediately after
 // doBufferAllocation: BLOCK_M1=64, EPILOGUE_SUBTILE=2, DQ_SUBTILE=4,
 // BWD_DOT_ATTRS=_BWD_DOT_ATTRS_BM64_TMEM.
 //
 // The budget comes from tt.smem_budget on the loop, not from the RUN-line
-// option; the two are kept in sync only for readability. It is 202000 rather
+// option; the two are kept in sync only for readability. It is 206096 rather
 // than the shipped 200000 because the point of this fixture is the dV
-// two-copy store-wait ring: at 200000 the effective budget is 195676 (2 KiB of
-// auxiliary SMEM) and Phase 3.7's dV bump lands at 197632, so the planner
-// reverts dV to one copy and there is no rotation left to check. dK must still
-// miss the bump for the asymmetry below to hold, so do not raise this further.
+// two-copy store-wait ring. The planner reserves 4096 B for the largest
+// conversion scratch on top of barriers and captures, so 206096 leaves the
+// same effective budget as 202000 did without it. At 200000 (effective 195676
+// before the scratch reservation) Phase 3.7's dV bump lands at 197632, so the
+// planner reverts dV to one copy and there is no rotation left to check. dK
+// must still miss the bump for the asymmetry below to hold, so do not raise
+// this further.
 // Whether the shipped 200000 config should still fit a two-copy dV is tracked
 // separately (T284939236).
 
