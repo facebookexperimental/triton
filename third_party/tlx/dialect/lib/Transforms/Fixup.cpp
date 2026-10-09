@@ -1281,6 +1281,19 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
           if (succeeded(layout->inferTransOpEncoding(
                   resultEnc, resultType.getShape(), inverseOrder,
                   inferredSrcEnc, trans.getLoc()))) {
+            // Inverse inference can linearize an existing MFMA encoding. Keep
+            // physically equivalent ownership to avoid oscillating with an
+            // encoding-uniform producer such as arith.truncf.
+            Attribute srcPhysical = getEffectiveEncoding(srcEnc);
+            Attribute inferredPhysical = getEffectiveEncoding(inferredSrcEnc);
+            if (srcEnc != inferredSrcEnc &&
+                isa_and_nonnull<ttg::DistributedEncodingTrait>(srcPhysical) &&
+                isa_and_nonnull<ttg::DistributedEncodingTrait>(
+                    inferredPhysical) &&
+                haveSamePhysicalLayout(
+                    srcTy.cloneWithEncoding(srcPhysical),
+                    srcTy.cloneWithEncoding(inferredPhysical)))
+              return;
             changed |= retypeWithEncoding(trans.getSrc(), inferredSrcEnc);
             return;
           }
@@ -1694,6 +1707,11 @@ public:
     mod->setAttr(ttg::AttrNumThreadsPerWarp,
                  b.getI32IntegerAttr(threadsPerWarp));
     mod->setAttr(ttg::AttrNumCTAsName, b.getI32IntegerAttr(numCTAs));
+    if (clusterDims.size() == 3) {
+      mod->setAttr(ttg::AttrClusterDimX, b.getI32IntegerAttr(clusterDims[0]));
+      mod->setAttr(ttg::AttrClusterDimY, b.getI32IntegerAttr(clusterDims[1]));
+      mod->setAttr(ttg::AttrClusterDimZ, b.getI32IntegerAttr(clusterDims[2]));
+    }
     mod->setAttr(ttg::AttrTargetName, b.getStringAttr(this->target.getValue()));
     if (hasTLXOps)
       mod->setAttr(AttrHasTLXOpsName, b.getBoolAttr(true));

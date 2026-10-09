@@ -2054,11 +2054,18 @@ void init_triton_ir(py::module_ &m) {
              }
              return self.create<ReduceReturnOp>(return_values);
            })
-      .def("create_scan",
-           [](TritonOpBuilder &self, std::vector<Value> operands, int axis,
-              bool reverse) -> OpState {
-             return self.create<ScanOp>(operands, axis, reverse);
-           })
+      .def(
+          "create_scan",
+          [](TritonOpBuilder &self, std::vector<Value> operands, int axis,
+             bool reverse, const std::string &reductionOrdering) -> OpState {
+            StringAttr orderingAttr;
+            if (!reductionOrdering.empty())
+              orderingAttr = StringAttr::get(self.getBuilder().getContext(),
+                                             reductionOrdering);
+            return self.create<ScanOp>(operands, axis, reverse, orderingAttr);
+          },
+          py::arg("operands"), py::arg("axis"), py::arg("reverse"),
+          py::arg("reduction_ordering") = "")
       .def("create_scan_ret",
            [](TritonOpBuilder &self, py::args args) -> OpState {
              llvm::SmallVector<Value> return_values;
@@ -2171,6 +2178,26 @@ void init_triton_ir(py::module_ &m) {
                auto i32Ty = IntegerType::get(ctx, 32);
                border->setAttr("triton.warp_pipeline.priority",
                                IntegerAttr::get(i32Ty, priority));
+             }
+           })
+      // Intra-wave scheduling-region marker (AMD). Unlike a warp-pipeline
+      // border this is a lexical begin/end marker: a late TTGIR pass consumes
+      // it and emits sched_group_barrier constraints without phase-shifting
+      // warp groups.
+      .def("create_intra_wave_pipeline_marker",
+           [](TritonOpBuilder &self, const std::string &label, int64_t pair,
+              bool isBegin) {
+             auto marker =
+                 self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+             auto ctx = self.getContext();
+             marker->setAttr("triton.intra_wave_pipeline.marker",
+                             StringAttr::get(ctx, isBegin ? "begin" : "end"));
+             marker->setAttr("triton.intra_wave_pipeline.label",
+                             StringAttr::get(ctx, label));
+             if (pair >= 0) {
+               auto i64Ty = IntegerType::get(ctx, 64);
+               marker->setAttr("triton.intra_wave_pipeline.pair",
+                               IntegerAttr::get(i64Ty, pair));
              }
            })
       // Make a tensor descriptor

@@ -9,6 +9,7 @@ Usage:
 import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -556,6 +557,188 @@ class TestTorchTLXEpilogueFusion(TestCase):
 
     @unittest.skipIf(
         not is_gfx950(),
+        "Need AMD MI350X (gfx950) for pre-drain epilogue prefetch",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template epilogue-fusion codegen API",
+    )
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    @parametrize("y_shape", ((129, 257), (1, 257), (129, 1)))
+    def test_tlx_addmm_predrain_epilogue_prefetch(
+        self,
+        dtype: torch.dtype,
+        y_shape: tuple[int, int],
+    ):
+        """Prefetch a full output tile or a simple Y broadcast before drain."""
+        from triton.language.extra.tlx.inductor import mm_templates as tlx_mm
+        from triton.language.extra.tlx.inductor import registry as tlx_registry
+
+        m, k, n = 129, 256, 257
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        a = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
+        y = torch.randn(y_shape, device=GPU_TYPE, dtype=dtype)
+
+        def fused(bias, a, weight, y):
+            value = torch.addmm(bias, a, weight.t())
+            return value + value * y
+
+        original_append_tlx = tlx_mm.append_tlx
+
+        def only_warppipe(templates, op_name, kernel_inputs):
+            original_append_tlx(templates, op_name, kernel_inputs)
+            if tlx_mm.gfx950_addmm_warppipe_template in templates:
+                templates[:] = [tlx_mm.gfx950_addmm_warppipe_template]
+            return templates
+
+        with (
+                mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
+                mock.patch.object(
+                    tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic,
+                    "WARPPIPE_CONFIGS",
+                    [(64, 64, 64, 8, 8, 3)],
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                torch.no_grad(),
+        ):
+            actual, code = run_and_get_code(torch.compile(fused, fullgraph=True), bias, a, weight, y)
+
+        expected = fused(bias, a, weight, y)
+        atol = 2e-2 * expected.abs().max().item()
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=2e-2)
+        source = "\n".join(code)
+        self.assertIn("TorchTLX pre-drain epilogue prefetch: gemm_drain", source)
+        self.assertEqual(1, source.count("tlx_predrain_ptr_gemm_drain = in_ptr3 +"))
+        self.assertNotIn("tl.load(in_ptr3", source)
+        self.assertIn("= tlx_prefetched_gemm_drain", source)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for pre-drain epilogue prefetch",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template epilogue-fusion codegen API",
+    )
+    def test_tlx_predrain_prefetch_rejects_multiple_external_loads(self):
+        """Two external epilogue operands exceed the initial one-load budget."""
+        from triton.language.extra.tlx.inductor import mm_templates as tlx_mm
+        from triton.language.extra.tlx.inductor import registry as tlx_registry
+
+        m, k, n = 129, 256, 257
+        dtype = torch.bfloat16
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        a = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
+        y = torch.randn((m, n), device=GPU_TYPE, dtype=dtype)
+        z = torch.randn((m, n), device=GPU_TYPE, dtype=dtype)
+
+        def fused(bias, a, weight, y, z):
+            value = torch.addmm(bias, a, weight.t())
+            return value + value * y + z
+
+        original_append_tlx = tlx_mm.append_tlx
+
+        def only_warppipe(templates, op_name, kernel_inputs):
+            original_append_tlx(templates, op_name, kernel_inputs)
+            if tlx_mm.gfx950_addmm_warppipe_template in templates:
+                templates[:] = [tlx_mm.gfx950_addmm_warppipe_template]
+            return templates
+
+        with (
+                mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
+                mock.patch.object(
+                    tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic,
+                    "WARPPIPE_CONFIGS",
+                    [(64, 64, 64, 8, 8, 3)],
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            actual, code = run_and_get_code(torch.compile(fused, fullgraph=True), bias, a, weight, y, z)
+
+        expected = fused(bias, a, weight, y, z)
+        atol = 2e-2 * expected.abs().max().item()
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=2e-2)
+        self.assertNotIn(
+            "TorchTLX pre-drain epilogue prefetch: gemm_drain",
+            "\n".join(code),
+        )
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for persistent pre-drain prefetch",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template epilogue-fusion codegen API",
+    )
+    def test_tlx_persistent_addmm_predrain_epilogue_prefetch(self):
+        """The paired hook stays inside each persistent output-tile iteration."""
+        from triton.language.extra.tlx.inductor import mm_templates as tlx_mm
+        from triton.language.extra.tlx.inductor import registry as tlx_registry
+
+        m, k, n = 4160, 256, 512
+        dtype = torch.bfloat16
+        bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        a = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
+        y = torch.randn((m, n), device=GPU_TYPE, dtype=dtype)
+
+        def fused(bias, a, weight, y):
+            value = torch.addmm(bias, a, weight.t())
+            return value + value * y
+
+        original_append_tlx = tlx_mm.append_tlx
+
+        def only_persistent(templates, op_name, kernel_inputs):
+            original_append_tlx(templates, op_name, kernel_inputs)
+            if tlx_mm.gfx950_addmm_persistent_warppipe_template in templates:
+                templates[:] = [tlx_mm.gfx950_addmm_persistent_warppipe_template]
+            return templates
+
+        with (
+                mock.patch.object(tlx_mm, "append_tlx", only_persistent),
+                mock.patch.object(
+                    tlx_registry.Gfx950AddMMPersistentWarpPipeConfigHeuristic,
+                    "WARPPIPE_CONFIGS",
+                    [(64, 128, 64, 8, 8, 2)],
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                torch.no_grad(),
+        ):
+            actual, code = run_and_get_code(torch.compile(fused, fullgraph=True), bias, a, weight, y)
+
+        expected = fused(bias, a, weight, y)
+        atol = 2e-2 * expected.abs().max().item()
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=2e-2)
+        source = "\n".join(code)
+        self.assertIn("Persistent TLX warp-pipelined addmm", source)
+        self.assertIn("TorchTLX pre-drain epilogue prefetch: gemm_drain", source)
+
+    @unittest.skipIf(
+        not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -734,7 +917,6 @@ class TestTorchTLXEpilogueFusion(TestCase):
         gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
         scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
         norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
-        torch._dynamo.mark_dynamic(x, 0, min=120, max=766)
 
         def matmul_rmsnorm(
             x: torch.Tensor,
@@ -797,7 +979,9 @@ class TestTorchTLXEpilogueFusion(TestCase):
             atol=3e-2,
             rtol=3e-2,
         )
-        self.assertEqual(compile_counter.frame_count, 1)
+        # The fused custom op declines dynamic M. The remaining TLX addmm
+        # candidates specialize M, so the second shape recompiles once.
+        self.assertEqual(compile_counter.frame_count, 2)
         generated_code = "\n".join(code)
         self.assertNotIn("tlx_gfx950_addmm_rmsnorm", generated_code)
         self.assertGreaterEqual(code[-1].count(".run("), 2)

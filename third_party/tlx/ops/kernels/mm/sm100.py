@@ -240,8 +240,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
         epilogue_elem_bytes = 4 if split_k > 1 else 2
         num_epilogue_buffers = max(num_mma_groups, 2)
         block_m_split = bm // num_mma_groups
-        smem_epilog = (block_m_split * (bn // epilogue_subtile) * epilogue_elem_bytes *
-                       num_epilogue_buffers)
+        smem_epilog = (block_m_split * (bn // epilogue_subtile) * epilogue_elem_bytes * num_epilogue_buffers)
         smem_barriers = num_smem_buffers * num_mma_groups * 8 * (2 if num_ctas == 2 else 1)
         return smem_a + smem_b + smem_epilog + smem_barriers
 
@@ -562,8 +561,7 @@ def preprocess_configs(configs, named_args, **kwargs):
         epilogue_elem_bytes = 4 if SPLIT_K > 1 else 2
         num_epilogue_buffers = max(NUM_MMA_GROUPS, 2)
         block_m_split = BLOCK_M // NUM_MMA_GROUPS
-        smem_epilog = (block_m_split * (BLOCK_N // EPILOGUE_SUBTILE) * epilogue_elem_bytes *
-                       num_epilogue_buffers)
+        smem_epilog = (block_m_split * (BLOCK_N // EPILOGUE_SUBTILE) * epilogue_elem_bytes * num_epilogue_buffers)
         smem_barriers = NUM_SMEM_BUFFERS * NUM_MMA_GROUPS * MBARRIER_SIZE
         if NUM_CTAS == 2:
             smem_barriers += NUM_SMEM_BUFFERS * NUM_MMA_GROUPS * MBARRIER_SIZE

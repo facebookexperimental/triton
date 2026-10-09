@@ -34,6 +34,7 @@ M = 2032
 K = 2560
 N = 2560
 EPS = 1.0e-5
+SHAPES = ({"m": M, "k": K, "n": N, "dtype": "bf16"}, )
 
 
 def add_arguments(parser) -> None:

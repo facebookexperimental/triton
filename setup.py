@@ -381,6 +381,7 @@ class CMakeBuild(build_ext):
             "TRITON_ROCPROFILER_SDK_LIB_PATH",
             "TRITON_SLEEF_SOURCE_DIR",
             "TRITON_NVDISASM_PATH",
+            "TRITON_AMD_CODEGEN_PATH",
             "TRITON_PTXAS_PATH",
             "TRITON_PTXAS_BLACKWELL_PATH",
         ]
@@ -480,6 +481,7 @@ def get_packages():
         yield "triton.profiler"
 
     yield "triton.language.extra.tlx"
+    yield "triton.language.extra.tlx.ops"
 
     # The TLX op library. find_packages() does follow the symlink once it
     # exists, but on a fresh tree add_links() may not have run yet, so

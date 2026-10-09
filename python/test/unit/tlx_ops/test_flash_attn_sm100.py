@@ -41,6 +41,8 @@ def _assert_close(out, ref, dtype):
 def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     from triton.tlx.ops import flash_attn as tlx_flash_attn
 
+    if N_CTX % 128 or HEAD_DIM not in (64, 128):
+        pytest.skip(f"sm100 takes N_CTX % 128 == 0 and HEAD_DIM 64/128, got {N_CTX}x{HEAD_DIM}")
     dtype = DTYPES[dtype_name]
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype)
     out = tlx_flash_attn(q, k, v, causal=causal, space="smoke")
@@ -52,6 +54,8 @@ def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
     """The kernel carries the full backward path even though the op defers it."""
     from triton.tlx.ops import flash_attn as tlx_flash_attn
 
+    if N_CTX % 128 or HEAD_DIM not in (64, 128):
+        pytest.skip(f"sm100 takes N_CTX % 128 == 0 and HEAD_DIM 64/128, got {N_CTX}x{HEAD_DIM}")
     dtype = DTYPES[dtype_name]
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=True)
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))

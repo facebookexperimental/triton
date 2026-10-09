@@ -38,6 +38,61 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
+// kWidth=8 requires two native K fragments on CDNA3.
+// CHECK-LABEL: llvm.func @scheduled_mfma_transient_bf16_16x16x16_kwidth8
+// CHECK-COUNT-2: rocdl.mfma.f32.16x16x16bf16.1k
+// CHECK-NOT: rocdl.mfma
+// CHECK-NOT: amdg.
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scheduled_mfma_transient_bf16_16x16x16_kwidth8(
+      %a: tensor<16x32xbf16, #lhs>,
+      %b: tensor<32x16xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %committed, %preserved = amdg.mfma_commit %result, %b
+        : tensor<16x16xf32, #mma>, tensor<32x16xbf16, #rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @scheduled_mfma_persistent_f16_32x32x8_kwidth8
+// CHECK-COUNT-2: llvm.inline_asm has_side_effects{{.*}}v_mfma_f32_32x32x8_f16
+// CHECK-NOT: v_mfma
+// CHECK-NOT: amdg.
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [32, 32, 8], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scheduled_mfma_persistent_f16_32x32x8_kwidth8(
+      %a: tensor<32x16xf16, #lhs>,
+      %b: tensor<16x32xf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "vgpr" initialize true
+        : tensor<32x16xf16, #lhs>, tensor<16x32xf16, #rhs>,
+          tensor<32x32xf32, #mma> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: llvm.func @scheduled_mfma_persistent_f16_32x32x8
 // CHECK: llvm.inline_asm has_side_effects
 // CHECK-SAME: "s_nop 3\0Av_mfma_f32_32x32x8_f16 $0, $1, $2, 0", "=&v,v,v"
@@ -217,6 +272,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     %committed, %preserved = amdg.mfma_commit %result, %b
         : tensor<16x16xf32, #mma>,
           tensor<16x16xbf16, #rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// Rank-three batches remain wave-local on CDNA3 as well.
+// CHECK-LABEL: llvm.func @wave_batched_transient_gfx942
+// CHECK: rocdl.mfma.f32.16x16x16bf16.1k
+// CHECK: llvm.inline_asm has_side_effects{{.*}}s_nop 10
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @wave_batched_transient_gfx942(%a: tensor<2x16x16xbf16, #lhs>, %b: tensor<2x16x16xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<2x16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient" register_class "auto" initialize true
+        : tensor<2x16x16xbf16, #lhs>, tensor<2x16x16xbf16, #rhs>, tensor<2x16x16xf32, #mma>
+          -> tensor<2x16x16xf32, #mma>
+    %committed, %preserved = amdg.mfma_commit %result, %b
+        : tensor<2x16x16xf32, #mma>, tensor<2x16x16xbf16, #rhs>
     tt.return
   }
 }

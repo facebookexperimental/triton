@@ -679,17 +679,25 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
 
     # allocate SMEM buffers and barriers
     NUM_Q_BUFS: tl.constexpr = NUM_GROUPS_PER_CTA * NUM_BUFFERS_Q
-    q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_Q_BUFS)
+    # In 2CTA mode the epilogue output tile shares Q's SMEM backing. O has
+    # fewer buffers than Q (same shape); the shared group tiles O from
+    # offset 0 of Q's backing.
+    qo_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_Q_BUFS, reuse=qo_smem_alias)
     BLOCK_N_KV: tl.constexpr = BLOCK_N // NUM_CTAS
     if USE_2CTA:
         # Separate k_tiles and v_tiles. K loaded as (N/2, D), local_trans to (D, N/2).
         # V loaded as (N, D/2).
         k_tiles = tlx.local_alloc((BLOCK_N_KV, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
         v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM_KV), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
-        o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_GROUPS_PER_CTA, reuse=q_tiles)
+        o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_GROUPS_PER_CTA,
+                                  reuse=qo_smem_alias)
     else:
         kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
         o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_MMA_GROUPS)
+
+    if USE_2CTA:
+        qo_smem_alias.set_buffer_overlap(tlx.reuse_group(q_tiles, o_tiles, group_type=tlx.reuse_group_type.shared))
 
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_Q_BUFS)
     q_empties = tlx.alloc_barriers(num_barriers=NUM_Q_BUFS)
@@ -1289,18 +1297,17 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
                              ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
-    off_h = tl.arange(0, HEAD_DIM)
+    off_h = tl.arange(0, HALF_HD)
     q = off_m[:, None]
-    h = off_h[None, :]
     tile_base = (q // BLK) * BLK
     local = q % BLK
-    half = h // HALF_HD
-    col = h % HALF_HD
-    packed_row = 2 * tile_base + local + BLK * half
-    src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + col
-    val = tl.load(src)
-    dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
-    tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
+    for half in tl.range(0, 2, loop_unroll_factor=1):
+        h = off_h[None, :] + half * HALF_HD
+        packed_row = 2 * tile_base + local + BLK * half
+        src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + off_h[None, :]
+        val = tl.load(src)
+        dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
+        tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
 
 
 @triton.jit
@@ -2334,12 +2341,6 @@ def _bwd_compute_inner_loop(
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
-    # Named-barrier rendezvous for the aliased-TMEM WAR (Hazard 1): all 8 compute
-    # warps must finish reading qk/dp before any overwrites it with P/dsT. One
-    # named_barrier_wait is a full bar.sync; indices 7-15 are free (0-6 reserved).
-    QK_READ_DONE_BAR: tl.constexpr = 10
-    DP_READ_DONE_BAR: tl.constexpr = 11
-    NUM_COMPUTE_THREADS: tl.constexpr = 8 * 32
     if num_steps_override > 0:
         num_steps = num_steps_override
     else:
@@ -2370,11 +2371,6 @@ def _bwd_compute_inner_loop(
 
         # Store P to TMEM.
         ppT = pT.to(do_out_dtype)
-        # Hazard 1 (intra-task WAR): P (f16) aliases the upper half of the qk
-        # (f32) TMEM region; tcgen05 ld/st warp->chunk maps differ, so a fast
-        # warp's P store can overwrite a 32x32 chunk a slow warp has not read as
-        # qkT. Rendezvous all 8 compute warps between the read and the store.
-        tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
         # P aliases the QK TMEM region, so qk_empties (which frees that region for
         # reuse) must be signaled after P is stored, not before. The
@@ -2397,9 +2393,6 @@ def _bwd_compute_inner_loop(
         tlx.barrier_arrive(d_empties[d_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
-        # Hazard 1 (intra-task WAR): dsT (f16) aliases dp's (f32) region -- same
-        # warp->chunk mismatch as the P store above.
-        tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
         # for reuse) must be signaled after dsT is stored, not before. The
@@ -2611,8 +2604,11 @@ def _attn_bwd_ws(
     # =========================================================================
     # Allocate SMEM and TMEM buffers
     # =========================================================================
-    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
-    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
+    # dK/dV epilogue staging shares K/V SMEM (see sdv/sdk_store_buf below).
+    k_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    v_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV, reuse=k_smem_alias)
+    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV, reuse=v_smem_alias)
     q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
     do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
 
@@ -2629,12 +2625,17 @@ def _attn_bwd_ws(
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
-    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
-    #   the dpT dot — precedes dv_fulls).
-    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
-    #   so the compute task must wait on k_mma_done before writing sdk).
-    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
-    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
+    # - sdv shares v_tiles' backing (free after dv_fulls; MMA's last
+    #   v_tiles read — the dpT dot — precedes dv_fulls).
+    # - sdk shares k_tiles' backing (MMA's dq dot still reads k_tiles after
+    #   dk_fulls, so the compute task must wait on k_mma_done before writing
+    #   sdk).
+    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV,
+                                    reuse=v_smem_alias)
+    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV,
+                                    reuse=k_smem_alias)
+    v_smem_alias.set_buffer_overlap(tlx.reuse_group(v_tiles, sdv_store_buf, group_type=tlx.reuse_group_type.shared))
+    k_smem_alias.set_buffer_overlap(tlx.reuse_group(k_tiles, sdk_store_buf, group_type=tlx.reuse_group_type.shared))
 
     sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
     sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
@@ -2774,7 +2775,7 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks(exclusive=True):
+    with tlx.async_tasks(exclusive=True, less_reg_mma=True):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0
@@ -3387,7 +3388,7 @@ class _attention(torch.autograd.Function):
         q, k, v, o, M = ctx.saved_tensors
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert o.is_contiguous() and do.is_contiguous()
-        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]

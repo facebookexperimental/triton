@@ -783,11 +783,12 @@ def TT_ScanOp
                      DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Associative scan using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
-      BoolAttr:$reverse);
+      BoolAttr:$reverse, OptionalAttr<StrAttr>:$reduction_ordering);
   let results = (outs Variadic<TT_Tensor>:$result);
   let regions = (region SizedRegion<1>:$combineOp);
   let builders = [OpBuilder<(ins "ValueRange":$srcs, "int":$axis,
-                      "bool":$reverse)>,
+                      "bool":$reverse,
+                      CArg<"StringAttr", "{}">:$reductionOrdering)>,
   ];
   let hasVerifier = 1;
   let hasRegionVerifier = 1;

@@ -688,13 +688,13 @@ private:
 
   void walkBlockForStores(Block &block, SmallVectorImpl<CircularStoreOp> &stack,
                           SmallVectorImpl<StoreWithBarrierInfo> &results,
-                          DenseMap<int, CircularStoreOp> &endMap) {
+                          DenseMap<unsigned, CircularStoreOp> &endMap) {
     for (Operation &op : block) {
       if (auto store = dyn_cast<CircularStoreOp>(&op)) {
         if (store.getIsStart())
           stack.push_back(store);
-        else
-          endMap[store.getScopeId()] = store;
+        else if (auto scopeId = store.getScopeId())
+          endMap[*scopeId] = store;
         continue;
       }
 
@@ -787,7 +787,7 @@ private:
   LogicalResult processFunction(FuncOp func, OpBuilder &builder) {
     SmallVector<CircularStoreOp, 8> stack;
     SmallVector<StoreWithBarrierInfo, 8> stores;
-    DenseMap<int, CircularStoreOp> endMap;
+    DenseMap<unsigned, CircularStoreOp> endMap;
 
     for (Block &block : func.getBody())
       walkBlockForStores(block, stack, stores, endMap);
@@ -801,7 +801,12 @@ private:
     };
 
     for (auto &si : stores) {
-      auto endStore = endMap.lookup(si.startStore.getScopeId());
+      // Dynamic-ID starts stay in the stack to preserve barrier operand
+      // positions, but only static-ID stores can be paired and specialized.
+      auto scopeId = si.startStore.getScopeId();
+      if (!scopeId)
+        continue;
+      auto endStore = endMap.lookup(*scopeId);
       if (!endStore)
         continue;
 

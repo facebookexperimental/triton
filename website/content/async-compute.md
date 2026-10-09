@@ -177,7 +177,7 @@ the register allocator still chooses physical registers.
 | API | Verified targets | Purpose |
 |-----|------------------|---------|
 | `tlx.amd_scheduled_mfma` | gfx942, gfx950 | Update explicitly ordered native MFMA accumulator chains. |
-| `tlx.amd_mfma_commit` | gfx942, gfx950 | Join one or more chains at an MFMA completion and liveness boundary. |
+| `tlx.amd_mfma_commit` | gfx942, gfx950 | Apply an MFMA completion and liveness boundary to one or more independent chains. |
 | `tlx.amd_register_class_anchor` | gfx950 | Add a separate local register-class anchor for each native 32-bit value. |
 | `tlx.amd_register_resident` | gfx950 | Require every tensor group to be allocatable together in native register tuples. |
 
@@ -250,8 +250,10 @@ acc = tlx.amd_scheduled_mfma(
 ```
 
 With `initialize=False`, the operation computes the native-fragment equivalent
-of `acc + a @ b`. It keeps one SSA chain per output fragment and creates
-updates in K-major, N-major, M-minor order:
+of `acc + a @ b` for the entire accumulator tile passed to the call. That tile
+may be an explicit subtile of a larger output. Within a call, the operation
+keeps one SSA chain per output fragment and creates updates in K-major,
+N-major, M-minor order:
 
 ```python
 for k in native_k_fragments:
@@ -264,10 +266,17 @@ This source order round-robins a K slice over independent accumulators before
 returning to the same dependency chain. LLVM may still reschedule independent
 instructions on the transient intrinsic path.
 
-`a` and `b` must be matching rank-two BF16 or F16 tensors with dot-operand
-layouts using `kWidth=4` or `8`. `acc` must be rank-two F32 with the
-corresponding unit-tile MFMA layout. Matrix shapes and per-wave native
-fragments must match.
+To schedule output regions independently, slice the corresponding operands
+and carry a separate accumulator for each region. Each scheduled call updates
+its entire passed subtile, so independent loads or other work can be placed
+between those calls. Keep these accumulators separate through the matching
+`amd_mfma_commit` boundary.
+
+`a` and `b` must be matching BF16 or F16 tensors with dot-operand layouts using
+`kWidth=4` or `8`. `acc` must be F32 with the corresponding unit-tile MFMA
+layout. All tensors must have matching rank two or three. Rank-three tensors
+have matching leading batch dimensions distributed over waves, with one batch
+repetition per wave. Matrix shapes and per-wave native fragments must match.
 
 | Argument | Meaning |
 |----------|---------|
@@ -277,21 +286,24 @@ fragments must match.
 | `resident_operand=0` / `1` | On the persistent path, select `a` / `b` for AGPR placement; the other source uses VGPRs. |
 | `accumulator_register_class=None` | `auto`: persistent work uses AGPR; transient placement is left to LLVM. |
 | `accumulator_register_class="vgpr"` / `"agpr"` | Select the persistent accumulator class explicitly. |
-| `initialize=True` | Start each output chain's first native K update from zero, ignoring the supplied accumulator. |
+| `initialize=True` | Start each output chain's first native K update from zero, ignoring the supplied accumulator values. |
 
 `resident_operand` and an explicit accumulator class impose hard class
 constraints only on the current persistent lowering. The transient intrinsic
 path leaves physical placement to LLVM; use `amd_register_resident` separately
 when a transient source needs an explicit allocation point. Set
 `initialize=True` only for the first band of a multi-band accumulation, or the
-earlier accumulated value will be discarded.
+earlier accumulated value will be discarded. When carrying independent output
+subtiles, apply this initialization rule to each accumulator separately.
 
 Because LLVM cannot model the latency or hazards of an MFMA hidden in inline
 assembly, unproven persistent chains retain target-specific input padding and
 per-update result drains. On gfx950, the compiler may defer those drains for a
-proven persistent AGPR chain ending at `amd_mfma_commit`; after scheduling and
-register allocation it repairs source and EXEC hazards and drains outstanding
-results before physical AGPR reads or overwrites. Those waits and the
+proven persistent AGPR or VGPR chain ending at a matching `amd_mfma_commit`
+boundary. After scheduling and register allocation, it repairs source,
+accumulator, and EXEC hazards and inserts any required waits before
+physical-register reads or overwrites of outstanding results. Other supported
+targets retain conservative waits for persistent chains. Those waits and the
 inline-assembly representation are implementation details and should be
 included when comparing the two roles.
 
@@ -334,6 +346,11 @@ dynamic iteration. Downstream code must use the returned result. When a
 must similarly use the returned `live_out`; the returned dependency may be
 discarded when it is no longer needed.
 
+Pass independent output subtiles as a tuple to commit them at the same
+boundary. Concatenate the returned results only after the commit. Concatenation
+may produce a different distributed layout; use `tlx.require_layout` on the
+joined value when its consumer requires a particular layout.
+
 The current lowering constrains a results-only boundary to AGPRs. A boundary
 with `preserve` constrains its F32 results to VGPRs and the preserved dot
 operand to AGPRs; directly committing an AGPR-resident scheduled-MFMA result
@@ -342,6 +359,42 @@ are implementation details, not portable synchronization semantics.
 
 `amd_mfma_commit` is not an MFMA queue instruction, `s_waitcnt`, hardware
 memory fence, workgroup barrier, or cross-wave synchronization operation.
+
+### Independent output subtiles on gfx950
+
+Assume `a` has shape `[64, 16]` and `b` has shape `[16, 128]`, with matching
+dot-operand layouts for the MFMA layout below. Each `[64, 64]` accumulator is
+one native output fragment per wave. The column slices align to the CTA tile,
+so `extract_slice` selects their registers without moving values across waves.
+
+```python
+mma: tl.constexpr = tlx.amd_mfma_layout(
+    version=4,
+    instr_shape=[32, 32, 16],
+    transposed=True,
+    warps_per_cta=[2, 2],
+)
+b_left = tlx.extract_slice(b, [16, 64], [0, 0])
+b_right = tlx.extract_slice(b, [16, 64], [0, 64])
+acc_left = tlx.zeros((64, 64), tl.float32, layout=mma)
+acc_right = tlx.zeros((64, 64), tl.float32, layout=mma)
+
+acc_left = tlx.amd_scheduled_mfma(
+    a, b_left, acc_left, accumulator_role="persistent", initialize=True,
+)
+tlx.amd_sched_barrier(0)
+# Independent loads or other work may be placed here.
+tlx.amd_sched_barrier(0)
+acc_right = tlx.amd_scheduled_mfma(
+    a, b_right, acc_right, accumulator_role="persistent", initialize=True,
+)
+acc_left, acc_right = tlx.amd_mfma_commit((acc_left, acc_right))
+acc = tlx.require_layout(tl.cat(acc_left, acc_right, dim=1), mma, pin=False)
+```
+
+For accumulation over multiple reduction bands, carry both subtiles through
+the loop with `initialize=False` after the first band, then commit their final
+values together before joining them.
 
 ### Transient-chain example
 

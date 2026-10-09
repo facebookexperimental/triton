@@ -49,6 +49,11 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
     offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
     a_base = offs_m[:, None] * stride_am
     b_base = offs_n * stride_bn
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
 
 {% if USE_ASYNC %}
     K_ITERS = K // BLOCK_K
@@ -69,7 +74,12 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
 {% else %}
     tail_width = K - k_tail
 {% endif %}
-    acc = gfx950_addmm_warppipe_compute_async(
+{% if SPLIT_K == 1 %}
+    {{prefetch_epilogue(("idx_m", "idx_n"), mask="mask", key="gemm_drain", max_operands=1, val_shape=("BLOCK_M", "BLOCK_N"), fallback_ptr="A")}}
+    acc, tlx_prefetched_gemm_drain = gfx950_addmm_warppipe_compute_async(
+{% else %}
+    acc, _tlx_unused_prefetch = gfx950_addmm_warppipe_compute_async(
+{% endif %}
         A,
         B,
         smem_a,
@@ -83,6 +93,15 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
         tail_width,
         stride_ak,
         stride_bk,
+{% if SPLIT_K == 1 %}
+        tlx_predrain_ptr_gemm_drain,
+        tlx_predrain_mask_gemm_drain,
+        tlx_predrain_enabled_gemm_drain,
+{% else %}
+        A,
+        False,
+        False,
+{% endif %}
         ALLOW_TF32,
         ACC_TYPE,
         BLOCK_M,
@@ -108,16 +127,10 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
     )
 {% endif %}
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
-    idx_m = rm[:, None]
-    idx_n = rn[None, :]
-    mask = (idx_m < M) & (idx_n < N)
-
 {% if SPLIT_K > 1 %}
     keep_out_ptr = {{output_ptr()}}  # noqa: F841
     ws_off = split_id * (M * N) + idx_m * N + idx_n
     tl.store(split_k_ws + ws_off, acc, mask=mask)
 {% else %}
-    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"), prefetched_epilogue="gemm_drain")}}
 {% endif %}

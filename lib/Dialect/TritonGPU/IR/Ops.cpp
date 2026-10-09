@@ -1,6 +1,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/DebugStringHelper.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -379,10 +380,20 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(local_load) -> local_load.
     if (auto sharedLoad = dyn_cast<LocalLoadOp>(arg)) {
-      // Shared_load can load to any layout so we can always fold convert into
-      // it.
+      bool outerRematerializesCoordinates =
+          op->hasAttr("tlx.rematerialize_coordinates");
+      bool loadHasRematerializationGroup =
+          sharedLoad->hasAttr("tlx.rematerialize_coordinates_group");
+      // A group names the concrete local-load operation whose coordinates are
+      // shared. Keep a separate outer boolean boundary instead of merging it
+      // into a grouped load.
+      if (loadHasRematerializationGroup && outerRematerializesCoordinates)
+        return failure();
+
+      // Shared_load can load to any layout so we can fold the conversion into
+      // it when doing so keeps the load-owned metadata semantics intact.
       // We insert at the point of the original op as there could be ops with
-      // memory side-effects between the LocalLoad op and the ConvertLayout op
+      // memory side-effects between the LocalLoad op and the ConvertLayout op.
       rewriter.setInsertionPoint(arg);
       auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
           op, op->getResult(0).getType(), sharedLoad.getSrc(),
@@ -392,6 +403,9 @@ struct CanonicalizeConvertFromConvert
       // load conservatively wait for unrelated async LDS writes.
       for (auto attr : sharedLoad->getDiscardableAttrs())
         replacement->setDiscardableAttr(attr.getName(), attr.getValue());
+      if (outerRematerializesCoordinates)
+        replacement->setAttr("tlx.rematerialize_coordinates",
+                             rewriter.getUnitAttr());
 
       return success();
     }
@@ -1116,6 +1130,26 @@ LogicalResult LocalScatterOp::verify() {
 }
 
 // LocalAtomicScatterRMWOp
+bool LocalAtomicScatterRMWOp::isCommutative() {
+  if (!getResult().use_empty() ||
+      !getDst().getType().getElementType().isInteger())
+    return false;
+
+  switch (getAtomicRmwOp()) {
+  case RMWOp::ADD:
+  case RMWOp::AND:
+  case RMWOp::OR:
+  case RMWOp::XOR:
+  case RMWOp::MAX:
+  case RMWOp::MIN:
+  case RMWOp::UMAX:
+  case RMWOp::UMIN:
+    return true;
+  default:
+    return false;
+  }
+}
+
 LogicalResult LocalAtomicScatterRMWOp::verify() {
   auto dstTy = getDst().getType();
   auto valuesTy = cast<RankedTensorType>(getValues().getType());
@@ -1835,6 +1869,10 @@ LogicalResult WarpPredicateOp::verify() {
     // reduction/region restrictions to the inner body.
     if (nested != getOperation() && isa<WarpPredicateOp>(nested))
       return WalkResult::skip();
+    if (!waveUniform && isa<triton::DotOp>(nested)) {
+      crossLaneOp = nested;
+      return WalkResult::interrupt();
+    }
     if (nested->getNumRegions() == 0)
       return WalkResult::advance();
     auto reduce = dyn_cast<triton::ReduceOp>(nested);
@@ -1883,40 +1921,6 @@ LogicalResult WarpPredicateOp::verify() {
              << crossLaneOp->getName() << " requires a wave-uniform predicate";
     return emitOpError("region may not contain nested operation ")
            << unsupportedRegion->getName();
-  }
-
-  if (!waveUniform) {
-    getRegion().walk([&](Operation *nested) {
-      if (crossLaneOp)
-        return WalkResult::interrupt();
-      if (nested != getOperation() && isa<WarpPredicateOp>(nested))
-        return WalkResult::skip();
-      if (isa<triton::DotOp>(nested)) {
-        crossLaneOp = nested;
-        return WalkResult::interrupt();
-      }
-      if (auto convert = dyn_cast<ConvertLayoutOp>(nested);
-          convert && !isConvertTrivial(convert)) {
-        Region *sourceRegion = convert.getSrc().getParentRegion();
-        bool captured = sourceRegion != &getRegion() &&
-                        !getRegion().isAncestor(sourceRegion);
-        bool boundary = convert->hasOneUse() &&
-                        llvm::any_of(yield.getValues(), [&](Value value) {
-                          return value == convert;
-                        });
-        // Layout propagation moves captured conversions before EXEC is
-        // restricted and yielded conversions after reconvergence. Only an
-        // internal shuffle truly executes under the predicate.
-        if (!captured && !boundary) {
-          crossLaneOp = nested;
-          return WalkResult::interrupt();
-        }
-      }
-      return WalkResult::advance();
-    });
-    if (crossLaneOp)
-      return emitOpError("cross-lane operation ")
-             << crossLaneOp->getName() << " requires a wave-uniform predicate";
   }
 
   WalkResult barrier = getRegion().walk([&](Operation *nested) {

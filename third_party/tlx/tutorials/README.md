@@ -93,6 +93,9 @@ plan = prepare_varlen_backward(
 )
 dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale)
 
+# Use FP32 dQ accumulation; inputs and returned gradients stay BF16.
+dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, dq_atomic_fp32=True)
+
 # Causal packed self-attention. Q and KV offsets and head counts must match.
 dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, causal=True)
 ```
@@ -119,6 +122,38 @@ key/value token.
 V may use the TritonBench-style `v_storage[:, 0]` view: the head and D axes must
 remain dense while the token stride may include gaps.  Returned `dv` is always
 contiguous.
+
+The default dQ path uses BF16 accumulation and atomics. The FP32 option enables
+FP32 accumulation, with FP32 atomics on most routes. Eligible aligned non-causal
+MHA and GQA cases use a shared interleaved schedule: each KV tile reuses K/V
+across its query heads and retains their dK/dV contributions in FP32 before
+storing BF16 outputs. For the batch-19 prefix configuration
+`(total_q, total_kv, max_q, max_kv) = (50754, 100696, 5662, 10414)`, the eager
+Hq/Hkv=12/4 and 64/8 paths can materialize BF16 dS and compute dQ in a separate
+consumer. One producer owns each KV tile, accumulates every query chunk and
+sibling head in FP32, and stores BF16 dK/dV directly. The consumer scales each
+KV256 dQ partial before adding it to the FP32 total, with one final BF16
+conversion.
+
+Both split paths require non-causal FP32 mode and 16-byte aligned Q/K/V/dO
+bases. Hq/Hkv=12/4 uses a fixed-pitch dS temporary of about **11.974 GiB**.
+Hq/Hkv=64/8 uses compact per-sequence rectangles padded to Q16 and KV256;
+the seeded prefix benchmark uses about **36.59 GiB**. The compact layout
+requires metadata attached by legacy plan preparation from the two cumulative
+sequence-length tensors. Plans prepared with device metadata, and older plans
+without compact dS metadata, retain the H64 FP32-atomic route.
+
+Capture on the current stream of Q's device, or `torch.cuda.OutOfMemoryError`
+from the optional dS allocation, selects the existing FP32-atomic route.
+H12's fallback uses a 0.292 GiB dQ accumulator and two owners with FP32 dK/dV
+partials followed by a reduction. H64's fallback uses a 1.558 GiB dQ accumulator
+and one owner with direct BF16 dK/dV stores. These memory figures exclude all
+other live tensors. Other allocation, capture-query, device-context, and kernel
+errors propagate without retry.
+
+Other shapes, causal attention, and BF16 dQ accumulation retain their existing
+paths, except that misaligned inputs bypass wide aligned copies through the
+generic BM16 kernel.
 
 In non-causal mode the Q and KV offsets are independent.  To model an
 extend-attention workload, pack only the extend tokens in Q and pack the full
@@ -161,3 +196,54 @@ checks live in `python/test/unit/language/test_tlx_codegen.py`; gfx1250 runtime
 checks live in `python/test/unit/language/test_tlx_amd_gfx1250.py`. The port
 uses `clamp_bounds=False` explicitly to retain the reference descriptor
 positioning semantics, including predicates and pre-clamped descriptors.
+
+## Symmetric-memory all-gather (Blackwell + MI350)
+
+[`blackwell_dist_all_gather.py`](distributed/blackwell_dist_all_gather.py) and
+[`amd_dist_all_gather.py`](distributed/amd_dist_all_gather.py) implement the same
+forward-only, single-node all-gather on top of
+`torch.distributed._symmetric_memory`. The pattern, identical on both
+architectures:
+
+1. Each rank allocates its shard with `symm_mem.empty()` and exchanges
+   handles with `symm_mem.rendezvous()`, which publishes every rank's base
+   pointer as an int64 `buffer_ptrs` table.
+2. Triton kernels read peer shards with plain `tl.load` on the published
+   pointers and `tl.store` into the local output slice; no collective
+   library sits in the data path.
+3. Phase boundaries are `handle.barrier(channel=...)` calls, alternating two
+   channels so consecutive phases never share one.
+
+The public entry point (`symm_mem_all_gather_into_tensor`) picks one of three
+strategies from the per-rank payload: small payloads use concurrent fanout
+peer reads, large even-length payloads use ring-ordered phased int32 reads
+(two BF16 elements per 4-byte transaction), and odd BF16 lengths fall back to
+phased BF16 reads to preserve slice alignment. Correctness is checked
+bit-for-bit against the vendor collective plus determinism iterations.
+
+Architecture deltas, all host-side (the three kernels are arch-agnostic):
+
+| | Blackwell (NVLink) | MI350 (xGMI) |
+| --- | --- | --- |
+| Collective backend | NCCL (`backend="nccl"`) | RCCL (same string on ROCm builds) |
+| Multicast | Disabled via `TORCH_SYMM_MEM_DISABLE_MULTICAST=1` | Not set |
+| Arch gate | `get_device_capability()[0] >= 10` | `gcnArchName` prefix `gfx950` |
+| Correctness baseline | `_c10d_functional.all_gather_into_tensor` | Same where available, else `dist.all_gather_into_tensor` |
+| Tuning | 64 MiB crossover, `num_warps=8`, `BLOCK_SIZE=4096`, with measured B200 table in the docstring | Same defaults carried over; xGMI retuning is future work |
+
+Multi-node is out of scope: the pattern assumes intranode peer visibility,
+same as the Blackwell original. The
+[`test_symm_mem_dist_all_gather`](testing/test_correctness.py) unit test
+covers both tutorials: it `mp.spawn`s two ranks, runs the 1 MiB / 64 MiB /
+64 MiB+1-element correctness cases through rendezvous, barriers, and the
+kernels, and skips unless 2+ Blackwell or gfx950 GPUs are visible. Run it
+with `pytest -k test_symm_mem_dist_all_gather` from
+`third_party/tlx/tutorials/testing`, or run either tutorial directly:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  third_party/tlx/tutorials/distributed/blackwell_dist_all_gather.py --mode correctness
+
+HIP_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 \
+  third_party/tlx/tutorials/distributed/amd_dist_all_gather.py --mode correctness
+```

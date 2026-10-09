@@ -361,9 +361,10 @@ def BufferLoadToLocalOp
   let summary =
       "Load from a scalar base pointer and a tensor offset to shared memory";
   let description = [{
-      AMD Buffer load operation. Similar to amdg.buffer_load op but directly wirtes to shared memory instead of into registers.
-      Contiguity is the maximum number of elements that can be loaded in a single vector with the given layout and mask.
-      This allows to use buffer_load_to_local even if the alignment cannot be proven based on IR.
+      AMD Buffer load operation. Similar to amdg.buffer_load op but directly writes to shared memory instead of into registers.
+      Contiguity is a trusted positive power-of-two lower bound on consecutive
+      elements available in the final offsets and mask layout. This allows
+      buffer_load_to_local to vectorize when alignment or mask uniformity cannot be proven from the IR.
     }];
   let arguments =
       (ins Arg<
@@ -525,7 +526,7 @@ def BufferStoreOp
       the first elements of each row in bytes. Compiler tries to obtain the `stride`
       when it converts to the buffer ops because it is important for optimizing
       the cache memory access.
-      Contiguity is the maximum number of elements that can be loaded in a single vector
+      Contiguity is the maximum number of elements that can be stored in a single vector
       with the given layout and mask.
       This allows to use buffer_store even if the alignment cannot be proven based on IR.
     }];
@@ -544,6 +545,7 @@ def BufferStoreOp
       (`stride` `=` $stride^)?
       attr-dict `:` type($value)
     }];
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -560,6 +562,7 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
       Optional<I32>:$multicastMask,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "::mlir::triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
       DefaultValuedAttr<BoolAttr, "false">:$forceNoAlias);
 
   let results = (outs LLVM_Type:$result);
@@ -567,6 +570,7 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
   let assemblyFormat = [{
     $ptr `,` $mask `,` $falseVal (`,` $multicastMask^)?
     oilist(`cacheModifier` `=` $cache)
+    (`volatile` $isVolatile^)?
     (`forceNoAlias` $forceNoAlias^)?
     attr-dict `:` functional-type(operands, results)
   }];
@@ -850,8 +854,8 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
     logical tensor.
 
     Distributed MFMA and dot layouts determine storage roles and native
-    fragment widths. Source code does not provide physical register classes,
-    tuple sizes, or wait-state counts.
+    fragment widths for rank-two or rank-three tensors. Source code does not
+    provide physical register classes, tuple sizes, or wait-state counts.
 
     A boundary that carries a live dot operand hands its F32 results out in
     VGPRs, so its accumulators must already be VGPR-resident. Committing an
@@ -880,12 +884,12 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   let summary = "Execute source-scheduled independent native MFMA fragments";
   let description = [{
-    Computes the full per-wave Cartesian product of the native fragments in
-    `a` and `b`, replacing every corresponding fragment in `acc`. Native
-    instructions are emitted in K-major, N-major, M-minor order. This
-    round-robins each K slice over the independent output fragments before
-    returning to an accumulator dependency chain, while preserving one SSA
-    chain per output fragment.
+    Computes the full per-wave Cartesian product of the native
+    fragments in `a` and `b`, replacing every corresponding fragment in `acc`.
+    Native instructions are emitted in
+    K-major, N-major, M-minor order. This round-robins each K slice over the
+    independent output fragments before returning to an accumulator dependency
+    chain, while preserving one SSA chain per output fragment.
 
     On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
     `rhs` and selects an input to constrain to AGPRs; the other input uses
@@ -901,8 +905,12 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
     drain, so any AGPR accumulator request is rejected, including persistent
     `auto`: a persistent accumulator must request `vgpr`.
-    `initialize` starts the native accumulators from zero. Completion
-    of transient result fragments is represented separately by `mfma_commit`.
+    `initialize` starts the updated native accumulators from zero.
+    To interleave work between output subtiles, use separate operations with
+    explicit input panels and independent accumulator tensors. Commit those
+    chains before joining their results into a larger output tile.
+    Completion of transient result fragments is represented separately by
+    `mfma_commit`.
 
     An AGPR-resident accumulator must not reach an `mfma_commit` that also
     carries a live dot operand: that boundary constrains its F32 results to
@@ -915,9 +923,15 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     a convergent-call attribute on the pinned compiler revision.
 
     The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
-    CDNA4. It accepts one or more K fragments per wave and the target's native
+    CDNA4. Operands and accumulator must have matching rank two or three.
+    Rank-three tensors have matching leading batch dimensions distributed
+    over waves, with exactly one batch repetition per wave. The fragment grid
+    remains local to each wave's batch.
+    It accepts one or more K fragments per wave and the target's native
     instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
-    16x16x32 on CDNA4.
+    16x16x32 on CDNA4. The logical K dimension must be a positive multiple
+    of both the native instruction K and the dot-operand layout's K tile.
+    On CDNA3, kWidth=8 makes the operand tile span two native K fragments.
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,

@@ -1,4 +1,4 @@
-from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.matmul_kernel_persistent import (
+from triton.tlx.ops.kernels.mm.gfx950 import (
     _C_STORE_32X128_LAYOUT as _GFX950_PERSISTENT_C_STORE_32X128_LAYOUT,
     _commit_accumulators as _gfx950_persistent_commit_accumulators,
     _compute_full_tile as _gfx950_persistent_compute_full_tile,

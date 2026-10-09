@@ -202,6 +202,9 @@ def _direct_matmul_kernel_gfx942(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    USE_I64_A_OFFSETS: tl.constexpr = False,
+    USE_I64_B_OFFSETS: tl.constexpr = False,
+    USE_I64_C_OFFSETS: tl.constexpr = False,
     SPLIT_M_128_32: tl.constexpr = False,
 ):
     """Register-staged GEMM with per-operand cache and XCD policy."""
@@ -242,9 +245,21 @@ def _direct_matmul_kernel_gfx942(
         acc0 = tl.zeros((128, BLOCK_N), tl.float32)
         acc1 = tl.zeros((32, BLOCK_N), tl.float32)
         for k in range(0, K, BLOCK_K):
-            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
-            a0_ptrs = a_ptr + offs_m0[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            a1_ptrs = a_ptr + offs_m1[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            if USE_I64_B_OFFSETS:
+                b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk + offs_n.to(tl.int64)[None, :] * stride_bn)
+            else:
+                b_offsets = (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+            if USE_I64_A_OFFSETS:
+                a0_offsets = (offs_m0.to(tl.int64)[:, None] * stride_am +
+                              (k + offs_k[None, :]).to(tl.int64) * stride_ak)
+                a1_offsets = (offs_m1.to(tl.int64)[:, None] * stride_am +
+                              (k + offs_k[None, :]).to(tl.int64) * stride_ak)
+            else:
+                a0_offsets = offs_m0[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+                a1_offsets = offs_m1[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            b_ptrs = b_ptr + b_offsets
+            a0_ptrs = a_ptr + a0_offsets
+            a1_ptrs = a_ptr + a1_offsets
             b = tl.load(b_ptrs)
             a0 = tl.load(a0_ptrs)
             a1 = tl.load(a1_ptrs)
@@ -272,8 +287,14 @@ def _direct_matmul_kernel_gfx942(
             )
             acc0 += bias0.to(tl.float32)
             acc1 += bias1.to(tl.float32)
-        tl.store(c_ptr + idx_m0 * stride_cm + idx_n * stride_cn, acc0, mask=mask0)
-        tl.store(c_ptr + idx_m1 * stride_cm + idx_n * stride_cn, acc1, mask=mask1)
+        if USE_I64_C_OFFSETS:
+            c0_offsets = idx_m0.to(tl.int64) * stride_cm + idx_n.to(tl.int64) * stride_cn
+            c1_offsets = idx_m1.to(tl.int64) * stride_cm + idx_n.to(tl.int64) * stride_cn
+        else:
+            c0_offsets = idx_m0 * stride_cm + idx_n * stride_cn
+            c1_offsets = idx_m1 * stride_cm + idx_n * stride_cn
+        tl.store(c_ptr + c0_offsets, acc0, mask=mask0)
+        tl.store(c_ptr + c1_offsets, acc1, mask=mask1)
     else:
         offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
         offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
@@ -285,14 +306,32 @@ def _direct_matmul_kernel_gfx942(
         even_k = K % BLOCK_K == 0
         k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
         for k in range(0, k_main, BLOCK_K):
-            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            if USE_I64_A_OFFSETS:
+                a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am + (k + offs_k[None, :]).to(tl.int64) * stride_ak)
+            else:
+                a_offsets = reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+            if USE_I64_B_OFFSETS:
+                b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk + reg_n.to(tl.int64)[None, :] * stride_bn)
+            else:
+                b_offsets = (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            a_ptrs = a_ptr + a_offsets
+            b_ptrs = b_ptr + b_offsets
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs)
             acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
         if not even_k:
-            a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
-            b_ptrs = b_ptr + (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            if USE_I64_A_OFFSETS:
+                a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am +
+                             (k_main + offs_k[None, :]).to(tl.int64) * stride_ak)
+            else:
+                a_offsets = reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
+            if USE_I64_B_OFFSETS:
+                b_offsets = ((k_main + offs_k[:, None]).to(tl.int64) * stride_bk +
+                             reg_n.to(tl.int64)[None, :] * stride_bn)
+            else:
+                b_offsets = (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            a_ptrs = a_ptr + a_offsets
+            b_ptrs = b_ptr + b_offsets
             tail = offs_k < K - k_main
             a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
             b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
@@ -310,7 +349,11 @@ def _direct_matmul_kernel_gfx942(
                 eviction_policy="evict_last",
             )
             acc += bias.to(tl.float32)
-        tl.store(c_ptr + idx_m * stride_cm + idx_n * stride_cn, acc, mask=mask)
+        if USE_I64_C_OFFSETS:
+            c_offsets = idx_m.to(tl.int64) * stride_cm + idx_n.to(tl.int64) * stride_cn
+        else:
+            c_offsets = idx_m * stride_cm + idx_n * stride_cn
+        tl.store(c_ptr + c_offsets, acc, mask=mask)
 
 
 @triton.jit
@@ -337,6 +380,9 @@ def matmul_kernel_gfx942(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    USE_I64_A_OFFSETS: tl.constexpr = False,
+    USE_I64_B_OFFSETS: tl.constexpr = False,
+    USE_I64_C_OFFSETS: tl.constexpr = False,
     SPLIT_M_128_32: tl.constexpr = False,
     USE_LOCAL_SPLIT_U: tl.constexpr = False,
     LOCAL_SPLIT_U: tl.constexpr = 1,
@@ -387,6 +433,9 @@ def matmul_kernel_gfx942(
             NUM_XCDS,
             XCD_CHUNK,
             ADD_BIAS,
+            USE_I64_A_OFFSETS,
+            USE_I64_B_OFFSETS,
+            USE_I64_C_OFFSETS,
             SPLIT_M_128_32,
         )
 
@@ -486,8 +535,7 @@ def _configs():
             group_m,
             num_warps,
             waves_per_eu=waves_per_eu,
-        )
-        for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
+        ) for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
     ]
 
 
@@ -664,6 +712,14 @@ def _full_config_key(a, b):
     return (a.device, a.dtype, tuple(a.shape), tuple(b.shape), tuple(a.stride()), tuple(b.stride()))
 
 
+def _needs_i64_offsets(tensor):
+    """Return whether this view can address beyond signed i32 byte offsets."""
+    if any(stride < 0 for stride in tensor.stride()):
+        return True
+    max_element_offset = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    return max_element_offset * tensor.element_size() > (1 << 31) - 1
+
+
 def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
     M, N, K = _validate_operands(a, b, out)
     bias_strides = _bias_strides(bias, M, N, a) if bias is not None else (0, 0)
@@ -712,6 +768,9 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         out.stride(0),
         out.stride(1),
         ADD_BIAS=bias is not None,
+        USE_I64_A_OFFSETS=_needs_i64_offsets(a),
+        USE_I64_B_OFFSETS=_needs_i64_offsets(b),
+        USE_I64_C_OFFSETS=_needs_i64_offsets(out),
         matrix_instr_nonkdim=16,
     )
     if fast_configs is not None:

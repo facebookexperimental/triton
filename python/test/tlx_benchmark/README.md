@@ -12,8 +12,8 @@ One shot command with extreme simplicity
 python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `flash_attn_mxfp8`, `hstu_attn`, `kda`, `kda_prefill`,
-`kda_decode`.
+`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `kda`,
+`kda_prefill`, `kda_decode`.
 
 ```
 options:
@@ -56,6 +56,7 @@ options:
 | `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
+| `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
@@ -80,6 +81,11 @@ There is no vendor library for SiLU-scaled ragged attention, so `hstu_attn`
 races the Triton kernel that ships today. The two are not tuned symmetrically --
 the reference autotunes its full space regardless of `--space` -- which is
 recorded per case as `ref_autotuned` rather than corrected for.
+
+`flash_attn_varlen` races SDPA over the batch padded to its longest sequence
+with a padding (and causal) mask -- what a torch-only caller runs -- so the
+reference also computes the padded positions. The op has one fixed launch
+config, so `--space` does not change it.
 
 Ops with a backward (`flash_attn`, `hstu_attn`, `kda`) produce two cases per
 shape. The backward is a different kernel at 2.5x the FLOPs, so folding it into

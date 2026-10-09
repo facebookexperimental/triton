@@ -73,6 +73,8 @@ from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
     blackwell_gemm_ws_template,
+    gfx942_addmm_template,
+    gfx942_mm_template,
     gfx950_addmm_interwave_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_addmm_warppipe_template,
@@ -126,6 +128,11 @@ def _is_gfx950() -> bool:
         return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
     except (AssertionError, AttributeError, RuntimeError):
         return False
+
+
+def _is_gfx942() -> bool:
+    """Whether the live device is MI300X/CDNA3."""
+    return current_target().is_gfx942
 
 
 #: Per-arch warp-pipe tile pools, keyed by ``current_target().key``. An arch
@@ -1216,6 +1223,80 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
     return m, n, k, out_dtype
 
 
+class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Feed the gfx942 tlx.ops heuristic into an Inductor GEMM template."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx942():
+            return
+        dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+        if dtype not in (torch.float16, torch.bfloat16):
+            return
+        if kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype:
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        strides = kernel_inputs.strides_hinted()
+        a_strides = strides[kernel_inputs._mat1_idx]
+        b_strides = strides[kernel_inputs._mat2_idx]
+        values = (m, n, k, *a_strides[-2:], *b_strides[-2:])
+        if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+            return
+        m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (
+            int(value) for value in values
+        )
+        if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+            return
+
+        # Keep TorchTLX and tlx.ops on the same measured shape policy.  The
+        # special split-panel/local-split-U paths have different program grids;
+        # this template is the common direct-load path only.
+        from triton.tlx.ops.kernels.mm.gfx942 import heuristic_config
+
+        for config in heuristic_config(m, n, k):
+            meta = dict(config.kwargs)
+            if meta.pop("SPLIT_M_128_32", False) or meta.pop(
+                "USE_LOCAL_SPLIT_U", False
+            ):
+                continue
+            meta.pop("XCD_CHUNK", None)  # fixed to four in the template source
+            triton_config = self.triton_config(
+                config.num_stages,
+                config.num_warps,
+                **meta,
+                matrix_instr_nonkdim=16,
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config,
+                m,
+                n,
+                k,
+                kernel_inputs.out_dtype(),
+            )
+
+
+@register_template_heuristic(
+    gfx942_mm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx942MMTemplateConfigHeuristic(_Gfx942MMTemplateConfigHeuristic):
+    """MI300X TorchTLX MM using the gfx942 tlx.ops shape heuristic."""
+
+
+@register_template_heuristic(
+    gfx942_addmm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx942AddMMTemplateConfigHeuristic(
+    AddMMConfigMixin, _Gfx942MMTemplateConfigHeuristic
+):
+    """MI300X TorchTLX AddMM using the gfx942 tlx.ops shape heuristic."""
+
+
 _GFX950_REGISTER_BLOCK_M = 256
 _GFX950_REGISTER_BLOCK_K = 64
 _GFX950_REGISTER_NUM_CU = 256
@@ -1678,6 +1759,7 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
     ]
 
     WARPPIPE_CONFIGS_BY_ARCH = ADDMM_WARPPIPE_CONFIGS_BY_ARCH
+    _PREDRAIN_EPILOGUE_PREFETCH = True
 
     def adjust_kernel_inputs(
         self, kernel_inputs: KernelInputs, op_name: str
@@ -1826,6 +1908,9 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
                     NUM_XCDS=num_xcds,
                     SPLIT_K=split_k,
                     USE_ASYNC=use_async,
+                    PREDRAIN_EPILOGUE_PREFETCH=int(
+                        self._PREDRAIN_EPILOGUE_PREFETCH
+                    ),
                     matrix_instr_nonkdim=16,
                     waves_per_eu=0,
                     kpack=get_default_kpack(block_k),
@@ -2133,6 +2218,12 @@ class Gfx950AddMMPersistentWarpPipeConfigHeuristic(
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs, op_name
         ):
+            # Pre-drain prefetch currently fails WarpPipeliner validation for
+            # the three-buffer persistent schedule. Preserve that GEMM
+            # candidate but leave its epilogue load after the drain. The
+            # validated two-buffer path remains eligible for prefetching.
+            if template_kwargs["NUM_BUFFERS"] != 2:
+                template_kwargs["PREDRAIN_EPILOGUE_PREFETCH"] = 0
             yield {**template_kwargs, "NUM_SMS": num_sms}
 
 
@@ -2291,6 +2382,7 @@ from torch._inductor.codegen.triton import (
     DeferredLine,
     TensorDescriptorOptions,
 )
+from torch._inductor.codegen.common import IndentedBuffer
 from .codegen import codegen_async_tma_store
 from torch._inductor.select_algorithm import (
     TritonTemplate,
@@ -2478,6 +2570,8 @@ def _tlx_ttk_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
     _orig_ttk_init(self, *args, **kwargs)
     self.async_tma_store = async_tma_store
     self._tlx_split_k = split_k
+    self._tlx_predrain_prefetches = {}
+    self._tlx_current_subgraph_name = None
 
 
 TritonTemplateKernel.__init__ = _tlx_ttk_init  # type: ignore[method-assign]
@@ -2491,6 +2585,8 @@ _orig_set_subgraph_body = TritonTemplateKernel.set_subgraph_body
 def _tlx_set_subgraph_body(self, body_name):  # type: ignore[no-untyped-def]
     """Restore TLX-specific state for one deferred store subgraph."""
     previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    previous_subgraph_name = getattr(self, "_tlx_current_subgraph_name", None)
+    self._tlx_current_subgraph_name = body_name
     layouts = getattr(self, "_tlx_output_layout_by_subgraph", {})
     if body_name in layouts:
         self._tlx_output_layout = layouts[body_name]
@@ -2519,13 +2615,19 @@ def _tlx_set_subgraph_body(self, body_name):  # type: ignore[no-untyped-def]
             yield
     finally:
         self._tlx_output_layout = previous_output_layout
+        self._tlx_current_subgraph_name = previous_subgraph_name
 
 
 TritonTemplateKernel.set_subgraph_body = _tlx_set_subgraph_body  # type: ignore[method-assign]
 
 
 def _tlx_store_output(  # type: ignore[no-untyped-def]
-    self, *args, async_tma_store_buf_idx=None, output_layout=None, **kwargs
+    self,
+    *args,
+    async_tma_store_buf_idx=None,
+    output_layout=None,
+    prefetched_epilogue=None,
+    **kwargs,
 ):
     if getattr(self, "async_tma_store", False):
         if async_tma_store_buf_idx is not None:
@@ -2546,6 +2648,15 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
                 result = _orig_store_output(self, *args, **kwargs)
         else:
             result = _orig_store_output(self, *args, **kwargs)
+        if prefetched_epilogue is not None:
+            request = self._tlx_predrain_prefetches.get(prefetched_epilogue)
+            if request is not None:
+                request["subgraph_name"] = result
+                request["load_names"] = _tlx_eligible_predrain_loads(
+                    self,
+                    result,
+                    request["max_operands"],
+                )
         if output_layout is not None:
             layouts = getattr(self, "_tlx_output_layout_by_subgraph", None)
             if layouts is None:
@@ -2576,6 +2687,246 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
 # Jinja template_env uses fn.__name__ to build the dict key — preserve it.
 _tlx_store_output.__name__ = "store_output"
 TritonTemplateKernel.store_output = _tlx_store_output  # type: ignore[method-assign]
+
+
+def _tlx_eligible_predrain_loads(self, subgraph_name, max_operands):  # type: ignore[no-untyped-def]
+    """Return conservative external tensor reads eligible for early issue."""
+    from torch._inductor.dependencies import MemoryDep
+
+    if (
+        not self.meta.get("PREDRAIN_EPILOGUE_PREFETCH", 0)
+        or getattr(self, "_tlx_split_k", 1) != 1
+        or max_operands != 1
+    ):
+        return ()
+
+    prefix = "<STORE_OUTPUT_"
+    if not (subgraph_name.startswith(prefix) and subgraph_name.endswith(">")):
+        return ()
+    subgraph_idx = int(subgraph_name[len(prefix) : -1])
+    nodes = getattr(self, "_epilogue_nodes_by_subgraph", {}).get(
+        subgraph_idx, ()
+    )
+    if not nodes:
+        return ()
+
+    produced = {self.output_node.get_name()}
+    writes = set()
+    for node in nodes:
+        ir_node = node.node
+        if getattr(ir_node, "get_reduction_type", lambda: None)() is not None:
+            return ()
+        if ir_node.get_mutation_names() or ir_node.get_inputs_that_alias_output():
+            return ()
+        produced.update(node.get_buffer_names())
+        writes.update(dep.name for dep in node.read_writes.writes)
+    produced.update(writes)
+
+    candidates = []
+    seen = set()
+    for node in nodes:
+        for dep in node.read_writes.reads:
+            if not isinstance(dep, MemoryDep) or dep.name in produced:
+                continue
+            if dep.name in seen:
+                # Multiple accesses to one operand can carry different indices;
+                # the initial contract admits exactly one pure load operation.
+                return ()
+            if (
+                dep.mode is not None
+                or dep.is_indirect()
+                or dep.name in writes
+                or dep.name in V.graph.mutated_buffers
+                or len(dep.var_names) > 2
+            ):
+                return ()
+            seen.add(dep.name)
+            candidates.append(dep)
+
+    if len(candidates) != 1:
+        return ()
+
+    dep = candidates[0]
+    if V.graph.get_dtype(dep.name) not in (torch.float16, torch.bfloat16):
+        return ()
+    output_numel = V.graph.sizevars.optimization_hint(
+        sympy.prod(self.output_node.get_size()), fallback=0
+    )
+    accessed_numel = dep.numel_hint()
+    if not output_numel or not accessed_numel or accessed_numel > output_numel:
+        return ()
+
+    # Bound the worst-case live range to 128 fp32 values per lane. Broadcast
+    # operands consume fewer registers than this full-tile upper bound.
+    block_m = int(self.meta.get("BLOCK_M", 0))
+    block_n = int(self.meta.get("BLOCK_N", 0))
+    lanes = max(int(self.num_warps) * 64, 1)
+    if not block_m or not block_n or (block_m * block_n + lanes - 1) // lanes > 128:
+        return ()
+    return (dep.name,)
+
+
+def _tlx_prefetch_epilogue(  # type: ignore[no-untyped-def]
+    self,
+    indices,
+    *,
+    key,
+    max_operands=1,
+    mask=None,
+    val_shape=None,
+    fallback_ptr=None,
+    indent_width=4,
+):
+    """Register a pre-drain hook paired with a later ``store_output`` call."""
+    if not isinstance(key, str) or not key:
+        raise AssertionError("prefetch_epilogue key must be a non-empty string")
+    if key in self._tlx_predrain_prefetches:
+        raise AssertionError(f"duplicate prefetch_epilogue key: {key}")
+    if not isinstance(indices, (list, tuple)) or not isinstance(mask, (str, type(None))):
+        raise AssertionError("prefetch_epilogue requires template indices and an optional mask")
+    if val_shape is not None and not isinstance(val_shape, tuple):
+        raise AssertionError("prefetch_epilogue val_shape must be a tuple or None")
+    if not isinstance(fallback_ptr, str) or not fallback_ptr:
+        raise AssertionError("prefetch_epilogue requires a fallback pointer")
+
+    hook_name = f"<TLX_PREFETCH_EPILOGUE_{key}>"
+    request = {
+        "max_operands": max_operands,
+        "key": key,
+        "fallback_ptr": fallback_ptr,
+        "subgraph_name": None,
+        "load_names": (),
+        "ptr": None,
+        "mask": None,
+    }
+    self._tlx_predrain_prefetches[key] = request
+
+    def hook():
+        code = IndentedBuffer()
+        enabled = request["ptr"] is not None
+        if enabled:
+            subgraph = self.subgraph_bodies[request["subgraph_name"]]
+            xindex_lines = [
+                line
+                for line in subgraph.body.getvalue().splitlines()
+                if line.strip().startswith("xindex = ")
+            ]
+            if len(xindex_lines) != 1:
+                raise AssertionError(
+                    "prefetched epilogue requires one output index assignment"
+                )
+            code.writeline(xindex_lines[0].strip())
+            code.writeline(f"# TorchTLX pre-drain epilogue prefetch: {key}")
+        code.writeline(
+            f"tlx_predrain_ptr_{key} = "
+            f"{request['ptr'] if enabled else request['fallback_ptr']}"
+        )
+        code.writeline(
+            f"tlx_predrain_mask_{key} = {request['mask'] if enabled else 'False'}"
+        )
+        code.writeline(
+            f"tlx_predrain_enabled_{key}: tl.constexpr = {enabled}"
+        )
+        result = code.getvalue().strip()
+        if indent_width:
+            result = "\n".join(
+                (" " * indent_width + line) if line else line
+                for line in result.splitlines()
+            )
+        return result.strip()
+
+    return self._register_hook(hook_name, hook)
+
+
+_tlx_prefetch_epilogue.__name__ = "prefetch_epilogue"
+TritonTemplateKernel.prefetch_epilogue = _tlx_prefetch_epilogue  # type: ignore[attr-defined]
+
+
+_orig_tk_load = TritonTemplateKernel.load
+
+
+def _tlx_load(self, name, index):  # type: ignore[no-untyped-def]
+    """Route one eligible epilogue load into its paired pre-drain hook."""
+    subgraph_name = getattr(self, "_tlx_current_subgraph_name", None)
+    request = next(
+        (
+            candidate
+            for candidate in self._tlx_predrain_prefetches.values()
+            if candidate["subgraph_name"] == subgraph_name
+            and name in candidate["load_names"]
+        ),
+        None,
+    )
+    if request is None:
+        return _orig_tk_load(self, name, index)
+
+    redirected = tuple(IndentedBuffer() for _ in range(4))
+    old_buffers = self.body, self.indexing_code, self.loads, self.compute
+    self.body, self.indexing_code, self.loads, self.compute = redirected
+    try:
+        result = _orig_tk_load(self, name, index)
+    finally:
+        self.body, self.indexing_code, self.loads, self.compute = old_buffers
+
+    emitted = [
+        line.strip()
+        for buffer in redirected
+        for line in buffer.getvalue().splitlines()
+        if line.strip()
+    ]
+    load_lines = [line for line in emitted if "= tl.load(" in line]
+    if len(emitted) != 1 or len(load_lines) != 1:
+        # The initial implementation only moves a single direct load. Restore
+        # anything more involved to the ordinary epilogue position.
+        for destination, source in zip(old_buffers, redirected):
+            destination.splice(source)
+        request["load_names"] = ()
+        return result
+
+    load_line = load_lines[0]
+    load_start = load_line.index("tl.load(") + len("tl.load(")
+    depth = 0
+    load_end = None
+    for offset, char in enumerate(load_line[load_start:], start=load_start):
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            if char == ")" and depth == 0:
+                load_end = offset
+                break
+            depth -= 1
+    if load_end is None:
+        for destination, source in zip(old_buffers, redirected):
+            destination.splice(source)
+        request["load_names"] = ()
+        return result
+
+    arguments = load_line[load_start:load_end]
+    parts = []
+    start = 0
+    depth = 0
+    for offset, char in enumerate(arguments):
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(arguments[start:offset].strip())
+            start = offset + 1
+    parts.append(arguments[start:].strip())
+    if len(parts) < 2 or parts[1].startswith(("other=", "eviction_policy=")):
+        for destination, source in zip(old_buffers, redirected):
+            destination.splice(source)
+        request["load_names"] = ()
+        return result
+
+    request["ptr"] = parts[0]
+    request["mask"] = parts[1].removeprefix("mask=")
+    self.loads.writeline(f"{result} = tlx_prefetched_{request['key']}")
+    return result
+
+
+TritonTemplateKernel.load = _tlx_load  # type: ignore[method-assign]
 
 # -- store: intercept TMA mode when async TMA is active --------------------
 _orig_tk_store = TritonTemplateKernel.store
@@ -2970,6 +3321,14 @@ _orig_render = TritonTemplateKernel.render
 
 
 def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=False):  # type: ignore[no-untyped-def]
+    # Register the paired prefetch hook for templates that expose a drain
+    # boundary. It remains a no-op unless the config knob and eligibility both
+    # permit moving a load.
+    if not any(
+        fn.__name__ == "prefetch_epilogue" for fn in self.extra_template_env_fns
+    ):
+        self._register_extra_template_env_fns(self.prefetch_epilogue)
+
     # Register compute_epilogue and output_ptr as extra template env functions
     # so they're available in the jinja template.
     if getattr(self, "async_tma_store", False):

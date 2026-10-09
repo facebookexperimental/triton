@@ -2,6 +2,7 @@
 """Run TorchTLX fusion benchmarks."""
 
 import argparse
+import contextlib
 import importlib
 import json
 import pathlib
@@ -64,6 +65,27 @@ def parse_args(cases):
     return args
 
 
+def selected_shapes(case, args) -> tuple[dict[str, object], ...]:
+    shapes = tuple(dict(shape) for shape in getattr(case, "SHAPES", ({}, )))
+    shape_keys = {key for shape in shapes for key in shape}
+    for key in shape_keys:
+        override = getattr(args, key, None)
+        if override is None:
+            continue
+        matching = [shape for shape in shapes if shape.get(key) == override]
+        if matching:
+            shapes = tuple(matching)
+        else:
+            for shape in shapes:
+                shape[key] = override
+    return shapes
+
+
+def format_shape(shape: dict[str, object]) -> str:
+    labels = {"m": "M", "n": "N", "k": "K"}
+    return " ".join(f"{labels.get(name, name)}={value}" for name, value in shape.items())
+
+
 def validate_candidate_code(case, source_files) -> None:
     generated_code = "\n".join(source_files)
     markers = getattr(case, "CANDIDATE_CODE_MARKERS", ())
@@ -77,10 +99,12 @@ def validate_candidate_code(case, source_files) -> None:
         raise RuntimeError("candidate implementation was not generated; missing one of: " + ", ".join(formatted))
 
 
-def compile_variant(case, config, inputs, variant):
-    torch._dynamo.reset()
-    with torch._inductor.config.patch(config):
-        compiled = torch.compile(case.model, fullgraph=True)
+def compile_variant(case, config, inputs, variant, *, model=None, reset=True):
+    if reset:
+        torch._dynamo.reset()
+    compile_context = getattr(case, "compile_context", contextlib.nullcontext)
+    with torch._inductor.config.patch(config), compile_context(variant):
+        compiled = torch.compile(model or case.model, fullgraph=True)
         has_code_markers = any(
             getattr(case, name, ()) for name in (
                 "CANDIDATE_CODE_MARKERS",
@@ -160,27 +184,99 @@ def run_comparison(case) -> None:
     ):
         print(f"sample={sample} baseline={baseline_us:.3f}us "
               f"{candidate['label']}={candidate_us:.3f}us")
-    print(f"FINAL baseline={baseline['median_us']:.3f}us "
+    print(f"FINAL {case.problem()} baseline={baseline['median_us']:.3f}us "
           f"{candidate['label']}={candidate['median_us']:.3f}us "
           f"speedup={baseline['median_us'] / candidate['median_us']:.3f}x")
+
+
+def run_interleaved_comparison(case, args) -> None:
+    """Compile both variants once and alternate timing order to limit drift."""
+    torch.compiler.config.force_disable_caches = True
+    torch._inductor.config.force_disable_caches = True
+    torch._inductor.config.fx_graph_cache = False
+    torch._inductor.config.fx_graph_remote_cache = False
+
+    print(f"torch={torch.__version__}; device={torch.cuda.get_device_name(0)}")
+    print(f"case={case.NAME}; {case.problem()}")
+    inputs = case.make_inputs()
+    eager = case.model(*inputs)
+    compiled = {}
+    torch._dynamo.reset()
+    models = getattr(case, "comparison_models")()
+    for (variant, config), model in zip(
+        (
+            ("baseline", case.BASELINE_CONFIG),
+            ("candidate", case.CANDIDATE_CONFIG),
+        ),
+            models,
+    ):
+        compiled[variant], output = compile_variant(
+            case,
+            config,
+            inputs,
+            variant,
+            model=model,
+            reset=False,
+        )
+        torch.testing.assert_close(
+            output,
+            eager,
+            atol=case.ATOL,
+            rtol=case.RTOL,
+        )
+        diff = (output.float() - eager.float()).abs()
+        print(f"{variant}_correctness_vs_eager "
+              f"max_abs={diff.max().item():.6f} "
+              f"mean_abs={diff.mean().item():.6f}")
+
+    samples = {"baseline": [], "candidate": []}
+    for sample in range(args.samples):
+        order = ("baseline", "candidate")
+        if sample % 2:
+            order = tuple(reversed(order))
+        measured = {}
+        for variant in order:
+            measured[variant] = bench_us(
+                lambda variant=variant: compiled[variant](*inputs),
+                args.warmup,
+                args.rep,
+            )
+            samples[variant].append(measured[variant])
+        print(f"sample={sample + 1} baseline={measured['baseline']:.3f}us "
+              f"{case.CANDIDATE_NAME}={measured['candidate']:.3f}us")
+
+    baseline_us = statistics.median(samples["baseline"])
+    candidate_us = statistics.median(samples["candidate"])
+    print(f"FINAL {case.problem()} baseline={baseline_us:.3f}us "
+          f"{case.CANDIDATE_NAME}={candidate_us:.3f}us "
+          f"speedup={baseline_us / candidate_us:.3f}x")
 
 
 def main() -> None:
     cases = discover_cases()
     args = parse_args(cases)
     case = cases[args.case]
-    case.configure(args)
     if args.list:
         for listed_case in cases.values():
-            print(f"{listed_case.NAME}: {listed_case.problem()}")
+            print(f"{listed_case.NAME}:")
+            for shape in getattr(listed_case, "SHAPES", ({}, )):
+                description = format_shape(shape) if shape else listed_case.problem()
+                print(f"  {description}")
         return
     load_runtime(case)
-    if args.variant:
-        result = run_variant(case, args.variant, args)
-        if args.result_json:
-            pathlib.Path(args.result_json).write_text(json.dumps(result))
-        return
-    run_comparison(case)
+    for shape in selected_shapes(case, args):
+        for name, value in shape.items():
+            setattr(args, name, value)
+        case.configure(args)
+        if args.variant:
+            result = run_variant(case, args.variant, args)
+            if args.result_json:
+                pathlib.Path(args.result_json).write_text(json.dumps(result))
+            continue
+        if getattr(case, "INTERLEAVE_VARIANTS", False):
+            run_interleaved_comparison(case, args)
+        else:
+            run_comparison(case)
 
 
 if __name__ == "__main__":

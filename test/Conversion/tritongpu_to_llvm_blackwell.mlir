@@ -535,6 +535,52 @@ tt.func public @tmem_copy_2d_slice(%src: !ttg.memdesc<1x1x8x2x256xi8, #shared2, 
 
 // -----
 
+// Unswizzled 256x16 scale view (rep_m = 2, rep_k = 4) of a packed scale load.
+// Chunk (m, k) sits at SMEM offset m * 2048 + k * 512 and is copied to TMEM
+// column (k * 2 + m) * 4.
+#shared_lin = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [128, 0]]}, alignment = 128>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+
+// CHECK-LABEL: @tmem_copy_2d_logical_scales
+tt.func public @tmem_copy_2d_logical_scales(%src: !ttg.memdesc<256x16xf8E4M3FN, #shared_lin, #ttg.shared_memory>,
+                                            %dst: !ttg.memdesc<256x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>) {
+  // CHECK: [[SMEM:%.*]] = llvm.getelementptr
+  // CHECK: [[TMEM:%.*]] = llvm.ptrtoint %arg1
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[T1:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK: llvm.add [[TMEM]], [[T1]]
+  // CHECK: [[S1:%.*]] = llvm.mlir.constant(2048 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S1]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S2:%.*]] = llvm.mlir.constant(512 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S2]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S3:%.*]] = llvm.mlir.constant(2560 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S3]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S4:%.*]] = llvm.mlir.constant(1024 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S4]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S5:%.*]] = llvm.mlir.constant(3072 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S5]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S6:%.*]] = llvm.mlir.constant(1536 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S6]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK: [[S7:%.*]] = llvm.mlir.constant(3584 : i32)
+  // CHECK: llvm.getelementptr [[SMEM]]{{\[}}[[S7]]{{\]}}
+  // CHECK: tcgen05.cp.cta_group::1.warpx4.32x128b
+  // CHECK-NOT: tcgen05.cp
+  ttng.tmem_copy %src, %dst : !ttg.memdesc<256x16xf8E4M3FN, #shared_lin, #ttg.shared_memory>, !ttg.memdesc<256x16xf8E4M3FN, #tmem_scales, #ttng.tensor_memory, mutable>
+  tt.return
+}
+
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread=[1, 4], threadsPerWarp=[32, 1], warpsPerCTA=[4, 1], order=[0, 1]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, rank = 5}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -1033,7 +1079,7 @@ tt.func @load_store_x1_unpacked(%arg0: !ttg.memdesc<128x2xf16, #tmem_x1_unpacked
 
 // CHECK-LABEL: max_reduction
 //       CHECK:  %[[M:.+]] = llvm.mlir.constant(-1 : i32) : i32
-//       CHECK:   nvvm.redux.sync  fmax %{{.*}}, %[[M]] {nan = true} : f32 -> f32
+//       CHECK:   nvvm.redux.sync  fmax %{{.*}}, %[[M]] nan = true : f32 -> f32
 //       CHECK:   nvvm.barrier
 //       CHECK:   nvvm.shfl.sync bfly
 //       CHECK:   nvvm.shfl.sync bfly
@@ -1082,7 +1128,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
   // CHECK-LABEL: lower_ldmatrix_trans_b8
   tt.func @lower_ldmatrix_trans_b8(%A: !ttg.memdesc<128x64xf8E4M3FN, #shared, #smem, mutable, 1x128x64>) {
     %0 = ttg.local_load %A : !ttg.memdesc<128x64xf8E4M3FN, #shared, #smem, mutable, 1x128x64> -> tensor<128x64xf8E4M3FN, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
-    // CHECK-COUNT-16: nvvm.ldmatrix %{{.*}} {eltType = #nvvm.ld_st_matrix_elt_type<b8>, layout = #nvvm.mma_layout<col>{{.*}}} : (!llvm.ptr<3>) -> !llvm.struct<(i32, i32, i32, i32)>
+    // CHECK-COUNT-16: nvvm.ldmatrix %{{.*}}, num = 2, layout = <col>, shape = <m = 16, n = 16>, element_type = <b8> : (!llvm.ptr<3>) -> !llvm.struct<(i32, i32, i32, i32)>
     tt.return
   }
 }
@@ -1095,7 +1141,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @stmatrix_b8_trans_linear
   tt.func public @stmatrix_b8_trans_linear(%data: tensor<1x1x1x16x256xf8E4M3FN, #linear3>) {
-    // CHECK-COUNT-2: nvvm.stmatrix %{{.*}} {eltType = #nvvm.ld_st_matrix_elt_type<b8>, layout = #nvvm.mma_layout<col>{{.*}}} : !llvm.ptr<3>, i32, i32, i32, i32
+    // CHECK-COUNT-2: nvvm.stmatrix %{{.*}} layout = <col>, shape = <m = 16, n = 8>, element_type = <b8> : !llvm.ptr<3>, i32, i32, i32, i32
     %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1x1x1x16x256xf8E4M3FN, #shared, #smem, mutable>
     ttg.local_store %data, %0 : tensor<1x1x1x16x256xf8E4M3FN, #linear3> -> !ttg.memdesc<1x1x1x16x256xf8E4M3FN, #shared, #smem, mutable>
     tt.return
@@ -1791,7 +1837,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
   // CHECK-LABEL: @tensor_memory_shift_2cta
   // CHECK: nvg.cluster_id
   // CHECK: llvm.urem
-  // CHECK: nvvm.tcgen05.shift {{.*}} {group = #nvvm.cta_group<cta_2>}
+  // CHECK: nvvm.tcgen05.shift {{.*}}, group = <cta_2>
   tt.func @tensor_memory_shift_2cta(
       %buffer: !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>) {
     ttng.tmem_shift %buffer : !ttg.memdesc<256x8xf32, #tmem_shift, #ttng.tensor_memory, mutable>

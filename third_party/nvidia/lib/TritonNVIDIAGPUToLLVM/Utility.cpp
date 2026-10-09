@@ -150,8 +150,9 @@ Value createLeaderCTAPredicate(Location loc, OpBuilder &rewriter) {
 }
 
 Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
-                             uint16_t broadcastBits, Value ctaId) {
-  int numCTAs = triton::gpu::lookupNumCTAs(rewriter);
+                             uint16_t broadcastBits, Value ctaId,
+                             std::optional<int> physicalNumCTAs) {
+  int numCTAs = physicalNumCTAs.value_or(triton::gpu::lookupNumCTAs(rewriter));
   auto encoding =
       triton::nvidia_gpu::getTMAMulticastMaskEncoding(numCTAs, broadcastBits);
   auto b = TritonLLVMOpBuilder(loc, rewriter);

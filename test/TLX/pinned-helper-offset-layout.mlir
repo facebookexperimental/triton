@@ -15,6 +15,8 @@
 // CHECK-DAG: #[[$TRANSPOSE_SRC_LINEAR:.*]] = #ttg.linear<{{.*}}register = {{\[\[0, 1\], \[8, 0\], \[0, 8\], \[0, 16\], \[0, 32\]\]}}
 // CHECK-DAG: #[[$TRANSPOSE_DST_LINEAR:.*]] = #ttg.linear<{{.*}}register = {{\[\[1, 0\], \[0, 8\], \[8, 0\], \[16, 0\], \[32, 0\]\]}}
 // CHECK-DAG: #[[$TRANSPOSE_DST_USER:.*]] = #tlx.user_layout<#[[$TRANSPOSE_DST_LINEAR]]>
+// CHECK-DAG: #[[$TRUNC_MMA:.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [16, 16, 32], isTransposed = true}>
+// CHECK-DAG: #[[$TRUNC_TRANSPOSE:.*]] = #ttg.linear<{{.*}}register = {{\[\[1, 0\], \[2, 0\], \[0, 64\], \[0, 128\]\]}}
 // The helper restructures only the loaded value. The pinned offset flows into
 // amdg.buffer_load, which is an ownership boundary for argument dataflow.
 //
@@ -52,6 +54,11 @@
 // CHECK: scf.condition(%{{.*}}) %{{.*}} : tensor<4x256xi32, #[[WHILE_LAYOUT]]>
 // CHECK: ^bb0(%{{.*}}: tensor<4x256xi32, #[[WHILE_LAYOUT]]>):
 // CHECK: scf.yield {{.*}} : tensor<4x256xi32, #[[WHILE_LAYOUT]]>
+// CHECK-LABEL: tt.func @mfma_trunc_transpose
+// CHECK: %[[MFMA_PIN:.*]] = tlx.require_layout
+// CHECK: %[[TRUNC:.*]] = arith.truncf %[[MFMA_PIN]] : tensor<256x16xf32, #tlx.no_verify_layout<#[[$TRUNC_MMA]]>> to tensor<256x16xbf16, #tlx.no_verify_layout<#[[$TRUNC_MMA]]>>
+// CHECK: tt.trans %[[TRUNC]]
+// CHECK-SAME: tensor<256x16xbf16, #tlx.no_verify_layout<#[[$TRUNC_MMA]]>> -> tensor<16x256xbf16, #tlx.no_verify_layout<#[[$TRUNC_TRANSPOSE]]>>
 //
 // Full post-fixup snapshots follow. The current module uses generic syntax
 // because releasing only the call operand makes the call temporarily invalid.
@@ -132,6 +139,15 @@
 }>
 #transpose_pin = #tlx.no_verify_layout<#tlx.user_layout<#transpose_physical>>
 #transpose_wrong_src_pin = #tlx.no_verify_layout<#tlx.user_layout<#transpose_physical>>
+#mfma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#mfma_pin = #tlx.no_verify_layout<#mfma>
+#mfma_transpose = #ttg.linear<{
+  register = [[1, 0], [2, 0], [0, 64], [0, 128]],
+  lane = [[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]],
+  warp = [[0, 16], [0, 32]],
+  block = []
+}>
+#mfma_transpose_pin = #tlx.no_verify_layout<#mfma_transpose>
 
 module {
   tt.func private @load_then_restructure(
@@ -195,6 +211,20 @@ module {
           : tensor<2x2x256xi32> -> tensor<4x256xi32>
       scf.yield %restored : tensor<4x256xi32>
     }
+    tt.return
+  }
+
+  // Inverse transpose inference produces a linear encoding physically equal
+  // to MFMA here. Preserve the MFMA source so it agrees with truncf's input;
+  // repeatedly switching between these encodings prevents convergence.
+  tt.func @mfma_trunc_transpose(%value: tensor<256x16xf32, #mfma_pin>) {
+    %pin = tlx.require_layout %value
+        : tensor<256x16xf32, #mfma_pin> -> tensor<256x16xf32, #mfma_pin>
+    %truncated = arith.truncf %pin
+        : tensor<256x16xf32, #mfma_pin> to tensor<256x16xbf16, #mfma_pin>
+    %transposed = tt.trans %truncated {order = array<i32: 1, 0>}
+        : tensor<256x16xbf16, #mfma_pin>
+          -> tensor<16x256xbf16, #mfma_transpose_pin>
     tt.return
   }
 }

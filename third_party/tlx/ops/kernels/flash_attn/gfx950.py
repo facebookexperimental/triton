@@ -178,7 +178,7 @@ def _concat_cols(x0, x1):
 
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
-    """Reduce four MFMA-layout column slices through one dependency chain."""
+    """Release the MFMA row sum to prevent repeated-RLC N8 relayouts."""
     tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
     tl.static_assert(x.shape[1] % 4 == 0)
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -200,7 +200,8 @@ def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
     else:
         partial = partial + x_2
         partial = partial + x_3
-    return tl.sum(partial, 1)
+    reduced = tl.sum(partial, 1)
+    return tlx.release_layout(reduced)
 
 
 @triton.jit
@@ -1438,7 +1439,8 @@ def _attn_inner_pipelined(
     PRESERVE_ALIGNED_CAUSAL_ACC_LAYOUT: tl.constexpr = (EXPLICIT_PV_LAYOUT and not MASK_STEPS and IS_CAUSAL
                                                         and q.shape[0] == 256 and BLOCK_N == 64)
     if (EXPLICIT_PV_LAYOUT32 or EXPLICIT_PV_LAYOUT) and not PRESERVE_ALIGNED_CAUSAL_ACC_LAYOUT:
-        state = SoftmaxState(tlx.release_layout(state.acc), state.l_i, state.m_i)
+        # Keep the handoff removable when an outer branch selects the same MFMA carrier.
+        state = SoftmaxState(tlx.release_layout(state.acc, relaxed=True), state.l_i, state.m_i)
 
     return state
 
@@ -1615,7 +1617,8 @@ def _attn_inner_full2_lazy(
     )
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), token=wait, relaxed=True)
     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
-    return SoftmaxState(tlx.release_layout(acc), state.l_i, state.m_i)
+    # A hard release here forces a 128 KiB relayout when this path joins an MFMA path.
+    return SoftmaxState(tlx.release_layout(acc, relaxed=True), state.l_i, state.m_i)
 
 
 @triton.jit
@@ -3611,10 +3614,8 @@ def _alert_nondeterministic_backward():
             stacklevel=2,
         )
         return
-    raise RuntimeError(
-        f"{caller} does not have a deterministic implementation, but "
-        "'torch.use_deterministic_algorithms(True)' is enabled"
-    )
+    raise RuntimeError(f"{caller} does not have a deterministic implementation, but "
+                       "'torch.use_deterministic_algorithms(True)' is enabled")
 
 
 class _attention(torch.autograd.Function):
@@ -3632,14 +3633,14 @@ class _attention(torch.autograd.Function):
         q, k, v, o, lse = ctx.saved_tensors
         do = do.contiguous()
         if torch.are_deterministic_algorithms_enabled() and not gfx950_bwd.fa_backward_is_deterministic(
-            q,
-            k,
-            v,
-            o,
-            do,
-            lse,
-            ctx.sm_scale,
-            ctx.causal,
+                q,
+                k,
+                v,
+                o,
+                do,
+                lse,
+                ctx.sm_scale,
+                ctx.causal,
         ):
             _alert_nondeterministic_backward()
         dq, dk, dv = gfx950_bwd.fa_backward(

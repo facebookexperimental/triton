@@ -21,30 +21,44 @@ along M and N):
     the MFMAs.
 
 Ragged handling (mask-free hot loop):
-  * M and N are wrapped with a modulo, so every hot-loop read is in bounds.
+  * Invalid M and N rows are wrapped or clamped, so hot-loop reads stay in bounds.
     Garbage rows/cols are dropped by the masked C store.
   * The pipeline covers an even number of whole K-tiles (n_pipe). Any leftover
     (an odd whole tile and/or a partial final tile) is a cold masked tl.load
     tail. Small K (< 2 whole tiles) skips the pipeline entirely and runs only
     the tail.
 """
+
 import os
+import threading
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 # gfx950 has 8 XCDs
 NUM_XCDS = 8
+_ENV_LOCK = threading.Lock()
+_MAX_BUFFER_BYTES = (1 << 31) - 2
 
 
-def num_sms():
-    return torch.cuda.get_device_properties(DEVICE).multi_processor_count
+def _num_sms(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _setup_env():
+    """Disable post-RA scheduling only while this inter-wave kernel compiles."""
+    previous = os.environ.get("TRITON_DISABLE_POST_MISCHED")
+    os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
+    return previous
+
+
+def _teardown_env(previous):
+    if previous is None:
+        os.environ.pop("TRITON_DISABLE_POST_MISCHED", None)
+    else:
+        os.environ["TRITON_DISABLE_POST_MISCHED"] = previous
 
 
 @triton.jit
@@ -55,7 +69,7 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
         return pid
     xcd = pid % num_xcds
     local_pid = pid // num_xcds
-    return ((local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size))
+    return (local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size)
 
 
 @triton.jit
@@ -85,29 +99,51 @@ def _grouped_gemm_tile(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     HAS_K_TAIL: tl.constexpr,
+    INPUT_CONTIGUITY: tl.constexpr = 8,
+    REBASE_INPUTS: tl.constexpr = True,
+    WIDE_OUTPUT: tl.constexpr = True,
 ):
     """Compute one [BLOCK_SIZE_M, BLOCK_SIZE_N] output tile of ``A @ B`` as four
     128x128 quadrants and store it to C."""
     tl.static_assert(NUM_BUFFERS == 2, "the 2x2 quadrant inter-wave pipeline is double-buffered")
 
+    stride_am = tl.multiple_of(stride_am, INPUT_CONTIGUITY)
+    stride_bn = tl.multiple_of(stride_bn, INPUT_CONTIGUITY)
+    pid_m = pid_m.to(tl.int32)
+    pid_n = pid_n.to(tl.int32)
     HALF_M: tl.constexpr = BLOCK_SIZE_M // 2
     HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
 
-    # A rows and B columns are wrapped so every hot-loop read stays in bounds and
-    # keeps vectorized loads along K. Garbage from wrapped lanes is dropped by the
-    # masked C store.
-    offs_am_top = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, HALF_M)) % gm, HALF_M)
-    offs_am_bot = tl.multiple_of((pid_m * BLOCK_SIZE_M + HALF_M + tl.arange(0, HALF_M)) % gm, HALF_M)
-    offs_bn_left = tl.multiple_of((pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)) % gn, HALF_N)
-    offs_bn_right = tl.multiple_of((pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)) % gn, HALF_N)
+    if REBASE_INPUTS:
+        # Rebase each operand tile with a scalar i64 product. Direct-to-LDS
+        # lane offsets stay i32 and span at most one tile. Clamp invalid rows
+        # to a valid row; masked stores discard their results.
+        m_top = tl.where(pid_m * BLOCK_SIZE_M < gm, pid_m * BLOCK_SIZE_M, 0)
+        n_left = tl.where(pid_n * BLOCK_SIZE_N < gn, pid_n * BLOCK_SIZE_N, 0)
+        a_top_ptr = tl.multiple_of(a_ptr + m_top.to(tl.int64) * stride_am, INPUT_CONTIGUITY * 2)
+        b_left_ptr = tl.multiple_of(b_ptr + n_left.to(tl.int64) * stride_bn, INPUT_CONTIGUITY * 2)
+        offs_am_top = tl.minimum(tl.arange(0, HALF_M), (gm - m_top - 1).to(tl.int32))
+        offs_am_bot = tl.minimum(HALF_M + tl.arange(0, HALF_M), gm - m_top - 1)
+        offs_bn_left = tl.minimum(tl.arange(0, HALF_N), (gn - n_left - 1).to(tl.int32))
+        offs_bn_right = tl.minimum(HALF_N + tl.arange(0, HALF_N), gn - n_left - 1)
+
+    else:
+        # A rows and B columns are wrapped so every hot-loop read stays in bounds and
+        # keeps vectorized loads along K. Garbage from wrapped lanes is dropped by the
+        # masked C store.
+        offs_am_top = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, HALF_M)) % gm, HALF_M)
+        offs_am_bot = tl.multiple_of((pid_m * BLOCK_SIZE_M + HALF_M + tl.arange(0, HALF_M)) % gm, HALF_M)
+        offs_bn_left = tl.multiple_of((pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)) % gn, HALF_N)
+        offs_bn_right = tl.multiple_of((pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)) % gn, HALF_N)
+
+        a_top_ptr = a_ptr
+        b_left_ptr = b_ptr
 
     # K is the contiguous/innermost axis of both A and (col-major) B tiles.
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
-    # Full 2-D tile offsets. With the pinned swizzle, tlx infers a compact
-    # offset layout, so keeping these offsets live is cheaper than rematerializing
-    # (which adds VALU/reload pressure). K stride is 1 for both A and col-major B,
-    # so the running K position is a scalar (ka) stepping by BLOCK_K.
+    # These 2-D offsets stay i32. The host guards their byte span against
+    # the buffer descriptor limit, including the running K position (ka).
     a_top_off = offs_am_top[:, None] * stride_am + offs_k[None, :]
     a_bot_off = offs_am_bot[:, None] * stride_am + offs_k[None, :]
     b_left_off = offs_bn_left[:, None] * stride_bn + offs_k[None, :]
@@ -132,22 +168,22 @@ def _grouped_gemm_tile(
 
     if n_full >= 2:
         # Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits)
-        tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + ka)
+        tlx.buffer_load_to_local(smem_b_left[0], b_left_ptr, b_left_off + ka, contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
-        tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+        tlx.buffer_load_to_local(smem_a_top[0], a_top_ptr, a_top_off + ka, contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
-        tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+        tlx.buffer_load_to_local(smem_a_bot[0], a_top_ptr, a_bot_off + ka, contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
-        tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + ka)
+        tlx.buffer_load_to_local(smem_b_right[0], b_left_ptr, b_right_off + ka, contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
 
-        tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off + (ka + kb1))
+        tlx.buffer_load_to_local(smem_b_left[1], b_left_ptr, b_left_off + (ka + kb1), contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
-        tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off + (ka + kb1))
+        tlx.buffer_load_to_local(smem_a_top[1], a_top_ptr, a_top_off + (ka + kb1), contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
-        tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off + (ka + kb1))
+        tlx.buffer_load_to_local(smem_a_bot[1], a_top_ptr, a_bot_off + (ka + kb1), contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
-        tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off + (ka + kb1))
+        tlx.buffer_load_to_local(smem_b_right[1], b_left_ptr, b_right_off + (ka + kb1), contiguity=INPUT_CONTIGUITY)
         tlx.async_load_commit_group()
 
         ka += BLOCK_SIZE_K * 2
@@ -164,7 +200,7 @@ def _grouped_gemm_tile(
                 acc_tl = tl.dot(a_top, b_left, acc_tl, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-                tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + ka)
+                tlx.buffer_load_to_local(smem_b_left[0], b_left_ptr, b_left_off + ka, contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             tlx.async_load_wait_group(5)
@@ -172,7 +208,7 @@ def _grouped_gemm_tile(
                 acc_bl = tl.dot(a_bot, b_left, acc_bl, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
-                tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+                tlx.buffer_load_to_local(smem_a_top[0], a_top_ptr, a_top_off + ka, contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             tlx.async_load_wait_group(5)
@@ -180,7 +216,7 @@ def _grouped_gemm_tile(
                 acc_tr = tl.dot(a_top, b_right, acc_tr, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
-                tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+                tlx.buffer_load_to_local(smem_a_bot[0], a_top_ptr, a_bot_off + ka, contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             tlx.async_load_wait_group(5)
@@ -188,7 +224,7 @@ def _grouped_gemm_tile(
                 acc_br = tl.dot(a_bot, b_right, acc_br, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-                tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + ka)
+                tlx.buffer_load_to_local(smem_b_right[0], b_left_ptr, b_right_off + ka, contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             # sub-iter 1 (buffer 1, K = ka + BLOCK_K)
@@ -197,7 +233,8 @@ def _grouped_gemm_tile(
                 acc_tl = tl.dot(a_top, b_left, acc_tl, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-                tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off + (ka + kb1))
+                tlx.buffer_load_to_local(smem_b_left[1], b_left_ptr, b_left_off + (ka + kb1),
+                                         contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             tlx.async_load_wait_group(5)
@@ -205,7 +242,7 @@ def _grouped_gemm_tile(
                 acc_bl = tl.dot(a_bot, b_left, acc_bl, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
-                tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off + (ka + kb1))
+                tlx.buffer_load_to_local(smem_a_top[1], a_top_ptr, a_top_off + (ka + kb1), contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             tlx.async_load_wait_group(5)
@@ -213,7 +250,7 @@ def _grouped_gemm_tile(
                 acc_tr = tl.dot(a_top, b_right, acc_tr, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
-                tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off + (ka + kb1))
+                tlx.buffer_load_to_local(smem_a_bot[1], a_top_ptr, a_bot_off + (ka + kb1), contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
 
             tlx.async_load_wait_group(5)
@@ -221,7 +258,8 @@ def _grouped_gemm_tile(
                 acc_br = tl.dot(a_bot, b_right, acc_br, allow_tf32=False)
             with tlx.warp_pipeline_stage("mem", priority=1):
                 a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-                tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off + (ka + kb1))
+                tlx.buffer_load_to_local(smem_b_right[1], b_left_ptr, b_right_off + (ka + kb1),
+                                         contiguity=INPUT_CONTIGUITY)
                 tlx.async_load_commit_group()
                 ka += BLOCK_SIZE_K * 2
 
@@ -259,7 +297,7 @@ def _grouped_gemm_tile(
 
     # Masked scalar tail: whole K-tiles past the pipelined region (an odd
     # leftover tile when n_full is odd) plus a partial final tile (gk % BLOCK_K).
-    # Uses the same wrapped M/N offsets, only K is masked. Runs 0-2 iterations
+    # Uses the same clamped M/N offsets, only K is masked. Runs 0-2 iterations
     # (and covers the whole GEMM when small K skipped the pipeline).
     #
     # Compiled out entirely when the host can prove no group needs it, which
@@ -267,10 +305,10 @@ def _grouped_gemm_tile(
     if HAS_K_TAIL:
         for kk in tl.range(n_pipe * BLOCK_SIZE_K, gk, BLOCK_SIZE_K, num_stages=1):
             k_mask = offs_k < gk - kk
-            a_top_t = tl.load(a_ptr + a_top_off + kk, mask=k_mask[None, :], other=0.0)
-            a_bot_t = tl.load(a_ptr + a_bot_off + kk, mask=k_mask[None, :], other=0.0)
-            b_left_t = tl.load(b_ptr + b_left_off + kk, mask=k_mask[None, :], other=0.0)
-            b_right_t = tl.load(b_ptr + b_right_off + kk, mask=k_mask[None, :], other=0.0)
+            a_top_t = tl.load(a_top_ptr + a_top_off + kk, mask=k_mask[None, :], other=0.0)
+            a_bot_t = tl.load(a_top_ptr + a_bot_off + kk, mask=k_mask[None, :], other=0.0)
+            b_left_t = tl.load(b_left_ptr + b_left_off + kk, mask=k_mask[None, :], other=0.0)
+            b_right_t = tl.load(b_left_ptr + b_right_off + kk, mask=k_mask[None, :], other=0.0)
             b_left_t = tl.trans(b_left_t)
             b_right_t = tl.trans(b_right_t)
             acc_tl = tl.dot(a_top_t, b_left_t, acc_tl, allow_tf32=False)
@@ -279,23 +317,35 @@ def _grouped_gemm_tile(
             acc_br = tl.dot(a_bot_t, b_right_t, acc_br, allow_tf32=False)
 
     # Store the four quadrants, mask out OOB rows and columns
-    offs_cm_top = pid_m * BLOCK_SIZE_M + tl.arange(0, HALF_M)
+    offs_cm_top = (pid_m * BLOCK_SIZE_M + tl.arange(0, HALF_M)).to(tl.int64 if WIDE_OUTPUT else tl.int32)
     offs_cm_bot = offs_cm_top + HALF_M
     offs_cn_left = pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)
     offs_cn_right = offs_cn_left + HALF_N
 
     c_tl = acc_tl.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_left[None, :], c_tl,
-             mask=(offs_cm_top[:, None] < gm) & (offs_cn_left[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_left[None, :],
+        c_tl,
+        mask=(offs_cm_top[:, None] < gm) & (offs_cn_left[None, :] < gn),
+    )
     c_bl = acc_bl.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_left[None, :], c_bl,
-             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_left[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_left[None, :],
+        c_bl,
+        mask=(offs_cm_bot[:, None] < gm) & (offs_cn_left[None, :] < gn),
+    )
     c_tr = acc_tr.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_right[None, :], c_tr,
-             mask=(offs_cm_top[:, None] < gm) & (offs_cn_right[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_right[None, :],
+        c_tr,
+        mask=(offs_cm_top[:, None] < gm) & (offs_cn_right[None, :] < gn),
+    )
     c_br = acc_br.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_right[None, :], c_br,
-             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_right[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_right[None, :],
+        c_br,
+        mask=(offs_cm_bot[:, None] < gm) & (offs_cn_right[None, :] < gn),
+    )
 
 
 @triton.jit
@@ -316,6 +366,7 @@ def _grouped_gemm_tile_generic(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     HAS_K_TAIL: tl.constexpr,
+    INPUT_CONTIGUITY: tl.constexpr = 1,
 ):
     """One [BLOCK_SIZE_M, BLOCK_SIZE_N] output tile, compiler-pipelined.
 
@@ -326,8 +377,11 @@ def _grouped_gemm_tile_generic(
     axis 0, the dot consumes it with no transpose, and the K-tail is a plain
     axis-0 mask.
     """
-    offs_am = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn
+    pid_m = pid_m.to(tl.int32)
+    pid_n = pid_n.to(tl.int32)
+    # Widen row indices before stride multiplication, including the K-tail reloads.
+    offs_am = ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm).to(tl.int64)
+    offs_bn = ((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn).to(tl.int64)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :]
@@ -337,8 +391,8 @@ def _grouped_gemm_tile_generic(
 
     n_full = gk // BLOCK_SIZE_K
     for _ in tl.range(0, n_full, num_stages=NUM_STAGES):
-        tl.multiple_of(a_ptrs, [16, 16])
-        tl.multiple_of(b_ptrs, [16, 16])
+        tl.multiple_of(a_ptrs, [INPUT_CONTIGUITY, INPUT_CONTIGUITY])
+        tl.multiple_of(b_ptrs, [INPUT_CONTIGUITY, INPUT_CONTIGUITY])
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
         acc = tl.dot(a, b, acc, allow_tf32=False)
@@ -356,11 +410,14 @@ def _grouped_gemm_tile_generic(
                       other=0.0)
         acc = tl.dot(a_t, b_t, acc, allow_tf32=False)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c = acc.to(c_ptr.dtype.element_ty)
-    tl.store(c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :], c,
-             mask=(offs_cm[:, None] < gm) & (offs_cn[None, :] < gn))
+    tl.store(
+        c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :],
+        c,
+        mask=(offs_cm[:, None] < gm) & (offs_cn[None, :] < gn),
+    )
 
 
 @triton.jit
@@ -395,6 +452,10 @@ def grouped_gemm_kernel(
     # False when the host can prove gk is exactly covered by the pipelined
     # region for every group, letting the masked K-tail be compiled out.
     HAS_K_TAIL: tl.constexpr,
+    INPUT_CONTIGUITY: tl.constexpr = 8,
+    WIDE_SCHEDULER: tl.constexpr = False,
+    REBASE_INPUTS: tl.constexpr = True,
+    WIDE_OUTPUT: tl.constexpr = True,
 ):
     """Persistent, XCD-grouped scheduler over the whole group of GEMMs.
     The per-tile compute is selected by TILE_MODE."""
@@ -409,12 +470,27 @@ def grouped_gemm_kernel(
 
         # Swizzled (row/col-permuted) LDS layout pinned to kill bank conflicts.
         # All four half-tiles are [128, 64].
-        tl.static_assert(HALF_M == 128 and HALF_N == 128 and BLOCK_SIZE_K == 64,
-                         "pinned swizzle bases are hardcoded for [128, 64] half-tiles")
+        tl.static_assert(
+            HALF_M == 128 and HALF_N == 128 and BLOCK_SIZE_K == 64,
+            "pinned swizzle bases are hardcoded for [128, 64] half-tiles",
+        )
         smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
             [(512, 16)],
-            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0],
-             [8, 0]],
+            [
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [16, 0],
+                [32, 0],
+                [64, 0],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+            ],
             [HALF_M, BLOCK_SIZE_K],
         )
 
@@ -426,32 +502,37 @@ def grouped_gemm_kernel(
         smem_b_right = tlx.local_alloc((HALF_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
 
     # Which global output tile we are computing
-    tile_idx = pid
+    tile_idx = pid.to(tl.int64) if WIDE_SCHEDULER else pid
 
     # The global tile id for where the current group begins
-    last_problem_end = 0
+    last_problem_end = tl.full((), 0, tl.int64 if WIDE_SCHEDULER else tl.int32)
 
     for g in range(group_size):
+        size_index = g.to(tl.int64) * 3
         # Load base pointers. Use assume_uniform to hint to the compiler that the pointers
         # are warp-uniform and can just be broadcasted from the first lane.
-        a_ptr = tl.multiple_of(tlx.assume_uniform(tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16))), 16)
-        b_ptr = tl.multiple_of(tlx.assume_uniform(tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16))), 16)
+        a_ptr = tl.multiple_of(tlx.assume_uniform(tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16))),
+                               INPUT_CONTIGUITY * 2)
+        b_ptr = tl.multiple_of(tlx.assume_uniform(tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16))),
+                               INPUT_CONTIGUITY * 2)
         c_ptr = tlx.assume_uniform(tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16)))
 
         # Load gemm sizes
-        gm = tl.load(group_gemm_sizes + g * 3)
-        gn = tl.load(group_gemm_sizes + g * 3 + 1)
-        gn = tl.multiple_of(gn, 16)
-        gk = tl.load(group_gemm_sizes + g * 3 + 2)
+        gm = tl.load(group_gemm_sizes + size_index)
+        gn = tl.load(group_gemm_sizes + size_index + 1)
+        gk = tl.load(group_gemm_sizes + size_index + 2)
 
         # Load strides
-        stride_am = tl.load(g_lds + g * 3)  # A row stride
-        stride_bn = tl.multiple_of(tl.load(g_lds + g * 3 + 1), 16)  # B N-stride
-        stride_cm = tl.load(g_lds + g * 3 + 2)  # C row stride
+        stride_am = tl.load(g_lds + size_index)  # A row stride
+        stride_bn = tl.load(g_lds + size_index + 1)  # B N-stride
+        stride_cm = tl.load(g_lds + size_index + 2)  # C row stride
 
         # How many tiles are necessary to compute this specific gemm
-        num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
-        num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
+        num_m_tiles = gm // BLOCK_SIZE_M + (gm % BLOCK_SIZE_M != 0)
+        num_n_tiles = gn // BLOCK_SIZE_N + (gn % BLOCK_SIZE_N != 0)
+        if WIDE_SCHEDULER:
+            num_m_tiles = num_m_tiles.to(tl.int64)
+            num_n_tiles = num_n_tiles.to(tl.int64)
         num_tiles = num_m_tiles * num_n_tiles
 
         # This program owns the tiles where tile_idx lies within this group's
@@ -468,14 +549,51 @@ def grouped_gemm_kernel(
 
             # Compute this (pid_m, pid_n) output tile. Scheduler-agnostic logic.
             if TILE_MODE == 0:
-                _grouped_gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn, stride_cm,
-                                   smem_a_top, smem_a_bot, smem_b_left, smem_b_right, BLOCK_SIZE_M=BLOCK_SIZE_M,
-                                   BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_BUFFERS=NUM_BUFFERS,
-                                   HAS_K_TAIL=HAS_K_TAIL)
+                _grouped_gemm_tile(
+                    pid_m,
+                    pid_n,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    gm,
+                    gn,
+                    gk,
+                    stride_am,
+                    stride_bn,
+                    stride_cm,
+                    smem_a_top,
+                    smem_a_bot,
+                    smem_b_left,
+                    smem_b_right,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    NUM_BUFFERS=NUM_BUFFERS,
+                    HAS_K_TAIL=HAS_K_TAIL,
+                    INPUT_CONTIGUITY=INPUT_CONTIGUITY,
+                    REBASE_INPUTS=REBASE_INPUTS,
+                    WIDE_OUTPUT=WIDE_OUTPUT,
+                )
             else:
-                _grouped_gemm_tile_generic(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn,
-                                           stride_cm, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
-                                           BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_STAGES=NUM_STAGES, HAS_K_TAIL=HAS_K_TAIL)
+                _grouped_gemm_tile_generic(
+                    pid_m,
+                    pid_n,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    gm,
+                    gn,
+                    gk,
+                    stride_am,
+                    stride_bn,
+                    stride_cm,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    NUM_STAGES=NUM_STAGES,
+                    HAS_K_TAIL=HAS_K_TAIL,
+                    INPUT_CONTIGUITY=INPUT_CONTIGUITY,
+                )
 
             # Program p owns tiles p, p+NUM_SM, p+2*NUM_SM, and so on
             tile_idx += NUM_SM
@@ -514,7 +632,7 @@ def _needs_k_tail(shapes, cfg):
     if cfg["TILE_MODE"] == 0:
         return True
     bk = cfg["BLOCK_SIZE_K"]
-    for (_, _, K) in shapes:
+    for _, _, K in shapes:
         if K > (K // bk) * bk:
             return True
     return False
@@ -556,7 +674,14 @@ def _tile_score(shapes, bm, bn, rate, nsm):
     return rate * util * (useful / padded)
 
 
-def _pick_config(shapes):
+def _quadrant_input_span_fits(rows, k, row_stride):
+    # Direct-to-LDS needs aligned dwords and uses a descriptor capped at
+    # INT32_MAX - 1 bytes. A rebased tile reads at most 256 rows.
+    span_bytes = ((min(256, rows) - 1) * row_stride + k) * 2
+    return row_stride % 2 == 0 and span_bytes <= _MAX_BUFFER_BYTES
+
+
+def _pick_config(shapes, device, *, allow_quadrant=True):
     """Choose a launch config from the group's shapes.
 
     The quadrant path is by far the fastest per-tile engine (782.7 vs 683.5
@@ -565,7 +690,7 @@ def _pick_config(shapes):
     it rounds every M up to 256. Score both engines on the same footing and take
     the winner.
     """
-    nsm = num_sms()
+    nsm = _num_sms(device)
 
     def entry(bm, bn, rate, cfg):
         tiles = sum(_cdiv(M, bm) * _cdiv(N, bn) for (M, N, _) in shapes)
@@ -579,14 +704,26 @@ def _pick_config(shapes):
     quad = dict(_CONFIG)
     quad_tiles = sum(_cdiv(M, 256) * _cdiv(N, 256) for (M, N, _) in shapes)
     quad["XCD_CHUNK"] = 32 if quad_tiles >= 2 * nsm else 8
-    cands = [entry(256, 256, _QUAD_RATE, quad)]
+    quad_safe = all(_quadrant_input_span_fits(M, K, K) and _quadrant_input_span_fits(N, K, K) for M, N, K in shapes)
+    cands = [entry(256, 256, _QUAD_RATE, quad)] if allow_quadrant and quad_safe else []
     for (bm, bn), (rate, bk, warps, stages) in _GENERIC_RATES.items():
         cands.append(
             entry(
-                bm, bn, rate, {
-                    "BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "GROUP_SIZE_M": 8, "NUM_BUFFERS": 2,
-                    "XCD_CHUNK": 16, "num_warps": warps, "TILE_MODE": 1, "NUM_STAGES": stages
-                }))
+                bm,
+                bn,
+                rate,
+                {
+                    "BLOCK_SIZE_M": bm,
+                    "BLOCK_SIZE_N": bn,
+                    "BLOCK_SIZE_K": bk,
+                    "GROUP_SIZE_M": 8,
+                    "NUM_BUFFERS": 2,
+                    "XCD_CHUNK": 16,
+                    "num_warps": warps,
+                    "TILE_MODE": 1,
+                    "NUM_STAGES": stages,
+                },
+            ))
 
     # c[0] = predicted throughput
     # c[1] = arithmetic intensity
@@ -612,13 +749,29 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
     group_A[i]: fp16 [M_i, K_i] row-major (K contiguous).
     group_B[i]: fp16 [K_i, N_i] column-major (K contiguous) == [N_i, K_i].t().
     """
+    device = group_A[0].device
     shapes = [(A.shape[0], B.shape[1], A.shape[1]) for A, B in zip(group_A, group_B)]
-    cfg = _pick_config(shapes)
+    cfg = _pick_config(shapes, device)
     if config:
         cfg.update(config)
+    input_contiguity = next(width for width in (8, 2, 1) if all(
+        A.stride(0) % width == 0 and B.stride(1) % width == 0 and A.data_ptr() % (width * 2) == 0 and B.data_ptr() %
+        (width * 2) == 0 for A, B in zip(group_A, group_B)))
+    if cfg["TILE_MODE"] == 0 and (input_contiguity < 2 or not all(
+            _quadrant_input_span_fits(A.shape[0], A.shape[1], A.stride(0))
+            and _quadrant_input_span_fits(B.shape[1], B.shape[0], B.stride(1)) for A, B in zip(group_A, group_B))):
+        cfg = _pick_config(shapes, device, allow_quadrant=False)
+    cfg["INPUT_CONTIGUITY"] = input_contiguity
+    cfg["REBASE_INPUTS"] = any(
+        ((A.shape[0] - 1) * A.stride(0) + A.shape[1]) *
+        2 > _MAX_BUFFER_BYTES or ((B.shape[1] - 1) * B.stride(1) + B.shape[0]) * 2 > _MAX_BUFFER_BYTES
+        for A, B in zip(group_A, group_B))
+    cfg["WIDE_OUTPUT"] = any(M * N * 2 > _MAX_BUFFER_BYTES for M, N, _ in shapes)
     if not config or "HAS_K_TAIL" not in config:
         cfg["HAS_K_TAIL"] = _needs_k_tail(shapes, cfg)
 
+    # The final persistent step may overshoot the last tile by NUM_SM - 1.
+    cfg["WIDE_SCHEDULER"] = _n_tiles(shapes, cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"]) + _num_sms(device) >= 1 << 31
     G = len(group_A)
     assert len(group_B) == G, "group_A / group_B length mismatch"
 
@@ -630,7 +783,7 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
         Kb, N = B.shape
         assert K == Kb, f"K mismatch: A has K={K}, B has K={Kb}"
         assert B.stride(0) == 1, "B must be column-major [K, N] (K contiguous, stride(0)==1)"
-        C = torch.empty((M, N), device=DEVICE, dtype=A.dtype)
+        C = torch.empty((M, N), device=device, dtype=A.dtype)
         group_C.append(C)
         A_addrs.append(A.data_ptr())
         B_addrs.append(B.data_ptr())
@@ -639,11 +792,11 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
         # lda = A row stride (K); ldb = B N-stride (== K for col-major); ldc = C row stride (N)
         g_lds += [A.stride(0), B.stride(1), C.stride(0)]
 
-    d_a_ptrs = torch.tensor(A_addrs, dtype=torch.int64, device=DEVICE)
-    d_b_ptrs = torch.tensor(B_addrs, dtype=torch.int64, device=DEVICE)
-    d_c_ptrs = torch.tensor(C_addrs, dtype=torch.int64, device=DEVICE)
-    d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device=DEVICE)
-    d_g_lds = torch.tensor(g_lds, dtype=torch.int32, device=DEVICE)
+    d_a_ptrs = torch.tensor(A_addrs, dtype=torch.int64, device=device)
+    d_b_ptrs = torch.tensor(B_addrs, dtype=torch.int64, device=device)
+    d_c_ptrs = torch.tensor(C_addrs, dtype=torch.int64, device=device)
+    d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device=device)
+    d_g_lds = torch.tensor(g_lds, dtype=torch.int32, device=device)
 
     return d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, group_C
 
@@ -651,94 +804,51 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
 def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
     """Forward already-constructed tensors straight to the kernel (no host-side
     setup), so it can be timed on its own."""
-    NUM_SM = num_sms()
-    grouped_gemm_kernel[(NUM_SM, )](
-        d_a_ptrs,
-        d_b_ptrs,
-        d_c_ptrs,
-        d_g_sizes,
-        d_g_lds,
-        G,
-        NUM_SM=NUM_SM,
-        BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
-        BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
-        BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
-        GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
-        NUM_XCDS=NUM_XCDS,
-        XCD_CHUNK=cfg["XCD_CHUNK"],
-        NUM_BUFFERS=cfg["NUM_BUFFERS"],
-        TILE_MODE=cfg["TILE_MODE"],
-        NUM_STAGES=cfg["NUM_STAGES"],
-        HAS_K_TAIL=cfg["HAS_K_TAIL"],
-        num_warps=cfg["num_warps"],
-        num_stages=1,
-        matrix_instr_nonkdim=16,
-        # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
-        # v_accvgpr moves around each mfma)
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
-    )
+    device = d_a_ptrs.device
+    NUM_SM = _num_sms(device)
+    with _ENV_LOCK:
+        previous_env = _setup_env()
+        try:
+            with torch.cuda.device(device):
+                grouped_gemm_kernel[(NUM_SM, )](
+                    d_a_ptrs,
+                    d_b_ptrs,
+                    d_c_ptrs,
+                    d_g_sizes,
+                    d_g_lds,
+                    G,
+                    NUM_SM=NUM_SM,
+                    BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
+                    BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
+                    BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
+                    GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
+                    NUM_XCDS=NUM_XCDS,
+                    XCD_CHUNK=cfg["XCD_CHUNK"],
+                    NUM_BUFFERS=cfg["NUM_BUFFERS"],
+                    TILE_MODE=cfg["TILE_MODE"],
+                    NUM_STAGES=cfg["NUM_STAGES"],
+                    HAS_K_TAIL=cfg["HAS_K_TAIL"],
+                    INPUT_CONTIGUITY=cfg.get("INPUT_CONTIGUITY", 8),
+                    WIDE_SCHEDULER=cfg.get("WIDE_SCHEDULER", False),
+                    REBASE_INPUTS=cfg.get("REBASE_INPUTS", True),
+                    WIDE_OUTPUT=cfg.get("WIDE_OUTPUT", True),
+                    num_warps=cfg["num_warps"],
+                    num_stages=1,
+                    matrix_instr_nonkdim=16,
+                    # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
+                    # v_accvgpr moves around each mfma)
+                    llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+                )
+        finally:
+            _teardown_env(previous_env)
 
 
-def grouped_gemm(group_A, group_B, config=None):
-    """group_A[i]: fp16 [M_i, K_i] row-major (K contiguous).
-       group_B[i]: fp16 [K_i, N_i] COLUMN-major (K contiguous) == [N_i, K_i].t().
-    """
-    d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, group_C = _make_grouped_gemm_args(
-        group_A, group_B, config)
-    _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg)
-    return group_C
+def grouped_gemm(group_a, group_b):
+    """Run a ragged group of FP16 matrix multiplications on gfx950."""
+    args = _make_grouped_gemm_args(group_a, group_b)
+    d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, cfg, outputs = args
+    _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size, cfg)
+    return outputs
 
 
-def _rand_groups(shape_spec, seed=0):
-    """A[M,K] row-major; B[K,N] column-major (K contiguous) via a [N,K].t() view."""
-    g = torch.Generator(device=DEVICE).manual_seed(seed)
-    group_A, group_B = [], []
-    for (M, N, K) in shape_spec:
-        group_A.append(torch.randn((M, K), device=DEVICE, dtype=torch.float16, generator=g))
-        Bt = torch.randn((N, K), device=DEVICE, dtype=torch.float16, generator=g)  # [N,K] row-major
-        group_B.append(Bt.t())  # [K,N] view, stride (1, K) == column-major
-    return group_A, group_B
-
-
-def _check(shape_spec, label):
-    group_A, group_B = _rand_groups(shape_spec)
-    group_C = grouped_gemm(group_A, group_B)
-    for i, (A, B) in enumerate(zip(group_A, group_B)):
-        ref = torch.matmul(A, B)
-        torch.testing.assert_close(group_C[i], ref, atol=1e-2, rtol=1e-2)
-    print(f"  [PASS] {label} ({len(shape_spec)} groups)")
-
-
-def test_op():
-    _check([(1024, 1024, 1024), (512, 512, 512), (256, 256, 256), (128, 128, 128)], "ragged M=N=K")
-    _check([(4096, 4096, 4096), (2048, 4096, 4096), (1000, 4096, 4096), (333, 4096, 4096)],
-           "ragged-M (MoE-style), N=K=4096")
-    _check([(512, 300, 4000), (333, 1000, 1500), (128, 128, 100), (256, 704, 320)], "k/n-unaligned")
-    _check([(1, 64, 64), (33, 128, 50)], "tiny")
-    print("test_op: all correctness checks passed")
-
-
-def _bench():
-
-    def tflops(ms, total_flops):
-        return total_flops * 1e-12 / (ms * 1e-3)
-
-    n = 16
-    spec = [(4096, 4096, 4096)] * n
-    group_A, group_B = _rand_groups(spec)
-    total_flops = sum(2 * M * N * K for (M, N, K) in spec)
-
-    # Host-side setup (pointer/size/stride tensors, output buffers) is built once,
-    # outside the timed region
-    d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, _ = _make_grouped_gemm_args(group_A, group_B)
-    ms = triton.testing.do_bench(lambda: _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg), rep=100)
-    print(f"  fast grouped GEMM : {tflops(ms, total_flops):7.1f} TFLOPS ({ms:.3f} ms)")
-
-    ms_torch = triton.testing.do_bench(lambda: [group_A[i] @ group_B[i] for i in range(n)], rep=100)
-    print(f"  torch loop        : {tflops(ms_torch, total_flops):7.1f} TFLOPS ({ms_torch:.3f} ms)")
-
-
-if __name__ == "__main__":
-    test_op()
-    print("\n16 x 4096 x 4096 x 4096:")
-    _bench()
+__all__ = ["grouped_gemm"]

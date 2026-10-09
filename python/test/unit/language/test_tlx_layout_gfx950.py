@@ -1,10 +1,14 @@
 """TLX layout tests -- CDNA4 (gfx950)."""
+import math
+import re
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 import triton.language.extra.tlx as tlx
+from triton.tlx.ops.kernels.flash_attn.gfx950 import _sum_rows_chain4 as _cluster_sum_rows_chain4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -21,6 +25,7 @@ def _assert_no_layout_residue(ttgir):
     assert "#tlx.user_layout" not in ttgir, "user-layout wrapper encoding leaked into final IR"
     assert "#tlx.no_verify_layout" not in ttgir, "no-verify wrapper encoding leaked into final IR"
     assert "ttg.require_layout" not in ttgir, "require_layout boundary leaked into final IR"
+    assert "ttg.release_layout" not in ttgir, "release_layout boundary leaked into final IR"
 
 
 _A16W16_SHARED_INTERVALS = [(512, 16)]
@@ -197,6 +202,69 @@ def test_require_layout_pin_modes_on_cdna4():
     assert "#tlx.user_layout" in hard.asm["ttir"]
 
 
+@triton.jit
+def _wave_local_scratch_reuse_kernel(X, Y, valid_rows, iterations):
+    # Flat offsets are row * 128 + col. The low six thread bits are lanes;
+    # both layouts keep the warp bases [[0, 32], [32, 0]].
+    source: tl.constexpr = tlx.layout(
+        shape=((32, 2, 2, 2), (4, 4, 2)),
+        stride=((128, 4, 32, 4096), (1, 8, 64)),
+    )
+    dest: tl.constexpr = tlx.layout(
+        shape=((4, 16, 2, 2), (8, 2, 2)),
+        stride=((8, 128, 32, 4096), (1, 2048, 64)),
+    )
+    rows = tl.arange(0, 64)[:, None]
+    cols = tl.arange(0, 128)[None, :]
+    base = tl.program_id(0) * 4 * 64 * 128
+    for iteration in range(iterations):
+        for part in tl.static_range(4):
+            offsets = base + part * 64 * 128 + rows * 128 + cols
+            src_offsets = tlx.require_layout(offsets, source)
+            src_mask = tlx.require_layout(tl.broadcast_to(rows < valid_rows, (64, 128)), source)
+            # Preserve source ownership through the load; each thread owns
+            # groups of four contiguous BF16 elements.
+            value = tlx.buffer_load(X, src_offsets, src_mask, other=0, contiguity=4)
+            value = (value.to(tl.float32) + iteration).to(tl.bfloat16)
+            # Both boundaries are hard pins so layout propagation cannot remove
+            # the conversion or change its per-wave scratch partition.
+            value = tlx.require_layout(value, source)
+            converted = tlx.require_layout(value, dest)
+            tl.store(Y + offsets, converted, rows < valid_rows)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("valid_rows", [1, 17, 31, 32, 33, 63, 64])
+@pytest.mark.parametrize("iterations", [1, 3, 11])
+def test_convert_layout_wave_local_scratch_reuse(valid_rows, iterations):
+    # Repeated conversions must order each wave's loads before reusing its
+    # physical scratch partition, including across the runtime loop backedge.
+    shape = (32, 4, 64, 128)
+    count = math.prod(shape)
+    inp_cpu = ((torch.arange(count, dtype=torch.int32) * 17 + 31) % 251 - 125).to(torch.bfloat16).reshape(shape)
+    inp = inp_cpu.to(DEVICE)
+    raw_output = torch.full((count + 128, ), 256, dtype=torch.bfloat16, device=DEVICE)
+    output = raw_output[64:-64].view(shape)
+    compiled = _wave_local_scratch_reuse_kernel[(32, )](inp, output, valid_rows, iterations, num_warps=4)
+
+    expected = torch.full((count + 128, ), 256, dtype=torch.bfloat16)
+    expected[64:-64].view(shape)[:, :, :valid_rows, :] = inp_cpu[:, :, :valid_rows, :] + (iterations - 1)
+    # Every value is an exactly representable BF16 integer. Check valid outputs,
+    # untouched masked rows, and 64-element guards at both ends.
+    torch.testing.assert_close(raw_output.cpu(), expected, atol=0, rtol=0)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+    # Keep this on the wave-local LDS path if conversion lowering changes.
+    asm = compiled.asm["amdgcn"]
+    assert re.search(r"\bds_write", asm)
+    assert re.search(r"\bds_read", asm)
+    assert "call void @llvm.amdgcn.wave.barrier()" in compiled.asm["llir"]
+    # All conversions must reuse one tile's scratch image. Extra conversions
+    # or CTA rendezvous between unrolled parts could hide the reuse hazard;
+    # only the runtime loop backedge may require a CTA barrier.
+    assert compiled.metadata.shared == 64 * 128 * inp.element_size()
+    assert len(re.findall(r"\bs_barrier\b", asm)) <= 1
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_fp_cast_preserves_explicit_mfma_layout_on_cdna4():
     """Ordinary FP casts keep concrete source ownership until a new anchor."""
@@ -312,8 +380,8 @@ def test_amd_mfma_layout_anchors_on_cdna4():
     compiled = kernel.warmup(x, y, shared, dot0, mma, x_store, acc_store, grid=(1, ), num_warps=4)
     ttir = compiled.asm["ttir"]
     ttgir = compiled.asm["ttgir"]
-    # Hard destination anchors express both conversions without a public
-    # release-layout operation.
+    # Explicit-layout producers and public pins use the same SSA boundary.
+    assert ttir.count("require_layout") >= 4
     assert "#ttg.amd_mfma" in ttir
     assert "#ttg.dot_op" in ttir
     assert "#tlx.user_layout" not in ttgir
@@ -364,13 +432,16 @@ def test_tlx_dot_preserves_explicit_accumulator_layout_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
+@pytest.mark.parametrize("rotate_final", [False, True], ids=["stage-three", "stage-four-rotated"])
+def test_mfma_split_concat_preserves_logical_columns_on_cdna4(rotate_final):
     """Order-preserving reshape/split/join reconstructs an MFMA score tile.
 
     Flash attention carries N8 probability fragments across source stages and
     later reassembles them for its row sum and P-by-V dot.  Marking these
     reshapes reorderable changes their logical register interpretation: the
     shapes still verify, but every reconstructed row can contain wrong values.
+    Both orders are production schedules: stage three uses the ordinary chain,
+    while the N8192+ causal stage-four schedule rotates the final two additions.
     """
 
     @triton.jit
@@ -383,21 +454,14 @@ def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
         return tl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] + x1.shape[1]])
 
     @triton.jit
-    def sum_rows_chain4(x):
-        x_01, x_23 = split_cols(x)
-        x_0, x_1 = split_cols(x_01)
-        x_2, x_3 = split_cols(x_23)
-        return tl.sum(x_0 + x_1 + x_2 + x_3, 1)
-
-    @triton.jit
-    def kernel(X, Recon, Chain, Direct, MMA: tl.constexpr):
+    def kernel(X, Recon, Chain, Direct, MMA: tl.constexpr, ROTATE_FINAL: tl.constexpr):
         rows = tl.arange(0, 256)
         cols = tl.arange(0, 64)
         offsets = rows[:, None] * 64 + cols[None, :]
         x = tlx.require_layout(tl.load(X + offsets), MMA)
         x_lo, x_hi = split_cols(x)
         reconstructed = concat_cols(x_lo, x_hi)
-        chain = sum_rows_chain4(x)
+        chain = _cluster_sum_rows_chain4(x, ROTATE_FINAL)
         direct = tl.sum(x, 1)
         tl.store(Recon + offsets, reconstructed)
         tl.store(Chain + rows, chain)
@@ -409,7 +473,21 @@ def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
     reconstructed = torch.empty_like(x)
     chain = torch.empty((256, ), device=DEVICE, dtype=torch.float32)
     direct = torch.empty_like(chain)
-    compiled = kernel[(1, )](x, reconstructed, chain, direct, mma, num_warps=8, enable_tree_reduction=True)
+    compiled = kernel[(1, )](
+        x,
+        reconstructed,
+        chain,
+        direct,
+        mma,
+        rotate_final,
+        num_warps=8,
+        enable_tree_reduction=True,
+    )
+
+    ttir = compiled.asm["ttir"]
+    release_line = next(line for line in ttir.splitlines() if "tlx.release_layout" in line)
+    release_operand = release_line.split("tlx.release_layout", 1)[1].split()[0]
+    assert any(f'{release_operand} = "tt.reduce"' in line for line in ttir.splitlines())
 
     reference = x.sum(1)
     torch.testing.assert_close(reconstructed, x, atol=0, rtol=0)
@@ -478,7 +556,7 @@ def test_buffer_load_to_local_infers_offset_layout_amd():
         offs_k = tl.arange(0, K)
         off = offs_m[:, None] * STRIDE_M + offs_k[None, :]
         smem = tlx.local_alloc((M, K), tl.float16, tl.constexpr(1), layout=SHARED)
-        tlx.buffer_load_to_local(smem[0], a_ptr, off)
+        tlx.buffer_load_to_local(smem[0], a_ptr, off, contiguity=8)
 
     pad = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
                                                        _A16W16_TILE)
@@ -492,6 +570,7 @@ def test_buffer_load_to_local_infers_offset_layout_amd():
     assert "#ttg.linear" in ttgir
     assert expected in ttgir, f"inferred offset layout mismatch; expected substring:\n{expected}\n\nttgir:\n{ttgir}"
     assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 8" in ttgir
     # It lowers all the way to amdgcn (the direct-to-LDS width/alignment
     # requirements are met by the inferred offset layout).
     assert compiled.asm.get("amdgcn")

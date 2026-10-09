@@ -42,6 +42,28 @@ namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
 namespace ttag = triton::amdgpu;
 
+static tlx::RequireLayoutOp
+createPinnedRegisterLayoutBoundary(TritonOpBuilder &builder, Value src,
+                                   Attribute encoding) {
+  auto srcType = cast<RankedTensorType>(src.getType());
+  Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
+  auto pinnedType = srcType.cloneWithEncoding(
+      tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(physicalEncoding)));
+  return builder.create<tlx::RequireLayoutOp>(pinnedType, src);
+}
+
+// Producers that already have a concrete register encoding can materialize the
+// durable TTG boundary immediately. Verification stays deferred through helper
+// inlining until the TLX placeholder resolver removes the layout wrapper.
+static ttg::RequireLayoutOp
+createPinnedProducerLayoutBoundary(TritonOpBuilder &builder, Value src,
+                                   Attribute encoding) {
+  auto srcType = cast<RankedTensorType>(src.getType());
+  auto pinnedType = srcType.cloneWithEncoding(
+      tlx::wrapNoVerifyLayout(tlx::getEffectiveEncoding(encoding)));
+  return builder.create<ttg::RequireLayoutOp>(pinnedType, src);
+}
+
 // Element type of a CLC (Cluster Launch Control) response buffer. A CLC
 // response is a 16-byte opaque hardware object, so each stage is stored as one
 // `ui128`. Single source of truth: both `create_alloc_clc_responses` and the
@@ -259,22 +281,20 @@ void init_triton_tlx_ir(py::module_ &m) {
                             self.getBuilder().getUnitAttr());
               return op;
             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-              // `pin`: wrap in #tlx.no_verify_layout(#tlx.user_layout) -- the
-              // #tlx.user_layout carries PinnedEncodingTrait so the requirement
-              // is honored as a hard anchor by Coalesce /
-              // RemoveLayoutConversions / OptimizeEpilogue (e.g. to pin an
-              // epilogue store's register layout), and the outer
-              // #tlx.no_verify_layout defers operand-layout verification until
-              // ResolvePlaceholderLayouts peels it (so a pinned store whose
-              // ptr/mask layouts don't yet match verifies fine). Non-pin is a
-              // soft requirement (#tlx.no_verify_layout only, e.g. dot
-              // operands).
-              Attribute tensorEncoding =
-                  pin ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(encoding))
-                      : tlx::wrapNoVerifyLayout(encoding);
-              newType = RankedTensorType::get(
-                  type.getShape(), type.getElementType(), tensorEncoding);
-              auto op = self.create<tlx::RequireLayoutOp>(newType, v);
+              // A pin always becomes the same first-class SSA boundary. The
+              // wrappers are temporary TLX inference metadata; the operation
+              // itself survives as ttg.require_layout for repeated RLC.
+              tlx::RequireLayoutOp op;
+              if (pin) {
+                op = createPinnedRegisterLayoutBoundary(self, v, encoding);
+              } else {
+                Attribute physicalEncoding =
+                    tlx::getEffectiveEncoding(encoding);
+                newType = RankedTensorType::get(
+                    type.getShape(), type.getElementType(),
+                    tlx::wrapNoVerifyLayout(physicalEncoding));
+                op = self.create<tlx::RequireLayoutOp>(newType, v);
+              }
               if (lateAddressCompute)
                 op->setAttr("tlx.rematerialize_coordinates",
                             self.getBuilder().getUnitAttr());
@@ -285,18 +305,23 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false,
           py::arg("late_address_compute") = false)
+      .def("has_pinned_layout",
+           [](TritonOpBuilder &, Value &v) -> bool {
+             auto type = dyn_cast<RankedTensorType>(v.getType());
+             return type && containsPinnedEncoding(type.getEncoding());
+           })
       .def(
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,
              Type &elementType, Attribute &encoding, Value &scalar) -> Value {
-            // Constants created with an explicit MFMA/dot layout are a
-            // genuine layout anchor, not a late metadata retag.  Defer the
-            // normal tensor-layout verifier until placeholder resolution,
-            // matching the existing TLX require/local-load APIs.
-            Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
-            auto resultType =
-                RankedTensorType::get(shape, elementType, tensorEncoding);
-            return self.createOrFold<tt::SplatOp>(resultType, scalar);
+            // Keep the producer verifier-deferred, then represent the explicit
+            // user pin with the same SSA boundary used by every other source.
+            Attribute physicalEncoding = tlx::getEffectiveEncoding(encoding);
+            auto resultType = RankedTensorType::get(
+                shape, elementType, tlx::wrapNoVerifyLayout(physicalEncoding));
+            Value result = self.createOrFold<tt::SplatOp>(resultType, scalar);
+            return createPinnedProducerLayoutBoundary(self, result,
+                                                      physicalEncoding);
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
@@ -332,17 +357,19 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("resultElementType"), py::arg("operation"),
           py::arg("operands"), py::arg("reference").none())
-      .def("create_release_layout",
-           [](TritonOpBuilder &self, Value &v) -> Value {
-             if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               auto newType = RankedTensorType::get(type.getShape(),
-                                                    type.getElementType());
-               return self.create<tlx::ReleaseLayoutOp>(newType, v);
-             } else {
-               throw std::runtime_error(
-                   "release_layout expects a ranked tensor");
-             }
-           })
+      .def(
+          "create_release_layout",
+          [](TritonOpBuilder &self, Value &v, bool relaxed) -> Value {
+            if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+              auto newType =
+                  RankedTensorType::get(type.getShape(), type.getElementType());
+              return self.create<tlx::ReleaseLayoutOp>(newType, v, relaxed);
+            } else {
+              throw std::runtime_error(
+                  "release_layout expects a ranked tensor");
+            }
+          },
+          py::arg("v"), py::arg("relaxed") = false)
       .def("create_assert_same_layout",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> void {
              self.create<tlx::AssertSameLayoutOp>(lhs, rhs);
@@ -359,48 +386,47 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_local_load",
           [](TritonOpBuilder &self, Value subView,
              std::optional<Value> asyncToken,
-             std::optional<Attribute> layoutEncoding) -> mlir::Value {
+             std::optional<Attribute> layoutEncoding, bool syncedViaAsyncWait,
+             bool rematerializeCoordinates,
+             std::optional<int32_t> rematerializeCoordinatesGroup)
+              -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
-            RankedTensorType newType;
-            if (layoutEncoding.has_value()) {
-              // CDNA MFMA dot operands are concrete hardware encodings.  Keep
-              // them bare so tt.dot's verifier sees DotOperandEncodingAttr
-              // directly; wrapping one in #tlx.user_layout would hide the
-              // operand parent and make the dot unverifiable during TTIR.
-              bool isAmdMfmaDot = false;
-              if (auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(
-                      layoutEncoding.value()))
-                isAmdMfmaDot = isa<ttg::AMDMfmaEncodingAttr>(dot.getParent());
-              if (isAmdMfmaDot) {
-                newType = RankedTensorType::get(subViewType.getShape(),
-                                                subViewType.getElementType(),
-                                                layoutEncoding.value());
-                return self.create<ttg::LocalLoadOp>(
-                    newType, subView, asyncToken.value_or(Value()));
-              }
-              // Pin the load result to the requested register layout, wrapped
-              // as a user layout (#tlx.user_layout). The wrapper carries
-              // PinnedEncodingTrait so remove-layout-conversions anchors the
-              // load and never rewrites it to a "preferred" layout; it is
-              // unwrapped to the concrete layout after the layout passes have
-              // run. Keep the inner no-verify wrapper (register encodings
-              // arrive wrapped so they defer tensor verification through
-              // inlining): resolve-placeholder-layouts strips the nested
-              // no-verify (keeping the user-layout marker) once inlining is
-              // done.
-              Attribute enc = tlx::wrapUserLayout(
-                  tlx::wrapNoVerifyLayout(layoutEncoding.value()));
-              newType = RankedTensorType::get(
-                  subViewType.getShape(), subViewType.getElementType(), enc);
-            } else {
-              newType = RankedTensorType::get(subViewType.getShape(),
-                                              subViewType.getElementType());
+            auto createLoad = [&](RankedTensorType resultType) {
+              auto load = self.create<ttg::LocalLoadOp>(
+                  resultType, subView, asyncToken.value_or(Value()));
+              if (syncedViaAsyncWait)
+                load->setAttr("ttg.amdg.syncedViaAsyncWait",
+                              self.getBuilder().getBoolAttr(true));
+              if (rematerializeCoordinates)
+                load->setAttr("tlx.rematerialize_coordinates",
+                              self.getBuilder().getUnitAttr());
+              if (rematerializeCoordinatesGroup)
+                load->setAttr("tlx.rematerialize_coordinates_group",
+                              self.getBuilder().getI32IntegerAttr(
+                                  *rematerializeCoordinatesGroup));
+              return load;
+            };
+
+            if (!layoutEncoding.has_value()) {
+              auto resultType = RankedTensorType::get(
+                  subViewType.getShape(), subViewType.getElementType());
+              return createLoad(resultType).getResult();
             }
-            return self.create<ttg::LocalLoadOp>(newType, subView,
-                                                 asyncToken.value_or(Value()));
+
+            Attribute physicalEncoding =
+                tlx::getEffectiveEncoding(layoutEncoding.value());
+            auto rawType = RankedTensorType::get(
+                subViewType.getShape(), subViewType.getElementType(),
+                tlx::wrapNoVerifyLayout(physicalEncoding));
+            auto load = createLoad(rawType);
+            return createPinnedProducerLayoutBoundary(self, load.getResult(),
+                                                      physicalEncoding);
           },
           py::arg("subView"), py::arg("asyncToken").none(),
-          py::arg("layoutEncoding") = std::nullopt)
+          py::arg("layoutEncoding") = std::nullopt,
+          py::arg("syncedViaAsyncWait") = false,
+          py::arg("rematerializeCoordinates") = false,
+          py::arg("rematerializeCoordinatesGroup") = std::nullopt)
       .def("create_local_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
@@ -884,16 +910,29 @@ void init_triton_tlx_ir(py::module_ &m) {
       // Barrier Ops
       .def("create_alloc_barriers",
            [](TritonOpBuilder &self, int numBarriers, int arriveCount,
-              Attribute barrierEncoding) -> mlir::Value {
+              Attribute barrierEncoding, int numCTAs) -> mlir::Value {
              auto context = self.getBuilder().getContext();
+             auto module = self.getBuilder()
+                               .getInsertionBlock()
+                               ->getParentOp()
+                               ->getParentOfType<ModuleOp>();
+             module->setAttr(ttg::AttrNumCTAsName,
+                             self.getBuilder().getI32IntegerAttr(numCTAs));
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+             SmallVector<int64_t> barriersShape = {numBarriers};
+             SmallVector<int64_t> singleBarrierShape = {1};
+             if (numCTAs > 1) {
+               barriersShape.push_back(numCTAs);
+               singleBarrierShape = {numCTAs};
+             }
              auto barriersMemDescType = ttg::MemDescType::get(
-                 {numBarriers}, self.getBuilder().getI64Type(), barrierEncoding,
+                 barriersShape, self.getBuilder().getI64Type(), barrierEncoding,
                  memorySpace, /*mutableMemory=*/true);
 
              auto singleBarrierMemDescType = ttg::MemDescType::get(
-                 {1}, self.getBuilder().getI64Type(), barrierEncoding,
-                 barriersMemDescType.getMemorySpace(), /*mutableMemory=*/true);
+                 singleBarrierShape, self.getBuilder().getI64Type(),
+                 barrierEncoding, barriersMemDescType.getMemorySpace(),
+                 /*mutableMemory=*/true);
 
              // Allocate buffer in shared memory
              mlir::Value bufferViews =
@@ -923,15 +962,38 @@ void init_triton_tlx_ir(py::module_ &m) {
            })
       .def(
           "create_barrier_arrive",
-          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount,
-             std::optional<Value> pred) -> void {
-            if (pred.has_value())
-              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount,
+          [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
+             std::optional<Value> pred, std::optional<uint32_t> ctaMask,
+             std::vector<int32_t> clusterDims) -> void {
+            if (ctaMask.has_value()) {
+              assert(clusterDims.size() == 3 &&
+                     "expected three cluster dimensions");
+              auto module = self.getBuilder()
+                                .getInsertionBlock()
+                                ->getParentOp()
+                                ->getParentOfType<ModuleOp>();
+              module->setAttr(
+                  ttg::AttrClusterDimX,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[0]));
+              module->setAttr(
+                  ttg::AttrClusterDimY,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[1]));
+              module->setAttr(
+                  ttg::AttrClusterDimZ,
+                  self.getBuilder().getI32IntegerAttr(clusterDims[2]));
+              self.create<ttng::ArriveBarrierOp>(
+                  mbarrierLoc, arriveCount, ctaMask.value(),
+                  pred.has_value() ? pred.value() : Value());
+            } else if (pred.has_value()) {
+              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
                                                  pred.value());
-            else
-              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
+            } else {
+              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount);
+            }
           },
-          py::arg("mbarrerLoc"), py::arg("arriveCount"), py::arg("pred").none())
+          py::arg("mbarrierLoc"), py::arg("arriveCount"),
+          py::arg("pred").none(), py::arg("ctaMask").none(),
+          py::arg("clusterDims"))
       .def(
           "create_warp_barrier_arrive",
           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
@@ -1033,21 +1095,11 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding already carries an inner no_verify (from
-            // make_linear_encoding_attr). Strip it, wrap with #tlx.user_layout
-            // (the hard anchor), then a single outer #tlx.no_verify_layout, so
-            // the encoding is exactly no_verify<user_layout<L>> -- no-verify
-            // outermost (deferred for verifiers keyed off the top-level attr,
-            // e.g. TritonGPU verifyTensorLayout), user-layout inside.
-            // resolve-placeholder-layouts strips the no-verify (keeping the
-            // user-layout marker) once inlining is done and num-warps is set.
-            Attribute tensorEncoding =
-                userLayout ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(
-                                 tlx::unwrapNoVerifyLayout(layoutEncoding)))
-                           : tlx::wrapNoVerifyLayout(layoutEncoding);
-            auto newType = RankedTensorType::get(subViewType.getShape(),
-                                                 subViewType.getElementType(),
-                                                 tensorEncoding);
+            Attribute physicalEncoding =
+                tlx::getEffectiveEncoding(layoutEncoding);
+            auto newType = RankedTensorType::get(
+                subViewType.getShape(), subViewType.getElementType(),
+                tlx::wrapNoVerifyLayout(physicalEncoding));
             ttng::TMEMLoadOp loadOp =
                 asyncToken.has_value()
                     ? ttng::TMEMLoadOp::create(
@@ -1056,7 +1108,10 @@ void init_triton_tlx_ir(py::module_ &m) {
                     : ttng::TMEMLoadOp::create(self.getBuilder(),
                                                self.getLastLoc(), newType,
                                                subView);
-            return loadOp;
+            if (!userLayout)
+              return loadOp;
+            return createPinnedProducerLayoutBoundary(self, loadOp,
+                                                      physicalEncoding);
           },
           py::arg("subView"), py::arg("layoutEncoding"),
           py::arg("asyncToken").none(), py::arg("userLayout") = false)
@@ -1466,6 +1521,12 @@ void init_triton_tlx_ir(py::module_ &m) {
             self.create<ttng::AsyncTMAGatherOp>(
                 desc, xOffsets, yOffset, mbarrier, result, pred, multicast);
           })
+      .def("create_async_TMA_scatter",
+           [](TritonOpBuilder &self, Value desc, Value xOffsets, Value yOffset,
+              Value source) -> void {
+             self.create<ttng::AsyncTMAScatterOp>(desc, xOffsets, yOffset,
+                                                  source);
+           })
       .def("create_async_TMA_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value pred, EvictionPolicy evictionPolicy) -> void {
@@ -1683,13 +1744,14 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def(
           "create_buffer_store",
           [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
-             std::optional<Value> mask, tt::CacheModifier cache) {
-            self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                             Value() /*stride*/, cache,
-                                             mask.value_or(Value()));
+             std::optional<Value> mask, tt::CacheModifier cache,
+             uint32_t contiguity) -> OpState {
+            return self.create<ttag::BufferStoreOp>(
+                storedValue, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), contiguity);
           },
           py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
-          py::arg("mask").none(), py::arg("cache"))
+          py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
       .def(
           "create_buffer_atomic_rmw",
           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
@@ -1706,13 +1768,14 @@ void init_triton_tlx_ir(py::module_ &m) {
           "create_buffer_load_to_local",
           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
              std::optional<Value> mask, std::optional<Value> other,
-             tt::CacheModifier cache) -> Value {
+             tt::CacheModifier cache, uint32_t contiguity) -> Value {
             return self.create<ttag::BufferLoadToLocalOp>(
                 dest, ptr, offsets, mask.value_or(Value()),
-                other.value_or(Value()), Value() /*stride*/, cache);
+                other.value_or(Value()), Value() /*stride*/, cache, contiguity);
           },
           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
-          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"))
+          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"),
+          py::arg("contiguity"))
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);

@@ -52,7 +52,12 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      # Every commit and tree, no file contents: the bench dashboard lists the commits between two nights' wheels,
+      # with the files each touches, as suspects for a perf change.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          filter: blob:none
 
       - uses: actions/setup-python@v5
         with:

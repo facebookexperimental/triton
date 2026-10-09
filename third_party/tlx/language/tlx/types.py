@@ -522,6 +522,12 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
         )
 
 
+@tl.builtin
+def make_tensor_memory_layout(block_m: tl.constexpr, block_n: tl.constexpr, _semantic=None):
+    return tensor_memory_layout_encoding.make_default(
+        (tl._unwrap_if_constexpr(block_m), tl._unwrap_if_constexpr(block_n)))
+
+
 class tensor_memory_scales_layout_encoding:
     """
     Tensor memory scales layout encoding for Blackwell.
@@ -548,6 +554,11 @@ class tensor_memory_scales_layout_encoding:
             self.CTASplitN,
             self.ctaMode,
         )
+
+
+@tl.builtin
+def make_tensor_memory_scales_layout(_semantic=None):
+    return tensor_memory_scales_layout_encoding.make_default()
 
 
 class nv_mma_shared_layout_encoding(shared_layout_encoding):

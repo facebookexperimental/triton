@@ -1118,9 +1118,46 @@ class ReduceOps(ReduceScanOpInterface):
 
 class ScanOps(ReduceScanOpInterface):
 
-    def __init__(self, axis, combine_fn, reverse):
+    def __init__(self, axis, combine_fn, reverse, reduction_ordering=None):
         super().__init__(axis, combine_fn)
         self.reverse = reverse
+        self.reduction_ordering = tl.core._unwrap_if_constexpr(reduction_ordering)
+        if self.reduction_ordering not in (None, tl.ReductionOrdering.UNORDERED, tl.ReductionOrdering.INNER_TREE):
+            raise ValueError(f"unsupported scan reduction_ordering: {self.reduction_ordering}")
+
+    def inner_tree_scan(self, input):
+        output = [arg.handle.data.copy() for arg in input]
+        length = output[0].shape[self.axis]
+        indices = np.arange(length)
+        for level in range((length - 1).bit_length()):
+            span = 1 << level
+            if self.combine_fn not in (tl.standard._sum_combine, tl.standard._prod_combine):
+                # User combine functions receive scalars, including in control flow.
+                for index in np.ndindex(output[0].shape):
+                    if not index[self.axis] & span:
+                        continue
+                    source = list(index)
+                    source[self.axis] = (index[self.axis] // (2 * span)) * (2 * span) + span - 1
+                    lhs = [self.to_tensor(data[tuple(source)], arg.dtype) for data, arg in zip(output, input)]
+                    rhs = [self.to_tensor(data[index], arg.dtype) for data, arg in zip(output, input)]
+                    result = self.combine_fn.fn(*lhs, *rhs)
+                    if not isinstance(result, tuple):
+                        result = (result, )
+                    for data, value in zip(output, result):
+                        data[index] = value.handle.data.item() if isinstance(value, tl.core.tensor) else value
+                continue
+            right = indices[(indices & span) != 0]
+            left = (right // (2 * span)) * (2 * span) + span - 1
+            lhs = [self.to_tensor(np.take(data, left, axis=self.axis), arg.dtype) for data, arg in zip(output, input)]
+            rhs = [self.to_tensor(np.take(data, right, axis=self.axis), arg.dtype) for data, arg in zip(output, input)]
+            result = self.combine_fn.fn(*lhs, *rhs)
+            if not isinstance(result, tuple):
+                result = (result, )
+            selection = [slice(None)] * output[0].ndim
+            selection[self.axis] = right
+            for data, value in zip(output, result):
+                data[tuple(selection)] = value.handle.data
+        return [self.to_tensor(data, arg.dtype) for data, arg in zip(output, input)]
 
     def cumsum(self, input):
         return [self.to_tensor(np.cumsum(input.handle.data, axis=self.axis), dtype=input.dtype)]
@@ -1166,7 +1203,9 @@ class ScanOps(ReduceScanOpInterface):
                     self.to_tensor(np.ascontiguousarray(np.flip(arg.handle.data, axis=self.axis)), arg.dtype))
         else:
             new_input = input
-        if self.combine_fn == tl.standard._sum_combine:
+        if self.reduction_ordering == tl.ReductionOrdering.INNER_TREE:
+            ret = self.inner_tree_scan(new_input)
+        elif self.combine_fn == tl.standard._sum_combine:
             ret = self.cumsum(new_input[0])
         elif self.combine_fn == tl.standard._prod_combine:
             ret = self.cumprod(new_input[0])
@@ -1186,8 +1225,8 @@ def _patch_reduce_scan(scope: _LangPatchScope):
     def _new_reduce(input, axis, combine_fn, keep_dims=False, **kwargs):
         return ReduceOps(axis, combine_fn, keep_dims).apply(input)
 
-    def _new_scan(input, axis, combine_fn, reverse=False, **kwargs):
-        return ScanOps(axis, combine_fn, reverse).apply(input)
+    def _new_scan(input, axis, combine_fn, reverse=False, reduction_ordering=None, **kwargs):
+        return ScanOps(axis, combine_fn, reverse, reduction_ordering).apply(input)
 
     scope.set_attr(tl, "reduce", _new_reduce)
     scope.set_attr(tl, "associative_scan", _new_scan)

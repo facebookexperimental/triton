@@ -1,5 +1,6 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/MLIRContext.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -150,6 +151,20 @@ public:
 protected:
   MLIRContext ctx;
 };
+
+TEST_F(LinearLayoutConversionsTest,
+       MfmaDefaultTilesPerWarpParserMatchesBuilder) {
+  auto parsed = dyn_cast<AMDMfmaEncodingAttr>(
+      parseAttribute("#ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], "
+                     "instrShape = [32, 32, 16], isTransposed = true}>",
+                     &ctx));
+  ASSERT_TRUE(parsed);
+
+  auto built = mfma(/*version=*/4, /*warps=*/{4, 1},
+                    /*instrShape=*/{32, 32, 16}, /*isTransposed=*/true);
+  EXPECT_EQ(parsed, built);
+  EXPECT_THAT(parsed.getTilesPerWarp(), ::testing::ElementsAre(1, 1));
+}
 
 TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
   auto layout =

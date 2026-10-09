@@ -221,6 +221,93 @@ def test_tmem_copy_accepts_packed_rank2_scale_smem(num_blocks, device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_copy_accepts_typed_scale_view():
+
+    @triton.jit
+    def kernel():
+        smem = tlx.local_alloc((1, 1, 1, 2, 256), tl.uint8, tl.constexpr(1))
+        typed_tmem = tlx.local_alloc(
+            (128, 4),
+            tl.float8e4nv,
+            tl.constexpr(1),
+            tlx.storage_kind.tmem,
+            layout=tlx.make_tensor_memory_scales_layout(),
+        )
+        scale_view = tlx.local_reinterpret(
+            typed_tmem[0],
+            tl.uint8,
+            layout=tlx.make_tensor_memory_scales_layout(),
+        )
+        tlx.tmem_copy(smem[0], scale_view)
+
+    compiled = kernel.warmup(grid=(1, ))
+    ttgir = compiled.asm["ttgir"]
+    assert "tensor_memory_scales_encoding" in ttgir
+    assert ttgir.count("ttng.tmem_copy") == 1
+    assert "tcgen05.cp" in compiled.asm["ptx"]
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_uint8_tmem_with_explicit_layout_is_scaled_mma_data(device):
+
+    @triton.jit
+    def kernel(out):
+        block_m: tl.constexpr = 128
+        block_n: tl.constexpr = 128
+        block_k: tl.constexpr = 128
+        packed_a = tlx.local_alloc(
+            (block_m, block_k // 2),
+            tl.uint8,
+            tl.constexpr(1),
+            tlx.storage_kind.tmem,
+            layout=tlx.make_tensor_memory_layout(block_m, block_k // 2),
+        )
+        packed_b = tlx.local_alloc((block_n, block_k // 2), tl.uint8, tl.constexpr(1))
+        scale_layout: tl.constexpr = tlx.make_tensor_memory_scales_layout()
+        a_scale = tlx.local_alloc(
+            (block_m, block_k // 16),
+            tl.float8e4nv,
+            tl.constexpr(1),
+            tlx.storage_kind.tmem,
+            layout=scale_layout,
+        )
+        b_scale = tlx.local_alloc(
+            (block_n, block_k // 16),
+            tl.float8e4nv,
+            tl.constexpr(1),
+            tlx.storage_kind.tmem,
+            layout=scale_layout,
+        )
+        acc = tlx.local_alloc(
+            (block_m, block_n),
+            tl.float32,
+            tl.constexpr(1),
+            tlx.storage_kind.tmem,
+        )
+
+        tlx.local_store(packed_a[0], tl.full((block_m, block_k // 2), 0, tl.uint8))
+        tlx.async_dot_scaled(
+            packed_a[0],
+            tlx.local_trans(packed_b[0]),
+            acc[0],
+            a_scale[0],
+            "e2m1",
+            b_scale[0],
+            "e2m1",
+            use_acc=False,
+        )
+        result = tlx.local_load(acc[0])
+        offs_m = tl.arange(0, block_m)
+        offs_n = tl.arange(0, block_n)
+        tl.store(out + offs_m[:, None] * block_n + offs_n[None, :], result)
+
+    out = torch.empty((128, 128), dtype=torch.float32, device=device)
+    compiled = kernel.warmup(out, grid=(1, ))
+    assert "tensor_memory_encoding" in compiled.asm["ttgir"]
+    assert "kind::mxf4nvf4.block_scale.block16" in compiled.asm["ptx"]
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(64, 64), (64, 8), (128, 16)])
 def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 

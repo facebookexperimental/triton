@@ -374,9 +374,8 @@ def _softmax_inner_loop(
         alpha = tl.math.exp2(m_i - m_ij)
         # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), qk_phase ^ 1)
-        # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
         # pyrefly: ignore [missing-attribute]
-        tlx.local_store(tlx.local_view(alpha_tiles, cid * BLOCK_N), alpha[:, None])
+        tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
         # pyrefly: ignore [missing-attribute]
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
@@ -385,9 +384,7 @@ def _softmax_inner_loop(
         ps = ()
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
-            # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
-            # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
-            p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
+            p_bufIdx = slice_id + cid * NUM_MMA_SLICES
             p_i = tl.math.exp2(qks[slice_id])
             # pyrefly: ignore [missing-attribute]
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
@@ -460,9 +457,7 @@ def _silu_inner_loop(
         qks = _split_n(qk, NUM_MMA_SLICES)
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
-            # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
-            # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
-            p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
+            p_bufIdx = slice_id + cid * NUM_MMA_SLICES
             p_i = fast_silu(qks[slice_id], MULT_BY_X=True)
             # pyrefly: ignore [missing-attribute]
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
@@ -528,9 +523,7 @@ def _silu_inner_loop(
         qks = _split_n(qk, NUM_MMA_SLICES)
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
-            # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
-            # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
-            p_bufIdx = cid * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id
+            p_bufIdx = slice_id + cid * NUM_MMA_SLICES
             if SLICE_MASK:
                 offs_n = start_n + tl.arange(
                     slice_id * BLOCK_N // NUM_MMA_SLICES,
@@ -599,9 +592,8 @@ def _softmax_correction_inner_loop(
             # -- update output accumulator --
             # pyrefly: ignore [missing-attribute]
             tlx.barrier_wait(alpha_fulls[cid], phase)
-            # Use alpha[0] for cid=0, and alpha[BLOCK_N] for cid=1
             # pyrefly: ignore [missing-attribute]
-            alpha_1 = tlx.local_load(alpha_tiles[cid * BLOCK_N])
+            alpha_1 = tlx.local_load(alpha_tiles[cid])
             # pyrefly: ignore [missing-attribute]
             tlx.barrier_arrive(alpha_empties[cid])
             for slice_id in tl.static_range(0, NUM_MMA_SLICES):
@@ -629,9 +621,9 @@ def _softmax_correction_inner_loop(
         # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
         # to disambigulate from alpha[0]/alpha[BLOCK_N]
         # pyrefly: ignore [missing-attribute]
-        l = tlx.local_load(l_tiles[cid * BLOCK_N + 1])
+        l = tlx.local_load(l_tiles[cid])
         # pyrefly: ignore [missing-attribute]
-        m = tlx.local_load(m_tiles[cid * BLOCK_N + 2])
+        m = tlx.local_load(m_tiles[cid])
         # Signal qk_empties after both l and m loads complete,
         # since both tiles share the same synchronization group.
         # pyrefly: ignore [missing-attribute]
@@ -781,6 +773,14 @@ def _attn_fwd_ws(
     o_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
     # allocate TMEM buffers and barriers
+    # Shared backing for QK, P and Alpha, l, and m (layout: see diagram
+    # below). Each MMA group owns one QK buffer; P's subtiled buffers and
+    # the single-column alpha/l/m share its TMEM region with sequential
+    # lifetimes.
+    # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem)
     # pyrefly: ignore [missing-attribute]
     qk_tiles = tlx.local_alloc(
         # pyrefly: ignore [missing-attribute]
@@ -789,53 +789,68 @@ def _attn_fwd_ws(
         NUM_MMA_GROUPS,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
-    # Shared buffer for QK, P and Alpha, l, and m.
-    # A single QK buffer is split evenly:
-    #   - First half  : stores P
-    #   - Second half  : stores Alpha, l, and m
-    #     QK : |                              BLK_M/2 * BLOCK_N * fp32                  |
-    #     P:                                                |  BLK_M/2 * BLOCK_N * fp16 |
-    #  Alpha : |BLK_M/2*1*fp32|
-    #     l :                 |BLK_M/2*1*fp32|
-    #     m :                                |BLK_M/2*1*fp32|
+    # Shared buffer for QK, P and Alpha, l, and m: P's subtiled buffers
+    # (group_size=NUM_MMA_SLICES) pack first, then single-column alpha/l/m.
     # pyrefly: ignore [missing-attribute]
     p_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
         # pyrefly: ignore [missing-attribute]
         tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS * NUM_MMA_SLICES * 2,
+        NUM_MMA_GROUPS * NUM_MMA_SLICES,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     alpha_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     l_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     m_tiles = tlx.local_alloc(
         (BLOCK_M_SPLIT, 1),
         tl.float32,
-        BLOCK_N * NUM_MMA_GROUPS * NUM_BUFFERS_QK,
+        NUM_MMA_GROUPS,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
     )
+    # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            qk_tiles,
+            # pyrefly: ignore [missing-attribute]
+            tlx.reuse_group(
+                # pyrefly: ignore [missing-attribute]
+                tlx.reuse_group(
+                    p_tiles,
+                    group_size=NUM_MMA_SLICES,
+                ),
+                alpha_tiles,
+                l_tiles,
+                m_tiles,
+                # pyrefly: ignore [missing-attribute]
+                group_type=tlx.reuse_group_type.distinct,
+            ),
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        ))
 
     # pyrefly: ignore [missing-attribute]
     acc_tiles = tlx.local_alloc(
@@ -1066,9 +1081,9 @@ def _attn_fwd_ws(
                         # Use l[1]/l[1+BLOCK_N] and m[2][2 + BLOCK_N]
                         # to disambigulate from alpha[0]/alpha[BLOCK_N]
                         # pyrefly: ignore [missing-attribute]
-                        tlx.local_store(l_tiles[cid * BLOCK_N + 1], l_i[:, None])
+                        tlx.local_store(l_tiles[cid], l_i[:, None])
                         # pyrefly: ignore [missing-attribute]
-                        tlx.local_store(m_tiles[cid * BLOCK_N + 2], m_i[:, None])
+                        tlx.local_store(m_tiles[cid], m_i[:, None])
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(l_fulls[cid])
                     else:
@@ -1186,8 +1201,6 @@ def _attn_fwd_ws(
                     if SOFTMAX:
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(acc_fulls[0], qk_phase)
-                    # Use p[NUM_MMA_SLICES + slice_id] for cid=0, and
-                    # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
@@ -1197,7 +1210,7 @@ def _attn_fwd_ws(
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                             [BLOCK_N // NUM_MMA_SLICES, DimQ],
                         )
-                        p_bufIdx = NUM_MMA_SLICES + slice_id
+                        p_bufIdx = slice_id + 0 * NUM_MMA_SLICES
                         # pyrefly: ignore [missing-attribute]
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
@@ -1247,7 +1260,7 @@ def _attn_fwd_ws(
                                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                                 [BLOCK_N // NUM_MMA_SLICES, DimQ],
                             )
-                            p_bufIdx = (1 * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id)
+                            p_bufIdx = (slice_id + 1 * NUM_MMA_SLICES)
                             use_acc = acc1_init if slice_id == 0 else True
                             mBarriers = ([kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else [])
                             # pyrefly: ignore [missing-attribute]
@@ -1282,14 +1295,13 @@ def _attn_fwd_ws(
                         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                             # pyrefly: ignore [missing-attribute]
                             tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
-                            # Use p[1] for cid=0, and p[3] for cid=1
                             # pyrefly: ignore [missing-attribute]
                             kv_slice = tlx.local_slice(
                                 kv_tiles[v_bufIdx],
                                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                                 [BLOCK_N // NUM_MMA_SLICES, DimQ],
                             )
-                            p_bufIdx = NUM_MMA_SLICES + slice_id
+                            p_bufIdx = slice_id + 0 * NUM_MMA_SLICES
                             # pyrefly: ignore [missing-attribute]
                             tlx.async_dot(
                                 p_tiles[p_bufIdx],
@@ -1312,14 +1324,13 @@ def _attn_fwd_ws(
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(p_fulls[slice_id + NUM_MMA_SLICES], qk_phase)
-                        # Use p[1] for cid=0, and p[3] for cid=1
                         # pyrefly: ignore [missing-attribute]
                         kv_slice = tlx.local_slice(
                             kv_tiles[v_bufIdx],
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                             [BLOCK_N // NUM_MMA_SLICES, DimQ],
                         )
-                        p_bufIdx = (1 * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id)
+                        p_bufIdx = (slice_id + 1 * NUM_MMA_SLICES)
                         use_acc = acc1_init if slice_id == 0 else True
                         mBarriers = ([acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else [])
                         # pyrefly: ignore [missing-attribute]
@@ -2532,6 +2543,11 @@ def _hstu_attn_bwd_ws(
     tile_idx = tl.program_id(0)
 
     # allocate smem buffers
+    # dK/dV epilogue staging shares K/V SMEM (see sdv/sdk_store_buf below).
+    # pyrefly: ignore [missing-attribute]
+    k_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    # pyrefly: ignore [missing-attribute]
+    v_smem_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
     # pyrefly: ignore [missing-attribute]
     k_tiles = tlx.local_alloc(
         # pyrefly: ignore [missing-attribute]
@@ -2539,6 +2555,7 @@ def _hstu_attn_bwd_ws(
         # pyrefly: ignore [missing-attribute]
         tlx.dtype_of(desc_k),
         NUM_BUFFERS_KV,
+        reuse=k_smem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     v_tiles = tlx.local_alloc(
@@ -2547,6 +2564,7 @@ def _hstu_attn_bwd_ws(
         # pyrefly: ignore [missing-attribute]
         tlx.dtype_of(desc_v),
         NUM_BUFFERS_KV,
+        reuse=v_smem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
@@ -2582,8 +2600,8 @@ def _hstu_attn_bwd_ws(
     )
 
     # SMEM staging buffers for dKV async TMA store (from D99341217)
-    # sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read precedes dv_fulls)
-    # sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
+    # sdv shares v_tiles' backing (free after dv_fulls; MMA's last v_tiles read precedes dv_fulls)
+    # sdk shares k_tiles' backing (MMA's dq dot still reads k_tiles after dk_fulls,
     #   so compute waits on k_mma_done before writing sdk)
     DKV_STORE_NCOL: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     DKV_STORE_ITERS: tl.constexpr = HEAD_DIM // DKV_STORE_NCOL
@@ -2594,7 +2612,7 @@ def _hstu_attn_bwd_ws(
         # pyrefly: ignore [missing-attribute]
         tlx.dtype_of(desc_dv),
         NUM_BUFFERS_KV,
-        reuse=v_tiles,
+        reuse=v_smem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     sdk_store_buf = tlx.local_alloc(
@@ -2603,8 +2621,26 @@ def _hstu_attn_bwd_ws(
         # pyrefly: ignore [missing-attribute]
         tlx.dtype_of(desc_dk),
         NUM_BUFFERS_KV,
-        reuse=k_tiles,
+        reuse=k_smem_alias,
     )
+    # pyrefly: ignore [missing-attribute]
+    v_smem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            v_tiles,
+            sdv_store_buf,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        ))
+    # pyrefly: ignore [missing-attribute]
+    k_smem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            k_tiles,
+            sdk_store_buf,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        ))
 
     # allocate barriers for smem buffers
     # pyrefly: ignore [missing-attribute]
@@ -2628,6 +2664,10 @@ def _hstu_attn_bwd_ws(
 
     # allocate tmem buffers
     # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem)
+    # pyrefly: ignore [missing-attribute]
     qk_tiles = tlx.local_alloc(
         # pyrefly: ignore [missing-attribute]
         (BLOCK_N1, BLOCK_M1),
@@ -2635,6 +2675,7 @@ def _hstu_attn_bwd_ws(
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     p_tiles = tlx.local_alloc(
@@ -2644,8 +2685,21 @@ def _hstu_attn_bwd_ws(
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
     )
+    # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            qk_tiles,
+            p_tiles,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        ))
+    # pyrefly: ignore [missing-attribute]
+    dp_dq_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem)
     # pyrefly: ignore [missing-attribute]
     dp_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
@@ -2653,6 +2707,7 @@ def _hstu_attn_bwd_ws(
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=dp_dq_alias,
     )
 
     # pyrefly: ignore [missing-attribute]
@@ -2705,8 +2760,17 @@ def _hstu_attn_bwd_ws(
             NUM_BUFFERS_TMEM,
             # pyrefly: ignore [missing-attribute]
             tlx.storage_kind.tmem,
-            reuse=dp_tiles,
+            reuse=dp_dq_alias,
         )
+        # pyrefly: ignore [missing-attribute]
+        dp_dq_alias.set_buffer_overlap(
+            # pyrefly: ignore [missing-attribute]
+            tlx.reuse_group(
+                dp_tiles,
+                dq_tiles,
+                # pyrefly: ignore [missing-attribute]
+                group_type=tlx.reuse_group_type.shared,
+            ))
         dp_empties = dq_empties
     else:
         # pyrefly: ignore [missing-attribute]
@@ -3841,6 +3905,10 @@ def _hstu_attn_bwd_ws_non_persistent(
 
     # allocate tmem buffers
     # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem)
+    # pyrefly: ignore [missing-attribute]
     qk_tiles = tlx.local_alloc(
         # pyrefly: ignore [missing-attribute]
         (BLOCK_N1, BLOCK_M1),
@@ -3848,6 +3916,7 @@ def _hstu_attn_bwd_ws_non_persistent(
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=qk_tmem_alias,
     )
     # pyrefly: ignore [missing-attribute]
     p_tiles = tlx.local_alloc(
@@ -3857,8 +3926,21 @@ def _hstu_attn_bwd_ws_non_persistent(
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
-        reuse=qk_tiles,
+        reuse=qk_tmem_alias,
     )
+    # pyrefly: ignore [missing-attribute]
+    qk_tmem_alias.set_buffer_overlap(
+        # pyrefly: ignore [missing-attribute]
+        tlx.reuse_group(
+            qk_tiles,
+            p_tiles,
+            # pyrefly: ignore [missing-attribute]
+            group_type=tlx.reuse_group_type.shared,
+        ))
+    # pyrefly: ignore [missing-attribute]
+    dp_dq_alias = tlx.storage_alias_spec(
+        # pyrefly: ignore [missing-attribute]
+        storage=tlx.storage_kind.tmem)
     # pyrefly: ignore [missing-attribute]
     dp_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
@@ -3866,6 +3948,7 @@ def _hstu_attn_bwd_ws_non_persistent(
         NUM_BUFFERS_TMEM,
         # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
+        reuse=dp_dq_alias,
     )
 
     # pyrefly: ignore [missing-attribute]
@@ -3918,8 +4001,17 @@ def _hstu_attn_bwd_ws_non_persistent(
             NUM_BUFFERS_TMEM,
             # pyrefly: ignore [missing-attribute]
             tlx.storage_kind.tmem,
-            reuse=dp_tiles,
+            reuse=dp_dq_alias,
         )
+        # pyrefly: ignore [missing-attribute]
+        dp_dq_alias.set_buffer_overlap(
+            # pyrefly: ignore [missing-attribute]
+            tlx.reuse_group(
+                dp_tiles,
+                dq_tiles,
+                # pyrefly: ignore [missing-attribute]
+                group_type=tlx.reuse_group_type.shared,
+            ))
         dp_empties = dq_empties
     else:
         # pyrefly: ignore [missing-attribute]
@@ -4860,6 +4952,13 @@ def backward_custom_vars(
     return M, Delta, stride_mm
 
 
+def _switch_bwd_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
+    """Keep packed QKV views when each head's feature dimension is contiguous."""
+    if x.stride(-1) == 1:
+        return x
+    return x.contiguous()
+
+
 def tlx_hstu_attention_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -4884,10 +4983,10 @@ def tlx_hstu_attention_bwd(
     use_persistent: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass for HSTU attention with jagged sequences."""
-    q = switch_to_contiguous_if_needed(q)
-    k = switch_to_contiguous_if_needed(k)
-    v = switch_to_contiguous_if_needed(v)
-    dout = switch_to_contiguous_if_needed(dout)
+    q = _switch_bwd_to_contiguous_if_needed(q)
+    k = _switch_bwd_to_contiguous_if_needed(k)
+    v = _switch_bwd_to_contiguous_if_needed(v)
+    dout = _switch_bwd_to_contiguous_if_needed(dout)
 
     Z = seq_offsets.numel() - 1
     total_seq_len_q, H, HEAD_DIM = q.shape
@@ -4906,47 +5005,53 @@ def tlx_hstu_attention_bwd(
         # accumulate dq in fp32
         dq = torch.empty_like(q, dtype=torch.float32)
 
-    # TMA descriptors
+    # TMA descriptors. Packed QKV views keep the full allocation's row/head
+    # strides, so make the flattened descriptor wide enough to address the
+    # final head without densifying the input.
     dummy_block = [1, 1]
+
+    def _packed_width(t, head_dim):
+        return (H - 1) * t.stride(1) + head_dim
+
     desc_q = TensorDescriptor(
         q,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(q, HEAD_DIM)],
         strides=[q.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_k = TensorDescriptor(
         k,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(k, HEAD_DIM)],
         strides=[k.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_v = TensorDescriptor(
         v,
-        shape=[total_seq_len_q, H * DimV],
+        shape=[total_seq_len_q, _packed_width(v, DimV)],
         strides=[v.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_do = TensorDescriptor(
         dout,
-        shape=[total_seq_len_q, H * DimV],
+        shape=[total_seq_len_q, _packed_width(dout, DimV)],
         strides=[dout.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_dq = TensorDescriptor(
         dq,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(dq, HEAD_DIM)],
         strides=[dq.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_dk = TensorDescriptor(
         dk,
-        shape=[total_seq_len_q, H * HEAD_DIM],
+        shape=[total_seq_len_q, _packed_width(dk, HEAD_DIM)],
         strides=[dk.stride(0), 1],
         block_shape=dummy_block,
     )
     desc_dv = TensorDescriptor(
         dv,
-        shape=[total_seq_len_q, H * DimV],
+        shape=[total_seq_len_q, _packed_width(dv, DimV)],
         strides=[dv.stride(0), 1],
         block_shape=dummy_block,
     )
@@ -4966,15 +5071,15 @@ def tlx_hstu_attention_bwd(
         k_scaled = k * (alpha * RCP_LN2)
         desc_k = TensorDescriptor(
             k_scaled,
-            shape=[total_seq_len_q, H * HEAD_DIM],
-            strides=[k.stride(0), 1],
+            shape=[total_seq_len_q, _packed_width(k_scaled, HEAD_DIM)],
+            strides=[k_scaled.stride(0), 1],
             block_shape=dummy_block,
         )
     else:
         # SiLU case: no pre-scaling of K
         desc_k = TensorDescriptor(
             k,
-            shape=[total_seq_len_q, H * HEAD_DIM],
+            shape=[total_seq_len_q, _packed_width(k, HEAD_DIM)],
             strides=[k.stride(0), 1],
             block_shape=dummy_block,
         )

@@ -53,7 +53,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
       // CHECK: %[[TMEM_LOAD:.*]] = ttng.tmem_load %{{.*}} : !ttg.memdesc<64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> tensor<64x32xf32, #{{.*}}>
       %result_2 = ttng.tmem_load %3 : !ttg.memdesc<64x32xf32, #tmem_1, #ttng.tensor_memory, mutable> -> tensor<64x32xf32, #blocked>
       // CHECK: %[[REL_CVT:.*]] = ttg.convert_layout %[[TMEM_LOAD]] : tensor<64x32xf32, #blocked> -> tensor<64x32xf32, #blocked1>
-      %4 = tlx.release_layout %result_2 : tensor<64x32xf32, #blocked> -> tensor<64x32xf32, #blocked1>
+      %4 = tlx.release_layout %result_2 {relaxed = true} : tensor<64x32xf32, #blocked> -> tensor<64x32xf32, #blocked1>
       %5 = arith.truncf %4 : tensor<64x32xf32, #blocked1> to tensor<64x32xf16, #blocked1>
       %6 = ttg.memdesc_index %arg13[%c0_i32] : !ttg.memdesc<1x64x32xf16, #tmem_2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x32xf16, #tmem_2, #ttng.tensor_memory, mutable>
       // CHECK: %[[STORE_CVT:.*]] = ttg.convert_layout %{{.*}} : tensor<64x32xf16, #blocked1> -> tensor<64x32xf16, #blocked>

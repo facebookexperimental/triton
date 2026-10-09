@@ -30,6 +30,7 @@ class OpSpec:
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
     supports_backward: bool = False
+    default_space: str = "heuristic"  # used when the caller passes space=None
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -42,6 +43,17 @@ _BF16 = frozenset({"bfloat16"})
 # `import triton.tlx` never imports a kernel module or builds autotune configs.
 # A missing (op, arch) is deferred, not an error -- the op raises on that arch.
 CATALOG: tuple[OpSpec, ...] = (
+    OpSpec(
+        op="mm",
+        arch="sm90",
+        variant="ws_cooperative",
+        impl="triton.tlx.ops.kernels.mm.sm90:mm",
+        dtypes=_FP16,
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        requires=frozenset({"tma"}),
+        # The full space is only 8 configs (seconds to tune) and beats the heuristic on tall shapes.
+        default_space="full",
+    ),
     OpSpec(
         op="mm",
         arch="sm100",
@@ -84,6 +96,54 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="grouped_gemm",
+        arch="sm100",
+        variant="ws",
+        impl="triton.tlx.ops.kernels.grouped_gemm.sm100:grouped_gemm",
+        dtypes=frozenset({"float16"}),
+        accepts=lambda d: all(stride * d["elem_bytes"] % 16 == 0
+                              for stride in d["row_strides"]) and all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="mm_mxfp8",
+        arch="sm100",
+        variant="ws_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp8.sm100:mm_mxfp8",
+        dtypes=frozenset({"float8_e4m3fn"}),
+        # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
+        accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="grouped_gemm_mxfp8",
+        arch="sm100",
+        variant="ws_persistent_mxfp8",
+        impl="triton.tlx.ops.kernels.grouped_gemm_mxfp8.sm100:grouped_gemm_mxfp8",
+        dtypes=frozenset({"float8_e4m3fn"}),
+        accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
+                                                                                           for ptr in d["base_ptrs"]),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="grouped_gemm_mxfp8",
+        arch="gfx950",
+        variant="persistent_warp_pipeline_mxfp8",
+        impl="triton.tlx.ops.kernels.grouped_gemm_mxfp8.gfx950:grouped_gemm_mxfp8",
+        dtypes=frozenset({"float8_e4m3fn"}),
+        accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
+                                                                                           for ptr in d["base_ptrs"]),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="grouped_gemm",
+        arch="gfx950",
+        variant="heuristic",
+        impl="triton.tlx.ops.kernels.grouped_gemm.gfx950:grouped_gemm",
+        dtypes=frozenset({"float16"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
         # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
         # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
         op="mm_torchtlx",
@@ -96,9 +156,27 @@ CATALOG: tuple[OpSpec, ...] = (
     ),
     OpSpec(
         op="mm_torchtlx",
+        arch="gfx942",
+        variant="inductor_gfx942_mm",
+        impl="triton.language.extra.tlx.inductor.gfx942_torch:mm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="mm_torchtlx",
         arch="gfx950",
         variant="inductor_gfx950_mm",
         impl="triton.language.extra.tlx.inductor.gfx950_torch:mm",
+        dtypes=_FP16,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        # TorchTLX providers are benchmark/catalog entries rather than public
+        # wrappers: their API is torch.addmm, with TLX selected by Inductor.
+        op="addmm_torchtlx",
+        arch="gfx942",
+        variant="inductor_gfx942_addmm",
+        impl="triton.tlx.ops.kernels.addmm.gfx942_torch:addmm",
         dtypes=_FP16,
         requires=frozenset(),
     ),
@@ -159,6 +237,26 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
         requires=frozenset({"tma", "tmem"}),
         supports_backward=True,
+    ),
+    OpSpec(
+        op="flash_attn_mxfp8",
+        arch="gfx950",
+        variant="mfma_mxfp8",
+        impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950:flash_attn_mxfp8",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
+        requires=frozenset(),
+        supports_backward=False,
+    ),
+    OpSpec(
+        op="flash_attn_varlen",
+        arch="gfx950",
+        variant="mfma_interleaved",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950:flash_attn_varlen",
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        requires=frozenset(),
+        supports_backward=False,
     ),
     OpSpec(
         op="hstu_attn_dev",
