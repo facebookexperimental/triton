@@ -6,7 +6,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -1890,13 +1890,30 @@ class HarnessTest(unittest.TestCase):
             patch.object(
                 mm,
                 "_oracle_winner",
-                return_value=lambda: artifact["op"](tensor, tensor, space="full"),
+                return_value=nullcontext(lambda: artifact["op"](tensor, tensor, space="full")),
             ),
         ):
             result = mm.benchmark(artifact, {"case_id": "a"}, 10)
 
         self.assertEqual(spaces, ["full", "heuristic"])
         self.assertEqual(result["metrics"]["full_space_parity"], 1.0)
+
+    def test_mm_oracle_winner_restores_cached_tuner(self) -> None:
+        import torch
+        import triton
+
+        from ..decision_maker.tuning_harnesses import mm
+
+        configs = [triton.Config({"BLOCK_M": m}, num_warps=4, num_stages=2) for m in (64, 128)]
+        tuner = Mock(configs=configs)
+        module = Mock(_precheck_local_split_u=Mock(return_value=False), _tuned=Mock(return_value=tuner))
+        artifact = {"module": module, "op": Mock()}
+        tensor = torch.empty((1, 1))
+        for config in configs:
+            winner = f"kernel: {mm._format_config(config)}"
+            with mm._oracle_winner(artifact, tensor, tensor, winner):
+                self.assertEqual(tuner.configs, [config])
+            self.assertIs(tuner.configs, configs)
 
     def test_benchmark_metrics_are_attached_to_verification(self) -> None:
         harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"

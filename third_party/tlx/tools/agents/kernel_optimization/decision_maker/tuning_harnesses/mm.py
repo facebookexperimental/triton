@@ -129,10 +129,10 @@ def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) 
         config_rows = list(oracle_metrics.get("top_full_configs", []))
         full_config_count = int(oracle_metrics.get("full_config_count", 0))
         full_best_config = str(oracle_metrics.get("full_best_config", ""))
-        full = _oracle_winner(artifact, a, b, full_best_config)
-        full()
-        torch.cuda.synchronize()
-        full_samples = _measure(full, repetitions)
+        with _oracle_winner(artifact, a, b, full_best_config) as full:
+            full()
+            torch.cuda.synchronize()
+            full_samples = _measure(full, repetitions)
     else:
         full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
         full_tuners: dict[str, Any] = {}
@@ -250,6 +250,7 @@ def _selected_heuristic_config(artifact: Mapping[str, Any], a, b) -> str:
     return _format_config(configs[0]) if len(configs) == 1 else ""
 
 
+@contextlib.contextmanager
 def _oracle_winner(artifact: Mapping[str, Any], a, b, winner: str):
     module = artifact.get("module")
     if module is None or not winner:
@@ -261,11 +262,14 @@ def _oracle_winner(artifact: Mapping[str, Any], a, b, winner: str):
     selected = [config for config in tuner.configs if _format_config(config) == expected]
     if len(selected) != 1:
         raise RuntimeError(f"could not resolve oracle winner {winner!r}")
+    # _tuned is lru_cached without strides: restore so same-shape cases still resolve their own winner.
+    # A single-config Autotuner bypasses its cache, so the cache needs no clearing.
+    original = tuner.configs
     tuner.configs = selected
-    cache = getattr(tuner, "cache", None)
-    if cache is not None:
-        cache.clear()
-    return lambda: artifact["op"](a, b, space="full")
+    try:
+        yield lambda: artifact["op"](a, b, space="full")
+    finally:
+        tuner.configs = original
 
 
 def _best_configs(tuners: Mapping[str, Any]) -> str:
