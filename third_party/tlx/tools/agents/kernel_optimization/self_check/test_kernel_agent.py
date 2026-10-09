@@ -505,6 +505,43 @@ class ScoringTest(unittest.TestCase):
         self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
         self.assertNotIn("third_party/tlx/tools/agents", prompt)
 
+    def test_codex_prompt_selects_explicit_gfx950_gemm_skill(self) -> None:
+        target = KernelTarget(
+            "hip",
+            "gfx950",
+            optimization_skills=("optimize-amd-gfx950-gemm",),
+        )
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=target,
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                _performance(("target", 100.0)),
+                (),
+            ),
+        )
+        self.assertIn("# AMD Kernel Optimization", prompt)
+        self.assertIn("# AMD gfx950 GEMM Optimization", prompt)
+        self.assertIn("# gfx950 GEMM Measurement And Baselines", prompt)
+        self.assertIn("# gfx950 GEMM Experiment Workflow", prompt)
+        self.assertIn("# gfx950 Production GEMM Catalog Architecture", prompt)
+        self.assertIn("# gfx950 GEMM Design Space", prompt)
+        self.assertIn("# gfx950 GEMM Pipeline And Machine Scheduling", prompt)
+        self.assertIn("# gfx950 GEMM Irregular Tiles And K Tails", prompt)
+        self.assertIn("# gfx950 GEMM Profiling And Artifact Analysis", prompt)
+        self.assertIn("# gfx950 GEMM Shape Families And Promotion", prompt)
+        self.assertIn("one region without `pair`", prompt)
+        self.assertIn("The `pair` ID prevents accidental association", prompt)
+        self.assertNotIn("# AMD TLX Attention Optimization", prompt)
+        self.assertNotIn("# AMD IR Live-Range Interpretation", prompt)
+
     def test_codex_prompt_selects_explicit_amd_live_range_skill(self) -> None:
         target = KernelTarget(
             "hip",
