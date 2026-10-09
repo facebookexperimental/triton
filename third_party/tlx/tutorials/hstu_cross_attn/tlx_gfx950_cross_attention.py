@@ -14,9 +14,10 @@
 """
 TLX HSTU cross attention targeting the gfx950 (AMD MI350X) architecture.
 
-Standalone OSS copy of the Hammer v2 kernel at D120435766. The kernel and
-variant bodies are preserved; only fbcode imports and custom-op dispatch are
-replaced with sibling tutorial helpers and a direct Python call.
+Standalone OSS copy of the Hammer v2 kernel at D120435766.
+Sibling tutorial helpers and direct Python calls replace the fbcode dependencies.
+The FP32 backward pipeline computes dQ in its output orientation.
+It writes the final FP32 sum directly to the BF16 output.
 
 Extracted from `hammer/v2/ops/triton/template/triton_bw_cross_attention.py`,
 the v3 cross attention kernel; the previous diff landed that as a forward-only,
@@ -98,6 +99,8 @@ from stubs import (
 )
 from tlx_gfx950_cross_attention_v3_baseline import (
     _tlx_gfx950_cross_attn_v3_ttgir_bwd, )
+from tlx_gfx950_cross_attention_small import coarse_softmax_backward, compact_softmax_backward, partial_softmax_backward, small_softmax_backward
+from tlx_gfx950_cross_attention_retained import retained_softmax_backward
 from triton_attention_utils import (
     backward_softmax_activation_scaled_alpha,
     fast_silu,
@@ -1731,25 +1734,7 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
         assert seq_offsets_q is None
         seq_offsets_q = seq_offsets
 
-    # redq only. The v3 source picks between three backward kernels through
-    # `BwdVariant`; this port carries the reduce-dq one alone, so the dtype
-    # choice the source spreads across four branches collapses: dq is reduced
-    # through memory and is always fp32, and dk/dv are each written once by the
-    # program that owns them, so they stay in k's dtype for both G == 1 (no
-    # collision) and G > 1 (PER_KV_HEAD groups the query heads in registers).
-    use_per_kv_head = G > 1
-    dq = torch.empty_like(q, dtype=torch.float32)
-    dk = torch.empty_like(k, dtype=k.dtype)
-    if shared_kv:
-        dv = dk
-    else:
-        dv = torch.empty_like(v, dtype=k.dtype)
-
     dout = switch_to_contiguous_if_needed(dout)
-    dq = switch_to_contiguous_if_needed(dq)
-    dk = switch_to_contiguous_if_needed(dk)
-    if not shared_kv:
-        dv = switch_to_contiguous_if_needed(dv)
 
     # Validate dtype consistency: q, k, v must have matching dtypes for
     # correct type casting in kernels (e.g., dk.to(q.dtype))
@@ -1924,7 +1909,11 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
             seq_offsets_q is not None,
             "V3 TTGIR baseline requires query offsets",
         )
-        if v3_ttgir_variant in (
+        single_kv_tile = v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 128
+        if single_kv_tile:
+            # The single-tile path writes final dQ without FP32 scratch.
+            dq_v3 = torch.empty_like(q)
+        elif v3_ttgir_variant in (
                 "v3_ttgir_atomic_dq",
                 "v3_ttgir_bf16_dq",
                 "v3_ttgir_bf16_prefetch_dq",
@@ -1935,6 +1924,8 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
             dq_v3 = torch.empty_like(q, dtype=torch.float32)
         else:
             dq_v3 = torch.zeros_like(q, dtype=torch.float32)
+        dq_final = (dq_v3 if single_kv_tile else torch.empty_like(dq_v3, dtype=q.dtype)
+                    if v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" else None)
         dk_v3 = torch.empty_like(k)
         dv_v3 = torch.empty((0, v.shape[1], v.shape[2]), dtype=v.dtype, device=v.device)
         _tlx_gfx950_cross_attn_v3_ttgir_bwd[(Z * H, 1)](
@@ -1993,6 +1984,17 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
             ),
             # pyrefly: ignore [bad-argument-type]
             PIPELINE_QDO=v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo",
+            DQ_FINAL=dq_final,
+            EARLY_TAIL_QDO=(v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len <= 128),
+            SINGLE_KV_TILE=single_kv_tile,
+            # Packed Q lengths are at most 256, so equality proves every length is 256.
+            PACKED_FIXED_Q=(single_kv_tile or (v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 384))
+            and total_seq_len_q == Z * 256,
+            FIXED_KV=(384 if v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 384
+                      and total_seq_len_q == Z * 256 and k.shape[0] == Z * 384 else 0),
+            NATIVE_Q_SCORE=(v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len == 384
+                            and total_seq_len_q == Z * 256),
+            CACHE_K=(v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo" and max_seq_len >= 1024),
             # pyrefly: ignore [unexpected-keyword]
             num_warps=4,
             # pyrefly: ignore [unexpected-keyword]
@@ -2001,12 +2003,20 @@ def tlx_gfx950_cross_attn_bwd(  # noqa C901
             matrix_instr_nonkdim=16,
             # pyrefly: ignore [unexpected-keyword]
             waves_per_eu=1,
+            # pyrefly: ignore [unexpected-keyword]
+            regclass_priority_trumps_globalness=v3_ttgir_variant == "v3_ttgir_fp32_pipeline_qdo",
         )
         return (
-            dq_v3.to(q.dtype),
+            dq_final if dq_final is not None else dq_v3.to(q.dtype),
             dk_v3,
             dv_v3,
         )
+
+    # The generic kernel reduces dQ through FP32 memory.
+    use_per_kv_head = G > 1
+    dq = switch_to_contiguous_if_needed(torch.empty_like(q, dtype=torch.float32))
+    dk = switch_to_contiguous_if_needed(torch.empty_like(k, dtype=k.dtype))
+    dv = dk if shared_kv else switch_to_contiguous_if_needed(torch.empty_like(v, dtype=k.dtype))
 
     if use_per_kv_head:
         H_kv = H // G
@@ -2176,6 +2186,30 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         ctx.G = G
         ctx.H = H
         ctx.H_kv = H_kv
+        batch = seq_offsets.numel() - 1
+        ctx.use_small_backward = (v3_ttgir_variant in (None, "v3_ttgir_fp32_pipeline_qdo") and 0 < batch <= 64
+                                  and 0 < max_seq_len <= 2048 and max_q_len == 256 and H > 0 and H == H_kv
+                                  and k.shape[1] == H and num_softmax_heads == H and DimQ == 128 and DimV == 128
+                                  and not causal and not enable_tma and truncate_method == "none"
+                                  and q.dtype == k.dtype == v.dtype == torch.bfloat16 and q.is_contiguous()
+                                  and k.is_contiguous() and v.is_contiguous() and attn_scale.ndim == 0)
+        ctx.use_retained_backward = (
+            v3_ttgir_variant in (None, "v3_ttgir_fp32_pipeline_qdo") and batch >= 256
+            and max_seq_len in (256, 512, 1024, 2048) and max_q_len == 256 and shared_kv
+            and H == H_kv == num_softmax_heads == 1 and DimQ == DimV == 128 and not causal and not enable_tma
+            and truncate_method == "none" and q.dtype == k.dtype == torch.bfloat16 and q.is_contiguous()
+            and k.is_contiguous() and q.device.type == "cuda" and q.device == k.device
+            and seq_offsets.ndim == seq_offsets_q.ndim == 1 and seq_offsets.numel() == seq_offsets_q.numel()
+            and seq_offsets.dtype == seq_offsets_q.dtype == torch.int64
+            and seq_offsets.device == seq_offsets_q.device == q.device and seq_offsets.is_contiguous()
+            and seq_offsets_q.is_contiguous() and attn_scale.ndim == 0 and torch.version.hip is not None
+            and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] == "gfx950")
+        ctx.use_coarse_backward = ctx.use_small_backward and batch > 4 and max_seq_len >= 384 and H == 1 and shared_kv
+        ctx.cache_coarse_delta = ctx.use_coarse_backward and max_seq_len >= 1024
+        ctx.use_partial_backward = ctx.use_small_backward and batch <= 4 and max_seq_len > 512 and shared_kv
+        ctx.use_compact_backward = (ctx.use_small_backward and batch <= 4 and (max_seq_len <= 1024 or shared_kv))
+        if ctx.use_compact_backward:
+            ctx.use_partial_backward = False
         return out.view(total_seq_len_q, H, DimV)
 
     @staticmethod
@@ -2201,6 +2235,28 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale, seq_offsets_q = saved_tensors[:6]
+        if ctx.use_retained_backward:
+            m, out = saved_tensors[6:8]
+            dq, dk = retained_softmax_backward(q, k, dout, m, out, seq_offsets_q, seq_offsets, ctx.alpha)
+            return (None, None, dq, dk, None, None, None, None, None, None, None, None, None, None, None, None)
+        if ctx.use_small_backward:
+            m, out = saved_tensors[6:8]
+            if ctx.use_partial_backward:
+                dq, dk, dv = partial_softmax_backward(q, k, dout, m, out, seq_offsets_q, seq_offsets, ctx.max_seq_len,
+                                                      ctx.alpha)
+            elif ctx.use_coarse_backward:
+                dq, dk, dv = coarse_softmax_backward(q, k, dout, m, out, seq_offsets_q, seq_offsets, ctx.alpha,
+                                                     cache_delta=ctx.cache_coarse_delta,
+                                                     early_stats=ctx.max_seq_len >= 1024 and not ctx.cache_coarse_delta)
+            elif ctx.use_compact_backward:
+                dq, dk, dv = compact_softmax_backward(q, k, v, dout, m, out, seq_offsets_q, seq_offsets,
+                                                      ctx.max_seq_len, ctx.alpha, ctx.shared_kv)
+            else:
+                dq, dk, dv = small_softmax_backward(q, k, v, dout, m, out, seq_offsets_q, seq_offsets, ctx.max_seq_len,
+                                                    ctx.alpha, ctx.shared_kv)
+            return (None, None, dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None)
+        # Preprocessing and the fallback kernels require contiguous gradient rows.
+        dout = dout.contiguous()
         idx = 6
         num_softmax_heads = ctx.num_softmax_heads
         # Reshape dout from [T, H, DimV] to folded [T*G, H_kv, DimV].
