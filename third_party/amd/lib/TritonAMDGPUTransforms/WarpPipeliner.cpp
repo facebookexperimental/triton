@@ -200,7 +200,8 @@ static void createClusterOp(OpBuilder &b, Location loc,
   return;
 }
 
-// Layout cleanup and unrolling can place stage inputs before inter-stage waits.
+// Place stage inputs after independent waits. This does not validate
+// cross-wave communication inside the next stage.
 static void sinkStageInputsIntoNextStage(Operation *begin, Operation *end) {
   SmallVector<Operation *> pending;
   auto consumesPending = [&](Operation *user) {
@@ -210,6 +211,8 @@ static void sinkStageInputsIntoNextStage(Operation *begin, Operation *end) {
   };
   for (Operation *op = begin; op && op != end;) {
     Operation *next = op->getNextNode();
+    // Gluon unrolling adds scalar IV remaps; TLX layout propagation also adds
+    // conversions at loop entry, before waits for unrelated async loads.
     if (triton::isPureScalarOp(op) || isa<ttg::ConvertLayoutOp>(op)) {
       pending.push_back(op);
       op = next;
@@ -228,8 +231,7 @@ static void sinkStageInputsIntoNextStage(Operation *begin, Operation *end) {
       }
       if (!conflict) {
         next = anchor->getNextNode();
-        // Reverse iteration + moveAfter(anchor) preserves source order:
-        // each earlier-inserted scalar is pushed right by later inserts.
+        // Reverse insertion preserves input order, including dependent inputs.
         for (Operation *s : llvm::reverse(pending))
           s->moveAfter(anchor);
       }
