@@ -695,6 +695,72 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
 
 
 @triton.jit
+def _bwd_kv_owner_causal_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
+                                       BM: tl.constexpr, BN: tl.constexpr):
+    """Prepare V64 inside each N2048 causal key owner."""
+    tl.static_assert(ARENA_N == 2048 and D == 128 and BM == 64 and BN == 64)
+    # Fresh host admission binds runtime N to this private arena length.
+    sequence_length: tl.constexpr = ARENA_N
+    Q, K, QS, KS = _saved_qk_arena_segments(QK, ARENA_N)
+    _, DO, _, DOS, KDQS, Delta = _preparation_arena_segments(Arena, ARENA_N)
+    DS, DSS = _backward_arena_segments(Arena, ARENA_N)
+    head = tl.program_id(0).to(tl.int64)
+    key_tile = tl.program_id(1)
+    keys = key_tile * BN + tl.arange(0, BN)
+    base = head * sequence_length * D
+    v, vs = _inline_prepare_v64(V, base, keys, D)
+    k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
+    ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
+    _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
+    dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
+    shared_layout: tl.constexpr = _stage_layout(D)
+    qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
+    domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
+    metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
+    lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+    deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+    begin = key_tile * BN // 128 * 128
+    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, sequence_length, BM, D, True, 0)
+    # Both prefix visits fill one packed DSS record, including masked zeros.
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                           sm_scale, DS, DSS, D, BM, BN, True, False, True, True, False, True, False, qmem, domem,
+                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                           begin, 0, True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                           sm_scale, DS, DSS, D, BM, BN, True, False, True, True, False, True, False, qmem, domem,
+                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                           begin + 64, 1, begin < sequence_length - 128,
+                           PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+    for pair_start in range(begin + 128, sequence_length - 128, 128):
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               pair_start, 0, True,
+                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               pair_start + 64, 1, True,
+                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+    if begin < sequence_length - 128:
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               sequence_length - 128, 0, True,
+                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               sequence_length - 64, 1, False,
+                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+    offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
+    tl.store(DK + offsets, dk * sm_scale)
+    tl.store(DV + offsets, dv)
+
+
+@triton.jit
 def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D: tl.constexpr,
                   BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr, PEEL: tl.constexpr, NATIVE: tl.constexpr,
@@ -1186,6 +1252,43 @@ def _remember_partial_arena_launch_plan(device, n, sm_scale, compiled):
     _ARENA_LAUNCH_PLANS[(device.index, n, False, sm_scale, ("partial_saved_qk_arena", 1))] = tuple(entries)
 
 
+def _causal_partial_arena_launch_plan(device, n, sm_scale):
+    if n != 2048 or device.type != "cuda" or device.index is None or not _arena_launch_controls():
+        return None
+    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, True, sm_scale, ("causal_partial_saved_qk_arena", 1)))
+    if plan is None or len(plan) != 3:
+        return None
+    for current, entry in zip((_prepare_do_arena, _bwd_kv_owner_causal_partial_arena, _bwd_q_consume_arena), plan):
+        jit, cache_key, kernel, source_hash, globals_used, runner = entry
+        cache = jit.device_caches.get(device.index)
+        if (jit is not current or jit.pre_run_hooks or jit.launch_metadata is not None or jit.debug
+                or jit.hash != source_hash or cache is None or cache[0].get(cache_key) is not kernel
+                or getattr(kernel, "_compile_iq_acf_cubin", None) is not None):
+            return None
+        for name, value, namespace in globals_used:
+            if name not in namespace or namespace[name] != value:
+                return None
+    return tuple(entry[5] for entry in plan)
+
+
+def _remember_causal_partial_arena_launch_plan(device, n, sm_scale, compiled):
+    if n != 2048 or device.type != "cuda" or device.index is None or not _arena_launch_controls() or len(compiled) != 3:
+        return
+    entries = []
+    grids = ((n // 32, 128, 1), (128, n // 64, 1), (n // 128, 128, 1))
+    for jit, kernel, grid in zip((_prepare_do_arena, _bwd_kv_owner_causal_partial_arena, _bwd_q_consume_arena), compiled, grids):
+        cache = jit.device_caches.get(device.index)
+        if (not isinstance(kernel, CompiledKernel) or cache is None or jit.pre_run_hooks
+                or jit.launch_metadata is not None or jit.debug or kernel.src.fn is not jit):
+            return
+        cache_key = next((key for key, cached in cache[0].items() if cached is kernel), None)
+        if cache_key is None:
+            return
+        globals_used = tuple((name, value, namespace) for (name, _), (value, namespace) in jit.used_global_vals.items())
+        entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
+    _ARENA_LAUNCH_PLANS[(device.index, n, True, sm_scale, ("causal_partial_saved_qk_arena", 1))] = tuple(entries)
+
+
 def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
     """Metadata-only admission; this never reads payload or scale values."""
     if type(causal) is not bool:
@@ -1383,11 +1486,33 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
             for tensor in (q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse)
             if tensor is not None)
         partial_prepare = qk_format and n in (1024, 2048) and not causal and sm_scale == 0.5
+        causal_partial_prepare = qk_format and n == 2048 and causal and sm_scale == 0.5
         plan = (_arena_launch_plan(device, n, causal, sm_scale, qk_format)
-                if ordinary_inputs and not partial_prepare else None)
+                if ordinary_inputs and not (partial_prepare or causal_partial_prepare) else None)
         saved_ks = q_fp8 if qk_format else k_scale
         saved_k = q_fp8 if qk_format else k_fp8
-        if partial_prepare:
+        if causal_partial_prepare:
+            partial_plan = _causal_partial_arena_launch_plan(device, n, sm_scale) if ordinary_inputs else None
+            if partial_plan is not None:
+                prepare, kv, query = partial_plan
+                stream = driver.active.get_current_stream(device.index)
+                prepare(do_bf16, out_bf16, arena, n, 128, 32, stream=stream)
+                kv(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, stream=stream)
+                query(saved_k, arena, dq, n, sm_scale, n, 128, 128, 64, True, 128, True, stream=stream)
+            else:
+                prepare = _prepare_do_arena.run(do_bf16, out_bf16, arena, n, 128, 32, num_warps=2, num_stages=1,
+                                                 grid=(n // 32, 128), warmup=False)
+                kv = _bwd_kv_owner_causal_partial_arena.run(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
+                                                     D=128, BM=64, BN=64, num_warps=2, num_stages=1,
+                                                     matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64),
+                                                     warmup=False)
+                query = _bwd_q_consume_arena.run(saved_k, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
+                                                 CAUSAL=True, HEADS=128, QK_FORMAT=True, num_warps=4, num_stages=1,
+                                                 matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
+                                                 warmup=False)
+                if ordinary_inputs:
+                    _remember_causal_partial_arena_launch_plan(device, n, sm_scale, (prepare, kv, query))
+        elif partial_prepare:
             partial_plan = _partial_arena_launch_plan(device, n, sm_scale) if ordinary_inputs else None
             if partial_plan is not None:
                 prepare, kv, query = partial_plan

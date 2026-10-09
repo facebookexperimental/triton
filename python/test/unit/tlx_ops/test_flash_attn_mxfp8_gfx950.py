@@ -551,7 +551,7 @@ def test_flash_attn_mxfp8_shared_backward_live_metadata(n_ctx, causal):
 @pytest.mark.parametrize(
     "n_ctx,qk_format,plan_kind",
     [(n, fmt, "ordinary") for n in (1024, 2048) for fmt in (False, True)]
-    + [(1024, True, "inline"), (1024, True, "partial")],
+    + [(1024, True, "inline"), (1024, True, "partial"), (2048, True, "causal_partial")],
 )
 def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_format, plan_kind):
     from contextlib import ExitStack
@@ -565,6 +565,7 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_for
         "ordinary": ("_prepare_fused_arena", "_bwd_kv_owner_arena", "_bwd_q_consume_arena"),
         "inline": ("_bwd_kv_owner_inline_arena", "_bwd_q_consume_arena"),
         "partial": ("_prepare_do_arena", "_bwd_kv_owner_partial_arena", "_bwd_q_consume_arena"),
+        "causal_partial": ("_prepare_do_arena", "_bwd_kv_owner_causal_partial_arena", "_bwd_q_consume_arena"),
     }[plan_kind]
     jits = [
         SimpleNamespace(device_caches={}, pre_run_hooks=[], launch_metadata=None, debug=False, hash="source",
@@ -599,8 +600,10 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_for
             assert len(shared._ARENA_LAUNCH_PLANS) == 2
             assert shared._arena_launch_plan(device, n_ctx, True, 0.5, qk_format) is None
         else:
-            other = "partial" if plan_kind == "inline" else "inline"
+            other = "partial" if plan_kind in ("inline", "causal_partial") else "inline"
             assert getattr(shared, "_" + other + "_arena_launch_plan")(device, n_ctx, 0.5) is None
+            if plan_kind == "causal_partial":
+                assert shared._causal_partial_arena_launch_plan(device, 1024, 0.5) is None
         expected = tuple(kernel.__getitem__.return_value for kernel in kernels)
         assert plan() == expected
         assert plan(selected_device=torch.device("cuda:3")) is None
@@ -623,14 +626,16 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_for
         assert plan() is None
         globals_dict["value"] = 7
         assert plan() == expected
-        if plan_kind == "partial":
-            key = (device.index, n_ctx, False, 0.5, ("partial_saved_qk_arena", 1))
+        if plan_kind in ("partial", "causal_partial"):
+            causal = plan_kind == "causal_partial"
+            format_key = "causal_partial_saved_qk_arena" if causal else "partial_saved_qk_arena"
+            key = (device.index, n_ctx, causal, 0.5, (format_key, 1))
             original = shared._ARENA_LAUNCH_PLANS[key]
             shared._ARENA_LAUNCH_PLANS[key] = original[:2]
             assert plan() is None
             shared._ARENA_LAUNCH_PLANS[key] = original
             replacement = SimpleNamespace(**vars(jits[1]))
-            with mock.patch.object(shared, "_bwd_kv_owner_partial_arena", replacement):
+            with mock.patch.object(shared, names[1], replacement):
                 assert plan() is None
 
     # Controls are tested independently of the mocked validity metadata.
@@ -666,8 +671,9 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         inputs[:4] = [
             torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="meta", dtype=torch.uint8), None, None, None
         ]
-    partial_prepare = qk_format and n_ctx in (1024, 2048) and not causal
-    jits = ((shared._prepare_do_arena, shared._bwd_kv_owner_partial_arena, shared._bwd_q_consume_arena) if partial_prepare else
+    partial_prepare = qk_format and (not causal or n_ctx == 2048)
+    partial_owner = shared._bwd_kv_owner_causal_partial_arena if causal else shared._bwd_kv_owner_partial_arena
+    jits = ((shared._prepare_do_arena, partial_owner, shared._bwd_q_consume_arena) if partial_prepare else
             (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     # Populate real transitive source hashes without compiling or using a GPU.
     assert all(jit.cache_key for jit in jits)
@@ -702,6 +708,7 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         assert query_args[0] is inputs[0 if qk_format else 1]
         assert query_args[2] is warm[0]
         assert query_args[5:] == (n_ctx, 128, 128, 64, causal, 128, qk_format)
+        assert runs[-1].call_args.kwargs["CAUSAL"] == causal
         assert kv_args[0] is inputs[0]
         if partial_prepare:
             # Cold and cached launches bind the runtime N ABI to ARENA_N.
@@ -742,7 +749,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         # real JIT objects must reject a retained compiled plan afterward.
         with mock.patch.object(jits[kv_index], "hash", None):
             if partial_prepare:
-                assert shared._partial_arena_launch_plan(device, n_ctx, 0.5) is None
+                lookup = shared._causal_partial_arena_launch_plan if causal else shared._partial_arena_launch_plan
+                assert lookup(device, n_ctx, 0.5) is None
             else:
                 assert shared._arena_launch_plan(device, n_ctx, causal, 0.5, qk_format) is None
         kernels[kv_index].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
@@ -751,22 +759,23 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         assert all(run.call_count == 1 for run in runs), "compiled launch errors must not retry JIT"
 
 
-@pytest.mark.parametrize("qk_format", (False, True))
-def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(qk_format):
+@pytest.mark.parametrize("n_ctx,qk_format,causal", [(1024, False, False), (1024, True, False), (2048, True, True)])
+def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(n_ctx, qk_format, causal):
     """Use actual public compiled runners with CPU-modeled launch handles."""
     from contextlib import ExitStack
     from types import SimpleNamespace
     from triton.backends.compiler import GPUTarget
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
 
-    shape = (4, 32, 1024, 128)
+    shape = (4, 32, n_ctx, 128)
     device = torch.device("cuda:2")
     inputs = [torch.empty(shape, device="meta") for _ in range(8)]
     if qk_format:
         inputs[:4] = [
-            torch.empty(shared._saved_qk_arena_layout(1024)[-1], device="meta", dtype=torch.uint8), None, None, None
+            torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="meta", dtype=torch.uint8), None, None, None
         ]
-    jits = ((shared._prepare_do_arena, shared._bwd_kv_owner_partial_arena, shared._bwd_q_consume_arena) if qk_format else
+    partial_owner = shared._bwd_kv_owner_causal_partial_arena if causal else shared._bwd_kv_owner_partial_arena
+    jits = ((shared._prepare_do_arena, partial_owner, shared._bwd_q_consume_arena) if qk_format else
             (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     kernels = []
     for jit in jits:
@@ -795,10 +804,10 @@ def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(qk_format):
         for jit, kernel in zip(jits, kernels):
             stack.enter_context(mock.patch.object(jit, "device_caches", {2: ({"compiled-key": kernel}, )}))
             stack.enter_context(mock.patch.object(jit, "run", return_value=kernel))
-        shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
-        first = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+        shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
+        first = shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
         active.stream = 202
-        second = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+        second = shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
         assert active.get_current_stream.call_count == 2
         assert all(kernel._run.call_args_list[0].args[3] == 101 for kernel in kernels)
         assert all(kernel._run.call_args_list[1].args[3] == 202 for kernel in kernels)
@@ -808,7 +817,7 @@ def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(qk_format):
             arena_index]
         kernels[0 if qk_format else 1]._run.side_effect = RuntimeError("modeled runner failure")
         with pytest.raises(RuntimeError, match="modeled runner failure"):
-            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+            shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
         assert kernels[-1]._run.call_count == 2, "a failed producer must not launch its consumer"
 
 
