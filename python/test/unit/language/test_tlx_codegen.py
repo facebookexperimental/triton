@@ -40,7 +40,7 @@ from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
 )
 import math
-from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as amd_fa_varlen_bwd
 from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _D64DQLaunch,
@@ -3944,6 +3944,9 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
             "D": 128,
             "BLOCK_M": block_m,
             "BLOCK_N": block_n,
+            "KV_SPLITS": 1,
+            "PHASE_IGLP": -1,
+            "PEEL_CAUSAL": False,
         },
     )
 
