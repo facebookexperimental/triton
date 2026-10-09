@@ -1170,4 +1170,3 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %result : tensor<64xf32, #carried>
   }
 }
-

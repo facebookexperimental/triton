@@ -3349,16 +3349,14 @@ TEST_F(LinearLayoutConversionsTest, TensorMemoryScales_TwoCTARHS) {
   auto kCol = S("col");
   auto cgaLayout = CGAEncodingAttr::get1CTALayout(&ctx, /*rank=*/2);
   auto enc = TensorMemoryScalesEncodingAttr::get(
-      &ctx, cgaLayout,
-      nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
+      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
       nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS);
 
   // N[0:32] selects rows 0:32, N[32:64] advances one TMEM column,
   // and N[64:128] selects row partition 64. Partition 32 remains a
   // broadcast so both M warp partitions see the same B scales.
   LinearLayout expected(
-      {{kRow,
-        {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}, {64, 0}}},
+      {{kRow, {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}, {64, 0}}},
        {kCol, {{0, 1}, {0, 2}, {32, 0}}},
        {kBlock, {}}},
       {d0, d1});

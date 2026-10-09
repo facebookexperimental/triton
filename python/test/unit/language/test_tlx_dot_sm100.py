@@ -1093,10 +1093,7 @@ def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED,
                     tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2))
                     tlx.barrier_expect_bytes(
                         bar_a_scale,
-                        A_SCALE_GROUPS
-                        * BLOCK_SCALE_K_GROUPS
-                        * 2
-                        * SCALE_SWIZZLE_WIDTH,
+                        A_SCALE_GROUPS * BLOCK_SCALE_K_GROUPS * 2 * SCALE_SWIZZLE_WIDTH,
                     )
                     tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N * BLOCK_K // 32)
                     tlx.async_descriptor_load(
@@ -1242,9 +1239,7 @@ def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED,
         local_a_scale = torch.full((2, 128, K // 32), 127, dtype=torch.uint8, device=device)
         local_a_scale[:, :64] = a_scale.reshape(2, 64, K // 32)
         a_scale_5d = swizzle_scale_to_5d(local_a_scale, 1, K // 32 // 4)
-        b_scale_5d = swizzle_scale_to_5d(
-            b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4
-        )
+        b_scale_5d = swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4)
     else:
         a_scale_5d = swizzle_scale_to_5d(a_scale.reshape(1, M, K // 32), M // 128, K // 32 // 4)
         b_scale_5d = swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4)
@@ -1337,8 +1332,8 @@ def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED,
         ):
             invalid_kwargs = {**kern_kwargs, **shape_overrides}
             with pytest.raises(
-                RuntimeError,
-                match="M64 two-CTA scaled MMA only supports K=128 and per-CTA N=64",
+                    RuntimeError,
+                    match="M64 two-CTA scaled MMA only supports K=128 and per-CTA N=64",
             ):
                 tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
                     a,
@@ -1361,8 +1356,8 @@ def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED,
     if BLOCK_M == 64 and WARP_SPECIALIZED:
         invalid_kwargs = {**kern_kwargs, "MMA_NUM_WARPS": 1}
         with pytest.raises(
-            RuntimeError,
-            match="scale lowering requires a power-of-two MMA partition with at least 4 warps",
+                RuntimeError,
+                match="scale lowering requires a power-of-two MMA partition with at least 4 warps",
         ):
             tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
                 a,

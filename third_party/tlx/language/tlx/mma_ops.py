@@ -661,9 +661,7 @@ def async_dot_scaled(
     # PTX ISA 9.4 Table 50 supports aggregate M=128 for cta_group::2. TLX
     # represents each CTA's half as M=64 with a TwoCTA_RHS accumulator.
     is_two_cta_m64 = M == 64 and two_ctas and acc.type.layout.blockM == 64
-    assert M == 128 or is_two_cta_m64, (
-        f"M must be 128, or 64 with a matching two-CTA accumulator, but got {M}"
-    )
+    assert M == 128 or is_two_cta_m64, (f"M must be 128, or 64 with a matching two-CTA accumulator, but got {M}")
     if not is_two_cta_m64:
         assert K >= 16, "K must be at least 16"
         assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"

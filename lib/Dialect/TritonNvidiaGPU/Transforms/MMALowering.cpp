@@ -78,8 +78,8 @@ static bool isConstantZero(Value value) {
 }
 
 static LogicalResult lowerTwoCTARHSScaleCopy(Value src, Value dst,
-                                              Operation *anchor,
-                                              PatternRewriter &rewriter) {
+                                             Operation *anchor,
+                                             PatternRewriter &rewriter) {
   Location loc = src.getLoc();
   auto srcType = cast<ttg::MemDescType>(src.getType());
   auto dstType = cast<ttg::MemDescType>(dst.getType());
@@ -98,15 +98,15 @@ static LogicalResult lowerTwoCTARHSScaleCopy(Value src, Value dst,
       context, shape, ttg::CGAEncodingAttr::get1CTALayout(context, 2));
   auto sharedEncoding = ttg::SharedLinearEncodingAttr::get(
       context, std::move(sharedLayout), /*alignment=*/128);
-  auto sharedViewType = ttg::MemDescType::get(
-      shape, elType, sharedEncoding, srcType.getMemorySpace(),
-      srcType.getMutableMemory());
-  Value sharedView = ttg::MemDescReinterpretOp::create(rewriter, loc,
-                                                       sharedViewType, src);
+  auto sharedViewType = ttg::MemDescType::get(shape, elType, sharedEncoding,
+                                              srcType.getMemorySpace(),
+                                              srcType.getMutableMemory());
+  Value sharedView =
+      ttg::MemDescReinterpretOp::create(rewriter, loc, sharedViewType, src);
   auto registerEncoding = getDefaultLayoutForTmemLdSt(dstType, numWarps);
   auto registerType = RankedTensorType::get(shape, elType, registerEncoding);
-  Value scale =
-      ttg::LocalLoadOp::create(rewriter, loc, registerType, sharedView, Value());
+  Value scale = ttg::LocalLoadOp::create(rewriter, loc, registerType,
+                                         sharedView, Value());
   Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
   TMEMStoreOp::create(rewriter, loc, dst, scale, pred);
   return success();
@@ -192,8 +192,8 @@ struct TCGen5MMAScaleSharedToTmemConversion
     }
     int blockM = op.getBlockM();
     int blockN = op.getBlockN();
-    auto dEncoding = cast<TensorMemoryEncodingAttr>(
-        op.getD().getType().getEncoding());
+    auto dEncoding =
+        cast<TensorMemoryEncodingAttr>(op.getD().getType().getEncoding());
     bool isTwoCTAM64 =
         op.getTwoCtas() && dEncoding.getBlockM() == 64 &&
         dEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS;
@@ -237,8 +237,8 @@ struct TCGen5MMAScaleSharedToTmemConversion
                 auto remote = arriveBarrier.getBarrier()
                                   .getDefiningOp<MapToRemoteBufferOp>();
                 if (remote && !isConstantZero(arriveBarrier.getPred()) &&
-                    areEquivalentBarrierViews(
-                                  remote.getSrc(), waitBarrier.getBarrier())) {
+                    areEquivalentBarrierViews(remote.getSrc(),
+                                              waitBarrier.getBarrier())) {
                   rhsPublicationBarrier = arrive;
                   break;
                 }
@@ -285,12 +285,12 @@ struct TCGen5MMAScaleSharedToTmemConversion
     }
     if (isa<ttg::SharedMemorySpaceAttr>(bScaleType.getMemorySpace())) {
       auto bScaleCTAMode = isTwoCTAM64 ? TensorMemoryCTAMode::TwoCTA_RHS
-                                      : TensorMemoryCTAMode::DEFAULT;
+                                       : TensorMemoryCTAMode::DEFAULT;
       if (rhsPublicationBarrier)
         rewriter.setInsertionPoint(rhsPublicationBarrier);
-      FailureOr<bool> changed = lowerScaleToTmem(
-          op.getBScaleMutable(), rewriter, blockN, bScaleBlockRepOrder,
-          bScaleCTAMode);
+      FailureOr<bool> changed =
+          lowerScaleToTmem(op.getBScaleMutable(), rewriter, blockN,
+                           bScaleBlockRepOrder, bScaleCTAMode);
       rewriter.setInsertionPoint(op);
       if (failed(changed))
         return failure();
@@ -309,8 +309,7 @@ struct TwoCTARHSScaleCopyConversion : public OpRewritePattern<TMEMCopyOp> {
         op.getDst().getType().getEncoding());
     if (!encoding || encoding.getCtaMode() != TensorMemoryCTAMode::TwoCTA_RHS)
       return failure();
-    if (failed(lowerTwoCTARHSScaleCopy(op.getSrc(), op.getDst(), op,
-                                       rewriter)))
+    if (failed(lowerTwoCTARHSScaleCopy(op.getSrc(), op.getDst(), op, rewriter)))
       return failure();
     rewriter.eraseOp(op);
     return success();

@@ -1199,8 +1199,8 @@ tensorMemoryScalesToLinearLayout(ArrayRef<int64_t> shape,
     auto bases = tile.getBases();
     bases[kRow].back() = bases[kCol].back();
     bases[kCol].pop_back();
-    tile = LinearLayout(std::move(bases), tile.getOutDims(),
-                        tile.isSurjective());
+    tile =
+        LinearLayout(std::move(bases), tile.getOutDims(), tile.isSurjective());
   }
   // Add a trivial block dimension
   tile *= LinearLayout::identity1D(1, kBlock, dims[0]);

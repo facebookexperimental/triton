@@ -478,7 +478,8 @@ LogicalResult TensorMemoryScalesEncodingAttr::verify(
   }
   if (ctaMode != TensorMemoryCTAMode::DEFAULT &&
       ctaMode != TensorMemoryCTAMode::TwoCTA_RHS) {
-    return emitError() << "scale layout only supports default or twocta_rhs CTA mode";
+    return emitError()
+           << "scale layout only supports default or twocta_rhs CTA mode";
   }
   return success();
 }
