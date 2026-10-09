@@ -604,8 +604,8 @@ def heuristic_config(M, N, K):
         return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
     # Tall deep-reduction workloads need output-width-specific choices because the measured 256-square default has substantial regret.
     if K > 256:
-        # Outputs wider than 256 with odd K use the measured rectangular winner instead of the rejected narrow-output generalization.
-        if N > 256 and K % 2 != 0:
+        # Outputs wider than 256 with K-dominant reductions use the measured rectangular winner.
+        if N > 256 and K > N:
             return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
         # At most 32 output columns favor the measured 32-column tile without padding to a square output block.
         if N <= 32:
@@ -616,12 +616,9 @@ def heuristic_config(M, N, K):
         # Outputs between 49 and 64 columns favor the measured four-wave 64-square configuration.
         if N <= 64:
             return [_config(64, 64, 64, 4, 4)]
-        # Odd reductions with at most 128 columns favor the measured four-wave square tile with a short K step.
-        if N <= 128 and K % 2 != 0:
-            return [_config(128, 128, 32, 8, 4)]
-        # Even reductions with at most 128 columns favor the measured eight-wave square tile with a K=64 step.
+        # At most 128 output columns favor the measured four-wave square tile with a short K step.
         if N <= 128:
-            return [_config(128, 128, 64, 8, 8)]
+            return [_config(128, 128, 32, 8, 4)]
         # Outputs between 129 and 256 columns favor the measured 64-column tile across multiple output blocks.
         if N <= 256:
             return [_config(128, 64, 64, 4, 8)]
