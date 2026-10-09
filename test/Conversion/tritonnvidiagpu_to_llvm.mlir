@@ -1426,3 +1426,440 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     llvm.return
   }
 }
+
+// -----
+
+// Named barriers select the `.aligned` NVVM intrinsic only when they provably
+// execute warp-uniformly; otherwise they fall back to the non-aligned form.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @named_barrier_wait_divergent_tid
+  tt.func @named_barrier_wait_divergent_tid() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %is_first = arith.cmpi eq, %tid, %c0 : index
+    cf.cond_br %is_first, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_wait_warp_id
+  tt.func @named_barrier_wait_warp_id() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %c32 = arith.constant 32 : i32
+    %warp = arith.divui %tid32, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // `(C - tid) / C` reverses lane order within each warp (lane 0 -> 1, lanes
+  // 1-31 -> 0), so it is not a warp ID; a branch on it is intra-warp divergent
+  // and must select the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_reverse_sub_tid
+  tt.func @named_barrier_wait_reverse_sub_tid() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %c32 = arith.constant 32 : i32
+    %rev = arith.subi %c32, %tid32 : i32
+    %warp = arith.divui %rev, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // Linearization is x-major, so a `tid.y` quotient by the warp size is not
+  // warp-constant in general: a warp can span `tid.y` values with different
+  // quotients. A branch on one must select the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_tid_y_quotient
+  tt.func @named_barrier_wait_tid_y_quotient() {
+    %tid = gpu.thread_id y
+    %tid32 = arith.index_cast %tid : index to i32
+    %c32 = arith.constant 32 : i32
+    %warp = arith.divui %tid32, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_arrive_program_id
+  tt.func @named_barrier_arrive_program_id() {
+    %pid = tt.get_program_id x : i32
+    %c0 = arith.constant 0 : i32
+    %is_zero = arith.cmpi eq, %pid, %c0 : i32
+    cf.cond_br %is_zero, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.arrive.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_arrive_data_dependent
+  tt.func @named_barrier_arrive_data_dependent(%ptr: !llvm.ptr) {
+    %v = llvm.load %ptr : !llvm.ptr -> i32
+    %c0 = arith.constant 0 : i32
+    %is_zero = arith.cmpi eq, %v, %c0 : i32
+    cf.cond_br %is_zero, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.arrive.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_arrive_func_arg
+  tt.func @named_barrier_arrive_func_arg(%flag: i1) {
+    cf.cond_br %flag, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.arrive.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_wait_dynamic_tid_id
+  tt.func @named_barrier_wait_dynamic_tid_id() {
+    %tid = gpu.thread_id x
+    %bar32 = arith.index_cast %tid : index to i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %bar32 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    tt.return
+  }
+
+  // Lane 0 skips the loop and returns 0; lane 1 runs it and returns 1.
+  // Both the initial and yielded values are constants, but the result is not
+  // warp-uniform because the bound is a scalar thread ID.
+  // CHECK-LABEL: @named_barrier_wait_lane_varying_for_result
+  tt.func @named_barrier_wait_lane_varying_for_result() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %result = scf.for %i = %c0 to %tid step %c1 iter_args(%value = %c0) -> (index) {
+      scf.yield %c1 : index
+    }
+    %branch = arith.cmpi eq, %result, %c0 : index
+    cf.cond_br %branch, ^then, ^exit
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^exit
+  ^exit:
+    tt.return
+  }
+
+  // The same zero-trip/one-trip distinction applies to scf.while results.
+  // CHECK-LABEL: @named_barrier_wait_lane_varying_while_result
+  tt.func @named_barrier_wait_lane_varying_while_result() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %result = scf.while (%state = %c0) : (index) -> (index) {
+      %first = arith.cmpi eq, %state, %c0 : index
+      %active = arith.cmpi ne, %tid, %c0 : index
+      %continue = arith.andi %first, %active : i1
+      scf.condition(%continue) %state : index
+    } do {
+    ^bb0(%state: index):
+      scf.yield %c1 : index
+    }
+    %branch = arith.cmpi eq, %result, %c0 : index
+    cf.cond_br %branch, ^then, ^exit
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^exit
+  ^exit:
+    tt.return
+  }
+
+  // The loop state starts uniform but the backedge yields a thread ID, so
+  // later iterations can diverge within a warp and the barrier must select
+  // the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_while_backedge_divergent
+  tt.func @named_barrier_wait_while_backedge_divergent() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %c10 = arith.constant 10 : index
+    %loop = scf.while (%state = %c0) : (index) -> (index) {
+      %lt = arith.cmpi ult, %state, %c10 : index
+      scf.condition(%lt) %state : index
+    } do {
+    ^bb0(%arg: index):
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      scf.yield %tid : index
+    }
+    tt.return
+  }
+
+  // A uniform condition can still forward a lane-varying init value as the
+  // `scf.while` result (including on the zero-trip path), even when the
+  // after-region yield is a constant.
+  // CHECK-LABEL: @named_barrier_wait_while_cond_arg_forward
+  tt.func @named_barrier_wait_while_cond_arg_forward() {
+    %tid = gpu.thread_id x
+    %pid = tt.get_program_id x : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c0 = arith.constant 0 : index
+    %result = scf.while (%state = %tid) : (index) -> (index) {
+      %run = arith.cmpi eq, %pid, %c0_i32 : i32
+      scf.condition(%run) %state : index
+    } do {
+    ^bb0(%arg: index):
+      scf.yield %c0 : index
+    }
+    %branch = arith.cmpi eq, %result, %c0 : index
+    cf.cond_br %branch, ^then, ^exit
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^exit
+  ^exit:
+    tt.return
+  }
+
+  // A loop with a uniform bound and a uniform backedge keeps `.aligned`.
+  // CHECK-LABEL: @named_barrier_wait_while_uniform
+  tt.func @named_barrier_wait_while_uniform(%n: index) {
+    %c0 = arith.constant 0 : index
+    %loop = scf.while (%state = %c0) : (index) -> (index) {
+      %lt = arith.cmpi ult, %state, %n : index
+      scf.condition(%lt) %state : index
+    } do {
+    ^bb0(%arg: index):
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      scf.yield %c0 : index
+    }
+    tt.return
+  }
+
+  // Sign extension from a width that keeps the sign bit above the lane bits
+  // preserves warp blocks, so the quotient is still a warp ID.
+  // CHECK-LABEL: @named_barrier_wait_sext_tid
+  tt.func @named_barrier_wait_sext_tid() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %tid64 = arith.extsi %tid32 : i32 to i64
+    %c32 = arith.constant 32 : i64
+    %warp = arith.divui %tid64, %c32 : i64
+    %c0 = arith.constant 0 : i64
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i64
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // Sign-extending a thread ID narrowed below the warp-size bits remaps lanes
+  // within a warp (lanes 16-31 go negative while lanes 0-15 stay
+  // non-negative), so the quotient is not a warp ID.
+  // CHECK-LABEL: @named_barrier_wait_narrow_sext_tid
+  tt.func @named_barrier_wait_narrow_sext_tid() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %narrow = arith.trunci %tid32 : i32 to i5
+    %wide = arith.extsi %narrow : i5 to i32
+    %c32 = arith.constant 32 : i32
+    %warp = arith.divui %wide, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // A divisor narrower than the warp-size bits cannot be a warp-size multiple;
+  // this must fall back cleanly instead of crashing in the modulus.
+  // CHECK-LABEL: @named_barrier_wait_narrow_divisor
+  tt.func @named_barrier_wait_narrow_divisor() {
+    %tid = gpu.thread_id x
+    %tid5 = arith.index_cast %tid : index to i5
+    %c16 = arith.constant 16 : i5
+    %warp = arith.divui %tid5, %c16 : i5
+    %c0 = arith.constant 0 : i5
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i5
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // Opaque inline asm may read lane-dependent state (e.g. `elect.sync`) even
+  // with uniform operands and no memory effects, so a branch on its result is
+  // not provably warp-uniform and must select the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_inline_asm
+  tt.func @named_barrier_wait_inline_asm() {
+    %c1 = arith.constant 1 : i1
+    %elected = llvm.inline_asm "elect.sync $0, $1;", "=b,b" %c1 : (i1) -> i1
+    cf.cond_br %elected, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
+  // CHECK-LABEL: @named_barrier_wait_warp_specialize
+  tt.func @named_barrier_wait_warp_specialize() {
+    ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 12 : i32} {
+  // Ping-pong across two partitions: partition bodies belong to the
+  // `warp_specialize.partitions` container op, which distributes whole warps,
+  // so both halves keep `.aligned`.
+  // CHECK-LABEL: @named_barrier_wait_warp_specialize_pingpong
+  tt.func @named_barrier_wait_warp_specialize_pingpong() {
+    ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4, 8>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.arrive.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    }
+    partition1() num_warps(4) {
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
