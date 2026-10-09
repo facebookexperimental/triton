@@ -100,13 +100,13 @@ def _retained_softmax_backward(Q, K, DO, LOGSUMEXP2, DELTA, Q_OFFSETS, KV_OFFSET
                                            stride=((1, 4 * BLOCK_Q, 0), (BLOCK_Q, 16 * BLOCK_Q)))
         for start in range(0, qe - qs, BLOCK_Q):
             m = qs + start + tl.arange(0, BLOCK_Q)
+            lse = tl.load(LOGSUMEXP2 + m, FIXED_Q | (m < qe), 0)
+            delta = tl.load(DELTA + m, FIXED_Q | (m < qe), 0)
             wait = tlx.async_load_wait_group(0)
             q = tlx.require_layout(tlx.local_load(qv, token=wait, layout=bl), bl)
             do = tlx.require_layout(tlx.local_load(dv, token=wait, layout=bl), bl)
             q_t = tlx.require_layout(tlx.local_load(tlx.local_trans(qv), token=wait, layout=score_b), score_b)
             do_t = tlx.require_layout(tlx.local_load(tlx.local_trans(dv), token=wait, layout=score_b), score_b)
-            lse = tl.load(LOGSUMEXP2 + m, FIXED_Q | (m < qe), 0)
-            delta = tl.load(DELTA + m, FIXED_Q | (m < qe), 0)
             nxt = m + BLOCK_Q
             qt = tlx.async_load(Q + nxt[:, None] * 128 + d[None, :], qv, mask=nxt[:, None] < qe, other=0)
             dt = tlx.async_load(DO + nxt[:, None] * 128 + d[None, :], dv, mask=nxt[:, None] < qe, other=0)
