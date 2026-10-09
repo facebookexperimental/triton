@@ -538,18 +538,21 @@ class tensor_memory_scales_layout_encoding:
         self,
         CTASplitM: int = 1,
         CTASplitN: int = 1,
+        ctaMode: int = TMemCTAMode.DEFAULT,
     ):
         self.CTASplitM = CTASplitM
         self.CTASplitN = CTASplitN
+        self.ctaMode = ctaMode
 
     @classmethod
-    def make_default(cls):
-        return cls(CTASplitM=1, CTASplitN=1)
+    def make_default(cls, ctaMode: int = TMemCTAMode.DEFAULT):
+        return cls(CTASplitM=1, CTASplitN=1, ctaMode=ctaMode)
 
     def to_ir(self, builder: ir.builder) -> None:
         return builder.make_tensor_memory_scales_encoding_attr(
             self.CTASplitM,
             self.CTASplitN,
+            self.ctaMode,
         )
 
 

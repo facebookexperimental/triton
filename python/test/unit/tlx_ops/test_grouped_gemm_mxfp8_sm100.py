@@ -195,10 +195,9 @@ def test_e8m0_reference_decodes_extreme_encodings():
 def test_grouped_gemm_mxfp8_catalog_entry():
     from triton.tlx.ops._catalog import CATALOG, InvalidInput, check_inputs, has_impl
 
-    specs = [spec for spec in CATALOG if spec.op == "grouped_gemm_mxfp8"]
+    specs = [spec for spec in CATALOG if spec.op == "grouped_gemm_mxfp8" and spec.arch == "sm100"]
     assert len(specs) == 1
     spec = specs[0]
-    assert spec.arch == "sm100"
     assert spec.variant == "ws_persistent_mxfp8"
     assert spec.impl == "triton.tlx.ops.kernels.grouped_gemm_mxfp8.sm100:grouped_gemm_mxfp8"
     assert spec.dtypes == frozenset({"float8_e4m3fn"})
@@ -206,7 +205,7 @@ def test_grouped_gemm_mxfp8_catalog_entry():
     assert not spec.supports_backward
     assert has_impl("grouped_gemm_mxfp8", "sm100")
     assert not has_impl("grouped_gemm_mxfp8", "sm90")
-    assert not has_impl("grouped_gemm_mxfp8", "gfx950")
+    assert has_impl("grouped_gemm_mxfp8", "gfx950")
 
     check_inputs(
         spec,

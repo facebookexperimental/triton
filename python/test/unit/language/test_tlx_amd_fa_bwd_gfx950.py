@@ -20,7 +20,7 @@ from unittest import mock
 import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
-from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as amd_fa_varlen_bwd
 from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _select_d64_dispatch,
@@ -634,21 +634,24 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
     def test_registration_captures_kernel_at_each_activation(self):
         from triton.tlx import pytorch as provider
 
-        first = object()
-        second = object()
+        originals = [object() for _ in range(4)]
         libraries = [mock.Mock(), mock.Mock()]
         with (
-                mock.patch.object(torch.library, "get_kernel", side_effect=(first, second)) as get_kernel,
+                mock.patch.object(torch.library, "get_kernel", side_effect=originals) as get_kernel,
                 mock.patch.object(torch.library, "Library", side_effect=libraries),
         ):
             first_handle = provider.register_tlx_gfx950_flash_attention_backward()
             second_handle = provider.register_tlx_gfx950_flash_attention_backward()
 
-        self.assertEqual(get_kernel.call_count, 2)
-        for library, original in zip(libraries, (first, second), strict=True):
-            implementation = library.impl.call_args.args[1]
-            self.assertIs(implementation.args[0], original)
-            self.assertTrue(library.impl.call_args.kwargs["with_keyset"])
+        ops = ("_scaled_dot_product_flash_attention_backward", "_flash_attention_backward")
+        self.assertEqual(get_kernel.call_args_list,
+                         [mock.call(getattr(torch.ops.aten, op).default, "CUDA") for _ in libraries for op in ops])
+        for activation, library in enumerate(libraries):
+            self.assertEqual(library.impl.call_count, 2)
+            for index, call in enumerate(library.impl.call_args_list):
+                self.assertEqual(call.args[0], ops[index])
+                self.assertIs(call.args[1].args[0], originals[2 * activation + index])
+                self.assertTrue(call.kwargs["with_keyset"])
         first_handle.remove()
         second_handle.remove()
         self.assertIsNone(first_handle.library)
@@ -674,8 +677,9 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
         self.assertFalse(provider._is_performance_validated(*tensors, 0.125, False))
 
         losing_d128 = (
-            ((16, 16, 4096, 128), (16, 16, 4096, 128), False),
-            ((16, 64, 2048, 128), (16, 8, 2048, 128), True),
+            ((16, 16, 8192, 128), (16, 16, 8192, 128), False),
+            ((16, 16, 16384, 128), (16, 16, 16384, 128), False),
+            ((16, 64, 8192, 128), (16, 8, 8192, 128), True),
         )
         for q_shape, k_shape, causal in losing_d128:
             with self.subTest(q_shape=q_shape, k_shape=k_shape, causal=causal):
@@ -712,7 +716,14 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
         d128_cases = (
             ((16, 16, 1024, 128), (16, 16, 1024, 128), False),
             ((16, 16, 2048, 128), (16, 16, 2048, 128), False),
+            ((16, 16, 4096, 128), (16, 16, 4096, 128), False),
+            ((16, 16, 4096, 128), (16, 16, 4096, 128), True),
+            ((16, 16, 8192, 128), (16, 16, 8192, 128), True),
+            ((16, 16, 16384, 128), (16, 16, 16384, 128), True),
+            ((16, 64, 8192, 128), (16, 8, 8192, 128), False),
             ((16, 64, 1024, 128), (16, 8, 1024, 128), True),
+            ((16, 64, 2048, 128), (16, 8, 2048, 128), True),
+            ((16, 64, 4096, 128), (16, 8, 4096, 128), True),
         )
         with mock.patch.dict(os.environ, {}, clear=True):
             for q_shape, k_shape, causal in d128_cases:
@@ -896,6 +907,9 @@ class TestTLXFlashAttentionProvider(unittest.TestCase):
             {"sink_insts_to_avoid_spills": not measured.sink_insts_to_avoid_spills},
             {"regclass_priority_trumps_globalness": not measured.regclass_priority_trumps_globalness},
             {"reverse_local_assignment": not measured.reverse_local_assignment},
+            {"kv_splits": 4},
+            {"phase_iglp": 3},
+            {"peel_causal": True},
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), mock.patch.object(
@@ -1524,6 +1538,122 @@ def test_varlen_d128_plan_tightens_provable_schedule_capacities(q_lengths, kv_le
     )
     assert capacities == expected_capacities
     amd_fa_varlen_bwd.validate_varlen_backward_plan(plan)
+
+
+def _mock_varlen_plan_device_kernels(monkeypatch):
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_validate_cu_seqlens_metadata", mock.Mock())
+    validate = mock.MagicMock()
+    build = mock.MagicMock()
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_validate_offsets", validate)
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_varlen_build_compact_schedules", build)
+    return validate.__getitem__.return_value, build.__getitem__.return_value
+
+
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths", "shared_offsets", "expected_capacities"),
+    (
+        pytest.param([17, 31, 40], [33, 129, 7], False, (7, 1, 3, 3), id="mixed"),
+        pytest.param([16, 32], [128, 256], False, (3, 3, 0, 2), id="all-full"),
+        pytest.param([1, 17], [1, 127], False, (3, 0, 2, 2), id="all-tail"),
+        pytest.param([17, 31, 40], [17, 31, 40], False, (7, 0, 3, 3), id="equal-separate"),
+        pytest.param([17, 31, 40], [17, 31, 40], True, (7, 0, 3, 3), id="equal-shared"),
+    ),
+)
+def test_varlen_d128_plan_reuses_host_metadata_host(monkeypatch, q_lengths, kv_lengths, shared_offsets,
+                                                    expected_capacities):
+    validate, build = _mock_varlen_plan_device_kernels(monkeypatch)
+    read = mock.Mock(side_effect=AssertionError("host metadata must avoid offset reads"))
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_read_cu_seqlens", read)
+    q_offsets = [0, *itertools.accumulate(q_lengths)]
+    kv_offsets = [0, *itertools.accumulate(kv_lengths)]
+    cu_q = torch.tensor(list(itertools.chain.from_iterable((offset, -1) for offset in q_offsets)),
+                        dtype=torch.int32)[::2]
+    cu_kv = cu_q if shared_offsets else torch.tensor(
+        list(itertools.chain.from_iterable((offset, -1) for offset in kv_offsets)), dtype=torch.int32)[::2]
+
+    plan = amd_fa_varlen_bwd._prepare_varlen_backward(cu_q, cu_kv,
+                                                      host_metadata=(q_offsets, q_lengths, kv_offsets, kv_lengths))
+
+    read.assert_not_called()
+    assert plan.cu_seqlens_q.is_contiguous() and plan.cu_seqlens_k.is_contiguous()
+    assert plan.cu_seqlens_q.data_ptr() != cu_q.data_ptr()
+    assert plan.cu_seqlens_k.data_ptr() != cu_kv.data_ptr()
+    assert (plan.cu_seqlens_q is plan.cu_seqlens_k) is shared_offsets
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (sum(q_lengths), sum(kv_lengths), max(q_lengths),
+                                                                      max(kv_lengths))
+    assert plan.batch == len(q_lengths)
+    assert plan.qk_offsets_equal is (q_offsets == kv_offsets)
+    assert (
+        plan.q_block_sequence.numel(),
+        plan.full_kv_block_sequence.numel(),
+        plan.tail_kv_block_sequence.numel(),
+        plan.wide_kv_start.numel(),
+    ) == expected_capacities
+    assert plan.wide_task_count == expected_capacities[-1]
+    validate.assert_called_once()
+    build.assert_called_once()
+    assert validate.call_args.args[:2] == (plan.cu_seqlens_q, plan.cu_seqlens_k)
+    assert build.call_args.args[:2] == (plan.cu_seqlens_q, plan.cu_seqlens_k)
+    cu_q.zero_()
+    cu_kv.zero_()
+    assert plan.cu_seqlens_q.tolist() == q_offsets
+    assert plan.cu_seqlens_k.tolist() == kv_offsets
+
+
+@pytest.mark.parametrize("shared_offsets", (False, True))
+def test_varlen_d128_plan_reads_owned_offsets_host(monkeypatch, shared_offsets):
+    _mock_varlen_plan_device_kernels(monkeypatch)
+    offsets = [0, 17, 48]
+    cu_q = torch.tensor([0, -1, 17, -1, 48, -1], dtype=torch.int32)[::2]
+    cu_kv = cu_q if shared_offsets else cu_q.clone()
+    read = mock.Mock(wraps=amd_fa_varlen_bwd._read_cu_seqlens)
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_read_cu_seqlens", read)
+
+    plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
+
+    assert read.call_count == (1 if shared_offsets else 2)
+    assert read.call_args_list[0].args[1] is plan.cu_seqlens_q
+    if not shared_offsets:
+        assert read.call_args_list[1].args[1] is plan.cu_seqlens_k
+    assert plan.cu_seqlens_q.is_contiguous() and plan.cu_seqlens_k.is_contiguous()
+    assert plan.cu_seqlens_q.data_ptr() != cu_q.data_ptr()
+    assert plan.cu_seqlens_k.data_ptr() != cu_kv.data_ptr()
+    assert (plan.cu_seqlens_q is plan.cu_seqlens_k) is shared_offsets
+    assert plan.qk_offsets_equal is True
+    cu_q.zero_()
+    cu_kv.zero_()
+    assert plan.cu_seqlens_q.tolist() == plan.cu_seqlens_k.tolist() == offsets
+
+
+def test_varlen_d128_plan_host_metadata_compact_prefix_host(monkeypatch):
+    _mock_varlen_plan_device_kernels(monkeypatch)
+    read = mock.Mock(side_effect=AssertionError("host metadata must avoid offset reads"))
+    monkeypatch.setattr(amd_fa_varlen_bwd, "_read_cu_seqlens", read)
+    q_offsets = [0, *itertools.accumulate(_H12_DS_Q_LENGTHS)]
+    kv_offsets = [0, *itertools.accumulate(_H12_DS_KV_LENGTHS)]
+    cu_q = torch.tensor(q_offsets, dtype=torch.int32)
+    cu_kv = torch.tensor(kv_offsets, dtype=torch.int32)
+
+    plan = amd_fa_varlen_bwd._prepare_varlen_backward(
+        cu_q, cu_kv, host_metadata=(q_offsets, _H12_DS_Q_LENGTHS, kv_offsets, _H12_DS_KV_LENGTHS))
+
+    expected = _packed_ds_offsets(_H12_DS_Q_LENGTHS, _H12_DS_KV_LENGTHS)
+    assert plan.packed_ds_prefix.dtype is torch.int64
+    assert plan.packed_ds_prefix.tolist() == expected
+    assert plan.packed_ds_head_elements == expected[-1]
+    assert (plan.total_q, plan.total_kv, plan.max_q, plan.max_kv) == (50754, 100696, 5662, 10414)
+    assert plan.wide_task_count == sum((length + 255) // 256 for length in _H12_DS_KV_LENGTHS)
+    read.assert_not_called()
+
+
+@pytest.mark.parametrize("token_metadata", ((17, None, None, None), (17, 33, 17, 33)))
+def test_varlen_d128_plan_rejects_combined_host_metadata_host(monkeypatch, token_metadata):
+    _mock_varlen_plan_device_kernels(monkeypatch)
+    cu_q = torch.tensor([0, 17], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 33], dtype=torch.int32)
+    with pytest.raises(ValueError, match="host offset metadata cannot be combined with token metadata"):
+        amd_fa_varlen_bwd._prepare_varlen_backward(cu_q, cu_kv, *token_metadata,
+                                                   host_metadata=([0, 17], [17], [0, 33], [33]))
 
 
 def _make_seeded_extend_attention_lengths(batch, max_context, seed):
@@ -3318,6 +3448,182 @@ def test_varlen_d128_split_codegen_is_scratch_free_gfx950():
         assert "buffer_atomic_pk_add_bf16" in compiled.asm["amdgcn"]
 
 
+@pytest.mark.parametrize("op", ("prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward"))
+def test_public_varlen_bwd_cpu_is_unsupported(op):
+    from triton.tlx import ops
+
+    function = getattr(ops, op)
+    offsets = torch.tensor([0, 1], dtype=torch.int32)
+    q = torch.empty((1, 1, 128), dtype=torch.bfloat16)
+    lse = torch.empty((1, 1), dtype=torch.float32)
+    args = (offsets, offsets) if op.startswith("prepare_") else (q, q, q, q, q, lse, object())
+    with pytest.raises(ops.UnsupportedOp, match="could not determine a GPU architecture.*cpu"):
+        function(*args)
+
+
+@pytest.mark.parametrize("invalid", ("rank", "batch", "dtype", "device"))
+def test_public_varlen_bwd_prepare_rejects_invalid_metadata(invalid):
+    from triton.tlx import ops
+
+    offsets = torch.tensor([0, 1], dtype=torch.int32)
+    other = {
+        "rank": offsets.view(1, 2),
+        "batch": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "dtype": offsets.to(torch.int64),
+        "device": torch.empty(2, dtype=torch.int32, device="meta"),
+    }[invalid]
+    with pytest.raises(ops.InvalidInput):
+        ops.prepare_flash_attn_varlen_backward(offsets, other)
+
+
+@pytest.mark.parametrize("invalid", ("rank", "device"))
+def test_public_varlen_bwd_rejects_invalid_inputs(invalid):
+    from triton.tlx import ops
+
+    q = torch.empty((1, 1, 128), dtype=torch.bfloat16)
+    k = q.view(1, 128) if invalid == "rank" else torch.empty_like(q, device="meta")
+    lse = torch.empty((1, 1), dtype=torch.float32)
+    with pytest.raises(ops.InvalidInput):
+        ops.flash_attn_varlen_backward(q, k, k, q, q, lse, object())
+
+
+def test_public_varlen_bwd_rejects_deterministic_algorithms():
+    from triton.tlx import ops
+
+    q = torch.empty((1, 1, 128), dtype=torch.bfloat16)
+    lse = torch.empty((1, 1), dtype=torch.float32)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        with pytest.raises(ops.UnsupportedOp, match="deterministic"):
+            ops.flash_attn_varlen_backward(q, q, q, q, q, lse, object())
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+@pytest.mark.parametrize(
+    ("op", "dtype", "dimensions"),
+    (
+        ("prepare_flash_attn_varlen_backward", torch.int64, {}),
+        ("flash_attn_varlen_backward", torch.float16, {"HEAD_DIM": 128}),
+        ("flash_attn_varlen_backward", torch.bfloat16, {"HEAD_DIM": 64}),
+    ),
+)
+def test_public_varlen_bwd_catalog_rejects_unsupported_inputs(op, dtype, dimensions):
+    from triton.tlx.ops._catalog import InvalidInput, check_inputs, impl_for
+
+    _, spec = impl_for(op, arch="gfx950")
+    with pytest.raises(InvalidInput, match="does not support"):
+        check_inputs(spec, dtype=dtype, **dimensions)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(("q_heads", "kv_heads", "causal"), ((2, 2, False), (6, 2, False), (2, 2, True)))
+@pytest.mark.parametrize("sm_scale", (None, -0.25))
+def test_public_varlen_bwd_prepared_plan_gfx950(q_heads, kv_heads, causal, sm_scale):
+    from triton.tlx import ops
+
+    q_lengths = [7, 31]
+    kv_lengths = q_lengths if causal else [33, 129]
+    q, k, v, out, do, lse, cu_q, cu_kv, _, expected = _make_varlen_d128_reference_case(
+        q_lengths, kv_lengths, q_heads=q_heads, kv_heads=kv_heads, causal=causal, sm_scale=sm_scale, seed=3775)
+    plan = ops.prepare_flash_attn_varlen_backward(cu_q, cu_kv)
+    # Public preparation owns copies; the caller's original offset tensors
+    # may be reused without changing the immutable plan.
+    cu_q.zero_()
+    cu_kv.zero_()
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    for _ in range(2):
+        actual = ops.flash_attn_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, causal)
+        for result, reference in zip(actual, expected, strict=True):
+            assert result.shape == reference.shape
+            assert result.dtype is torch.bfloat16 and not result.requires_grad and result.grad_fn is None
+            assert torch.isfinite(result).all()
+            error = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+                reference.float())
+            assert error.item() < 1e-2
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_public_varlen_bwd_prepare_compact_prefix_gfx950():
+    from triton.tlx import ops
+
+    q_offsets = [0, *itertools.accumulate(_H12_DS_Q_LENGTHS)]
+    kv_offsets = [0, *itertools.accumulate(_H12_DS_KV_LENGTHS)]
+    cu_q = torch.tensor(q_offsets, dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor(kv_offsets, dtype=torch.int32, device="cuda")
+    plan = ops.prepare_flash_attn_varlen_backward(cu_q, cu_kv)
+    expected = _packed_ds_offsets(_H12_DS_Q_LENGTHS, _H12_DS_KV_LENGTHS)
+    assert plan.packed_ds_prefix.tolist() == expected
+    assert plan.packed_ds_head_elements == expected[-1]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("offsets", ([0, 0, 16], [1, 8, 16], [0, 16, 8]))
+def test_public_varlen_bwd_prepare_rejects_invalid_offsets_gfx950(offsets):
+    from triton.tlx import ops
+
+    cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    with pytest.raises(ops.InvalidInput, match="start at zero|strictly increasing"):
+        ops.prepare_flash_attn_varlen_backward(cu, cu)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_public_varlen_bwd_preparation_rejects_capture_gfx950():
+    from triton.tlx import ops
+
+    cu = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+    # Resolve the catalog before capture so this targets the explicit guard.
+    ops.prepare_flash_attn_varlen_backward(cu, cu)
+    with pytest.raises(ops.InvalidInput, match="outside CUDA graph capture"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            ops.prepare_flash_attn_varlen_backward(cu, cu)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_public_varlen_bwd_prepared_capture_replay_gfx950():
+    from triton.tlx import ops
+
+    q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = _make_varlen_d128_reference_case([7, 31], [33, 129],
+                                                                                           q_heads=2, kv_heads=2,
+                                                                                           seed=3776)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        plan = ops.prepare_flash_attn_varlen_backward(cu_q, cu_kv)
+        ops.flash_attn_varlen_backward(q, k, v, out, do, lse, plan, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = ops.flash_attn_varlen_backward(q, k, v, out, do, lse, plan, scale)
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(2):
+        for result in actual:
+            result.fill_(float("nan"))
+        graph.replay()
+        for result, reference in zip(actual, expected, strict=True):
+            assert torch.isfinite(result).all()
+            error = torch.linalg.vector_norm(result.float() - reference.float()) / torch.linalg.vector_norm(
+                reference.float())
+            assert error.item() < 1e-2
+
+
+def test_varlen_bwd_tutorial_compatibility_shim():
+    from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd as tutorial_bwd
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as gfx950_varlen_bwd
+
+    for name in (
+            "VarlenBackwardPlan",
+            "prepare_varlen_backward",
+            "validate_varlen_backward_plan",
+            "fa_varlen_backward",
+    ):
+        assert getattr(tutorial_bwd, name) is getattr(gfx950_varlen_bwd, name)
+        assert name in tutorial_bwd.__all__
+
+
 # Dense backward contract tests live here rather than in the packaged kernel
 # module. Keep these broader than the PyTorch provider allow-list: they protect
 # the retained direct API and its explicit experimental dispatches.
@@ -3525,6 +3831,101 @@ def test_dense_bwd_gqa_supported_shapes_end_to_end_gfx950(shape, causal):
     for actual, expected in zip(actual_grads, case.grads, strict=True):
         assert torch.isfinite(actual).all()
         assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.parametrize(
+    ("hq", "hk", "n", "causal", "bm", "splits", "iglp", "peel"),
+    [(16, 16, 4096, False, 16, 1, 3, False), (16, 16, 4096, True, 16, 1, 3, True), (16, 16, 8192, True, 16, 1, 3, True),
+     (16, 16, 16384, True, 16, 1, 3, True), (64, 8, 2048, True, 16, 4, -1, False),
+     (64, 8, 4096, True, 16, 4, -1, False), (64, 8, 8192, False, 32, 1, -1, False)],
+)
+def test_dense_bwd_optimized_dispatch(hq, hk, n, causal, bm, splits, iglp, peel, monkeypatch):
+    for name in (amd_fa_bwd._D128_SINK_INSTS_ENV, amd_fa_bwd._D128_REGCLASS_PRIORITY_ENV,
+                 amd_fa_bwd._D128_REVERSE_LOCAL_ENV):
+        monkeypatch.delenv(name, raising=False)
+    config = amd_fa_bwd._select_d128_interleaved_dispatch((16, hq, n, 128), (16, hk, n, 128), causal)
+    assert (config.block_m, config.kv_splits, config.phase_iglp, config.peel_causal) == (bm, splits, iglp, peel)
+    expected_entry = (amd_fa_bwd._dense_bwd_dkdv_dq_bm32_kernel
+                      if bm == 32 else amd_fa_bwd._attn_bwd_dkdv_dq_d128_gqa_kernel)
+    assert config.main_entry is expected_entry
+
+
+@pytest.mark.parametrize(("hq", "hk", "n", "causal"), [(16, 16, 2048, True), (16, 16, 8192, False), (64, 8, 1024, True),
+                                                       (64, 8, 8192, True), (64, 8, 4096, False)])
+def test_dense_bwd_unmeasured_dispatch_is_unchanged(hq, hk, n, causal):
+    default = amd_fa_bwd._select_d128_interleaved_dispatch()
+    actual = amd_fa_bwd._select_d128_interleaved_dispatch((16, hq, n, 128), (16, hk, n, 128), causal)
+    assert actual == default
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("route", "hk"),
+    [
+        pytest.param("mha", 2, id="mha"),
+        pytest.param("causal_mha", 2, id="causal_mha"),
+        pytest.param("head_split", 1, id="head_split-hkv1"),
+        pytest.param("head_split", 2, id="head_split-hkv2"),
+        pytest.param("bm32", 1, id="bm32-hkv1"),
+        pytest.param("bm32", 2, id="bm32-hkv2"),
+    ],
+)
+@pytest.mark.parametrize("n", [256, 768])
+@pytest.mark.parametrize("sm_scale", [128**-0.5, 0.0, -0.125])
+def test_dense_bwd_optimized_routes_gfx950(route, hk, n, sm_scale, monkeypatch):
+    grouped = route in ("head_split", "bm32")
+    causal = route in ("causal_mha", "head_split")
+    # Preserve GQA ratio eight while covering addressing across original KV heads.
+    hq = 8 * hk if grouped else hk
+    measured_n = 8192 if route == "bm32" else 4096
+    measured = amd_fa_bwd._select_d128_interleaved_dispatch((16, 64 if grouped else 16, measured_n, 128),
+                                                            (16, 8 if grouped else 16, measured_n, 128), causal)
+    monkeypatch.setattr(amd_fa_bwd, "_select_d128_interleaved_dispatch", lambda *args: measured)
+    case = _make_dense_gqa_reference_case((2, hq, hk, n, 128), causal=causal, seed=2026, sm_scale=sm_scale)
+    actual = fa_backward(*case.kernel_args)
+    for result, expected in zip(actual, case.grads, strict=True):
+        assert torch.isfinite(result).all()
+        if torch.count_nonzero(expected).item() == 0:
+            assert torch.count_nonzero(result).item() == 0
+        else:
+            assert _snr_db(result, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    ("route", "hk"),
+    [
+        pytest.param("causal_mha", 2, id="causal_mha"),
+        pytest.param("head_split", 1, id="head_split-hkv1"),
+        pytest.param("head_split", 2, id="head_split-hkv2"),
+        pytest.param("bm32", 1, id="bm32-hkv1"),
+        pytest.param("bm32", 2, id="bm32-hkv2"),
+    ],
+)
+def test_dense_bwd_optimized_graph_replay_gfx950(route, hk, monkeypatch):
+    grouped = route != "causal_mha"
+    causal = route != "bm32"
+    hq = 8 * hk if grouped else hk
+    n = 8192 if route == "bm32" else 4096
+    measured = amd_fa_bwd._select_d128_interleaved_dispatch((16, 64 if grouped else 16, n, 128),
+                                                            (16, 8 if grouped else 16, n, 128), causal)
+    monkeypatch.setattr(amd_fa_bwd, "_select_d128_interleaved_dispatch", lambda *args: measured)
+    case = _make_dense_gqa_reference_case((1, hq, hk, 256, 128), causal=causal, seed=3899)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fa_backward(*case.kernel_args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = fa_backward(*case.kernel_args)
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(2):
+        for result in actual:
+            result.fill_(float("nan"))
+        graph.replay()
+        for result, expected in zip(actual, case.grads, strict=True):
+            assert torch.isfinite(result).all()
+            assert _snr_db(result, expected) >= 40.0
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

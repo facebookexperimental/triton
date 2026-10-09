@@ -66,6 +66,36 @@ jobs:
           restore-keys: |
             ccache-build-wheel-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Compute build dependency cache keys
+        id: cache-key
+        run: |
+          llvm_file="cmake/llvm-info.json"
+          amd_file="cmake/amd-llvm-info.json"
+
+          # Check if files exist before proceeding
+          if [[ ! -f "$llvm_file" || ! -f "$amd_file" ]]; then
+            echo "Error: Required dependency files are missing."
+            exit 1
+          fi
+
+          # Both manifests carry their hash + build_number; key off the content
+          # hash so any LLVM or AMD codegen bump invalidates the cache.
+          echo "llvm=$(sha256sum $llvm_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+          echo "amd=$(sha256sum $amd_file | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+        shell: bash
+      - name: Restore build dependencies
+        id: restore-build-deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          # Prebuilt outputs of llvm-build.yml and amd-codegen-llvm-build.yml,
+          # downloaded into the Triton cache dir by build_helpers during the
+          # wheel build. Every wheel ships the AMD backend, so every build
+          # needs both trees.
+          path: |
+            ~/.triton/llvm
+            ~/.triton/amd
+          key: ${{ runner.os }}-${{ runner.arch }}-llvm-${{ steps.cache-key.outputs.llvm }}-amd-${{ steps.cache-key.outputs.amd }}
+
       - name: Set up build environment
         env:
           VIRTUAL_ENV: ${{ runner.temp }}/triton-build-venv
@@ -79,6 +109,14 @@ jobs:
         run: |
           uv build --wheel --no-build-isolation --out-dir dist/
           ls -lh dist/
+
+      - name: Save build dependencies
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.triton/llvm
+            ~/.triton/amd
+          key: ${{ steps.restore-build-deps-cache.outputs.cache-primary-key }}
 
       - name: Validate wheel and prepare artifact
         id: wheel

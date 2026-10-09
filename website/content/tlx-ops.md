@@ -41,6 +41,7 @@ flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
 flash_attn_mxfp8/gfx950.py
+flash_attn_varlen/gfx950.py
 hstu_attn/sm100.py
 kda/sm100.py
 ```
@@ -55,12 +56,13 @@ kernels/
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
     flash_attn_mxfp8/     sm100.py  gfx950.py           (gfx950 forward only)
+    flash_attn_varlen/    gfx950.py                     (forward only)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
     grouped_gemm/         sm100.py  gfx950.py
-    grouped_gemm_mxfp8/   sm100.py
+    grouped_gemm_mxfp8/   sm100.py  gfx950.py
     addmm_glu/            gfx950.py
     paged_decode/         gfx950.py
     ikbo_fa/              gfx950.py
@@ -113,9 +115,10 @@ out = triton.tlx.ops.grouped_gemm_mxfp8(
 
 The exact public signature is
 `(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None,
-sf_layout='natural')`. This is a forward-only SM100 (compute capability 10.0)
-operation: E4M3 inputs and E8M0 scale factors produce a contiguous BF16 result.
-It has no backward implementation or non-SM100 fallback.
+sf_layout='natural')`. This is a forward-only operation for SM100 (compute
+capability 10.0) and gfx950 (MI350/MI355X): E4M3 inputs and E8M0 scale factors
+produce a contiguous BF16 result. It has no backward implementation or fallback
+on other architectures.
 
 ### Data and group layout
 
@@ -165,3 +168,10 @@ saturated N/K shapes use a cooperative 2CTA cluster, while other shapes retain
 the 1CTA path. Each launch owns a counter initialized to zero; that reset is part
 of CUDA graph capture and is replayed before the kernel, so repeated graph
 replays traverse all tiles.
+
+The gfx950 implementation launches one persistent workgroup per CU (`num_sms`
+counts CUs) with an XCD-aware static tile stride, so it needs no counter and is
+graph-safe. When 256x256 tiles fill the device it uses the 2x2-quadrant
+`warp_pipeline_stage` engine of the FP16 gfx950 grouped GEMM, with each
+half-tile's scales copied direct-to-LDS alongside its data. Smaller problems
+use a compiler-pipelined 128-row tile. It does not autotune.

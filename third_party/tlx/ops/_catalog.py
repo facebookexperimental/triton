@@ -30,6 +30,7 @@ class OpSpec:
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
     supports_backward: bool = False
+    default_space: str = "heuristic"  # used when the caller passes space=None
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -50,6 +51,8 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
+        # The full space is only 8 configs (seconds to tune) and beats the heuristic on tall shapes.
+        default_space="full",
     ),
     OpSpec(
         op="mm",
@@ -121,6 +124,16 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
                                                                                            for ptr in d["base_ptrs"]),
         requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="grouped_gemm_mxfp8",
+        arch="gfx950",
+        variant="persistent_warp_pipeline_mxfp8",
+        impl="triton.tlx.ops.kernels.grouped_gemm_mxfp8.gfx950:grouped_gemm_mxfp8",
+        dtypes=frozenset({"float8_e4m3fn"}),
+        accepts=lambda d: all(row_bytes % 16 == 0 for row_bytes in d["row_bytes"]) and all(ptr % 16 == 0
+                                                                                           for ptr in d["base_ptrs"]),
+        requires=frozenset(),
     ),
     OpSpec(
         op="grouped_gemm",
@@ -216,6 +229,23 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=True,
     ),
     OpSpec(
+        op="prepare_flash_attn_varlen_backward",
+        arch="gfx950",
+        variant="host_validated",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:prepare_varlen_backward",
+        dtypes=frozenset({"int32"}),
+    ),
+    OpSpec(
+        op="flash_attn_varlen_backward",
+        arch="gfx950",
+        variant="prepared",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:fa_varlen_backward",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        # Explicit first-order gradients; differentiating this op is unsupported.
+        supports_backward=False,
+    ),
+    OpSpec(
         op="flash_attn_mxfp8",
         arch="sm100",
         variant="ws_pipelined_persistent_mxfp8",
@@ -232,6 +262,16 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx950:flash_attn_mxfp8",
         dtypes=_BF16,
         accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
+        requires=frozenset(),
+        supports_backward=False,
+    ),
+    OpSpec(
+        op="flash_attn_varlen",
+        arch="gfx950",
+        variant="mfma_interleaved",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950:flash_attn_varlen",
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
         requires=frozenset(),
         supports_backward=False,
     ),

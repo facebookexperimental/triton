@@ -357,13 +357,15 @@ def require_tmem_layout(src: tlx.buffered_tensor, col_stride: int, cta_mode: int
     return src.handle
 
 
-def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
-    """
-    Require tensor memory scales layout for a TMEM tensor.
-    """
+def require_tmem_scales_layout(
+    src: tlx.buffered_tensor,
+    cta_mode: int = tlx.TMemCTAMode.DEFAULT,
+    _builder=None,
+):
+    """Require the requested tensor-memory scale layout for a TMEM tensor."""
     assert isinstance(
         src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem, ("input must be a TMEM tensor")
-    layout = tlx.tensor_memory_scales_layout_encoding.make_default()
+    layout = tlx.tensor_memory_scales_layout_encoding.make_default(cta_mode)
     layout_handle = layout.to_ir(_builder)
     return _builder.create_require_layout(src.handle, layout_handle)
 
@@ -647,19 +649,6 @@ def async_dot_scaled(
     version = 5 if cuda_compute_capability >= 100 else 3
     assert version == 5, "async_dot_scaled is only available on Blackwell"
 
-    M, K, N = A.shape[0], A.shape[1], B.shape[1]
-    # Blackwell block-scaled tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA
-    # instruction shape is fixed to M=128 with N a multiple of 8 in [8, 256]. K is
-    # only lower-bounded because the lowering splits the K blocks across instructions.
-    assert M == 128, f"M must be 128 for the scaled MMA, but got {M}"
-    assert K >= 16, "K must be at least 16"
-    assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
-
-    assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
-    assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
-    assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
-
-    # Handle input formats
     supported_formats = {"e2m1", "e4m3", "e5m2"}
     A_format = tl._unwrap_if_constexpr(A_format)
     B_format = tl._unwrap_if_constexpr(B_format)
@@ -667,6 +656,19 @@ def async_dot_scaled(
     assert B_format in supported_formats, f"Unsupported B_format: {B_format}"
     A_type = _semantic._str_to_fp_type(A_format)
     B_type = _semantic._str_to_fp_type(B_format)
+
+    M, K, N = A.shape[0], A.shape[1], B.shape[1]
+    # PTX ISA 9.4 Table 50 supports aggregate M=128 for cta_group::2. TLX
+    # represents each CTA's half as M=64 with a TwoCTA_RHS accumulator.
+    is_two_cta_m64 = M == 64 and two_ctas and acc.type.layout.blockM == 64
+    assert M == 128 or is_two_cta_m64, (f"M must be 128, or 64 with a matching two-CTA accumulator, but got {M}")
+    if not is_two_cta_m64:
+        assert K >= 16, "K must be at least 16"
+        assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
+
+    assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
+    assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
+    assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
 
     a_is_tmem = A.type.storage == tlx.storage_kind.tmem
     a_cta_mode = tlx.TMemCTAMode.DEFAULT
@@ -696,13 +698,14 @@ def async_dot_scaled(
     assert isinstance(B_scale, tlx.buffered_tensor), "B_scale must be a buffered tensor"
 
     if A_scale.type.storage == tlx.storage_kind.tmem:
-        A_scale_handle = require_tmem_scales_layout(A_scale, _semantic.builder)
+        A_scale_handle = require_tmem_scales_layout(A_scale, _builder=_semantic.builder)
     else:
         assert A_scale.type.storage == tlx.storage_kind.smem, "A_scale must be in SMEM or TMEM"
         A_scale_handle = require_nv_mma_shared_layout(A_scale, False, _semantic.builder)
 
     if B_scale.type.storage == tlx.storage_kind.tmem:
-        B_scale_handle = require_tmem_scales_layout(B_scale, _semantic.builder)
+        b_scale_cta_mode = tlx.TMemCTAMode.TwoCTA_RHS if is_two_cta_m64 else tlx.TMemCTAMode.DEFAULT
+        B_scale_handle = require_tmem_scales_layout(B_scale, b_scale_cta_mode, _semantic.builder)
     else:
         assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be in SMEM or TMEM"
         B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)

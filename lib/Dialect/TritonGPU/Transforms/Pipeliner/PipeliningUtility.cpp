@@ -10,6 +10,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -212,6 +213,22 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
                     predicatedOp.getPredicateOperand(), pred);
     predicatedOp.setPredicateOperand(mask);
     return op;
+  }
+  // Dots (tt.dot, ttng.warp_group_dot, ...): predicate by executing
+  // conditionally and forwarding the accumulator input on the inactive path.
+  // Mirrors streamPredication in the AMD pipeline.
+  if (auto dotOp = dyn_cast<tt::DotOpInterface>(op)) {
+    rewriter.setInsertionPoint(op);
+    auto loc = dotOp->getLoc();
+    auto ifOp = scf::IfOp::create(rewriter, loc, dotOp->getResult(0).getType(),
+                                  pred, /*withElseRegion=*/true);
+    auto thenB = ifOp.getThenBodyBuilder();
+    auto yield = scf::YieldOp::create(thenB, loc, dotOp->getResult(0));
+    dotOp->moveBefore(yield);
+    auto elseB = ifOp.getElseBodyBuilder();
+    scf::YieldOp::create(elseB, loc, dotOp->getOperand(2));
+    op->replaceAllUsesWith(ifOp->getResults());
+    return ifOp;
   }
   // Ops without a built-in pred operand: wrap in scf.if.
   //

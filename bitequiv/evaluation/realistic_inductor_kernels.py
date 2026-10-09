@@ -1371,18 +1371,6 @@ def get_bounded_indices(indices, max_len=None):
 
 
 @triton.jit
-def load_checked_block(block_ptr, IS_DIVISIBLE: tl.constexpr, SAFE_HEAD_DIM: tl.constexpr):
-    if IS_DIVISIBLE and SAFE_HEAD_DIM:
-        return tl.load(block_ptr)
-    elif IS_DIVISIBLE and not SAFE_HEAD_DIM:
-        return tl.load(block_ptr, boundary_check=(1, ), padding_option="zero")
-    elif not IS_DIVISIBLE and SAFE_HEAD_DIM:
-        return tl.load(block_ptr, boundary_check=(0, ), padding_option="zero")
-    else:
-        return tl.load(block_ptr, boundary_check=(0, 1), padding_option="zero")
-
-
-@triton.jit
 def load_checked_2d(
     ptr,
     offs_m,

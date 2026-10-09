@@ -2180,6 +2180,26 @@ void init_triton_ir(py::module_ &m) {
                                IntegerAttr::get(i32Ty, priority));
              }
            })
+      // Intra-wave scheduling-region marker (AMD). Unlike a warp-pipeline
+      // border this is a lexical begin/end marker: a late TTGIR pass consumes
+      // it and emits sched_group_barrier constraints without phase-shifting
+      // warp groups.
+      .def("create_intra_wave_pipeline_marker",
+           [](TritonOpBuilder &self, const std::string &label, int64_t pair,
+              bool isBegin) {
+             auto marker =
+                 self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+             auto ctx = self.getContext();
+             marker->setAttr("triton.intra_wave_pipeline.marker",
+                             StringAttr::get(ctx, isBegin ? "begin" : "end"));
+             marker->setAttr("triton.intra_wave_pipeline.label",
+                             StringAttr::get(ctx, label));
+             if (pair >= 0) {
+               auto i64Ty = IntegerType::get(ctx, 64);
+               marker->setAttr("triton.intra_wave_pipeline.pair",
+                               IntegerAttr::get(i64Ty, pair));
+             }
+           })
       // Make a tensor descriptor
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,

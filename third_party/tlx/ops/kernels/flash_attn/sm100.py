@@ -1297,18 +1297,17 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
                              ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
-    off_h = tl.arange(0, HEAD_DIM)
+    off_h = tl.arange(0, HALF_HD)
     q = off_m[:, None]
-    h = off_h[None, :]
     tile_base = (q // BLK) * BLK
     local = q % BLK
-    half = h // HALF_HD
-    col = h % HALF_HD
-    packed_row = 2 * tile_base + local + BLK * half
-    src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + col
-    val = tl.load(src)
-    dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
-    tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
+    for half in tl.range(0, 2, loop_unroll_factor=1):
+        h = off_h[None, :] + half * HALF_HD
+        packed_row = 2 * tile_base + local + BLK * half
+        src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + off_h[None, :]
+        val = tl.load(src)
+        dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
+        tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
 
 
 @triton.jit
