@@ -2392,7 +2392,7 @@ def _bwd_compute_inner_loop(
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
         tlx.barrier_arrive(d_empties[d_buf_id])
-        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+        dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
