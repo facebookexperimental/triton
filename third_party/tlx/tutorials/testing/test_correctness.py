@@ -122,6 +122,8 @@ if is_hip():
         matmul as _amd_gemm_pipelined, )
     from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
         matmul as _amd_gemm_pingpong, )
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v7_slice.matmul_kernel import (
+        matmul as _amd_gemm_v7_slice, )
     from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v9_beyond_hotloop.matmul_kernel import (
         matmul as _amd_gemm_v9_beyond_hotloop, )
     from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
@@ -1545,6 +1547,17 @@ def test_amd_gemm_pingpong(dtype):
         a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
         b = (torch.randn((K, N), device=DEVICE, dtype=dtype) + 1) / K
         torch.testing.assert_close(_amd_gemm_pingpong(a, b), torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_gemm_v7_slice(dtype):
+    # Fixed 256x256x64 tile; K is consumed two tiles at a time and has to be K-contiguous in B.
+    for M, N, K in ((256, 256, 256), (512, 768, 1024)):
+        torch.manual_seed(0)
+        a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
+        b = ((torch.randn((N, K), device=DEVICE, dtype=dtype) + 1) / K).T
+        torch.testing.assert_close(_amd_gemm_v7_slice(a, b), torch.matmul(a, b))
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

@@ -710,6 +710,55 @@ def compile_for_gfx942(fn, signature, constexprs):
 
 
 @triton.jit
+def _amd_dot_cd_regclass_kernel(a_ptr, b_ptr, c_ptr, CD_REGCLASS: tl.constexpr):
+    offs_m = tl.arange(0, 64)
+    offs_n = tl.arange(0, 64)
+    offs_k = tl.arange(0, 32)
+    a = tl.load(a_ptr + offs_m[:, None] * 32 + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * 64 + offs_n[None, :])
+    c_ptrs = c_ptr + offs_m[:, None] * 64 + offs_n[None, :]
+    # A loaded (non-constant) accumulator, so the input (C) is pinned as well as the result (D).
+    acc = tl.load(c_ptrs)
+    if CD_REGCLASS == "none":
+        acc = tlx.amd_dot(a, b, acc)
+    else:
+        acc = tlx.amd_dot(a, b, acc, cd_regclass=CD_REGCLASS)
+    tl.store(c_ptrs, acc)
+
+
+def _compile_amd_dot_cd_regclass(cd_regclass):
+    return compile_for_gfx950(
+        _amd_dot_cd_regclass_kernel,
+        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "c_ptr": "*fp32"},
+        constexprs={"CD_REGCLASS": cd_regclass},
+    )
+
+
+@pytest.mark.parametrize("cd_regclass", ["a", "v"])
+def test_amd_dot_cd_regclass_pins_mfma_accumulator_gfx950(cd_regclass):
+    """The request survives the MFMA rewrite and becomes tied register-class pins."""
+    compiled = _compile_amd_dot_cd_regclass(cd_regclass)
+    assert f'amdg.cd_regclass = "{cd_regclass}"' in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "llvm.amdgcn.mfma" in llir
+    assert f'asm "", "={cd_regclass},0"' in llir
+
+
+def test_amd_dot_without_cd_regclass_matches_tl_dot_gfx950():
+    """Without a request, amd_dot is a plain dot: no attribute and no pins."""
+    compiled = _compile_amd_dot_cd_regclass("none")
+    assert "amdg.cd_regclass" not in compiled.asm["ttgir"]
+    llir = compiled.asm["llir"]
+    assert "llvm.amdgcn.mfma" in llir
+    assert '"=a,0"' not in llir and '"=v,0"' not in llir
+
+
+def test_amd_dot_rejects_unknown_cd_regclass():
+    with pytest.raises(CompilationError, match="cd_regclass must be None"):
+        _compile_amd_dot_cd_regclass("agpr")
+
+
+@triton.jit
 def _warp_predicate_update(lhs, rhs, increment, side_ptr, offsets):
     tl.store(side_ptr + offsets, lhs)
     return lhs + increment, rhs - increment
@@ -5379,6 +5428,54 @@ def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
     with pytest.raises(Exception, match="prefetch two 64-wide K tiles"):
         bench.validate_shape_for_providers((256, 256, 64), 9, ["tlx"])
     bench.validate_shape_for_providers((256, 256, 128), 9, ["tlx"])
+
+
+def test_tlx_gfx9_gemm_v7_keeps_pins_and_lds_layout_gfx950():
+    """The 4-wave v7 keeps its accumulator pins and explicit LDS layout through codegen."""
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v7_slice.matmul_kernel import v7_slice
+
+    src = ASTSource(
+        fn=v7_slice,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*fp16",
+            "M": "i32",
+            "N": "i32",
+        },
+        # K-contiguous A and B and a row-major C, as the benchmark launches it.
+        # The direct-to-LDS loads need the strides' contiguity and alignment,
+        # which the JIT gets from specializing the launch arguments.
+        constexprs={
+            "K": 512,
+            "stride_am": 512,
+            "stride_ak": 1,
+            "stride_bk": 1,
+            "stride_bn": 512,
+            "stride_cm": 256,
+            "stride_cn": 1,
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 64,
+        },
+        # Runtime JIT launches attach the base-pointer alignment and range
+        # automatically; ASTSource compile-only signatures do not.
+        attrs={(i, ): [("tt.divisibility", 16), ("tt.pointer_range", 32)]
+               for i in range(3)},
+    )
+    compiled = triton_compile(src, target=GFX950, options={
+        "num_warps": 4,
+        "num_stages": 1,
+        "matrix_instr_nonkdim": 16,
+    })
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count('amdg.cd_regclass = "a"') == 8
+    # A-tile LDS bases: the row-128 bit comes last.
+    assert "[1, 0], [2, 0], [4, 0], [8, 0], [128, 0]], block = []" in ttgir
+    assert 'asm "", "=a,0"' in compiled.asm["llir"]
+    amdgcn = compiled.asm["amdgcn"]
+    assert "v_mfma_f32_16x16x32_f16" in amdgcn
+    assert "ds_read_b128" in amdgcn
 
 
 def test_tlx_gfx9_gemm_bench_input_modes_are_deterministic():
