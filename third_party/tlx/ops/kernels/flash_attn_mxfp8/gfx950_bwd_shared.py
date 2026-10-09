@@ -625,7 +625,7 @@ def _bwd_kv_owner_inline_arena(QK, V, DO, O, LSE, Arena, DK, DV, N, sm_scale, AR
 @triton.jit
 def _prepare_do_arena(DO, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr):
     """Prepare each dO32 payload and Delta row once per backward call."""
-    tl.static_assert(N == 1024 and D == 128 and BLOCK_N == 32)
+    tl.static_assert((N == 1024 or N == 2048) and D == 128 and BLOCK_N == 32)
     head = tl.program_id(1).to(tl.int64)
     group = tl.program_id(0)
     rows = group * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -644,7 +644,7 @@ def _prepare_do_arena(DO, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: t
 def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
                                 BM: tl.constexpr, BN: tl.constexpr):
     """Prepare V64 once per key owner and consume prepared dO and Delta."""
-    tl.static_assert(ARENA_N == 1024 and D == 128 and BM == 64 and BN == 64)
+    tl.static_assert((ARENA_N == 1024 or ARENA_N == 2048) and D == 128 and BM == 64 and BN == 64)
     # Fresh host admission binds runtime N to this private arena length.
     sequence_length: tl.constexpr = ARENA_N
     Q, K, QS, KS = _saved_qk_arena_segments(QK, ARENA_N)
@@ -1373,7 +1373,7 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
             type(tensor) is torch.Tensor
             for tensor in (q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse)
             if tensor is not None)
-        partial_prepare = qk_format and n == 1024 and not causal and sm_scale == 0.5
+        partial_prepare = qk_format and n in (1024, 2048) and not causal and sm_scale == 0.5
         plan = (_arena_launch_plan(device, n, causal, sm_scale, qk_format)
                 if ordinary_inputs and not partial_prepare else None)
         saved_ks = q_fp8 if qk_format else k_scale

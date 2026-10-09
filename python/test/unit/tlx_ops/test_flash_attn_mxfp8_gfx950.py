@@ -653,7 +653,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_invalidation(n_ctx, qk_for
 
 @pytest.mark.parametrize("n_ctx", (1024, 2048))
 @pytest.mark.parametrize("qk_format", (False, True))
-def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_format):
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_format, causal):
     from contextlib import ExitStack
     from types import SimpleNamespace
     from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd_shared as shared
@@ -665,7 +666,7 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         inputs[:4] = [
             torch.empty(shared._saved_qk_arena_layout(n_ctx)[-1], device="meta", dtype=torch.uint8), None, None, None
         ]
-    partial_prepare = qk_format and n_ctx == 1024
+    partial_prepare = qk_format and n_ctx in (1024, 2048) and not causal
     jits = ((shared._prepare_do_arena, shared._bwd_kv_owner_partial_arena, shared._bwd_q_consume_arena) if partial_prepare else
             (shared._prepare_fused_arena, shared._bwd_kv_owner_arena, shared._bwd_q_consume_arena))
     # Populate real transitive source hashes without compiling or using a GPU.
@@ -691,8 +692,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
             kernel._compile_iq_acf_cubin = None
             stack.enter_context(mock.patch.object(jit, "device_caches", {2: ({"compiled-key": kernel}, )}))
             runs.append(stack.enter_context(mock.patch.object(jit, "run", return_value=kernel)))
-        cold = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
-        warm = shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+        cold = shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
+        warm = shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs)
         assert all(first is not second for first, second in zip(cold, warm))
         kv_index = 1
@@ -700,13 +701,13 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         query_args = kernels[-1].__getitem__.return_value.call_args.args
         assert query_args[0] is inputs[0 if qk_format else 1]
         assert query_args[2] is warm[0]
-        assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128, qk_format)
+        assert query_args[5:] == (n_ctx, 128, 128, 64, causal, 128, qk_format)
         assert kv_args[0] is inputs[0]
         if partial_prepare:
             # Cold and cached launches bind the runtime N ABI to ARENA_N.
             cold_kv_args = runs[kv_index].call_args.args
             cold_arena_n = runs[kv_index].call_args.kwargs["ARENA_N"]
-            assert cold_kv_args[6] == cold_arena_n == n_ctx == 1024
+            assert cold_kv_args[6] == cold_arena_n == n_ctx
             assert kv_args[6] == kv_args[8] == n_ctx
             prepare_args = kernels[0].__getitem__.return_value.call_args.args
             assert prepare_args[0] is inputs[5] and prepare_args[1] is inputs[6]
@@ -718,12 +719,17 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
             arguments = (prepare_args, kv_args, query_args)
             expected_tensors = 12
         else:
+            # Cold and cached launches bind the runtime N ABI to ARENA_N.
+            cold_kv_args = runs[kv_index].call_args.args
+            cold_arena_n = runs[kv_index].call_args.kwargs["ARENA_N"]
+            assert cold_kv_args[8] == cold_arena_n == n_ctx
+            assert kv_args[8] == kv_args[10] == n_ctx
             assert kv_args[5] is query_args[1] is allocations[4]
             assert kv_args[6] is warm[1] and kv_args[7] is warm[2]
             prepare_args = kernels[0].__getitem__.return_value.call_args.args
             assert prepare_args[4] is kv_args[5]
             assert prepare_args[5:] == (n_ctx, 128, 32, qk_format)
-            assert kv_args[10:] == (n_ctx, 128, 64, 64, False, qk_format)
+            assert kv_args[10:] == (n_ctx, 128, 64, 64, causal, qk_format)
             arguments = (prepare_args, kv_args, query_args)
             expected_tensors = 13 if qk_format else 16
             if qk_format:
@@ -738,10 +744,10 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
             if partial_prepare:
                 assert shared._partial_arena_launch_plan(device, n_ctx, 0.5) is None
             else:
-                assert shared._arena_launch_plan(device, n_ctx, False, 0.5, qk_format) is None
+                assert shared._arena_launch_plan(device, n_ctx, causal, 0.5, qk_format) is None
         kernels[kv_index].__getitem__.return_value.side_effect = RuntimeError("compiled launch failed")
         with pytest.raises(RuntimeError, match="compiled launch failed"):
-            shared._launch_backward_shared_square(*inputs, 0.5, False, device, shape, qk_format)
+            shared._launch_backward_shared_square(*inputs, 0.5, causal, device, shape, qk_format)
         assert all(run.call_count == 1 for run in runs), "compiled launch errors must not retry JIT"
 
 
