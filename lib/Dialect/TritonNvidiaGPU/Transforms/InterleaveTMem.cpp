@@ -531,8 +531,11 @@ void processBlock(BlockInterleaveInfo &info) {
 
   // Step 1: Record which memory op each WS barrier guards.
   DenseMap<Operation *, Operation *> barrierMap;
-  if (reorderWSBarriers)
+  DenseMap<Operation *, unsigned> originalOrder;
+  if (reorderWSBarriers) {
     barrierMap = buildBarrierToMemoryOpMap(block);
+    originalOrder = buildOriginalBlockOrder(block);
+  }
 
   // Step 2: Reorder WS barriers. Pushes arrives down and pulls waits up past
   // barriers from independent channels, unblocking tmem_load sinking.
@@ -565,7 +568,7 @@ void processBlock(BlockInterleaveInfo &info) {
 
   // Step 4: Restore barriers to optimal positions near their memory ops.
   if (reorderWSBarriers)
-    optimizeWSBarrierLocations(barrierMap);
+    optimizeWSBarrierLocations(barrierMap, originalOrder);
   // Barrier restoration and TMEM-load sinking may move a load across a token
   // wait that was already positioned before staging reuse. Re-establish that
   // canonical placement so the load/conversion overlaps the prior TMA store.

@@ -747,4 +747,44 @@ tt.func public @wait_stops_at_possibly_aliasing_arg(
   %9 = arith.truncf %8 : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
   tt.return %5, %6, %9 : tensor<128x64xf16, #blocked>, tensor<128x64xf16, #blocked>, tensor<128x128xf16, #blocked>
 }
+
+// A subtile read twice (once per epilogue consumer) must not end up above the
+// wait that guards the accumulator. The wait is tied to the first tmem_load
+// after it; that load sinks to its late consumer, while the duplicate read of
+// the same subtile only sinks to its earlier consumer. Moving the wait down to
+// its tied load would leave the duplicate read ahead of the wait.
+// CHECK-LABEL: @wait_not_moved_past_duplicate_subtile_load
+// TARGETED-LABEL: @wait_not_moved_past_duplicate_subtile_load
+tt.func @wait_not_moved_past_duplicate_subtile_load(
+    %acc_bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %buf0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %buf1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %buf2: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %buf3: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+  %s1 = ttng.tmem_subslice %alloc {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+  ttng.wait_barrier %acc_bar, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 0, 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %a = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  %b = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  %c = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  %d = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  ttng.arrive_barrier %acc_bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 0, 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %tc = arith.truncf %c : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %tc, %buf0 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  %td = arith.truncf %d : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %td, %buf1 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  %ta = arith.truncf %a : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %ta, %buf2 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  %tb = arith.truncf %b : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %tb, %buf3 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  // CHECK-NOT: ttng.tmem_load
+  // CHECK:     ttng.wait_barrier
+  // CHECK:     ttng.tmem_load
+  // TARGETED-NOT: ttng.tmem_load
+  // TARGETED:     ttng.wait_barrier
+  // TARGETED:     ttng.tmem_load
+  tt.return
+}
 }
