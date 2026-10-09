@@ -1094,9 +1094,14 @@ def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: 
     if QK_FORMAT:
         tl.static_assert(K is None and QS is None and KS is None)
         Q, K, QS, KS = _saved_qk_arena_segments(Q, ARENA_N)
+        # Fresh host admission binds runtime N to this private arena length.
+        sequence_length: tl.constexpr = ARENA_N
+    else:
+        sequence_length = N
     vb, do8, vs, dos, _, delta = _preparation_arena_segments(Arena, ARENA_N)
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
-    _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN, CAUSAL,
+    _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, sequence_length, sm_scale, DS, DSS, D, BM, BN,
+                  CAUSAL,
                   SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
                   PACK_P_EARLY=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
                   DELAY_DO_HEAD=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048))
@@ -1544,8 +1549,9 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
                stream=stream)
             query(saved_k, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, qk_format, stream=stream)
         else:
-            # N stays runtime in both reduction kernels; ARENA_N only fixes
-            # preparation byte offsets. Cold JIT errors propagate unchanged.
+            # N remains runtime in both public reduction signatures.
+            # ARENA_N fixes arena offsets and private saved-QK KV arithmetic.
+            # Cold JIT errors propagate.
             prepare = _prepare_fused_arena.run(v_bf16, do_bf16, saved_ks, out_bf16, arena, n, 128, 32,
                                                QK_FORMAT=qk_format, num_warps=4, num_stages=2, grid=(n // 32, 128),
                                                warmup=False)
