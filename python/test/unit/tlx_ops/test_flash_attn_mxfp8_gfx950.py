@@ -703,6 +703,11 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         assert query_args[5:] == (n_ctx, 128, 128, 64, False, 128, qk_format)
         assert kv_args[0] is inputs[0]
         if partial_prepare:
+            # Cold and cached launches bind the runtime N ABI to ARENA_N.
+            cold_kv_args = runs[kv_index].call_args.args
+            cold_arena_n = runs[kv_index].call_args.kwargs["ARENA_N"]
+            assert cold_kv_args[6] == cold_arena_n == n_ctx == 1024
+            assert kv_args[6] == kv_args[8] == n_ctx
             prepare_args = kernels[0].__getitem__.return_value.call_args.args
             assert prepare_args[0] is inputs[5] and prepare_args[1] is inputs[6]
             assert prepare_args[2] is kv_args[3] is query_args[1] is allocations[4]

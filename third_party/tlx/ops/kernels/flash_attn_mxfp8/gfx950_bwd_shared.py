@@ -645,17 +645,19 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
                                 BM: tl.constexpr, BN: tl.constexpr):
     """Prepare V64 once per key owner and consume prepared dO and Delta."""
     tl.static_assert(ARENA_N == 1024 and D == 128 and BM == 64 and BN == 64)
+    # Fresh host admission binds runtime N to this private arena length.
+    sequence_length: tl.constexpr = ARENA_N
     Q, K, QS, KS = _saved_qk_arena_segments(QK, ARENA_N)
     _, DO, _, DOS, KDQS, Delta = _preparation_arena_segments(Arena, ARENA_N)
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     head = tl.program_id(0).to(tl.int64)
     key_tile = tl.program_id(1)
     keys = key_tile * BN + tl.arange(0, BN)
-    base = head * N * D
+    base = head * sequence_length * D
     v, vs = _inline_prepare_v64(V, base, keys, D)
-    k = _load_resident_kv64(K, base, keys, N, D, True)
-    ks = _load_scale_native(KS, head, key_tile * BN, N, 64, 4, False, False)
-    _store_inline_kdqs(KS, KDQS, head, key_tile, N)
+    k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
+    ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
+    _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
     dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
     dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
@@ -665,23 +667,27 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
     metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
     lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
     deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
-    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, N, BM, D, True, 0)
-    for pair_start in range(0, N - 128, 128):
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN,
-                               False, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
-                               deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start, 0, True,
+    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0)
+    for pair_start in range(0, sequence_length - 128, 128):
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               pair_start, 0, True,
                                PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN,
-                               False, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
-                               deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start + 64, 1, True,
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               pair_start + 64, 1, True,
                                PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
-    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN,
-                           False, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
-                           deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 128, 0, True,
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                           sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                           sequence_length - 128, 0, True,
                            PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
-    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, N, sm_scale, DS, DSS, D, BM, BN,
-                           False, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
-                           deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 64, 1, False,
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
+                           sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
+                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                           sequence_length - 64, 1, False,
                            PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
