@@ -263,6 +263,31 @@ tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
 // CHECK-NOT: rocdl.sched.barrier
 // CHECK: tt.return
 
+// Layout cleanup can put accumulator conversions before the first wait.
+// CHECK-LABEL: tt.func @loop_layout_inputs_past_wait(
+// CHECK: scf.for
+// CHECK-NEXT: ttg.async_wait
+// CHECK-NEXT: {{.*}}scf.execute_region
+// CHECK-NEXT: {{.*}}ttg.convert_layout
+// CHECK-NEXT: {{.*}}ttg.convert_layout
+// CHECK: triton.warp_pipeline.stage = "first"
+// CHECK: triton.warp_pipeline.stage = "second"
+tt.func @loop_layout_inputs_past_wait(%n: index, %input: tensor<256x32xf32, #linear>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %result = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %input) -> tensor<256x32xf32, #linear> {
+    %mma_acc = ttg.convert_layout %acc : tensor<256x32xf32, #linear> -> tensor<256x32xf32, #mma>
+    %linear_acc = ttg.convert_layout %mma_acc : tensor<256x32xf32, #mma> -> tensor<256x32xf32, #linear>
+    ttg.async_wait {num = 0 : i32}
+    %sum = arith.addf %linear_acc, %input : tensor<256x32xf32, #linear>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "first"}
+    %next = arith.addf %sum, %input : tensor<256x32xf32, #linear>
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "second"}
+    scf.yield %next : tensor<256x32xf32, #linear>
+  }
+  tt.return
+}
+
 // -- Negative: no border → no structuring ----
 tt.func @no_split_example(%n: index) {
   %c0  = arith.constant 0 : index
