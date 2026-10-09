@@ -173,10 +173,8 @@ static void createClusterOp(OpBuilder &b, Location loc,
   return;
 }
 
-// Move pure scalar IV-remap ops after adjacent inter-stage barriers/waits so
-// they become part of the next stage.  If a barrier/wait uses one of those
-// scalars, leave the run in place to preserve SSA.
-static void sinkPureScalarsIntoNextStage(Block &blk) {
+// Layout cleanup and unrolling can place stage inputs before inter-stage waits.
+static void sinkStageInputsIntoNextStage(Block &blk) {
   SmallVector<Operation *> pending;
   auto consumesPending = [&](Operation *user) {
     return llvm::any_of(user->getOperands(), [&](Value v) {
@@ -185,7 +183,7 @@ static void sinkPureScalarsIntoNextStage(Block &blk) {
   };
   for (Operation *op = &blk.front(); op;) {
     Operation *next = op->getNextNode();
-    if (triton::isPureScalarOp(op)) {
+    if (triton::isPureScalarOp(op) || isa<ttg::ConvertLayoutOp>(op)) {
       pending.push_back(op);
       op = next;
       continue;
@@ -232,7 +230,7 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   SmallVector<SmallVector<Operation *>> clusters;
   auto ctx = forOp.getContext();
 
-  sinkPureScalarsIntoNextStage(blk);
+  sinkStageInputsIntoNextStage(blk);
 
   // One pass over the body; collect clusters split by explicit borders.
   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
