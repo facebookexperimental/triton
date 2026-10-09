@@ -2391,7 +2391,7 @@ def _bwd_compute_inner_loop(
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
         tlx.barrier_arrive(d_empties[d_buf_id])
-        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
+        dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
@@ -2986,7 +2986,7 @@ def _attn_bwd_ws(
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
 
         # reduction
-        with tlx.async_task(num_warps=4, registers=88):
+        with tlx.async_task(num_warps=4, registers=96):
             blk_idx = 0
             curr_m = start_m
             step_m = BLOCK_M1
@@ -3066,7 +3066,7 @@ def _attn_bwd_ws(
             tlx.async_descriptor_store_wait(0)
 
         # mma
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=96):
             blk_idx = 0
             if is_leader:
                 kv_buf_id, kv_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
@@ -3173,7 +3173,7 @@ def _attn_bwd_ws(
                 tile_count += 1
 
         # load
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=96):
             blk_idx = 0
             if USE_2CTA:
                 blk_idx = _bwd_load_2cta(
@@ -3293,7 +3293,7 @@ def _attn_bwd_ws(
         # relay — waits for peer's DSMEM to arrive, then signals ds_fulls
         # so the MMA task can read the combined ds_tiles.
         if USE_2CTA:
-            with tlx.async_task(num_warps=1, registers=40):
+            with tlx.async_task(num_warps=1, registers=48):
                 for blk_idx_relay in range(num_steps):
                     ds_buf_id_relay, ds_phase_relay = get_bufidx_phase(blk_idx_relay, NUM_BUFFERS_DS)
                     tlx.barrier_wait(ds_peer_fulls[ds_buf_id_relay], ds_phase_relay)
