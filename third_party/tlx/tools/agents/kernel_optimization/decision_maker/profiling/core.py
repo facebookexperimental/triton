@@ -481,6 +481,8 @@ def resolve_profile_request_for_target(
                 continue
             if tool not in resolved:
                 resolved.append(tool)
+        if "rocprofv3" in resolved and "amdgcn_isa" not in resolved:
+            resolved.append("amdgcn_isa")
         tools = tuple(resolved)
     return replace(request, tools=tools).to_json()
 
@@ -1404,6 +1406,7 @@ def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
         "ncu",
         "rocprofv3",
         "fb_att",
+        "amdgcn_isa",
         "native_profiler",
         "diagnostics",
         "diagnostic_proton_intra_kernel",

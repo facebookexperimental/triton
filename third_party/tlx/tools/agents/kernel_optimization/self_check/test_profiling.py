@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from ..decision_maker.profiling import rocm_profiler as rocm_profiler_module
 from ..decision_maker.profiling.amd_att import collect_fb_att
+from ..decision_maker.profiling.amdgcn_isa import analyze_amdgcn, collect_amdgcn_isa
 from ..decision_maker.profiling import (
     ProfileRequest,
     compact_profile_summary,
@@ -111,12 +112,12 @@ class ProfileRequestTest(unittest.TestCase):
         assert amd is not None
         self.assertEqual(
             amd["tools"],
-            ["rocprofv3", "ncu"],
+            ["rocprofv3", "ncu", "amdgcn_isa"],
         )
 
         hip = resolve_profile_request_for_target(payload, {"backend": "hip"})
         assert hip is not None
-        self.assertEqual(hip["tools"], ["rocprofv3", "ncu"])
+        self.assertEqual(hip["tools"], ["rocprofv3", "ncu", "amdgcn_isa"])
 
         deep = resolve_profile_request_for_target(
             ProfileRequest(
@@ -126,7 +127,8 @@ class ProfileRequestTest(unittest.TestCase):
             {"backend": "hip"},
         )
         assert deep is not None
-        self.assertEqual(deep["tools"], ["fb_att", "rocprofv3"])
+        self.assertEqual(deep["tools"], ["fb_att", "rocprofv3", "amdgcn_isa"])
+        self.assertNotIn("amdgcn_isa", cuda["tools"])
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -765,6 +767,10 @@ class ProfileParsingTest(unittest.TestCase):
                     "valid": True,
                     "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
                 },
+                "amdgcn_isa": {
+                    "resources": {"vgpr_spills": 37},
+                    "findings": ["37 VGPR + 41 SGPR spills"],
+                },
                 "native_profiler": {
                     "raw": "x" * 5000,
                     "summary": {"duration_us": 1.0},
@@ -783,12 +789,115 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertEqual(compact["rocprofv3"]["summary"]["duration_us"], 2.0)
         self.assertNotIn("raw_metrics", compact["rocprofv3"])
         self.assertTrue(compact["fb_att"]["valid"])
+        self.assertEqual(compact["amdgcn_isa"]["resources"]["vgpr_spills"], 37)
+        self.assertEqual(compact["amdgcn_isa"]["findings"], ["37 VGPR + 41 SGPR spills"])
         self.assertIn("native_profiler", compact)
         self.assertNotIn("raw", compact["native_profiler"])
         diagnostic = compact["diagnostic_proton_intra_kernel"]
         self.assertNotIn("trace_events", diagnostic)
         self.assertEqual(diagnostic["artifacts"]["trace"], "/tmp/proton.trace")
         self.assertEqual(compact["artifacts"]["csv"], "/tmp/profile.csv")
+
+
+_AMDGCN_FIXTURE = Path(__file__).with_name("fixtures") / "amdgcn" / "persistent_mxfp8_excerpt.amdgcn"
+
+
+class AmdgcnIsaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.analysis = analyze_amdgcn(
+            _AMDGCN_FIXTURE.read_text(), kernel_name="_mxfp8_grouped_gemm_kernel"
+        )
+
+    def test_extracts_resources(self) -> None:
+        resources = self.analysis["resources"]
+        self.assertEqual(resources["total_vgprs"], 256)
+        self.assertEqual(resources["vgpr_spills"], 37)
+        self.assertEqual(resources["sgpr_spills"], 41)
+        self.assertEqual(resources["scratch_bytes"], 152)
+        self.assertEqual(resources["occupancy_waves_per_simd"], 2)
+
+    def test_selects_innermost_mfma_loop_as_hot_loop(self) -> None:
+        hot = self.analysis["hot_loop"]
+        self.assertEqual(hot["label"], ".LBB0_16")
+        self.assertEqual(hot["loop_depth"], 3)
+        self.assertEqual(hot["mfma"], 8)
+        self.assertEqual(hot["scaled_mfma"], 8)
+        self.assertEqual(hot["ds_read_by_width"], {"b128": 4, "u8": 8})
+        self.assertEqual(hot["byte_assembly_valu"], 3)
+        self.assertEqual(hot["lds_dma_loads"], 2)
+        self.assertEqual(hot["global_stores"], 0)
+
+    def test_reports_reloads_that_drain_outstanding_stores(self) -> None:
+        boundary = self.analysis["boundary"]
+        self.assertGreater(boundary["global_stores"], 0)
+        self.assertGreater(boundary["reload_drains_after_stores"], 0)
+        reloads = self.analysis["source_locations"]["boundary_scratch_reloads"]
+        self.assertTrue(reloads[0].startswith("gfx950.py:353 "))
+
+    def test_attributes_byte_reads_to_source_lines(self) -> None:
+        byte_reads = self.analysis["source_locations"]["hot_loop_byte_reads"]
+        self.assertTrue(all(entry.startswith("gfx950.py:") for entry in byte_reads))
+        self.assertFalse(any(":0 " in entry for entry in byte_reads))
+
+    def test_findings_name_spills_reload_drains_and_byte_gathers(self) -> None:
+        findings = "\n".join(self.analysis["findings"])
+        self.assertIn("37 VGPR + 41 SGPR spills at the 256-VGPR ceiling", findings)
+        self.assertIn("followed by s_waitcnt vmcnt(0) after", findings)
+        self.assertIn("8 sub-dword ds_reads + 3 byte-assembly VALU per 8 MFMA", findings)
+        self.assertLessEqual(len(self.analysis["findings"]), 8)
+
+    def test_tolerates_dump_without_metadata(self) -> None:
+        analysis = analyze_amdgcn(
+            "k:\n.LBB0_1: ; =>This Inner Loop Header: Depth=1\n"
+            "\tv_mfma_f32_16x16x32_bf16 v[0:3], v[4:7], v[8:11], v[0:3]\n"
+            "\ts_cbranch_scc1 .LBB0_1\n.Lfunc_end0:\n",
+            kernel_name="k",
+        )
+        self.assertEqual(analysis["resources"], {})
+        self.assertEqual(analysis["hot_loop"]["mfma"], 1)
+        self.assertEqual(analysis["findings"], [])
+
+    def test_collects_dump_for_dominant_kernel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "workload.py"
+            script.write_text(
+                "import os, pathlib, shutil, sys\n"
+                "dump = pathlib.Path(os.environ['TRITON_DUMP_DIR']) / 'HASH'\n"
+                "dump.mkdir(parents=True)\n"
+                "assert os.environ['TRITON_ALWAYS_COMPILE'] == '1'\n"
+                "shutil.copyfile(sys.argv[1], dump / '_mxfp8_grouped_gemm_kernel.amdgcn')\n"
+                "(dump / 'other.amdgcn').write_text('')\n"
+            )
+            result = collect_amdgcn_isa(
+                [sys.executable, str(script), str(_AMDGCN_FIXTURE)],
+                Path(directory) / "artifacts",
+                kernel_filter="_mxfp8_grouped_gemm_kernel.kd",
+                timeout_seconds=60.0,
+            )
+            self.assertNotIn("error", result)
+            self.assertEqual(result["tool"], "amdgcn_isa")
+            self.assertEqual(result["kernel"], "_mxfp8_grouped_gemm_kernel")
+            self.assertEqual(result["resources"]["vgpr_spills"], 37)
+            self.assertTrue(Path(result["artifacts"]["amdgcn"]).is_file())
+
+            missing = collect_amdgcn_isa(
+                [sys.executable, str(script), str(_AMDGCN_FIXTURE)],
+                Path(directory) / "artifacts-missing",
+                kernel_filter="absent_kernel",
+                timeout_seconds=60.0,
+            )
+            self.assertIn("no AMDGCN dump", missing["error"])
+            self.assertIn("_mxfp8_grouped_gemm_kernel", missing["available_kernels"])
+
+    def test_reports_failed_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = collect_amdgcn_isa(
+                [sys.executable, "-c", "raise SystemExit(3)"],
+                Path(directory),
+                kernel_filter="k",
+                timeout_seconds=60.0,
+            )
+        self.assertIn("failed with code 3", result["error"])
 
 
 if __name__ == "__main__":

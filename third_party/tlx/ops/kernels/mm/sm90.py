@@ -40,16 +40,16 @@ def matmul_tma_set_block_size_hook(nargs):
         nargs["b_desc"].block_shape = [block_k, block_n]
     else:
         nargs["b_desc"].block_shape = [block_n, block_k]
-    nargs["c_desc"].block_shape = [block_m_split, block_n // 2]
+    nargs["c_desc"].block_shape = [block_m_split, block_n // 4 if nargs["EPILOGUE_SUBTILE"] else block_n]
 
 
-def _config(block_m, block_n, num_stages):
+def _config(block_m, block_n, num_stages, group_size_m=8):
     return triton.Config(
         {
             "BM": block_m,
             "BN": block_n,
             "BK": 64,
-            "GROUP_SIZE_M": 8,
+            "GROUP_SIZE_M": group_size_m,
             "NUM_STAGES": num_stages,
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": True,
@@ -61,12 +61,26 @@ def _config(block_m, block_n, num_stages):
 
 
 def _full_configs():
+    # GROUP_SIZE_M=1 walks tiles row-major so all N-tiles of a narrow-N, tall-M
+    # product share the A panel in L2; square shapes prefer the grouped order.
     return [
-        _config(block_m, block_n, num_stages) for block_m, block_n in ((128, 256), (256, 128)) for num_stages in (3, 4)
+        _config(block_m, block_n, num_stages, group_size_m)
+        for block_m, block_n in ((128, 256), (256, 128))
+        for num_stages in (3, 4)
+        for group_size_m in (1, 8)
     ]
 
 
 CONFIGS = _full_configs
+
+
+def _prune_full_configs(configs, nargs, **kwargs):
+    # With N <= 512 only 2-4 tiles span N, and grouped order (G=8) is bimodal on
+    # tall shapes (e.g. 2Mx512x512 runs at 420 or ~480 TFLOPS), so autotune can
+    # lock in a slow config from one lucky sample. Row-major order is stable.
+    if nargs["N"] > 512:
+        return configs
+    return [c for c in configs if c.kwargs["GROUP_SIZE_M"] == 1] or configs
 
 
 def _smoke_configs():
@@ -77,9 +91,11 @@ SMOKE_CONFIGS = _smoke_configs
 
 
 def heuristic_config(M, N, K):
-    del K
-    block_m, block_n = (256, 128) if M >= N else (128, 256)
-    return [_config(block_m, block_n, 3)]
+    # Square shapes favor 128x256 tiles. The 4-stage ring (the SMEM max) wins at
+    # large K but regresses some tall shapes with K <= 512.
+    block_m, block_n = (256, 128) if M > N else (128, 256)
+    num_stages = 4 if K >= 1024 else 3
+    return [_config(block_m, block_n, num_stages)]
 
 
 @triton.jit
@@ -102,6 +118,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     EPILOGUE_SUBTILE: tl.constexpr,
     A_ROW_MAJOR: tl.constexpr,
     B_ROW_MAJOR: tl.constexpr,
+    A_EVICTION: tl.constexpr,
 ):
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
 
@@ -121,6 +138,9 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
         b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
     else:
         b = tlx.local_alloc((BN, BK), tlx.dtype_of(b_desc), NUM_STAGES)
+    if EPILOGUE_SUBTILE:
+        # Two staging slots per consumer let TMA stores drain under the next tile.
+        c_smem = tlx.local_alloc((block_m_split, BN // 4), tlx.dtype_of(c_desc), 2 * NUM_MMA_GROUPS)
 
     bars_empty_a = tlx.alloc_barriers(
         num_barriers=NUM_STAGES * NUM_MMA_GROUPS,
@@ -174,6 +194,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                             data_a_0,
                             [offset_am, offset_k],
                             full_a_0,
+                            eviction_policy=A_EVICTION,
                         )
                     else:
                         tlx.async_descriptor_load(
@@ -181,6 +202,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                             data_a_0,
                             [offset_k, offset_am],
                             full_a_0,
+                            eviction_policy=A_EVICTION,
                         )
 
                     empty_b = tlx.local_view(bars_empty_b, buf)
@@ -221,6 +243,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                             data_a_1,
                             [offset_am + block_m_split, offset_k],
                             full_a_1,
+                            eviction_policy=A_EVICTION,
                         )
                     else:
                         tlx.async_descriptor_load(
@@ -228,6 +251,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                             data_a_1,
                             [offset_k, offset_am + block_m_split],
                             full_a_1,
+                            eviction_policy=A_EVICTION,
                         )
 
                     phase = phase ^ (buf == NUM_STAGES - 1)
@@ -309,28 +333,45 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 if EPILOGUE_SUBTILE:
                     acc = tl.reshape(acc, (block_m_split, 2, BN // 2))
                     acc = tl.permute(acc, (0, 2, 1))
-                    acc_0, acc_1 = tl.split(acc)
-                    c_desc.store(
-                        [offset_cm, offset_bn],
-                        acc_0.to(tlx.dtype_of(c_desc)),
-                    )
-                    c_desc.store(
-                        [offset_cm, offset_bn + BN // 2],
-                        acc_1.to(tlx.dtype_of(c_desc)),
-                    )
+                    acc_lo, acc_hi = tl.split(acc)
+                    acc_lo = tl.permute(tl.reshape(acc_lo, (block_m_split, 2, BN // 4)), (0, 2, 1))
+                    acc_0, acc_1 = tl.split(acc_lo)
+                    acc_hi = tl.permute(tl.reshape(acc_hi, (block_m_split, 2, BN // 4)), (0, 2, 1))
+                    acc_2, acc_3 = tl.split(acc_hi)
+                    slot_0 = tlx.local_view(c_smem, 2 * consumer_id)
+                    slot_1 = tlx.local_view(c_smem, 2 * consumer_id + 1)
+                    _store_subtile(c_desc, slot_0, acc_0, offset_cm, offset_bn)
+                    _store_subtile(c_desc, slot_1, acc_1, offset_cm, offset_bn + BN // 4)
+                    _store_subtile(c_desc, slot_0, acc_2, offset_cm, offset_bn + BN // 2)
+                    _store_subtile(c_desc, slot_1, acc_3, offset_cm, offset_bn + 3 * (BN // 4))
                 else:
                     c_desc.store(
                         [offset_cm, offset_bn],
                         acc.to(tlx.dtype_of(c_desc)),
                     )
 
+            if EPILOGUE_SUBTILE:
+                tlx.async_descriptor_store_wait(0)
+
+
+@triton.jit
+def _store_subtile(c_desc, slot, acc, offset_m, offset_n):
+    # A slot is reused every second store; waiting until at most one store is
+    # pending guarantees the TMA engine has finished reading this slot.
+    tlx.async_descriptor_store_wait(1)
+    tlx.local_store(slot, acc.to(tlx.dtype_of(c_desc)))
+    tlx.fence("async_shared")
+    tlx.async_descriptor_store(c_desc, slot, [offset_m, offset_n])
+
 
 @functools.lru_cache(maxsize=None)
 def _tuned(space, shape=None):
+    prune_configs_by = None
     if space == "heuristic":
         configs = heuristic_config(*shape)
     elif space == "full":
         configs = CONFIGS()
+        prune_configs_by = {"early_config_prune": _prune_full_configs}
     elif space == "smoke":
         configs = SMOKE_CONFIGS()
     else:
@@ -339,6 +380,7 @@ def _tuned(space, shape=None):
     return triton.autotune(
         configs=configs,
         key=["M", "N", "K"],
+        prune_configs_by=prune_configs_by,
     )(matmul_kernel_tma_ws_hopper_cooperative)
 
 
@@ -393,5 +435,8 @@ def mm(a, b, *, out=None, space="full"):
         NUM_SMS=num_sms,
         A_ROW_MAJOR=a_row_major,
         B_ROW_MAJOR=b_row_major,
+        # With N <= 1024 only a few N-tiles read each A panel, back to back;
+        # keeping it in L2 serves the repeat reads. Larger N regresses slightly.
+        A_EVICTION="evict_last" if N <= 1024 else "",
     )
     return c

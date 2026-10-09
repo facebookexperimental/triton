@@ -4,7 +4,11 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton._C.libtriton import ir
 from triton._internal_testing import is_blackwell, swizzle_scale_to_5d
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+from triton.compiler.compiler import make_backend
 import triton.language.extra.tlx as tlx
 from typing import Optional
 
@@ -66,6 +70,150 @@ def test_descriptor_gather(offset_dtype, device):
     gather4_count = BLOCK_M * BLOCK_N * x.element_size() // (4 * 4 * 128)
     assert kernel.asm["ptx"].count("cp.async.bulk.tensor.2d.tile::gather4") == gather4_count
     torch.testing.assert_close(y, x[x_offsets.long()])
+
+
+@triton.jit
+def _descriptor_scatter_compile_kernel(input_ptr, offsets_ptr, output_ptr, BLOCK_M: tl.constexpr,
+                                       BLOCK_N: tl.constexpr):
+    desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[256, BLOCK_N],
+        strides=[BLOCK_N, 1],
+        block_shape=[1, BLOCK_N],
+    )
+    buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1))
+    buffer = tlx.local_view(buffers, 0)
+    rows = tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    values = tl.load(input_ptr + rows[:, None] * BLOCK_N + cols[None, :])
+    tlx.local_store(buffer, values)
+    offset_layout: tl.constexpr = tlx.layout(
+        shape=((32, 4), (8, )),
+        stride=((0, 8), (1, )),
+    )
+    offset_ids = tlx.require_layout(tl.arange(0, BLOCK_M), offset_layout)
+    x_offsets = tl.load(offsets_ptr + offset_ids)
+    tlx.fence("async_shared")
+    tlx.async_descriptor_scatter(desc, buffer, x_offsets, 0)
+    tlx.async_descriptor_store_wait(0)
+
+
+def _compile_descriptor_scatter(capability):
+    source = ASTSource(
+        fn=_descriptor_scatter_compile_kernel,
+        signature={"input_ptr": "*fp16", "offsets_ptr": "*i32", "output_ptr": "*fp16"},
+        constexprs={"BLOCK_M": 32, "BLOCK_N": 128},
+    )
+    target = GPUTarget("cuda", capability, 32)
+    backend = make_backend(target)
+    options = backend.parse_options({"num_warps": 4, **source.parse_options()})
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    module = source.make_ir(
+        target,
+        options,
+        backend.get_codegen_implementation(options),
+        backend.get_module_map(),
+        context,
+    )
+    metadata = {"target": target, **options.__dict__}
+    stages = {}
+    backend.add_stages(stages, options, source.language)
+    artifacts = {}
+    for stage_name, compile_stage in stages.items():
+        module = compile_stage(module, metadata)
+        artifacts[stage_name] = module if isinstance(module, str) else str(module)
+        if stage_name == "ptx":
+            break
+    return artifacts
+
+
+@pytest.mark.parametrize("capability,ptx_target", [(103, "sm_103a"), (107, "sm_107a")])
+def test_descriptor_scatter_compiles_on_sm103up(capability, ptx_target):
+    compiled = _compile_descriptor_scatter(capability)
+    assert compiled["ttgir"].count("ttng.async_tma_scatter") == 1
+    assert ".version 9.4" in compiled["ptx"]
+    assert f".target {ptx_target}" in compiled["ptx"]
+    assert "cp.async.bulk.tensor.2d.tile::scatter4" in compiled["ptx"]
+
+
+@triton.jit
+def _descriptor_scatter_invalid_offsets_kernel(output_ptr):
+    desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[8, 16],
+        strides=[16, 1],
+        block_shape=[1, 16],
+    )
+    buffers = tlx.local_alloc((8, 16), tl.float16, tl.constexpr(1))
+    buffer = tlx.local_view(buffers, 0)
+    x_offsets = tl.full((8, ), 0.0, tl.float32)
+    tlx.async_descriptor_scatter(desc, buffer, x_offsets, 0)
+
+
+def test_descriptor_scatter_rejects_float_offsets():
+    source = ASTSource(
+        fn=_descriptor_scatter_invalid_offsets_kernel,
+        signature={"output_ptr": "*fp16"},
+        constexprs={},
+    )
+    with pytest.raises(triton.CompilationError, match="x_offsets must have dtype int16 or int32"):
+        triton.compile(source, target=GPUTarget("cuda", 103, 32))
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("offset_dtype", [torch.int16, torch.int32])
+def test_descriptor_scatter(offset_dtype, device):
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    @triton.jit
+    def descriptor_scatter_kernel(input_ptr, offsets_ptr, output_ptr, M, N, BLOCK_M: tl.constexpr,
+                                  BLOCK_N: tl.constexpr):
+        desc = tl.make_tensor_descriptor(
+            output_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[1, BLOCK_N],
+        )
+
+        buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, tl.constexpr(1))
+        buffer = tlx.local_view(buffers, 0)
+        rows = tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_N)
+        values = tl.load(input_ptr + rows[:, None] * BLOCK_N + cols[None, :])
+        tlx.local_store(buffer, values)
+
+        offset_layout: tl.constexpr = tlx.layout(
+            shape=((32, 4), (8, )),
+            stride=((0, 8), (1, )),
+        )
+        offset_ids = tlx.require_layout(tl.arange(0, BLOCK_M), offset_layout)
+        x_offsets = tl.load(offsets_ptr + offset_ids)
+
+        tlx.fence("async_shared")
+        tlx.async_descriptor_scatter(desc, buffer, x_offsets, 0)
+        tlx.async_descriptor_store_wait(0)
+
+    triton.set_allocator(alloc_fn)
+    M, N = 256, 128
+    BLOCK_M, BLOCK_N = 32, 128
+    x = torch.arange(BLOCK_M * BLOCK_N, dtype=torch.float16, device=device).reshape(BLOCK_M, BLOCK_N)
+    x_offsets = ((torch.arange(BLOCK_M, dtype=torch.int32, device=device) * 37 + 3) % M).to(offset_dtype)
+    y = torch.full((M, N), -1, dtype=x.dtype, device=device)
+
+    kernel = descriptor_scatter_kernel[(1, )](x, x_offsets, y, M, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4)
+
+    assert kernel.asm["ttgir"].count("ttng.async_tma_scatter") == 1
+    scatter4_count = BLOCK_M // 16
+    assert kernel.asm["ptx"].count("cp.async.bulk.tensor.2d.tile::scatter4") == scatter4_count
+    expected = torch.full_like(y, -1)
+    expected[x_offsets.long()] = x
+    torch.testing.assert_close(y, expected)
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")

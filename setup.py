@@ -381,6 +381,7 @@ class CMakeBuild(build_ext):
             "TRITON_ROCPROFILER_SDK_LIB_PATH",
             "TRITON_SLEEF_SOURCE_DIR",
             "TRITON_NVDISASM_PATH",
+            "TRITON_AMD_CODEGEN_PATH",
             "TRITON_PTXAS_PATH",
             "TRITON_PTXAS_BLACKWELL_PATH",
         ]
