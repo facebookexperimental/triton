@@ -2530,3 +2530,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK: scf.yield
+
+// -----
+
+// ---- Nested flat pipeline recovered inside a persistent loop ----
+//
+// The flat tag is required for nested execute_regions: untagged stages inside
+// a pipelined_for belong to that loop and are handled by the loop conversion.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @nested_flat_pipeline_backend(%n: index, %ptr: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+
+    scf.for %tile = %c0 to %n step %c1 {
+      scf.execute_region no_inline {
+        tt.store %ptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.flat, triton.warp_pipeline.stage = "stage0", triton.warp_pipeline.priority = 1 : i32}
+
+      scf.execute_region no_inline {
+        tt.store %ptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.flat, triton.warp_pipeline.stage = "stage1", triton.warp_pipeline.priority = 0 : i32}
+      scf.yield
+    }
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @nested_flat_pipeline_backend
+// CHECK: scf.for
+// CHECK-NOT: scf.execute_region
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: tt.store
+// CHECK: rocdl.s.barrier
+// CHECK: tt.store
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return
