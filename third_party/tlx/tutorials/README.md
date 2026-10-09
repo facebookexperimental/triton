@@ -1,8 +1,8 @@
 # AMD attention tutorials
 
-## PyTorch dense FlashAttention backward
+## PyTorch FlashAttention backward
 
-The packaged gfx950 BF16 backward kernels live in
+The packaged dense gfx950 BF16 backward kernels live in
 [`../ops/kernels/flash_attn/gfx950_bwd.py`](../ops/kernels/flash_attn/gfx950_bwd.py).
 Current PyTorch releases can opt into them through the FlashAttention provider
 registry:
@@ -14,15 +14,16 @@ from torch.nn.attention import activate_flash_attention_impl
 activate_flash_attention_impl("TLX_GFX950_BWD")
 ```
 
-Activation is process-global and replaces only
-`aten::_scaled_dot_product_flash_attention_backward`; PyTorch continues to run
-the forward kernel. The provider selects TLX only for correctness- and
-performance-validated dense BF16 gfx950 routes. Dropout, deterministic mode,
-unsupported layouts/shapes, and routes without a measured advantage call the
+Activation is process-global and replaces
+`aten::_scaled_dot_product_flash_attention_backward` and packed
+`aten::_flash_attention_backward`; PyTorch continues to run the forward kernel.
+The provider selects TLX only for correctness- and performance-validated BF16
+gfx950 routes. Dropout, deterministic mode, unsupported layouts/shapes, and
+routes without a measured advantage call the
 CUDA kernel captured at activation. Use
 `torch.nn.attention.restore_flash_attention_impl()` to remove the override.
-The automatic set is an exact allow-list of D64, D128, and D256 signatures that
-won through the activated provider on MI350X; unmeasured shapes and known
+The dense automatic set is an exact allow-list of D64, D128, and D256
+signatures that won through the activated provider on MI350X; unmeasured shapes and known
 losing members of the same kernel families fall back. For short D128
 `(16, 27, 200, 128)`, the default split route improves forward plus backward by
 1.15x non-causal and 1.35x causal. The exact-D128 opt-in improves it by 1.34x
@@ -36,6 +37,42 @@ N=1024 (1.05x). Neighboring D128 shapes that did not clear the performance
 gate remain on the native provider. For causal rectangular attention, use
 PyTorch's `causal_lower_right(SQ, SKV)` bias; plain `is_causal=True` rejects
 unequal sequence lengths before reaching FlashAttention.
+
+Seven additional B16 D128 signatures have measured eager backward gains:
+MHA H16 at N=4096 non-causal and N=4096/8192/16384 causal, plus GQA H64/8
+at N=8192 non-causal and N=2048/4096 causal. The provider selects a phase
+scheduling hint for non-causal MHA, the same hint with causal-diagonal peeling
+for causal MHA, a BM32 tile for long non-causal GQA, and four query-head owners
+per KV head for the two causal GQA cases. Neighboring shapes retain their
+existing dispatches.
+
+On MI350X these routes improve backward by 1.09x--1.22x over native PyTorch
+with CK selected as the preferred FlashAttention library, including all
+preprocessing, allocation, conversion, and reduction work. Against the previous
+TLX kernels on the same compiler, causal MHA improves by about 1.03x, long
+non-causal GQA by 1.12x, and causal GQA by 1.20x--1.30x. Non-causal MHA has
+essentially unchanged latency. These backward-only measurements use main
+`ed7752a24` with LLVM `ce352942`; the updated compiler already removes the
+previous non-causal MHA spills. The BM32 kernel now has 17 spills and regresses
+against the earlier LLVM `b010a18d` build, despite retaining an advantage over
+the native provider. Using the old shared helpers reproduces those spills.
+Head splitting reads the original K/V tensors and reduces FP32 dK/dV partials
+once before the final BF16 stores; its additional scratch is 1 GiB at N=2048
+and 2 GiB at N=4096. It increases the number of workgroups without increasing
+per-CU residency. Existing BF16 dQ atomic accumulation is unchanged, and the
+provider still falls back in deterministic mode.
+
+The packed D128 adapter enables measured non-causal MHA/GQA cases from
+[#3775](https://github.com/facebookexperimental/triton/pull/3775), including
+the Hq/Hkv=12/4 and 64/8 prefix cases. It checks tensor shapes, 16-byte base
+alignment, and the exact Q/KV prefix sums against the allow-list; matching
+totals and maximum lengths alone is insufficient. Eligible calls validate
+offsets, prepare a fresh plan, normalize O/dO to contiguous storage, and use
+FP32 dQ accumulation. These costs are included in provider measurements.
+CUDA graph capture, empty sequences, local windows, and other unsupported or
+unmeasured cases use the captured native kernel. Preparation and backward
+kernel errors propagate. Use the explicit prepared-plan API below to reuse
+metadata and execute backward inside graph capture.
 
 ## Adaptive FlashAttention
 
@@ -69,62 +106,61 @@ correctness/performance driver.
 
 ## Packed variable-length FlashAttention backward
 
-[`amd_fa_varlen_bwd.py`](amd_fa_varlen_bwd.py) provides a gfx950 specialization
-for packed BF16 THD backward with head dimension 128.  Non-causal mode supports
-MHA/GQA with `Hq % Hkv == 0`; causal mode supports MHA self-attention with
-identical Q/KV cumulative offsets and `Hq == Hkv`.  Prepare a plan once for
-immutable cumulative sequence offsets, then reuse it for every backward
-invocation with the same packing:
+The packaged implementation in
+[`../ops/kernels/flash_attn_varlen/gfx950_bwd.py`](../ops/kernels/flash_attn_varlen/gfx950_bwd.py)
+exposes packed BF16 THD backward with head dimension 128 on gfx950 through
+`triton.tlx.ops`. Non-causal mode supports MHA/GQA with `Hq % Hkv == 0`;
+causal mode supports MHA self-attention with identical Q/KV cumulative offsets
+and `Hq == Hkv`. Prepare a plan once, then reuse it with the same packing:
 
 ```python
-from triton.language.extra.tlx.tutorials.amd_fa_varlen_bwd import (
-    fa_varlen_backward,
-    prepare_varlen_backward,
-    validate_varlen_backward_plan,
+from triton.tlx import ops
+
+plan = ops.prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k)
+# FP32 dQ accumulation by default; inputs and returned gradients stay BF16.
+dq, dk, dv = ops.flash_attn_varlen_backward(
+    q, k, v, out, do, lse, plan, sm_scale, causal=False,
 )
-
-plan = prepare_varlen_backward(
-    cu_seqlens_q,
-    cu_seqlens_k,
-    q.shape[0],
-    k.shape[0],
-    max_seqlen_q,
-    max_seqlen_k,
-)
-dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale)
-
-# Use FP32 dQ accumulation; inputs and returned gradients stay BF16.
-dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, dq_atomic_fp32=True)
-
-# Causal packed self-attention. Q and KV offsets and head counts must match.
-dq, dk, dv = fa_varlen_backward(q, k, v, out, do, lse, plan, sm_scale, causal=True)
 ```
 
-When all four totals/maxima are supplied, plan preparation requires contiguous
-offsets, asynchronously validates them, and builds compact BM16/BN128 schedules
-plus a masked BM32/BN256 schedule on the GPU. The legacy two-argument call also
-accepts strided rank-1 offsets, cloning them into contiguous plan storage before
-copying them to the CPU to infer metadata, and therefore synchronizes. Invalid
-zero-start, monotonicity, terminal-total, or maximum-length metadata sets a
-device error flag that suppresses schedule consumption. The metadata-supplied
-path does not copy sequence offsets or task counts to the host. Prepare and
-consume a plan on the same CUDA stream. For untrusted offsets, call
-`validate_varlen_backward_plan(plan)` once before reuse; this explicitly
-synchronizes the error flag and raises `ValueError` on invalid metadata. Pass
-`causal=True` to this validator when separately allocated Q/KV offset tensors
-must also be checked for value equality. The frozen plan prevents field
-rebinding, but its PyTorch
-tensors are still mutable; treat every plan-owned offset and schedule tensor as
-immutable after preparation. Keep plan construction outside the timed or
-repeated execution path. Every sequence must have at least one query and one
-key/value token.
-`lse` is contiguous FP32 with shape `(query_heads, total_q)`.  In causal mode,
+Public preparation clones the two rank-1 CUDA int32 offset tensors into
+plan-owned storage and synchronizes to validate them. Offsets must start at
+zero and be strictly increasing; every sequence needs at least one Q and KV
+token. Prepare outside CUDA graph capture and consume the plan on the same
+device and stream. The original offset tensors may then be modified, but all
+plan-owned tensors must remain immutable. Preparation also supplies compact
+H64 dS metadata for eligible prefix inputs. Reusing this plan avoids repeated
+host validation and supports backward graph capture.
+
+Supply the existing forward output and contiguous natural-log FP32 `lse` with
+shape `(query_heads, total_q)`, using the same scale and causal flag as forward.
+Dropout, local windows, and deterministic algorithms are unsupported. Q/K/O/dO
+must be contiguous. This explicit API returns first-order gradients and builds
+no autograd graph, even when inputs require gradients; higher-order derivatives
+are unsupported. Pass `dq_atomic_fp32=False` for BF16 dQ accumulation.
+
+[`amd_fa_varlen_bwd.py`](amd_fa_varlen_bwd.py) retains the lower-level
+`prepare_varlen_backward`, `validate_varlen_backward_plan`, and
+`fa_varlen_backward` entry points as a compatibility shim. Unlike the public
+backward API, `fa_varlen_backward` defaults to BF16 dQ accumulation. When all
+four totals/maxima are supplied to its preparation helper, for example
+`prepare_varlen_backward(cu_q, cu_k, total_q, total_kv, max_q, max_k)`, it
+requires contiguous offsets and asynchronously builds compact BM16/BN128 and
+masked BM32/BN256 schedules on the GPU. This path retains the supplied offsets
+and copies neither offsets nor task counts to the host. Invalid zero-start,
+monotonicity, terminal-total, or maximum-length metadata sets a device error
+flag that suppresses schedule consumption. For untrusted offsets, call
+`validate_varlen_backward_plan(plan)` before reuse to synchronize the flag and
+raise `ValueError` on invalid metadata. Pass `causal=True` to also check Q/KV
+offset equality. The two-argument helper clones and validates offsets like the
+public preparation API, including strided rank-1 inputs.
+
+In causal mode,
 V may use the TritonBench-style `v_storage[:, 0]` view: the head and D axes must
 remain dense while the token stride may include gaps.  Returned `dv` is always
 contiguous.
 
-The default dQ path uses BF16 accumulation and atomics. The FP32 option enables
-FP32 accumulation, with FP32 atomics on most routes. Eligible aligned non-causal
+FP32 dQ accumulation uses FP32 atomics on most routes. Eligible aligned non-causal
 MHA and GQA cases use a shared interleaved schedule: each KV tile reuses K/V
 across its query heads and retains their dK/dV contributions in FP32 before
 storing BF16 outputs. For the batch-19 prefix configuration
@@ -139,8 +175,8 @@ Both split paths require non-causal FP32 mode and 16-byte aligned Q/K/V/dO
 bases. Hq/Hkv=12/4 uses a fixed-pitch dS temporary of about **11.974 GiB**.
 Hq/Hkv=64/8 uses compact per-sequence rectangles padded to Q16 and KV256;
 the seeded prefix benchmark uses about **36.59 GiB**. The compact layout
-requires metadata attached by legacy plan preparation from the two cumulative
-sequence-length tensors. Plans prepared with device metadata, and older plans
+requires metadata attached by public preparation or the legacy two-argument
+helper. Plans prepared with device metadata, and older plans
 without compact dS metadata, retain the H64 FP32-atomic route.
 
 Capture on the current stream of Q's device, or `torch.cuda.OutOfMemoryError`

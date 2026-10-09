@@ -163,6 +163,13 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
+  if (auto requireOp = dyn_cast<ttg::RequireLayoutOp>(op)) {
+    assert(operandIndex == 0 && "RequireLayoutOp only has one operand");
+    auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+    return resultType &&
+           isSupportedDotConstraintEncoding(resultType.getEncoding());
+  }
+
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
@@ -178,6 +185,14 @@ public:
           !isTrackedDotValue(cvt.getResult()))
         return;
       unionLatticeAnchors<DotRewriteLattice>(cvt.getSrc(), cvt.getResult());
+    });
+    top->walk([&](ttg::RequireLayoutOp requireOp) {
+      auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+      if (!isTrackedDotValue(requireOp.getSrc()) || !resultType ||
+          !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+        return;
+      unionLatticeAnchors<DotRewriteLattice>(requireOp.getSrc(),
+                                             requireOp.getResult());
     });
   }
 
@@ -513,13 +528,26 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
   return nullptr;
 }
 
-static bool isDirectlyIndexedBufferView(Value dest, Value root) {
+// Direct-to-LDS can preserve the inferred offset layout through views that do
+// not reorder the destination. Static subslices are required by packed GEMM
+// staging, where several narrow global-load windows populate one wider LDS
+// allocation.
+static bool isSupportedBufferView(Value dest, Value root) {
   Value current = dest;
   while (current != root) {
-    auto index = current.getDefiningOp<ttg::MemDescIndexOp>();
-    if (!index)
-      return false;
-    current = index.getSrc();
+    if (auto index = current.getDefiningOp<ttg::MemDescIndexOp>()) {
+      current = index.getSrc();
+      continue;
+    }
+    if (auto require = current.getDefiningOp<tlx::RequireLayoutOp>()) {
+      current = require.getSrc();
+      continue;
+    }
+    if (auto subslice = current.getDefiningOp<ttg::MemDescSubsliceOp>()) {
+      current = subslice.getSrc();
+      continue;
+    }
+    return false;
   }
   return true;
 }
@@ -539,11 +567,13 @@ pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
     if (!mustPin)
       return success();
     return buf.emitOpError()
-           << "contiguity > 1 requires a directly indexed user-pinned "
+           << "contiguity > 1 requires a supported view of a user-pinned "
               "padded_shared destination; "
            << reason;
   };
-  if (!mustPin && buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>())
+  bool hasExplicitOffsetLayout =
+      !!buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>();
+  if (!mustPin && hasExplicitOffsetLayout)
     return success();
 
   auto destTy = dyn_cast<ttg::MemDescType>(buf.getDest().getType());
@@ -553,9 +583,18 @@ pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
     return failOrSkip("destination is not a shared-memory memdesc");
   if (!isa_and_nonnull<ttg::PinnedEncodingTrait>(rootTy.getEncoding()))
     return failOrSkip("the root allocation is not user-pinned");
-  if (!isDirectlyIndexedBufferView(buf.getDest(), root))
+  if (!isSupportedBufferView(buf.getDest(), root))
     return failOrSkip(
-        "only the allocation itself and memdesc_index views are supported");
+        "only memdesc_index, require_layout, and static subslice views are "
+        "supported");
+  // An authored offset layout already describes the physical write into a
+  // packed subslice. It may target either padded_shared or shared_linear LDS.
+  // The generic inference below only sees the logical view shape, so it cannot
+  // reconstruct bases that span the wider allocation. Final Direct-to-LDS
+  // lowering still checks that the authored layout and requested width form a
+  // legal coalesced write.
+  if (hasExplicitOffsetLayout)
+    return success();
   auto paddedEnc = dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(
       tlx::getEffectiveEncoding(destTy.getEncoding()));
   if (!paddedEnc)

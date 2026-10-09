@@ -846,8 +846,31 @@ def test_async_dots_blackwell_tmem(device):
     torch.testing.assert_close(d, ref_out)
 
 
+@pytest.mark.parametrize(
+    ("BLOCK_M", "N", "SCALE_MODE", "WARP_SPECIALIZED", "B_SCALE_IN_TMEM"),
+    [
+        (128, 256, "nonuniform", False, False),
+        (128, 128, "nonuniform", False, False),
+        (64, 128, "unit", False, False),
+        (64, 128, "a_nonuniform", False, False),
+        (64, 128, "b_nonuniform", False, False),
+        (64, 128, "nonuniform", False, False),
+        (64, 128, "nonuniform", True, False),
+        (64, 128, "b_nonuniform", False, True),
+    ],
+    ids=[
+        "m128_per_cta_n256",
+        "m128_per_cta_n128",
+        "m64_per_cta_unit_scales",
+        "m64_per_cta_n128_a_nonuniform",
+        "m64_per_cta_n128_b_nonuniform",
+        "m64_per_cta_n128_nonuniform_scales",
+        "m64_per_cta_n128_nonuniform_scales_manual_ws",
+        "m64_per_cta_n128_b_nonuniform_tmem_scale",
+    ],
+)
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_async_dot_scaled_2cta(device):
+def test_async_dot_scaled_2cta(device, BLOCK_M, N, SCALE_MODE, WARP_SPECIALIZED, B_SCALE_IN_TMEM):
     """
     Test 2-CTA scaled MMA generates tcgen05.mma.cta_group::2 instruction.
     Also verifies numerical correctness against reference implementation.
@@ -879,6 +902,9 @@ def test_async_dot_scaled_2cta(device):
         M: tl.constexpr,
         N: tl.constexpr,
         K: tl.constexpr,
+        WARP_SPECIALIZED: tl.constexpr,
+        B_SCALE_IN_TMEM: tl.constexpr,
+        MMA_NUM_WARPS: tl.constexpr,
     ):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
@@ -900,91 +926,286 @@ def test_async_dot_scaled_2cta(device):
             block_shape=[BLOCK_K, BLOCK_N // 2],
         )
 
-        desc_a_scale = tl.make_tensor_descriptor(
-            a_scale_ptr,
-            shape=[M // 128, K // 32 // 4, 2, 2 * 128],
-            strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
-            block_shape=[BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
-        )
+        # E8M0 scales use the hardware-compatible 5D swizzled representation.
+        SCALE_K_GROUPS: tl.constexpr = K // 128
+        BLOCK_SCALE_K_GROUPS: tl.constexpr = BLOCK_K // 128
+        SCALE_SWIZZLE_WIDTH: tl.constexpr = 256
+        SCALE_K_STRIDE: tl.constexpr = 2 * SCALE_SWIZZLE_WIDTH
+        SCALE_ROW_STRIDE: tl.constexpr = SCALE_K_GROUPS * SCALE_K_STRIDE
+        A_SCALE_GROUPS: tl.constexpr = triton.cdiv(BLOCK_M, 128)
 
-        # B scale is NOT split across CTAs - full scale needed for MMA
-        desc_b_scale = tl.make_tensor_descriptor(
-            b_scale_ptr,
-            shape=[N // 128, K // 32 // 4, 2, 2 * 128],
-            strides=[K // 32 // 4 * 2 * 2 * 128, 2 * 2 * 128, 2 * 128, 1],
-            block_shape=[BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128],
-        )
+        if BLOCK_M == 64:
+            # Pad A to one M128 group; CTA rank selects its local M64 half.
+            a_scale_shape: tl.constexpr = [2, 1, SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH]
+            a_scale_strides: tl.constexpr = [
+                SCALE_ROW_STRIDE,
+                SCALE_ROW_STRIDE,
+                SCALE_K_STRIDE,
+                SCALE_SWIZZLE_WIDTH,
+                1,
+            ]
+            a_scale_block_shape: tl.constexpr = [
+                1,
+                1,
+                BLOCK_SCALE_K_GROUPS,
+                2,
+                SCALE_SWIZZLE_WIDTH,
+            ]
+            desc_a_scale = tl.make_tensor_descriptor(
+                a_scale_ptr,
+                shape=a_scale_shape,
+                strides=a_scale_strides,
+                block_shape=a_scale_block_shape,
+            )
+            desc_b_scale = tl.make_tensor_descriptor(
+                b_scale_ptr,
+                shape=[1, 1, SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH],
+                strides=[
+                    SCALE_ROW_STRIDE,
+                    SCALE_ROW_STRIDE,
+                    SCALE_K_STRIDE,
+                    SCALE_SWIZZLE_WIDTH,
+                    1,
+                ],
+                block_shape=[1, 1, BLOCK_SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH],
+            )
+        else:
+            desc_a_scale = tl.make_tensor_descriptor(
+                a_scale_ptr,
+                shape=[1, M // 128, SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH],
+                strides=[
+                    M // 128 * SCALE_ROW_STRIDE,
+                    SCALE_ROW_STRIDE,
+                    SCALE_K_STRIDE,
+                    SCALE_SWIZZLE_WIDTH,
+                    1,
+                ],
+                block_shape=[
+                    1,
+                    A_SCALE_GROUPS,
+                    BLOCK_SCALE_K_GROUPS,
+                    2,
+                    SCALE_SWIZZLE_WIDTH,
+                ],
+            )
+
+            # B scales remain full logical N128 scales in every CTA.
+            desc_b_scale = tl.make_tensor_descriptor(
+                b_scale_ptr,
+                shape=[1, N // 128, SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH],
+                strides=[
+                    N // 128 * SCALE_ROW_STRIDE,
+                    SCALE_ROW_STRIDE,
+                    SCALE_K_STRIDE,
+                    SCALE_SWIZZLE_WIDTH,
+                    1,
+                ],
+                block_shape=[
+                    1,
+                    BLOCK_N // 128,
+                    BLOCK_SCALE_K_GROUPS,
+                    2,
+                    SCALE_SWIZZLE_WIDTH,
+                ],
+            )
 
         # async load a and b into SMEM
         a_tile = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float8e4nv, tl.constexpr(1))
-        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float8e4nv, tl.constexpr(1))  # difference from 1cta
-        a_scale_tile = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
-        # B scale tile is NOT halved - full scale for MMA
-        b_scale_tile = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 // 4, 2, 2 * 128), tl.uint8, tl.constexpr(1))
+        b_tile = tlx.local_alloc((BLOCK_K, BLOCK_N // 2), tl.float8e4nv, tl.constexpr(1))
+        a_scale_tile = tlx.local_alloc(
+            (1, A_SCALE_GROUPS, BLOCK_SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH),
+            tl.uint8,
+            tl.constexpr(1),
+        )
+        if BLOCK_M == 64:
+            b_scale_tile = tlx.local_alloc(
+                (1, 1, BLOCK_SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH),
+                tl.uint8,
+                tl.constexpr(1),
+            )
+        else:
+            b_scale_tile = tlx.local_alloc(
+                (1, BLOCK_N // 128, BLOCK_SCALE_K_GROUPS, 2, SCALE_SWIZZLE_WIDTH),
+                tl.uint8,
+                tl.constexpr(1),
+            )
+        if B_SCALE_IN_TMEM:
+            b_scale_tmem = tlx.local_alloc(
+                (BLOCK_N, BLOCK_K // 32),
+                tl.uint8,
+                tl.constexpr(1),
+                tlx.storage_kind.tmem,
+            )
 
         bars = tlx.alloc_barriers(tl.constexpr(4))
         bar_a = tlx.local_view(bars, 0)
         bar_b = tlx.local_view(bars, 1)
         bar_a_scale = tlx.local_view(bars, 2)
         bar_b_scale = tlx.local_view(bars, 3)
-        tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K * 1)  # fp8
-        tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2) * 1)  # difference from 1cta: B is half
-        tlx.barrier_expect_bytes(bar_a_scale, BLOCK_M // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)
-        tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N // 128 * BLOCK_K // 32 // 4 * 2 * 2 * 128)  # full B scale
-
-        # difference from 1cta: A offset by CTA rank, B offset by CTA rank
-        tlx.async_descriptor_load(desc_a, a_tile[0], [cluster_cta_rank * BLOCK_M, 0], bar_a)
-        tlx.async_descriptor_load(desc_b, b_tile[0], [0, cluster_cta_rank * BLOCK_N // 2], bar_b)
-        tlx.async_descriptor_load(desc_a_scale, a_scale_tile[0], [cluster_cta_rank * BLOCK_M // 128, 0, 0, 0],
-                                  bar_a_scale)
-        tlx.async_descriptor_load(desc_b_scale, b_scale_tile[0], [0, 0, 0, 0], bar_b_scale)  # full B scale
-
-        tlx.barrier_wait(bar_a, tl.constexpr(0))
-        tlx.barrier_wait(bar_b, tl.constexpr(0))
-        tlx.barrier_wait(bar_a_scale, tl.constexpr(0))
-        tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
-
-        # difference from 1cta: CTA0 waits for both CTAs before issuing MMA op
-        # "Arrive Remote, Wait Local" pattern: all CTAs signal CTA 0's barrier, only CTA 0 waits
-        tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
-        tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
-
-        c_tile = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
-
-        # Allocate barrier for MMA completion
+        c_tile = tlx.local_alloc(
+            (BLOCK_M, BLOCK_N),
+            tl.float32,
+            tl.constexpr(1),
+            tlx.storage_kind.tmem,
+        )
         mma_done_bars = tlx.alloc_barriers(tl.constexpr(1))
         mma_done_bar = tlx.local_view(mma_done_bars, 0)
 
-        # difference from 1cta: set two_ctas. Compiler auto generates pred to issue mma only from CTA0
-        # Pass mma_done_bar directly to async_dot_scaled for MMA completion signaling
-        tlx.async_dot_scaled(
-            a_tile[0],
-            b_tile[0],
-            c_tile[0],
-            a_scale_tile[0],
-            A_format,
-            b_scale_tile[0],
-            B_format,
-            use_acc=False,
-            two_ctas=True,
-            mBarriers=[mma_done_bar],
-        )
+        if WARP_SPECIALIZED:
+            # Manual WS only: epilogue, MMA, and TMA each have explicit owners.
+            with tlx.async_tasks():
+                with tlx.async_task("default"):
+                    tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+                    result = tlx.local_load(c_tile[0])
+                    c = result.to(tl.float16)
+                    offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
+                    offs_n = tl.arange(0, BLOCK_N)
+                    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+                    tl.store(c_ptrs, c)
 
-        # Wait for MMA completion
-        tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+                with tlx.async_task(num_warps=MMA_NUM_WARPS, num_regs=80):
+                    tlx.barrier_wait(bar_a, tl.constexpr(0))
+                    tlx.barrier_wait(bar_b, tl.constexpr(0))
+                    tlx.barrier_wait(bar_a_scale, tl.constexpr(0))
+                    tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
+                    a_scale_operand = a_scale_tile[0]
+                    b_scale_operand = b_scale_tile[0]
+                    if B_SCALE_IN_TMEM:
+                        tlx.tmem_copy(b_scale_tile[0], b_scale_tmem[0])
+                        b_scale_operand = b_scale_tmem[0]
+                    tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+                    tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
+                    tlx.async_dot_scaled(
+                        a_tile[0],
+                        b_tile[0],
+                        c_tile[0],
+                        a_scale_operand,
+                        A_format,
+                        b_scale_operand,
+                        B_format,
+                        use_acc=False,
+                        two_ctas=True,
+                        mBarriers=[mma_done_bar],
+                    )
 
-        result = tlx.local_load(c_tile[0])
-
-        c = result.to(tl.float16)
-        offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = tl.arange(0, BLOCK_N)
-        c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-        tl.store(c_ptrs, c)
+                with tlx.async_task(num_warps=1, num_regs=232):
+                    tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K)
+                    tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2))
+                    tlx.barrier_expect_bytes(
+                        bar_a_scale,
+                        A_SCALE_GROUPS * BLOCK_SCALE_K_GROUPS * 2 * SCALE_SWIZZLE_WIDTH,
+                    )
+                    tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N * BLOCK_K // 32)
+                    tlx.async_descriptor_load(
+                        desc_a,
+                        a_tile[0],
+                        [cluster_cta_rank * BLOCK_M, 0],
+                        bar_a,
+                    )
+                    tlx.async_descriptor_load(
+                        desc_b,
+                        b_tile[0],
+                        [0, cluster_cta_rank * BLOCK_N // 2],
+                        bar_b,
+                    )
+                    if BLOCK_M == 64:
+                        scale_offsets = [cluster_cta_rank, 0, 0, 0, 0]
+                    else:
+                        scale_offsets = [
+                            0,
+                            cluster_cta_rank * BLOCK_M // 128,
+                            0,
+                            0,
+                            0,
+                        ]
+                    tlx.async_descriptor_load(
+                        desc_a_scale,
+                        a_scale_tile[0],
+                        scale_offsets,
+                        bar_a_scale,
+                    )
+                    tlx.async_descriptor_load(
+                        desc_b_scale,
+                        b_scale_tile[0],
+                        [0, 0, 0, 0, 0],
+                        bar_b_scale,
+                    )
+        else:
+            tlx.barrier_expect_bytes(bar_a, BLOCK_M * BLOCK_K)
+            tlx.barrier_expect_bytes(bar_b, BLOCK_K * (BLOCK_N // 2))
+            tlx.barrier_expect_bytes(
+                bar_a_scale,
+                A_SCALE_GROUPS * BLOCK_K // 32 // 4 * 2 * 2 * 128,
+            )
+            tlx.barrier_expect_bytes(bar_b_scale, BLOCK_N * BLOCK_K // 32)
+            tlx.async_descriptor_load(
+                desc_a,
+                a_tile[0],
+                [cluster_cta_rank * BLOCK_M, 0],
+                bar_a,
+            )
+            tlx.async_descriptor_load(
+                desc_b,
+                b_tile[0],
+                [0, cluster_cta_rank * BLOCK_N // 2],
+                bar_b,
+            )
+            if BLOCK_M == 64:
+                scale_offsets = [cluster_cta_rank, 0, 0, 0, 0]
+            else:
+                scale_offsets = [
+                    0,
+                    cluster_cta_rank * BLOCK_M // 128,
+                    0,
+                    0,
+                    0,
+                ]
+            tlx.async_descriptor_load(
+                desc_a_scale,
+                a_scale_tile[0],
+                scale_offsets,
+                bar_a_scale,
+            )
+            tlx.async_descriptor_load(
+                desc_b_scale,
+                b_scale_tile[0],
+                [0, 0, 0, 0, 0],
+                bar_b_scale,
+            )
+            tlx.barrier_wait(bar_a, tl.constexpr(0))
+            tlx.barrier_wait(bar_b, tl.constexpr(0))
+            tlx.barrier_wait(bar_a_scale, tl.constexpr(0))
+            tlx.barrier_wait(bar_b_scale, tl.constexpr(0))
+            a_scale_operand = a_scale_tile[0]
+            b_scale_operand = b_scale_tile[0]
+            if B_SCALE_IN_TMEM:
+                tlx.tmem_copy(b_scale_tile[0], b_scale_tmem[0])
+                b_scale_operand = b_scale_tmem[0]
+            tlx.barrier_arrive(cta_bars[0], 1, remote_cta_rank=0)
+            tlx.barrier_wait(cta_bars[0], phase=0, pred=pred_cta0)
+            tlx.async_dot_scaled(
+                a_tile[0],
+                b_tile[0],
+                c_tile[0],
+                a_scale_operand,
+                A_format,
+                b_scale_operand,
+                B_format,
+                use_acc=False,
+                two_ctas=True,
+                mBarriers=[mma_done_bar],
+            )
+            tlx.barrier_wait(mma_done_bar, tl.constexpr(0))
+            result = tlx.local_load(c_tile[0])
+            c = result.to(tl.float16)
+            offs_m = cluster_cta_rank * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_n = tl.arange(0, BLOCK_N)
+            c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+            tl.store(c_ptrs, c)
 
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
-    # M=256 so BLOCK_M=128 per CTA, N=256 so BLOCK_N=256 total (128 per CTA for B data)
-    M, N, K = (256, 256, 128)
+    M, K = (2 * BLOCK_M, 128)
 
     DTYPE_MAP = {
         "e5m2": torch.float8_e5m2,
@@ -994,17 +1215,36 @@ def test_async_dot_scaled_2cta(device):
     A_DATA_TYPE = "e4m3"
     B_DATA_TYPE = "e4m3"
 
-    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).to(DTYPE_MAP[A_DATA_TYPE]).to(device)
-    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
+    value_high = 4 if BLOCK_M == 64 else 40
+    a = torch.randint(1, value_high, (M, K), dtype=torch.uint8).to(DTYPE_MAP[A_DATA_TYPE]).to(device)
+    b = torch.randint(1, value_high, (K, N), dtype=torch.uint8).to(DTYPE_MAP[B_DATA_TYPE]).to(device)
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
 
-    a_scale = torch.randint(124, 130, (M, K // 32), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(124, 130, (N, K // 32), dtype=torch.uint8, device=device)
-    a_scale_4d = swizzle_scale_to_5d(a_scale.reshape(1, M, K // 32), M // 128, K // 32 // 4).squeeze(0)
-    b_scale_4d = swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4).squeeze(0)
+    if BLOCK_M == 64:
+        # Keep the scaled result finite while varying every row and K block.
+        unit_a_scale = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device)
+        unit_b_scale = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device)
+        random_a_scale = torch.randint(124, 128, (M, K // 32), dtype=torch.uint8, device=device)
+        random_b_scale = torch.randint(124, 128, (N, K // 32), dtype=torch.uint8, device=device)
+        a_scale = random_a_scale if SCALE_MODE in ("a_nonuniform", "nonuniform") else unit_a_scale
+        b_scale = random_b_scale if SCALE_MODE in ("b_nonuniform", "nonuniform") else unit_b_scale
+        if SCALE_MODE in ("a_nonuniform", "nonuniform"):
+            assert torch.unique(a_scale).numel() > 1
+        if SCALE_MODE in ("b_nonuniform", "nonuniform"):
+            assert torch.unique(b_scale).numel() > 1
+    else:
+        a_scale = torch.randint(124, 130, (M, K // 32), dtype=torch.uint8, device=device)
+        b_scale = torch.randint(124, 130, (N, K // 32), dtype=torch.uint8, device=device)
+    if BLOCK_M == 64:
+        local_a_scale = torch.full((2, 128, K // 32), 127, dtype=torch.uint8, device=device)
+        local_a_scale[:, :64] = a_scale.reshape(2, 64, K // 32)
+        a_scale_5d = swizzle_scale_to_5d(local_a_scale, 1, K // 32 // 4)
+        b_scale_5d = swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4)
+    else:
+        a_scale_5d = swizzle_scale_to_5d(a_scale.reshape(1, M, K // 32), M // 128, K // 32 // 4)
+        b_scale_5d = swizzle_scale_to_5d(b_scale.reshape(1, N, K // 32), N // 128, K // 32 // 4)
 
-    BLOCK_M = M // 2  # 128 per CTA
-    BLOCK_N = N  # 256 total, 128 per CTA for B data
+    BLOCK_N = N
     BLOCK_K = K
     kern_kwargs = {
         "BLOCK_M": BLOCK_M,
@@ -1013,6 +1253,9 @@ def test_async_dot_scaled_2cta(device):
         "M": M,
         "N": N,
         "K": K,
+        "WARP_SPECIALIZED": WARP_SPECIALIZED,
+        "B_SCALE_IN_TMEM": B_SCALE_IN_TMEM,
+        "MMA_NUM_WARPS": 4,
     }
     kernel = tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
         a,
@@ -1021,8 +1264,8 @@ def test_async_dot_scaled_2cta(device):
         b,
         b.stride(0),
         b.stride(1),
-        a_scale_4d,
-        b_scale_4d,
+        a_scale_5d,
+        b_scale_5d,
         c,
         c.stride(0),
         c.stride(1),
@@ -1042,6 +1285,12 @@ def test_async_dot_scaled_2cta(device):
     assert ttgir.count("nvg.cluster_id") == 1
     assert ttgir.count("ttng.map_to_remote_buffer") == 1
     assert ttgir.count("ttng.tc_gen5_mma_scaled") >= 1
+    if BLOCK_M == 64:
+        assert "blockM = 64" in ttgir
+        # The accumulator and complete B scale both use Layout-B addressing.
+        assert ttgir.count("ctaMode = twocta_rhs") >= 2
+    if WARP_SPECIALIZED:
+        assert ttgir.count("ttg.warp_specialize") == 1
 
     ptx = kernel.asm["ptx"]
     # The key assertion: with two_ctas=True, should generate cta_group::2 for scaled MMA
@@ -1049,7 +1298,11 @@ def test_async_dot_scaled_2cta(device):
         f"Expected tcgen05.mma.cta_group::2 for 2-CTA scaled MMA, but found: "
         f"cta_group::1 count={ptx.count('tcgen05.mma.cta_group::1')}, "
         f"cta_group::2 count={ptx.count('tcgen05.mma.cta_group::2')}")
-
+    if BLOCK_M == 64:
+        if B_SCALE_IN_TMEM:
+            assert "ttng.tmem_copy" in ttgir
+        else:
+            assert "tcgen05.st.sync.aligned.32x32b.x2.b32" in ptx
     # Numeric verification: compute reference and compare
     def fp8e8m0_to_float32(scale):
         """Convert FP8 E8M0 scale values to float32."""
@@ -1066,9 +1319,63 @@ def test_async_dot_scaled_2cta(device):
     a_scale_f32 = a_scale_f32.repeat_interleave(32, dim=1)[:M, :K]
     b_scale_f32 = b_scale_f32.repeat_interleave(32, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float16)
+    if BLOCK_M == 64:
+        assert torch.isfinite(ref_out).all()
 
     atol = 1e-2 * math.sqrt(K / 32)
     torch.testing.assert_close(ref_out, c, atol=atol, rtol=0)
+
+    if BLOCK_M == 64 and SCALE_MODE == "unit" and not WARP_SPECIALIZED and not B_SCALE_IN_TMEM:
+        for shape_overrides in (
+            {"BLOCK_K": 256, "K": 256},
+            {"BLOCK_N": 256, "N": 256},
+        ):
+            invalid_kwargs = {**kern_kwargs, **shape_overrides}
+            with pytest.raises(
+                    RuntimeError,
+                    match="M64 two-CTA scaled MMA only supports K=128 and per-CTA N=64",
+            ):
+                tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
+                    a,
+                    a.stride(0),
+                    a.stride(1),
+                    b,
+                    b.stride(0),
+                    b.stride(1),
+                    a_scale_5d,
+                    b_scale_5d,
+                    c,
+                    c.stride(0),
+                    c.stride(1),
+                    A_DATA_TYPE,
+                    B_DATA_TYPE,
+                    ctas_per_cga=(2, 1, 1),
+                    **invalid_kwargs,
+                )
+
+    if BLOCK_M == 64 and WARP_SPECIALIZED:
+        invalid_kwargs = {**kern_kwargs, "MMA_NUM_WARPS": 1}
+        with pytest.raises(
+                RuntimeError,
+                match="scale lowering requires a power-of-two MMA partition with at least 4 warps",
+        ):
+            tcgen5_dot_scaled_2cta_kernel[(M // BLOCK_M, N // BLOCK_N)](
+                a,
+                a.stride(0),
+                a.stride(1),
+                b,
+                b.stride(0),
+                b.stride(1),
+                a_scale_5d,
+                b_scale_5d,
+                c,
+                c.stride(0),
+                c.stride(1),
+                A_DATA_TYPE,
+                B_DATA_TYPE,
+                ctas_per_cga=(2, 1, 1),
+                **invalid_kwargs,
+            )
 
 
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])

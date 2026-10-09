@@ -5,6 +5,8 @@ contract is contiguous square FP16/BF16 attention with ``HEAD_DIM`` 64 or 128.
 """
 
 import torch
+import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensor
 
 import triton
 import triton.language as tl
@@ -23,7 +25,7 @@ def _host_descriptor_pre_hook(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     NUM_MMA_GROUPS = nargs["NUM_MMA_GROUPS"]
     BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
-    if nargs["USE_BM192"]:
+    if nargs["RANK3_DESC"]:
         nargs["desc_q"].block_shape = [1, BLOCK_M_SPLIT, HEAD_DIM]
         nargs["desc_v"].block_shape = [1, BLOCK_N, HEAD_DIM]
         nargs["desc_k"].block_shape = [1, BLOCK_N, HEAD_DIM]
@@ -39,6 +41,9 @@ def _host_descriptor_pre_hook(nargs):
 
 
 _DEFAULT_BLOCK_M = 128
+# H100 crossover against the unpadded persistent kernel; routed on N_CTX alone
+# because the serving batch may be symbolic.
+_NON_PERSISTENT_N_CTX_LIMIT = 4 * _DEFAULT_BLOCK_M
 # Profile-selected on H100 to avoid consumer spills without reducing CTA residency.
 _FWD_CONSUMER_REGISTERS = tl.constexpr(240)
 _DEFAULT_ROW_SCHEDULE = {
@@ -131,6 +136,9 @@ def _select_forward_policy(causal, shape, dtype, block_m, num_sms, use_bm192=Fal
         workload_tuning = _CAUSAL_BM192_WORKLOAD_LAUNCH_TUNING
     else:
         workload_tuning = _CAUSAL_WORKLOAD_LAUNCH_TUNING if causal else _NONCAUSAL_WORKLOAD_LAUNCH_TUNING
+    # A symbolic (e.g. dynamic-batch) shape is unhashable and matches no entry.
+    if not all(isinstance(dim, int) for dim in shape):
+        workload_key = None
     launch_tuning = workload_tuning.get(workload_key, _DEFAULT_LAUNCH_TUNING)
     worker_cap = launch_tuning["WORKER_CAP"]
     target_workers = num_sms * launch_tuning.get("WORKER_MULTIPLIER", 1)
@@ -167,6 +175,94 @@ configs = [
     ) for num_buffers in (2, 3)
 ]
 
+non_persistent_configs = [
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=3, num_warps=4),
+]
+
+
+@triton.autotune(configs=non_persistent_configs, key=["H", "N_CTX"])
+@triton.jit
+def _attn_fwd_non_persistent(
+    q,
+    k,
+    v,
+    out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_od,
+    H,
+    sm_scale,
+    N_CTX: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    d_mask = offs_d < HEAD_DIM
+
+    q_ptrs = (q + off_z * stride_qz + off_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    q_tile = tl.load(
+        q_ptrs,
+        mask=(offs_m[:, None] < N_CTX) & d_mask[None, :],
+        other=0.0,
+    )
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    qk_scale = sm_scale * 1.4426950408889634
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N_CTX
+        k_ptrs = (k + off_z * stride_kz + off_h * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+        v_ptrs = (v + off_z * stride_vz + off_h * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
+        tile_mask = n_mask[:, None] & d_mask[None, :]
+        k_tile = tl.load(k_ptrs, mask=tile_mask, other=0.0)
+        v_tile = tl.load(v_ptrs, mask=tile_mask, other=0.0)
+
+        qk = tl.dot(q_tile, tl.trans(k_tile), allow_tf32=False) * qk_scale
+        qk = tl.where(n_mask[None, :], qk, float("-inf"))
+        if CAUSAL:
+            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(v_tile.dtype), v_tile, acc, allow_tf32=False)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    out_ptrs = (out + off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
+    tl.store(
+        out_ptrs,
+        acc.to(out.dtype.element_ty),
+        mask=(offs_m[:, None] < N_CTX) & d_mask[None, :],
+    )
+
 
 def _prune_configs_by_head_dim(configs, named_args, **kwargs):
     head_dim = kwargs["HEAD_DIM"]
@@ -179,6 +275,19 @@ def _prune_configs_by_head_dim(configs, named_args, **kwargs):
         config for config in configs if config.kwargs["BLOCK_M"] == block_m and config.kwargs["BLOCK_N"] == block_n
         and config.kwargs["NUM_BUFFERS"] == num_buffers
     ]
+
+
+@triton.jit
+def _mask_tail(qk, kv_start, VALID_N_CTX, BLOCK_N: tl.constexpr, LAST_TILE_ONLY: tl.constexpr):
+    offs_n = kv_start + tl.arange(0, BLOCK_N)
+    # H100: the warp-uniform last-tile branch speeds D64 tails 10-19% but slows
+    # D128 tails 6-19%, so D128 masks every tile.
+    if LAST_TILE_ONLY:
+        if kv_start + BLOCK_N > VALID_N_CTX:
+            qk = tl.where(offs_n[None, :] < VALID_N_CTX, qk, -float("inf"))
+    else:
+        qk = tl.where(offs_n[None, :] < VALID_N_CTX, qk, -float("inf"))
+    return qk
 
 
 @triton.jit
@@ -259,13 +368,15 @@ def _compute_offsets(
 )
 @triton.jit
 def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
-                                    Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+                                    Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX, VALID_N_CTX,  #
                                     HEAD_DIM: tl.constexpr,  #
                                     BLOCK_M: tl.constexpr,  #
                                     BLOCK_N: tl.constexpr,  #
                                     FP8_OUTPUT: tl.constexpr,  #
                                     CAUSAL: tl.constexpr,  #
                                     USE_BM192: tl.constexpr,  #
+                                    RANK3_DESC: tl.constexpr,  #
+                                    HAS_TAIL: tl.constexpr,  #
                                     ROW_REVERSE_HEAD_GROUP: tl.constexpr,  #
                                     ROW_REVERSE_MAX: tl.constexpr,  #
                                     ROW_AFFINE_MUL: tl.constexpr,  #
@@ -368,7 +479,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     kv_offset = kv_offset_y + first_kv_idx
                     tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                     tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    if USE_BM192:
+                    if RANK3_DESC:
                         tlx.async_descriptor_load(
                             desc_k,
                             k_tiles[kv_buf_id],
@@ -383,7 +494,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 tlx.barrier_wait(q_empties[q_cid], q_phase ^ 1)
                 tlx.barrier_expect_bytes(q_fulls[q_cid], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                 qo_offset_y_split = qo_offset_y + q_cid * BLOCK_M_SPLIT
-                if USE_BM192:
+                if RANK3_DESC:
                     tlx.async_descriptor_load(
                         desc_q,
                         q_tiles[q_cid],
@@ -398,7 +509,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     tlx.barrier_wait(q_empties[cid], q_phase ^ 1)  # noqa: TR051
                     tlx.barrier_expect_bytes(q_fulls[cid], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
                     qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
-                    if USE_BM192:
+                    if RANK3_DESC:
                         tlx.async_descriptor_load(
                             desc_q,
                             q_tiles[cid],
@@ -428,7 +539,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         k_offset = kv_offset_y + kv_idx
                         tlx.barrier_wait(k_empties[k_buf_id], k_phase ^ 1)
                         tlx.barrier_expect_bytes(k_fulls[k_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        if USE_BM192:
+                        if RANK3_DESC:
                             tlx.async_descriptor_load(desc_k, k_tiles[k_buf_id], [off_hz, kv_idx, 0], k_fulls[k_buf_id])
                         else:
                             tlx.async_descriptor_load(desc_k, k_tiles[k_buf_id], [k_offset, 0], k_fulls[k_buf_id])
@@ -438,7 +549,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         v_offset = kv_offset_y + previous_kv_idx
                         tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
                         tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        if USE_BM192:
+                        if RANK3_DESC:
                             tlx.async_descriptor_load(
                                 desc_v,
                                 v_tiles[v_buf_id],
@@ -454,7 +565,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     v_offset = kv_offset_y + final_v_idx
                     tlx.barrier_wait(v_empties[v_buf_id], v_phase ^ 1)
                     tlx.barrier_expect_bytes(v_fulls[v_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    if USE_BM192:
+                    if RANK3_DESC:
                         tlx.async_descriptor_load(desc_v, v_tiles[v_buf_id], [off_hz, final_v_idx, 0],
                                                   v_fulls[v_buf_id])
                     else:
@@ -465,14 +576,14 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                     kv_offset = kv_offset_y + lo
                     tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                     tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    if USE_BM192:
+                    if RANK3_DESC:
                         tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [off_hz, lo, 0], k_fulls[kv_buf_id])
                     else:
                         tlx.async_descriptor_load(desc_k, k_tiles[kv_buf_id], [kv_offset, 0], k_fulls[kv_buf_id])
 
                     tlx.barrier_wait(v_empties[kv_buf_id], kv_phase ^ 1)
                     tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    if USE_BM192:
+                    if RANK3_DESC:
                         tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [off_hz, lo, 0], v_fulls[kv_buf_id])
                     else:
                         tlx.async_descriptor_load(desc_v, v_tiles[kv_buf_id], [kv_offset, 0], v_fulls[kv_buf_id])
@@ -483,7 +594,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         kv_offset = kv_offset_y + kv_idx
                         tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                         tlx.barrier_expect_bytes(k_fulls[kv_buf_id], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        if USE_BM192:
+                        if RANK3_DESC:
                             tlx.async_descriptor_load(
                                 desc_k,
                                 k_tiles[kv_buf_id],
@@ -495,7 +606,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                         tlx.barrier_wait(v_empties[kv_buf_id], kv_phase ^ 1)
                         tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        if USE_BM192:
+                        if RANK3_DESC:
                             tlx.async_descriptor_load(
                                 desc_v,
                                 v_tiles[kv_buf_id],
@@ -587,6 +698,9 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                 # wait for the MMA to complete
                 qk = tlx.async_dot_wait(0, qk)
+                offs_n = first_kv_idx + tl.arange(0, BLOCK_N)
+                if HAS_TAIL:
+                    qk = _mask_tail(qk, first_kv_idx, VALID_N_CTX, BLOCK_N, HEAD_DIM == 64)
                 # release the K buffer
                 tlx.barrier_arrive(k_empties[k_buf_id], 1)
                 # The single-tile path has completed its final QK read.
@@ -597,7 +711,6 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 if CAUSAL:
                     offs_m = start_m * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
                     if (CAUSAL and USE_BM192) or lo + BLOCK_M >= hi:
-                        offs_n = first_kv_idx + tl.arange(0, BLOCK_N)
                         qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))
                 m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
                 if CAUSAL and USE_BM192:
@@ -697,6 +810,8 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
 
                     # wait for the current qk MMA to complete
                     qk = tlx.async_dot_wait(1, qk)
+                    if HAS_TAIL:
+                        qk = _mask_tail(qk, kv_idx, VALID_N_CTX, BLOCK_N, HEAD_DIM == 64)
                     # release the K buffer
                     tlx.barrier_arrive(k_empties[k_buf_id], 1)
                     if CAUSAL and USE_BM192:
@@ -753,6 +868,8 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                         acc = tlx.async_dot(p, v_tiles[v_buf_id], acc)
 
                         qk = tlx.async_dot_wait(1, qk)
+                        if HAS_TAIL:
+                            qk = _mask_tail(qk, kv_idx, VALID_N_CTX, BLOCK_N, HEAD_DIM == 64)
                         tlx.barrier_arrive(k_empties[k_buf_id], 1)
                         if kv_idx + BLOCK_N == hi:
                             tlx.barrier_arrive(q_empties[cid], 1)
@@ -796,7 +913,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                 # epilogue
                 qo_offset_y_split = qo_offset_y + cid * BLOCK_M_SPLIT
                 acc = acc * inv_l_i[:, None]
-                if USE_BM192:
+                if RANK3_DESC:
                     o_tile = acc.to(tlx.dtype_of(desc_o)).reshape(1, BLOCK_M_SPLIT, HEAD_DIM)
                     desc_o.store(
                         [off_hz, start_m * BLOCK_M + cid * BLOCK_M_SPLIT, 0],
@@ -891,6 +1008,8 @@ def _attn_bwd_tlx(
     D,
     H,
     N_CTX,
+    VALID_N_CTX,
+    HAS_TAIL: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1075,8 +1194,10 @@ def _attn_bwd_tlx(
                 doT = tlx.local_trans(do)
                 qkT = tlx.async_dot_wait(0, qkT)
                 qkT *= sm_scale * RCP_LN2
+                offs_n = start_n + cid_start_n + tl.arange(0, CID_BLOCK_N)
+                if HAS_TAIL:
+                    qkT = tl.where(offs_n[:, None] < VALID_N_CTX, qkT, -float("inf"))
                 if CAUSAL and start_m < start_n + BLOCK_N:
-                    offs_n = start_n + cid_start_n + tl.arange(0, CID_BLOCK_N)
                     qkT = tl.where(offs_m[None, :] >= offs_n[:, None], qkT, -float("inf"))
                 pT = tl.math.exp2(qkT - m[None, :])
                 dpT = tlx.async_dot(v_slice, doT)
@@ -1128,43 +1249,40 @@ def _attn_bwd_tlx(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal, config):
+    def forward(ctx, q, k, v, sm_scale, causal, config, valid_n_ctx):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in (64, 128)
-        assert q.shape[2] % _DEFAULT_BLOCK_M == 0
         o = torch.empty_like(q)
         extra_kern_args = {}
-        use_bm192 = (config is None and q.dtype == torch.bfloat16 and q.shape[0] == 4 and q.shape[1] == 48
-                     and q.shape[2] in (1024, 2048, 4096, 8192) and q.shape[3] == 64)
+        n_ctx = triton.cdiv(q.shape[2], _DEFAULT_BLOCK_M) * _DEFAULT_BLOCK_M
+        use_bm192 = (config is None and all(isinstance(dim, int) for dim in q.shape) and q.dtype == torch.bfloat16
+                     and q.shape[0] == 4 and q.shape[1] == 48 and q.shape[2] in (1024, 2048, 4096, 8192)
+                     and q.shape[3] == 64)
 
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        # Rank-3 descriptors safely truncate BM192's final 128-row output tile.
-        if use_bm192:
-            batch_heads = q.shape[0] * q.shape[1]
+        M = torch.empty((q.shape[0], q.shape[1], n_ctx), device=q.device, dtype=torch.float32)
+        # Per-head rank-3 descriptors zero-fill loads and clip stores past the
+        # head's last row: BM192's final 128-row tile, or an unpadded tail.
+        rank3_desc = use_bm192 or q.shape[2] != n_ctx
+        if rank3_desc:
+            assert q.dtype != torch.float8_e5m2
             dummy_block = [1, 1, 1]
-            desc_shape = [batch_heads, q.shape[2], HEAD_DIM_K]
-            desc_strides = [q.shape[2] * HEAD_DIM_K, HEAD_DIM_K, 1]
-            desc_q = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-            desc_v = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=desc_shape, strides=desc_strides, block_shape=dummy_block)
+            desc_q, desc_k, desc_v, desc_o = (TensorDescriptor.from_tensor(t.view(-1, *t.shape[2:]), dummy_block)
+                                              for t in (q, k, v, o))
         else:
             # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
             y_dim = q.shape[0] * q.shape[1] * q.shape[2]
             dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_q = TensorDescriptor.from_tensor(q.reshape(y_dim, HEAD_DIM_K), dummy_block)
             if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
-                                          block_shape=dummy_block)
+                desc_v = TensorDescriptor.from_tensor(v.reshape(HEAD_DIM_K, y_dim), dummy_block)
             else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                          block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+                desc_v = TensorDescriptor.from_tensor(v.reshape(y_dim, HEAD_DIM_K), dummy_block)
+            desc_k = TensorDescriptor.from_tensor(k.reshape(y_dim, HEAD_DIM_K), dummy_block)
+            desc_o = TensorDescriptor.from_tensor(o.reshape(y_dim, HEAD_DIM_K), dummy_block)
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -1172,9 +1290,24 @@ class _attention(torch.autograd.Function):
         triton.set_allocator(alloc_fn)
 
         NUM_SMS = torch.cuda.get_device_properties(q.device).multi_processor_count
-        if config is not None:
+        if config is None:
+            selected_configs = _prune_configs_by_head_dim(
+                configs,
+                {},
+                HEAD_DIM=HEAD_DIM_K,
+                CAUSAL=causal,
+                USE_BM192=use_bm192,
+            )
+            assert len(selected_configs) == 1
+            selected = selected_configs[0]
+            config = {
+                **selected.kwargs,
+                "num_warps": selected.num_warps,
+                "num_stages": selected.num_stages,
+            }
+        else:
             config = dict(config)
-        block_m = 192 if use_bm192 else (_DEFAULT_BLOCK_M if config is None else config["BLOCK_M"])
+        block_m = 192 if use_bm192 else config["BLOCK_M"]
         row_schedule, steady_unroll, target_workers = _select_forward_policy(
             causal,
             q.shape,
@@ -1185,64 +1318,50 @@ class _attention(torch.autograd.Function):
         )
 
         def grid(META):
-            total_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
-            return (min(target_workers, total_tiles), 1, 1)
+            total_tiles = triton.cdiv(n_ctx, META["BLOCK_M"]) * q.shape[0] * q.shape[1]
+            return (torch.sym_min(target_workers, total_tiles), 1, 1)
 
         ctx.grid = grid
-        if config is None:
-            _attn_fwd_ws_pipelined_pingpong[grid](
-                sm_scale,
-                M,  #
-                q.shape[0],
-                q.shape[1],  #
-                desc_q,
-                desc_k,
-                desc_v,
-                desc_o,  #
-                N_CTX=q.shape[2],  #
-                HEAD_DIM=HEAD_DIM_K,  #
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-                CAUSAL=causal,  #
-                USE_BM192=use_bm192,  #
-                STEADY_UNROLL=steady_unroll,  #
-                **row_schedule,  #
-                **extra_kern_args,
-            )
-        else:
-            nargs = {
-                **config,
-                "HEAD_DIM": HEAD_DIM_K,
-                "desc_q": desc_q,
-                "desc_k": desc_k,
-                "desc_v": desc_v,
-                "desc_o": desc_o,
-                "FP8_OUTPUT": q.dtype == torch.float8_e5m2,
-                "USE_BM192": use_bm192,
-            }
-            _host_descriptor_pre_hook(nargs)
-            _attn_fwd_ws_pipelined_pingpong.fn[grid](
-                sm_scale,
-                M,
-                q.shape[0],
-                q.shape[1],
-                desc_q,
-                desc_k,
-                desc_v,
-                desc_o,
-                N_CTX=q.shape[2],
-                HEAD_DIM=HEAD_DIM_K,
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,
-                CAUSAL=causal,
-                USE_BM192=use_bm192,
-                STEADY_UNROLL=steady_unroll,
-                **row_schedule,
-                **config,
-            )
+        nargs = {
+            **config,
+            "HEAD_DIM": HEAD_DIM_K,
+            "desc_q": desc_q,
+            "desc_k": desc_k,
+            "desc_v": desc_v,
+            "desc_o": desc_o,
+            "FP8_OUTPUT": q.dtype == torch.float8_e5m2,
+            "USE_BM192": use_bm192,
+            "RANK3_DESC": rank3_desc,
+        }
+        _host_descriptor_pre_hook(nargs)
+        torch._library.capture_triton(_attn_fwd_ws_pipelined_pingpong.fn)[grid](
+            sm_scale,
+            M,
+            q.shape[0],
+            q.shape[1],
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            N_CTX=n_ctx,
+            VALID_N_CTX=valid_n_ctx,
+            HEAD_DIM=HEAD_DIM_K,
+            FP8_OUTPUT=q.dtype == torch.float8_e5m2,
+            CAUSAL=causal,
+            USE_BM192=use_bm192,
+            RANK3_DESC=rank3_desc,
+            HAS_TAIL=valid_n_ctx != n_ctx,
+            STEADY_UNROLL=steady_unroll,
+            **row_schedule,
+            **config,
+            **extra_kern_args,
+        )
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
+        ctx.valid_n_ctx = valid_n_ctx
         return o
 
     @staticmethod
@@ -1291,18 +1410,74 @@ class _attention(torch.autograd.Function):
             delta,
             N_HEAD,
             N_CTX,
+            ctx.valid_n_ctx,
+            HAS_TAIL=ctx.valid_n_ctx != N_CTX,
             HEAD_DIM=ctx.HEAD_DIM,
             CAUSAL=ctx.causal,
         )
 
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 def attention(q, k, v, sm_scale, causal=False, config=None):
     if isinstance(causal, dict) and config is None:
         config = causal
         causal = False
-    return _attention.apply(q, k, v, sm_scale, causal, config)
+    return _apply_attention(q, k, v, sm_scale, causal, config)
+
+
+def _non_persistent_attention(q, k, v, sm_scale, causal):
+    batch, heads, n_ctx, head_dim = q.shape
+    out = torch.empty_like(q)
+
+    def grid(meta):
+        return (triton.cdiv(n_ctx, meta["BLOCK_M"]), batch * heads)
+
+    torch._library.capture_triton(_attn_fwd_non_persistent)[grid](
+        q,
+        k,
+        v,
+        out,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        heads,
+        sm_scale,
+        N_CTX=n_ctx,
+        HEAD_DIM=head_dim,
+        CAUSAL=causal,
+    )
+    return out
+
+
+def _persistent_attention(q, k, v, sm_scale, causal, config):
+    q, k, v = (t.contiguous() for t in (q, k, v))
+    valid_n_ctx = q.shape[2]
+    padding = -valid_n_ctx % _DEFAULT_BLOCK_M
+    # The forward reads an unpadded tail through rank-3 descriptors; only the
+    # backward still needs tile-aligned storage.
+    if not padding or not torch.is_grad_enabled() or not (q.requires_grad or k.requires_grad or v.requires_grad):
+        return _attention.apply(q, k, v, sm_scale, causal, config, valid_n_ctx)
+    q, k, v = (F.pad(t, (0, 0, 0, padding)) for t in (q, k, v))
+    out = _attention.apply(q, k, v, sm_scale, causal, config, valid_n_ctx)
+    return out[:, :, :valid_n_ctx, :]
+
+
+def _should_use_non_persistent(q, k, v, config):
+    n_ctx = q.shape[2]
+    return (config is None and q.shape[-1] == 128 and n_ctx < _NON_PERSISTENT_N_CTX_LIMIT
+            and n_ctx % _DEFAULT_BLOCK_M != 0 and not (q.requires_grad or k.requires_grad or v.requires_grad))
+
+
+def _apply_attention(q, k, v, sm_scale, causal, config):
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("Flash Attention requires equal Q/K/V shapes")
+    if isinstance(q, FakeTensor):
+        return torch.empty_like(q)
+    if _should_use_non_persistent(q, k, v, config):
+        return _non_persistent_attention(q, k, v, sm_scale, causal)
+    return _persistent_attention(q, k, v, sm_scale, causal, config)
 
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
@@ -1312,4 +1487,4 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
         raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
-    return _attention.apply(q, k, v, sm_scale, causal, None)
+    return _apply_attention(q, k, v, sm_scale, causal, None)

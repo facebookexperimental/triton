@@ -1394,13 +1394,13 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // default warps keep arrive/wait after bar init
 // CHECK: mbarrier.init.shared::cta.b64
-// CHECK-NEXT: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: nvvm.cluster.arrive aligned
+// CHECK-NEXT: nvvm.cluster.wait aligned
 
 llvm.func @paired_cta_cluster_sync(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
-  nvvm.cluster.arrive {aligned}
-  nvvm.cluster.wait {aligned}
+  nvvm.cluster.arrive aligned
+  nvvm.cluster.wait aligned
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
     ttg.warp_yield
@@ -1431,7 +1431,7 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 llvm.func @explicit_cluster_sync_no_ws_arrive(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
-  nvvm.cluster.wait {aligned}
+  nvvm.cluster.wait aligned
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
     ttg.warp_yield
@@ -1464,18 +1464,18 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // Cleanup: non-default warps arrive at partition end before looping back
 // CHECK: "use"
-// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK: nvvm.cluster.arrive aligned
 // CHECK-NEXT: llvm.br
 
 // Default warps: arrive/wait after bar init
 // CHECK: mbarrier.init.shared::cta.b64
-// CHECK-NEXT: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: nvvm.cluster.arrive aligned
+// CHECK-NEXT: nvvm.cluster.wait aligned
 
 llvm.func @cluster_sync_init_and_cleanup(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
-  nvvm.cluster.arrive {aligned}
-  nvvm.cluster.wait {aligned}
+  nvvm.cluster.arrive aligned
+  nvvm.cluster.wait aligned
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
     ttg.warp_yield

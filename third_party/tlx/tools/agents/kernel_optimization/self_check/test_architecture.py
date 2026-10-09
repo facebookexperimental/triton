@@ -71,6 +71,12 @@ def test_platform_registries_select_knowledge_and_profiler() -> None:
     assert any("knowledge/common" in str(path) for path in paths)
     assert any("knowledge/nvidia/common" in str(path) for path in paths)
     assert any("knowledge/nvidia/blackwell" in str(path) for path in paths)
+    assert any(path.name == "overlapping-tmem-accumulators.md" for path in paths)
+    assert any(path.name == "memory-bound-and-autotune-selection.md" for path in paths)
+    assert not any(
+        path.name == "overlapping-tmem-accumulators.md"
+        for path in knowledge_paths(KernelTarget(backend="cuda", architecture="H100"))
+    )
     assert native_profiler_for_backend("cuda") == "ncu"
 
     amd_paths = knowledge_paths(KernelTarget(backend="hip", architecture="gfx950"))

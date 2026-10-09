@@ -1297,18 +1297,17 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
                              ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
-    off_h = tl.arange(0, HEAD_DIM)
+    off_h = tl.arange(0, HALF_HD)
     q = off_m[:, None]
-    h = off_h[None, :]
     tile_base = (q // BLK) * BLK
     local = q % BLK
-    half = h // HALF_HD
-    col = h % HALF_HD
-    packed_row = 2 * tile_base + local + BLK * half
-    src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + col
-    val = tl.load(src)
-    dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
-    tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
+    for half in tl.range(0, 2, loop_unroll_factor=1):
+        h = off_h[None, :] + half * HALF_HD
+        packed_row = 2 * tile_base + local + BLK * half
+        src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + off_h[None, :]
+        val = tl.load(src)
+        dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
+        tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
 
 
 @triton.jit
@@ -2776,7 +2775,7 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks(exclusive=True):
+    with tlx.async_tasks(exclusive=True, less_reg_mma=True):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0
@@ -3389,7 +3388,7 @@ class _attention(torch.autograd.Function):
         q, k, v, o, M = ctx.saved_tensors
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert o.is_contiguous() and do.is_contiguous()
-        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]

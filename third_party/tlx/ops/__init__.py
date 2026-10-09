@@ -20,7 +20,9 @@ choosing another space. `mm` and `addmm` also accept `out=` for implementations
 that support a preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
-any op that offers one, so that a first call stays interactive. Measured on
+any op that offers one, so that a first call stays interactive. The exception
+is `mm` on sm90, whose full space is only 8 configs; it defaults to "full".
+Measured on
 B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache (348 configs
 compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
@@ -32,12 +34,19 @@ Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can follow
-`mm`.
+`mm`. `mm_mxfp8` has a heuristic but defaults to "full" because its tuned
+configs are measurably faster; pass `space="heuristic"` for a fast first call.
 
 An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch. A forward-only implementation raises
 `UnsupportedBackward` before launch when autograd is enabled and any supported
 tensor input requires gradients; inference under `torch.no_grad()` is allowed.
+
+`prepare_flash_attn_varlen_backward` and `flash_attn_varlen_backward` expose
+explicit first-order attention gradients from an existing forward result.
+Prepare the immutable sequence plan once, then reuse it for backward calls;
+this explicit API accepts inputs requiring gradients but does not build an
+autograd graph for higher-order derivatives.
 """
 
 from __future__ import annotations
@@ -45,20 +54,22 @@ from __future__ import annotations
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
-    "mm", "grouped_gemm", "addmm", "flash_attn", "flash_attn_mxfp8", "hstu_attn_dev", "kimi_delta_attention",
-    "kda_paged_prefill", "kda_recurrent_decode", "UnsupportedOp", "UnsupportedBackward", "InvalidInput"
+    "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
+    "flash_attn_varlen", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
+    "InvalidInput"
 ]
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space=None):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     This op is currently forward-only.
 
-    Defaults to a single analytically chosen config so the first call stays
-    interactive. Pass `space="full"` to implementations that expose a full
-    autotune space; unsupported spaces raise `InvalidInput`. See the module
-    docstring.
+    `space=None` uses the implementation's default: "full" on sm90, otherwise
+    a single analytically chosen config so the first call stays interactive.
+    Pass `space="full"` to implementations that expose a full autotune space;
+    unsupported spaces raise `InvalidInput`. See the module docstring.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -80,9 +91,90 @@ def mm(a, b, *, out=None, space="heuristic"):
         check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
                      row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
     check_backward(spec, a, b)
+    if space is None:
+        space = spec.default_space
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
+
+
+def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
+    if sf_layout == "natural":
+        expected_a, expected_b = (M, K // 32), (N, K // 32)
+        if a_scale.shape != expected_a or b_scale.shape != expected_b:
+            raise InvalidInput("tlx.ops.mm_mxfp8 natural scales must have exact shapes "
+                               f"a_scale={expected_a}, b_scale={expected_b}; got "
+                               f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
+        return
+    if sf_layout != "cublas_blocked":
+        raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural' or 'cublas_blocked'; "
+                           f"got {sf_layout!r}")
+    # M, N and K are 128-aligned, so the 128x4 atoms need no padding.
+    if a_scale.numel() != M * K // 32 or b_scale.numel() != N * K // 32:
+        raise InvalidInput("tlx.ops.mm_mxfp8 cublas_blocked scales must contain exactly "
+                           f"{M * K // 32} a-scale and {N * K // 32} b-scale bytes; "
+                           f"got {a_scale.numel()} and {b_scale.numel()}")
+
+
+def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+    """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
+
+    ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
+    (K-major, as for a linear weight); M, N and K must be multiples of 128.
+    Each run of 32 values along K has one E8M0 scale. ``sf_layout="natural"``
+    takes ``[M, K // 32]`` and ``[N, K // 32]`` scales; ``"cublas_blocked"``
+    takes the swizzled byte layout returned by torchao's
+    ``MXTensor.to_mx(..., is_swizzled_scales=True)``. A supplied ``out`` is
+    returned by identity. Forward-only.
+
+    ``space`` defaults to "full" (autotune; the first call per shape compiles
+    and benchmarks the pruned space). "heuristic" launches one shape-picked
+    config without autotuning.
+    """
+    import torch
+
+    tensors = (a, a_scale, b, b_scale)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects tensor inputs")
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects rank-2 a and b; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    M, K = a.shape
+    N, b_k = b.shape
+    if b_k != K:
+        raise InvalidInput("tlx.ops.mm_mxfp8 reduction dimensions must match; "
+                           f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
+    if min(M, N, K) <= 0 or M % 128 or N % 128 or K % 128:
+        raise InvalidInput("tlx.ops.mm_mxfp8 requires positive M, N and K divisible by 128; "
+                           f"got M={M}, N={N}, K={K}")
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects E4M3 a and b; "
+                           f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
+    if a_scale.dtype != torch.float8_e8m0fnu or b_scale.dtype != torch.float8_e8m0fnu:
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects E8M0 a_scale and b_scale; "
+                           f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs to be contiguous")
+    if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors[1:]):
+        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs on the same CUDA device; "
+                           f"got {[tensor.device for tensor in tensors]}")
+    _check_mm_mxfp8_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
+    if out is not None:
+        if not isinstance(out, torch.Tensor):
+            raise InvalidInput("tlx.ops.mm_mxfp8 expects out to be a tensor or None")
+        if out.shape != (M, N) or out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
+            raise InvalidInput("tlx.ops.mm_mxfp8 out must be contiguous BF16 [M, N] on a's device; "
+                               f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+        if any(torch._C._overlaps(out, tensor) for tensor in tensors):
+            raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
+    if space not in ("heuristic", "full"):
+        raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space!r}")
+
+    fn, spec = impl_for("mm_mxfp8", device=a.device)
+    tma_tensors = tensors if out is None else (*tensors, out)
+    check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
+    check_backward(spec, *tensors, out)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
 
 
 def grouped_gemm(group_a, group_b):
@@ -147,6 +239,146 @@ def grouped_gemm(group_a, group_b):
     return fn(group_a, group_b)
 
 
+def _grouped_gemm_mxfp8_dims(x, w, split_sizes):
+    GM, K = x.shape
+    G = split_sizes.shape[0]
+    if w.ndim == 3:
+        w_groups, N, w_k = w.shape
+        if w_groups != G:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects w.shape[0] == G; "
+                               f"got w.shape={tuple(w.shape)}, G={G}")
+    else:
+        grouped_n, w_k = w.shape
+        if G == 0 or grouped_n % G != 0:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects packed w.shape[0] divisible by G; "
+                               f"got w.shape={tuple(w.shape)}, G={G}")
+        N = grouped_n // G
+    return GM, G, N, K, w_k
+
+
+def _check_grouped_gemm_mxfp8_scales(x_scale, w_scale, w, *, GM, G, N, K, sf_layout):
+    scale_k = K // 32
+    if sf_layout == "natural":
+        expected_x = (GM, scale_k)
+        expected_w = (G, N, scale_k) if w.ndim == 3 else (G * N, scale_k)
+        if x_scale.shape != expected_x or w_scale.shape != expected_w:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 natural scales must have exact shapes "
+                               f"x_scale={expected_x}, w_scale={expected_w}; got "
+                               f"x_scale={tuple(x_scale.shape)}, w_scale={tuple(w_scale.shape)}")
+        return
+
+    if sf_layout != "cublas_blocked":
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 sf_layout must be 'natural' or "
+                           f"'cublas_blocked'; got {sf_layout!r}")
+    if x_scale.ndim != 2 or w_scale.ndim != 2:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 cublas_blocked scales must be rank-2 byte tensors; "
+                           f"got x_scale.ndim={x_scale.ndim}, w_scale.ndim={w_scale.ndim}")
+    padded_scale_k = ((scale_k + 3) // 4) * 4
+    expected_x_bytes = ((GM + 127) // 128) * 128 * padded_scale_k
+    expected_w_bytes = G * ((N + 127) // 128) * 128 * padded_scale_k
+    x_bytes = x_scale.numel() * x_scale.element_size()
+    w_bytes = w_scale.numel() * w_scale.element_size()
+    if x_bytes != expected_x_bytes or w_bytes != expected_w_bytes:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 cublas_blocked scales must contain exactly "
+                           f"{expected_x_bytes} x-scale bytes and {expected_w_bytes} w-scale bytes; "
+                           f"got {x_bytes} and {w_bytes}")
+
+
+def _check_grouped_gemm_mxfp8_out(out, tensors, *, GM, N, device):
+    import torch
+
+    if out is None:
+        return
+    if not isinstance(out, torch.Tensor):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects out to be a tensor or None")
+    if out.shape != (GM, N) or out.dtype != torch.bfloat16 or out.device != device or not out.is_contiguous():
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 out must be contiguous BF16 [GM, N] on x's device; "
+                           f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+    if any(torch._C._overlaps(out, tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 out must not overlap any input")
+
+
+def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout="natural"):
+    """Run a forward-only SM100 or gfx950 grouped GEMM over pre-quantized MXFP8 inputs.
+
+    ``x`` is contiguous ``[GM, K]`` and ``w`` is contiguous ``[G, N, K]``
+    or packed ``[G * N, K]`` E4M3 data. Natural E8M0 scales match those
+    logical data shapes with a final ``K // 32`` dimension. CuBLAS-blocked
+    scales are rank-2 opaque byte tensors with exact 128x4-atom storage.
+
+    ``split_sizes`` stays on device: the kernel validates that values are
+    nonnegative, every prefix is 128-aligned, and the final sum is ``GM``.
+    The BF16 result has shape ``[GM, N]``; a supplied ``out`` is returned by
+    identity. ``num_sms`` defaults to all SMs (CUs on AMD) on ``x.device``.
+    """
+    import torch
+
+    tensors = (x, x_scale, w, w_scale, split_sizes)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects tensor inputs")
+    if x.ndim != 2 or w.ndim not in (2, 3) or split_sizes.ndim != 1:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects x/w/split_sizes ranks 2/(2 or 3)/1; "
+                           f"got {x.ndim}/{w.ndim}/{split_sizes.ndim}")
+
+    GM, G, N, K, w_k = _grouped_gemm_mxfp8_dims(x, w, split_sizes)
+    if min(GM, G, N, K) <= 0:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 requires positive GM, G, N, and K; "
+                           f"got GM={GM}, G={G}, N={N}, K={K}")
+    if w_k != K:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 reduction dimensions must match; "
+                           f"got x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)}")
+    if GM % 128 != 0 or K % 128 != 0:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 requires GM and K divisible by 128; "
+                           f"got GM={GM}, K={K}")
+
+    if x.dtype != torch.float8_e4m3fn or w.dtype != torch.float8_e4m3fn:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects E4M3 x and w; "
+                           f"got x.dtype={x.dtype}, w.dtype={w.dtype}")
+    if x_scale.dtype != torch.float8_e8m0fnu or w_scale.dtype != torch.float8_e8m0fnu:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects E8M0 x_scale and w_scale; "
+                           f"got x_scale.dtype={x_scale.dtype}, w_scale.dtype={w_scale.dtype}")
+    if split_sizes.dtype != torch.int32:
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects split_sizes.dtype == torch.int32; "
+                           f"got {split_sizes.dtype}")
+    if not all(tensor.is_contiguous() for tensor in tensors):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects all inputs to be contiguous")
+    if x.device.type != "cuda" or any(tensor.device != x.device for tensor in tensors[1:]):
+        raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 expects all inputs on the same CUDA device; "
+                           f"got {[tensor.device for tensor in tensors]}")
+
+    _check_grouped_gemm_mxfp8_scales(x_scale, w_scale, w, GM=GM, G=G, N=N, K=K, sf_layout=sf_layout)
+    if num_sms is not None:
+        device_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        if type(num_sms) is not int or not 1 <= num_sms <= device_sms:
+            raise InvalidInput("tlx.ops.grouped_gemm_mxfp8 num_sms must be an int in "
+                               f"[1, {device_sms}] for {x.device}; got {num_sms!r}")
+    _check_grouped_gemm_mxfp8_out(out, tensors, GM=GM, N=N, device=x.device)
+
+    fn, spec = impl_for("grouped_gemm_mxfp8", device=x.device)
+    tma_tensors = (x, x_scale, w, w_scale) if out is None else (x, x_scale, w, w_scale, out)
+    check_inputs(
+        spec,
+        dtype=x.dtype,
+        row_bytes=(
+            x.stride(0) * x.element_size(),
+            w.stride(-2) * w.element_size(),
+            N * torch.bfloat16.itemsize,
+        ),
+        base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors),
+    )
+    check_backward(spec, x, x_scale, w, w_scale, split_sizes, out)
+    return fn(
+        x,
+        x_scale,
+        w,
+        w_scale,
+        split_sizes,
+        out=out,
+        num_sms=num_sms,
+        sf_layout=sf_layout,
+    )
+
+
 def addmm(input, a, b, *, out=None, space="heuristic"):
     """Fused ``input + a @ b`` for two-dimensional fp16/bf16 matrices.
 
@@ -180,6 +412,86 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
         return fn(q, k, v, causal, sm_scale, space=space)
 
 
+def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k):
+    """Prepare reusable packed-attention backward metadata from int32 offsets.
+
+    The two rank-1 CUDA tensors must describe the same nonempty batch. Their
+    offsets must start at zero and be strictly increasing; empty sequences
+    are unsupported. Preparation copies offsets into plan-owned storage and
+    synchronizes to validate them and determine compact workspace sizes.
+    Call this once outside CUDA graph capture, then reuse the returned plan.
+
+    Prepare and consume the plan on the same CUDA stream. Treat every tensor
+    owned by the plan as immutable; the caller's original offsets may be
+    modified after preparation. The plan also enables eligible compact dS
+    backward implementations without repeating host synchronization.
+    """
+    import torch
+
+    for name, offsets in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
+        if not isinstance(offsets, torch.Tensor) or offsets.ndim != 1 or offsets.numel() < 2:
+            raise InvalidInput(f"{name} must be a rank-1 tensor with at least two elements")
+        if offsets.dtype is not torch.int32:
+            raise InvalidInput(f"{name} must have dtype torch.int32")
+    if cu_seqlens_q.device != cu_seqlens_k.device:
+        raise InvalidInput("cu_seqlens_q and cu_seqlens_k must be on the same device")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise InvalidInput("cu_seqlens_q and cu_seqlens_k must describe the same batch")
+    fn, spec = impl_for("prepare_flash_attn_varlen_backward", device=cu_seqlens_q.device)
+    check_inputs(spec, dtype=cu_seqlens_q.dtype)
+    with torch.cuda.device(cu_seqlens_q.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise InvalidInput("prepare_flash_attn_varlen_backward must run outside CUDA graph capture")
+        try:
+            return fn(cu_seqlens_q, cu_seqlens_k)
+        except (TypeError, ValueError) as error:
+            raise InvalidInput(f"tlx.ops.prepare_flash_attn_varlen_backward: {error}") from error
+
+
+def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=False, *, dq_atomic_fp32=True):
+    """Return explicit first-order dQ/dK/dV for packed BF16 D128 attention.
+
+    Q/K/V use ``(tokens, heads, head_dim)`` order. Supply the existing forward
+    output ``o``, its gradient ``do``, and contiguous natural-log softmax LSE
+    with shape ``(query_heads, query_tokens)`` and dtype FP32. The forward
+    must use the same scale and causal flag, with no dropout or local window.
+    ``sm_scale`` defaults to ``head_dim ** -0.5``.
+
+    Use a plan returned by :func:`prepare_flash_attn_varlen_backward` on the
+    same device and CUDA stream, and do not modify its tensors. Noncausal
+    MHA/GQA allows independent Q/KV lengths. Causal attention requires MHA
+    with identical Q/KV sequence offsets. Q/K/O/dO must be contiguous. V must
+    be contiguous in noncausal mode; causal V may have a larger token stride
+    when its head and head-dimension axes remain dense.
+
+    Inputs may require gradients. This call builds no autograd graph and its
+    BF16 gradient outputs do not support higher-order differentiation.
+    Deterministic algorithms are unsupported. dQ accumulation uses FP32 by
+    default; ``dq_atomic_fp32=False`` selects the BF16 accumulation path.
+    Eligible eager calls may allocate an optional materialized-dS workspace;
+    CUDA graph capture or its allocation OOM uses the existing atomic route.
+    """
+    import torch
+
+    tensors = (q, k, v, o, do, lse)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("flash_attn_varlen_backward expects tensor Q/K/V/O/dO/LSE inputs")
+    if any(tensor.ndim != 3 for tensor in (q, k, v, o, do)):
+        raise InvalidInput("flash_attn_varlen_backward expects rank-3 packed THD Q/K/V/O/dO tensors")
+    if any(tensor.device != q.device for tensor in tensors):
+        raise InvalidInput("flash_attn_varlen_backward inputs must be on the same device")
+    if torch.are_deterministic_algorithms_enabled():
+        raise UnsupportedOp("flash_attn_varlen_backward does not provide deterministic gradients")
+    fn, spec = impl_for("flash_attn_varlen_backward", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    scale = q.shape[-1]**-0.5 if sm_scale is None else sm_scale
+    with torch.cuda.device(q.device), torch.no_grad():
+        try:
+            return fn(q, k, v, o, do, lse, plan, scale, causal, dq_atomic_fp32=dq_atomic_fp32)
+        except (TypeError, ValueError) as error:
+            raise InvalidInput(f"tlx.ops.flash_attn_varlen_backward: {error}") from error
+
+
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
 
@@ -206,6 +518,42 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
     return fn(q, k, v, causal, sm_scale, space=space)
+
+
+def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False):
+    """Forward-only attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
+
+    Sequence ``b`` owns query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and
+    key/value rows ``cu_seqlens_k[b]:cu_seqlens_k[b + 1]``; both offset tensors
+    are int32 ``(batch + 1,)``. ``max_seqlen_q`` must bound every query length
+    (it sizes the grid); ``max_seqlen_k`` is accepted for flash-attn API
+    parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
+    Causal masking is bottom-right aligned: query ``i`` sees keys
+    ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
+    `sm_scale` defaults to `HEAD_DIM ** -0.5`. Returns the output only (no
+    log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
+    uninitialized.
+    """
+    import torch
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects rank-3 (tokens, heads, head_dim) Q/K/V tensors")
+    if k.shape != v.shape or q.shape[2] != k.shape[2] or q.shape[1] % k.shape[1] != 0:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects K/V of identical shape, Q's head dim, and a head count "
+                           f"dividing Q's; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects Q/K/V to have the same dtype")
+    if q.stride(2) != 1 or k.stride(2) != 1 or v.stride(2) != 1:
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects unit-stride head dims")
+    if (cu_seqlens_q.ndim != 1 or cu_seqlens_q.shape != cu_seqlens_k.shape or cu_seqlens_q.shape[0] < 1
+            or cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32):
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects int32 (batch + 1,) cu_seqlens_q and cu_seqlens_k")
+    if any(t.device != q.device for t in (k, v, cu_seqlens_q, cu_seqlens_k)):
+        raise InvalidInput("tlx.ops.flash_attn_varlen expects all tensors on one device")
+    fn, spec = impl_for("flash_attn_varlen", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
+    check_backward(spec, q, k, v)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
 
 
 def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,

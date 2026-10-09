@@ -4,6 +4,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -285,26 +286,91 @@ buildBarrierToMemoryOpMap(Block &block) {
   return map;
 }
 
+// Record each op's position in the block before any reordering, so that
+// optimizeWSBarrierLocations can tell which ops a barrier originally guarded.
+inline DenseMap<Operation *, unsigned> buildOriginalBlockOrder(Block &block) {
+  DenseMap<Operation *, unsigned> order;
+  unsigned idx = 0;
+  for (auto &op : block)
+    order[&op] = idx++;
+  return order;
+}
+
 // After tmem_load sinking, relocate WS barriers back to optimal positions
 // relative to their associated memory ops. Arrives go right after their memory
 // op, or after later same-block operand definitions required by SSA. Waits go
 // right before their memory op. Skips moves that would break SSA dominance.
+//
+// The associated memory op is only the nearest one when the map was built, and
+// sinking can reorder the other ops the barrier guards. So a wait moving down
+// stops at the first op on the same buffer that originally followed it, and an
+// arrive moving up stops at the last op on the same buffer that originally
+// preceded it. Otherwise, when a subtile is read twice and the two reads sink
+// by different amounts, one read ends up outside the wait/arrive pair. "Same
+// buffer" compares memdesc roots, so every slot and view of one allocation
+// counts. When the memory op has no memdesc operand, any side-effecting op
+// counts. Ops with regions, and ops missing from `originalOrder`, are treated
+// as guarded.
 inline void optimizeWSBarrierLocations(
-    const DenseMap<Operation *, Operation *> &barrierToMemOp) {
+    const DenseMap<Operation *, Operation *> &barrierToMemOp,
+    const DenseMap<Operation *, unsigned> &originalOrder) {
+  auto memDescRoots = [](Operation *op) {
+    DenseSet<Value> roots;
+    for (Value operand : op->getOperands())
+      if (isa<triton::gpu::MemDescType>(operand.getType()))
+        roots.insert(mlir::getMemDescRoot(operand));
+    return roots;
+  };
+  auto touchesBuffer = [&](Operation *op, const DenseSet<Value> &roots) {
+    if (roots.empty() || op->getNumRegions() != 0)
+      return true;
+    return llvm::any_of(memDescRoots(op),
+                        [&](Value root) { return roots.contains(root); });
+  };
+  auto isGuarded = [&](Operation *op, Operation *barrier, bool isWait,
+                       const DenseSet<Value> &roots) {
+    if (isMemoryEffectFree(op) || !touchesBuffer(op, roots))
+      return false;
+    auto it = originalOrder.find(op);
+    if (it == originalOrder.end())
+      return true;
+    unsigned barrierPos = originalOrder.lookup(barrier);
+    return isWait ? it->second > barrierPos : it->second < barrierPos;
+  };
   for (auto [barrier, memOp] : barrierToMemOp) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
+    DenseSet<Value> roots = memDescRoots(memOp);
     if (auto arrive = dyn_cast<ArriveBarrierOp>(barrier)) {
       Operation *anchor = getArriveAnchorAfterOperands(arrive, memOp);
+      if (anchor->isBeforeInBlock(barrier)) {
+        for (auto *cur = barrier->getPrevNode(); cur != anchor;
+             cur = cur->getPrevNode()) {
+          if (isGuarded(cur, barrier, /*isWait=*/false, roots)) {
+            anchor = cur;
+            break;
+          }
+        }
+      }
       if (barrier->getPrevNode() != anchor) {
         Operation *target = anchor->getNextNode();
         if (!wouldBreakOperandDominance(barrier, target))
           barrier->moveAfter(anchor);
       }
     } else {
-      if (barrier->getNextNode() != memOp) {
-        if (!wouldBreakOperandDominance(barrier, memOp))
-          barrier->moveBefore(memOp);
+      Operation *target = memOp;
+      if (barrier->isBeforeInBlock(memOp)) {
+        for (auto *cur = barrier->getNextNode(); cur != memOp;
+             cur = cur->getNextNode()) {
+          if (isGuarded(cur, barrier, /*isWait=*/true, roots)) {
+            target = cur;
+            break;
+          }
+        }
+      }
+      if (barrier->getNextNode() != target) {
+        if (!wouldBreakOperandDominance(barrier, target))
+          barrier->moveBefore(target);
       }
     }
   }

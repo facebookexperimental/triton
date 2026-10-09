@@ -70,7 +70,11 @@ ragged_attention:
   devices:
     - cuda
     - b200
-  backends: hstu_triton_autows_clc
+  # TritonBench still selects a BM=128, two-stage configuration for the
+  # dqreduce backend, which requires more shared memory than B200 provides. The
+  # packed QKV path is covered by py_self_attention_tlx_autows_blackwell_test
+  # with its maintained BM=64 configuration.
+  backends: hstu_triton_autows_clc,hstu_triton_autows_dqreduce
   disabled_devices:
     - b200
 # rms_norm subprocess segfaults on hip (exit code 11)
@@ -123,3 +127,18 @@ jsd:
   report: true
   disabled_devices:
     - hip
+# limit the test ops to save CI resources
+bf16xint16_gemm:
+cross_entropy:
+gdn_fwd_h:
+geglu:
+int4_gemm:
+inductor_softmax_fused:
+softmax:
+sum:
+vector_add:
+moe_fused_mul_sum:
+mamba2_chunk_scan:
+mamba2_chunk_state:
+low_mem_dropout:
+kl_div:

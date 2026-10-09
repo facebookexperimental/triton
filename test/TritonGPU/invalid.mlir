@@ -933,6 +933,18 @@ tt.func @async_copy_invalid_other_type(%input: tensor<64x64x!tt.ptr<f16>, #block
 
 // -----
 
+#tmem_scales = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+// expected-error @below {{twocta_rhs tensor-memory scales require a per-CTA allocation shape of 128x4; got 64, 4}}
+!invalid_twocta_rhs_rows = !ttg.memdesc<64x4xi8, #tmem_scales, #ttng.tensor_memory>
+
+// -----
+
+#tmem_scales = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+// expected-error @below {{twocta_rhs tensor-memory scales require a per-CTA allocation shape of 128x4; got 128, 8}}
+!invalid_twocta_rhs_columns = !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory>
+
+// -----
+
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 // expected-error @below {{element type bit width must be 1 or at least 8; got 4}}
 !subbyte_memdesc = !ttg.memdesc<8xi4, #shared, #ttg.shared_memory>
@@ -1158,4 +1170,3 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %result : tensor<64xf32, #carried>
   }
 }
-

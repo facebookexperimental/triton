@@ -29,9 +29,9 @@ def _packed_fp4_axis(operand_shape, result_shape):
 def _packed_arith(operation, operands, dtype, semantic):
     arch = semantic.builder.options.arch
     assert isinstance(arch, str) and arch.startswith("sm"), (
-        f"tlx.packed_{operation}4 requires an NVIDIA Rubin GPU, got architecture {arch}")
+        f"tlx.packed_{operation}4 requires an NVIDIA GPU, got architecture {arch}")
     capability = cuda_parse_arch(arch)
-    assert capability >= 107, (f"tlx.packed_{operation}4 requires compute capability >= 107 (Rubin GPU), "
+    assert capability >= 103, (f"tlx.packed_{operation}4 requires compute capability >= 103, "
                                f"current capability: {capability}")
 
     operands = tuple(semantic.to_tensor(operand) for operand in operands)
@@ -103,19 +103,19 @@ def _packed_arith(operation, operands, dtype, semantic):
 
 @tl.builtin
 def packed_add4(lhs, rhs, dtype=None, _semantic=None):
-    """Add four packed FP8/FP4 lanes with a Rubin instruction."""
+    """Add four packed FP8/FP4 lanes with an SM103+ PTX 9.4 instruction."""
     return _packed_arith("add", (lhs, rhs), dtype, _semantic)
 
 
 @tl.builtin
 def packed_sub4(lhs, rhs, dtype=None, _semantic=None):
-    """Subtract four packed FP8/FP4 lanes with a Rubin instruction."""
+    """Subtract four packed FP8/FP4 lanes with an SM103+ PTX 9.4 instruction."""
     return _packed_arith("sub", (lhs, rhs), dtype, _semantic)
 
 
 @tl.builtin
 def packed_mul4(lhs, rhs, dtype=None, _semantic=None):
-    """Multiply four packed FP8/FP4 lanes with a Rubin instruction.
+    """Multiply four packed FP8/FP4 lanes with an SM103+ PTX 9.4 instruction.
 
     When both operands are packed FP4, ``dtype`` is required and packing is
     inferred along the final tensor dimension.
@@ -125,5 +125,5 @@ def packed_mul4(lhs, rhs, dtype=None, _semantic=None):
 
 @tl.builtin
 def packed_fma4(lhs, rhs, acc, dtype=None, _semantic=None):
-    """Fused multiply-add four packed FP8/FP4 lanes with a Rubin instruction."""
+    """Fused multiply-add four packed FP8/FP4 lanes with an SM103+ PTX 9.4 instruction."""
     return _packed_arith("fma", (lhs, rhs, acc), dtype, _semantic)

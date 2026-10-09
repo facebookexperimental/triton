@@ -85,25 +85,51 @@ with tlx.async_tasks():
 
 ## Warp pipeline
 
-> **[gfx950]** — AMD MI350 (CDNA4); not available on MI300.
+> **[amd]** — AMD targets only. Intra-wave scheduling is currently tuned and
+> validated on gfx950.
 
-`tlx.warp_pipeline_stage(label, *, priority=None)` is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.
+```python
+tlx.warp_pipeline_stage(
+    label=None,
+    *,
+    scope="inter_wave",
+    priority=None,
+    pair=None,
+)
+```
 
-**This is an explicit partitioning marker, not an automatic optimization.** Correctness depends on the user's buffering and synchronization structure. In particular:
-- Use multi-buffered shared memory (typically triple buffering with `NUM_BUFFERS=3`) to prevent data races between warp groups accessing the same buffer.
-- Use explicit `tlx.async_load_wait_group()` to ensure data is ready before consumption.
-- Handle prologue (prefetch) and epilogue (drain) around the main loop.
-
-See the gfx1250 warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`) for the full pattern.
+`tlx.warp_pipeline_stage` is a context manager for two distinct AMD pipeline
+mechanisms. The default `scope="inter_wave"` preserves the original behavior:
+the compiler partitions a loop into stages and phase-shifts two warp groups.
+`scope="intra_wave"` instead defines a bounded instruction-scheduling window
+inside each wave; it does not split or phase-shift warp groups.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `label` | `str` | Stage name for diagnostics (e.g. `"load"`, `"compute"`) |
-| `priority` | `int` (0-3), optional | Hardware scheduling hint, maps to `s_setprio`. Higher = more urgent. |
+| `label` | `str`, optional | Stage name used in diagnostics. Defaults to `"cluster"` for inter-wave stages and `"stage"` for intra-wave stages. |
+| `scope` | `"inter_wave"` or `"intra_wave"` | Selects warp-group phase shifting or instruction scheduling within each wave. Defaults to `"inter_wave"`. |
+| `priority` | `int` (0-3), optional | Inter-wave-only hardware priority, lowered to `s_setprio`. Higher values are more urgent. |
+| `pair` | non-negative `int`, optional | Intra-wave only. Marks one half of an explicit two-region window. Both adjacent regions must use the same value. Omit it for one mixed region. |
+
+### Inter-wave pipeline
+
+Inter-wave stages split the loop body at source boundaries and insert
+conditional barriers so that one warp group executes one stage ahead of the
+other. This overlaps memory latency with compute but makes the source
+responsible for the complete pipeline protocol:
+
+- Use multi-buffered shared memory, typically triple buffering, to avoid races between warp groups.
+- Use explicit `tlx.async_load_wait_group()` calls before consuming data.
+- Implement the prologue, steady state, and epilogue drain.
+
+`priority` is valid only in this scope. `pair` is rejected. See the
+gfx1250 warp-pipeline GEMM example
+(`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`) for
+the full pattern.
 
 Auto software pipelining is automatically disabled on loops that contain warp pipeline stages.
 
-Example (simplified — see gfx1250 example for production pattern):
+Example (simplified):
 ```python
 import triton.language.extra.tlx as tlx
 
@@ -137,3 +163,48 @@ def gemm_kernel(..., BLOCK_K: tl.constexpr, NUM_BUFFERS: tl.constexpr):
     # Epilogue: drain remaining buffers
     ...
 ```
+
+### Intra-wave scheduling
+
+Intra-wave stages keep every wave on the same control path. The compiler
+counts the machine instructions represented by the marked TTGIR operations and
+emits AMD scheduling-group constraints so independent DS/VMEM instructions can
+be issued between MFMAs. These constraints are instruction-scheduler
+directives, not runtime synchronization or memory fences.
+
+The explicit form uses two adjacent regions with the same `pair`. The pair is
+a structural validation token, not a scheduling policy: it prevents an
+unrelated neighboring region from being consumed accidentally. The regions
+must be dataflow-independent and contain one memory-only region and one
+MFMA-only region. The compiler automatically interleaves their chunks.
+
+```python
+with tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=0):
+    acc = tl.dot(a_tile, b_tile, acc)
+with tlx.warp_pipeline_stage("future_load", scope="intra_wave", pair=0):
+    future = tl.load(future_ptrs)
+```
+
+When `pair` is omitted, one region must contain both independent streams. The
+compiler derives memory and MFMA chunks from SSA dependencies, moves the chunks
+into a stable interleaving before register allocation, and distributes MFMA
+cover across the active memory anchors:
+
+```python
+with tlx.warp_pipeline_stage(
+    "load_and_compute",
+    scope="intra_wave",
+):
+    future = tl.load(future_ptrs)
+    acc = tl.dot(a_tile, b_tile, acc)
+```
+
+Single-region interleaving accepts read-only memory operations.
+Memory writes, asynchronous commits, volatile loads, control flow, unknown
+side effects, or dataflow between the memory and MFMA streams are rejected.
+The marked region is the complete scheduling window: the compiler does not
+borrow operations from outside it.
+
+Intra-wave scheduling does not make buffer reuse safe or data ready. The
+kernel must still provide the correct buffering, asynchronous waits, and reuse
+boundaries. `priority` is rejected in this scope.

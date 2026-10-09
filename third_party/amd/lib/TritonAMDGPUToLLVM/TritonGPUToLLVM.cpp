@@ -5,6 +5,7 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/TypeConverter.h"
+#include "TritonAMDGPUTransforms/SchedulingAttributes.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
@@ -56,6 +57,15 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
   unsigned nextSyncId = 1;
   mod.walk([&](triton::FuncOp func) {
     for (Block &block : func.getBody()) {
+      // Explicit intra-wave regions already carry their complete user-chosen
+      // scheduling-group program. Do not overlay the automatic whole-block
+      // planner when both features are enabled for the same kernel.
+      if (llvm::any_of(block.without_terminator(), [](Operation &op) {
+            return isa<ROCDL::SchedGroupBarrier>(op) &&
+                   op.hasAttr(triton::AMD::kIntraWavePipelineWindowAttr);
+          }))
+        continue;
+
       SmallVector<Operation *> boundaries;
       for (Operation &op : block.without_terminator())
         if (isa<triton::gpu::BarrierOp>(op))

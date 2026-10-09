@@ -21,6 +21,21 @@ def get_func_body_asm(amdgcn):
     return amdgcn[0]
 
 
+def _packed_op_feeds_wide_store(bb, match, wide_store):
+    line_start = bb.rfind("\n", 0, match.start()) + 1
+    line_end = bb.find("\n", match.end())
+    line = bb[line_start:line_end if line_end != -1 else None]
+    dest = re.search(r"v\[(\d+):(\d+)\]", line)
+    if not dest:
+        return False
+    lo, hi = sorted((int(dest.group(1)), int(dest.group(2))))
+    for store_line in bb.splitlines():
+        if wide_store.search(store_line) and all(
+                re.search(rf"v(?:\[)?{lane}\b", store_line) for lane in range(lo, hi + 1)):
+            return True
+    return False
+
+
 # check there are actually instances of colliding/adjacent fops and mfma without scalarization
 def test_check_not_scalarize():
     triton.knobs.amd.scalarize_packed_fops = False
@@ -93,15 +108,24 @@ def test_check_scalarized():
         found_mfma = False
         found_packed_fop = False
         packed_fop = re.compile(r"v_pk_(add|sub|mul)\w+")
+        # The backend may merge scalar ALU ops feeding a merged wide store into
+        # a packed op (fewer instructions + wider memory op). LLVM's own
+        # MFMA-adjacent unpacking leaves those alone when they do not overlap
+        # MFMA latency, so they are not scalarization failures. Anything else
+        # packed in an MFMA block is.
+        wide_store = re.compile(r"(ds_write2\w*|buffer_store_format_xy\w*|(?:buffer|flat|global)_store_dwordx2\w*)\b")
         for bb in bbs:
-            if "mfma" in bb or "wmma" in bb:
-                assert not packed_fop.search(bb)
+            has_mfma = "mfma" in bb or "wmma" in bb
+            if has_mfma:
                 found_mfma = True
-            if packed_fop.search(bb):
-                assert not ("mfma" in bb or "wmma" in bb)
-                found_packed_fop = True
-            # we don't check for v_pk_add because for this kernel,
-            # there are no remaining v_pk_adds (the remaining v_pk_muls are in the epilogue)
+            for m in packed_fop.finditer(bb):
+                if has_mfma:
+                    assert _packed_op_feeds_wide_store(
+                        bb, m, wide_store), (f"packed op in MFMA block not feeding a wide store: {m.group(0)}")
+                else:
+                    found_packed_fop = True
+            # the remaining v_pk_muls are in the epilogue; the one v_pk_add left
+            # in the MFMA loop feeds a merged ds_write2 wide store (see above)
 
         assert found_mfma and found_packed_fop, f"couldn't find mfma or packed fop: {found_mfma=}, {found_packed_fop=}"
 

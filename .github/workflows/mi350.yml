@@ -87,7 +87,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
 
-  mi350-meta-triton-test:
+  mi350-tritonbench-test:
     needs: mi350-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-fb-triton-mi350-1
@@ -177,8 +177,8 @@ jobs:
         if: always() && github.event_name == 'schedule' && failure()
         run: |
           BUCKET="amd-tritonbench"
-          TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-tritonbench-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-tritonbench-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   mi350-tlx-test:
@@ -533,8 +533,8 @@ jobs:
             ${FAILED_FLAG}
 
   report-mi350-tritonbench:
-    needs: mi350-meta-triton-test
-    if: always() && github.event_name == 'schedule' && needs.mi350-meta-triton-test.outputs.failures != '' && needs.mi350-meta-triton-test.outputs.failures != '[]'
+    needs: mi350-tritonbench-test
+    if: always() && github.event_name == 'schedule' && needs.mi350-tritonbench-test.outputs.failures != '' && needs.mi350-tritonbench-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -542,7 +542,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        item: ${{ fromJSON(needs.mi350-meta-triton-test.outputs.failures) }}
+        item: ${{ fromJSON(needs.mi350-tritonbench-test.outputs.failures) }}
     uses: ./.github/workflows/report-nightly-failure.yml
     with:
       issue_title: ${{ matrix.item.issue_title }}
@@ -646,16 +646,16 @@ jobs:
       platform: mi350
 
   reconcile-mi350-tritonbench:
-    needs: mi350-meta-triton-test
-    if: always() && github.event_name == 'schedule' && (needs.mi350-meta-triton-test.result == 'success' || needs.mi350-meta-triton-test.result == 'failure')
+    needs: mi350-tritonbench-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-tritonbench-test.result == 'success' || needs.mi350-tritonbench-test.result == 'failure')
     permissions:
       contents: read
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
       workflow_name: ${{ github.workflow }}
-      job_name: mi350-meta-triton-test
-      failures: ${{ needs.mi350-meta-triton-test.outputs.failures }}
+      job_name: mi350-tritonbench-test
+      failures: ${{ needs.mi350-tritonbench-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   reconcile-mi350-tlx:
