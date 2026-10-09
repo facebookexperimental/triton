@@ -118,7 +118,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // are consecutive same-task writers of the same accumulator.
 //
 // CHECK-LABEL: @chained_accum_back_edge
-// CHECK: ttg.local_alloc {alignment = 8 : i32, ttg.ws_generated_barrier}
+// CHECK: ttg.local_alloc {alignment = 8 : i32, ttg.ws_buffer_ids = array<i32: {{[0-9, ]+}}>, ttg.ws_generated_barrier}
 // CHECK: ttg.warp_specialize
 // CHECK: ttng.wait_barrier
 // CHECK: ttng.tmem_load
