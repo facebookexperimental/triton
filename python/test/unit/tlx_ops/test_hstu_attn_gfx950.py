@@ -3,6 +3,8 @@ import importlib
 from pathlib import Path
 import pytest
 import torch
+import triton
+import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx.ops.kernels.hstu_attn._shapes import CORRECTNESS_SHAPES, inputs
 
@@ -247,21 +249,251 @@ def _assert_cross_attention_fp32_close(actual, expected):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("route,batch,heads,shared_kv,cap,offset_dtype", [
+    ("compact", 4, 2, True, 128, torch.int32),
+    ("compact", 4, 2, False, 128, torch.int64),
+    ("small", 5, 2, True, 128, torch.int64),
+    ("small", 5, 2, False, 128, torch.int32),
+    ("coarse", 5, 1, True, 512, torch.int64),
+    ("coarse", 5, 1, True, 1024, torch.int32),
+    ("retained", 256, 1, True, 256, torch.int64),
+    ("fallback", 65, 2, False, 128, torch.int32),
+])
+def test_hstu_cross_attn_gfx950_saved_tensor_layouts(monkeypatch, route, batch, heads, shared_kv, cap, offset_dtype):
+    """Accept equivalent saved tensors with padded row and offset strides."""
+    tutorial = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/hstu_cross_attn"
+    monkeypatch.syspath_prepend(str(tutorial))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    xa = importlib.import_module("tlx_gfx950_cross_attention")
+    monkeypatch.setattr(xa._tlx_gfx950_cross_attn_fwd, "configs", [xa.get_fwd_triton_spec_configs()[0]])
+    monkeypatch.setattr(xa._tlx_gfx950_cross_attn_bwd, "configs", [xa._tlx_gfx950_cross_attn_bwd.configs[0]])
+    torch.manual_seed(301)
+    q_lengths = [0, 31, 33, 16] + [0] * (batch - 4)
+    kv_lengths = [17, 0, 65, 128] + [0] * (batch - 4)
+    q_offsets = torch.tensor([0] + q_lengths, device="cuda", dtype=offset_dtype).cumsum(0, dtype=offset_dtype)
+    kv_offsets = torch.tensor([0] + kv_lengths, device="cuda", dtype=offset_dtype).cumsum(0, dtype=offset_dtype)
+    q = torch.randn(sum(q_lengths), heads, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(sum(kv_lengths), heads, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = k if shared_kv else torch.randn_like(k, requires_grad=True)
+    leaves = (q, k) if shared_kv else (q, k, v)
+    q_ref = q.detach().float().requires_grad_(True)
+    k_ref = k.detach().float().requires_grad_(True)
+    v_ref = k_ref if shared_kv else v.detach().float().requires_grad_(True)
+    reference_leaves = (q_ref, k_ref) if shared_kv else (q_ref, k_ref, v_ref)
+    reference = _cross_attention_fp32_reference(q_ref, k_ref, v_ref, q_lengths, kv_lengths)
+    saved_names = iter(("q", "k", "v", "kv_offsets", "scale", "q_offsets", "m", "out", "targets"))
+    unpacked = set()
+
+    def pack(tensor):
+        return tensor, next(saved_names)
+
+    def unpack(packed):
+        tensor, name = packed
+        if tensor.ndim == 0:
+            return tensor
+        fill = float("nan") if tensor.is_floating_point() else 0
+        storage = torch.full((*tensor.shape[:-1], tensor.shape[-1] * 2), fill, device=tensor.device, dtype=tensor.dtype)
+        view = storage[::2] if tensor.ndim == 1 else storage[..., :tensor.shape[-1]]
+        view.copy_(tensor)
+        assert not view.is_contiguous()
+        torch.testing.assert_close(view, tensor, atol=0, rtol=0, equal_nan=True)
+        unpacked.add(name)
+        return view
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        out = xa.tlx_gfx950_cross_attn_mha_wrapper(
+            max_seq_len=cap, alpha=1.0 / 128, q=q, k=k, v=v, seq_offsets=kv_offsets,
+            attn_scale=torch.tensor(1.0 / cap, device="cuda"), max_q_len=256, seq_offsets_q=q_offsets,
+            num_softmax_heads=heads, num_targets=torch.tensor(q_lengths, device="cuda", dtype=torch.int64),
+            causal=False, shared_kv=shared_kv, enable_tma=False, v3_ttgir_variant=None)
+    assert out.grad_fn.use_compact_backward == (route == "compact")
+    assert out.grad_fn.use_coarse_backward == (route == "coarse")
+    assert out.grad_fn.use_retained_backward == (route == "retained")
+    assert out.grad_fn.use_small_backward == (route in ("compact", "small", "coarse"))
+    _assert_cross_attention_fp32_close(out, reference)
+    for _ in range(2):
+        do = 0.1 * torch.randn_like(out)
+        actual = torch.autograd.grad(out, leaves, do, retain_graph=True)
+        expected = torch.autograd.grad(reference, reference_leaves, do.float(), retain_graph=True)
+        for got, want in zip(actual, expected):
+            _assert_cross_attention_fp32_close(got, want)
+    assert unpacked == {"q", "k", "v", "kv_offsets", "q_offsets", "m", "out", "targets"}
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("kernel_name,heads,cap", [
+    ("_small_bwd_shared", 256, 32),
+    ("_compact_bwd_shared", 256, 128),
+    ("_compact_bwd_shared_split", 1, 2048),
+])
+def test_hstu_cross_attn_gfx950_int32_offsets_widen_before_addressing(monkeypatch, kernel_name, heads, cap):
+    """Compile large logical offsets without allocating their full tensors."""
+    tutorial = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/hstu_cross_attn"
+    monkeypatch.syspath_prepend(str(tutorial))
+    small = importlib.import_module("tlx_gfx950_cross_attention_small")
+    q = torch.empty((1, heads, 128), device="cuda", dtype=torch.bfloat16)
+    m = torch.empty((1, heads), device="cuda", dtype=torch.float32)
+    offsets = torch.tensor([65536, 67584], device="cuda", dtype=torch.int32)
+    options = small._COMPACT_SPLIT_OPTIONS if kernel_name.endswith("split") else small._SMALL_OPTIONS
+    # Warmup compiles the kernel without reading the small placeholder tensors.
+    compiled = getattr(small, kernel_name).warmup(q, q, q, m, q, offsets, offsets, q, q, 1.0 / 128, heads, cap,
+                                                  grid=(heads, 36, 1), **options)
+    pointer_lines = [
+        line for line in compiled.asm["ttir"].splitlines()
+        if "tt.addptr" in line and "tensor<" in line and "!tt.ptr<bf16>" in line
+    ]
+    assert pointer_lines
+    # Row 65536 with H256 and D128 needs element offset 2147483648.
+    assert all("xi64>" in line for line in pointer_lines), "BF16 addresses must use 64-bit element offsets"
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("hook_kind", ["pre_run", "runtime_cache"])
+def test_hstu_cross_attn_gfx950_launcher_hooks_after_warmup(monkeypatch, hook_kind):
+    tutorial = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/hstu_cross_attn"
+    monkeypatch.syspath_prepend(str(tutorial))
+    small = importlib.import_module("tlx_gfx950_cross_attention_small")
+
+    @triton.jit
+    def add(X, Y, BIAS: tl.constexpr):
+        offsets = tl.arange(0, 64)
+        tl.store(Y + offsets, tl.load(X + offsets) + BIAS)
+
+    launcher = small._GuardedLauncher(add)
+    x = torch.arange(64, device="cuda", dtype=torch.int32)
+    y = torch.empty_like(x)
+    launcher[(1, )](x, y, 2)
+    launcher[(1, )](x, y, 2)
+    torch.testing.assert_close(y, x + 2, atol=0, rtol=0)
+    direct = torch.empty_like(y)
+    add[(1, )](x, direct, 2)
+    torch.testing.assert_close(y, direct, atol=0, rtol=0)
+    assert launcher.counters()["hits"] == 1
+    calls = []
+    if hook_kind == "pre_run":
+
+        def hook(*args, **kwargs):
+            calls.append(True)
+            args[0].fill_(7)
+
+        add.add_pre_run_hook(hook)
+        bias = 2
+    else:
+
+        def hook(*args, **kwargs):
+            calls.append(True)
+
+        monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", hook)
+        bias = 3
+    launcher[(1, )](x, y, bias)
+    torch.testing.assert_close(y, x + bias, atol=0, rtol=0)
+    assert calls == [True]
+    assert launcher.counters()["fallbacks"] == 1
+    assert launcher.counters()["hits"] == 1
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("invalidate", ["entry", "device_cache"])
+def test_hstu_cross_attn_gfx950_launcher_jit_cache_invalidation(monkeypatch, invalidate):
+    tutorial = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/hstu_cross_attn"
+    monkeypatch.syspath_prepend(str(tutorial))
+    small = importlib.import_module("tlx_gfx950_cross_attention_small")
+
+    @triton.jit
+    def copy(X, Y):
+        offsets = tl.arange(0, 64)
+        tl.store(Y + offsets, tl.load(X + offsets))
+
+    launcher = small._GuardedLauncher(copy)
+    x = torch.arange(64, device="cuda", dtype=torch.int32)
+    y = torch.empty_like(x)
+    launcher[(1, )](x, y)
+    launcher[(1, )](x, y)
+    device = torch.cuda.current_device()
+    if invalidate == "entry":
+        copy.device_caches[device][0].clear()
+    else:
+        copy.device_caches.pop(device)
+    replacement = x + 11
+    compiled = launcher[(1, )](replacement, y)
+    torch.testing.assert_close(y, replacement, atol=0, rtol=0)
+    direct = torch.empty_like(y)
+    ordinary = copy[(1, )](replacement, direct)
+    torch.testing.assert_close(y, direct, atol=0, rtol=0)
+    assert compiled is ordinary
+    assert any(compiled is value for value in copy.device_caches[device][0].values())
+    assert launcher.counters()["misses"] == 2
+    assert launcher.counters()["hits"] == 1
+    assert launcher.counters()["entries"] == 1
+    launcher[(1, )](x, y)
+    torch.testing.assert_close(y, x, atol=0, rtol=0)
+    assert launcher.counters()["hits"] == 2
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_hstu_cross_attn_gfx950_launcher_specialization_and_eviction(monkeypatch):
+    tutorial = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/hstu_cross_attn"
+    monkeypatch.syspath_prepend(str(tutorial))
+    small = importlib.import_module("tlx_gfx950_cross_attention_small")
+
+    @triton.jit
+    def affine(X, Y, scale, BIAS: tl.constexpr):
+        offsets = tl.arange(0, 64)
+        tl.store(Y + offsets, tl.load(X + offsets) * scale + BIAS)
+
+    launcher = small._GuardedLauncher(affine, max_entries=2)
+    specializations = [
+        (torch.int32, 0, 2, 1, 4),
+        (torch.int32, 1, 2, 1, 4),
+        (torch.int32, 1, 3, 1, 4),
+        (torch.int32, 1, 3, 4, 4),
+        (torch.float32, 1, 3, 4, 4),
+        (torch.float32, 1, 3, 4, 8),
+        (torch.int32, 0, 2, 1, 4),
+    ]
+    for index, (dtype, shift, scale, bias, warps) in enumerate(specializations):
+        storage = torch.arange(65, device="cuda", dtype=dtype)
+        x = storage[shift:shift + 64]
+        y = torch.empty_like(x)
+        compiled = launcher[(1, )](x, y, scale, bias, num_warps=warps)
+        torch.testing.assert_close(y, x * scale + bias, atol=0, rtol=0)
+        direct = torch.empty_like(y)
+        ordinary = affine[(1, )](x, direct, scale, bias, num_warps=warps)
+        torch.testing.assert_close(y, direct, atol=0, rtol=0)
+        assert compiled is ordinary
+        assert launcher.counters()["misses"] == index + 1
+        assert launcher.counters()["entries"] <= 2
+    assert launcher.counters()["evictions"] == len(specializations) - 2
+    replacement = torch.arange(64, device="cuda", dtype=torch.int32) + 17
+    launcher[(1, )](replacement, y, 2, 1, num_warps=4)
+    torch.testing.assert_close(y, replacement * 2 + 1, atol=0, rtol=0)
+    assert launcher.counters()["hits"] == 1
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        launcher[(1, )](replacement, y, 2, 1, num_warps=4)
+    replacement.add_(5)
+    y.zero_()
+    graph.replay()
+    torch.testing.assert_close(y, replacement * 2 + 1, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("variant", [None, "v3_ttgir_fp32_pipeline_qdo"])
-@pytest.mark.parametrize("heads,shared_kv,q_lengths,kv_lengths,coarse,partial", [
-    pytest.param(heads, shared_kv, [0, 31, 256, 255], [257, 0, 1, 129], False, False,
+@pytest.mark.parametrize("heads,shared_kv,q_lengths,kv_lengths,coarse", [
+    pytest.param(heads, shared_kv, [0, 31, 256, 255], [257, 0, 1, 129], False,
                  id=f"small-h{heads}-{'shared' if shared_kv else 'separate'}")
     for heads in [1, 2]
     for shared_kv in [True, False]
 ] + [
-    pytest.param(heads, True, [0, 31, 256, 255], [257, 0, 2048, 129], False, False, id=f"compact-long-h{heads}")
+    pytest.param(heads, True, [0, 31, 256, 255], [257, 0, 2048, 129], False, id=f"compact-long-h{heads}")
     for heads in [1, 2]
 ] + [
-    pytest.param(2, True, [0, 31, 256, 255], [257, 0, 1024, 129], False, False, id="compact-eight-warps"),
-    pytest.param(1, True, [0, 31, 256, 255, 1], [0, 1, 129, 2048, 257], True, False, id="coarse-ragged"),
+    pytest.param(2, True, [0, 31, 256, 255], [257, 0, 1024, 129], False, id="compact-eight-warps"),
+    pytest.param(1, True, [0, 31, 256, 255, 1], [0, 1, 129, 2048, 257], True, id="coarse-ragged"),
 ])
 def test_hstu_cross_attn_gfx950_fast_backward_reuse(monkeypatch, variant, heads, shared_kv, q_lengths, kv_lengths,
-                                                    coarse, partial):
+                                                    coarse):
     tutorial = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/hstu_cross_attn"
     monkeypatch.syspath_prepend(str(tutorial))
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
@@ -289,7 +521,6 @@ def test_hstu_cross_attn_gfx950_fast_backward_reuse(monkeypatch, variant, heads,
             causal=False, shared_kv=shared_kv, enable_tma=False, v3_ttgir_variant=variant)
         assert out.grad_fn.use_small_backward
         assert out.grad_fn.use_coarse_backward == coarse
-        assert out.grad_fn.use_partial_backward == partial
         assert out.grad_fn.use_compact_backward == (not coarse)
         _assert_cross_attention_fp32_close(out, reference)
 
@@ -402,7 +633,6 @@ def test_hstu_cross_attn_gfx950_coarse_boundary_preservation(monkeypatch, varian
                                                         v3_ttgir_variant="v3_ttgir", **kwargs)
         assert out.grad_fn.use_small_backward
         assert out.grad_fn.use_coarse_backward == (cap >= 384)
-        assert not out.grad_fn.use_partial_backward
         assert not baseline.grad_fn.use_small_backward
         _assert_cross_attention_fp32_close(out, reference)
         _assert_cross_attention_fp32_close(baseline, reference)
@@ -1176,7 +1406,7 @@ def test_hstu_cross_attn_gfx950_small_single_key_gradient(monkeypatch, batch, ca
                                                enable_tma=False, v3_ttgir_variant="v3_ttgir_fp32_pipeline_qdo")
     assert out.grad_fn.use_small_backward
     assert not out.grad_fn.use_coarse_backward and not out.grad_fn.use_compact_backward
-    assert not out.grad_fn.use_partial_backward and not out.grad_fn.use_retained_backward
+    assert not out.grad_fn.use_retained_backward
     leaves = (q, k) if shared_kv else (q, k, v)
     for call in range(2):
         do = 0.1 * torch.randn_like(q) if call == 0 else (
@@ -1303,7 +1533,7 @@ def test_hstu_cross_attn_gfx950_coarse_single_key_finite_extreme(monkeypatch, ca
     for do_value in [0.25, -0.125]:
         do = torch.full((1, 1, 128), do_value, device="cuda", dtype=q.dtype).expand_as(q)
         dq, dkv, _ = small.coarse_softmax_backward(q, k, do, m, out, q_offsets, kv_offsets, alpha, cache_delta=cap
-                                                   > 1024, early_stats=cap == 1024)
+                                                   >= 1024)
         expected = torch.tensor(lengths, device="cuda", dtype=torch.float32)[:, None, None] * do_value
         expected = expected.expand_as(dkv)
         assert torch.count_nonzero(dq) == 0

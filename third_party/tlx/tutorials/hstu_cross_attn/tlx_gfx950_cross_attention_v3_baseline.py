@@ -89,7 +89,6 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
     FIXED_Q: tl.constexpr = False,
     EARLY_TAIL_QDO: tl.constexpr = False,
     CACHE_K: tl.constexpr = False,
-    EARLY_COARSE_STATS: tl.constexpr = False,
     SINGLE_KV_TILE: tl.constexpr = False,
     PACKED_FIXED_Q: tl.constexpr = False,
     NATIVE_Q_SCORE: tl.constexpr = False,
@@ -391,8 +390,7 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
                             if CACHE_DELTA:
                                 current_cached_delta = tlx.local_load(
                                     tlx.local_slice(delta_view, [start_m.to(tl.int32)], [32]))
-                            if (EARLY_COARSE_STATS and KV_SPLITS > 1 or NATIVE_Q_SCORE
-                                    or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA:
+                            if (NATIVE_Q_SCORE or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA:
                                 early_rows = seq_start_q_11 + start_m + offs_m_25
                                 early_lse = tl.load(M + early_rows, mask=mask_m_108)
                                 early_delta = _backward_delta(Delta, OUT, early_rows, mask_m_108, do)
@@ -427,8 +425,7 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
                     m_130 = start_m + m_129  # triton_attention_utils.py:245
                     if CACHE_DELTA and PIPELINE_QDO:
                         m_131 = cached_lse
-                    elif (EARLY_COARSE_STATS and KV_SPLITS > 1 or NATIVE_Q_SCORE
-                          or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
+                    elif (NATIVE_Q_SCORE or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
                         m_131 = early_lse
                     else:
                         m_131 = tl.load(M + m_130, mask=mask_m_108)  # triton_attention_utils.py:245
@@ -453,7 +450,7 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
                                 prefetched_delta = tlx.local_load(
                                     tlx.local_slice(delta_view, [start_m.to(tl.int32)], [32]))
                         else:
-                            if (EARLY_COARSE_STATS and KV_SPLITS > 1 or NATIVE_Q_SCORE
+                            if (NATIVE_Q_SCORE
                                     or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
                                 prefetched_delta = early_delta
                             else:
@@ -589,8 +586,7 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
                             native_score_b)
                     if CACHE_DELTA:
                         current_cached_delta = tlx.local_load(tlx.local_slice(delta_view, [start_m.to(tl.int32)], [32]))
-                    if (EARLY_COARSE_STATS and KV_SPLITS > 1 or NATIVE_Q_SCORE
-                            or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA:
+                    if (NATIVE_Q_SCORE or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA:
                         early_rows = seq_start_q_11 + start_m + offs_m_25
                         early_lse = tl.load(M + early_rows, mask=mask_m_108)
                         early_delta = _backward_delta(Delta, OUT, early_rows, mask_m_108, do)
@@ -613,8 +609,7 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
                     m_130 = start_m + m_129
                     if CACHE_DELTA and PIPELINE_QDO:
                         m_131 = cached_lse
-                    elif (EARLY_COARSE_STATS and KV_SPLITS > 1 or NATIVE_Q_SCORE
-                          or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
+                    elif (NATIVE_Q_SCORE or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
                         m_131 = early_lse
                     else:
                         m_131 = tl.load(M + m_130, mask=mask_m_108)
@@ -625,8 +620,7 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(  # noqa: C901
                     if CACHE_DELTA:
                         prefetched_delta = current_cached_delta
                     else:
-                        if (EARLY_COARSE_STATS and KV_SPLITS > 1 or NATIVE_Q_SCORE
-                                or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
+                        if (NATIVE_Q_SCORE or SINGLE_KV_TILE and KV_SPLITS == 1) and not CACHE_DELTA and PIPELINE_QDO:
                             prefetched_delta = early_delta
                         else:
                             prefetched_delta = _backward_delta(Delta, OUT, m_130, mask_m_108, do)
@@ -811,7 +805,6 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd(  # noqa: C901
     CACHE_DELTA: tl.constexpr = False,
     EARLY_TAIL_QDO: tl.constexpr = False,
     CACHE_K: tl.constexpr = False,
-    EARLY_COARSE_STATS: tl.constexpr = False,
     SINGLE_KV_TILE: tl.constexpr = False,
     PACKED_FIXED_Q: tl.constexpr = False,
     NATIVE_Q_SCORE: tl.constexpr = False,
@@ -856,34 +849,34 @@ def _tlx_gfx950_cross_attn_v3_ttgir_bwd(  # noqa: C901
         AUTOTUNE_MAX_SEQ_LEN,
     )
     if PACKED_FIXED_Q:
-        _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(*args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE,
-                                                 ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ, STAGE_QDO=STAGE_QDO,
-                                                 PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT,
-                                                 KV_SPLITS=KV_SPLITS, CACHE_DELTA=CACHE_DELTA, FIXED_Q=True,
-                                                 EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
-                                                 EARLY_COARSE_STATS=EARLY_COARSE_STATS, SINGLE_KV_TILE=SINGLE_KV_TILE,
-                                                 PACKED_FIXED_Q=True, NATIVE_Q_SCORE=NATIVE_Q_SCORE, FIXED_KV=FIXED_KV)
+        _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(
+            *args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE, ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ,
+            STAGE_QDO=STAGE_QDO, PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT, KV_SPLITS=KV_SPLITS,
+            CACHE_DELTA=CACHE_DELTA, FIXED_Q=True, EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
+            SINGLE_KV_TILE=SINGLE_KV_TILE, PACKED_FIXED_Q=True, NATIVE_Q_SCORE=NATIVE_Q_SCORE, FIXED_KV=FIXED_KV)
     elif PIPELINE_QDO:
         seq = tl.program_id(0)
         q_start = tl.load(seq_offsets_q + seq)
         q_end = tl.load(seq_offsets_q + seq + 1)
         # Check each sequence before selecting the constant query bound.
         if q_end - q_start == 256:
-            _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(
-                *args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE, ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ,
-                STAGE_QDO=STAGE_QDO, PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT, KV_SPLITS=KV_SPLITS,
-                CACHE_DELTA=CACHE_DELTA, FIXED_Q=True, EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
-                EARLY_COARSE_STATS=EARLY_COARSE_STATS, SINGLE_KV_TILE=SINGLE_KV_TILE)
+            _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(*args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE,
+                                                     ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ, STAGE_QDO=STAGE_QDO,
+                                                     PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT,
+                                                     KV_SPLITS=KV_SPLITS, CACHE_DELTA=CACHE_DELTA, FIXED_Q=True,
+                                                     EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
+                                                     SINGLE_KV_TILE=SINGLE_KV_TILE)
         else:
-            _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(
-                *args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE, ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ,
-                STAGE_QDO=STAGE_QDO, PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT, KV_SPLITS=KV_SPLITS,
-                CACHE_DELTA=CACHE_DELTA, FIXED_Q=False, EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
-                EARLY_COARSE_STATS=EARLY_COARSE_STATS, SINGLE_KV_TILE=SINGLE_KV_TILE)
+            _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(*args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE,
+                                                     ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ, STAGE_QDO=STAGE_QDO,
+                                                     PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT,
+                                                     KV_SPLITS=KV_SPLITS, CACHE_DELTA=CACHE_DELTA, FIXED_Q=False,
+                                                     EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
+                                                     SINGLE_KV_TILE=SINGLE_KV_TILE)
     else:
         _tlx_gfx950_cross_attn_v3_ttgir_bwd_impl(*args, DIRECT_FIRST_DQ_STORE=DIRECT_FIRST_DQ_STORE,
                                                  ATOMIC_DQ=ATOMIC_DQ, PREFETCH_DQ=PREFETCH_DQ, STAGE_QDO=STAGE_QDO,
                                                  PIPELINE_QDO=PIPELINE_QDO, DQ_FINAL=DQ_FINAL, OUT=OUT,
                                                  KV_SPLITS=KV_SPLITS, CACHE_DELTA=CACHE_DELTA, FIXED_Q=False,
                                                  EARLY_TAIL_QDO=EARLY_TAIL_QDO, CACHE_K=CACHE_K,
-                                                 EARLY_COARSE_STATS=EARLY_COARSE_STATS, SINGLE_KV_TILE=SINGLE_KV_TILE)
+                                                 SINGLE_KV_TILE=SINGLE_KV_TILE)

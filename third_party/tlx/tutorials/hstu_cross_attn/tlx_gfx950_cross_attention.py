@@ -99,7 +99,7 @@ from stubs import (
 )
 from tlx_gfx950_cross_attention_v3_baseline import (
     _tlx_gfx950_cross_attn_v3_ttgir_bwd, )
-from tlx_gfx950_cross_attention_small import coarse_softmax_backward, compact_softmax_backward, partial_softmax_backward, small_softmax_backward
+from tlx_gfx950_cross_attention_small import coarse_softmax_backward, compact_softmax_backward, small_softmax_backward
 from tlx_gfx950_cross_attention_retained import retained_softmax_backward
 from triton_attention_utils import (
     backward_softmax_activation_scaled_alpha,
@@ -2181,7 +2181,6 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         ctx.shared_kv = shared_kv
         ctx.enable_tma = enable_tma
         ctx.num_softmax_heads = num_softmax_heads
-        ctx.stride_mm = M.stride(0)
         ctx.total_seq_len_q = total_seq_len_q
         ctx.G = G
         ctx.H = H
@@ -2206,10 +2205,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] == "gfx950")
         ctx.use_coarse_backward = ctx.use_small_backward and batch > 4 and max_seq_len >= 384 and H == 1 and shared_kv
         ctx.cache_coarse_delta = ctx.use_coarse_backward and max_seq_len >= 1024
-        ctx.use_partial_backward = ctx.use_small_backward and batch <= 4 and max_seq_len > 512 and shared_kv
         ctx.use_compact_backward = (ctx.use_small_backward and batch <= 4 and (max_seq_len <= 1024 or shared_kv))
-        if ctx.use_compact_backward:
-            ctx.use_partial_backward = False
         return out.view(total_seq_len_q, H, DimV)
 
     @staticmethod
@@ -2235,19 +2231,22 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale, seq_offsets_q = saved_tensors[:6]
+        # Saved-tensor hooks can return equal values with different strides.
+        seq_offsets = seq_offsets.contiguous()
+        seq_offsets_q = seq_offsets_q.contiguous()
+        if ctx.use_retained_backward or ctx.use_small_backward:
+            q = q.contiguous()
+            k = k.contiguous()
+            v = k if ctx.shared_kv else v.contiguous()
+            m = saved_tensors[6].contiguous()
+            out = saved_tensors[7].contiguous()
         if ctx.use_retained_backward:
-            m, out = saved_tensors[6:8]
             dq, dk = retained_softmax_backward(q, k, dout, m, out, seq_offsets_q, seq_offsets, ctx.alpha)
             return (None, None, dq, dk, None, None, None, None, None, None, None, None, None, None, None, None)
         if ctx.use_small_backward:
-            m, out = saved_tensors[6:8]
-            if ctx.use_partial_backward:
-                dq, dk, dv = partial_softmax_backward(q, k, dout, m, out, seq_offsets_q, seq_offsets, ctx.max_seq_len,
-                                                      ctx.alpha)
-            elif ctx.use_coarse_backward:
+            if ctx.use_coarse_backward:
                 dq, dk, dv = coarse_softmax_backward(q, k, dout, m, out, seq_offsets_q, seq_offsets, ctx.alpha,
-                                                     cache_delta=ctx.cache_coarse_delta,
-                                                     early_stats=ctx.max_seq_len >= 1024 and not ctx.cache_coarse_delta)
+                                                     cache_delta=ctx.cache_coarse_delta)
             elif ctx.use_compact_backward:
                 dq, dk, dv = compact_softmax_backward(q, k, v, dout, m, out, seq_offsets_q, seq_offsets,
                                                       ctx.max_seq_len, ctx.alpha, ctx.shared_kv)
@@ -2274,9 +2273,9 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
         if (ctx.H > 1 and ctx.H_kv == 1 and (num_softmax_heads == 0 or num_softmax_heads == ctx.H) and not ctx.causal):
             dout = dout.view(ctx.total_seq_len_q * ctx.H, -1, dout.shape[-1])
         if num_softmax_heads > 0:
-            M = saved_tensors[idx]
+            M = saved_tensors[idx].contiguous()
             idx += 1
-            out = saved_tensors[idx]
+            out = saved_tensors[idx].contiguous()
             idx += 1
             Delta = torch.empty_like(M)
             pre_grid = (triton.cdiv(out.shape[0], 128), num_softmax_heads)
@@ -2289,7 +2288,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             M = torch.empty(0, device=q.device, dtype=torch.float32)
             Delta = torch.empty(0, device=q.device, dtype=torch.float32)
         if ctx.has_num_targets:
-            num_targets = saved_tensors[idx]
+            num_targets = saved_tensors[idx].contiguous()
             idx += 1
         else:
             num_targets = None
@@ -2310,7 +2309,7 @@ class _TlxGfx950CrossAttentionFunction(torch.autograd.Function):
             num_softmax_heads=num_softmax_heads,
             M=M,
             Delta=Delta,
-            stride_mm=ctx.stride_mm,
+            stride_mm=M.stride(0),
             G=ctx.G,
             truncate_method=ctx.truncate_method,
             enable_tma=ctx.enable_tma,

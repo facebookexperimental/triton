@@ -190,10 +190,10 @@ def _small_bwd_impl(Q, K, V, DO, M, OUT, SOQ, SOK, DQ, DK, DV, alpha, H: tl.cons
     batch = head_batch // H
     head = head_batch % H
     d = tl.arange(0, HEAD_DIM)
-    q_start = tl.load(SOQ + batch)
-    q_end = tl.load(SOQ + batch + 1)
-    k_start = tl.load(SOK + batch)
-    k_end = tl.load(SOK + batch + 1)
+    q_start = tl.load(SOQ + batch).to(tl.int64)
+    q_end = tl.load(SOQ + batch + 1).to(tl.int64)
+    k_start = tl.load(SOK + batch).to(tl.int64)
+    k_end = tl.load(SOK + batch + 1).to(tl.int64)
 
     if task < QUERY_TILES:
         if k_end - k_start != 1:
@@ -325,14 +325,6 @@ def _coarse_bwd(Q, K, DO, SOQ, SOK, DQ, DK, M, OUT, TQ, SQ, SK, SDO, SDQ, SDK, a
 
 
 @triton.jit
-def _coarse_bwd_early_stats(Q, K, DO, SOQ, SOK, DQ, DK, M, OUT, TQ, SQ, SK, SDO, SDQ, SDK, alpha):
-    _tlx_gfx950_cross_attn_v3_ttgir_bwd(Q, K, K, DO, TQ, 0, SOK, SOQ, DQ, DK, DK, SQ, 128, SK, 128, SK, 128, SDO, 128,
-                                        SDQ, 128, SDK, 128, 128, 128, alpha, 0, 0, M, 0, 0, 0, 0, 0, 0,
-                                        DIRECT_FIRST_DQ_STORE=True, ATOMIC_DQ=False, PREFETCH_DQ=True, STAGE_QDO=True,
-                                        PIPELINE_QDO=True, DQ_FINAL=None, OUT=OUT, KV_SPLITS=4, EARLY_COARSE_STATS=True)
-
-
-@triton.jit
 def _coarse_bwd_cached(Q, K, DO, SOQ, SOK, DQ, DK, M, OUT, TQ, SQ, SK, SDO, SDQ, SDK, alpha):
     _tlx_gfx950_cross_attn_v3_ttgir_bwd(Q, K, K, DO, TQ, 0, SOK, SOQ, DQ, DK, DK, SQ, 128, SK, 128, SK, 128, SDO, 128,
                                         SDQ, 128, SDK, 128, 128, 128, alpha, 0, 0, M, 0, 0, 0, 0, 0, 0,
@@ -344,16 +336,16 @@ def _coarse_bwd_cached(Q, K, DO, SOQ, SOK, DQ, DK, M, OUT, TQ, SQ, SK, SDO, SDQ,
 def _reduce_partial_dq(PARTIAL, DQ, N, DO, DK, SOQ, SOK):
     batch = tl.program_id(0)
     tile = tl.program_id(1)
-    qs = tl.load(SOQ + batch)
-    qe = tl.load(SOQ + batch + 1)
-    ks = tl.load(SOK + batch)
-    ke = tl.load(SOK + batch + 1)
+    qs = tl.load(SOQ + batch).to(tl.int64)
+    qe = tl.load(SOQ + batch + 1).to(tl.int64)
+    ks = tl.load(SOK + batch).to(tl.int64)
+    ke = tl.load(SOK + batch + 1).to(tl.int64)
     offsets = qs * 128 + tile * 2048 + tl.arange(0, 2048)
     mask = offsets < qe * 128
     if ke - ks != 1:
         value = tl.full((2048, ), 0, tl.float32)
         for split in tl.static_range(4):
-            value += tl.load(PARTIAL + split * N + offsets, mask, other=0)
+            value += tl.load(PARTIAL + split * N.to(tl.int64) + offsets, mask, other=0)
         tl.store(DQ + offsets, value, mask)
     else:
         tl.store(DQ + offsets, 0., mask)
@@ -368,13 +360,12 @@ def _reduce_partial_dq(PARTIAL, DQ, N, DO, DK, SOQ, SOK):
 
 
 _coarse_launcher = _GuardedLauncher(_coarse_bwd)
-_coarse_early_stats_launcher = _GuardedLauncher(_coarse_bwd_early_stats)
 _coarse_cached_launcher = _GuardedLauncher(_coarse_bwd_cached)
 _reduce_launcher = _GuardedLauncher(_reduce_partial_dq)
 _COARSE_OPTIONS = dict(_SMALL_OPTIONS, regclass_priority_trumps_globalness=False)
 
 
-def coarse_softmax_backward(q, k, dout, m, out, offsets_q, offsets_kv, alpha, cache_delta=False, early_stats=False):
+def coarse_softmax_backward(q, k, dout, m, out, offsets_q, offsets_kv, alpha, cache_delta=False):
     """Split shared-K/V sequences into four disjoint blocks of KV tiles."""
     dout = dout.contiguous()
     tokens = q.shape[0]
@@ -386,110 +377,11 @@ def coarse_softmax_backward(q, k, dout, m, out, offsets_q, offsets_kv, alpha, ca
             128, 128, alpha)
     if cache_delta:
         launcher = _coarse_cached_launcher
-    elif early_stats:
-        launcher = _coarse_early_stats_launcher
     else:
         launcher = _coarse_launcher
     launcher.launch(grid, args, _COARSE_OPTIONS)
     _reduce_launcher.launch((offsets_q.numel() - 1, 16, 1), (partial, dq, q.numel(), dout, dk, offsets_q, offsets_kv),
                             {})
-    return dq, dk, None
-
-
-@triton.jit
-def _partial_bwd(Q, K, DO, M, OUT, SOQ, SOK, PQ, TQ: tl.constexpr, TK, alpha, H: tl.constexpr, KV_TILES: tl.constexpr):
-    head_batch = tl.program_id(0)
-    query_tile = tl.program_id(1)
-    kv_tile = tl.program_id(2)
-    batch = head_batch // H
-    head = head_batch % H
-    q_start = tl.load(SOQ + batch)
-    q_end = tl.load(SOQ + batch + 1)
-    k_start = tl.load(SOK + batch)
-    k_end = tl.load(SOK + batch + 1)
-    rows = q_start + query_tile * 128 + tl.arange(0, 128)
-    columns = k_start + kv_tile * 64 + tl.arange(0, 64)
-    d = tl.arange(0, 128)
-    q_mask = rows < q_end
-    k_mask = columns < k_end
-    q_offsets = (rows[:, None] * H + head) * 128 + d[None, :]
-    k_offsets = (columns[:, None] * H + head) * 128 + d[None, :]
-    q = tl.load(Q + q_offsets, mask=q_mask[:, None], other=0)
-    do = tl.load(DO + q_offsets, mask=q_mask[:, None], other=0)
-    k = tl.load(K + k_offsets, mask=k_mask[:, None], other=0)
-    m = tl.load(M + rows * H + head, mask=q_mask, other=0)
-    out = tl.load(OUT + q_offsets, mask=q_mask[:, None], other=0)
-    delta = tl.sum(out.to(tl.float32) * do.to(tl.float32), axis=1)
-    valid = q_mask[:, None] & k_mask[None, :]
-    scores = tl.dot(q, tl.trans(k), allow_tf32=False)
-    p = tl.exp2(scores * (alpha * 1.44269504) - m[:, None])
-    p = tl.where(valid, p, 0)
-    dp = tl.dot(do, tl.trans(k), allow_tf32=False)
-    ds = tl.where(valid, p * (dp - delta[:, None]), 0).to(tl.bfloat16)
-    dq = tl.dot(ds, k, allow_tf32=False) * alpha
-    tl.store(PQ + kv_tile * TQ * H * 128 + q_offsets, dq, mask=q_mask[:, None])
-    dk = tl.dot(tl.trans(ds), q, allow_tf32=False) * alpha
-    dv = tl.dot(tl.trans(p.to(tl.bfloat16)), do, allow_tf32=False)
-    tl.store(PQ + KV_TILES * TQ * H * 128 + query_tile * TK * H * 128 + k_offsets, dk + dv, mask=k_mask[:, None])
-
-
-@triton.jit
-def _reduce_partials(PQ, DQ, DK, TQ: tl.constexpr, TK, H: tl.constexpr, KV_TILES: tl.constexpr):
-    block = tl.program_id(0)
-    offsets = tl.arange(0, 256)
-    q_blocks: tl.constexpr = triton.cdiv(TQ * H * 128, 256)
-    if block < q_blocks:
-        offsets += block * 256
-        tile = tl.arange(0, triton.next_power_of_2(KV_TILES))
-        partial = tl.load(PQ + tile[:, None] * (TQ * H * 128) + offsets[None, :],
-                          mask=(tile[:, None] < KV_TILES) & (offsets[None, :] < TQ * H * 128), other=0)
-        tl.store(DQ + offsets, tl.sum(partial, axis=0), mask=offsets < TQ * H * 128)
-    else:
-        offsets += (block - q_blocks) * 256
-        kv_tile = tl.arange(0, 2)
-        kv_partial = tl.load(PQ + KV_TILES * TQ * H * 128 + kv_tile[:, None] * (TK * H * 128) + offsets[None, :],
-                             mask=offsets[None, :] < TK * H * 128, other=0)
-        tl.store(DK + offsets, tl.sum(kv_partial, axis=0), mask=offsets < TK * H * 128)
-
-
-class _PartialReductionLauncher(_GuardedLauncher):
-
-    def _argument_keys(self, complete):
-        partial, dq, dk, tq, tk, heads, kv_tiles = complete
-        if any(type(value) is not torch.Tensor for value in (partial, dq, dk)):
-            return super()._argument_keys(complete)
-        if any(type(value) is not int for value in (tq, tk, heads, kv_tiles)):
-            return super()._argument_keys(complete)
-        # This private reducer receives only the three allocations below.
-        device = dq.device
-        q_elements = tq * heads * 128
-        k_elements = tk * heads * 128
-        return ((torch.Tensor, torch.float32, device, partial.data_ptr() % 16 == 0,
-                 (kv_tiles * q_elements + 2 * k_elements) * 4 <= 2**31 - 1),
-                (torch.Tensor, torch.bfloat16, device, dq.data_ptr() % 16 == 0, q_elements * 2
-                 <= 2**31 - 1), (torch.Tensor, torch.bfloat16, device, dk.data_ptr() % 16 == 0, k_elements * 2
-                                 <= 2**31 - 1), (int, tq), (int, tk), (int, heads), (int, kv_tiles))
-
-
-_PARTIAL_REDUCE_OPTIONS = dict(num_warps=4)
-_partial_launcher = _GuardedLauncher(_partial_bwd, bound_options=_SMALL_OPTIONS)
-_partial_reduce_launcher = _PartialReductionLauncher(_reduce_partials, bound_options=_PARTIAL_REDUCE_OPTIONS)
-
-
-def partial_softmax_backward(q, k, dout, m, out, offsets_q, offsets_kv, max_kv, alpha):
-    """Reduce partial gradients from independent KV tiles."""
-    dout = dout.contiguous()
-    tq, heads, dim = q.shape
-    tk = k.shape[0]
-    kv_tiles = triton.cdiv(max_kv, 64)
-    partial = torch.empty((kv_tiles * tq + 2 * tk) * heads * dim, device=q.device, dtype=torch.float32)
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    grid = ((offsets_q.numel() - 1) * heads, 2, kv_tiles)
-    _partial_launcher.launch(grid, (q, k, dout, m, out, offsets_q, offsets_kv, partial, tq, tk, alpha, heads, kv_tiles),
-                             _SMALL_OPTIONS)
-    blocks = triton.cdiv(tq * heads * dim, 256) + triton.cdiv(tk * heads * dim, 256)
-    _partial_reduce_launcher.launch((blocks, 1, 1), (partial, dq, dk, tq, tk, heads, kv_tiles), _PARTIAL_REDUCE_OPTIONS)
     return dq, dk, None
 
 
@@ -667,10 +559,10 @@ def _compact_bwd_impl(Q, K, V, DO, M, OUT, SOQ, SOK, DQ, DK, DV, alpha, H: tl.co
     task = tl.program_id(1)
     batch = bh // H
     head = bh % H
-    qs = tl.load(SOQ + batch)
-    qe = tl.load(SOQ + batch + 1)
-    ks = tl.load(SOK + batch)
-    ke = tl.load(SOK + batch + 1)
+    qs = tl.load(SOQ + batch).to(tl.int64)
+    qe = tl.load(SOQ + batch + 1).to(tl.int64)
+    ks = tl.load(SOK + batch).to(tl.int64)
+    ke = tl.load(SOK + batch + 1).to(tl.int64)
     if task < triton.cdiv(256, BQ):
         if SHARED and MAX_KV > 512:
             _compact_q_owner_staged(Q, K, DO, M, OUT, DQ, qs, qe, ks, ke, head, task, alpha, H, MAX_KV, BQ, KL)
@@ -772,10 +664,10 @@ def _compact_q_owner_split(Q, K, DO, M, OUT, DQ, qs, qe, ks, ke, task, alpha):
 def _compact_bwd_shared_split(Q, K, DO, M, OUT, SOQ, SOK, DQ, DK, alpha, H: tl.constexpr, MAX_KV: tl.constexpr):
     batch = tl.program_id(0)
     task = tl.program_id(1)
-    qs = tl.load(SOQ + batch)
-    qe = tl.load(SOQ + batch + 1)
-    ks = tl.load(SOK + batch)
-    ke = tl.load(SOK + batch + 1)
+    qs = tl.load(SOQ + batch).to(tl.int64)
+    qe = tl.load(SOQ + batch + 1).to(tl.int64)
+    ks = tl.load(SOK + batch).to(tl.int64)
+    ke = tl.load(SOK + batch + 1).to(tl.int64)
     if task < 16:
         _compact_q_owner_split(Q, K, DO, M, OUT, DQ, qs, qe, ks, ke, task, alpha)
     else:
