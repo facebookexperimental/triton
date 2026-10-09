@@ -902,7 +902,10 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
 @triton.jit
 def _kdqs_pair(S, head, group: tl.constexpr, start, N):
     # The prepared ABI repeats KS[group] across32 consecutive feature rows.
-    groups = (N // 32).to(tl.int64)
+    if tl.constexpr(isinstance(N, int)):
+        groups = tl.cast(N // 32, tl.int64)
+    else:
+        groups = (N // 32).to(tl.int64)
     kg = (start // 32).to(tl.int64)
     byte_offset = (head * 128 + group * 32) * groups + kg
     # N%128==0 and BK64 starts imply kg%2==0: no partial pair exists.
@@ -973,7 +976,10 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 2])
     lhs_layout: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=16)
     rhs_layout: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=16)
-    query_tiles = tl.cdiv(N, BM).to(tl.int64)
+    if tl.constexpr(isinstance(N, int)):
+        query_tiles = tl.cast(tl.cdiv(N, BM), tl.int64)
+    else:
+        query_tiles = tl.cdiv(N, BM).to(tl.int64)
     linear = tl.program_id(0).to(tl.int64) + tl.program_id(1).to(tl.int64) * query_tiles
     head = linear % HEADS
     logical_tile = (query_tiles - 1 - linear // HEADS).to(tl.int32)
@@ -1037,7 +1043,10 @@ def _bwd_q_consume_arena(K, Arena, DQ, N, sm_scale, ARENA_N: tl.constexpr, D: tl
         _, K, _, _ = _saved_qk_arena_segments(K, ARENA_N)
     _, _, _, _, kdqs, _ = _preparation_arena_segments(Arena, ARENA_N)
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
-    _bwd_q_consume(DS, DSS, K, kdqs, DQ, N, sm_scale, D, BM, BK, CAUSAL, HEADS)
+    if QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048):
+        _bwd_q_consume(DS, DSS, K, kdqs, DQ, ARENA_N, sm_scale, D, BM, BK, CAUSAL, HEADS)
+    else:
+        _bwd_q_consume(DS, DSS, K, kdqs, DQ, N, sm_scale, D, BM, BK, CAUSAL, HEADS)
 
 
 # Only compiled kernels and their JIT validity metadata are retained. Input
