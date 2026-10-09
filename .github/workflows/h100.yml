@@ -85,7 +85,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
 
-  h100-meta-triton-test:
+  h100-tritonbench-test:
     needs: h100-build
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
     runs-on: linux-gcp-h100
@@ -173,8 +173,8 @@ jobs:
         if: always() && github.event_name == 'schedule' && failure()
         run: |
           BUCKET="h100-tritonbench"
-          TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-tritonbench-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-tritonbench-test","summary":"TritonBench tests failed on H100 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   h100-tlx-test:
@@ -382,8 +382,8 @@ jobs:
             ${FAILED_FLAG}
 
   report-h100-tritonbench:
-    needs: h100-meta-triton-test
-    if: always() && github.event_name == 'schedule' && needs.h100-meta-triton-test.outputs.failures != '' && needs.h100-meta-triton-test.outputs.failures != '[]'
+    needs: h100-tritonbench-test
+    if: always() && github.event_name == 'schedule' && needs.h100-tritonbench-test.outputs.failures != '' && needs.h100-tritonbench-test.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -391,7 +391,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        item: ${{ fromJSON(needs.h100-meta-triton-test.outputs.failures) }}
+        item: ${{ fromJSON(needs.h100-tritonbench-test.outputs.failures) }}
     uses: ./.github/workflows/report-nightly-failure.yml
     with:
       issue_title: ${{ matrix.item.issue_title }}
@@ -469,16 +469,16 @@ jobs:
       platform: h100
 
   reconcile-h100-tritonbench:
-    needs: h100-meta-triton-test
-    if: always() && github.event_name == 'schedule' && (needs.h100-meta-triton-test.result == 'success' || needs.h100-meta-triton-test.result == 'failure')
+    needs: h100-tritonbench-test
+    if: always() && github.event_name == 'schedule' && (needs.h100-tritonbench-test.result == 'success' || needs.h100-tritonbench-test.result == 'failure')
     permissions:
       contents: read
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
       workflow_name: ${{ github.workflow }}
-      job_name: h100-meta-triton-test
-      failures: ${{ needs.h100-meta-triton-test.outputs.failures }}
+      job_name: h100-tritonbench-test
+      failures: ${{ needs.h100-tritonbench-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   reconcile-h100-tlx:
