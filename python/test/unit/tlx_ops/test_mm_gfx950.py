@@ -5,6 +5,7 @@ import time
 import pytest
 import torch
 from triton._internal_testing import is_hip_cdna4
+from triton.tlx import ops as tlx_ops
 from triton.tlx.ops import InvalidInput, UnsupportedOp
 from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
@@ -22,6 +23,123 @@ FAILED_SHAPES = {
     (2617290, 384, 1152, (1152, 1), (1, 1152), "bf16"),
     (2701258, 384, 1152, (1152, 1), (1, 1152), "bf16"),
 }
+
+
+def _assert_range_result(actual, expected):
+    assert actual.shape == expected.shape
+    tolerance = 1e-2 if actual.dtype == torch.bfloat16 else 1e-3
+    amax = max(expected[row:row + 64].abs().max().item() for row in range(0, expected.shape[0], 64))
+    for row in range(0, expected.shape[0], 64):
+        torch.testing.assert_close(actual[row:row + 64], expected[row:row + 64], atol=tolerance * amax, rtol=tolerance)
+
+
+@pytest.mark.parametrize("m,n,k,dtype_name,b_step", [
+    (24, 1024, 768, "bf16", 1),
+    (96, 1280, 1024, "bf16", 1),
+    (3072, 1280, 960, "bf16", 1),
+    (1536, 1184, 997, "bf16", 1),
+    (3072, 896, 1024, "bf16", 2),
+    (16384, 1024, 1280, "bf16", 1),
+    (6144, 1792, 1280, "bf16", 1),
+    (4608, 1536, 1792, "bf16", 1),
+    (6144, 128, 1024, "bf16", 1),
+    (6144, 192, 1024, "bf16", 1),
+    (1280, 1536, 1024, "fp16", 1),
+    (992, 1008, 1024, "fp16", 1),
+    (992, 1008, 1024, "bf16", 1),
+    (256, 256, 256, "bf16", 1),
+    (12288, 1152, 1008, "bf16", 1),
+    (96, 16384, 1024, "bf16", 1),
+    (8192, 128, 512, "bf16", 1),
+])
+def test_mm_range_family_numerics(m, n, k, dtype_name, b_step):
+    dtype = torch.bfloat16 if dtype_name == "bf16" else torch.float16
+    torch.manual_seed(23)
+    a = torch.randn((m, k), device="cuda", dtype=dtype)
+    b = torch.randn((k, n * b_step), device="cuda", dtype=dtype)[:, ::b_step]
+    candidates = _gfx950._range_dispatch_candidates(m, n, k, dtype, a.element_size(), a.stride(), b.stride())
+    assert candidates
+    out = torch.empty((m, n * 2), device="cuda", dtype=dtype)[:, ::2]
+    expected = a @ b
+    for dispatch in candidates:
+        if dispatch[1] is not None:
+            assert dispatch[1].get("split_k", 1) == 1
+            assert dispatch[1].get("streamk_tail_split", 0) == 0
+        assert _gfx950._launch_dispatch(a, b, out, dispatch) is out
+        _assert_range_result(out, expected)
+    assert tlx_ops.mm(a, b, out=out, space="heuristic") is out
+    _assert_range_result(out, expected)
+
+
+@pytest.mark.parametrize("a_strides,b_strides,k", [
+    ((1, 768), (1280, 1), 1024),
+    ((1024, 1), (1280, 1), 8192),
+    ((2**30, 1), (1280, 1), 1024),
+])
+def test_mm_range_family_rejects_unsupported_geometry(a_strides, b_strides, k):
+    assert not _gfx950._range_dispatch_candidates(768, 1280, k, torch.bfloat16, 2, a_strides, b_strides)
+
+
+@pytest.mark.parametrize("m,n,k,block_m", [(96, 1280, 1024, 32), (8192, 640, 1024, 256)])
+def test_mm_range_compiled_cache_rebinds_operands_and_output(m, n, k, block_m):
+    cache = _gfx950._range_register_compiled_cache()
+    cache.clear()
+    try:
+        for _ in range(2):
+            a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+            b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
+            candidates = _gfx950._range_dispatch_candidates(m, n, k, a.dtype, a.element_size(), a.stride(), b.stride())
+            dispatch = next(item for item in candidates
+                            if item[0] == "range_register" and item[1]["BLOCK_M"] == block_m)
+            out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+            assert _gfx950._launch_dispatch(a, b, out, dispatch) is out
+            _assert_range_result(out, a @ b)
+            assert len(cache) == 1
+        out = torch.empty((m, n * 2), device="cuda", dtype=torch.bfloat16)[:, ::2]
+        assert _gfx950._launch_dispatch(a, b, out, dispatch) is out
+        _assert_range_result(out, a @ b)
+        assert len(cache) == 2
+    finally:
+        cache.clear()
+
+
+def test_mm_range_full_space_reuses_selection(monkeypatch):
+    from triton import knobs, testing
+
+    _gfx950._RANGE_TUNED_PLAN_CACHE.clear()
+    measured = 0
+    original = testing.do_bench_cudagraph
+
+    def observed(*args, **kwargs):
+        nonlocal measured
+        measured += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(testing, "do_bench_cudagraph", observed)
+    try:
+        for _ in range(2):
+            a = torch.randn((96, 1024), device="cuda", dtype=torch.bfloat16)
+            b = torch.randn((1024, 1280), device="cuda", dtype=torch.bfloat16)
+            out = torch.empty((96, 1280), device="cuda", dtype=torch.bfloat16)
+            assert tlx_ops.mm(a, b, out=out, space="full") is out
+            _assert_range_result(out, a @ b)
+            assert len(_gfx950._RANGE_TUNED_PLAN_CACHE) == 1
+            assert measured == 9
+        launches = 0
+
+        def on_launch(metadata):
+            nonlocal launches
+            launches += 1
+
+        knobs.runtime.launch_enter_hook.add(on_launch)
+        try:
+            assert tlx_ops.mm(a, b, out=out, space="full") is out
+            _assert_range_result(out, a @ b)
+            assert launches > 0
+        finally:
+            knobs.runtime.launch_enter_hook.remove(on_launch)
+    finally:
+        _gfx950._RANGE_TUNED_PLAN_CACHE.clear()
 
 
 def _cases():
@@ -59,13 +177,7 @@ def test_mm(m, n, k, a_strides, b_strides, dtype_name):
                                             f"over the {MAX_SECONDS_PER_CASE}s budget")
 
     expected = torch.matmul(a, b)
-    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
-    torch.testing.assert_close(
-        out,
-        expected,
-        atol=tolerance * expected.abs().max().item(),
-        rtol=tolerance,
-    )
+    _assert_range_result(out, expected)
 
 
 @pytest.mark.parametrize(
@@ -124,6 +236,46 @@ def test_mm_wave_grid_pgr2_double_buffered_k64_tail(k, split_k):
         atol=1e-3 * expected.abs().max().item(),
         rtol=1e-3,
     )
+
+
+@pytest.mark.parametrize("dtype_name,b_transposed,m,n", [
+    ("bf16", False, 256, 256),
+    ("bf16", False, 257, 352),
+    ("bf16", True, 257, 352),
+    ("fp16", False, 257, 352),
+    ("fp16", True, 257, 352),
+])
+def test_mm_wave_grid_row_major_direct_to_lds(dtype_name, b_transposed, m, n):
+    dtype = torch.bfloat16 if dtype_name == "bf16" else torch.float16
+    k = 256
+    torch.manual_seed(23)
+    a = torch.randn((m, k), device="cuda", dtype=dtype)
+    b = torch.randn((n, k), device="cuda", dtype=dtype).T if b_transposed else torch.randn(
+        (k, n), device="cuda", dtype=dtype)
+    plan = _gfx950._wg_regular_wave_grid_plan(
+        8,
+        5 if b_transposed else 8,
+        2,
+        2,
+        64,
+        local_stages=2,
+        pgr2_operands=True,
+        direct_to_lds=True,
+        direct_chunk=32 if b_transposed else 128,
+        pack_direct_chunks=b_transposed,
+        row_major_b_lds=True,
+        row_wise_epilogue=True,
+        wide_epilogue=not b_transposed,
+        num_xcds=1,
+        workgroup_mapping=1,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+    )
+
+    out = _gfx950._wg_matmul(a, b, _candidate_plan=plan)
+    expected = torch.matmul(a, b)
+    _assert_range_result(out, expected)
 
 
 @pytest.mark.parametrize("k", [257, 294, 319])
@@ -225,6 +377,69 @@ def test_mm_tuned_rectangular_register_plans():
             plan["num_stages"],
             plan["matrix_instr_nonkdim"],
         ) == wanted
+
+
+@pytest.mark.parametrize("m,n,k", [(384, 384, 48), (319, 385, 63)])
+def test_mm_short_k_register_is_batch_invariant(m, n, k):
+    from triton.tlx.ops import mm as tlx_mm
+
+    torch.manual_seed(17)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
+
+    out = tlx_mm(a, b, space="heuristic")
+    sliced = tlx_mm(a[:256], b, space="heuristic")
+    expected = torch.matmul(a, b)
+    assert torch.equal(out[:256], sliced)
+    torch.testing.assert_close(
+        out,
+        expected,
+        atol=1e-2 * expected.abs().max().item(),
+        rtol=1e-2,
+    )
+
+
+def test_mm_caches_public_catalog_lookup(monkeypatch):
+    a = torch.empty((16, 16), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty_like(a)
+    out = torch.empty_like(a)
+    _, spec = tlx_ops.impl_for("mm", device=a.device)
+    calls = 0
+
+    def counting_impl_for(op, *, device):
+        nonlocal calls
+        calls += 1
+        assert op == "mm"
+        assert device == a.device
+        return (lambda _a, _b, *, out, space: out), spec
+
+    monkeypatch.setattr(tlx_ops, "impl_for", counting_impl_for)
+    tlx_ops._mm_impl_for_device.cache_clear()
+    try:
+        assert tlx_ops.mm(a, b, out=out) is out
+        assert tlx_ops.mm(a, b, out=out) is out
+        assert calls == 1
+    finally:
+        tlx_ops._mm_impl_for_device.cache_clear()
+
+
+def test_mm_reuses_out_tensor():
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+    out = torch.empty((128, 128), device="cuda", dtype=torch.float16)
+
+    actual = tlx_mm(a, b, out=out, space="heuristic")
+    expected = torch.matmul(a, b)
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=1e-3 * expected.abs().max().item(),
+        rtol=1e-3,
+    )
 
 
 def test_mm_row_major_uses_tuned_register_plan():
@@ -814,6 +1029,37 @@ def test_mm_accepts_full_space(monkeypatch):
 
     monkeypatch.setattr(_gfx950, "_launch_register", launch_register)
     assert tlx_mm(a, b, out=expected, space="full") is expected
+
+
+def test_mm_full_space_passes_complete_register_signature(monkeypatch):
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = torch.randn((16, 64), device="cuda", dtype=torch.float16)
+    b = torch.randn((64, 32), device="cuda", dtype=torch.float16)
+    out = torch.empty((16, 32), device="cuda", dtype=torch.float16)
+    captured = {}
+
+    class FakeTuner:
+
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+
+            def launch(*args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+            return launch
+
+    monkeypatch.setattr(_gfx950, "_register_kernel", FakeTuner())
+    assert tlx_mm(a, b, out=out, space="full") is out
+    args = captured["args"]
+    assert args[0] is a
+    assert args[1] is b
+    assert all(arg is out for arg in args[2:6])
+    assert args[6:9] == (16, 32, 64)
+    assert captured["kwargs"]["ADD_BIAS"] is False
+    assert captured["kwargs"]["WRITE_STATS"] is False
+    assert captured["kwargs"]["IS_RMS_NORM"] is False
 
 
 def test_mm_rejects_invalid_space():
