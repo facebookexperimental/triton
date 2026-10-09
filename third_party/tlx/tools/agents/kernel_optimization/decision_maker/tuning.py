@@ -272,15 +272,21 @@ def _parity_summary(
 
 def _recall_summary(performance: PerformanceSummary) -> dict[str, int | float]:
     matches = 0
+    unresolved = 0
     for evaluation in performance.cases:
         metrics = evaluation.verification.metrics
         heuristic = _config_signature(metrics.get("heuristic_config"))
+        # Empty: the harness cannot name the selected config (e.g. non-register paths), so it is not a miss.
+        if not heuristic:
+            unresolved += 1
+            continue
         full = _config_signature(metrics.get("full_best_config"))
-        matches += bool(heuristic and heuristic == full)
-    total = len(performance.cases)
+        matches += heuristic == full
+    total = len(performance.cases) - unresolved
     return {
         "matched_shapes": matches,
         "total_shapes": total,
+        "unresolved_shapes": unresolved,
         "rate": matches / total if total else 0.0,
     }
 

@@ -1070,12 +1070,23 @@ class ScoringTest(unittest.TestCase):
                     ),
                     timing=TimingSamples((1.0, )),
                 ),
+                CaseEvaluation(
+                    case_id="unresolved",
+                    verification=VerificationResult(
+                        True,
+                        metrics={
+                            "full_best_config": "kernel: BLOCK_M=128 GROUP_M=4",
+                            "heuristic_config": "",
+                        },
+                    ),
+                    timing=TimingSamples((1.0, )),
+                ),
             ),
         )
 
         self.assertEqual(
             _recall_summary(performance),
-            {"matched_shapes": 1, "total_shapes": 2, "rate": 0.5},
+            {"matched_shapes": 1, "total_shapes": 2, "unresolved_shapes": 1, "rate": 0.5},
         )
 
     def test_tuning_edits_only_the_heuristic(self) -> None:
@@ -1162,7 +1173,7 @@ class ScoringTest(unittest.TestCase):
             )
             self.assertEqual(
                 result["summary"]["recall_before"],
-                {"matched_shapes": 1, "total_shapes": 1, "rate": 1.0},
+                {"matched_shapes": 1, "total_shapes": 1, "unresolved_shapes": 0, "rate": 1.0},
             )
             self.assertEqual(result["summary"]["recall_after"], result["summary"]["recall_before"])
             self.assertEqual((root / "out/best_kernel.py").read_text(), candidate)
