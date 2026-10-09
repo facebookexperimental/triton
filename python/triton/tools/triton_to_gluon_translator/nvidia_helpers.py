@@ -504,7 +504,10 @@ def tl_cat(lhs, rhs, can_reorder=False):
             layout=default_blocked_layout([lhs.shape[0] + rhs.shape[0]], ttgl.num_warps()),
         )
     else:
-        return cat_with_permute(lhs, rhs)
+        # cat_with_permute yields a linear layout; convert back to the default
+        # blocked layout so consumers (e.g. store pointers built from tl_arange)
+        # see matching layouts, consistent with the can_reorder=True path.
+        return reset_to_default_layout(cat_with_permute(lhs, rhs))
 
 
 @gluon.jit
