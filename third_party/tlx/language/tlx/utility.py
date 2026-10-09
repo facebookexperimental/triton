@@ -30,6 +30,13 @@ def cluster_cta_rank(_semantic=None):
     """
     :return the unique CTA ID within a cluster across all dims
     """
+    if _semantic.builder.options.backend_name == "hip":
+        options = _semantic.builder.options
+        # 3.8 backport: AMD options have no ctas_per_cga, so use num_ctas.
+        cluster_size = (getattr(options, "ctas_per_cga", None) or (options.num_ctas, 1, 1))[0]
+        if cluster_size == 1:
+            return _semantic.to_tensor(0)
+        return tl.tensor(_semantic.builder.create_amd_cluster_cta_rank(), tl.int32)
     return tl.tensor(_semantic.builder.create_cluster_cta_rank(), tl.int32)
 
 

@@ -20,7 +20,16 @@ def _make_mbarrier_layout_handle(_semantic):
 
 @tl.builtin
 def cluster_barrier(_semantic=None):
-    _semantic.builder.create_cluster_barrier()
+    """Synchronize all threads in all CTAs of the cluster.
+
+    On AMD, synchronize each workgroup before signaling the cluster barrier.
+    All participating CTAs must execute the same sequence of barriers.
+    """
+    if _semantic.builder.options.backend_name == "hip":
+        _semantic.builder.create_workgroup_barrier()
+        _semantic.builder.create_amd_cluster_barrier()
+    else:
+        _semantic.builder.create_cluster_barrier()
 
 
 @tl.builtin
@@ -46,10 +55,8 @@ def workgroup_barrier(_semantic=None):
     Full-workgroup barrier with an LDS memory fence (AMD).
 
     Lowers to a local (shared-memory-fenced) `s_barrier` bracketed by scheduler
-    barriers so instructions cannot be hoisted across it. Unlike
-    `cluster_barrier` (NVIDIA cluster arrive/wait), this is the plain CDNA
-    workgroup rendezvous and is the barrier used at hand-rolled ping-pong cluster
-    borders (pairs with `cond_barrier` for the phase shift).
+    barriers so instructions cannot be hoisted across it. Synchronizes threads
+    within the current workgroup.
     """
     _semantic.builder.create_workgroup_barrier()
 
