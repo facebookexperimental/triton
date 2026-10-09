@@ -208,6 +208,16 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (bitwidth != 8) {
       return emitError() << "bitwidth must be 8";
     }
+    if (enc.getCtaMode() == nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS) {
+      auto layoutAllocShape = dropPipeliningDim(allocShape, enc);
+      auto shapePerCTA = getShapePerCTA(enc, layoutAllocShape);
+      if (shapePerCTA != ArrayRef<int64_t>({128, 4})) {
+        return emitError()
+               << "twocta_rhs tensor-memory scales require a per-CTA "
+                  "allocation shape of 128x4; got "
+               << shapePerCTA;
+      }
+    }
   } else if (isa<triton::tlx::DummyTMEMLayoutAttr>(encoding)) {
     // Dummy TMEM layout for deferred resolution - allow any shape for TMEM
     // The layout will be resolved to a concrete encoding during layout

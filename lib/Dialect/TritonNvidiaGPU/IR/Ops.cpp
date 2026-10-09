@@ -1649,8 +1649,25 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   }
   if (enc.getFp4Padded())
     return emitOpError("accumulator layout must not be fp4_padded");
-  if (enc.getBlockM() != 128)
-    return emitOpError("only supports instruction shape blockM=128");
+  bool isTwoCTAM64 = getTwoCtas() && enc.getBlockM() == 64 &&
+                     enc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS;
+  if (enc.getBlockM() != 128 && !isTwoCTAM64)
+    return emitOpError(
+        "only supports blockM=128 or two-CTA blockM=64 with TwoCTA_RHS");
+  if (isTwoCTAM64 && (getBlockK() != 128 || getBlockN() != 64)) {
+    return emitOpError(
+        "M64 two-CTA scaled MMA only supports K=128 and per-CTA N=64");
+  }
+  if (isTwoCTAM64 &&
+      isa<SharedMemorySpaceAttr>(getBScale().getType().getMemorySpace())) {
+    int numWarps = lookupNumWarps(getOperation());
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps)) {
+      return emitOpError()
+             << "scale lowering requires a power-of-two MMA partition with at "
+                "least 4 warps; got "
+             << numWarps;
+    }
+  }
   if (auto lhsEnc =
           dyn_cast<TensorMemoryEncodingAttr>(getA().getType().getEncoding())) {
     if (failed(verifyScaledLHSOperand(getOperation(),
@@ -1674,6 +1691,13 @@ LogicalResult TCGen5MMAScaledOp::verify() {
     bool isOrderRelevant = isScaleBlockRepOrderRelevant(scaleType);
     auto encoding =
         dyn_cast<TensorMemoryScalesEncodingAttr>(scaleType.getEncoding());
+    if (isTwoCTAM64 && !isA &&
+        (!encoding ||
+         encoding.getCtaMode() != TensorMemoryCTAMode::TwoCTA_RHS)) {
+      return emitOpError()
+             << "two-CTA blockM=64 B scales in tensor memory must use "
+                "#ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>";
+    }
     if (!encoding) {
       if (!isOrderRelevant)
         return success();
