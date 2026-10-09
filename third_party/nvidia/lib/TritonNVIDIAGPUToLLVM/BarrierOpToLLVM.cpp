@@ -26,14 +26,18 @@
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include "Utility.h"
+#include "WarpUniformity.h"
 #include <type_traits>
 
 using namespace mlir;
@@ -545,6 +549,14 @@ struct ArriveBarrierOpConversion
   }
 };
 
+// Selects the `.aligned` form only when the barrier provably executes
+// warp-uniformly with warp-uniform operands.
+bool canUseAlignedBarrier(Operation *op, Value barId, Value numThreads) {
+  return NVIDIA::isWarpUniformValue(barId) &&
+         NVIDIA::isWarpUniformValue(numThreads) &&
+         NVIDIA::hasUniformExecution(op);
+}
+
 struct NamedBarrierArriveOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::NamedBarrierArriveOp> {
   using ConvertOpToLLVMPattern<
@@ -555,11 +567,18 @@ struct NamedBarrierArriveOpConversion
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    // Use the NVVM intrinsic which has IntrConvergent, preventing LLVM from
-    // duplicating this barrier across control flow (e.g., jump threading).
+    // Use the NVVM intrinsics, which have IntrConvergent, preventing LLVM
+    // from duplicating this barrier across control flow (e.g., jump
+    // threading). The `.aligned` form additionally requires warp-level
+    // alignment, so it is selected only when the barrier provably executes
+    // warp-uniformly; otherwise fall back to the non-aligned form.
+    const char *intrinsic =
+        canUseAlignedBarrier(op, op.getBar(), op.getNumThreads())
+            ? "llvm.nvvm.barrier.cta.arrive.aligned.count"
+            : "llvm.nvvm.barrier.cta.arrive.count";
     LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, "llvm.nvvm.barrier.cta.arrive.aligned.count",
-        TypeRange{}, {adaptor.getBar(), adaptor.getNumThreads()});
+        rewriter, loc, intrinsic, TypeRange{},
+        {adaptor.getBar(), adaptor.getNumThreads()});
     rewriter.eraseOp(op);
     return success();
   }
@@ -586,10 +605,17 @@ struct NamedBarrierWaitOpConversion
   matchAndRewrite(triton::nvidia_gpu::NamedBarrierWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    // Use the NVVM intrinsic which has IntrConvergent, preventing LLVM from
-    // duplicating this barrier across control flow (e.g., jump threading).
+    // Use the NVVM intrinsics, which have IntrConvergent, preventing LLVM
+    // from duplicating this barrier across control flow (e.g., jump
+    // threading). The `.aligned` form additionally requires warp-level
+    // alignment, so it is selected only when the barrier provably executes
+    // warp-uniformly; otherwise fall back to the non-aligned form.
+    const char *intrinsic =
+        canUseAlignedBarrier(op, op.getBar(), op.getNumThreads())
+            ? "llvm.nvvm.barrier.cta.sync.aligned.count"
+            : "llvm.nvvm.barrier.cta.sync.count";
     LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, "llvm.nvvm.barrier.cta.sync.aligned.count", TypeRange{},
+        rewriter, loc, intrinsic, TypeRange{},
         {adaptor.getBar(), adaptor.getNumThreads()});
     rewriter.eraseOp(op);
     return success();
