@@ -531,3 +531,36 @@ def test_amd_cond_barrier(device):
     # The paired bracket lowers to two amdg.cond_barrier ops.
     ttgir = compiled.asm["ttgir"]
     assert ttgir.count("amdg.cond_barrier") == 2, f"TTGIR {ttgir}"
+
+
+@triton.jit
+def _amd_cluster_ids(output):
+    pid = tl.program_id(0)
+    rank = tlx.cluster_cta_rank()
+    tlx.cluster_barrier()
+    tl.store(output + pid, pid * 16 + rank)
+
+
+# 3.8 backport of Beta's test_amd_cluster_barrier_compiles: 3.8 has no AMD
+# ctas_per_cga support, so clusters are requested via num_ctas instead.
+@pytest.mark.parametrize("arch,num_ctas", [
+    ("gfx1250", 1),
+    ("gfx1250", 2),
+    ("gfx1250", 4),
+    ("gfx950", 1),
+])
+def test_amd_cluster_barrier_compiles(arch, num_ctas):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    options = dict(num_warps=4, num_ctas=num_ctas)
+    source = ASTSource(_amd_cluster_ids, signature={"output": "*i32"})
+    compiled = triton.compile(source, target=GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64), options=options)
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.barrier local" in ttgir
+    assert "amdg.cluster_barrier_arrive" in ttgir
+    assert "amdg.cluster_barrier_wait" in ttgir
+    assert "s_barrier" in compiled.asm["amdgcn"]
+    multi_cta = num_ctas > 1
+    assert ("s_barrier_signal -3" in compiled.asm["amdgcn"]) == multi_cta
+    assert ("s_barrier_wait -3" in compiled.asm["amdgcn"]) == multi_cta

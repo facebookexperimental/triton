@@ -669,6 +669,16 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
              self.create<triton::nvidia_gpu::ClusterWaitOp>();
            })
+      .def("create_amd_cluster_barrier",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::ClusterBarrierArriveOp>();
+             self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
+      .def("create_amd_cluster_cta_rank",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<ROCDL::ClusterWorkgroupIdXOp>(
+                 self.getBuilder().getI32Type());
+           })
       .def("create_fence_mbarrier_init_cluster",
            [](TritonOpBuilder &self) -> void {
              self.create<ttng::FenceMBarrierInitReleaseClusterOp>();
