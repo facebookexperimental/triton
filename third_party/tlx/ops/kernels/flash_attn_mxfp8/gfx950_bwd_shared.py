@@ -318,17 +318,32 @@ def _load_metadata(memory):
 
 @triton.jit
 def _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start, N, BM: tl.constexpr,
-                D: tl.constexpr, EVEN_N: tl.constexpr, SLOT: tl.constexpr):
+                D: tl.constexpr, EVEN_N: tl.constexpr, SLOT: tl.constexpr,
+                COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
     tl.static_assert(SLOT == 0 or SLOT == 1)
     copy_layout: tl.constexpr = tlx.layout(shape=((64, 2), (1, )), stride=((1, 0), (0, )))
     offsets = tlx.require_layout((start + tl.arange(0, 64)).to(tl.int32), copy_layout, pin=True)
     metadata_base = head.to(tl.int64) * N
     tlx.buffer_load_to_local(lsemem[SLOT], LSE + metadata_base, offsets)
-    tlx.buffer_load_to_local(deltamem[SLOT], Delta + metadata_base, offsets)
+    if COMMON_PREP:
+        tl.static_assert(PREP_N == 1024 or PREP_N == 2048)
+        tl.static_assert(BM == 64 and D == 128)
+        prep_offsets: tl.constexpr = _preparation_arena_layout(PREP_N)
+        delta_offsets = tlx.require_layout(
+            (prep_offsets[5] // 4 + head.to(tl.int32) * PREP_N + start + tl.arange(0, 64)).to(tl.int32),
+            copy_layout, pin=True)
+        tlx.buffer_load_to_local(deltamem[SLOT], Delta.to(tl.pointer_type(tl.float32)), delta_offsets)
+    else:
+        tlx.buffer_load_to_local(deltamem[SLOT], Delta + metadata_base, offsets)
     rows = start + tl.arange(0, BM)
     offsets = rows[:, None] * D + tl.arange(0, D)[None, :]
     tlx.buffer_load_to_local(qmem[SLOT], Q + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
-    tlx.buffer_load_to_local(domem[SLOT], DO + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
+    if COMMON_PREP:
+        do_offsets = (prep_offsets[1] + base.to(tl.int32) + offsets).to(tl.int32)
+        tlx.buffer_load_to_local(domem[SLOT], DO.to(tl.pointer_type(tl.float8e4nv)), do_offsets,
+                                  EVEN_N | (rows[:, None] < N), 0.0)
+    else:
+        tlx.buffer_load_to_local(domem[SLOT], DO + base, offsets, EVEN_N | (rows[:, None] < N), 0.0)
     tlx.async_load_commit_group()
 
 
@@ -394,12 +409,20 @@ def _quantize_ds_square(ds, BN: tl.constexpr, BM: tl.constexpr):
 
 
 @triton.jit
-def _load_rhs_words(S, head, start, N):
+def _load_rhs_words(S, head, start, N, COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
     # Both query-square words are logically register-local in every thread.
     word_layout: tl.constexpr = tlx.layout(shape=((64, 2), (2, )), stride=((0, 0), (1, )))
     groups = tlx.require_layout(tl.arange(0, 2), word_layout, pin=True)
-    word_base = (S + head.to(tl.int64) * N * 4).to(tl.pointer_type(tl.uint32))
-    offsets = tlx.require_layout((start + groups * 32).to(tl.int32), word_layout, pin=True)
+    if COMMON_PREP:
+        tl.static_assert(PREP_N == 1024 or PREP_N == 2048)
+        prep_offsets: tl.constexpr = _preparation_arena_layout(PREP_N)
+        word_base = S.to(tl.pointer_type(tl.uint32))
+        offsets = tlx.require_layout(
+            (prep_offsets[3] // 4 + head.to(tl.int32) * PREP_N + start + groups * 32).to(tl.int32),
+            word_layout, pin=True)
+    else:
+        word_base = (S + head.to(tl.int64) * N * 4).to(tl.pointer_type(tl.uint32))
+        offsets = tlx.require_layout((start + groups * 32).to(tl.int32), word_layout, pin=True)
     words = tlx.buffer_load(word_base, offsets, contiguity=1)
     words = tlx.require_layout(words, word_layout, pin=False)
     return words
@@ -766,7 +789,8 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr, PEEL: tl.constexpr, NATIVE: tl.constexpr,
                   RELAXED: tl.constexpr, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head,
                   base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr,
-                  PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False):
+                  PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
+                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
     export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
@@ -774,12 +798,12 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     phase: tl.constexpr = 0
     queries = start + tl.arange(0, BM)
     q_words = _load_rhs_words(QS, head, start, N)
-    do_words = _load_rhs_words(DOS, head, start, N)
+    do_words = _load_rhs_words(DOS, head, start, N, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
     tlx.async_load_wait_group(0)
     tlx.workgroup_barrier()
     if PREFETCH:
         _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start + BM, N, BM, D, EVEN_N,
-                    1 - SLOT)
+                    1 - SLOT, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
     q = _load_rhs_kv64(qmem[SLOT], True, NATIVE, RELAXED)
     if not DELAY_DO_HEAD:
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
@@ -858,11 +882,15 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr = False, PEEL: tl.constexpr = False,
                   NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False, XCD_KEY_TILES: tl.constexpr = 0,
-                  PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False):
+                  PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
+                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     tl.static_assert(not SEQ_K_CONTIG, 'Shared-LDS specialization requires ordinary contiguous payloads')
     tl.static_assert(D == 128 and BM == 64 and (BN == 64) and NATIVE and (not RELAXED) and (not PEEL))
     tl.static_assert(EVEN_N, 'Unmasked DS export requires complete 128-row tiles')
+    if COMMON_PREP:
+        tl.static_assert(CAUSAL and (PREP_N == 1024 or PREP_N == 2048))
+        tl.static_assert(N == PREP_N)
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
     if XCD_KEY_TILES:
@@ -905,61 +933,72 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     begin = 0
     if CAUSAL:
         begin = key_tile * BN // 128 * 128
-    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, N, BM, D, EVEN_N, 0)
+    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, N, BM, D, EVEN_N, 0,
+                COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
     if CAUSAL:
         # The first physical128 block is always masked. Only its second
         # tile needs a runtime prefetch decision for the final-only CTA.
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin, 0,
-                               True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD)
+                               True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin + 64,
                                1, begin < N - 128, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                               DELAY_DO_HEAD=DELAY_DO_HEAD)
+                               DELAY_DO_HEAD=DELAY_DO_HEAD,
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
         for pair_start in range(begin + 128, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
+                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
+                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
         if begin < N - 128:
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    N - 128, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
+                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    N - 64, 1, False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
+                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
     else:
         for pair_start in range(begin, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
+                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
+                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 128, 0,
-                               True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD)
+                               True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 64, 1,
-                               False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD)
+                               False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
     out = base + keys[:, None] * D + d[None, :]
     tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
     tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
@@ -1099,12 +1138,17 @@ def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: 
     else:
         sequence_length = N
     vb, do8, vs, dos, _, delta = _preparation_arena_segments(Arena, ARENA_N)
+    common_prep: tl.constexpr = QK_FORMAT and CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048)
+    if common_prep:
+        # The read offsets select the original regions from one Arena base.
+        do8, dos, delta = Arena, Arena, Arena
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, sequence_length, sm_scale, DS, DSS, D, BM, BN,
                   CAUSAL,
                   SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
                   PACK_P_EARLY=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
-                  DELAY_DO_HEAD=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048))
+                  DELAY_DO_HEAD=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
+                  COMMON_PREP=common_prep, PREP_N=ARENA_N)
 
 
 @triton.jit
