@@ -513,10 +513,13 @@ def _decode_rhs_late(words, WARPS_N: tl.constexpr = 1):
 
 
 @triton.jit
-def _store_ds_scale_packed(S, value, head, key_start, start, N):
+def _store_ds_scale_packed(S, value, head, key_start, start, N, WARPS_N: tl.constexpr = 1):
     # Same four distinct byte writers as the baseline: native row0/32,
     # column0/1. Pack Q128 x K64 metadata into one aligned 8-byte record.
-    layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (1, 1)), stride=((2, 1, 64), (2, 128)))
+    if WARPS_N == 2:
+        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (1, 1)), stride=((2, 1, 0, 64), (2, 128)))
+    else:
+        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (1, 1)), stride=((2, 1, 64), (2, 128)))
     linear = tlx.require_layout(tl.arange(0, 128).reshape(64, 2), layout, pin=True)
     row = linear // 2
     col = linear % 2
@@ -909,7 +912,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     # Workspace ABI follows the original kernel mask mode, not this tile's
     # peeled fine-mask flag (which is False in causal bulk/drain calls).
     if PACK_DSS:
-        _store_ds_scale_packed(DSS_EXPORT, dsk, head, key_tile * BN, start, N)
+        _store_ds_scale_packed(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
     else:
         _store_ds_scale_native(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
     return (dk, dv)
@@ -1186,7 +1189,8 @@ def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: 
                   CAUSAL, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
                   PACK_P_EARLY=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
                   DELAY_DO_HEAD=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
-                  COMMON_PREP=common_prep, PREP_N=ARENA_N, LSE_SPLIT=LSE_SPLIT)
+                  COMMON_PREP=common_prep, PREP_N=ARENA_N, LSE_SPLIT=LSE_SPLIT,
+                  WARPS_N=(2 if QK_FORMAT and CAUSAL and ARENA_N == 1024 and LSE_SPLIT else 1))
 
 
 @triton.jit
@@ -1226,6 +1230,13 @@ def _arena_launch_controls():
             or os.environ.get("TRITON_COMPILE_IQ_APPLY") or os.environ.get("TRITON_COMPILE_IQ_COLLECT")):
         return False
     return True
+
+
+def _can_overlap_gradient_allocation():
+    # Preserve allocation interception by keeping its original launch order.
+    return (torch.empty is torch._C._VariableFunctions.empty
+            and not torch._C._is_torch_function_mode_enabled() and not torch._C._len_torch_dispatch_stack()
+            and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch))
 
 
 def _arena_launch_plan(device, n, causal, sm_scale, qk_format=False, lse_split=False):
@@ -1542,6 +1553,23 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
     if n not in _PREPARATION_ARENA_BYTES:
         ds = torch.empty((4, 32, n, n), dtype=torch.float8_e4m3fn, device=device)
         dss = torch.empty((4, 32, n // 32, n // 32), dtype=torch.uint8, device=device)
+    if (qk_format and lse_split and sm_scale == 0.5 and n == 1024 and not causal
+            and all(type(tensor) is torch.Tensor for tensor in (q_fp8, v_bf16, do_bf16, out_bf16, lse))
+            and _can_overlap_gradient_allocation()):
+        plan = _partial_arena_launch_plan(device, n, sm_scale, lse_split)
+        if plan is not None:
+            prepare, kv, query = plan
+            stream = driver.active.get_current_stream(device.index)
+            # Preparation uses admitted inputs and the fresh workspace.
+            prepare(do_bf16, out_bf16, arena, n, 128, 32, stream=stream)
+            # Allocate each gradient before its first writer.
+            dq = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            kv(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, lse_split, stream=stream)
+            query(q_fp8, arena, dq, n, sm_scale, n, 128, 128, 64, False, 128, True, stream=stream)
+            return dq, dk, dv
+
     dq = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dk = torch.empty(shape, dtype=torch.bfloat16, device=device)
     dv = torch.empty(shape, dtype=torch.bfloat16, device=device)
@@ -1622,7 +1650,8 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
                                                warmup=False)
             kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
                                          D=128, BM=64, BN=64, CAUSAL=causal, QK_FORMAT=qk_format, LSE_SPLIT=lse_split,
-                                         num_warps=2, enable_fp_fusion=not lse_split, num_stages=1,
+                                         num_warps=(4 if qk_format and causal and n == 1024 and lse_split else 2),
+                                         enable_fp_fusion=not lse_split, num_stages=1,
                                          matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
             query = _bwd_q_consume_arena.run(saved_k, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
                                              CAUSAL=causal, HEADS=128, QK_FORMAT=qk_format, num_warps=4, num_stages=1,
