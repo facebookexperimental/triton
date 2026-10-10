@@ -1,14 +1,16 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 """K/V projections (M=B*kv_len, N=K=80) feeding learned-query attention.
 
-Baseline: stock Inductor (two skinny mm kernels materialize bf16 K and V, stock flex
-template reads them). Candidate: the same model with torchTLX on, the slot for an sm90
-TLX flex template that projects K/V tiles in its prologue from the 80x80 weights in SMEM.
+Baseline: SDPA with torchTLX off. Candidate: flex attention with torchTLX allowed
+to project K/V tiles in its prologue from the weights.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
+
+from torchtlx_benchmark.run_torchtlx_fusions import attention
 
 if TYPE_CHECKING:
     import torch
@@ -62,11 +64,13 @@ def _project(q, x, wk, wv):
     return q.expand(x.shape[0], -1, -1).unsqueeze(1), k, v
 
 
-def model(q, x, wk, wv) -> torch.Tensor:
-    from torch.nn.attention.flex_attention import flex_attention
-
+def model(q, x, wk, wv, *, use_flex=False) -> torch.Tensor:
     q, k, v = _project(q, x, wk, wv)
-    return flex_attention(q.contiguous(), k, v)
+    return attention(q.contiguous(), k, v, use_flex=use_flex)
+
+
+def comparison_models():
+    return model, partial(model, use_flex=True)
 
 
 def make_inputs() -> tuple[torch.Tensor, ...]:
