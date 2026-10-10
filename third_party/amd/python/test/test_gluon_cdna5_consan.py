@@ -10,7 +10,7 @@ import os
 
 from triton._internal_testing import is_hip_gfx1250
 
-pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires CDNA5")
 
 
 def _run_consan_subprocess(test_name, *args, timeout=120):
@@ -19,7 +19,7 @@ def _run_consan_subprocess(test_name, *args, timeout=120):
     The subprocess pipe captures all stderr output including messages
     flushed during process exit.
     """
-    helper_script = os.path.join(os.path.dirname(__file__), "gfx1250_consan_helper.py")
+    helper_script = os.path.join(os.path.dirname(__file__), "cdna5_consan_helper.py")
     proc = subprocess.Popen(
         [sys.executable, helper_script, test_name] + [str(a) for a in args],
         stdout=subprocess.PIPE,

@@ -258,7 +258,7 @@ jobs:
             [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
           fi
           echo "b200 collects:" "${FILES[@]}"
-          python -m pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
+          PYTHONPATH="${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest "${FILES[@]}" --import-mode=importlib -v --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
@@ -286,7 +286,7 @@ jobs:
             echo "kernel-only PR: codegen tests do not touch the changed kernel(s); skipping"
             exit 0
           fi
-          python -m pytest python/test/unit/language/test_tlx_codegen.py -v --junitxml=/tmp/tlx-codegen.xml
+          python -m pytest python/test/unit/language/test_tlx_codegen.py --import-mode=importlib -v --junitxml=/tmp/tlx-codegen.xml
       - name: Run host-default TLX L2 perf
         id: run_perf_tests
         if: always() && github.event_name == 'schedule'
@@ -484,7 +484,7 @@ jobs:
             echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
             exit 0
           fi
-          python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
+          python -m pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
         if: always() && github.event_name == 'schedule'

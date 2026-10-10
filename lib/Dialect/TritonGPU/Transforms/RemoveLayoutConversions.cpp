@@ -361,9 +361,8 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       if (isa<mlir::triton::ReduceOp>(op)) {
         auto tensorType =
             dyn_cast<RankedTensorType>(op->getOperand(0).getType());
-        if (tensorType && isa<NvidiaMmaEncodingAttr>(
-                              getEffectiveLayoutEncoding(
-                                  tensorType.getEncoding()))) {
+        if (tensorType && isa<NvidiaMmaEncodingAttr>(getEffectiveLayoutEncoding(
+                              tensorType.getEncoding()))) {
           auto mmaInstrShape =
               cast<NvidiaMmaEncodingAttr>(encoding).getInstrShape();
           if (tensorType.getShape()[tensorType.getRank() - 2] <
@@ -376,8 +375,8 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       }
 
       if (auto convertOp = dyn_cast<ConvertLayoutOp>(op)) {
-        Attribute dstEncoding = getEffectiveLayoutEncoding(
-            convertOp.getType().getEncoding());
+        Attribute dstEncoding =
+            getEffectiveLayoutEncoding(convertOp.getType().getEncoding());
         if (auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(dstEncoding))
           return (mmaLayout.getVersionMajor() > 1) ? true
                                                    : mmaLayout == encoding;
@@ -583,8 +582,8 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
       return;
     bool hasChanged = false;
     for (Attribute encoding : info.encodings)
-      hasChanged |= layouts[target].insertEncoding(
-          getEffectiveLayoutEncoding(encoding));
+      hasChanged |=
+          layouts[target].insertEncoding(getEffectiveLayoutEncoding(encoding));
     if (hasChanged)
       changed.push_back(target);
   };
@@ -798,8 +797,8 @@ getAtomicContiguousWidth(Value value, Attribute encoding,
   if (!ptrTy || !ptrAxisInfo)
     return 0;
 
-  ptrTy = ptrTy.cloneWithEncoding(
-      getEffectiveLayoutEncoding(ptrTy.getEncoding()));
+  ptrTy =
+      ptrTy.cloneWithEncoding(getEffectiveLayoutEncoding(ptrTy.getEncoding()));
   auto candidateTy = ptrTy.cloneWithEncoding(encoding);
   auto order = getOrder(candidateTy);
   auto contigPerThread = getContigPerThread(candidateTy);
@@ -955,9 +954,8 @@ projectToPredicateEncoding(RankedTensorType valueType,
   if (!isa<DistributedEncodingTrait>(encoding))
     return failure();
   for (int rank = valueType.getRank(); rank > predicateType.getRank(); --rank)
-    encoding = SliceEncodingAttr::get(
-        valueType.getContext(), rank - 1,
-        cast<DistributedEncodingTrait>(encoding));
+    encoding = SliceEncodingAttr::get(valueType.getContext(), rank - 1,
+                                      cast<DistributedEncodingTrait>(encoding));
   return encoding;
 }
 
@@ -1626,8 +1624,8 @@ void LayoutPropagation::resolveConflicts() {
     }
     if (info.encodings.size() <= 1)
       continue;
-    if ((op && (isa<RequireLayoutOp>(op) ||
-                op->hasAttr("tlx.preserve_layout"))) ||
+    if ((op &&
+         (isa<RequireLayoutOp>(op) || op->hasAttr("tlx.preserve_layout"))) ||
         containsPinnedEncoding(originalType.getEncoding())) {
       // An explicit requirement is an invariant, not merely another
       // profitable anchor. Legacy pinned wrappers follow the same rule until

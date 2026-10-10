@@ -1556,9 +1556,14 @@ def test_amd_gemm_v9_beyond_hotloop_is_deterministic():
     b = torch.randn((N, K), device=DEVICE, dtype=torch.float16).T
     reference = torch.matmul(a, b)
 
-    for _ in range(5):
+    baseline = _amd_gemm_v9_beyond_hotloop(a, b)
+    for _ in range(4):
         actual = _amd_gemm_v9_beyond_hotloop(a, b)
-        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+        torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+
+    # FP32 reduction order can change the final fp16 rounding relative to torch.
+    # Keep run-to-run equality exact while checking numerical accuracy separately.
+    torch.testing.assert_close(baseline, reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=["fp16"])

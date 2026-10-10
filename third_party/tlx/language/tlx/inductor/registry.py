@@ -3516,7 +3516,7 @@ _orig_compute_fusion_metadata = getattr(
 
 
 def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
-    self, scheduling, epilogue_nodes, prologue_nodes, buf_name_to_prologue_group
+    self, scheduling, epilogue_nodes, *args, **kwargs
 ):
     split_k = getattr(self, "_tlx_split_k", 1)
     if split_k > 1 and epilogue_nodes:
@@ -3528,11 +3528,7 @@ def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
         self._scheduling_ref = scheduling
     elif _orig_compute_fusion_metadata is not None:
         _orig_compute_fusion_metadata(
-            self,
-            scheduling,
-            epilogue_nodes,
-            prologue_nodes,
-            buf_name_to_prologue_group,
+            self, scheduling, epilogue_nodes, *args, **kwargs
         )
 
 
