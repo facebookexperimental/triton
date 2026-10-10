@@ -556,7 +556,8 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
     keys = key_tile * BN + tl.arange(0, BN)
     base = head * sequence_length * D
     v, vs = _inline_prepare_v64(V, base, keys, D)
-    if ARENA_N == 2048:
+    immutable_kv: tl.constexpr = ARENA_N == 1024 or ARENA_N == 2048
+    if immutable_kv:
         # Publish immutable K/V once before the query reduction.
         kv_layout: tl.constexpr = _stage_layout(D)
         k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
@@ -587,22 +588,22 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                                qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                pair_start, 0, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
+                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                                qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                pair_start + 64, 1, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
+                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                            sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                            qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                            sequence_length - 128, 0, True,
-                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
+                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                            sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                            qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                            sequence_length - 64, 1, False,
-                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
+                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
     tl.store(DV + offsets, dv)
