@@ -317,9 +317,26 @@ bool DotScaledOp::verifyDims() {
     if (this->getLhsKPack())
       aKdim *= 2;
   }
+  if (this->getAElemType() == ScaleDotElemType::E2M3 ||
+      this->getAElemType() == ScaleDotElemType::E3M2) {
+    // fp6 K-packs 4 values per 3 bytes and pads the K dim to the unpacked
+    // width; the trailing quarter is ignored padding. aKdim is already the
+    // unpacked width.
+    if (this->getLhsKPack()) {
+      if (aKdim % 4 != 0)
+        return false;
+    }
+  }
   if (this->getBElemType() == ScaleDotElemType::E2M1) {
     if (this->getRhsKPack())
       bKdim *= 2;
+  }
+  if (this->getBElemType() == ScaleDotElemType::E2M3 ||
+      this->getBElemType() == ScaleDotElemType::E3M2) {
+    if (this->getRhsKPack()) {
+      if (bKdim % 4 != 0)
+        return false;
+    }
   }
 
   return aKdim == bKdim;
@@ -356,6 +373,16 @@ LogicalResult DotScaledOp::verify() {
   if (this->getAElemType() == ScaleDotElemType::E2M1) {
     if (this->getLhsKPack())
       k *= 2;
+  }
+  if (this->getAElemType() == ScaleDotElemType::E2M3 ||
+      this->getAElemType() == ScaleDotElemType::E3M2) {
+    // fp6 K-packs 4 values per 3 bytes and pads the K dim to the unpacked
+    // width; k is already unpacked.
+    if (this->getLhsKPack()) {
+      if (k % 4 != 0)
+        return this->emitError("padded K dim must be a multiple of 4 for fp6 "
+                               "(4 values per 3 bytes plus padding)");
+    }
   }
   auto cShape = this->getC().getType().getShape();
   int64_t mDim = cShape[cShape.size() - 2];
@@ -404,10 +431,24 @@ LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
     if (llvm::product_of(*scaleShape) == 1)
       return 0;
 
-    int64_t unpackFactor = (format == ScaleDotElemType::E2M1 && kPack) ? 2 : 1;
     int64_t kdim = operandShape[opIdx == 0 ? operandShape.size() - 1
-                                           : operandShape.size() - 2] *
-                   unpackFactor;
+                                          : operandShape.size() - 2];
+    if (format == ScaleDotElemType::E2M1 && kPack) {
+      kdim *= 2;
+    } else if ((format == ScaleDotElemType::E2M3 ||
+                format == ScaleDotElemType::E3M2) &&
+               kPack) {
+      // fp6 K-packs 4 values per 3 bytes and pads the K dim to the unpacked
+      // width; kdim is already unpacked.
+      if (kdim % 4 != 0) {
+        std::ostringstream oss;
+        oss << "padded K dim " << kdim
+            << " must be a multiple of 4 for fp6 (4 values per 3 bytes plus "
+               "padding)";
+        errMsg = oss.str();
+        return 0;
+      }
+    }
     int32_t scaleFactor = kdim / (*scaleShape)[scaleShape->size() - 1];
     if (scaleFactor != 16 && scaleFactor != 32) {
       std::ostringstream oss;
