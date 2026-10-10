@@ -1,4 +1,4 @@
-// RUN: triton-opt --split-input-file %s --verify-diagnostics
+// RUN: triton-opt --split-input-file %s --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics
 
 // Reject truncated tile vectors before querying native MFMA ownership.
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1, 1], instrShape = [16, 16, 32], isTransposed = true, tilesPerWarp = [1, 1]}>
@@ -1721,6 +1721,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // expected-error @+1 {{scale and output must both have an encoding, or neither}}
     %u = amdg.scaled_upcast_fp4 %x scale %s {axis = 1 : i32} : tensor<16x32xi8>, tensor<16x64xi8, #enc> -> tensor<16x64xbf16>
     tt.return
+  }
+}
+
+// -----
+
+// A compiler-owned operand pin cannot hide an instruction behind its marker.
+module {
+  llvm.func @scheduled_operand_pin_nonempty_asm(%x: vector<4xi32>) -> vector<4xi32> {
+    // expected-error @+1 {{expected a pure empty tied register-class pin marked with a unit attribute}}
+    %pin = llvm.inline_asm {ttg.amdg.scheduled_mfma_operand_pin} "v_mov_b32 $0, $1", "=v,0" %x : (vector<4xi32>) -> vector<4xi32>
+    llvm.return %pin : vector<4xi32>
+  }
+}
+
+// -----
+
+// Native operand pins represent complete packed register fragments.
+module {
+  llvm.func @scheduled_operand_pin_scalar_type(%x: i32) -> i32 {
+    // expected-error @+1 {{expected matching fixed vector<i32> operand and result types for a scheduled MFMA operand pin}}
+    %pin = llvm.inline_asm {ttg.amdg.scheduled_mfma_operand_pin} "", "=a,0" %x : (i32) -> i32
+    llvm.return %pin : i32
   }
 }
 

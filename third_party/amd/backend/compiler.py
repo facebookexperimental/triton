@@ -14,8 +14,6 @@ import functools
 import warnings
 from pathlib import Path
 
-from .amdgc_hazard_repair import insert_scheduled_mfma_hazard_nops
-
 MAX_INT_32 = 2**31 - 1
 
 
@@ -765,6 +763,8 @@ class HIPBackend(BaseBackend):
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.convert.add_reconcile_unrealized_casts(pm)
+        # Share operand pins through CSE, then retain their ordering in LLVM.
+        amd.passes.ttgpuir.add_finalize_scheduled_mfma_operands(pm)
         try:
             pm.run(mod, "make_llir")
         finally:
@@ -962,7 +962,6 @@ class HIPBackend(BaseBackend):
                 dump_ir=knobs.getenv_bool("LLVM_IR_ENABLE_DUMP", False),
                 enable_timing=knobs.getenv_bool("LLVM_ENABLE_TIMING", False),
             )
-        amdgcn = insert_scheduled_mfma_hazard_nops(amdgcn, options.arch)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)

@@ -44,6 +44,22 @@ def ConvertTritonAMDGPUToLLVM
   ];
 }
 
+def FinalizeScheduledMfmaOperands
+    : Pass<"triton-amdgpu-finalize-scheduled-mfma-operands", "mlir::ModuleOp"> {
+  let summary = "Finalize ordering of scheduled MFMA operand register pins";
+  let constructor = "mlir::triton::createFinalizeScheduledMfmaOperandsPass()";
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+  let description = [{
+    Keep compiler-generated persistent MFMA operand pins pure through MLIR
+    canonicalization and CSE, then make the surviving pins side-effecting before
+    LLVM translation. This retains shared operands and their register-class
+    constraints, and orders the surviving pins at their post-CSE positions
+    before LLVM scheduling.
+    Only tagged operand pins are changed. Removing the marker makes subsequent
+    runs a no-op; result pins and commit finalization remain unchanged.
+  }];
+}
+
 def ConvertBuiltinFuncToLLVM
     : Pass<"convert-builtin-func-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert Builtin Func to LLVM";

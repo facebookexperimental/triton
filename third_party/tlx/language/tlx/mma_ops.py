@@ -141,53 +141,67 @@ def amd_scheduled_mfma(
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
-    """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
+    """Update native CDNA3/CDNA4 MFMA fragments with explicit lifetime contracts.
 
     Unlike ``tl.dot``, which represents one logical matrix product and carries
     no accumulator-lifetime or register-class contract, this operation exposes
     independent native fragment chains in source order.
 
-    With ``initialize=False``, the operation computes ``acc + a @ b`` over
-    the supplied output tile. It keeps one SSA chain per native output fragment and
-    creates updates in K-major, N-major, M-minor order. LLVM may reschedule
-    independent updates on the transient intrinsic path. With
-    ``initialize=True``, the first native K update of every output fragment
-    starts from zero, ignoring the supplied accumulator values.
+    With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
+    The operation keeps one SSA chain per output fragment and creates updates
+    in K-major, N-major, M-minor order. LLVM determines the final instruction
+    schedule. With ``initialize=True``, the first native K update starts from
+    zero and the result is ``a @ b``; the supplied accumulator value is ignored.
 
     To interleave work between output subtiles, slice the corresponding input
     panels and use separate accumulator tensors and calls. Commit those chains
     before joining the subtiles for a consumer of the full output tile.
 
     ``accumulator_role`` changes lowering, not the numerical operation.
-    ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
-    intrinsics. ``"persistent"`` describes a chain carried across phases and
-    uses register-constrained inline assembly. Because LLVM cannot model an
-    MFMA hidden in inline assembly, that path adds target-specific input and
-    result wait padding. On the persistent path,
-    ``resident_operand=0`` or ``1`` selects the left or right input for AGPR
-    placement, and ``accumulator_register_class`` may select ``"agpr"`` or
-    ``"vgpr"``. Persistent ``auto`` selects AGPRs. The transient intrinsic path
-    does not apply these class constraints and leaves physical placement to
-    LLVM; use :func:`amd_register_resident` for a hard source residency point.
+    ``"transient"`` describes a phase-local chain; ``"persistent"`` describes a
+    chain carried across phases. Both roles use native ROCDL MFMA intrinsics,
+    exposing arithmetic latency and hazards to LLVM.
 
-    On gfx950, the compiler recognizes eligible persistent AGPR or VGPR
-    accumulator chains ending at a matching ``amd_mfma_commit`` boundary.
-    After scheduling and physical register assignment, it repairs source,
-    accumulator, and EXEC hazards and inserts any required waits before
-    physical-register reads or overwrites of outstanding results. Unproven
-    persistent chains and those on other supported targets retain conservative
-    waits.
+    Persistent chains use inline assembly to constrain operand register
+    classes. ``resident_operand=0`` or ``1`` selects the left or right input
+    for AGPR placement; other inputs use VGPRs. ``accumulator_register_class``
+    may select ``"agpr"`` or ``"vgpr"``, and persistent ``auto`` selects AGPRs.
+    Persistent accumulator tuples are pinned after all K updates; nonconstant
+    input accumulators are also pinned before the updates when ``initialize``
+    is false. These side-effecting accumulator pins constrain compiler-side
+    ordering. Kernel chains with only native consumers and no calls retain
+    empty pins that provide no hardware wait. If a persistent result reaches
+    opaque inline assembly or an unmodeled escape, including through potentially
+    aliasing memory reloads, without a sufficient explicit commit, affected
+    result pins include a target-specific completion wait. Non-kernel helpers
+    and functions with remaining calls conservatively complete every persistent
+    result at its pin, including unused fragments.
 
-    CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
-    ``accumulator_register_class="vgpr"``. The inputs must be matching BF16 or
-    F16 dot operands with ``kWidth`` 4 or 8, and the accumulator must be F32
-    with the corresponding unit-tile MFMA layout. The logical K dimension must
-    be a positive multiple of both the native instruction K and the dot-operand
-    layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile span two
-    native K fragments. All tensors must have the
-    same rank, either two or three. Rank-three tensors have matching leading
-    batch dimensions distributed over waves, with one batch per wave. All active
-    lanes of a wave must execute the operation uniformly.
+    Functions containing persistent MFMAs also prefix nonempty opaque inline
+    assembly with the largest required completion delay in that function. This
+    includes pure assembly and writers unrelated to the result: register reuse
+    can otherwise overlap an MFMA's in-flight accesses after a result becomes
+    dead or partially unused. Keeping the delay inside the assembly preserves
+    it through LLVM scheduling. Empty register pins and compiler-owned commits
+    retain their separate handling. These conservative rules may add redundant
+    waits around opaque code; MFMA arithmetic remains native, and the waits are
+    not memory fences.
+
+    The transient path does not apply these class constraints and leaves
+    physical placement to LLVM; use :func:`amd_register_resident` for a hard
+    source residency point. Use :func:`amd_mfma_commit` for explicit completion
+    boundaries with live dependencies.
+
+    CDNA3 retains its VGPR-only accumulator contract, so a persistent chain on
+    gfx942 must pass ``accumulator_register_class="vgpr"``. The inputs must be
+    matching BF16 or F16 dot operands with ``kWidth`` 4 or 8, and the accumulator
+    must be F32 with the corresponding unit-tile MFMA layout. The logical K
+    dimension must be a positive multiple of both the native instruction K and
+    the dot-operand layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile
+    span two native K fragments. All tensors must have the same rank, either two
+    or three. Rank-three tensors have matching leading batch dimensions
+    distributed over waves, with one batch per wave. All active lanes of a wave
+    must execute the operation uniformly.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)

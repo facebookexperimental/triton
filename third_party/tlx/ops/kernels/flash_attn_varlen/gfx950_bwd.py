@@ -3004,6 +3004,8 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     next_stats_m = tl.minimum(m_block + 1, num_m_blocks - 1) * BLOCK_M
                     next_dq_a = tlx.zeros((BLOCK_M, D // 2), tl.float32, layout=mma_md)
                     next_dq_b = tlx.zeros((BLOCK_M, D // 2), tl.float32, layout=mma_md)
+                    # Defer selected second-half K loads for MHA until dQ frees
+                    # first-half operands. Keeping them live during dK spills VGPRs.
                     for n64_index in tl.static_range(0, 4):
                         if n64_index < 3:
                             ds64_next_shared = tlx.local_slice(current_ds, [(n64_index + 1) * (BLOCK_N // 4), 0],
@@ -3016,12 +3018,14 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                             tlx.amd_sched_barrier(0)
                             dq_k_a0 = tlx.local_load(tlx.local_slice(k_buffer, [0, 0], [32, D // 2]), token=kv_wait,
                                                      layout=k_op1_md, relaxed=True)
-                            dq_k_b0 = tlx.local_load(tlx.local_slice(k_buffer, [0, D // 2], [32, D // 2]),
-                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
+                            if HQ != HKV:
+                                dq_k_b0 = tlx.local_load(tlx.local_slice(k_buffer, [0, D // 2], [32, D // 2]),
+                                                         token=kv_wait, layout=k_op1_md, relaxed=True)
                             dq_k_a1 = tlx.local_load(tlx.local_slice(k_buffer, [32, 0], [32, D // 2]), token=kv_wait,
                                                      layout=k_op1_md, relaxed=True)
-                            dq_k_b1 = tlx.local_load(tlx.local_slice(k_buffer, [32, D // 2], [32, D // 2]),
-                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
+                            if HQ != HKV:
+                                dq_k_b1 = tlx.local_load(tlx.local_slice(k_buffer, [32, D // 2], [32, D // 2]),
+                                                         token=kv_wait, layout=k_op1_md, relaxed=True)
                             tlx.amd_sched_barrier(0)
                             dk_n0_b = tlx.amd_scheduled_mfma(ds_nd64, q_nd64_b, dk_n0_b, accumulator_role="persistent",
                                                              accumulator_register_class="agpr",
@@ -3037,8 +3041,9 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                                                      token=kv_wait, layout=k_op1_md, relaxed=True)
                             dq_k_a3 = tlx.local_load(tlx.local_slice(k_buffer, [96, 0], [32, D // 2]), token=kv_wait,
                                                      layout=k_op1_md, relaxed=True)
-                            dq_k_b3 = tlx.local_load(tlx.local_slice(k_buffer, [96, D // 2], [32, D // 2]),
-                                                     token=kv_wait, layout=k_op1_md, relaxed=True)
+                            if HQ != HKV:
+                                dq_k_b3 = tlx.local_load(tlx.local_slice(k_buffer, [96, D // 2], [32, D // 2]),
+                                                         token=kv_wait, layout=k_op1_md, relaxed=True)
                             tlx.amd_sched_barrier(0)
                             dk_n1_b = tlx.amd_scheduled_mfma(ds_nd64, q_nd64_b, dk_n1_b, accumulator_role="persistent",
                                                              accumulator_register_class="agpr",
@@ -3090,13 +3095,16 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     ds6 = tlx.extract_slice(current_ds_full, [BLOCK_M, 32], [0, 192])
                     ds7 = tlx.extract_slice(current_ds_full, [BLOCK_M, 32], [0, 224])
                     dq_k_a0 = tlx.require_layout(dq_k_a0, k_op1_md, pin=False)
-                    dq_k_b0 = tlx.require_layout(dq_k_b0, k_op1_md, pin=False)
+                    if HQ != HKV:
+                        dq_k_b0 = tlx.require_layout(dq_k_b0, k_op1_md, pin=False)
                     dq_k_a1 = tlx.require_layout(dq_k_a1, k_op1_md, pin=False)
-                    dq_k_b1 = tlx.require_layout(dq_k_b1, k_op1_md, pin=False)
+                    if HQ != HKV:
+                        dq_k_b1 = tlx.require_layout(dq_k_b1, k_op1_md, pin=False)
                     dq_k_a2 = tlx.require_layout(dq_k_a2, k_op1_md, pin=False)
                     dq_k_b2 = tlx.require_layout(dq_k_b2, k_op1_md, pin=False)
                     dq_k_a3 = tlx.require_layout(dq_k_a3, k_op1_md, pin=False)
-                    dq_k_b3 = tlx.require_layout(dq_k_b3, k_op1_md, pin=False)
+                    if HQ != HKV:
+                        dq_k_b3 = tlx.require_layout(dq_k_b3, k_op1_md, pin=False)
                     dq_k_a4 = tlx.require_layout(dq_k_a4, k_op1_md, pin=False)
                     dq_k_b4 = tlx.require_layout(dq_k_b4, k_op1_md, pin=False)
                     dq_k_a5 = tlx.require_layout(dq_k_a5, k_op1_md, pin=False)
@@ -3132,22 +3140,42 @@ def _varlen_bwd_interleaved_bm16_bn256_fp32_kernel(
                     next_dq_a = tlx.amd_scheduled_mfma(ds4, dq_k_a4, next_dq_a, resident_operand=1,
                                                        accumulator_role="transient")
                     tlx.amd_sched_barrier(0)
-                    next_q_t2 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])),
-                                               token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                    if HQ == HKV:
+                        dq_k_b0 = tlx.local_load(tlx.local_slice(k_buffer, [0, D // 2], [32, D // 2]), token=kv_wait,
+                                                 layout=k_op1_md, relaxed=True)
+                    else:
+                        next_q_t2 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
                     tlx.amd_sched_barrier(0)
+                    if HQ == HKV:
+                        next_q_t2 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 64], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
+                        dq_k_b1 = tlx.local_load(tlx.local_slice(k_buffer, [32, D // 2], [32, D // 2]), token=kv_wait,
+                                                 layout=k_op1_md, relaxed=True)
                     next_dq_a = tlx.amd_scheduled_mfma(ds5, dq_k_a5, next_dq_a, resident_operand=1,
                                                        accumulator_role="transient")
                     next_dq_a = tlx.amd_scheduled_mfma(ds6, dq_k_a6, next_dq_a, resident_operand=1,
                                                        accumulator_role="transient")
                     tlx.amd_sched_barrier(0)
-                    next_q_t3 = tlx.local_load(tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])),
-                                               token=qdo_wait, layout=qt_op1_nm, relaxed=True)
+                    if HQ == HKV:
+                        dq_k_b3 = tlx.local_load(tlx.local_slice(k_buffer, [96, D // 2], [32, D // 2]), token=kv_wait,
+                                                 layout=k_op1_md, relaxed=True)
+                    else:
+                        next_q_t3 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
                     tlx.amd_sched_barrier(0)
                     next_dq_a = tlx.amd_scheduled_mfma(ds7, dq_k_a7, next_dq_a, resident_operand=1,
                                                        accumulator_role="transient")
 
                     next_dq_b = tlx.amd_scheduled_mfma(ds0, dq_k_b0, next_dq_b, resident_operand=1,
                                                        accumulator_role="transient", initialize=True)
+                    if HQ == HKV:
+                        next_q_t3 = tlx.local_load(
+                            tlx.local_trans(tlx.local_slice(next_q_view, [0, 96], [BLOCK_M, 32])), token=qdo_wait,
+                            layout=qt_op1_nm, relaxed=True)
                     next_dq_b = tlx.amd_scheduled_mfma(ds1, dq_k_b1, next_dq_b, resident_operand=1,
                                                        accumulator_role="transient")
                     next_dq_b = tlx.amd_scheduled_mfma(ds2, dq_k_b2, next_dq_b, resident_operand=1,
