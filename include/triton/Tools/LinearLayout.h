@@ -885,13 +885,13 @@ public:
                                      : llvm::Log2_32(size - 1) + 1;
   }
 
-private:
   // Factory function that gracefully fails rather than asserts if the layout is
   // not well-formed.
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
             bool requireSurjective);
 
+private:
   // Constructor that does not check invariants.  Used by tryCreate.
   struct NoCheckInvariants {};
   LinearLayout(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,

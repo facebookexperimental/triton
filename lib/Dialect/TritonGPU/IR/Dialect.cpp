@@ -1274,6 +1274,38 @@ basesPerDimImpl(const LinearLayout::BasesT &namedBases, StringAttr dimName,
   return ret;
 }
 
+FailureOr<CGAEncodingAttr>
+triton::gpu::maybeLinearToCGAEncodingAttr(const LinearLayout &layout) {
+  auto inDims = llvm::to_vector(layout.getInDimNames());
+  auto *ctx = inDims.front().getContext();
+  auto outDims = llvm::to_vector(layout.getOutDimNames());
+  assert(outDims == standardOutDimNames(ctx, layout.getNumOutDims()) &&
+         "layout must have standard output dimensions");
+  auto kBlock = StringAttr::get(ctx, "block");
+  assert(llvm::is_contained(inDims, kBlock) &&
+         "layout must have a 'block' dim");
+
+  auto cgaLogicalShape =
+      basesPerDimImpl(layout.getBases(), kBlock, layout.getNumOutDims());
+  auto shapePerCTA = layout.getOutDims();
+  for (auto [dim, split] : llvm::zip(shapePerCTA, cgaLogicalShape))
+    dim.second /= split;
+  llvm::erase(inDims, kBlock);
+  auto ctaBases = layout.sublayout(inDims, outDims).getBases();
+  // Interleaved block bits can leave CTA bases outside the trimmed shape.
+  auto ctaLayout = LinearLayout::tryCreate(std::move(ctaBases), shapePerCTA,
+                                           /*requireSurjective=*/false);
+  if (!ctaLayout)
+    return failure();
+  auto maybeCgaLayout = divideLeft(layout, *ctaLayout);
+  if (!maybeCgaLayout)
+    return failure();
+  auto cgaLayout = maybeCgaLayout->sublayout({kBlock}, outDims);
+  if (!isPermutationMatrixLayout(cgaLayout))
+    return failure();
+  return CGAEncodingAttr::get(ctx, std::move(cgaLayout));
+}
+
 static CGAEncodingAttr
 linearToCGAEncodingAttr(const LinearLayout &ll,
                         ArrayRef<unsigned> cgaLogicalShape) {
