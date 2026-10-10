@@ -1,0 +1,7 @@
+{
+  "priority": 30,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": [],
+  "selection": "optimize-amd-gemm",
+  "documents": ["amd-gemm-optimization.md"]
+}

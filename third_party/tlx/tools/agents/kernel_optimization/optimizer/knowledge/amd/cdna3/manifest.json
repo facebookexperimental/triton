@@ -1,0 +1,6 @@
+{
+  "priority": 20,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": ["gfx942"],
+  "documents": ["gfx942-kernel-optimization.md"]
+}

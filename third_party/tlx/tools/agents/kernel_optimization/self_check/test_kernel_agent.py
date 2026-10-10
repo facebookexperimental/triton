@@ -43,6 +43,7 @@ from ..contracts import (
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
+    ResearchEvidence,
     TimingSamples,
     VerificationResult,
 )
@@ -63,6 +64,7 @@ from ..decision_maker.tuning import (
 )
 from ..decision_maker.profiling import ProfileRequest
 from ..optimizer.agent import (
+    AgentSourceResearchRequest,
     CandidateContext,
     CandidateProposal,
     FixedCandidateProvider,
@@ -1369,6 +1371,29 @@ class CliTest(unittest.TestCase):
         self.assertTrue(args.govern)
         self.assertEqual(_resolve_task(args), "tuning")
 
+    def test_gfx942_kernel_authoring_groups_are_disjoint(self) -> None:
+        groups = {
+            name: production_cases("mm", name)
+            for name in (
+                "gfx942_group_a",
+                "gfx942_group_b",
+                "gfx942_group_c",
+                "gfx942_group_d",
+            )
+        }
+        self.assertEqual({name: len(cases) for name, cases in groups.items()}, {
+            "gfx942_group_a": 24,
+            "gfx942_group_b": 7,
+            "gfx942_group_c": 3,
+            "gfx942_group_d": 1,
+        })
+        case_ids = [
+            case.case_id
+            for cases in groups.values()
+            for case in cases
+        ]
+        self.assertEqual(len(case_ids), len(set(case_ids)))
+
     def test_tune_after_authoring_is_explicit_and_infers_authoring(self) -> None:
         args = _parse_args(
             [
@@ -1971,6 +1996,67 @@ class CommitBodyTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+
+    def test_source_research_action_is_collected_before_candidate(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
+        contexts = []
+
+        class Provider:
+            def propose(self, request, context):
+                del request
+                contexts.append(context)
+                if not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest=source_digest(context.current_source),
+                        question="Which nearby kernel uses a structural schedule?",
+                        rationale="The local parameter search is saturated.",
+                    )
+                return CandidateProposal(
+                    candidate_source,
+                    "use the researched structural schedule",
+                    research_evidence_ids=(context.research_evidence[0].action_id, ),
+                )
+
+        class ResearchProvider:
+            def research(self, request, context):
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="collected",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    findings=("A nearby kernel uses a persistent row schedule.", ),
+                )
+
+        harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            result = KernelOptimizer(
+                Provider(), source_research_provider=ResearchProvider()
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=harness_path,
+                    cases=(InputCase("a", {}), ),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(len(contexts[1].research_evidence), 1)
+        self.assertTrue(result.success)
+        self.assertEqual(result.best_kernel, candidate_source)
 
     def test_parity_tuning_refines_from_best_intermediate_tree(self) -> None:
         def performance(parity: float) -> PerformanceSummary:
@@ -2977,18 +3063,18 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertIn("proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts)
         self.assertIn(f"proton.intra.trace={trace_path}", parts)
 
-    def test_profile_log_includes_fb_att_artifact(self) -> None:
+    def test_profile_log_includes_amd_att_artifact(self) -> None:
         parts = _profile_log_parts(
             {
-                "fb_att": {
+                "amd_att": {
                     "valid": True,
                     "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
                 }
             }
         )
 
-        self.assertIn("fb_att.valid=true", parts)
-        self.assertIn("fb_att.ui=/tmp/gemm_0_ui", parts)
+        self.assertIn("amd_att.valid=true", parts)
+        self.assertIn("amd_att.ui=/tmp/gemm_0_ui", parts)
 
     def test_diagnostic_proton_profiles_baseline_and_successful_final_only(
         self,

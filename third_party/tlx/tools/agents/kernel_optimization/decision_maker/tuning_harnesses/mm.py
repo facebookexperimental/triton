@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import inspect
@@ -31,6 +33,15 @@ if str(_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGENT_ROOT))
 
 from policy_source import frozen_source_digest, validate_branch_comments  # noqa: E402
+try:  # noqa: E402
+    from ..profiling.amd_att import collect_amd_att, compare_amd_att_profiles
+    from ..profiling.rocm_profiler import collect_rocprofv3
+except ImportError:  # pragma: no cover - direct profile-workload execution
+    _DECISION_MAKER_ROOT = _AGENT_ROOT / "decision_maker"
+    if str(_DECISION_MAKER_ROOT) not in sys.path:
+        sys.path.insert(0, str(_DECISION_MAKER_ROOT))
+    from profiling.amd_att import collect_amd_att, compare_amd_att_profiles
+    from profiling.rocm_profiler import collect_rocprofv3
 
 
 def _target_setting(target: Mapping[str, Any], name: str, default: str = "") -> str:
@@ -81,6 +92,8 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
             "directory": directory,
             "module": module,
             "op": op,
+            "source_path": source_path,
+            "arch": arch,
             "device": str(target.get("device") or "cuda"),
             "phase": phase,
             "oracle_cases": oracle_cases,
@@ -129,26 +142,35 @@ def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) 
         config_rows = list(oracle_metrics.get("top_full_configs", []))
         full_config_count = int(oracle_metrics.get("full_config_count", 0))
         full_best_config = str(oracle_metrics.get("full_best_config", ""))
-        with _oracle_winner(artifact, a, b, full_best_config) as full:
-            full()
-            torch.cuda.synchronize()
-            full_samples = _measure(full, repetitions)
     else:
         full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
         full_tuners: dict[str, Any] = {}
         with _record_tuners(full_tuners):
             full()
         torch.cuda.synchronize()
-        full_samples = _measure(full, repetitions)
         config_rows = _config_rows(full_tuners)
         full_config_count = sum(len(getattr(tuner, "configs", ())) for tuner in full_tuners.values())
         full_best_config = _best_configs(full_tuners)
+    # Benchmark the selected configuration directly. Re-entering the full
+    # Autotuner here measures Python/cache behavior and can alternate
+    # between search and steady-state paths for very short kernels.
+    # Searches may run concurrently on exclusive GPUs, but short steady-state
+    # measurements contend on the host when eight worker processes benchmark
+    # at once. Serialize only the final fixed-winner and reference timings.
+    with _oracle_winner(artifact, a, b, full_best_config) as full, _exclusive_measurement():
+        full()
+        torch.cuda.synchronize()
+        full_samples = _measure(full, repetitions)
+        aten_samples = _measure(lambda: torch.matmul(a, b), repetitions)
     full_median = statistics.median(full_samples)
+    aten_median = statistics.median(aten_samples)
 
     metrics: dict[str, Any] = {
         "full_config_count": full_config_count,
         "full_best_config": full_best_config,
         "full_median_us": full_median,
+        "aten_median_us": aten_median,
+        "aten_parity": aten_median / full_median,
         "top_full_configs": config_rows[:8],
     }
     if artifact["phase"] in {"search_space", "full"}:
@@ -209,13 +231,224 @@ def profile(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config_timings, indent=2, sort_keys=True) + "\n")
         record["full_config_timings_artifact"] = str(path)
+    request = request or {}
+    tools = tuple(str(tool) for tool in request.get("tools", ()))
+    if "rocprofv3" not in tools and "amd_att" not in tools:
+        return record
+    if not artifacts_dir:
+        record["profiling_error"] = "profile request has no artifacts_dir"
+        return record
+    winner = str(record.get("full_best_config", ""))
+    if not winner:
+        record["profiling_error"] = "benchmark did not record a full-space winner"
+        return record
+    artifacts_path = Path(str(artifacts_dir))
+    case_path = artifacts_path / "case.json"
+    case_path.parent.mkdir(parents=True, exist_ok=True)
+    case_path.write_text(json.dumps(case, indent=2, sort_keys=True) + "\n")
+    workload = _profile_workload_command(
+        Path(artifact["source_path"]),
+        case_path,
+        artifact["device"],
+        str(artifact["arch"]),
+        winner,
+        implementation="tlx",
+    )
+    level = str(request.get("level", "summary"))
+    if "rocprofv3" in tools:
+        record["rocprofv3"] = collect_rocprofv3(
+            workload,
+            artifacts_path,
+            level=level,
+            sample_count=5,
+            timeout_seconds=300.0,
+        )
+    if "amd_att" in tools:
+        rocprof = record.get("rocprofv3", {})
+        summary = rocprof.get("summary", {}) if isinstance(rocprof, Mapping) else {}
+        kernel_filter = str(summary.get("dominant_kernel", "")).removesuffix(".kd")
+        record["amd_att"] = (
+            collect_amd_att(
+                workload,
+                artifacts_path,
+                kernel_filter=kernel_filter,
+                iteration=3,
+                timeout_seconds=300.0,
+            )
+            if kernel_filter
+            else {"error": "AMD ATT requires a dominant rocprofv3 kernel"}
+        )
+        aten_workload = _profile_workload_command(
+            Path(artifact["source_path"]),
+            case_path,
+            artifact["device"],
+            str(artifact["arch"]),
+            winner,
+            implementation="aten",
+        )
+        aten_artifacts = artifacts_path / "aten_baseline"
+        aten_rocprof = collect_rocprofv3(
+            aten_workload,
+            aten_artifacts,
+            level=level,
+            sample_count=5,
+            timeout_seconds=300.0,
+        )
+        aten_summary = (
+            aten_rocprof.get("summary", {})
+            if isinstance(aten_rocprof, Mapping)
+            else {}
+        )
+        aten_filter = str(aten_summary.get("dominant_kernel", "")).removesuffix(".kd")
+        aten_att = (
+            collect_amd_att(
+                aten_workload,
+                aten_artifacts,
+                kernel_filter=aten_filter,
+                iteration=3,
+                timeout_seconds=300.0,
+            )
+            if aten_filter
+            else {"error": "ATen ATT requires a dominant rocprofv3 kernel"}
+        )
+        record["aten_baseline"] = {
+            "rocprofv3": aten_rocprof,
+            "amd_att": aten_att,
+        }
+        record["att_comparison"] = compare_amd_att_profiles(
+            record["amd_att"], aten_att
+        )
+        record["aten_comparison"] = _compare_with_aten(
+            record.get("rocprofv3", {}),
+            aten_rocprof,
+            record["att_comparison"],
+        )
     return record
+
+
+def _compare_with_aten(
+    tlx_rocprof: Mapping[str, Any],
+    aten_rocprof: Mapping[str, Any],
+    att_comparison: Mapping[str, Any],
+) -> dict[str, Any]:
+    tlx_summary = tlx_rocprof.get("summary", {})
+    aten_summary = aten_rocprof.get("summary", {})
+    tlx_duration = float(tlx_summary.get("duration_us", 0.0))
+    aten_duration = float(aten_summary.get("duration_us", 0.0))
+    tlx_counters = tlx_rocprof.get("counters", {})
+    aten_counters = aten_rocprof.get("counters", {})
+    counter_ratios = {
+        name: float(tlx_counters[name]) / float(aten_counters[name])
+        for name in sorted(tlx_counters.keys() & aten_counters.keys())
+        if float(aten_counters[name]) != 0.0
+    }
+    tlx_resources = _dominant_resources(tlx_rocprof)
+    aten_resources = _dominant_resources(aten_rocprof)
+    resource_ratios = {
+        name: float(tlx_resources[name]) / float(aten_resources[name])
+        for name in sorted(tlx_resources.keys() & aten_resources.keys())
+        if float(aten_resources[name]) != 0.0
+    }
+    return {
+        "valid": bool(att_comparison.get("valid"))
+        and tlx_duration > 0.0
+        and aten_duration > 0.0,
+        "duration_us": {"tlx": tlx_duration, "aten": aten_duration},
+        "tlx_over_aten_duration": (
+            tlx_duration / aten_duration if aten_duration > 0.0 else None
+        ),
+        "tlx_over_aten_counters": counter_ratios,
+        "tlx_over_aten_resources": resource_ratios,
+        "att_stats": dict(att_comparison),
+    }
+
+
+def _dominant_resources(profile: Mapping[str, Any]) -> Mapping[str, Any]:
+    kernels = profile.get("kernels", ())
+    if not isinstance(kernels, Sequence) or not kernels:
+        return {}
+    first = kernels[0]
+    return first.get("resources", {}) if isinstance(first, Mapping) else {}
+
+
+def _profile_workload_command(
+    source_path: Path,
+    case_path: Path,
+    device: str,
+    arch: str,
+    winner: str,
+    *,
+    implementation: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--profile-workload",
+        "--candidate",
+        str(source_path),
+        "--case-json",
+        str(case_path),
+        "--device",
+        device,
+        "--arch",
+        arch,
+        "--winner",
+        winner,
+        "--implementation",
+        implementation,
+    ]
+
+
+def _run_profile_workload(arguments: argparse.Namespace) -> int:
+    case = json.loads(arguments.case_json.read_text())
+    a, b = _inputs(case, arguments.device)
+    if arguments.implementation == "aten":
+        winner = contextlib.nullcontext(lambda: torch.matmul(a, b))
+    else:
+        module = _load_module(arguments.candidate, arguments.arch)
+        artifact = {
+            "module": module,
+            "op": _install_candidate(module, arguments.arch),
+            "device": arguments.device,
+        }
+        winner = _oracle_winner(artifact, a, b, arguments.winner)
+    with winner as launch:
+        for _ in range(3):
+            launch()
+        torch.cuda.synchronize()
+        for _ in range(10):
+            launch()
+        torch.cuda.synchronize()
+    return 0
+
+
+def _parse_profile_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-workload", action="store_true")
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--case-json", type=Path, required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--arch", required=True)
+    parser.add_argument("--winner", required=True)
+    parser.add_argument("--implementation", choices=("tlx", "aten"), required=True)
+    return parser.parse_args()
 
 
 def _measure(fn, repetitions: int) -> list[float]:
     rep_ms = max(20, int(repetitions))
     samples_ms = triton.testing.do_bench(fn, warmup=5, rep=rep_ms, return_mode="all")
     return [float(sample) * 1000.0 for sample in samples_ms]
+
+
+@contextlib.contextmanager
+def _exclusive_measurement():
+    lock_path = Path(tempfile.gettempdir()) / "tlx-agent-gpu-measurement.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _coefficient_of_variation(samples: Sequence[float]) -> float:
@@ -362,3 +595,7 @@ def _strided_random(shape, strides, dtype, device, generator):
     storage_size = 1 + sum((size - 1) * stride for size, stride in zip(shape, strides))
     storage = torch.randn(storage_size, device=device, dtype=dtype, generator=generator)
     return torch.as_strided(storage, shape, strides)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_profile_workload(_parse_profile_arguments()))
