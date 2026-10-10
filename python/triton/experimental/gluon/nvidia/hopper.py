@@ -49,7 +49,9 @@ def _validate_common_descriptor(
             assert (
                 stride * elem_bytes
             ) % 32 == 0, "For fp4_padded, tensor strides must be 32-byte aligned"
-        assert tl.target_info.cuda_capability_geq(
+        # Descriptors may be constructed for offline compilation without an active runtime driver.
+        target = tl.target_info.current_target()
+        assert target is None or tl.target_info.cuda_capability_geq(
             10, 0
         ), "fp4_padded requires blackwell or newer"
     assert (
@@ -130,7 +132,8 @@ class TensorDescriptor:
                 assert (
                     stride * elem_bytes
                 ) % 32 == 0, "For fp4_padded, tensor strides must be 32-byte aligned"
-            assert tl.target_info.cuda_capability_geq(
+            target = tl.target_info.current_target()
+            assert target is None or tl.target_info.cuda_capability_geq(
                 10, 0
             ), "fp4_padded requires blackwell or newer"
         assert (

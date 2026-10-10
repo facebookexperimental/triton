@@ -253,7 +253,7 @@ jobs:
             [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
           fi
           echo "h100 collects:" "${FILES[@]}"
-          python -m pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
+          PYTHONPATH="${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest "${FILES[@]}" --import-mode=importlib -v --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
@@ -349,7 +349,7 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
-          uv pip install pytest
+          uv pip install pytest cloudpickle
       - name: Select kernel-affected tests
         id: select
         if: github.event_name == 'pull_request'
@@ -364,7 +364,7 @@ jobs:
             echo "kernel-only PR: no runtime tests touch the changed kernel(s); skipping"
             exit 0
           fi
-          python -m pytest python/test/unit/runtime/ -v --junitxml=/tmp/runtime-unit.xml
+          python -m pytest python/test/unit/runtime/ --import-mode=importlib -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (runtime)
         id: parse
         if: always() && github.event_name == 'schedule'

@@ -89,7 +89,7 @@ def get_ptxas_version(arch: int = 80):
 
 
 @functools.lru_cache()
-def ptx_get_version(cuda_version) -> int:
+def ptx_get_version(cuda_version: str) -> int:
     """
     Get the highest PTX version supported by the current CUDA driver.
     """
@@ -217,6 +217,7 @@ class CUDAOptions:
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
     launch_pdl: bool = False
+    clc: bool = False
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15")
     deprecated_fp8_dot_operand_dtypes: Tuple[str] = ()
     default_dot_input_precision: str = "tf32"
@@ -267,6 +268,14 @@ class CUDAOptions:
         assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
+
+        # Upstream clc=True is a separate single-CTA opt-in. The clustered
+        # scheduler (including ctas_per_cga) is tl.clc_tile_scheduler().
+        if self.clc and (self.num_ctas != 1 or self.ctas_per_cga is not None or self.preferred_ctas_per_cga is not None
+                         or (self.cluster_dims is not None and tuple(self.cluster_dims) != (1, 1, 1))):
+            raise ValueError("clc=True requires num_ctas=1 and no physical cluster "
+                             "(ctas_per_cga, cluster_dims, preferred_ctas_per_cga); "
+                             "use tl.clc_tile_scheduler() for clustered CLC")
 
         # num_ctas and ctas_per_cga are alternative cluster models, not two dials
         # on one. Under num_ctas the CTAs share a program and its tensors are
@@ -338,6 +347,12 @@ class CUDABackend(BaseBackend):
             # Preserve the established ordering before Blackwell while using
             # linear ordering for the Blackwell workloads it targets.
             args["enable_tree_reduction"] = capability < 100
+
+        if args.get("clc", False) and capability < 100:
+            raise ValueError(f"clc=True requires NVIDIA SM100+ (Blackwell); current target is sm_{capability}; "
+                             "use tl.clc_tile_scheduler() for the fbtriton CLC path")
+        if args.get("clc", False) and knobs.nvidia.use_meta_ws:
+            raise ValueError("clc=True does not support Meta AutoWS; use tl.clc_tile_scheduler()")
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
@@ -832,6 +847,12 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
+        if opt.clc and capability < 100:
+            raise ValueError("clc=True requires NVIDIA SM100+ (Blackwell); "
+                             "use tl.clc_tile_scheduler() for the fbtriton CLC path")
+        if opt.clc and knobs.nvidia.use_meta_ws:
+            raise ValueError("clc=True does not support Meta AutoWS; use tl.clc_tile_scheduler()")
+
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
@@ -877,6 +898,12 @@ class CUDABackend(BaseBackend):
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, opt.allowDependentTwoCTA)
+        if opt.clc:
+            # Validate before ToCLC creates its own sync CLC ops. The split
+            # pass consumes this one-shot marker before normal scheduling.
+            mod.set_attr("ttg.verify-clc-opt-in", ir.builder(mod.context).get_bool_attr(True))
+            nvidia.passes.ttnvgpuir.add_clc_split(pm)
+            nvidia.passes.ttnvgpuir.add_to_clc(pm)
         # optimize TTGIR
         ptx_version = get_ptx_version_from_options(opt, capability)
         max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
@@ -1015,7 +1042,8 @@ class CUDABackend(BaseBackend):
                 # scheduler never emits). So skip WS entirely.
                 pass
             elif not knobs.nvidia.use_meta_ws:
-                # 2-CTA + upstream WS is not supported
+                # clc=True can use upstream WS for a single CTA on SM100+.
+                # Meta AutoWS and physical clusters remain unsupported.
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
@@ -1077,6 +1105,8 @@ class CUDABackend(BaseBackend):
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
+        if capability // 10 >= 10:
+            nvidia.passes.ttnvgpuir.add_lower_clc(pm)
         smem_budget = _max_shared_mem_for_capability(capability)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         nvidia.passes.hopper.add_multi_cta_reduction(pm)

@@ -137,7 +137,7 @@ jobs:
 
     - name: Enable Cache
       if: steps.llvm-build.outputs.exists != 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ env.SCCACHE_DIR }}
         key: ${{ matrix.config.target-os }}-${{ matrix.config.arch }}-${{ env.short_llvm_commit_hash }}

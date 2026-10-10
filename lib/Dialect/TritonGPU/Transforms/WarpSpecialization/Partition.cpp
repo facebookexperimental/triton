@@ -3,6 +3,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -10,7 +12,6 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/IR/Use.h"
 
 using namespace mlir;
 using namespace triton;
@@ -51,10 +52,10 @@ LogicalResult verifyPartitionAttrs(Operation *op) {
   // META_WS_CHANGE: PSM intentionally leaves some nested operations without
   // partition annotations for later task-id propagation.
   if (op->hasAttr(kWarpSpecializeAttrName) && !useMetaWS) {
-    if (!isa<scf::ForOp>(op)) {
+    if (!isa<scf::ForOp, scf::WhileOp>(op)) {
       return op->emitOpError("has unexpected attribute ")
              << kWarpSpecializeAttrName
-             << " which is expected only on `scf.for` ops";
+             << " which is expected only on `scf.for` or `scf.while` ops";
     }
 
     Operation *failedOp = nullptr;
@@ -117,7 +118,7 @@ LogicalResult verifyPartitionAttrs(Operation *op) {
   }
 
   if (auto outputsAttr = op->getAttr(kPartitionOutputsAttrName)) {
-    if (!isa<scf::ForOp, scf::IfOp, triton::ReduceOp>(op))
+    if (!isa<scf::ForOp, scf::WhileOp, scf::IfOp, triton::ReduceOp>(op))
       return op->emitOpError("has unexpected attribute ")
              << kPartitionOutputsAttrName;
 
@@ -169,7 +170,9 @@ bool Partition::hasOp(Operation *op) const {
 
 void Partition::iterateInputs(LoopLikeOpInterface loop,
                               function_ref<void(OpOperand &)> callback) const {
-  Block *body = getLoopBodyBlock(loop);
+  Value inductionVar;
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    inductionVar = forOp.getInductionVar();
   for (Operation *op : getOps()) {
     visitNestedOperands(op, [&](OpOperand &operand) {
       // Ignore implicit captures.
@@ -177,22 +180,20 @@ void Partition::iterateInputs(LoopLikeOpInterface loop,
       std::optional<SetVector<int>> partitionIds;
       if (hasPartition(value.getDefiningOp()))
         partitionIds = getPartitionIds(value.getDefiningOp());
-      if (value.getParentBlock() != body)
+      // An scf.while has both before and after regions; each can contain
+      // partition inputs. For scf.for this still selects its single body.
+      if (value.getParentRegion()->getParentOp() != loop.getOperation())
         return;
-      if (auto arg = dyn_cast<BlockArgument>(value)) {
-        assert(arg.getOwner() == body);
-        // Ignore the induction variable.
-        if (arg == getLoopInductionVar(loop))
-          return;
-        // This value originates from a previous iteration.
+      // Ignore the induction variable.
+      if (value == inductionVar)
+        return;
+      if (isa<BlockArgument>(value)) {
+        // A loop block argument comes from another iteration or region.
         callback(operand);
-      } else {
-        if (!partitionIds || !partitionIds->contains(getIndex())) {
-          // This value originates from a different partition in the same
-          // iteration.
-          assert(value.getDefiningOp()->getParentOp() == loop.getOperation());
-          callback(operand);
-        }
+      } else if (!partitionIds || !partitionIds->contains(getIndex())) {
+        // This value originates from a different partition in this iteration.
+        assert(value.getDefiningOp()->getParentOp() == loop.getOperation());
+        callback(operand);
       }
     });
   }
@@ -201,13 +202,12 @@ void Partition::iterateInputs(LoopLikeOpInterface loop,
 void Partition::iterateOutputs(
     LoopLikeOpInterface loop,
     function_ref<void(Operation *, OpOperand &)> callback) const {
-  Block *body = getLoopBodyBlock(loop);
-  Operation *terminator = getLoopBodyTerminator(loop);
   for (Operation *op : getOps()) {
     for (OpOperand &use : op->getUses()) {
-      Operation *owner = body->findAncestorOpInBlock(*use.getOwner());
-
-      // Handle post-loop operations.
+      Operation *owner = nullptr;
+      for (Region *region : loop.getLoopRegions())
+        if ((owner = region->front().findAncestorOpInBlock(*use.getOwner())))
+          break;
       if (!owner) {
         // The user is outside the loop, so it's a post-loop operation.
         // Use the operation directly.
@@ -221,14 +221,10 @@ void Partition::iterateOutputs(
       std::optional<SetVector<int>> partitionIds;
       if (hasPartition(owner))
         partitionIds = getPartitionIds(owner);
-      if (owner == terminator) {
-        // This value is used in a subsequent iteration.
+      if (isa<scf::YieldOp, scf::ConditionOp>(owner) || !partitionIds ||
+          !partitionIds->contains(getIndex())) {
+        // This value crosses a loop boundary or another partition.
         callback(owner, use);
-      } else {
-        if (!partitionIds || !partitionIds->contains(getIndex())) {
-          // This value is used in a different partition in the same iteration.
-          callback(owner, use);
-        }
       }
     }
   }
@@ -237,9 +233,28 @@ void Partition::iterateOutputs(
 void Partition::iterateDefs(
     LoopLikeOpInterface loop,
     function_ref<void(OpResult, unsigned)> callback) const {
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation())) {
+    iterateDefs(whileOp, callback);
+    return;
+  }
   iterateInputs(loop, [&](OpOperand &input) {
     auto [def, distance] = getLoopDefinitionAndDistance(loop, input.get());
     if (def && def.getParentBlock() == getLoopBodyBlock(loop))
+      callback(def, distance);
+  });
+}
+
+void Partition::iterateDefs(
+    scf::WhileOp loop, function_ref<void(OpResult, unsigned)> callback) const {
+  iterateInputs(loop, [&](OpOperand &input) {
+    auto value = input.get();
+    int distance = 0;
+    while (auto arg = dyn_cast<BlockArgument>(value)) {
+      value = loop.getYieldOp().getOperand(arg.getArgNumber());
+      ++distance;
+    }
+    auto def = dyn_cast<OpResult>(value);
+    if (def && loop->isProperAncestor(def.getDefiningOp()))
       callback(def, distance);
   });
 }
@@ -248,30 +263,41 @@ void Partition::iterateUses(
     LoopLikeOpInterface loop,
     function_ref<void(OpResult, OpOperand &, unsigned)> callback) const {
   SmallVector<std::tuple<OpResult, OpOperand *, unsigned>> uses;
-  iterateOutputs(loop, [&](Operation *owner, OpOperand &use) {
+  iterateOutputs(loop, [&](Operation *, OpOperand &use) {
     uses.emplace_back(cast<OpResult>(use.get()), &use, 0);
   });
   while (!uses.empty()) {
     auto [output, use, distance] = uses.pop_back_val();
-    Operation *owner =
-        getLoopBodyBlock(loop)->findAncestorOpInBlock(*use->getOwner());
-
-    // Handle post-loop operations.
+    Operation *owner = nullptr;
+    for (Region *region : loop.getLoopRegions())
+      if ((owner = region->front().findAncestorOpInBlock(*use->getOwner())))
+        break;
     if (!owner) {
-      // The user is outside the loop, so it's a post-loop operation.
+      // Keep fbtriton's post-loop consumers visible to callers.
       callback(output, *use, distance);
       continue;
     }
-
-    if (owner != getLoopBodyTerminator(loop)) {
-      callback(output, *use, distance);
+    if (isa<scf::YieldOp>(owner)) {
+      BlockArgument arg;
+      if (isa<scf::WhileOp>(loop.getOperation()))
+        arg = loop.getRegionIterArgs()[use->getOperandNumber()];
+      else
+        arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
+      if (!arg)
+        continue;
+      for (OpOperand &argUse : arg.getUses())
+        uses.emplace_back(output, &argUse, distance + 1);
       continue;
     }
-    BlockArgument arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
-    if (!arg)
+    if (auto condition = dyn_cast<scf::ConditionOp>(owner);
+        condition && use->getOperandNumber() > 0) {
+      auto body = &loop.getLoopRegions().back()->front();
+      auto arg = body->getArgument(use->getOperandNumber() - 1);
+      for (OpOperand &argUse : arg.getUses())
+        uses.emplace_back(output, &argUse, distance);
       continue;
-    for (OpOperand &use : arg.getUses())
-      uses.emplace_back(output, &use, distance + 1);
+    }
+    callback(output, *use, distance);
   }
 }
 
@@ -337,10 +363,21 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   if (!isa<scf::ForOp, scf::WhileOp>(loop.getOperation()) ||
       !hasSupportedLoopCarry(loop))
     return failure();
-  // META_WS_CHANGE: Preserve Meta's scf.while support; the upstream verifier
-  // currently accepts scf.for only.
-  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation());
-      forOp && failed(verifyPartitionedLoop(forOp)))
+  // Meta PSM leaves some scf.while before-region ops unannotated. Upstream
+  // schedules can also carry partition types after serialization, but those
+  // are all empty; Meta PSM assigns semantic types such as "computation".
+  // Still verify scf.for and upstream's scf.while schedules.
+  auto types = loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
+  bool hasMetaTypes = false;
+  if (types)
+    hasMetaTypes = llvm::any_of(types, [](Attribute attr) {
+      auto type = dyn_cast<StringAttr>(attr);
+      return type && !type.getValue().empty();
+    });
+  bool isMetaWhile =
+      isa<scf::WhileOp>(loop.getOperation()) &&
+      (triton::tools::getBoolEnv("TRITON_USE_META_WS") || hasMetaTypes);
+  if (!isMetaWhile && failed(verifyPartitionedLoop(loop)))
     return failure();
   auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
   if (!stages)
@@ -350,7 +387,6 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   if (!tag)
     return failure();
 
-  auto types = loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
   if (types && types.size() != stages.size())
     return mlir::emitError(loop.getLoc(), "partition types attribute '")
            << kPartitionTypesAttrName << "' must match partition stages size";
@@ -360,7 +396,7 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   for (auto [idx, attr] : llvm::enumerate(stages)) {
     auto stage = dyn_cast<IntegerAttr>(attr);
     if (!stage || stage.getInt() < 0) {
-      return mlir::emitError(loop.getLoc(), "partition stages attribute '")
+      return mlir::emitError(loop->getLoc(), "partition stages attribute '")
              << kPartitionStagesAttrName << "' has invalid element " << attr;
     }
 
@@ -377,11 +413,12 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   }
 
   SmallVector<Operation *> annotatedOps;
-  getLoopBodyRegion(loop).walk([&](Operation *op) {
-    if (hasPartition(op)) {
-      annotatedOps.push_back(op);
-    }
-  });
+  // Include both scf.while regions, not just its scheduled after region.
+  for (Region *region : loop.getLoopRegions())
+    region->walk([&](Operation *op) {
+      if (hasPartition(op))
+        annotatedOps.push_back(op);
+    });
 
   for (auto op : annotatedOps) {
     auto attrs = getPartitionIds(op);
@@ -424,44 +461,22 @@ void PartitionSet::dump() const {
 
 namespace mlir::triton::gpu {
 
-SetVector<int> getPartitionIds(Operation *op) {
-  auto attrs = op->getAttr(kPartitionAttrName);
-  SmallVector<int> partitionIds;
-  for (auto id : cast<DenseI32ArrayAttr>(attrs).asArrayRef()) {
-    partitionIds.push_back(id);
-  }
-  llvm::sort(partitionIds);
-  return SetVector<int>(partitionIds.begin(), partitionIds.end());
-}
-
-SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
-  SmallVector<SetVector<int>, 4> partitionOutputsIds;
-  if (op->getNumResults() == 0)
-    return partitionOutputsIds;
-
-  assert(op->hasAttr(kPartitionOutputsAttrName));
-  auto arrayAttr = cast<ArrayAttr>(op->getAttr(kPartitionOutputsAttrName));
-  for (Attribute attr : arrayAttr) {
-    auto ids = cast<DenseI32ArrayAttr>(attr).asArrayRef();
-    partitionOutputsIds.push_back(SetVector<int>(ids.begin(), ids.end()));
-  }
-  return partitionOutputsIds;
-}
-
 SetVector<int> getPartitionIds(OpOperand *use) {
-  auto owner = use->getOwner();
-  if (isa<scf::YieldOp>(owner)) {
-    return getPartitionOutputs(owner->getParentOp())[use->getOperandNumber()];
+  Operation *owner = use->getOwner();
+  auto pos = use->getOperandNumber();
+  if (isa<scf::YieldOp, scf::ConditionOp>(owner)) {
+    unsigned numControlOperands = isa<scf::ConditionOp>(owner) ? 1 : 0;
+    if (pos < numControlOperands)
+      return getPartitionIds(owner);
+    return getPartitionOutputs(owner->getParentOp())[pos - numControlOperands];
   }
-  if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
-    int idx = use->getOperandNumber() - forOp.getNumControlOperands();
-    return idx >= 0 ? getPartitionOutputs(owner)[idx] : getPartitionIds(forOp);
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(owner)) {
+    auto numControlOperands = owner->getNumOperands() - loop.getInits().size();
+    if (pos < numControlOperands)
+      return getPartitionIds(owner);
+    return getPartitionOutputs(owner)[pos - numControlOperands];
   }
   return getPartitionIds(owner);
-}
-
-bool hasPartition(Operation *op) {
-  return op && op->hasAttr(kPartitionAttrName);
 }
 
 bool hasWarpSpecializeTag(Operation *op) {
@@ -474,7 +489,7 @@ std::optional<int> getWarpSpecializeTag(Operation *op) {
   return std::nullopt;
 }
 
-LogicalResult verifyPartitionedLoop(scf::ForOp loop) {
+LogicalResult verifyPartitionedLoop(LoopLikeOpInterface loop) {
   if (failed(verifyPartitionAttrs(loop)))
     return failure();
 

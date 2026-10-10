@@ -2,6 +2,7 @@
 #define TRITON_ANALYSIS_MEMBAR_H
 
 #include "Allocation.h"
+#include "BufferIndexAnalysis.h"
 #include "CallGraph.h"
 #include "Function.h"
 
@@ -50,7 +51,9 @@ struct MembarScratchSync {
 // logical view on it (layout, subslice offsets and shape for the access)
 struct AllocationSlice {
 public:
-  // Create allocation slice from a value, collecting subslice offsets
+  // Create allocation slice from a value, collecting subslice offsets.
+  // BufferIndexAnalysis attaches dynamic buffer-index information to the
+  // stage-aware slice before it is inserted into BlockInfo.
   AllocationSlice(Value value, Interval<size_t> allocationInterval,
                   Allocation::BufferId bufferId,
                   Allocation *allocation = nullptr, Value stageBasis = {});
@@ -90,6 +93,8 @@ public:
     if (invalidateBufferId) {
       shifted.bufferId = Allocation::InvalidBufferId;
       shifted.stage = {};
+      // Per-function SSA identities cannot be compared across call sites.
+      shifted.bufferIndexExpr = nullptr;
     } else if (shifted.stage.parent) {
       shifted.stage.parentInterval =
           Interval<size_t>(shifted.stage.parentInterval.start() + offset,
@@ -99,6 +104,13 @@ public:
   }
 
   void print(raw_ostream &os) const;
+
+  // Buffer-index expression attached by BufferIndexAnalysis. It participates
+  // in ordering/equality so accesses to different slots remain separate.
+  // Must not be mutated after the slice is inserted into a sorted container
+  // (e.g. BlockInfo::SliceMapT); rebuild the container instead, as
+  // BufferIndexAnalysis::invalidateBufferIndices does.
+  const BufferIndexExpr *bufferIndexExpr = nullptr;
 
 private:
   // An empty basis denotes a literal stage. A nonempty basis denotes
@@ -116,7 +128,7 @@ private:
                               size_t, unsigned, unsigned>;
 
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
-             llvm::ArrayRef<int64_t>, StageKey>
+             llvm::ArrayRef<int64_t>, StageKey, const BufferIndexExpr *>
   asTuple() const {
     return {allocationInterval,
             bufferId,
@@ -124,7 +136,8 @@ private:
             subsliceOffsets,
             {stage.parent.getAsOpaquePointer(),
              stage.basis.getAsOpaquePointer(), stage.parentInterval,
-             stage.stride, stage.numStages, stage.offset}};
+             stage.stride, stage.numStages, stage.offset},
+            bufferIndexExpr};
   }
   // Offsets from subslice. Empty when offsets are unknown
   SmallVector<int64_t> subsliceOffsets;
@@ -319,7 +332,12 @@ public:
   /// a shared memory read. If the temporary storage is written but not read,
   /// it is considered as the problem of the operation itself but not the membar
   /// analysis.
-  using MembarOrFenceAnalysis::MembarOrFenceAnalysis;
+  MembarAnalysis(Allocation &allocation, MembarFilterFn filter,
+                 MembarScratchSync scratchSync = {})
+      : MembarOrFenceAnalysis(allocation, std::move(filter),
+                              std::move(scratchSync)),
+        bufferIndexAnalysis(
+            cast<FunctionOpInterface>(allocation.getOperation())) {}
 
   void run(FunctionOpInterface function, FuncMapT &funcMap);
 
@@ -328,10 +346,16 @@ private:
   void update(Operation *operation, BlockInfo *blockInfo, FuncMapT *funcMap,
               OpBuilder *builder) override;
 
+  void updateSuccessor(Operation *terminator, Block *successor,
+                       BlockInfo *blockInfo) override;
+
+  void updateExitState(BlockInfo *blockInfo) override;
+
   void insertBarrier(Operation *operation, OpBuilder *builder);
 
   // Materialize only the final decisions, after CFG analysis has converged.
   llvm::SmallPtrSet<Operation *, 16> scratchSyncOps;
+  BufferIndexAnalysis bufferIndexAnalysis;
 };
 
 /// Postorder traversal on the callgraph to insert membar instructions
