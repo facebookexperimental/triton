@@ -1589,7 +1589,8 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
         # scales directly; no directional exports or second Delta launch.
         _bwd_kv_owner.run(q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds, dss,
                           D=128, BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False,
-                          NATIVE=True, RELAXED=False, enable_fp_fusion=not lse_split,
+                          NATIVE=True, RELAXED=False, DELAY_DO_HEAD=lse_split and not causal and n in (4096, 8192),
+                          enable_fp_fusion=not lse_split,
                           XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0), num_warps=2, num_stages=1,
                           matrix_instr_nonkdim=32, waves_per_eu=0, LSE_SPLIT=lse_split, grid=(128,
                                                                                               n // 64), warmup=False)
