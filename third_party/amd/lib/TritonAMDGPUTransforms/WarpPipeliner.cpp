@@ -173,10 +173,9 @@ static void createClusterOp(OpBuilder &b, Location loc,
   return;
 }
 
-// Move pure scalar IV-remap ops after adjacent inter-stage barriers/waits so
-// they become part of the next stage.  If a barrier/wait uses one of those
-// scalars, leave the run in place to preserve SSA.
-static void sinkPureScalarsIntoNextStage(Block &blk) {
+// Place stage inputs after independent waits. This does not validate
+// cross-wave communication inside the next stage.
+static void sinkStageInputsIntoNextStage(Block &blk) {
   SmallVector<Operation *> pending;
   auto consumesPending = [&](Operation *user) {
     return llvm::any_of(user->getOperands(), [&](Value v) {
@@ -185,7 +184,9 @@ static void sinkPureScalarsIntoNextStage(Block &blk) {
   };
   for (Operation *op = &blk.front(); op;) {
     Operation *next = op->getNextNode();
-    if (triton::isPureScalarOp(op)) {
+    // Gluon unrolling adds scalar IV remaps; TLX layout propagation also adds
+    // conversions at loop entry, before waits for unrelated async loads.
+    if (triton::isPureScalarOp(op) || isa<ttg::ConvertLayoutOp>(op)) {
       pending.push_back(op);
       op = next;
       continue;
@@ -203,8 +204,7 @@ static void sinkPureScalarsIntoNextStage(Block &blk) {
       }
       if (!conflict) {
         next = anchor->getNextNode();
-        // Reverse iteration + moveAfter(anchor) preserves source order:
-        // each earlier-inserted scalar is pushed right by later inserts.
+        // Reverse insertion preserves input order, including dependent inputs.
         for (Operation *s : llvm::reverse(pending))
           s->moveAfter(anchor);
       }
@@ -232,7 +232,7 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   SmallVector<SmallVector<Operation *>> clusters;
   auto ctx = forOp.getContext();
 
-  sinkPureScalarsIntoNextStage(blk);
+  sinkStageInputsIntoNextStage(blk);
 
   // One pass over the body; collect clusters split by explicit borders.
   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
