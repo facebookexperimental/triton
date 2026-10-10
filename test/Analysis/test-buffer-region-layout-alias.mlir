@@ -299,3 +299,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shar
     tt.return
   }
 }
+
+// -----
+
+// AMD packed, transposed LDS loads read the same physical bytes as an ordinary
+// local load even though their result shape and layout differ.
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+
+// CHECK-LABEL: amd_packed_a_transposed vs amd_packed_a_transposed: alias=true
+// CHECK: amd_packed_a_transposed vs amd_packed_b_local_load: alias=true
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32, "ttg.total-num-warps" = 4 : i32} {
+  tt.func public @amd_packed_transposed_local_load_alias() {
+    %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16x64xi8, #shared, #smem, mutable>
+    %packed = amdg.local_load_packed_transposed %buffer {test.region_name = "amd_packed_a_transposed"} : !ttg.memdesc<16x64xi8, #shared, #smem, mutable> -> tensor<32x32xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>
+    %plain = ttg.local_load %buffer {test.region_name = "amd_packed_b_local_load"} : !ttg.memdesc<16x64xi8, #shared, #smem, mutable> -> tensor<16x64xi8>
+    tt.return
+  }
+}
