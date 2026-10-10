@@ -619,22 +619,26 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                                qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                pair_start, 0, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
+                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
+                               EARLY_DP=ARENA_N == 1024)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                                qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                pair_start + 64, 1, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
+                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
+                               EARLY_DP=ARENA_N == 1024)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                            sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                            qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                            sequence_length - 128, 0, True,
-                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
+                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
+                           EARLY_DP=ARENA_N == 1024)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                            sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                            qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                            sequence_length - 64, 1, False,
-                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv)
+                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
+                           EARLY_DP=ARENA_N == 1024)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
     tl.store(DV + offsets, dv)
@@ -713,7 +717,8 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   RELAXED: tl.constexpr, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head,
                   base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr,
                   PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
-                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, IMMUTABLE_KV: tl.constexpr = False):
+                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, IMMUTABLE_KV: tl.constexpr = False,
+                  EARLY_DP: tl.constexpr = False):
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
     export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
@@ -734,30 +739,57 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if IMMUTABLE_KV:
         # The owner or first tile barrier publishes K before these immutable reads.
         k = tlx.local_load(k[0], layout=export_layout, relaxed=True)
-    scores = tlx.release_layout(
-        tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
-                       tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
-                       tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
-    lse = _load_metadata(lsemem[SLOT])
-    logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
-    valid = (EVEN_N | (keys[:, None] < N)) & (EVEN_N | (queries[None, :] < N))
-    if CAUSAL and (not PEEL or phase == 0):
-        valid = valid & (keys[:, None] <= queries[None, :])
-    p = tl.exp2(tl.where(valid, logits, -float('inf')))
-    if IGLP:
-        tlx.amd_iglp_opt(3)
-    if DELAY_DO_HEAD:
-        # The score/P computation does not consume the dO operand.
+    if EARLY_DP:
+        tl.static_assert(DELAY_DO_HEAD and IMMUTABLE_KV and NATIVE and not CAUSAL)
+        # Retain both matrix results before their vector consumers.
+        scores_mma = tlx.dot_scaled(
+            tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
+            tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
+            tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
+        lse = _load_metadata(lsemem[SLOT])
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
-    dos = _decode_rhs_head(do_words)
-    if IMMUTABLE_KV:
+        dos = _decode_rhs_head(do_words)
         # The owner or first tile barrier publishes V before these immutable reads.
         tlx.amd_sched_barrier(0)
         v = tlx.local_load(v[0], layout=export_layout, relaxed=True)
-    dp = tlx.release_layout(
-        tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
-                       tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
-                       tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
+        dp_mma = tlx.dot_scaled(
+            tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
+            tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
+            tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
+        scores = tlx.release_layout(scores_mma)
+        logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
+        valid = (EVEN_N | (keys[:, None] < N)) & (EVEN_N | (queries[None, :] < N))
+        if CAUSAL and (not PEEL or phase == 0):
+            valid = valid & (keys[:, None] <= queries[None, :])
+        p = tl.exp2(tl.where(valid, logits, -float('inf')))
+        if IGLP:
+            tlx.amd_iglp_opt(3)
+        dp = tlx.release_layout(dp_mma)
+    else:
+        scores = tlx.release_layout(
+            tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
+                           tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
+                           tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
+        lse = _load_metadata(lsemem[SLOT])
+        logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
+        valid = (EVEN_N | (keys[:, None] < N)) & (EVEN_N | (queries[None, :] < N))
+        if CAUSAL and (not PEEL or phase == 0):
+            valid = valid & (keys[:, None] <= queries[None, :])
+        p = tl.exp2(tl.where(valid, logits, -float('inf')))
+        if IGLP:
+            tlx.amd_iglp_opt(3)
+        if DELAY_DO_HEAD:
+            # The score/P computation does not consume the dO operand.
+            do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
+        dos = _decode_rhs_head(do_words)
+        if IMMUTABLE_KV:
+            # The owner or first tile barrier publishes V before these immutable reads.
+            tlx.amd_sched_barrier(0)
+            v = tlx.local_load(v[0], layout=export_layout, relaxed=True)
+        dp = tlx.release_layout(
+            tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
+                           tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
+                           tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
     delta = _load_metadata(deltamem[SLOT])
     ds = tl.where(valid, p * (dp - delta[None, :]), 0.0)
     if PACK_P_EARLY:
