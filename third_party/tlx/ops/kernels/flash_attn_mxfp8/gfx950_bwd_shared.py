@@ -555,34 +555,65 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
     key_tile = tl.program_id(1)
     keys = key_tile * BN + tl.arange(0, BN)
     base = head * sequence_length * D
-    v, vs = _inline_prepare_v64(V, base, keys, D)
-    immutable_kv: tl.constexpr = ARENA_N == 1024 or ARENA_N == 2048
-    if immutable_kv:
-        # Publish immutable K/V once before the query reduction.
-        kv_layout: tl.constexpr = _stage_layout(D)
-        k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
-        vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
-        kv_offsets = (keys[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
-        tlx.buffer_load_to_local(k[0], K + base, kv_offsets, True, 0.0)
-        tlx.local_store(vmem[0], v)
-        v = vmem
-        tlx.async_load_commit_group()
-        tlx.async_load_wait_group(0)
-        tlx.workgroup_barrier()
+    early_initial_copies: tl.constexpr = ARENA_N == 2048
+    if early_initial_copies:
+        immutable_kv: tl.constexpr = ARENA_N == 1024 or ARENA_N == 2048
+        if immutable_kv:
+            kv_layout: tl.constexpr = _stage_layout(D)
+            k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+            vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+        shared_layout: tl.constexpr = _stage_layout(D)
+        qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
+        domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
+        metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
+        lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+        deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+        if immutable_kv:
+            kv_offsets = (keys[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+            tlx.buffer_load_to_local(k[0], K + base, kv_offsets, True, 0.0)
+            tlx.async_load_commit_group()
+        else:
+            k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
+        _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0)
+        v, vs = _inline_prepare_v64(V, base, keys, D)
+        if immutable_kv:
+            # The first tile wait and barrier publish immutable K/V.
+            tlx.local_store(vmem[0], v)
+            v = vmem
+        ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
+        _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
+        mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+        dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
+        dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
     else:
-        k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
-    ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
-    _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
-    dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
-    dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
-    shared_layout: tl.constexpr = _stage_layout(D)
-    qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
-    domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
-    metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
-    lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
-    deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
-    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0)
+        v, vs = _inline_prepare_v64(V, base, keys, D)
+        immutable_kv: tl.constexpr = ARENA_N == 1024 or ARENA_N == 2048
+        if immutable_kv:
+            # Publish immutable K/V once before the query reduction.
+            kv_layout: tl.constexpr = _stage_layout(D)
+            k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+            vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+            kv_offsets = (keys[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+            tlx.buffer_load_to_local(k[0], K + base, kv_offsets, True, 0.0)
+            tlx.local_store(vmem[0], v)
+            v = vmem
+            tlx.async_load_commit_group()
+            tlx.async_load_wait_group(0)
+            tlx.workgroup_barrier()
+        else:
+            k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
+        ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
+        _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
+        mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+        dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
+        dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), mma, pin=False)
+        shared_layout: tl.constexpr = _stage_layout(D)
+        qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
+        domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
+        metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
+        lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+        deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+        _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0)
     for pair_start in range(0, sequence_length - 128, 128):
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
@@ -701,7 +732,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
     qs = _decode_rhs_head(q_words)
     if IMMUTABLE_KV:
-        # The prologue publishes K before these immutable reads.
+        # The owner or first tile barrier publishes K before these immutable reads.
         k = tlx.local_load(k[0], layout=export_layout, relaxed=True)
     scores = tlx.release_layout(
         tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
@@ -720,7 +751,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
     dos = _decode_rhs_head(do_words)
     if IMMUTABLE_KV:
-        # The prologue publishes V before these immutable reads.
+        # The owner or first tile barrier publishes V before these immutable reads.
         tlx.amd_sched_barrier(0)
         v = tlx.local_load(v[0], layout=export_layout, relaxed=True)
     dp = tlx.release_layout(
