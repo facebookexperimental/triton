@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import statistics
@@ -54,6 +55,16 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
             if not valid:
                 return {"success": False, "diagnostics": diagnostic}
 
+    phase = _target_setting(target, "TLX_AGENT_TUNING_PHASE", "search_space")
+    oracle_cases: dict[str, Any] = {}
+    if phase == "heuristic":
+        oracle_path = Path(_target_setting(target, "TLX_AGENT_FULL_SPACE_ORACLE"))
+        try:
+            payload = json.loads(oracle_path.read_text())
+            oracle_cases = {case["case_id"]: case for case in payload["cases"]}
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            return {"success": False, "diagnostics": f"could not load full-space oracle: {error}"}
+
     directory = tempfile.TemporaryDirectory(prefix="tlx-agent-mm-tuning-")
     source_path = Path(directory.name) / "candidate.py"
     source_path.write_text(kernel_source)
@@ -71,7 +82,8 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
             "module": module,
             "op": op,
             "device": str(target.get("device") or "cuda"),
-            "phase": _target_setting(target, "TLX_AGENT_TUNING_PHASE", "search_space"),
+            "phase": phase,
+            "oracle_cases": oracle_cases,
             "stable_cv_max": float(target.get("evaluation_policy", {}).get("stable_cv_max", 0.03)),
             "records": {},
         },
@@ -81,9 +93,14 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
 def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     a, b = _inputs(case, artifact["device"])
     try:
-        expected = torch.matmul(a, b)
+        expected = _reference_matmul(a, b)
         tolerance = 8e-3 if a.dtype == torch.bfloat16 else 1e-3
-        spaces = ("heuristic", "full") if artifact["phase"] == "search_space" else ("heuristic", )
+        if artifact["phase"] == "search_space":
+            spaces = ("heuristic", "full")
+        elif artifact["phase"] == "full":
+            spaces = ("full", )
+        else:
+            spaces = ("heuristic", )
         for space in spaces:
             actual = artifact["op"](a, b, space=space)
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=tolerance)
@@ -92,24 +109,49 @@ def verify(artifact: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     return {"passed": True}
 
 
+def _reference_matmul(a, b, *, max_rows: int = 65536):
+    """Avoid rocBLAS's incorrect final row on very tall, narrow GEMMs."""
+    if a.shape[0] <= max_rows:
+        return torch.matmul(a, b)
+    expected = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
+    for row in range(0, a.shape[0], max_rows):
+        expected[row:row + max_rows] = torch.matmul(a[row:row + max_rows], b)
+    return expected
+
+
 def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) -> dict[str, Any]:
     a, b = _inputs(case, artifact["device"])
-    full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
-    full_tuners: dict[str, Any] = {}
-    with _record_tuners(full_tuners):
-        full()
-    torch.cuda.synchronize()
-    full_samples = _measure(full, repetitions)
-    config_rows = _config_rows(full_tuners)
+    if artifact["phase"] == "heuristic":
+        oracle = artifact["oracle_cases"].get(case["case_id"])
+        if oracle is None or oracle.get("timing") is None:
+            raise RuntimeError(f"full-space oracle has no timing for {case['case_id']}")
+        oracle_metrics = oracle["verification"].get("metrics", {})
+        config_rows = list(oracle_metrics.get("top_full_configs", []))
+        full_config_count = int(oracle_metrics.get("full_config_count", 0))
+        full_best_config = str(oracle_metrics.get("full_best_config", ""))
+        with _oracle_winner(artifact, a, b, full_best_config) as full:
+            full()
+            torch.cuda.synchronize()
+            full_samples = _measure(full, repetitions)
+    else:
+        full = lambda: artifact["op"](a, b, space="full")  # noqa: E731
+        full_tuners: dict[str, Any] = {}
+        with _record_tuners(full_tuners):
+            full()
+        torch.cuda.synchronize()
+        full_samples = _measure(full, repetitions)
+        config_rows = _config_rows(full_tuners)
+        full_config_count = sum(len(getattr(tuner, "configs", ())) for tuner in full_tuners.values())
+        full_best_config = _best_configs(full_tuners)
     full_median = statistics.median(full_samples)
 
     metrics: dict[str, Any] = {
-        "full_config_count": sum(len(getattr(tuner, "configs", ())) for tuner in full_tuners.values()),
-        "full_best_config": _best_configs(full_tuners),
+        "full_config_count": full_config_count,
+        "full_best_config": full_best_config,
         "full_median_us": full_median,
         "top_full_configs": config_rows[:8],
     }
-    if artifact["phase"] == "search_space":
+    if artifact["phase"] in {"search_space", "full"}:
         samples = full_samples
     else:
         heuristic_tuners: dict[str, Any] = {}
@@ -124,6 +166,8 @@ def benchmark(artifact: dict[str, Any], case: dict[str, Any], repetitions: int) 
         metrics.update({
             "full_space_parity":
             full_median / heuristic_median,
+            "heuristic_config":
+            _selected_heuristic_config(artifact, a, b),
             "heuristic_config_count":
             max(
                 1,
@@ -183,6 +227,49 @@ def _format_config(config) -> str:
         return ""
     kwargs = " ".join(f"{key}={value}" for key, value in config.kwargs.items())
     return f"{kwargs} num_warps={config.num_warps} num_stages={config.num_stages}"
+
+
+def _selected_heuristic_config(artifact: Mapping[str, Any], a, b) -> str:
+    module = artifact.get("module")
+    if module is None:
+        return ""
+    shape = (a.shape[0], b.shape[1], a.shape[1])
+    precheck = getattr(module, "_precheck_local_split_u", None)
+    if precheck is not None and precheck(a, b, None):
+        plan = module._MEASURED_LOCAL_SPLIT_U_PLANS[shape]
+        return _format_config(module._local_split_u_config(plan))
+    heuristic = module.heuristic_config
+    if "dtype" in inspect.signature(heuristic).parameters:
+        path, plan = heuristic(*shape, a.dtype, a.element_size(), a.stride(), b.stride())
+        if path != "register":
+            return ""
+        plan = dict(plan)
+        configs = [triton.Config(plan, num_warps=plan.pop("num_warps"), num_stages=plan.pop("num_stages"))]
+    else:
+        configs = heuristic(*shape)
+    return _format_config(configs[0]) if len(configs) == 1 else ""
+
+
+@contextlib.contextmanager
+def _oracle_winner(artifact: Mapping[str, Any], a, b, winner: str):
+    module = artifact.get("module")
+    if module is None or not winner:
+        raise RuntimeError("full-space oracle did not record its winning config")
+    expected = winner.split(": ", 1)[-1]
+    shape = (a.shape[0], b.shape[1], a.shape[1])
+    enable_local_split_u = bool(module._precheck_local_split_u(a, b, None))
+    tuner = module._tuned("full", shape, enable_local_split_u)
+    selected = [config for config in tuner.configs if _format_config(config) == expected]
+    if len(selected) != 1:
+        raise RuntimeError(f"could not resolve oracle winner {winner!r}")
+    # _tuned is lru_cached without strides: restore so same-shape cases still resolve their own winner.
+    # A single-config Autotuner bypasses its cache, so the cache needs no clearing.
+    original = tuner.configs
+    tuner.configs = selected
+    try:
+        yield lambda: artifact["op"](a, b, space="full")
+    finally:
+        tuner.configs = original
 
 
 def _best_configs(tuners: Mapping[str, Any]) -> str:

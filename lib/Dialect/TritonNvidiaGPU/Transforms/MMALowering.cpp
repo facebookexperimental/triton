@@ -1,11 +1,14 @@
+#include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -53,18 +56,87 @@ public:
   }
 };
 
+static bool areEquivalentBarrierViews(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  auto lhsIndex = lhs.getDefiningOp<ttg::MemDescIndexOp>();
+  auto rhsIndex = rhs.getDefiningOp<ttg::MemDescIndexOp>();
+  if (!lhsIndex || !rhsIndex ||
+      !areEquivalentBarrierViews(lhsIndex.getSrc(), rhsIndex.getSrc()))
+    return false;
+  APInt lhsValue;
+  APInt rhsValue;
+  return matchPattern(lhsIndex.getIndex(), m_ConstantInt(&lhsValue)) &&
+         matchPattern(rhsIndex.getIndex(), m_ConstantInt(&rhsValue)) &&
+         lhsValue == rhsValue;
+}
+
+static bool isConstantZero(Value value) {
+  APInt constant;
+  return value && matchPattern(value, m_ConstantInt(&constant)) &&
+         constant.isZero();
+}
+
+static LogicalResult lowerTwoCTARHSScaleCopy(Value src, Value dst,
+                                             Operation *anchor,
+                                             PatternRewriter &rewriter) {
+  Location loc = src.getLoc();
+  auto srcType = cast<ttg::MemDescType>(src.getType());
+  auto dstType = cast<ttg::MemDescType>(dst.getType());
+  int numWarps = ttg::lookupNumWarps(anchor);
+  if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps)) {
+    return emitError(loc)
+           << "two-CTA M64 scaled MMA scale lowering requires a power-of-two "
+              "MMA partition with at least 4 warps; got "
+           << numWarps;
+  }
+
+  MLIRContext *context = src.getContext();
+  auto shape = dstType.getShape();
+  Type elType = dstType.getElementType();
+  auto sharedLayout = ttg::getScaleSmemLayoutForTMEMCopy(
+      context, shape, ttg::CGAEncodingAttr::get1CTALayout(context, 2));
+  auto sharedEncoding = ttg::SharedLinearEncodingAttr::get(
+      context, std::move(sharedLayout), /*alignment=*/128);
+  auto sharedViewType = ttg::MemDescType::get(shape, elType, sharedEncoding,
+                                              srcType.getMemorySpace(),
+                                              srcType.getMutableMemory());
+  Value sharedView =
+      ttg::MemDescReinterpretOp::create(rewriter, loc, sharedViewType, src);
+  auto registerEncoding = getDefaultLayoutForTmemLdSt(dstType, numWarps);
+  auto registerType = RankedTensorType::get(shape, elType, registerEncoding);
+  Value scale = ttg::LocalLoadOp::create(rewriter, loc, registerType,
+                                         sharedView, Value());
+  Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+  TMEMStoreOp::create(rewriter, loc, dst, scale, pred);
+  return success();
+}
+
 struct TCGen5MMAScaleSharedToTmemConversion
     : public OpRewritePattern<TCGen5MMAScaledOp> {
   using OpRewritePattern<TCGen5MMAScaledOp>::OpRewritePattern;
 
   // Create a tmem_copy of scales from shared memory to tmem. `rows` is the M or
   // N of the MMA operation (for LHS or RHS respectively).
-  bool lowerScaleToTmem(OpOperand &operand, PatternRewriter &rewriter, int rows,
-                        TensorMemoryScalesBlockRepOrder blockRepOrder) const {
+  FailureOr<bool> lowerScaleToTmem(
+      OpOperand &operand, PatternRewriter &rewriter, int rows,
+      TensorMemoryScalesBlockRepOrder blockRepOrder,
+      TensorMemoryCTAMode ctaMode = TensorMemoryCTAMode::DEFAULT) const {
     Location loc = operand.getOwner()->getLoc();
     MLIRContext *context = operand.getOwner()->getContext();
     Attribute tensorMemorySpace = TensorMemorySpaceAttr::get(context);
     auto oldType = cast<ttg::MemDescType>(operand.get().getType());
+    int numWarps = 0;
+    if (ctaMode == TensorMemoryCTAMode::TwoCTA_RHS) {
+      numWarps = ttg::lookupNumWarps(operand.getOwner());
+      if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps)) {
+        operand.getOwner()->emitError()
+            << "two-CTA M64 scaled MMA scale lowering requires a power-of-two "
+               "MMA partition with at least 4 warps; got "
+            << numWarps;
+        return failure();
+      }
+    }
     auto numElems = product(oldType.getShape());
     Type elType = oldType.getElementType();
     // The scales SMEM source may use a flexible multi-dimensional layout (e.g.
@@ -88,13 +160,23 @@ struct TCGen5MMAScaleSharedToTmemConversion
     }
     // Distribute the scales across the rows of the MMA operation.
     SmallVector<int64_t> shape = {rows, numElems / rows};
-    Attribute scaleEncoding =
-        TensorMemoryScalesEncodingAttr::get(context, CGALayout, blockRepOrder);
+    Attribute scaleEncoding = TensorMemoryScalesEncodingAttr::get(
+        context, CGALayout, blockRepOrder, ctaMode);
     Type scaleAType =
         ttg::MemDescType::get(shape, elType, scaleEncoding, tensorMemorySpace,
                               /*mutableMemory=*/true);
     auto tmemAlloc = TMEMAllocOp::create(rewriter, loc, scaleAType, Value());
-    TMEMCopyOp::create(rewriter, loc, operand.get(), tmemAlloc);
+    if (ctaMode == TensorMemoryCTAMode::TwoCTA_RHS) {
+      // The M=128 cta_group::2 Layout-B RHS consumes the high N half from
+      // row partition 64. Reinterpret the packed scale SMEM as its canonical
+      // 2D tensor and let the TMEM store layout move that basis from columns
+      // to rows. Cross-CTA publication remains an explicit user barrier.
+      if (failed(lowerTwoCTARHSScaleCopy(operand.get(), tmemAlloc,
+                                         operand.getOwner(), rewriter)))
+        return failure();
+    } else {
+      TMEMCopyOp::create(rewriter, loc, operand.get(), tmemAlloc);
+    }
     operand.set(tmemAlloc);
     return true;
   }
@@ -110,24 +192,127 @@ struct TCGen5MMAScaleSharedToTmemConversion
     }
     int blockM = op.getBlockM();
     int blockN = op.getBlockN();
+    auto dEncoding =
+        cast<TensorMemoryEncodingAttr>(op.getD().getType().getEncoding());
+    bool isTwoCTAM64 =
+        op.getTwoCtas() && dEncoding.getBlockM() == 64 &&
+        dEncoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS;
+    if (isTwoCTAM64) {
+      // A scales remain per-CTA along M. B scales describe the complete N
+      // dimension and use the Layout-B row partition selected by TwoCTA_RHS.
+      blockN *= 2;
+    }
     auto aScaleBlockRepOrder = getTensorMemoryScalesBlockRepOrder(
         op, /*isA=*/true, op.getAType(), op.getBType(),
         aScaleType.getElementType(), bScaleType.getElementType());
     auto bScaleBlockRepOrder = getTensorMemoryScalesBlockRepOrder(
         op, /*isA=*/false, op.getAType(), op.getBType(),
         aScaleType.getElementType(), bScaleType.getElementType());
+    Operation *rhsPublicationBarrier = nullptr;
+    if (isTwoCTAM64) {
+      for (Operation *wait = op->getPrevNode(); wait;
+           wait = wait->getPrevNode()) {
+        if (isa<ClusterBarrierOp>(wait)) {
+          rhsPublicationBarrier = wait;
+          break;
+        }
+        if (isa<ClusterWaitOp>(wait)) {
+          for (Operation *arrive = wait->getPrevNode(); arrive;
+               arrive = arrive->getPrevNode()) {
+            if (isa<ClusterArriveOp>(arrive)) {
+              rhsPublicationBarrier = arrive;
+              break;
+            }
+            if (isa<ClusterWaitOp, ClusterBarrierOp, WaitBarrierOp,
+                    MMAv5OpInterface>(arrive))
+              break;
+          }
+          break;
+        }
+        if (auto waitBarrier = dyn_cast<WaitBarrierOp>(wait)) {
+          if (!isConstantZero(waitBarrier.getPred())) {
+            for (Operation *arrive = wait->getPrevNode(); arrive;
+                 arrive = arrive->getPrevNode()) {
+              if (auto arriveBarrier = dyn_cast<ArriveBarrierOp>(arrive)) {
+                auto remote = arriveBarrier.getBarrier()
+                                  .getDefiningOp<MapToRemoteBufferOp>();
+                if (remote && !isConstantZero(arriveBarrier.getPred()) &&
+                    areEquivalentBarrierViews(remote.getSrc(),
+                                              waitBarrier.getBarrier())) {
+                  rhsPublicationBarrier = arrive;
+                  break;
+                }
+              }
+              if (isa<ClusterWaitOp, ClusterBarrierOp, WaitBarrierOp,
+                      MMAv5OpInterface>(arrive))
+                break;
+            }
+          }
+          break;
+        }
+        if (isa<MMAv5OpInterface>(wait))
+          break;
+      }
+      if (!rhsPublicationBarrier) {
+        return op.emitError(
+            "two-CTA blockM=64 scaled MMA requires a matched inter-CTA "
+            "arrive/wait barrier after publishing its scales");
+      }
+      DominanceInfo dominance(op->getParentOp());
+      auto sharedScaleDoesNotDominate = [&](Value scale) {
+        auto type = cast<ttg::MemDescType>(scale.getType());
+        return isa<ttg::SharedMemorySpaceAttr>(type.getMemorySpace()) &&
+               !dominance.dominates(scale, rhsPublicationBarrier);
+      };
+      if (sharedScaleDoesNotDominate(op.getAScale()) ||
+          sharedScaleDoesNotDominate(op.getBScale())) {
+        return op.emitError(
+            "two-CTA blockM=64 shared-memory scale operands must be defined "
+            "before their publication barrier");
+      }
+    }
+
     bool anyChanged = false;
     if (isa<ttg::SharedMemorySpaceAttr>(aScaleType.getMemorySpace())) {
-      anyChanged = lowerScaleToTmem(op.getAScaleMutable(), rewriter, blockM,
-                                    aScaleBlockRepOrder) ||
-                   anyChanged;
+      if (rhsPublicationBarrier)
+        rewriter.setInsertionPoint(rhsPublicationBarrier);
+      FailureOr<bool> changed = lowerScaleToTmem(
+          op.getAScaleMutable(), rewriter, blockM, aScaleBlockRepOrder);
+      rewriter.setInsertionPoint(op);
+      if (failed(changed))
+        return failure();
+      anyChanged = *changed || anyChanged;
     }
     if (isa<ttg::SharedMemorySpaceAttr>(bScaleType.getMemorySpace())) {
-      anyChanged = lowerScaleToTmem(op.getBScaleMutable(), rewriter, blockN,
-                                    bScaleBlockRepOrder) ||
-                   anyChanged;
+      auto bScaleCTAMode = isTwoCTAM64 ? TensorMemoryCTAMode::TwoCTA_RHS
+                                       : TensorMemoryCTAMode::DEFAULT;
+      if (rhsPublicationBarrier)
+        rewriter.setInsertionPoint(rhsPublicationBarrier);
+      FailureOr<bool> changed =
+          lowerScaleToTmem(op.getBScaleMutable(), rewriter, blockN,
+                           bScaleBlockRepOrder, bScaleCTAMode);
+      rewriter.setInsertionPoint(op);
+      if (failed(changed))
+        return failure();
+      anyChanged = *changed || anyChanged;
     }
     return LogicalResult::success(anyChanged);
+  }
+};
+
+struct TwoCTARHSScaleCopyConversion : public OpRewritePattern<TMEMCopyOp> {
+  using OpRewritePattern<TMEMCopyOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TMEMCopyOp op,
+                                PatternRewriter &rewriter) const override {
+    auto encoding = dyn_cast<TensorMemoryScalesEncodingAttr>(
+        op.getDst().getType().getEncoding());
+    if (!encoding || encoding.getCtaMode() != TensorMemoryCTAMode::TwoCTA_RHS)
+      return failure();
+    if (failed(lowerTwoCTARHSScaleCopy(op.getSrc(), op.getDst(), op, rewriter)))
+      return failure();
+    rewriter.eraseOp(op);
+    return success();
   }
 };
 
@@ -245,7 +430,7 @@ public:
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<SyncMMALowering, TCGen5MMAScaleSharedToTmemConversion,
-                 MergeCommitIntoMMA>(context);
+                 TwoCTARHSScaleCopyConversion, MergeCommitIntoMMA>(context);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();

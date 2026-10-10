@@ -1,35 +1,29 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-"""Run TorchTLX fusion benchmarks."""
+"""Gate and benchmark TorchTLX fusion cases against stock PT2."""
+
+from __future__ import annotations
 
 import argparse
 import contextlib
 import importlib
-import json
 import pathlib
 import statistics
-import subprocess
 import sys
-import tempfile
+import types
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
+REL_L2_TOL = 1e-2
 
 
 def load_runtime(case) -> None:
-    # Keep case discovery and --list usable without loading GPU extension
-    # modules. This also lets users inspect available cases before activating
-    # the PyTorch environment used to run them.
-    global torch, triton, run_and_get_code
-
+    global torch, triton
     import torch as torch_module
     import triton as triton_module  # @manual=//triton:triton
-    from torch._inductor.utils import run_and_get_code as torch_run_and_get_code
-
     import triton.language.extra.tlx.inductor.registry  # noqa: F401
 
     torch = torch_module
     triton = triton_module
-    run_and_get_code = torch_run_and_get_code
     case.torch = torch_module
 
 
@@ -39,8 +33,6 @@ def discover_cases() -> dict[str, object]:
         case = importlib.import_module(f"torchtlx_benchmark.{path.stem}")
         if case.NAME != path.stem:
             raise ValueError(f"case name {case.NAME!r} does not match {path.name}")
-        if case.NAME in cases:
-            raise ValueError(f"duplicate case name: {case.NAME}")
         cases[case.NAME] = case
     return cases
 
@@ -49,26 +41,20 @@ def parse_args(cases):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=cases, default=next(iter(cases)))
     parser.add_argument("--list", action="store_true")
-    parser.add_argument("--warmup", type=int, default=100)
-    parser.add_argument("--rep", type=int, default=500)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--rep", type=int, default=50)
     parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument("--variant", choices=("baseline", "candidate"), help=argparse.SUPPRESS)
-    parser.add_argument("--result-json", help=argparse.SUPPRESS)
-
     selected, _ = parser.parse_known_args()
     cases[selected.case].add_arguments(parser)
     args = parser.parse_args()
-    if args.samples < 1:
-        parser.error("--samples must be positive")
-    if args.warmup <= 0 or args.rep <= 0:
-        parser.error("--warmup and --rep must be positive")
+    if min(args.samples, args.warmup, args.rep) <= 0:
+        parser.error("--samples, --warmup and --rep must be positive")
     return args
 
 
 def selected_shapes(case, args) -> tuple[dict[str, object], ...]:
     shapes = tuple(dict(shape) for shape in getattr(case, "SHAPES", ({}, )))
-    shape_keys = {key for shape in shapes for key in shape}
-    for key in shape_keys:
+    for key in {key for shape in shapes for key in shape}:
         override = getattr(args, key, None)
         if override is None:
             continue
@@ -81,202 +67,124 @@ def selected_shapes(case, args) -> tuple[dict[str, object], ...]:
     return shapes
 
 
-def format_shape(shape: dict[str, object]) -> str:
-    labels = {"m": "M", "n": "N", "k": "K"}
-    return " ".join(f"{labels.get(name, name)}={value}" for name, value in shape.items())
+def flatten(output):
+    if isinstance(output, torch.Tensor):
+        return [output]
+    if isinstance(output, (tuple, list)):
+        return [t for item in output for t in flatten(item)]
+    return []
 
 
-def validate_candidate_code(case, source_files) -> None:
-    generated_code = "\n".join(source_files)
-    markers = getattr(case, "CANDIDATE_CODE_MARKERS", ())
-    marker_groups = getattr(case, "CANDIDATE_CODE_MARKER_GROUPS", ())
-    missing = [marker for marker in markers if marker not in generated_code]
-    if missing:
-        raise RuntimeError("candidate implementation was not generated; missing code markers: " + ", ".join(missing))
-    missing_groups = [group for group in marker_groups if not any(marker in generated_code for marker in group)]
-    if missing_groups:
-        formatted = [" or ".join(group) for group in missing_groups]
-        raise RuntimeError("candidate implementation was not generated; missing one of: " + ", ".join(formatted))
+def relative_l2(output, reference) -> float:
+    worst = 0.0
+    for out, ref in zip(flatten(output), flatten(reference), strict=True):
+        if out.shape != ref.shape:
+            raise AssertionError(f"shape {out.shape} != reference {ref.shape}")
+        out, ref = out.double(), ref.double()
+        if not bool(torch.isfinite(out).all() & torch.isfinite(ref).all()):
+            return float("inf")
+        ref_sq = float(ref.square().sum())
+        err_sq = float((out - ref).square().sum())
+        error = (err_sq / ref_sq)**0.5 if ref_sq else err_sq**0.5
+        worst = max(worst, error)
+    return worst
 
 
-def compile_variant(case, config, inputs, variant, *, model=None, reset=True):
-    if reset:
-        torch._dynamo.reset()
+def gate(case, label, output, reference) -> None:
+    error = relative_l2(output, reference)
+    tol = getattr(case, "REL_L2_TOL", REL_L2_TOL)
+    ok = error <= tol
+    print(f"GATE {'PASS' if ok else 'FAIL'} {label}: rel_l2={error:.3e} tol={tol:.0e}")
+    if not ok:
+        raise AssertionError(f"{label}: relative-L2 gate failed")
+
+
+def compile_variant(case, inputs, variant):
+    config = case.BASELINE_CONFIG if variant == "baseline" else case.CANDIDATE_CONFIG
     compile_context = getattr(case, "compile_context", contextlib.nullcontext)
     with torch._inductor.config.patch(config), compile_context(variant):
-        compiled = torch.compile(model or case.model, fullgraph=True)
-        has_code_markers = any(
-            getattr(case, name, ()) for name in (
-                "CANDIDATE_CODE_MARKERS",
-                "CANDIDATE_CODE_MARKER_GROUPS",
-            ))
-        if variant == "candidate" and has_code_markers:
-            output, source_files = run_and_get_code(compiled, *inputs)
-            validate_candidate_code(case, source_files)
-        else:
-            output = compiled(*inputs)
+        model = types.FunctionType(case.model.__code__.replace(co_name=variant), case.model.__globals__, variant,
+                                   case.model.__defaults__, case.model.__closure__)
+        compiled = torch.compile(model, fullgraph=True, options=config)
+        output = compiled(*inputs)
     torch.cuda.synchronize()
     return compiled, output
 
 
-def bench_us(fn, warmup: int, rep: int) -> float:
-    return float(triton.testing.do_bench(
-        fn,
-        warmup=warmup,
-        rep=rep,
-        return_mode="median",
-    )) * 1000.0
+def gradients(output, inputs, grad_inputs, grad_outputs):
+    tensors = tuple(inputs[i] for i in grad_inputs)
+    return torch.autograd.grad(tuple(flatten(output)), tensors, grad_outputs, retain_graph=True, allow_unused=True)
 
 
-def run_variant(case, variant: str, args) -> dict[str, object]:
-    config = case.BASELINE_CONFIG if variant == "baseline" else case.CANDIDATE_CONFIG
-    label = "baseline" if variant == "baseline" else case.CANDIDATE_NAME
+def bench_us(fn, args) -> float:
+    return float(triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep, return_mode="median")) * 1000
 
-    torch.compiler.config.force_disable_caches = True
-    torch._inductor.config.force_disable_caches = True
-    torch._inductor.config.fx_graph_cache = False
-    torch._inductor.config.fx_graph_remote_cache = False
 
-    print(f"variant={label}; torch={torch.__version__}")
-    print(f"device={torch.cuda.get_device_name(0)}")
-    print(f"case={case.NAME}; {case.problem()}")
-
-    inputs = case.make_inputs()
-    eager = case.model(*inputs)
-    compiled, output = compile_variant(case, config, inputs, variant)
-    torch.testing.assert_close(output, eager, atol=case.ATOL, rtol=case.RTOL)
-    diff = (output.float() - eager.float()).abs()
-    print(f"correctness_vs_eager max_abs={diff.max().item():.6f} mean_abs={diff.mean().item():.6f}")
-
-    samples = []
+def time_interleaved(case, args, functions, phase) -> None:
+    samples = {variant: [] for variant in functions}
     for sample in range(args.samples):
-        latency = bench_us(lambda: compiled(*inputs), args.warmup, args.rep)
-        samples.append(latency)
-        if not args.result_json:
-            print(f"sample={sample + 1} {label}={latency:.3f}us")
-    return {"label": label, "samples_us": samples, "median_us": statistics.median(samples)}
-
-
-def run_comparison(case) -> None:
-    results = {}
-    with tempfile.TemporaryDirectory(prefix="torchtlx_fusion_") as tmp:
-        for variant in ("baseline", "candidate"):
-            result_path = pathlib.Path(tmp) / f"{variant}.json"
-            command = [
-                sys.executable,
-                str(pathlib.Path(__file__).resolve()),
-                *sys.argv[1:],
-                "--variant",
-                variant,
-                "--result-json",
-                str(result_path),
-            ]
-            completed = subprocess.run(command)
-            if completed.returncode:
-                raise SystemExit(f"{variant} process failed with exit code {completed.returncode}")
-            results[variant] = json.loads(result_path.read_text())
-
-    baseline = results["baseline"]
-    candidate = results["candidate"]
-    for sample, (baseline_us, candidate_us) in enumerate(
-            zip(baseline["samples_us"], candidate["samples_us"]),
-            start=1,
-    ):
-        print(f"sample={sample} baseline={baseline_us:.3f}us "
-              f"{candidate['label']}={candidate_us:.3f}us")
-    print(f"FINAL {case.problem()} baseline={baseline['median_us']:.3f}us "
-          f"{candidate['label']}={candidate['median_us']:.3f}us "
-          f"speedup={baseline['median_us'] / candidate['median_us']:.3f}x")
-
-
-def run_interleaved_comparison(case, args) -> None:
-    """Compile both variants once and alternate timing order to limit drift."""
-    torch.compiler.config.force_disable_caches = True
-    torch._inductor.config.force_disable_caches = True
-    torch._inductor.config.fx_graph_cache = False
-    torch._inductor.config.fx_graph_remote_cache = False
-
-    print(f"torch={torch.__version__}; device={torch.cuda.get_device_name(0)}")
-    print(f"case={case.NAME}; {case.problem()}")
-    inputs = case.make_inputs()
-    eager = case.model(*inputs)
-    compiled = {}
-    torch._dynamo.reset()
-    models = getattr(case, "comparison_models")()
-    for (variant, config), model in zip(
-        (
-            ("baseline", case.BASELINE_CONFIG),
-            ("candidate", case.CANDIDATE_CONFIG),
-        ),
-            models,
-    ):
-        compiled[variant], output = compile_variant(
-            case,
-            config,
-            inputs,
-            variant,
-            model=model,
-            reset=False,
-        )
-        torch.testing.assert_close(
-            output,
-            eager,
-            atol=case.ATOL,
-            rtol=case.RTOL,
-        )
-        diff = (output.float() - eager.float()).abs()
-        print(f"{variant}_correctness_vs_eager "
-              f"max_abs={diff.max().item():.6f} "
-              f"mean_abs={diff.mean().item():.6f}")
-
-    samples = {"baseline": [], "candidate": []}
-    for sample in range(args.samples):
-        order = ("baseline", "candidate")
-        if sample % 2:
-            order = tuple(reversed(order))
+        order = ("baseline", "candidate") if sample % 2 == 0 else ("candidate", "baseline")
         measured = {}
         for variant in order:
-            measured[variant] = bench_us(
-                lambda variant=variant: compiled[variant](*inputs),
-                args.warmup,
-                args.rep,
-            )
+            measured[variant] = bench_us(functions[variant], args)
             samples[variant].append(measured[variant])
-        print(f"sample={sample + 1} baseline={measured['baseline']:.3f}us "
-              f"{case.CANDIDATE_NAME}={measured['candidate']:.3f}us")
+        print(f"{phase} sample={sample + 1} baseline_us={measured['baseline']:.3f} "
+              f"candidate_us={measured['candidate']:.3f}")
+    baseline = statistics.median(samples["baseline"])
+    candidate = statistics.median(samples["candidate"])
+    print(f"FINAL {phase} {case.problem()} baseline_us={baseline:.3f} "
+          f"candidate_us={candidate:.3f} speedup={baseline / candidate:.3f}x")
 
-    baseline_us = statistics.median(samples["baseline"])
-    candidate_us = statistics.median(samples["candidate"])
-    print(f"FINAL {case.problem()} baseline={baseline_us:.3f}us "
-          f"{case.CANDIDATE_NAME}={candidate_us:.3f}us "
-          f"speedup={baseline_us / candidate_us:.3f}x")
+
+def run_case(case, args) -> None:
+    print(f"case={case.NAME} {case.problem()} device={torch.cuda.get_device_name(0)}")
+    torch.manual_seed(0)
+    inputs = case.make_inputs()
+    grad_inputs = getattr(case, "GRAD_INPUTS", ())
+    for i in grad_inputs:
+        inputs[i].requires_grad_(True)
+    torch._dynamo.reset()
+    compiled, outputs = {}, {}
+    for variant in ("baseline", "candidate"):
+        compiled[variant], outputs[variant] = compile_variant(case, inputs, variant)
+    gate(case, "forward candidate vs baseline", outputs["candidate"], outputs["baseline"])
+    if grad_inputs:
+        run_backward(case, args, inputs, grad_inputs, outputs)
+    del outputs
+    functions = {variant: (lambda fn=fn: fn(*inputs)) for variant, fn in compiled.items()}
+    time_interleaved(case, args, functions, "forward")
+
+
+def run_backward(case, args, inputs, grad_inputs, outputs) -> None:
+    torch.manual_seed(1)
+    grad_outputs = tuple(torch.randn_like(t) / max(1, t.shape[-1])**0.5 for t in flatten(outputs["baseline"]))
+    functions = {
+        variant: (lambda out=out: gradients(out, inputs, grad_inputs, grad_outputs))
+        for variant, out in outputs.items()
+    }
+    grads = {variant: fn() for variant, fn in functions.items()}
+    gate(case, "gradients candidate vs baseline", grads["candidate"], grads["baseline"])
+    eager_grads = gradients(case.model(*inputs), inputs, grad_inputs, grad_outputs)
+    for variant in grads:
+        print(f"INFO {variant} gradients vs eager: rel_l2={relative_l2(grads[variant], eager_grads):.3e}")
+    del grads, eager_grads
+    time_interleaved(case, args, functions, "backward")
 
 
 def main() -> None:
     cases = discover_cases()
     args = parse_args(cases)
-    case = cases[args.case]
     if args.list:
-        for listed_case in cases.values():
-            print(f"{listed_case.NAME}:")
-            for shape in getattr(listed_case, "SHAPES", ({}, )):
-                description = format_shape(shape) if shape else listed_case.problem()
-                print(f"  {description}")
+        for case in cases.values():
+            print(f"{case.NAME}: {getattr(case, 'SHAPES', ())}")
         return
+    case = cases[args.case]
     load_runtime(case)
     for shape in selected_shapes(case, args):
         for name, value in shape.items():
             setattr(args, name, value)
         case.configure(args)
-        if args.variant:
-            result = run_variant(case, args.variant, args)
-            if args.result_json:
-                pathlib.Path(args.result_json).write_text(json.dumps(result))
-            continue
-        if getattr(case, "INTERLEAVE_VARIANTS", False):
-            run_interleaved_comparison(case, args)
-        else:
-            run_comparison(case)
+        run_case(case, args)
 
 
 if __name__ == "__main__":

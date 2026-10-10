@@ -75,7 +75,7 @@ defaults `HIP_VISIBLE_DEVICES` to 4 — set it to a free GPU (`rocm-smi`) yourse
 - **`mi350-tlx-test`** — TLX unit tests (`python/test/unit/language/test_tlx_*.py`)
   + the tutorial correctness suite (`test_correctness.py`). AMD/IKBO run;
   Hopper/Blackwell and gfx1250 cases auto-skip.
-- **`mi350-meta-triton-test`** — TritonBench perf coverage (perf-regression lives
+- **`mi350-tritonbench-test`** — TritonBench perf coverage (perf-regression lives
   here, not in the perf scripts above).
 
 Nightly failures are filed as issues via `report-nightly-failure.yml`.

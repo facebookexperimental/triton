@@ -73,6 +73,7 @@ from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
     blackwell_gemm_ws_template,
+    hopper_gemm_ws_template,
     gfx942_addmm_template,
     gfx942_mm_template,
     gfx950_addmm_interwave_template,
@@ -815,6 +816,66 @@ def _candidate_scorer_evaluate(
             best_config["INTERLEAVE_EPILOGUE"] = 0
 
     return best_config
+
+
+@register_template_heuristic(
+    hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
+)
+class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
+    """Reuse the SM90 TLX ops configuration space for Inductor."""
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if not current_target().is_hopper or not isinstance(inputs, MMKernelInputs):
+            return False
+        if config.triton.tlx_mode not in ("allow", "force"):
+            return False
+        if any(mat.get_name() in V.graph.unaligned_buffers for mat in inputs.mat1mat2()):
+            return False
+        strides = inputs.strides_hinted()
+        for idx in (inputs._mat1_idx, inputs._mat2_idx):
+            if inputs.dtype(idx) not in (torch.float16, torch.bfloat16):
+                return False
+            inner = tma_inner_dim(strides[idx])
+            if inner is None or strides[idx][1 - inner] % 8:
+                return False
+        return inputs.dtype(inputs._mat1_idx) == inputs.dtype(inputs._mat2_idx)
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from triton.tlx.ops.kernels.mm.sm90 import (
+            CONFIGS,
+            _prune_full_configs,
+            heuristic_config,
+        )
+
+        m, n, k = kernel_inputs.mnk_hinted()
+        if min(m, n, k) <= 0:
+            return
+        configs = (
+            _prune_full_configs(CONFIGS(), {"N": n})
+            if config.triton.tlx_mode == "allow"
+            else heuristic_config(m, n, k)
+        )
+        strides = kernel_inputs.strides_hinted()
+        for conf in configs:
+            meta = conf.kwargs
+            yield {
+                "BLOCK_M": meta["BM"],
+                "BLOCK_N": meta["BN"],
+                "BLOCK_K": meta["BK"],
+                "BLOCK_M_SPLIT": meta["BM"] // meta["NUM_MMA_GROUPS"],
+                "slice_size": meta["BN"] // 4,
+                "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
+                "NUM_STAGES": meta["NUM_STAGES"],
+                "NUM_MMA_GROUPS": meta["NUM_MMA_GROUPS"],
+                "NUM_SMS": get_num_sms(),
+                "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
+                "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
+                "A_EVICTION": repr("evict_last" if n <= 1024 else ""),
+                "TMA_EPILOGUE_STORE": int(n % 8 == 0),
+                "num_stages": conf.num_stages,
+                "num_warps": conf.num_warps,
+                "ACC_TYPE": "tl.float32",
+            }
 
 
 class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):

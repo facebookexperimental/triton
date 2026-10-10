@@ -40,7 +40,7 @@ from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
 )
 import math
-from triton.language.extra.tlx.tutorials import amd_fa_varlen_bwd
+from triton.tlx.ops.kernels.flash_attn_varlen import gfx950_bwd as amd_fa_varlen_bwd
 from triton.tlx.ops.kernels.flash_attn import gfx950_bwd as amd_fa_bwd
 from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
     _D64DQLaunch,
@@ -1859,6 +1859,9 @@ def _amd_intra_wave_async_commit_kernel(
     future_ptr,
     output_ptr,
     side_output_ptr,
+    PAIR_ID: tl.constexpr,
+    COMMIT_IN_COMPUTE: tl.constexpr,
+    REPEAT_COMMIT: tl.constexpr,
 ):
     rows = tl.arange(0, 16)
     reduction = tl.arange(0, 32)
@@ -1869,20 +1872,33 @@ def _amd_intra_wave_async_commit_kernel(
     offsets = tl.arange(0, 128)
     buffers = tlx.local_alloc((128, ), tl.float16, 2)
 
-    with tlx.warp_pipeline_stage("future_loads", scope="intra_wave", pair=0):
+    if COMMIT_IN_COMPUTE:
         token0 = tlx.async_load(
             future_ptr + offsets,
             tlx.local_view(buffers, 0),
         )
+    with tlx.warp_pipeline_stage("future_loads", scope="intra_wave", pair=PAIR_ID):
+        if not COMMIT_IN_COMPUTE:
+            token0 = tlx.async_load(
+                future_ptr + offsets,
+                tlx.local_view(buffers, 0),
+            )
         token1 = tlx.async_load(
             future_ptr + 128 + offsets,
             tlx.local_view(buffers, 1),
         )
-        tlx.async_load_commit_group([token0, token1])
-    with tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=0):
+        if not COMMIT_IN_COMPUTE:
+            tlx.async_load_commit_group([token0, token1])
+            if REPEAT_COMMIT:
+                tlx.async_load_commit_group([token0, token1])
+    with tlx.warp_pipeline_stage("compute", scope="intra_wave", pair=PAIR_ID):
+        if COMMIT_IN_COMPUTE:
+            tlx.async_load_commit_group([token0])
         for _ in tl.static_range(2):
             acc = tl.dot(a, b, acc, allow_tf32=False)
 
+    if COMMIT_IN_COMPUTE:
+        tlx.async_load_commit_group([token1])
     tlx.async_load_wait_group(0)
     future0 = tlx.local_load(tlx.local_view(buffers, 0))
     future1 = tlx.local_load(tlx.local_view(buffers, 1))
@@ -3928,6 +3944,9 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
             "D": 128,
             "BLOCK_M": block_m,
             "BLOCK_N": block_n,
+            "KV_SPLITS": 1,
+            "PHASE_IGLP": -1,
+            "PEEL_CAUSAL": False,
         },
     )
 
@@ -4400,11 +4419,47 @@ def test_amd_intra_wave_pipeline_rejects_existing_schedule_hint_gfx950(use_iglp,
         )
 
 
-def test_amd_intra_wave_pipeline_rejects_async_commit_group_gfx950():
-    with pytest.raises(
-            RuntimeError,
-            match="intra-wave pipeline stage does not support async commit groups",
-    ):
+def test_amd_intra_wave_pipeline_keeps_paired_async_commit_group_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_intra_wave_async_commit_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "future_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "side_output_ptr": "*fp16",
+            "PAIR_ID": "constexpr",
+            "COMMIT_IN_COMPUTE": "constexpr",
+            "REPEAT_COMMIT": "constexpr",
+        },
+        constexprs={"PAIR_ID": 0, "COMMIT_IN_COMPUTE": False, "REPEAT_COMMIT": False},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("async_commit_group") == 1
+    groups = re.findall(r"rocdl\.sched\.group\.barrier ([a-z_]+), ([0-9]+),", ttgir)
+    assert groups == [
+        ("vmem_read", "1"),
+        ("ds_write", "1"),
+        ("mfma_wmma", "1"),
+        ("vmem_read", "1"),
+        ("ds_write", "1"),
+        ("mfma_wmma", "1"),
+    ], groups
+    assert "amdgcn" in compiled.asm
+
+
+@pytest.mark.parametrize(
+    "pair_id,commit_in_compute,repeat_commit,message",
+    [
+        (None, False, False, "async commit groups require a paired intra-wave memory stage"),
+        (0, True, False, "async commit groups require a paired intra-wave memory stage"),
+        (0, False, True, "async commit group must follow schedulable memory work"),
+    ],
+    ids=["unpaired", "compute-stage", "unanchored"],
+)
+def test_amd_intra_wave_pipeline_rejects_misplaced_async_commit_group_gfx950(pair_id, commit_in_compute, repeat_commit,
+                                                                             message):
+    with pytest.raises(RuntimeError, match=message):
         compile_for_gfx950(
             _amd_intra_wave_async_commit_kernel,
             signature={
@@ -4413,8 +4468,15 @@ def test_amd_intra_wave_pipeline_rejects_async_commit_group_gfx950():
                 "future_ptr": "*fp16",
                 "output_ptr": "*fp32",
                 "side_output_ptr": "*fp16",
+                "PAIR_ID": "constexpr",
+                "COMMIT_IN_COMPUTE": "constexpr",
+                "REPEAT_COMMIT": "constexpr",
             },
-            constexprs={},
+            constexprs={
+                "PAIR_ID": pair_id,
+                "COMMIT_IN_COMPUTE": commit_in_compute,
+                "REPEAT_COMMIT": repeat_commit,
+            },
         )
 
 

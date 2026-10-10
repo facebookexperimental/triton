@@ -595,13 +595,17 @@ void init_triton_tlx_ir(py::module_ &m) {
                  static_cast<ttng::TensorMemoryCTAMode>(ctaMode)));
            })
       .def("make_tensor_memory_scales_encoding_attr",
-           [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN) {
+           [](TritonOpBuilder &self, unsigned CTASplitM, unsigned CTASplitN,
+              unsigned ctaMode) {
              auto context = self.getBuilder().getContext();
              llvm::SmallVector<unsigned, 2> splits = {CTASplitM, CTASplitN};
              llvm::SmallVector<unsigned, 2> order = {0, 1};
              auto cgaLayout = makeCGALayout(context, splits, splits, order);
              return mlir::cast<Attribute>(
-                 ttng::TensorMemoryScalesEncodingAttr::get(context, cgaLayout));
+                 ttng::TensorMemoryScalesEncodingAttr::get(
+                     context, cgaLayout,
+                     ttng::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
+                     static_cast<ttng::TensorMemoryCTAMode>(ctaMode)));
            })
       .def("make_nv_mma_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,

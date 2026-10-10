@@ -461,7 +461,7 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         # from the for-loop optimization pipeline (software pipelining, etc.) that
         # doesn't run on `scf.while`. Hence the checked IR below is a for loop
         # carrying `arange`; the name-loc prefixes are preserved through the uplift.
-        # CHECK: %ivar_[[IV0:.+]] = scf.for %ivar_[[IV1:.+]] = %ivar to %N step %c1_i32 iter_args(%arange_[[AR0:.+]] = %arange) -> (tensor<16xi32>) : i32 {
+        # CHECK: %ivar = scf.for %ivar_[[IV1:.+]] = %c0_i32 to %N step %c1_i32 iter_args(%arange_[[AR0:.+]] = %arange) -> (tensor<16xi32>) : i32 {
         while ivar < N:
             # CHECK: %ivar_[[IV2:.+]] = arith.addi %ivar_[[IV1]], %c1_i32 : i32
             ivar += 1
@@ -470,7 +470,7 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
             # CHECK: scf.yield %arange_[[AR2]] : tensor<16xi32>
             arange *= ivar
 
-        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]] : tensor<16xi32>
+        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar : tensor<16xi32>
         tl.device_print("", arange)
 
     h = triton.compile(triton.compiler.ASTSource(fn=kernel_basic_while, signature={"N": "i32"}, constexprs={}))

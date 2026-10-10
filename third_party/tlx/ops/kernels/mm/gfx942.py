@@ -563,6 +563,9 @@ def heuristic_config(M, N, K):
     # Small-M workloads with both a narrow output and deep K favor a compact tile with a long K step.
     if M <= 384 and N <= 2048:
         return [_config(64, 64, 256, 4, 8)]
+    # Small-M, wide-output reductions with deep K favor the measured 64-square tile with a K=256 step.
+    if M <= 256 and N >= 4096 and K >= 4096:
+        return [_config(64, 64, 256, 4, 8)]
     # Remaining small-M workloads favor a rectangular tile that limits masked rows while retaining N reuse.
     if M <= 384:
         return [_config(64, 128, 128, 4, 8)]
@@ -599,6 +602,26 @@ def heuristic_config(M, N, K):
     # Other M-near-4096 matrices favor a wide N tile and four-wave scheduling.
     if M <= 4096:
         return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
+    # Tall deep-reduction workloads need output-width-specific choices because the measured 256-square default has substantial regret.
+    if K > 256:
+        # Outputs wider than 256 with K-dominant reductions use the measured rectangular winner.
+        if N > 256 and K > N:
+            return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]
+        # At most 32 output columns favor the measured 32-column tile without padding to a square output block.
+        if N <= 32:
+            return [_config(128, 32, 64, 8, 4)]
+        # Up to 48 output columns favor the measured 128-row, 64-column tile with eight waves.
+        if N <= 48:
+            return [_config(128, 64, 64, 4, 8)]
+        # Outputs between 49 and 64 columns favor the measured four-wave 64-square configuration.
+        if N <= 64:
+            return [_config(64, 64, 64, 4, 4)]
+        # At most 128 output columns favor the measured four-wave square tile with a short K step.
+        if N <= 128:
+            return [_config(128, 128, 32, 8, 4)]
+        # Outputs between 129 and 256 columns favor the measured 64-column tile across multiple output blocks.
+        if N <= 256:
+            return [_config(128, 64, 64, 4, 8)]
     # Very large M with shallow K favors a wide N tile to reduce the number of output workgroups.
     if M >= 1048576:
         return [_config(128, 256, 32, 16, 4, waves_per_eu=2)]

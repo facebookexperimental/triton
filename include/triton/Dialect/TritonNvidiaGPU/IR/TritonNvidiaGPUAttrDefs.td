@@ -164,17 +164,22 @@ def TTG_TensorMemoryScalesEncodingAttr
     non-K dimension. When one MMA instruction consumes only one scale block along K, the value of this parameter
     does not matter. Otherwise, it must match the hardware instruction layout. For example, Rubin NVFP4 A scales
     with `BLOCK_M = 256` require `kThenMn`, while B scales keep the default `mnThenK`.
+    `ctaMode = twocta_rhs` represents B scales for the M=128 cta_group::2 Layout-B data path. It moves the high N
+    basis from TMEM columns to row partition 64 while keeping row partition 32 broadcast.
   }];
   let parameters =
       (ins TTNG_CGALayoutRankTwoParam:$CGALayout,
           DefaultValuedParameter<
               "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder",
               "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_"
-              "THEN_K">:$blockRepOrder);
+              "THEN_K">:$blockRepOrder,
+          DefaultValuedParameter<"TensorMemoryCTAMode",
+                                 "TensorMemoryCTAMode::DEFAULT">:$ctaMode);
   let builders = [AttrBuilder<
       (ins "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout), [{
       return get(context, CGALayout,
-                 ::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K);
+                 ::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K,
+                 ::mlir::triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
     }]>];
   let genVerifyDecl = 1;
   let assemblyFormat = "`<` struct(params) `>`";

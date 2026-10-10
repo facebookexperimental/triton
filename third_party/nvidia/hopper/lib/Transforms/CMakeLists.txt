@@ -83,4 +83,5 @@ add_triton_library(NVHopperTransforms
   TritonGPUIR
   MLIRTransformUtils
   TritonGPUModuloCore
+  TritonNVIDIAGPUToLLVM
 )

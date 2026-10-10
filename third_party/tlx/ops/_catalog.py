@@ -30,6 +30,7 @@ class OpSpec:
     accepts: Optional[Callable[[Mapping[str, Any]], bool]] = None
     requires: frozenset = frozenset()
     supports_backward: bool = False
+    default_space: str = "heuristic"  # used when the caller passes space=None
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -50,6 +51,8 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
         requires=frozenset({"tma"}),
+        # The full space is only 8 configs (seconds to tune) and beats the heuristic on tall shapes.
+        default_space="full",
     ),
     OpSpec(
         op="mm",
@@ -141,6 +144,15 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_torchtlx",
+        arch="sm90",
+        variant="inductor_hopper_gemm_ws",
+        impl="triton.language.extra.tlx.inductor.sm100_torch:mm",
+        dtypes=_FP16,
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        requires=frozenset({"tma"}),
+    ),
+    OpSpec(
         # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
         # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
         op="mm_torchtlx",
@@ -224,6 +236,23 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset(),
         supports_backward=True,
+    ),
+    OpSpec(
+        op="prepare_flash_attn_varlen_backward",
+        arch="gfx950",
+        variant="host_validated",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:prepare_varlen_backward",
+        dtypes=frozenset({"int32"}),
+    ),
+    OpSpec(
+        op="flash_attn_varlen_backward",
+        arch="gfx950",
+        variant="prepared",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.gfx950_bwd:fa_varlen_backward",
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        # Explicit first-order gradients; differentiating this op is unsupported.
+        supports_backward=False,
     ),
     OpSpec(
         op="flash_attn_mxfp8",

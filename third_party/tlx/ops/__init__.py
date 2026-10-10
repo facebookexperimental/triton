@@ -20,7 +20,9 @@ choosing another space. `mm` and `addmm` also accept `out=` for implementations
 that support a preallocated output.
 
 `space=` defaults to "heuristic" -- a single config chosen analytically -- for
-any op that offers one, so that a first call stays interactive. Measured on
+any op that offers one, so that a first call stays interactive. The exception
+is `mm` on sm90, whose full space is only 8 configs; it defaults to "full".
+Measured on
 B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache (348 configs
 compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
 tens of GB of autotune workspaces; at "heuristic" the same call is under a
@@ -39,6 +41,12 @@ An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch. A forward-only implementation raises
 `UnsupportedBackward` before launch when autograd is enabled and any supported
 tensor input requires gradients; inference under `torch.no_grad()` is allowed.
+
+`prepare_flash_attn_varlen_backward` and `flash_attn_varlen_backward` expose
+explicit first-order attention gradients from an existing forward result.
+Prepare the immutable sequence plan once, then reuse it for backward calls;
+this explicit API accepts inputs requiring gradients but does not build an
+autograd graph for higher-order derivatives.
 """
 
 from __future__ import annotations
@@ -48,19 +56,20 @@ from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_ba
 __all__ = [
     "mm", "mm_mxfp8", "grouped_gemm", "grouped_gemm_mxfp8", "addmm", "flash_attn", "flash_attn_mxfp8",
     "flash_attn_varlen", "hstu_attn_dev", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput"
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
+    "InvalidInput"
 ]
 
 
-def mm(a, b, *, out=None, space="heuristic"):
+def mm(a, b, *, out=None, space=None):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     This op is currently forward-only.
 
-    Defaults to a single analytically chosen config so the first call stays
-    interactive. Pass `space="full"` to implementations that expose a full
-    autotune space; unsupported spaces raise `InvalidInput`. See the module
-    docstring.
+    `space=None` uses the implementation's default: "full" on sm90, otherwise
+    a single analytically chosen config so the first call stays interactive.
+    Pass `space="full"` to implementations that expose a full autotune space;
+    unsupported spaces raise `InvalidInput`. See the module docstring.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -82,6 +91,8 @@ def mm(a, b, *, out=None, space="heuristic"):
         check_inputs(spec, dtype=a.dtype, M=a.shape[0], N=b.shape[1], K=a.shape[1],
                      row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]), elem_bytes=a.element_size())
     check_backward(spec, a, b)
+    if space is None:
+        space = spec.default_space
     if out is None:
         return fn(a, b, space=space)
     return fn(a, b, out=out, space=space)
@@ -399,6 +410,86 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     import torch
     with torch.cuda.device(q.device):
         return fn(q, k, v, causal, sm_scale, space=space)
+
+
+def prepare_flash_attn_varlen_backward(cu_seqlens_q, cu_seqlens_k):
+    """Prepare reusable packed-attention backward metadata from int32 offsets.
+
+    The two rank-1 CUDA tensors must describe the same nonempty batch. Their
+    offsets must start at zero and be strictly increasing; empty sequences
+    are unsupported. Preparation copies offsets into plan-owned storage and
+    synchronizes to validate them and determine compact workspace sizes.
+    Call this once outside CUDA graph capture, then reuse the returned plan.
+
+    Prepare and consume the plan on the same CUDA stream. Treat every tensor
+    owned by the plan as immutable; the caller's original offsets may be
+    modified after preparation. The plan also enables eligible compact dS
+    backward implementations without repeating host synchronization.
+    """
+    import torch
+
+    for name, offsets in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
+        if not isinstance(offsets, torch.Tensor) or offsets.ndim != 1 or offsets.numel() < 2:
+            raise InvalidInput(f"{name} must be a rank-1 tensor with at least two elements")
+        if offsets.dtype is not torch.int32:
+            raise InvalidInput(f"{name} must have dtype torch.int32")
+    if cu_seqlens_q.device != cu_seqlens_k.device:
+        raise InvalidInput("cu_seqlens_q and cu_seqlens_k must be on the same device")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise InvalidInput("cu_seqlens_q and cu_seqlens_k must describe the same batch")
+    fn, spec = impl_for("prepare_flash_attn_varlen_backward", device=cu_seqlens_q.device)
+    check_inputs(spec, dtype=cu_seqlens_q.dtype)
+    with torch.cuda.device(cu_seqlens_q.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise InvalidInput("prepare_flash_attn_varlen_backward must run outside CUDA graph capture")
+        try:
+            return fn(cu_seqlens_q, cu_seqlens_k)
+        except (TypeError, ValueError) as error:
+            raise InvalidInput(f"tlx.ops.prepare_flash_attn_varlen_backward: {error}") from error
+
+
+def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=False, *, dq_atomic_fp32=True):
+    """Return explicit first-order dQ/dK/dV for packed BF16 D128 attention.
+
+    Q/K/V use ``(tokens, heads, head_dim)`` order. Supply the existing forward
+    output ``o``, its gradient ``do``, and contiguous natural-log softmax LSE
+    with shape ``(query_heads, query_tokens)`` and dtype FP32. The forward
+    must use the same scale and causal flag, with no dropout or local window.
+    ``sm_scale`` defaults to ``head_dim ** -0.5``.
+
+    Use a plan returned by :func:`prepare_flash_attn_varlen_backward` on the
+    same device and CUDA stream, and do not modify its tensors. Noncausal
+    MHA/GQA allows independent Q/KV lengths. Causal attention requires MHA
+    with identical Q/KV sequence offsets. Q/K/O/dO must be contiguous. V must
+    be contiguous in noncausal mode; causal V may have a larger token stride
+    when its head and head-dimension axes remain dense.
+
+    Inputs may require gradients. This call builds no autograd graph and its
+    BF16 gradient outputs do not support higher-order differentiation.
+    Deterministic algorithms are unsupported. dQ accumulation uses FP32 by
+    default; ``dq_atomic_fp32=False`` selects the BF16 accumulation path.
+    Eligible eager calls may allocate an optional materialized-dS workspace;
+    CUDA graph capture or its allocation OOM uses the existing atomic route.
+    """
+    import torch
+
+    tensors = (q, k, v, o, do, lse)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise InvalidInput("flash_attn_varlen_backward expects tensor Q/K/V/O/dO/LSE inputs")
+    if any(tensor.ndim != 3 for tensor in (q, k, v, o, do)):
+        raise InvalidInput("flash_attn_varlen_backward expects rank-3 packed THD Q/K/V/O/dO tensors")
+    if any(tensor.device != q.device for tensor in tensors):
+        raise InvalidInput("flash_attn_varlen_backward inputs must be on the same device")
+    if torch.are_deterministic_algorithms_enabled():
+        raise UnsupportedOp("flash_attn_varlen_backward does not provide deterministic gradients")
+    fn, spec = impl_for("flash_attn_varlen_backward", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    scale = q.shape[-1]**-0.5 if sm_scale is None else sm_scale
+    with torch.cuda.device(q.device), torch.no_grad():
+        try:
+            return fn(q, k, v, o, do, lse, plan, scale, causal, dq_atomic_fp32=dq_atomic_fp32)
+        except (TypeError, ValueError) as error:
+            raise InvalidInput(f"tlx.ops.flash_attn_varlen_backward: {error}") from error
 
 
 def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
