@@ -76,7 +76,8 @@ kernels/
 `[batch, heads, sequence, 128]` shapes and a positive sequence length divisible
 by 256. Each head must contain fewer than `2**31` elements. Both causal and
 noncausal backward return BF16 gradients, accumulate in FP32, and avoid atomics.
-Training uses hardware exp2 and saves the matching base-2 logsumexp.
+Training uses hardware exp2 and saves the row maximum and log2 normalization
+term separately. Backward preserves both terms when it reconstructs probabilities.
 
 Q/K use E4M3 payloads with E8M0 scales per 32×32 block, as in current Blackwell.
 The general backward requantizes operands for their reduction axes and uses

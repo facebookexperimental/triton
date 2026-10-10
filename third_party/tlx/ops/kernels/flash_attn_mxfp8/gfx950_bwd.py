@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from .gfx950_quant import _scale_exponent
+from .gfx950_quant import _centered_log_probs, _scale_exponent
 
 
 @triton.jit
@@ -79,7 +79,7 @@ def _stage_query_inputs(qmem, domem, qdkmem, dodvmem, Q, DO, QDK, DODV, base, st
 @triton.jit
 def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Delta, DK, DV, N, sm_scale,
                   D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
-                  EVEN_N: tl.constexpr):
+                  EVEN_N: tl.constexpr, LSE_SPLIT: tl.constexpr = False):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     key_tile = tl.program_id(1)
     head = tl.program_id(0).to(tl.int64)
@@ -119,7 +119,12 @@ def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Del
         dos = tl.load(DOS + sbase + queries[:, None] * (D // 32) + sd[None, :], EVEN_N | (queries[:, None] < N), 127)
         scores = tlx.dot_scaled(k, ks, "e4m3", q.T, qs, "e4m3")
         lse = tl.load(LSE + head * N + queries, EVEN_N | (queries < N), 0)
-        logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
+        if LSE_SPLIT:
+            plane = tl.num_programs(0).to(tl.int64) * N
+            log_norm = tl.load(LSE + plane + head * N + queries, EVEN_N | (queries < N), 0)
+            logits = _centered_log_probs(scores, lse[None, :], log_norm[None, :], sm_scale)
+        else:
+            logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
         valid = (EVEN_N | (keys[:, None] < N)) & (EVEN_N | (queries[None, :] < N))
         if CAUSAL:
             valid = valid & (keys[:, None] <= queries[None, :])
@@ -152,7 +157,7 @@ def _bwd_kv_owner(Q, QDK, K, V, DO, DODV, QS, QDKS, KS, VS, DOS, DODVS, LSE, Del
 @triton.jit
 def _bwd_q_owner(Q, K, KDQ, V, DO, QS, KS, KDQS, VS, DOS, LSE, Delta, DQ, N, sm_scale, D: tl.constexpr,
                  BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, SEQ_K_CONTIG: tl.constexpr,
-                 EVEN_N: tl.constexpr):
+                 EVEN_N: tl.constexpr, LSE_SPLIT: tl.constexpr = False):
     """One CTA owns the complete dQ reduction for BM queries."""
     queries = tl.program_id(0) * BM + tl.arange(0, BM)
     head = tl.program_id(1).to(tl.int64)
@@ -167,6 +172,9 @@ def _bwd_q_owner(Q, K, KDQ, V, DO, QS, KS, KDQS, VS, DOS, LSE, Delta, DQ, N, sm_
     qs = tl.load(QS + sbase + queries[:, None] * (D // 32) + sd[None, :], EVEN_N | (queries[:, None] < N), 127)
     dos = tl.load(DOS + sbase + queries[:, None] * (D // 32) + sd[None, :], EVEN_N | (queries[:, None] < N), 127)
     lse = tl.load(LSE + head * N + queries, EVEN_N | (queries < N), 0)
+    if LSE_SPLIT:
+        plane = tl.num_programs(1).to(tl.int64) * N
+        log_norm = tl.load(LSE + plane + head * N + queries, EVEN_N | (queries < N), 0)
     delta = tl.load(Delta + head * N + queries, EVEN_N | (queries < N), 0)
     dq = tl.full((BM, D), 0.0, tl.float32)
     kmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1)
@@ -195,7 +203,10 @@ def _bwd_q_owner(Q, K, KDQ, V, DO, QS, KS, KDQS, VS, DOS, LSE, Delta, DQ, N, sm_
         ks = tl.load(KS + sbase + keys[:, None] * (D // 32) + sd[None, :], EVEN_N | (keys[:, None] < N), 127)
         vs = tl.load(VS + sbase + keys[:, None] * (D // 32) + sd[None, :], EVEN_N | (keys[:, None] < N), 127)
         scores = tlx.dot_scaled(q, qs, "e4m3", k.T, ks, "e4m3")
-        logits = scores * (sm_scale * 1.4426950408889634) - lse[:, None]
+        if LSE_SPLIT:
+            logits = _centered_log_probs(scores, lse[:, None], log_norm[:, None], sm_scale)
+        else:
+            logits = scores * (sm_scale * 1.4426950408889634) - lse[:, None]
         valid = (EVEN_N | (queries[:, None] < N)) & (EVEN_N | (keys[None, :] < N))
         if CAUSAL:
             valid = valid & (queries[:, None] >= keys[None, :])
@@ -214,7 +225,8 @@ def _bwd_q_owner(Q, K, KDQ, V, DO, QS, KS, KDQS, VS, DOS, LSE, Delta, DQ, N, sm_
 
 
 def launch_backward(do, do_dv, q, q_dk, k, k_dq, v, o, lse, q_scale, q_dk_scale, k_scale, k_dq_scale, v_scale, do_scale,
-                    do_dv_scale, sm_scale, do_bf16, dq, dk, dv, delta, causal=False, block_m=64, block_n=128):
+                    do_dv_scale, sm_scale, do_bf16, dq, dk, dv, delta, causal=False, block_m=64, block_n=128,
+                    lse_split=False):
     """Launch deterministic owners into preallocated outputs.
 
     Public validation constrains this gfx950 kernel to dense MHA, D128 and
@@ -230,6 +242,9 @@ def launch_backward(do, do_dv, q, q_dk, k, k_dq, v, o, lse, q_scale, q_dk_scale,
         raise ValueError("gfx950 MXFP8 backward requires per-head N*D < 2**31")
     if not math.isfinite(sm_scale):
         raise ValueError("gfx950 MXFP8 backward requires a finite sm_scale")
+    lse_shape = (2, b, h, n) if lse_split else (b, h, n)
+    if lse.shape != lse_shape or delta.shape != (b, h, n):
+        raise ValueError("gfx950 MXFP8 backward requires matching softmax statistics and Delta shapes")
     assert block_m in (32, 64, 128) and block_n in (64, 128)
     seq_k_contig = q_dk.stride(-2) == 1
     assert all((x.stride(-2) == 1) == seq_k_contig for x in (k_dq, do_dv))
@@ -238,10 +253,12 @@ def launch_backward(do, do_dv, q, q_dk, k, k_dq, v, o, lse, q_scale, q_dk_scale,
     kv_kernel = _bwd_kv_owner[(b * h, triton.cdiv(n, block_n))](q, q_dk, k, v, do, do_dv, q_scale, q_dk_scale, k_scale,
                                                                 v_scale, do_scale, do_dv_scale, lse, delta, dk, dv, n,
                                                                 sm_scale, D=d, BM=block_m, BN=block_n, CAUSAL=causal,
-                                                                SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n, num_warps=4,
-                                                                num_stages=1, matrix_instr_nonkdim=32)
+                                                                SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n,
+                                                                LSE_SPLIT=lse_split, enable_fp_fusion=not lse_split,
+                                                                num_warps=4, num_stages=1, matrix_instr_nonkdim=32)
     _bwd_q_owner[(triton.cdiv(n, block_n), b * h)](q, k, k_dq, v, do, q_scale, k_scale, k_dq_scale, v_scale, do_scale,
                                                    lse, delta, dq, n, sm_scale, D=d, BM=block_n, BN=block_m,
-                                                   CAUSAL=causal, SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n, num_warps=4,
+                                                   CAUSAL=causal, SEQ_K_CONTIG=seq_k_contig, EVEN_N=even_n,
+                                                   LSE_SPLIT=lse_split, enable_fp_fusion=not lse_split, num_warps=4,
                                                    num_stages=1, matrix_instr_nonkdim=32)
     return kv_kernel

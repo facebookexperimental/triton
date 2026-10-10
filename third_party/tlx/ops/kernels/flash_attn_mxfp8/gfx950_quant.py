@@ -10,6 +10,18 @@ import triton.language as tl
 
 
 @triton.jit
+def _rounded_mul(x, y):
+    # Split-statistics launches disable FP fusion to round this product separately.
+    return x * y
+
+
+@triton.jit
+def _centered_log_probs(scores, row_max, log_norm, sm_scale):
+    scaled = _rounded_mul(scores, sm_scale * 1.4426950408889634)
+    return (scaled - row_max) - log_norm
+
+
+@triton.jit
 def _scale_exponent(amax):
     # RCEIL(float32(amax * (1 / 448))) as an E8M0 byte. Since
     # 448 = 1.75 * 2**8, the mantissa cutoff is 0x600000; adding

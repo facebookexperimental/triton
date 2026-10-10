@@ -27,8 +27,8 @@ within the error of rounding P to E4M3 (up to 6.25%).
 ``_launch_quantized(..., fast_exp=False)`` runs the kernel with the hardware
 exp instead.
 
-Training uses the hardware-exp loop kernel and saves its base-2 logsumexp
-before P quantization. Backward uses native scaled MFMA for all five unique
+Training uses the hardware-exp loop kernel and saves separate FP32 row maxima
+and log2 normalization terms. Backward uses native scaled MFMA for all five unique
 products, fixed-scale P and transpose-compatible 32x32 dS quantization.
 The general path uses separate Q and KV owners that recompute QK and dP.
 For contiguous B4/H32/D128 MHA at scale 0.5 and N=1024/2048/4096/8192,
@@ -50,7 +50,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from .gfx950_quant import _decode_scale, _scale_exponent
+from .gfx950_quant import _decode_scale, _rounded_mul, _scale_exponent
 from .gfx950_bwd_shared import _saved_qk_arena_segments
 
 _FP8 = torch.float8_e4m3fn
@@ -168,6 +168,7 @@ def _fa_loop(
     MASK_N: tl.constexpr,
     CAUSAL_MASK: tl.constexpr,
     NEGATIVE_SCALE: tl.constexpr,
+    CENTER_LOGITS: tl.constexpr = False,
 ):
     offs_d = tl.arange(0, HEAD_DIM)
     offs_s = tl.arange(0, SCALE_K)
@@ -189,21 +190,20 @@ def _fa_loop(
         vb_mask = offs_vb[None, :] < tl.cdiv(N_CTX, 32)
         vs = tl.load(vs_ptr + offs_vb[None, :] * stride_vsn + offs_d[:, None], mask=vb_mask, other=127)
         qk = tl.dot_scaled(q, q_scale, "e4m3", k, ks, "e4m3", fast_math=True)
-        if NEGATIVE_SCALE:
-            # Multiplication reverses extrema for a negative scale. Scale
-            # first, then apply the mask in logit units before reducing max.
-            qk = qk * qk_scale
+        if CENTER_LOGITS or NEGATIVE_SCALE:
+            # Scale before masking to handle zero scales and large negative scores.
+            qk = _rounded_mul(qk, qk_scale) if CENTER_LOGITS else qk * qk_scale
         if CAUSAL_MASK or MASK_N:
             valid = offs_m[:, None] >= offs_n[None, :] if CAUSAL_MASK else offs_m[:, None] < N_CTX
             if MASK_N:
                 valid = valid & (offs_n[None, :] < N_CTX)
             if CAUSAL_MASK:
                 valid = valid & (offs_m[:, None] < N_CTX)
-            qk = tl.where(valid, qk, -float("inf") if NEGATIVE_SCALE else -1.0e6)
-        # qk_scale takes the scores to log2 units: the block maxima are scaled
-        # directly, each score inside the exp argument.
+            qk = tl.where(valid, qk, -float("inf") if CENTER_LOGITS or NEGATIVE_SCALE else -1.0e6)
+        # Split launches and negative-scale launches already use logit units.
+        # Other launches scale block maxima here and scores inside exp.
         qk = tl.reshape(qk, (BLOCK_M, BLOCK_N // 32, 32))
-        if NEGATIVE_SCALE:
+        if CENTER_LOGITS or NEGATIVE_SCALE:
             tmax = tl.max(qk, 2)
         else:
             tmax = tl.max(qk, 2) * qk_scale
@@ -211,7 +211,10 @@ def _fa_loop(
         # P to MXFP8: a block's max P is exp2(its max score - m).
         # The scale's exponent joins the exp argument, so P comes out divided by it.
         byte = _mx_scale(tl.math.exp2(tmax - m_ij[:, None]))
-        if NEGATIVE_SCALE:
+        if CENTER_LOGITS:
+            centered = qk - m_ij[:, None, None]
+            p = tl.math.exp2(centered - (byte - 127).to(tl.float32)[:, :, None])
+        elif NEGATIVE_SCALE:
             p = tl.math.exp2(qk - (m_ij[:, None] + (byte - 127).to(tl.float32))[:, :, None])
         else:
             p = tl.math.exp2(qk * qk_scale - (m_ij[:, None] + (byte - 127).to(tl.float32))[:, :, None])
@@ -273,6 +276,7 @@ def _mxfp8_fa_fwd(
     EVEN_N: tl.constexpr,
     SAVE_LSE: tl.constexpr,
     NEGATIVE_SCALE: tl.constexpr,
+    LSE_SPLIT: tl.constexpr = False,
 ):
     SCALE_K: tl.constexpr = HEAD_DIM // 32
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
@@ -284,6 +288,9 @@ def _mxfp8_fa_fwd(
     offs_d = tl.arange(0, HEAD_DIM)
     offs_s = tl.arange(0, SCALE_K)
     row_mask = offs_m < N_CTX
+    if LSE_SPLIT:
+        # Use the same FP32 coefficient calculation as backward.
+        qk_scale = qk_scale * 1.4426950408889634
 
     q = tl.load(Q + off_z * stride_qb + off_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
                 mask=row_mask[:, None], other=0.0)
@@ -300,21 +307,27 @@ def _mxfp8_fa_fwd(
         acc, l_i, m_i = _fa_loop(acc, l_i, m_i, q, q_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, stride_kn, stride_kd,
                                  stride_ksn, stride_vn, stride_vd, stride_vsn, offs_m, 0, start_m * BLOCK_M, N_CTX,
                                  qk_scale, HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, False, False,
-                                 NEGATIVE_SCALE)
+                                 NEGATIVE_SCALE, CENTER_LOGITS=LSE_SPLIT)
         diag_hi = tl.minimum(start_m * BLOCK_M + BLOCK_M, N_CTX)
         acc, l_i, m_i = _fa_loop(acc, l_i, m_i, q, q_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, stride_kn, stride_kd,
                                  stride_ksn, stride_vn, stride_vd, stride_vsn, offs_m, start_m * BLOCK_M, diag_hi,
                                  N_CTX, qk_scale, HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, True, True,
-                                 NEGATIVE_SCALE)
+                                 NEGATIVE_SCALE, CENTER_LOGITS=LSE_SPLIT)
     else:
         acc, l_i, m_i = _fa_loop(acc, l_i, m_i, q, q_scale, k_ptr, v_ptr, ks_ptr, vs_ptr, stride_kn, stride_kd,
                                  stride_ksn, stride_vn, stride_vd, stride_vsn, offs_m, 0, N_CTX, N_CTX, qk_scale,
-                                 HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, not EVEN_N, False, NEGATIVE_SCALE)
+                                 HEAD_DIM, SCALE_K, BLOCK_M, BLOCK_N, NUM_STAGES, not EVEN_N, False, NEGATIVE_SCALE,
+                                 CENTER_LOGITS=LSE_SPLIT)
     out = tl.where(l_i[:, None] > 0, acc / l_i[:, None], 0)
     tl.store(Out + off_z * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
              out.to(tl.bfloat16), mask=row_mask[:, None])
     if SAVE_LSE:
-        tl.store(LSE + off_hz * N_CTX + offs_m, m_i + tl.log2(l_i), row_mask)
+        if LSE_SPLIT:
+            plane = tl.num_programs(1).to(tl.int64) * N_CTX
+            tl.store(LSE + off_hz * N_CTX + offs_m, m_i, row_mask)
+            tl.store(LSE + plane + off_hz * N_CTX + offs_m, tl.log2(l_i), row_mask)
+        else:
+            tl.store(LSE + off_hz * N_CTX + offs_m, m_i + tl.log2(l_i), row_mask)
 
 
 # Padded LDS layouts the AMD pipeliner picks for these FP8 dot operands with
@@ -999,7 +1012,7 @@ def quantize_mxfp8_v(v, *, transposed=False):
 
 
 def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True,
-                      return_lse=False):
+                      return_lse=False, split_lse=False):
     """Launch on already-quantized inputs: ``q_fp8`` and ``q_scale`` from
     ``quantize_mxfp8_head(q)``, K from ``quantize_mxfp8_head(k,
     pack_k=pingpong)`` and V from ``quantize_mxfp8_v(v, transposed=pingpong)``,
@@ -1008,11 +1021,15 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
     ``fast_exp=False`` uses the hardware exp. ``return_lse=True`` selects
     the hardware-exp loop kernel and returns ``(output, base2_lse)``; it
     requires unpacked K scales and non-transposed V, regardless of causal.
+    ``split_lse=True`` returns FP32 ``[2,B,H,N]`` row maxima and log2
+    normalization terms instead of their sum.
     Nonpositive scales also require that loop-kernel layout."""
     if not math.isfinite(sm_scale):
         raise ValueError("gfx950 flash_attn_mxfp8 expects a finite sm_scale")
     batch, heads, n_ctx, _ = q_fp8.shape
-    qk_scale = sm_scale * _LOG2E
+    if split_lse and not return_lse:
+        raise ValueError("Split softmax statistics require return_lse=True")
+    qk_scale = sm_scale if split_lse else sm_scale * _LOG2E
     out = torch.empty(q_fp8.shape, device=q_fp8.device, dtype=torch.bfloat16)
     cfg = _default_config(causal, n_ctx, training=return_lse or sm_scale <= 0)
     if cfg["pingpong"]:
@@ -1081,7 +1098,8 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         _mxfp8_fa_fwd_pingpong[grid](*args, **kwargs)
         return out
     grid = (triton.cdiv(n_ctx, cfg["block_m"]), batch * heads)
-    lse = torch.empty((batch, heads, n_ctx), device=q_fp8.device, dtype=torch.float32) if return_lse else None
+    lse_shape = (2, batch, heads, n_ctx) if split_lse else (batch, heads, n_ctx)
+    lse = torch.empty(lse_shape, device=q_fp8.device, dtype=torch.float32) if return_lse else None
     v_scale = v_scale.contiguous()
     _mxfp8_fa_fwd[grid](
         q_fp8,
@@ -1128,6 +1146,8 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         EVEN_N=(n_ctx % cfg["block_n"] == 0),
         SAVE_LSE=return_lse,
         NEGATIVE_SCALE=sm_scale < 0,
+        LSE_SPLIT=split_lse,
+        enable_fp_fusion=not split_lse,
         num_warps=cfg["num_warps"],
         num_stages=1,
         llvm_fn_attrs=(("amdgpu-ieee", "false"), ),
@@ -1143,9 +1163,9 @@ _PUBLIC_QK_ARENA_LENGTHS = (1024, 2048)
 _PUBLIC_QK_FORWARD_HELPERS = tuple(
     (name, _forward_helper_contract(globals()[name]))
     for name in ("quantize_mxfp8_head", "quantize_mxfp8_v", "_launch_quantized", "_default_config"))
-_PUBLIC_QK_JIT_HELPERS = tuple(
-    (name, globals()[name], globals()[name].src)
-    for name in ("_quantize_mxfp8_kernel", "_mxfp8_fa_fwd", "_mx_scale", "_decode_scale", "_scale_exponent"))
+_PUBLIC_QK_JIT_HELPERS = tuple((name, globals()[name], globals()[name].src)
+                               for name in ("_quantize_mxfp8_kernel", "_mxfp8_fa_fwd", "_fa_loop", "_mx_scale",
+                                            "_decode_scale", "_scale_exponent", "_rounded_mul"))
 
 
 def _can_save_public_qk_arena(q, k, v, sm_scale, causal):
@@ -1204,13 +1224,14 @@ class _MXFP8Attention(torch.autograd.Function):
             for tensor, key in ((q, False), (k, True)):
                 _quantize_saved_qk_arena[(n // 64, 128)](tensor, arena, *tensor.stride(), ARENA_N=n, KEY=key,
                                                          num_warps=4)
-            # These controlled views exist only for the unchanged forward.
+            # Forward reads these controlled Q/K views.
             q_fp8, k_fp8, q_scale, k_scale = _saved_qk_arena_views(arena, n)
         else:
             q_fp8, q_scale = quantize_mxfp8_head(q)
             k_fp8, k_scale = quantize_mxfp8_head(k)
         v_fp8, v_scale = quantize_mxfp8_v(v)
-        out, lse = _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, return_lse=True)
+        out, lse = _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, return_lse=True,
+                                     split_lse=True)
         if packed:
             ctx.save_for_backward(q, k, v, arena, out, lse)
             ctx.saved_format = _SAVED_QK_ARENA_FORMAT
@@ -1219,6 +1240,7 @@ class _MXFP8Attention(torch.autograd.Function):
             ctx.saved_format = None
         ctx.sm_scale = sm_scale
         ctx.causal = causal
+        ctx.lse_split = True
         return out
 
     @staticmethod
@@ -1238,19 +1260,25 @@ class _MXFP8Attention(torch.autograd.Function):
             raise ValueError("Unknown MXFP8 saved tensor format")
         # Autograd may execute after the caller changes the current device.
         with torch.cuda.device(q.device):
+            # Unpack hooks preserve values but can restore different strides or negative flags.
+            q, k, v, out, lse = (tensor.resolve_neg().contiguous() for tensor in (q, k, v, out, lse))
+            if ctx.saved_format is None:
+                q_fp8, k_fp8, q_scale, k_scale = (tensor.resolve_neg().contiguous()
+                                                  for tensor in (q_fp8, k_fp8, q_scale, k_scale))
+            lse_split = getattr(ctx, "lse_split", False)
             do_bf16 = do.resolve_neg().to(torch.bfloat16).contiguous()
-            # Saved Q/K have unpacked square32 scales; O/LSE come from the
-            # same hardware-exp training forward. Keep original BF16 V/dO for
+            # Saved Q/K have unpacked square32 scales. Softmax statistics and
+            # O come from the same hardware-exp forward. Keep BF16 V/dO for
             # backward preparation rather than requantizing saved FP8 data.
             shared_args = (q_fp8, k_fp8, q_scale, k_scale, v, do_bf16, out, lse, ctx.sm_scale)
-            shared_grads = _try_launch_backward_shared_square(*shared_args, causal=ctx.causal)
+            shared_grads = _try_launch_backward_shared_square(*shared_args, causal=ctx.causal, lse_split=lse_split)
             if shared_grads is not None:
                 dq, dk, dv = shared_grads
                 return dq, dk, dv, None, None
             if ctx.saved_format == _SAVED_QK_ARENA_FORMAT:
                 # General fallback uses controlled views only after fresh
                 # whole-arena checks, never the separate shared admission.
-                _check_saved_qk_backward_tensors(qk_arena, v, do_bf16, out, lse, allow_views=True)
+                _check_saved_qk_backward_tensors(qk_arena, v, do_bf16, out, lse, allow_views=True, lse_split=lse_split)
                 q_fp8, k_fp8, q_scale, k_scale = _saved_qk_arena_views(qk_arena, q.shape[2])
             from .gfx950_bwd import launch_backward
             from .gfx950_quant import quantize_backward_operands
@@ -1263,10 +1291,10 @@ class _MXFP8Attention(torch.autograd.Function):
             dq = torch.empty_like(q)
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
-            delta = torch.empty_like(lse)
+            delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
             launch_backward(do_fp8, do_dv, q_fp8, q_dk, k_fp8, k_dq, v_bwd, out, lse, q_scale, q_dk_scale, k_scale,
                             k_dq_scale, v_scale, do_scale, do_dv_scale, ctx.sm_scale, do_bf16, dq, dk, dv, delta,
-                            causal=ctx.causal)
+                            causal=ctx.causal, lse_split=lse_split)
         return dq, dk, dv, None, None
 
 

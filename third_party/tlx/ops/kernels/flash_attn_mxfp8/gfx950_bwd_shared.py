@@ -317,14 +317,32 @@ def _load_metadata(memory):
 
 
 @triton.jit
+def _load_softmax_metadata(memory, BM: tl.constexpr):
+    # Keep the full descriptor at the helper boundary to retain slice strides.
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    columns: tl.constexpr = tlx.slice_layout(mma, 0)
+    row_max = tlx.local_load(tlx.local_slice(memory, [0], [BM]), layout=columns, relaxed=False)
+    log_norm = tlx.local_load(tlx.local_slice(memory, [BM], [BM]), layout=columns, relaxed=False)
+    return (tlx.require_layout(row_max, columns, pin=False), tlx.require_layout(log_norm, columns, pin=False))
+
+
+@triton.jit
 def _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start, N, BM: tl.constexpr,
-                D: tl.constexpr, EVEN_N: tl.constexpr, SLOT: tl.constexpr,
-                COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
+                D: tl.constexpr, EVEN_N: tl.constexpr, SLOT: tl.constexpr, COMMON_PREP: tl.constexpr = False,
+                PREP_N: tl.constexpr = 0, LSE_SPLIT: tl.constexpr = False):
     tl.static_assert(SLOT == 0 or SLOT == 1)
     copy_layout: tl.constexpr = tlx.layout(shape=((64, 2), (1, )), stride=((1, 0), (0, )))
     offsets = tlx.require_layout((start + tl.arange(0, 64)).to(tl.int32), copy_layout, pin=True)
     metadata_base = head.to(tl.int64) * N
-    tlx.buffer_load_to_local(lsemem[SLOT], LSE + metadata_base, offsets)
+    if LSE_SPLIT:
+        # Admission fixes B4/H32, so each metadata plane contains 128 heads.
+        # Both copies use the same slot publication and reuse barriers.
+        row_max = tlx.local_slice(lsemem[SLOT], [0], [BM])
+        log_norm = tlx.local_slice(lsemem[SLOT], [BM], [BM])
+        tlx.buffer_load_to_local(row_max, LSE + metadata_base, offsets)
+        tlx.buffer_load_to_local(log_norm, LSE + (head.to(tl.int64) + 128) * N, offsets)
+    else:
+        tlx.buffer_load_to_local(lsemem[SLOT], LSE + metadata_base, offsets)
     if COMMON_PREP:
         tl.static_assert(PREP_N == 1024 or PREP_N == 2048)
         tl.static_assert(BM == 64 and D == 128)
@@ -543,7 +561,7 @@ def _prepare_do_arena(DO, O, Arena, N: tl.constexpr, D: tl.constexpr, BLOCK_N: t
 
 @triton.jit
 def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
-                                BM: tl.constexpr, BN: tl.constexpr):
+                                BM: tl.constexpr, BN: tl.constexpr, LSE_SPLIT: tl.constexpr = False):
     """Prepare V64 once per key owner and consume prepared dO and Delta."""
     tl.static_assert((ARENA_N == 1024 or ARENA_N == 2048) and D == 128 and BM == 64 and BN == 64)
     # Fresh host admission binds runtime N to this private arena length.
@@ -566,7 +584,7 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
         qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
         domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
         metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
-        lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+        lsemem = tlx.local_alloc(((2 if LSE_SPLIT else 1) * BM, ), tl.float32, 2, layout=metadata_layout)
         deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
         if immutable_kv:
             kv_offsets = (keys[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
@@ -574,7 +592,8 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
             tlx.async_load_commit_group()
         else:
             k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
-        _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0)
+        _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0,
+                    LSE_SPLIT=LSE_SPLIT)
         v, vs = _inline_prepare_v64(V, base, keys, D)
         if immutable_kv:
             # The first tile wait and barrier publish immutable K/V.
@@ -611,34 +630,31 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
         qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
         domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
         metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
-        lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+        lsemem = tlx.local_alloc(((2 if LSE_SPLIT else 1) * BM, ), tl.float32, 2, layout=metadata_layout)
         deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
-        _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0)
+        _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, 0, sequence_length, BM, D, True, 0,
+                    LSE_SPLIT=LSE_SPLIT)
     for pair_start in range(0, sequence_length - 128, 128):
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                               pair_start, 0, True,
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
+                               D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
+                               lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start, 0, True,
                                PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
-                               EARLY_DP=ARENA_N == 1024)
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                               pair_start + 64, 1, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
-                               EARLY_DP=ARENA_N == 1024)
-    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                           sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                           sequence_length - 128, 0, True,
+                               EARLY_DP=ARENA_N == 1024, LSE_SPLIT=LSE_SPLIT)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
+                               D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
+                               lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start + 64, 1,
+                               True, PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
+                               EARLY_DP=ARENA_N == 1024, LSE_SPLIT=LSE_SPLIT)
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS, D,
+                           BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
+                           deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, sequence_length - 128, 0, True,
                            PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
-                           EARLY_DP=ARENA_N == 1024)
-    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                           sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                           sequence_length - 64, 1, False,
+                           EARLY_DP=ARENA_N == 1024, LSE_SPLIT=LSE_SPLIT)
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS, D,
+                           BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
+                           deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, sequence_length - 64, 1, False,
                            PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=immutable_kv,
-                           EARLY_DP=ARENA_N == 1024)
+                           EARLY_DP=ARENA_N == 1024, LSE_SPLIT=LSE_SPLIT)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
     tl.store(DV + offsets, dv)
@@ -646,7 +662,7 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
 
 @triton.jit
 def _bwd_kv_owner_causal_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
-                                       BM: tl.constexpr, BN: tl.constexpr):
+                                       BM: tl.constexpr, BN: tl.constexpr, LSE_SPLIT: tl.constexpr = False):
     """Prepare V64 inside each N2048 causal key owner."""
     tl.static_assert(ARENA_N == 2048 and D == 128 and BM == 64 and BN == 64)
     # Fresh host admission binds runtime N to this private arena length.
@@ -669,42 +685,40 @@ def _bwd_kv_owner_causal_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, A
     qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
     domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
     metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
-    lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+    lsemem = tlx.local_alloc(((2 if LSE_SPLIT else 1) * BM, ), tl.float32, 2, layout=metadata_layout)
     deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
     begin = key_tile * BN // 128 * 128
-    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, sequence_length, BM, D, True, 0)
+    _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, sequence_length, BM, D, True, 0,
+                LSE_SPLIT=LSE_SPLIT)
     # Both prefix visits fill one packed DSS record, including masked zeros.
-    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                           sm_scale, DS, DSS, D, BM, BN, True, False, True, True, False, True, False, qmem, domem,
-                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                           begin, 0, True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
-    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                           sm_scale, DS, DSS, D, BM, BN, True, False, True, True, False, True, False, qmem, domem,
-                           qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                           begin + 64, 1, begin < sequence_length - 128,
-                           PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS, D,
+                           BM, BN, True, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
+                           deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin, 0, True, PACK_DSS=True,
+                           PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
+    dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS, D,
+                           BM, BN, True, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
+                           deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin + 64, 1, begin
+                           < sequence_length - 128, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True,
+                           LSE_SPLIT=LSE_SPLIT)
     for pair_start in range(begin + 128, sequence_length - 128, 128):
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                               pair_start, 0, True,
-                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                               pair_start + 64, 1, True,
-                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
+                               D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
+                               lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start, 0, True,
+                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
+                               D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
+                               lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start + 64, 1,
+                               True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
     if begin < sequence_length - 128:
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                               sequence_length - 128, 0, True,
-                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
-        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
-                               sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
-                               qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
-                               sequence_length - 64, 1, False,
-                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
+                               D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
+                               lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
+                               sequence_length - 128, 0, True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True,
+                               LSE_SPLIT=LSE_SPLIT)
+        dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
+                               D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
+                               lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, sequence_length - 64,
+                               1, False, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
     tl.store(DV + offsets, dv)
@@ -718,7 +732,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr,
                   PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
                   COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, IMMUTABLE_KV: tl.constexpr = False,
-                  EARLY_DP: tl.constexpr = False):
+                  EARLY_DP: tl.constexpr = False, LSE_SPLIT: tl.constexpr = False):
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
     export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
@@ -731,7 +745,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     tlx.workgroup_barrier()
     if PREFETCH:
         _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start + BM, N, BM, D, EVEN_N,
-                    1 - SLOT, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                    1 - SLOT, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
     q = _load_rhs_kv64(qmem[SLOT], True, NATIVE, RELAXED)
     if not DELAY_DO_HEAD:
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
@@ -746,7 +760,10 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
             tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
             tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
             tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
-        lse = _load_metadata(lsemem[SLOT])
+        if LSE_SPLIT:
+            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM)
+        else:
+            lse = _load_metadata(lsemem[SLOT])
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
         dos = _decode_rhs_head(do_words)
         # The owner or first tile barrier publishes V before these immutable reads.
@@ -757,7 +774,12 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
             tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
             tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
         scores = tlx.release_layout(scores_mma)
-        logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
+        if LSE_SPLIT:
+            # Split launches disable FP fusion to round the product separately.
+            scaled = scores * (sm_scale * 1.4426950408889634)
+            logits = (scaled - lse[None, :]) - log_norm[None, :]
+        else:
+            logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
         valid = (EVEN_N | (keys[:, None] < N)) & (EVEN_N | (queries[None, :] < N))
         if CAUSAL and (not PEEL or phase == 0):
             valid = valid & (keys[:, None] <= queries[None, :])
@@ -770,8 +792,15 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
             tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
                            tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
                            tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
-        lse = _load_metadata(lsemem[SLOT])
-        logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
+        if LSE_SPLIT:
+            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM)
+        else:
+            lse = _load_metadata(lsemem[SLOT])
+        if LSE_SPLIT:
+            scaled = scores * (sm_scale * 1.4426950408889634)
+            logits = (scaled - lse[None, :]) - log_norm[None, :]
+        else:
+            logits = scores * (sm_scale * 1.4426950408889634) - lse[None, :]
         valid = (EVEN_N | (keys[:, None] < N)) & (EVEN_N | (queries[None, :] < N))
         if CAUSAL and (not PEEL or phase == 0):
             valid = valid & (keys[:, None] <= queries[None, :])
@@ -845,7 +874,7 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr = False, PEEL: tl.constexpr = False,
                   NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False, XCD_KEY_TILES: tl.constexpr = 0,
                   PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
-                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
+                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, LSE_SPLIT: tl.constexpr = False):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     tl.static_assert(not SEQ_K_CONTIG, 'Shared-LDS specialization requires ordinary contiguous payloads')
     tl.static_assert(D == 128 and BM == 64 and (BN == 64) and NATIVE and (not RELAXED) and (not PEEL))
@@ -884,7 +913,7 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     qmem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
     domem = tlx.local_alloc((BM, D), tl.float8e4nv, 2, layout=shared_layout)
     metadata_layout: tl.constexpr = tlx.swizzled_layout(0, 1, 1, order=[0])
-    lsemem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
+    lsemem = tlx.local_alloc(((2 if LSE_SPLIT else 1) * BM, ), tl.float32, 2, layout=metadata_layout)
     deltamem = tlx.local_alloc((BM, ), tl.float32, 2, layout=metadata_layout)
     if SEQ_K_CONTIG:
         qdkmem = tlx.local_alloc((D, BM), tl.float8e4nv, 1, layout=_stage_layout(BM))
@@ -896,7 +925,7 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if CAUSAL:
         begin = key_tile * BN // 128 * 128
     _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, N, BM, D, EVEN_N, 0,
-                COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
     if CAUSAL:
         # The first physical128 block is always masked. Only its second
         # tile needs a runtime prefetch decision for the final-only CTA.
@@ -904,63 +933,62 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin, 0,
                                True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin + 64,
                                1, begin < N - 128, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                               DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                               DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
         for pair_start in range(begin + 128, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
-                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
+                                   LSE_SPLIT=LSE_SPLIT)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
-                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
+                                   LSE_SPLIT=LSE_SPLIT)
         if begin < N - 128:
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    N - 128, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
-                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
+                                   LSE_SPLIT=LSE_SPLIT)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    N - 64, 1, False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
-                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
+                                   LSE_SPLIT=LSE_SPLIT)
     else:
         for pair_start in range(begin, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
-                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
+                                   LSE_SPLIT=LSE_SPLIT)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                                   DELAY_DO_HEAD=DELAY_DO_HEAD,
-                                   COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                                   DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
+                                   LSE_SPLIT=LSE_SPLIT)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 128, 0,
                                True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 64, 1,
                                False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
     out = base + keys[:, None] * D + d[None, :]
     tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
     tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
@@ -1091,7 +1119,8 @@ def _bwd_q_consume(DS, DSS, K, KDQS, DQ, N, sm_scale, D: tl.constexpr, BM: tl.co
 
 @triton.jit
 def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: tl.constexpr, D: tl.constexpr,
-                        BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, QK_FORMAT: tl.constexpr = False):
+                        BM: tl.constexpr, BN: tl.constexpr, CAUSAL: tl.constexpr, QK_FORMAT: tl.constexpr = False,
+                        LSE_SPLIT: tl.constexpr = False):
     if QK_FORMAT:
         tl.static_assert(K is None and QS is None and KS is None)
         Q, K, QS, KS = _saved_qk_arena_segments(Q, ARENA_N)
@@ -1106,11 +1135,10 @@ def _bwd_kv_owner_arena(Q, K, QS, KS, LSE, Arena, DK, DV, N, sm_scale, ARENA_N: 
         do8, dos, delta = Arena, Arena, Arena
     DS, DSS = _backward_arena_segments(Arena, ARENA_N)
     _bwd_kv_owner(Q, K, vb, do8, QS, KS, vs, dos, LSE, delta, DK, DV, sequence_length, sm_scale, DS, DSS, D, BM, BN,
-                  CAUSAL,
-                  SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
+                  CAUSAL, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False, NATIVE=True, RELAXED=False,
                   PACK_P_EARLY=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
                   DELAY_DO_HEAD=QK_FORMAT and not CAUSAL and (ARENA_N == 1024 or ARENA_N == 2048),
-                  COMMON_PREP=common_prep, PREP_N=ARENA_N)
+                  COMMON_PREP=common_prep, PREP_N=ARENA_N, LSE_SPLIT=LSE_SPLIT)
 
 
 @triton.jit
@@ -1131,6 +1159,10 @@ def _bwd_q_consume_arena(K, Arena, DQ, N, sm_scale, ARENA_N: tl.constexpr, D: tl
 _ARENA_LAUNCH_PLANS = {}
 
 
+def _softmax_plan_format(format_key, lse_split):
+    return (*format_key, "split_softmax", 1) if lse_split else format_key
+
+
 def _arena_launch_controls():
     # A direct compiled launch skips JIT hooks and option binding. Use normal
     # JIT for instrumentation and any non-default compiler/runtime controls.
@@ -1148,10 +1180,11 @@ def _arena_launch_controls():
     return True
 
 
-def _arena_launch_plan(device, n, causal, sm_scale, qk_format=False):
+def _arena_launch_plan(device, n, causal, sm_scale, qk_format=False, lse_split=False):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return None
     format_key = _SAVED_QK_ARENA_FORMAT if qk_format else ("legacy_shared_square", 0)
+    format_key = _softmax_plan_format(format_key, lse_split)
     plan = _ARENA_LAUNCH_PLANS.get((device.index, n, causal, sm_scale, format_key))
     if plan is None:
         return None
@@ -1168,7 +1201,7 @@ def _arena_launch_plan(device, n, causal, sm_scale, qk_format=False):
     return tuple(entry[5] for entry in plan)
 
 
-def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled, qk_format=False):
+def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled, qk_format=False, lse_split=False):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return
     entries = []
@@ -1186,13 +1219,15 @@ def _remember_arena_launch_plan(device, n, causal, sm_scale, compiled, qk_format
         # as documented by JITCallable._unsafe_update_src. Track that contract.
         entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
     format_key = _SAVED_QK_ARENA_FORMAT if qk_format else ("legacy_shared_square", 0)
+    format_key = _softmax_plan_format(format_key, lse_split)
     _ARENA_LAUNCH_PLANS[(device.index, n, causal, sm_scale, format_key)] = tuple(entries)
 
 
-def _partial_arena_launch_plan(device, n, sm_scale):
+def _partial_arena_launch_plan(device, n, sm_scale, lse_split=False):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return None
-    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, False, sm_scale, ("partial_saved_qk_arena", 1)))
+    format_key = _softmax_plan_format(("partial_saved_qk_arena", 1), lse_split)
+    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, False, sm_scale, format_key))
     if plan is None or len(plan) != 3:
         return None
     for current, entry in zip((_prepare_do_arena, _bwd_kv_owner_partial_arena, _bwd_q_consume_arena), plan):
@@ -1208,7 +1243,7 @@ def _partial_arena_launch_plan(device, n, sm_scale):
     return tuple(entry[5] for entry in plan)
 
 
-def _remember_partial_arena_launch_plan(device, n, sm_scale, compiled):
+def _remember_partial_arena_launch_plan(device, n, sm_scale, compiled, lse_split=False):
     if device.type != "cuda" or device.index is None or not _arena_launch_controls() or len(compiled) != 3:
         return
     entries = []
@@ -1223,13 +1258,15 @@ def _remember_partial_arena_launch_plan(device, n, sm_scale, compiled):
             return
         globals_used = tuple((name, value, namespace) for (name, _), (value, namespace) in jit.used_global_vals.items())
         entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
-    _ARENA_LAUNCH_PLANS[(device.index, n, False, sm_scale, ("partial_saved_qk_arena", 1))] = tuple(entries)
+    format_key = _softmax_plan_format(("partial_saved_qk_arena", 1), lse_split)
+    _ARENA_LAUNCH_PLANS[(device.index, n, False, sm_scale, format_key)] = tuple(entries)
 
 
-def _causal_partial_arena_launch_plan(device, n, sm_scale):
+def _causal_partial_arena_launch_plan(device, n, sm_scale, lse_split=False):
     if n != 2048 or device.type != "cuda" or device.index is None or not _arena_launch_controls():
         return None
-    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, True, sm_scale, ("causal_partial_saved_qk_arena", 1)))
+    format_key = _softmax_plan_format(("causal_partial_saved_qk_arena", 1), lse_split)
+    plan = _ARENA_LAUNCH_PLANS.get((device.index, n, True, sm_scale, format_key))
     if plan is None or len(plan) != 3:
         return None
     for current, entry in zip((_prepare_do_arena, _bwd_kv_owner_causal_partial_arena, _bwd_q_consume_arena), plan):
@@ -1245,7 +1282,7 @@ def _causal_partial_arena_launch_plan(device, n, sm_scale):
     return tuple(entry[5] for entry in plan)
 
 
-def _remember_causal_partial_arena_launch_plan(device, n, sm_scale, compiled):
+def _remember_causal_partial_arena_launch_plan(device, n, sm_scale, compiled, lse_split=False):
     if n != 2048 or device.type != "cuda" or device.index is None or not _arena_launch_controls() or len(compiled) != 3:
         return
     entries = []
@@ -1260,13 +1297,17 @@ def _remember_causal_partial_arena_launch_plan(device, n, sm_scale, compiled):
             return
         globals_used = tuple((name, value, namespace) for (name, _), (value, namespace) in jit.used_global_vals.items())
         entries.append((jit, cache_key, kernel, jit.hash, globals_used, kernel[grid]))
-    _ARENA_LAUNCH_PLANS[(device.index, n, True, sm_scale, ("causal_partial_saved_qk_arena", 1))] = tuple(entries)
+    format_key = _softmax_plan_format(("causal_partial_saved_qk_arena", 1), lse_split)
+    _ARENA_LAUNCH_PLANS[(device.index, n, True, sm_scale, format_key)] = tuple(entries)
 
 
-def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
+def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal, *,
+                                lse_split=False):
     """Metadata-only admission; this never reads payload or scale values."""
     if type(causal) is not bool:
         raise ValueError("Shared-square backward requires an actual bool causal flag")
+    if type(lse_split) is not bool:
+        raise ValueError("Shared-square backward requires an actual bool lse_split flag")
     if not isinstance(q_fp8, torch.Tensor) or q_fp8.device.type != "cuda":
         raise ValueError("Shared-square backward requires GPU tensors")
     shape = tuple(q_fp8.shape)
@@ -1287,7 +1328,8 @@ def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16,
         ("v_bf16", v_bf16, shape, torch.bfloat16, 2 * payload_bytes),
         ("do_bf16", do_bf16, shape, torch.bfloat16, 2 * payload_bytes),
         ("out_bf16", out_bf16, shape, torch.bfloat16, 2 * payload_bytes),
-        ("lse", lse, shape[:-1], torch.float32, scale_bytes),
+        ("lse", lse, (2, ) + shape[:-1] if lse_split else shape[:-1], torch.float32,
+         (2 if lse_split else 1) * scale_bytes),
     )
     device = q_fp8.device
     for name, tensor, expected_shape, dtype, expected_bytes in specs:
@@ -1302,10 +1344,12 @@ def _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16,
     return device, shape
 
 
-def _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse, *, allow_views=False):
+def _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse, *, allow_views=False, lse_split=False):
     """Fresh arena admission; general backward also accepts dense offset views."""
     if not isinstance(v_bf16, torch.Tensor) or v_bf16.device.type != "cuda":
         raise ValueError("Shared-square backward requires GPU tensors")
+    if type(lse_split) is not bool:
+        raise ValueError("Shared-square backward requires an actual bool lse_split flag")
     shape = tuple(v_bf16.shape)
     if len(shape) != 4 or shape[:2] != (4, 32) or shape[2] not in (1024, 2048) or shape[3] != 128:
         raise ValueError("Saved Q/K arena requires B4/H32/D128 and N1024/2048")
@@ -1313,10 +1357,11 @@ def _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse, *
     n = shape[2]
     _check_saved_qk_arena(qk_arena, device, n)
     payload_bytes = 128 * n * 128
-    specs = (("v_bf16", v_bf16, shape, torch.bfloat16, 2 * payload_bytes), ("do_bf16", do_bf16, shape, torch.bfloat16,
-                                                                            2 * payload_bytes),
-             ("out_bf16", out_bf16, shape, torch.bfloat16, 2 * payload_bytes), ("lse", lse, shape[:-1], torch.float32,
-                                                                                128 * n * 4))
+    specs = (("v_bf16", v_bf16, shape, torch.bfloat16,
+              2 * payload_bytes), ("do_bf16", do_bf16, shape, torch.bfloat16,
+                                   2 * payload_bytes), ("out_bf16", out_bf16, shape, torch.bfloat16, 2 * payload_bytes),
+             ("lse", lse, (2, ) + shape[:-1] if lse_split else shape[:-1], torch.float32,
+              (2 if lse_split else 1) * 128 * n * 4))
     for name, tensor, expected_shape, dtype, expected_bytes in specs:
         if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided or tensor.shape != expected_shape
                 or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous()
@@ -1334,13 +1379,14 @@ def _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse, *
     return device, shape
 
 
-def _check_shared_square_qk_arena_inputs(qk_arena, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal):
+def _check_shared_square_qk_arena_inputs(qk_arena, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal, *,
+                                         lse_split=False):
     """Eligibility plus fresh admission for the private public-autograd format."""
     if type(causal) is not bool:
         raise ValueError("Shared-square backward requires an actual bool causal flag")
     if type(sm_scale) is not float or not math.isfinite(sm_scale) or sm_scale != 0.5:
         raise ValueError("Saved Q/K arena requires Python float sm_scale=0.5")
-    return _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse)
+    return _check_saved_qk_backward_tensors(qk_arena, v_bf16, do_bf16, out_bf16, lse, lse_split=lse_split)
 
 
 def _is_gfx950(device):
@@ -1361,7 +1407,7 @@ def can_use_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_b
 
 
 def _try_launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, *,
-                                       causal=False):
+                                       causal=False, lse_split=False):
     """Internal autograd dispatch; the caller already holds the input device.
 
     Return None only for unsupported metadata or architecture. Validation
@@ -1372,21 +1418,21 @@ def _try_launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, d
     try:
         if qk_format:
             device, shape = _check_shared_square_qk_arena_inputs(q_fp8, v_bf16, do_bf16, out_bf16, lse, sm_scale,
-                                                                 causal)
+                                                                 causal, lse_split=lse_split)
             if shape[2] not in _PREPARATION_ARENA_BYTES:
                 return None
         else:
             device, shape = _check_shared_square_inputs(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse,
-                                                        sm_scale, causal)
+                                                        sm_scale, causal, lse_split=lse_split)
     except ValueError:
         return None
     if not _is_gfx950(device):
         return None
     if qk_format:
         return _launch_backward_shared_square(q_fp8, None, None, None, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal,
-                                              device, shape, qk_format=True)
+                                              device, shape, qk_format=True, lse_split=lse_split)
     return _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale,
-                                          causal, device, shape)
+                                          causal, device, shape, lse_split=lse_split)
 
 
 def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, *,
@@ -1419,7 +1465,7 @@ def launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf1
 
 
 def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf16, out_bf16, lse, sm_scale, causal,
-                                   device, shape, qk_format=False):
+                                   device, shape, qk_format=False, lse_split=False):
     """Launch after metadata/architecture checks, inside the input device context."""
     n = shape[2]
     if qk_format and n not in _PREPARATION_ARENA_BYTES:
@@ -1461,52 +1507,54 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
             if tensor is not None)
         partial_prepare = qk_format and n in (1024, 2048) and not causal and sm_scale == 0.5
         causal_partial_prepare = qk_format and n == 2048 and causal and sm_scale == 0.5
-        plan = (_arena_launch_plan(device, n, causal, sm_scale, qk_format)
+        plan = (_arena_launch_plan(device, n, causal, sm_scale, qk_format, lse_split)
                 if ordinary_inputs and not (partial_prepare or causal_partial_prepare) else None)
         saved_ks = q_fp8 if qk_format else k_scale
         saved_k = q_fp8 if qk_format else k_fp8
         if causal_partial_prepare:
-            partial_plan = _causal_partial_arena_launch_plan(device, n, sm_scale) if ordinary_inputs else None
+            partial_plan = _causal_partial_arena_launch_plan(device, n, sm_scale,
+                                                             lse_split) if ordinary_inputs else None
             if partial_plan is not None:
                 prepare, kv, query = partial_plan
                 stream = driver.active.get_current_stream(device.index)
                 prepare(do_bf16, out_bf16, arena, n, 128, 32, stream=stream)
-                kv(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, stream=stream)
+                kv(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, lse_split, stream=stream)
                 query(saved_k, arena, dq, n, sm_scale, n, 128, 128, 64, True, 128, True, stream=stream)
             else:
                 prepare = _prepare_do_arena.run(do_bf16, out_bf16, arena, n, 128, 32, num_warps=2, num_stages=1,
                                                  grid=(n // 32, 128), warmup=False)
                 kv = _bwd_kv_owner_causal_partial_arena.run(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
-                                                     D=128, BM=64, BN=64, num_warps=2, num_stages=1,
-                                                     matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64),
-                                                     warmup=False)
+                                                            D=128, BM=64, BN=64, LSE_SPLIT=lse_split, num_warps=2,
+                                                            num_stages=1, enable_fp_fusion=not lse_split,
+                                                            matrix_instr_nonkdim=32, waves_per_eu=0,
+                                                            grid=(128, n // 64), warmup=False)
                 query = _bwd_q_consume_arena.run(saved_k, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
                                                  CAUSAL=True, HEADS=128, QK_FORMAT=True, num_warps=4, num_stages=1,
                                                  matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                                                  warmup=False)
                 if ordinary_inputs:
-                    _remember_causal_partial_arena_launch_plan(device, n, sm_scale, (prepare, kv, query))
+                    _remember_causal_partial_arena_launch_plan(device, n, sm_scale, (prepare, kv, query), lse_split)
         elif partial_prepare:
-            partial_plan = _partial_arena_launch_plan(device, n, sm_scale) if ordinary_inputs else None
+            partial_plan = _partial_arena_launch_plan(device, n, sm_scale, lse_split) if ordinary_inputs else None
             if partial_plan is not None:
                 prepare, kv, query = partial_plan
                 stream = driver.active.get_current_stream(device.index)
                 prepare(do_bf16, out_bf16, arena, n, 128, 32, stream=stream)
-                kv(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, stream=stream)
+                kv(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, lse_split, stream=stream)
                 query(saved_k, arena, dq, n, sm_scale, n, 128, 128, 64, False, 128, True, stream=stream)
             else:
                 prepare = _prepare_do_arena.run(do_bf16, out_bf16, arena, n, 128, 32, num_warps=2, num_stages=1,
                                                  grid=(n // 32, 128), warmup=False)
-                kv = _bwd_kv_owner_partial_arena.run(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
-                                                     D=128, BM=64, BN=64, num_warps=2, num_stages=1,
-                                                     matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64),
-                                                     warmup=False)
+                kv = _bwd_kv_owner_partial_arena.run(q_fp8, v_bf16, lse, arena, dk, dv, n, sm_scale, ARENA_N=n, D=128,
+                                                     BM=64, BN=64, LSE_SPLIT=lse_split, num_warps=2, num_stages=1,
+                                                     enable_fp_fusion=not lse_split, matrix_instr_nonkdim=32,
+                                                     waves_per_eu=0, grid=(128, n // 64), warmup=False)
                 query = _bwd_q_consume_arena.run(saved_k, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
                                                  CAUSAL=False, HEADS=128, QK_FORMAT=True, num_warps=4, num_stages=1,
                                                  matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                                                  warmup=False)
                 if ordinary_inputs:
-                    _remember_partial_arena_launch_plan(device, n, sm_scale, (prepare, kv, query))
+                    _remember_partial_arena_launch_plan(device, n, sm_scale, (prepare, kv, query), lse_split)
         elif plan is not None:
             prepare, kv, query = plan
             # Resolve one invocation-local stream for this producer/consumer
@@ -1515,7 +1563,7 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
             # Pass the complete original ABI, including constexpr positions.
             prepare(v_bf16, do_bf16, saved_ks, out_bf16, arena, n, 128, 32, qk_format, stream=stream)
             kv(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, n, 128, 64, 64, causal, qk_format,
-               stream=stream)
+               lse_split, stream=stream)
             query(saved_k, arena, dq, n, sm_scale, n, 128, 128, 64, causal, 128, qk_format, stream=stream)
         else:
             # N remains runtime in both public reduction signatures.
@@ -1525,15 +1573,15 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
                                                QK_FORMAT=qk_format, num_warps=4, num_stages=2, grid=(n // 32, 128),
                                                warmup=False)
             kv = _bwd_kv_owner_arena.run(q_fp8, k_fp8, q_scale, k_scale, lse, arena, dk, dv, n, sm_scale, ARENA_N=n,
-                                         D=128, BM=64, BN=64, CAUSAL=causal, QK_FORMAT=qk_format, num_warps=2,
-                                         num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64),
-                                         warmup=False)
+                                         D=128, BM=64, BN=64, CAUSAL=causal, QK_FORMAT=qk_format, LSE_SPLIT=lse_split,
+                                         num_warps=2, enable_fp_fusion=not lse_split, num_stages=1,
+                                         matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
             query = _bwd_q_consume_arena.run(saved_k, arena, dq, n, sm_scale, ARENA_N=n, D=128, BM=128, BK=64,
                                              CAUSAL=causal, HEADS=128, QK_FORMAT=qk_format, num_warps=4, num_stages=1,
                                              matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                                              warmup=False)
             if ordinary_inputs:
-                _remember_arena_launch_plan(device, n, causal, sm_scale, (prepare, kv, query), qk_format)
+                _remember_arena_launch_plan(device, n, causal, sm_scale, (prepare, kv, query), qk_format, lse_split)
     else:
         _prepare_fused.run(v_bf16, do_bf16, k_scale, vb, do8, vs, dos, kdqs, out_bf16, delta, n, 128, 32, num_warps=4,
                            num_stages=2, grid=(n // 32, 128), warmup=False)
@@ -1541,9 +1589,10 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
         # scales directly; no directional exports or second Delta launch.
         _bwd_kv_owner.run(q_fp8, k_fp8, vb, do8, q_scale, k_scale, vs, dos, lse, delta, dk, dv, n, sm_scale, ds, dss,
                           D=128, BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False,
-                          NATIVE=True, RELAXED=False,
+                          NATIVE=True, RELAXED=False, enable_fp_fusion=not lse_split,
                           XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0), num_warps=2, num_stages=1,
-                          matrix_instr_nonkdim=32, waves_per_eu=0, grid=(128, n // 64), warmup=False)
+                          matrix_instr_nonkdim=32, waves_per_eu=0, LSE_SPLIT=lse_split, grid=(128,
+                                                                                              n // 64), warmup=False)
         _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
                            num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=0, grid=(n // 128, 128),
                            warmup=False)

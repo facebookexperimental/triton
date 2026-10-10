@@ -407,7 +407,8 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     Inputs have identical [batch, heads, sequence, 128] shapes with sequence
     lengths divisible by 256. Both architectures return BF16 gradients.
     Both architectures use 32x32 Q/K blocks. gfx950 training
-    uses hardware exp2 and saves base-2 LSE, whereas its noncausal inference
+    uses hardware exp2 and saves separate row maxima and log2 normalization
+    terms, whereas its noncausal inference
     path may use an approximate exp2. See the kernel module for the recipes.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
