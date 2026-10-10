@@ -573,15 +573,31 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
 
     repository = _repository_root() if task == "tuning" or production_authoring else None
     if repository is not None and not environment_ready:
-        from .benchmark_environment import governed_benchmark_device
+        from .benchmark_environment import (
+            device_environment,
+            governed_benchmark_device,
+            governed_benchmark_devices,
+        )
 
-        with governed_benchmark_device(
-            repository,
-            args.arch,
-            args.device,
-            govern=args.govern,
-        ):
-            return _run_task(args, environment_ready=True)
+        if task == "tuning":
+            with governed_benchmark_devices(
+                repository,
+                args.arch,
+                args.device,
+                govern=args.govern,
+            ) as devices:
+                args._tuning_device_environments = tuple(
+                    device_environment(device) for device in devices
+                )
+                return _run_task(args, environment_ready=True)
+        else:
+            with governed_benchmark_device(
+                repository,
+                args.arch,
+                args.device,
+                govern=args.govern,
+            ):
+                return _run_task(args, environment_ready=True)
 
     budget = _budget_from_args(args)
     provider = (
@@ -608,6 +624,7 @@ def _run_task(args: argparse.Namespace, *, environment_ready: bool = False) -> i
             commit=args.commit_winner,
             commit_message=args.commit_message,
             vcs=args.vcs,
+            device_environments=getattr(args, "_tuning_device_environments", ()),
         )
         print(json.dumps(result["summary"], indent=2, sort_keys=True))
         return exit_code
