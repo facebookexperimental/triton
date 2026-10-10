@@ -1238,7 +1238,7 @@ class _MXFP8Attention(torch.autograd.Function):
             raise ValueError("Unknown MXFP8 saved tensor format")
         # Autograd may execute after the caller changes the current device.
         with torch.cuda.device(q.device):
-            do_bf16 = do.to(torch.bfloat16).contiguous()
+            do_bf16 = do.resolve_neg().to(torch.bfloat16).contiguous()
             # Saved Q/K have unpacked square32 scales; O/LSE come from the
             # same hardware-exp training forward. Keep original BF16 V/dO for
             # backward preparation rather than requantizing saved FP8 data.

@@ -1707,6 +1707,44 @@ def test_flash_attn_mxfp8_gfx950_backward_meta_shapes(causal, n_ctx, scale, seed
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("n_ctx", (256, 1024, 2048))
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_mxfp8_gfx950_backward_lazy_negative_grad_output(n_ctx, causal):
+    from triton.tlx.ops import flash_attn_mxfp8
+    from triton.tlx.ops.kernels.flash_attn_mxfp8 import gfx950_bwd, gfx950_bwd_shared as shared
+
+    torch.manual_seed(20)
+    packed = n_ctx in (1024, 2048)
+    shape = (4, 32, n_ctx, 128) if packed else (1, 1, n_ctx, 128)
+    inputs = _qkv(shape, requires_grad=True)
+    out = flash_attn_mxfp8(*inputs, causal=causal, sm_scale=0.5)
+    expected_format = shared._SAVED_QK_ARENA_FORMAT if packed else None
+    assert out.grad_fn.saved_format == expected_format
+    saved = out.grad_fn.saved_tensors
+    assert len(saved) == (6 if packed else 9)
+
+    do = torch.randn_like(out) * 0.5
+    lazy_do = torch._neg_view(do)
+    materialized_do = lazy_do.resolve_neg()
+    assert lazy_do.dtype == torch.bfloat16 and lazy_do.is_contiguous() and lazy_do.is_neg()
+    assert not materialized_do.is_neg()
+
+    with mock.patch.object(gfx950_bwd, "launch_backward", wraps=gfx950_bwd.launch_backward) as general:
+        with mock.patch.object(shared, "_launch_backward_shared_square",
+                               wraps=shared._launch_backward_shared_square) as square:
+            expected = torch.autograd.grad(out, inputs, materialized_do, retain_graph=True)
+            actual = torch.autograd.grad(out, inputs, lazy_do)
+    assert general.call_count == (0 if packed else 2)
+    assert square.call_count == (2 if packed else 0)
+    if packed:
+        assert all(call.args[0] is saved[3] and call.kwargs["qk_format"] for call in square.call_args_list)
+    for got, ref in zip(actual, expected):
+        assert got.dtype == ref.dtype == torch.bfloat16
+        assert bool(got.isfinite().all()) and bool(ref.isfinite().all())
+        assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
 @pytest.mark.parametrize("causal", (False, True))
 def test_flash_attn_mxfp8_gfx950_backward_zero_blocks(causal):
     from triton.tlx.ops import flash_attn_mxfp8
