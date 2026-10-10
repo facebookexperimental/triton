@@ -556,7 +556,20 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
     keys = key_tile * BN + tl.arange(0, BN)
     base = head * sequence_length * D
     v, vs = _inline_prepare_v64(V, base, keys, D)
-    k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
+    if ARENA_N == 2048:
+        # Publish immutable K/V once before the query reduction.
+        kv_layout: tl.constexpr = _stage_layout(D)
+        k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+        vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+        kv_offsets = (keys[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+        tlx.buffer_load_to_local(k[0], K + base, kv_offsets, True, 0.0)
+        tlx.local_store(vmem[0], v)
+        v = vmem
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(0)
+        tlx.workgroup_barrier()
+    else:
+        k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
     ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
     _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
@@ -574,22 +587,22 @@ def _bwd_kv_owner_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, ARENA_N:
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                                qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                pair_start, 0, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                                sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                                qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                pair_start + 64, 1, True,
-                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+                               PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                            sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                            qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                            sequence_length - 128, 0, True,
-                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length,
                            sm_scale, DS, DSS, D, BM, BN, False, False, True, True, False, True, False, qmem, domem,
                            qmem, domem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                            sequence_length - 64, 1, False,
-                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True)
+                           PACK_DSS=False, PACK_P_EARLY=True, DELAY_DO_HEAD=True, IMMUTABLE_KV=ARENA_N == 2048)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
     tl.store(DV + offsets, dv)
@@ -668,7 +681,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   RELAXED: tl.constexpr, qmem, domem, qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head,
                   base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr,
                   PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
-                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
+                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, IMMUTABLE_KV: tl.constexpr = False):
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
                                                    warps_per_cta=[2, 1])
     export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
@@ -686,6 +699,9 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if not DELAY_DO_HEAD:
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
     qs = _decode_rhs_head(q_words)
+    if IMMUTABLE_KV:
+        # The prologue publishes K before these immutable reads.
+        k = tlx.local_load(k[0], layout=export_layout, relaxed=True)
     scores = tlx.release_layout(
         tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
                        tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
@@ -702,6 +718,10 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         # The score/P computation does not consume the dO operand.
         do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
     dos = _decode_rhs_head(do_words)
+    if IMMUTABLE_KV:
+        # The prologue publishes V before these immutable reads.
+        tlx.amd_sched_barrier(0)
+        v = tlx.local_load(v[0], layout=export_layout, relaxed=True)
     dp = tlx.release_layout(
         tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
                        tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',

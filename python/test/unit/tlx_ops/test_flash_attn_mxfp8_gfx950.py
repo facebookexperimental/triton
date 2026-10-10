@@ -758,7 +758,8 @@ def test_flash_attn_mxfp8_shared_backward_launch_plan_fresh_arguments(n_ctx, qk_
         assert all(run.call_count == 1 for run in runs), "compiled launch errors must not retry JIT"
 
 
-@pytest.mark.parametrize("n_ctx,qk_format,causal", [(1024, False, False), (1024, True, False), (2048, True, True)])
+@pytest.mark.parametrize("n_ctx,qk_format,causal", [(1024, False, False), (1024, True, False), (2048, True, False),
+                                               (2048, True, True)])
 def test_flash_attn_mxfp8_shared_backward_runner_plan_current_stream(n_ctx, qk_format, causal):
     """Use actual public compiled runners with CPU-modeled launch handles."""
     from contextlib import ExitStack
