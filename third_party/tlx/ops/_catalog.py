@@ -144,6 +144,15 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_torchtlx",
+        arch="sm90",
+        variant="inductor_hopper_gemm_ws",
+        impl="triton.language.extra.tlx.inductor.sm100_torch:mm",
+        dtypes=_FP16,
+        accepts=lambda d: all(s * d["elem_bytes"] % 16 == 0 for s in d["row_strides"]),
+        requires=frozenset({"tma"}),
+    ),
+    OpSpec(
         # torchTLX: the same mm through torch.compile. Benchmark-only, so it has
         # no `tlx.ops` wrapper; the entry exists so the perf suite can gate on it.
         op="mm_torchtlx",

@@ -1,0 +1,88 @@
+from triton.tlx.ops.kernels.mm._sm90_core import (
+    _allocate_buffers,
+    _consume_tile,
+    _run_producer,
+    _split_acc,
+    _store_subtile,
+)
+
+
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+
+    if A_ROW_MAJOR:
+        desc_a = tl.make_tensor_descriptor(
+            A, shape=[M, K], strides=[stride_am, 1],
+            block_shape=[BLOCK_M_SPLIT, BLOCK_K])
+    else:
+        desc_a = tl.make_tensor_descriptor(
+            A, shape=[K, M], strides=[stride_ak, 1],
+            block_shape=[BLOCK_K, BLOCK_M_SPLIT])
+    if B_ROW_MAJOR:
+        desc_b = tl.make_tensor_descriptor(
+            B, shape=[K, N], strides=[stride_bk, 1],
+            block_shape=[BLOCK_K, BLOCK_N])
+    else:
+        desc_b = tl.make_tensor_descriptor(
+            B, shape=[N, K], strides=[stride_bn, 1],
+            block_shape=[BLOCK_N, BLOCK_K])
+
+    a, b, empty_a, full_a, empty_b, full_b = _allocate_buffers(
+        desc_a, desc_b, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES,
+        NUM_MMA_GROUPS, A_ROW_MAJOR, B_ROW_MAJOR)
+{% if TMA_EPILOGUE_STORE %}
+    c_smem = tlx.local_alloc(
+        (BLOCK_M_SPLIT, slice_size), {{output_ptr()}}.dtype.element_ty,
+        2 * NUM_MMA_GROUPS)
+    desc_c = tl.make_tensor_descriptor(
+        {{output_ptr()}}, shape=[M, N], strides=[{{stride(None, 0)}}, 1],
+        block_shape=[BLOCK_M_SPLIT, slice_size])
+{% endif %}
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            _run_producer(
+                M, N, K, desc_a, desc_b, a, b, empty_a, full_a, empty_b, full_b,
+                NUM_SMS, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M, NUM_STAGES,
+                NUM_MMA_GROUPS, A_ROW_MAJOR, B_ROW_MAJOR, A_EVICTION)
+
+        with tlx.async_task(num_warps=4, replicate=2, registers=232):
+            start_pid = tl.program_id(0)
+            num_pid_m = tl.cdiv(M, BLOCK_M)
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_tiles = num_pid_m * num_pid_n
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            consumer_id: tl.constexpr = tlx.async_task_replica_id()
+            phase = 0
+            buf = 0
+            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+                group_id = tile_id // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+                pid_n = (tile_id % num_pid_in_group) // group_size_m
+                offs_am = pid_m * BLOCK_M + BLOCK_M_SPLIT * consumer_id
+                offs_bn = pid_n * BLOCK_N
+                acc, buf, phase = _consume_tile(
+                    K, a, b, empty_a, full_a, empty_b, full_b, buf, phase,
+                    consumer_id, BLOCK_K, NUM_STAGES, A_ROW_MAJOR, B_ROW_MAJOR)
+                subtiles = _split_acc(acc, BLOCK_M_SPLIT, BLOCK_N)
+                for slice_id in tl.static_range(4):
+                    result = subtiles[slice_id]
+                    offs_cn = offs_bn + slice_id * slice_size
+{% if TMA_EPILOGUE_STORE %}
+                    {{compute_epilogue(("offs_am", "offs_cn"), "result", result_name="fused_c", indent_width=20, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
+                    slot = tlx.local_view(c_smem, 2 * consumer_id + slice_id % 2)
+                    _store_subtile(desc_c, slot, fused_c, offs_am, offs_cn)
+{% else %}
+                    {{store_output(("offs_am", "offs_cn"), "result", indent_width=20, val_shape=("BLOCK_M_SPLIT", "slice_size"), block_indexing=True)}}
+{% endif %}
+{% if TMA_EPILOGUE_STORE %}
+            tlx.async_descriptor_store_wait(0)
+{% endif %}

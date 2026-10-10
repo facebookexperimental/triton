@@ -667,14 +667,16 @@ class TestTLXTemplates(TestCase):
         with mock.patch.object(_tlx_mm, "is_rocm", return_value=False), mock.patch.object(_tlx_mm,
                                                                                           "current_target") as target:
             target.return_value.is_blackwell = False
+            target.return_value.is_hopper = True
             h100_result = _tlx_mm.append_tlx(h100_templates, "mm", kernel_inputs)
 
             target.return_value.is_blackwell = True
+            target.return_value.is_hopper = False
             scaled_mm_result = _tlx_mm.append_tlx(scaled_mm_templates, "scaled_mm", kernel_inputs)
             mm_result = _tlx_mm.append_tlx([], "mm", kernel_inputs)
 
         self.assertIs(h100_result, h100_templates)
-        self.assertEqual(h100_templates, [existing_template])
+        self.assertEqual(h100_templates, [existing_template, _tlx_mm.hopper_gemm_ws_template])
         self.assertIs(scaled_mm_result, scaled_mm_templates)
         self.assertEqual(scaled_mm_templates, [existing_template])
         self.assertEqual(mm_result, [_tlx_mm.blackwell_gemm_ws_template])
@@ -2068,6 +2070,60 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("split_k_ws", code_str)
         self.assertIn("_reduce_k", code_str)
+
+
+@instantiate_parametrized_tests
+@unittest.skipIf(not is_hopper(), "Need H100 for the Hopper GEMM template")
+class TestHopperMMTemplate(TestCase):
+
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    @parametrize("shape,layout", (
+        ((264, 256, 328), "nn"),
+        ((264, 256, 328), "nt"),
+        ((264, 256, 328), "tn"),
+        ((264, 256, 328), "tt"),
+        ((259, 259, 328), "nt"),
+        ((16400, 512, 64), "tt"),
+    ))
+    def test_mm(self, dtype, shape, layout):
+        from triton.tlx.ops import mm as tlx_mm
+
+        m, n, k = shape
+        a = (torch.randn(k, m, device=GPU_TYPE, dtype=dtype).t() if layout[0] == "t" else torch.randn(
+            m, k, device=GPU_TYPE, dtype=dtype))
+        b = (torch.randn(n, k, device=GPU_TYPE, dtype=dtype).t() if layout[1] == "t" else torch.randn(
+            k, n, device=GPU_TYPE, dtype=dtype))
+        expected = (a.float() @ b.float()).to(dtype)
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("_consume_tile", "\n".join(code))
+        if n % 8 == 0:
+            torch.testing.assert_close(tlx_mm(a, b), expected, atol=2e-2, rtol=2e-2)
+
+    @parametrize("n", (256, 259))
+    def test_fused_epilogue(self, n):
+        a = torch.randn(259, 328, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(n, 328, device=GPU_TYPE, dtype=torch.bfloat16).t()
+
+        def mm_gelu(a, b):
+            return torch.nn.functional.gelu(a @ b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(mm_gelu), a, b)
+        expected = torch.nn.functional.gelu(a.float() @ b.float()).to(a.dtype)
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        generated = "\n".join(code)
+        self.assertIn("_consume_tile", generated)
+        self.assertNotIn("triton_poi_", generated)
 
 
 class TestInterWaveTemplateCodegen(TestCase):

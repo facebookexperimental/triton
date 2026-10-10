@@ -73,6 +73,12 @@ blackwell_gemm_ws_template = TritonTemplate(
     source=load_tlx_template("blackwell_gemm_ws"),
 )
 
+hopper_gemm_ws_template = TritonTemplate(
+    name="tlx_hopper_gemm_ws",
+    grid=_persistent_mm_grid_split_k,
+    source=load_tlx_template("hopper_gemm_ws"),
+)
+
 # TLX warp-pipelined addmm template (MI350X/gfx950), col-major B only.
 # Hand-pipelined (num_stages=1): async_load prefetch into multi-buffered LDS +
 # tlx.warp_pipeline_stage("mfma"/"mem"). Wins on latency-bound thin-N fp16 addmm.
@@ -188,6 +194,9 @@ def append_tlx(templates, op_name, kernel_inputs):
         return _append_tlx_amd(templates, op_name)
     if current_target().is_blackwell:
         return _append_tlx_blackwell(templates, op_name)
+    if current_target().is_hopper and op_name == "mm":
+        if hopper_gemm_ws_template not in templates:
+            templates.append(hopper_gemm_ws_template)
     return templates
 
 
