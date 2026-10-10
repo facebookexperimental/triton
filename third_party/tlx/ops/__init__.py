@@ -492,7 +492,7 @@ def flash_attn_varlen_backward(q, k, v, o, do, lse, plan, sm_scale=None, causal=
             raise InvalidInput(f"tlx.ops.flash_attn_varlen_backward: {error}") from error
 
 
-def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
+def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
     """MXFP8 attention over contiguous BF16 ``(Z, H, N_CTX, HEAD_DIM)`` tensors.
 
     Q, K, V and the softmax probabilities are quantized internally to E4M3
@@ -502,6 +502,8 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     kernels/flash_attn_mxfp8/gfx950.py), and the two agree to within the
     quantization error rather than bitwise. Head dim 128 and sequence lengths
     divisible by 256. Blackwell returns BF16 gradients; gfx950 is forward only.
+    ``p_expcast=True`` (Blackwell only) encodes the forward probabilities with
+    ExpCast-FP8 instead of exp2 (see kernels/flash_attn_mxfp8/sm100.py).
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn_mxfp8 expects rank-4 Q/K/V tensors")
@@ -517,7 +519,7 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
     fn, spec = impl_for("flash_attn_mxfp8", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], N_CTX=q.shape[-2])
     check_backward(spec, q, k, v)
-    return fn(q, k, v, causal, sm_scale, space=space)
+    return fn(q, k, v, causal, sm_scale, space=space, p_expcast=p_expcast)
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False):

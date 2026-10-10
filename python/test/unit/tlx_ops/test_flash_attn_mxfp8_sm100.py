@@ -34,12 +34,8 @@ def _cosine(actual, expected):
 
 
 @pytest.fixture(params=[False, True], ids=["exp2", "expcast"])
-def p_expcast(request, monkeypatch):
+def p_expcast(request):
     """Run the forward with MUFU exp2 P (default) and with the ExpCast-FP8 P encode."""
-    from triton.tlx.ops.kernels.flash_attn_mxfp8 import sm100
-
-    for config in sm100._attn_fwd_mxf8_ws.configs:
-        monkeypatch.setitem(config.kwargs, "P_EXPCAST", request.param)
     return request.param
 
 
@@ -113,7 +109,7 @@ def test_flash_attn_mxfp8_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name, p_expca
     torch.manual_seed(20)
     q, k, v = _qkv((Z, H, N_CTX, HEAD_DIM))
     scale = 0.5
-    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
+    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke", p_expcast=p_expcast)
     ref = _sdpa(q, k, v, causal, scale)
     torch.testing.assert_close(out, ref, atol=0.2, rtol=0)
 
@@ -125,26 +121,23 @@ def test_flash_attn_mxfp8_fwd_multiple_cta_waves(causal, p_expcast):
     torch.manual_seed(20)
     q, k, v = _qkv(MULTI_WAVE_SHAPE)
     scale = 0.5
-    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke")
+    out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke", p_expcast=p_expcast)
     ref = _sdpa(q, k, v, causal, scale)
     torch.testing.assert_close(out, ref, atol=0.15, rtol=0)
 
 
 @pytest.mark.parametrize("scale", [128**-0.5, 0.5])
 @pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_mxfp8_expcast_error_vs_exp2(causal, scale, monkeypatch):
+def test_flash_attn_mxfp8_expcast_error_vs_exp2(causal, scale):
     """ExpCast-FP8 trades P accuracy for speed; bound its error relative to the exp2 path on the same inputs."""
     from triton.tlx.ops import flash_attn_mxfp8
-    from triton.tlx.ops.kernels.flash_attn_mxfp8 import sm100
 
     torch.manual_seed(20)
     q, k, v = _qkv(MULTI_WAVE_SHAPE)
     ref = _sdpa(q.float(), k.float(), v.float(), causal, scale)
     rel_l2 = {}
     for p_expcast in (False, True):
-        for config in sm100._attn_fwd_mxf8_ws.configs:
-            monkeypatch.setitem(config.kwargs, "P_EXPCAST", p_expcast)
-        out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke").float()
+        out = flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke", p_expcast=p_expcast).float()
         rel_l2[p_expcast] = ((out - ref).norm() / ref.norm()).item()
     # Measured worst case is 1.09x (flat logits at the default scale).
     assert rel_l2[True] <= 1.15 * rel_l2[False], rel_l2
@@ -160,7 +153,7 @@ def test_flash_attn_mxfp8_bwd_multiple_cta_waves(causal, p_expcast):
     scale = 0.5
     do = torch.randn_like(q)
 
-    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke").backward(do)
+    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke", p_expcast=p_expcast).backward(do)
     _sdpa(rq, rk, rv, causal, scale).backward(do)
 
     for label, actual, expected in (("dq", q.grad, rq.grad), ("dk", k.grad, rk.grad), ("dv", v.grad, rv.grad)):
@@ -178,7 +171,7 @@ def test_flash_attn_mxfp8_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name, p_expca
     scale = 0.5
     do = torch.randn_like(q)
 
-    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke").backward(do)
+    flash_attn_mxfp8(q, k, v, causal=causal, sm_scale=scale, space="smoke", p_expcast=p_expcast).backward(do)
     _sdpa(rq, rk, rv, causal, scale).backward(do)
 
     for label, actual, expected in (("dq", q.grad, rq.grad), ("dk", k.grad, rk.grad), ("dv", v.grad, rv.grad)):

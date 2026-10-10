@@ -1,7 +1,6 @@
 """Blackwell MXFP8 Flash Attention forward and backward implementation."""
 
 import math
-import os
 
 import torch
 import triton
@@ -50,9 +49,6 @@ def _mxf8_host_descriptor_pre_hook(nargs):
     nargs["desc_v_scale"].block_shape = [1, REP_HEAD, REP_N, 2, 256]
 
 
-# Opt-in ExpCast-FP8 P encode (no MUFU exp2 for P); see _softmax_inner_loop.
-_P_EXPCAST = os.environ.get("TLX_FA_MXFP8_EXPCAST", "") == "1"
-
 # TODO: Tune. These are just copied
 mxfp8_configs = [
     triton.Config(
@@ -68,7 +64,6 @@ mxfp8_configs = [
             "GROUP_SIZE_N": 1,
             "RESCALE_OPT": True,
             "UNROLL_KV": False,
-            "P_EXPCAST": _P_EXPCAST,
         },
         num_stages=1,
         num_warps=4,
@@ -3300,7 +3295,7 @@ def _quantize_mxfp8_operand(ref, transpose_for_reduction=False):
     return data, scale
 
 
-def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal):
+def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, p_expcast=False):
     """Launch MXFP8 forward and return its BF16 output and FP32 logsumexp."""
     Z, H, N_CTX, HEAD_DIM = q.shape
     y_dim = Z * H * N_CTX
@@ -3344,6 +3339,7 @@ def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale,
         N_CTX=N_CTX,
         HEAD_DIM=HEAD_DIM,
         STAGE=3 if causal else 1,
+        P_EXPCAST=p_expcast,
     )
     return o, m_tensor
 
@@ -3351,7 +3347,7 @@ def _forward_prequantized_with_lse(q, k, v, q_scale, k_scale, v_scale, sm_scale,
 class _MXFP8Attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal):
+    def forward(ctx, q, k, v, sm_scale, causal, p_expcast):
         q_fp8, q_scale, q_scale_dk = _quantize_mxfp8_32x32_operand(q)
         k_fp8, k_scale, k_scale_dq = _quantize_mxfp8_32x32_operand(k)
         v_fp8, v_scale = _quantize_mxfp8_operand(v, transpose_for_reduction=True)
@@ -3364,6 +3360,7 @@ class _MXFP8Attention(torch.autograd.Function):
             v_scale,
             sm_scale,
             causal,
+            p_expcast,
         )
         ctx.save_for_backward(
             v,
@@ -3422,13 +3419,17 @@ class _MXFP8Attention(torch.autograd.Function):
             dv.to(ctx.input_dtype),
             None,
             None,
+            None,
         )
 
 
-def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Differentiable Blackwell MXFP8 attention over BF16 master tensors."""
+def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
+    """Differentiable Blackwell MXFP8 attention over BF16 master tensors.
+
+    ``p_expcast`` encodes the forward P with ExpCast-FP8 instead of exp2; see _softmax_inner_loop.
+    """
     if space not in ("full", "smoke"):
         raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
-    return _MXFP8Attention.apply(q, k, v, sm_scale, causal)
+    return _MXFP8Attention.apply(q, k, v, sm_scale, causal, p_expcast)

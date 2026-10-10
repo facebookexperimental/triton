@@ -1075,9 +1075,11 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
     return out
 
 
-def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full"):
+def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_expcast=False):
     """BF16 MXFP8 attention. ``space`` selects no separate gfx950 config yet."""
     del space
+    if p_expcast:
+        raise ValueError("gfx950 flash_attn_mxfp8 does not support p_expcast")
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
     if q.dtype != torch.bfloat16:
