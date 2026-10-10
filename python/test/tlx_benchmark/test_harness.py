@@ -1244,12 +1244,12 @@ def test_no_gpu_stays_distinguishable_from_an_unset_pin(unpinned_driver, monkeyp
 # --------------------------------------------------------------------------
 
 
-def test_wallclock_is_the_default_and_the_documented_vocabulary():
+def test_gpu_events_is_the_default_and_the_documented_vocabulary():
     from _harness import LATENCY_MODES
     from _harness.measure import measure
 
     assert LATENCY_MODES == ("wallclock", "gpu_events")
-    assert "wallclock" == inspect.signature(measure).parameters["mode"].default
+    assert "gpu_events" == inspect.signature(measure).parameters["mode"].default
 
 
 def test_an_unknown_latency_mode_is_rejected():
@@ -1257,3 +1257,101 @@ def test_an_unknown_latency_mode_is_rejected():
 
     with pytest.raises(ValueError, match="mode must be one of"):
         measure(lambda: None, mode="profiler")
+
+
+def _fake_gpu_queue(monkeypatch, query_results):
+    import types
+    import torch
+    import importlib
+
+    timing = importlib.import_module("_harness.measure")
+
+    queries = iter(query_results)
+    calls = []
+    attempt = [0]
+
+    class Event:
+
+        def __init__(self, **kwargs):
+            self.attempt = attempt[0]
+
+        def record(self):
+            calls.append("record")
+
+        def query(self):
+            calls.append("query")
+            return next(queries)
+
+        def elapsed_time(self, end):
+            calls.append("elapsed")
+            return float(self.attempt)
+
+    def sleep(cycles):
+        calls.append(cycles)
+        attempt[0] += 1
+
+    active = types.SimpleNamespace(
+        get_device_interface=lambda: types.SimpleNamespace(Event=Event, synchronize=lambda: calls.append("sync")),
+        get_empty_cache_for_benchmark=lambda: "cache",
+        clear_cache=lambda cache: calls.append("clear"),
+    )
+    monkeypatch.setattr(triton.runtime.driver, "_active", active)
+    monkeypatch.setattr(torch.cuda, "_sleep", sleep)
+    return timing, calls
+
+
+def test_gpu_events_retries_started_batches_and_discards_their_samples(monkeypatch):
+    timing, calls = _fake_gpu_queue(monkeypatch, [True, False])
+    samples = timing._gpu_event_samples(lambda: calls.append("launch"), 2)
+    assert samples == [1.0, 1.0]  # only the second attempt's events are timed
+    assert [call for call in calls if isinstance(call, int)] == [timing._GATE_CYCLES, timing._GATE_CYCLES * 2]
+    assert calls.count("clear") == calls.count("launch") == 4
+    assert calls.index("query") < calls.index("sync", 1)
+    assert calls.count("elapsed") == 2
+
+
+def test_gpu_events_fails_without_a_fully_queued_batch(monkeypatch):
+    timing, calls = _fake_gpu_queue(monkeypatch, [True] * 4)
+    with pytest.raises(RuntimeError, match="no valid samples"):
+        timing._gpu_event_samples(lambda: None, 2)
+    assert "elapsed" not in calls
+    assert calls.count("query") == 4
+
+
+@pytest.mark.parametrize("legacy_mode", ["gpu_events", "wallclock"])
+@pytest.mark.parametrize("has_reference", [False, True])
+def test_run_case_uses_only_gpu_timing_and_keeps_cpu_diagnostics(monkeypatch, legacy_mode, has_reference):
+    import types
+    import torch
+    from _harness import driver, report
+
+    tlx_fn, ref_fn = lambda: None, lambda: None
+    prep = driver.Prepared(tlx_fn=tlx_fn, ref_fn=ref_fn if has_reference else None, flop_count=1_000_000, check=lambda:
+                           (True, ""))
+    bench = types.SimpleNamespace(prepare=lambda *args: prep)
+    modes = []
+
+    def measure(fn, *, mode, **kwargs):
+        modes.append(mode)
+        return _stat(mean=2.0 if fn is tlx_fn else 1.0)
+
+    monkeypatch.setattr(driver, "measure", measure)
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 80.0 if fn is tlx_fn else 16.0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    result = driver.run_case(bench, _case(), space="full", cold=False, latency_mode=legacy_mode)
+    assert result.status is Status.OK
+    assert result.tlx.mean == 2.0
+    assert result.tlx_host_us == 80.0
+    if has_reference:
+        assert result.speedup == 2.0
+        assert result.ref_host_us == 16.0
+        assert modes == ["gpu_events", "gpu_events"]
+    else:
+        assert result.ref is result.ref_host_us is None
+        assert modes == ["gpu_events"]
+    doc = result.to_dict()
+    assert "tlx_eager" not in doc and "ref_eager" not in doc
+    rendered = report.table([result])
+    assert "eager" not in rendered and "CPU us" in rendered
+    assert "80.00" in rendered

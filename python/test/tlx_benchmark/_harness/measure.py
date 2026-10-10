@@ -216,11 +216,8 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
 #: The two ways to time a call.
 #:
 #: "wallclock" is `triton.testing.do_bench`: CUDA events around each `fn()`,
-#: dispatched normally from the host. That is the authoritative mode here,
-#: because what it reports is what a caller gets -- if the host cannot keep the
-#: GPU fed, that is a real cost of using the op, and `tlx_host_us` says so
-#: alongside. It is also what every existing number in this suite was taken
-#: with.
+#: dispatched normally from the host. This is the eager-call diagnostic;
+#: submission gaps can enter the event interval.
 #:
 #: "gpu_events" is tritonbench's `--latency-measure-mode=gpu_events`: the whole
 #: batch is enqueued behind a blocked stream, so the host runs far ahead and
@@ -228,45 +225,47 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
 #: which is the right question when comparing two kernels rather than two
 #: end-to-end paths -- most useful on the multi-kernel backward passes
 #: (attention, KDA), where a wallclock reading folds in several launches' worth
-#: of host work. It flatters both providers equally, so a speedup ratio moves
-#: less than either absolute number.
+#: of host work. This is the kernel-performance verdict metric. Both modes
+#: clear the same benchmark cache before every timed call.
 LATENCY_MODES = ("wallclock", "gpu_events")
 
-#: GPU cycles to hold the stream while the host enqueues the batch. Only the
-#: ramp needs covering -- once the first iteration runs there is always queued
-#: work behind it -- so this is sized for the enqueue, not for the measurement.
-#: ~20ms at 1GHz, against a few microseconds of Python per iteration.
-_GATE_CYCLES = 20_000_000
+#: The gate must cover the entire enqueue, including slow Python wrappers.
+#: Cycles are only an initial guess; the event query below validates each batch.
+_GATE_CYCLES = 200_000_000
+_GATE_MAX_ATTEMPTS = 4
 
 
 def _gpu_event_samples(fn: Callable, iters: int, grad_to_none: Optional[Iterable] = None) -> list[float]:
-    """Per-iteration ms, with the host held off until the batch is queued."""
+    """Per-iteration ms, with timed GPU work held off until the batch is queued."""
     import torch
 
     di = triton.runtime.driver.active.get_device_interface()
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
-    starts = [di.Event(enable_timing=True) for _ in range(iters)]
-    ends = [di.Event(enable_timing=True) for _ in range(iters)]
-
     di.synchronize()
-    # Everything below is enqueued behind this sleep, so the host reaches the
-    # end of the loop before the GPU reaches the start of it.
-    torch.cuda._sleep(_GATE_CYCLES)
-    for i in range(iters):
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        triton.runtime.driver.active.clear_cache(cache)
-        starts[i].record()
-        fn()
-        ends[i].record()
-    di.synchronize()
-    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    for attempt in range(_GATE_MAX_ATTEMPTS):
+        starts = [di.Event(enable_timing=True) for _ in range(iters)]
+        ends = [di.Event(enable_timing=True) for _ in range(iters)]
+        torch.cuda._sleep(_GATE_CYCLES * 2**attempt)
+        for i in range(iters):
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            triton.runtime.driver.active.clear_cache(cache)
+            starts[i].record()
+            fn()
+            ends[i].record()
+        # Query before synchronizing: an incomplete first event proves the
+        # entire batch was submitted before its first timed interval began.
+        fully_queued = not starts[0].query()
+        di.synchronize()
+        if fully_queued:
+            return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    raise RuntimeError("GPU timing batch started before complete host enqueue; no valid samples")
 
 
 def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optional[int] = None,
             rep: Optional[int] = None, auto_window: bool = False, replicates: int = DEFAULT_REPLICATES,
-            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True, mode: str = "wallclock") -> Stat:
+            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True, mode: str = "gpu_events") -> Stat:
     # replicates>1 re-warms each time and measures drift BETWEEN runs
     # (rel_max_deviation); that is no longer the gate, hence the default of 1.
     # Window sizing is inherently temporal -- `do_bench` derives its iteration
@@ -274,7 +273,6 @@ def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optiona
     # matter what the caller wants reported.
     if mode not in LATENCY_MODES:
         raise ValueError(f"mode must be one of {LATENCY_MODES}, got {mode!r}")
-    estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
     replicates = max(1, replicates)
 
     if mode == "gpu_events":
@@ -288,6 +286,7 @@ def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optiona
             return summarize([to_tflops(r, flop_count) for r in runs], remove_outliers=remove_outliers, unit="tflops")
         return summarize(runs, remove_outliers=remove_outliers, unit="ms")
 
+    estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
     if auto_window:
         warmup_ms, rep_ms = resolve_warmup_and_rep(warmup, rep, estimate_ms)
     else:
