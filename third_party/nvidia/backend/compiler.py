@@ -154,16 +154,9 @@ def sm_arch_from_capability(capability: int):
 def _max_shared_mem_for_capability(capability: int) -> int:
     """Return CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN for a given SM capability.
 
-    Tries querying the GPU driver first. Falls back to a static table for
-    offline compilation environments (e.g. Triton CC on RE) where no GPU is present.
+    Use the compilation target's limit without initializing the runtime driver.
+    Query the driver only for architectures not covered by the table.
     """
-    try:
-        from triton.runtime.driver import driver as rt_driver
-
-        return rt_driver.active.utils.get_device_properties(rt_driver.active.get_current_device())["max_shared_mem"]
-    except (RuntimeError, Exception):
-        pass
-    # Fallback for offline compilation (no GPU present).
     # Values are CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN per
     # the CUDA Programming Guide "Technical Specifications per Compute Capability".
     _SMEM_SIZES = {
@@ -179,6 +172,18 @@ def _max_shared_mem_for_capability(capability: int) -> int:
         110: 232448,  # SM110: 228 KB per SM, optin = 227 KB
         120: 101376,  # SM120: 100 KB per SM, optin = 99 KB
     }
+    if capability in _SMEM_SIZES:
+        return _SMEM_SIZES[capability]
+
+    # Driver initialization builds cuda_utils and creates a CUDA context. Doing
+    # this in every Inductor compile worker retains substantial host memory
+    # (and, in fbcode, a Remote Execution client). Known targets need neither.
+    try:
+        from triton.runtime.driver import driver as rt_driver
+
+        return rt_driver.active.utils.get_device_properties(rt_driver.active.get_current_device())["max_shared_mem"]
+    except Exception:
+        pass
     # Try exact capability first (e.g. 86), then round to family base
     # (e.g. 86 -> 80) for unknown sub-variants, then fall back to 48 KB
     # (the default max shared mem per block without optin).
