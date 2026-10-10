@@ -52,6 +52,7 @@ def parse_args(cases):
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--rep", type=int, default=500)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--forward-only", action="store_true", help="skip backward for cases with GRAD_INPUTS")
     parser.add_argument("--variant", choices=("baseline", "candidate"), help=argparse.SUPPRESS)
     parser.add_argument("--result-json", help=argparse.SUPPRESS)
 
@@ -97,6 +98,16 @@ def validate_candidate_code(case, source_files) -> None:
     if missing_groups:
         formatted = [" or ".join(group) for group in missing_groups]
         raise RuntimeError("candidate implementation was not generated; missing one of: " + ", ".join(formatted))
+
+
+def report_error(case, label, output, reference, gate=True) -> None:
+    out, ref = output.float(), reference.float()
+    diff = (out - ref).abs()
+    rel_l2 = ((out - ref).norm() / ref.norm().clamp_min(1e-30)).item()
+    print(f"{label} max_abs={diff.max().item():.6f} mean_abs={diff.mean().item():.6f} rel_l2={rel_l2:.3e}")
+    tol = getattr(case, "REL_L2_TOL", None)
+    if gate and tol is not None and rel_l2 > tol:
+        raise RuntimeError(f"{label}: rel_l2 {rel_l2:.3e} > {tol}")
 
 
 def compile_variant(case, config, inputs, variant, *, model=None, reset=True):
@@ -145,8 +156,7 @@ def run_variant(case, variant: str, args) -> dict[str, object]:
     eager = case.model(*inputs)
     compiled, output = compile_variant(case, config, inputs, variant)
     torch.testing.assert_close(output, eager, atol=case.ATOL, rtol=case.RTOL)
-    diff = (output.float() - eager.float()).abs()
-    print(f"correctness_vs_eager max_abs={diff.max().item():.6f} mean_abs={diff.mean().item():.6f}")
+    report_error(case, "correctness_vs_eager", output, eager)
 
     samples = []
     for sample in range(args.samples):
@@ -189,6 +199,26 @@ def run_comparison(case) -> None:
           f"speedup={baseline['median_us'] / candidate['median_us']:.3f}x")
 
 
+def backward_leaves(case, inputs, args):
+    if args.forward_only or not getattr(case, "GRAD_INPUTS", ()):
+        return []
+    return [inputs[i].requires_grad_() for i in case.GRAD_INPUTS]
+
+
+def interleaved_samples(fns, args, label, candidate_name):
+    samples = {"baseline": [], "candidate": []}
+    for sample in range(args.samples):
+        order = ("baseline", "candidate")
+        if sample % 2:
+            order = tuple(reversed(order))
+        measured = {variant: bench_us(fns[variant], args.warmup, args.rep) for variant in order}
+        for variant in order:
+            samples[variant].append(measured[variant])
+        print(f"sample={sample + 1}{label} baseline={measured['baseline']:.3f}us "
+              f"{candidate_name}={measured['candidate']:.3f}us")
+    return statistics.median(samples["baseline"]), statistics.median(samples["candidate"])
+
+
 def run_interleaved_comparison(case, args) -> None:
     """Compile both variants once and alternate timing order to limit drift."""
     torch.compiler.config.force_disable_caches = True
@@ -199,10 +229,15 @@ def run_interleaved_comparison(case, args) -> None:
     print(f"torch={torch.__version__}; device={torch.cuda.get_device_name(0)}")
     print(f"case={case.NAME}; {case.problem()}")
     inputs = case.make_inputs()
+    leaves = backward_leaves(case, inputs, args)
     eager = case.model(*inputs)
+    grad_out = torch.randn_like(eager) if leaves else None
+    eager_grads = torch.autograd.grad(eager, leaves, grad_out) if leaves else ()
     compiled = {}
+    outputs = {}
+    grads = {}
     torch._dynamo.reset()
-    models = getattr(case, "comparison_models")()
+    models = getattr(case, "comparison_models", lambda: (case.model, case.model))()
     for (variant, config), model in zip(
         (
             ("baseline", case.BASELINE_CONFIG),
@@ -224,32 +259,41 @@ def run_interleaved_comparison(case, args) -> None:
             atol=case.ATOL,
             rtol=case.RTOL,
         )
-        diff = (output.float() - eager.float()).abs()
-        print(f"{variant}_correctness_vs_eager "
-              f"max_abs={diff.max().item():.6f} "
-              f"mean_abs={diff.mean().item():.6f}")
+        report_error(case, f"{variant}_correctness_vs_eager", output, eager)
+        outputs[variant] = output
+        if leaves:
+            grads[variant] = torch.autograd.grad(output, leaves, grad_out, retain_graph=True)
+            for i, (got, want) in enumerate(zip(grads[variant], eager_grads)):
+                # Not gated: eager and PT2 reduce in different orders.
+                report_error(case, f"{variant}_grad{i}_vs_eager", got, want, gate=False)
+    report_error(case, "candidate_vs_baseline", outputs["candidate"], outputs["baseline"])
+    for i, (got, want) in enumerate(zip(grads.get("candidate", ()), grads.get("baseline", ()))):
+        report_error(case, f"candidate_vs_baseline_grad{i}", got, want)
 
-    samples = {"baseline": [], "candidate": []}
-    for sample in range(args.samples):
-        order = ("baseline", "candidate")
-        if sample % 2:
-            order = tuple(reversed(order))
-        measured = {}
-        for variant in order:
-            measured[variant] = bench_us(
-                lambda variant=variant: compiled[variant](*inputs),
-                args.warmup,
-                args.rep,
-            )
-            samples[variant].append(measured[variant])
-        print(f"sample={sample + 1} baseline={measured['baseline']:.3f}us "
-              f"{case.CANDIDATE_NAME}={measured['candidate']:.3f}us")
-
-    baseline_us = statistics.median(samples["baseline"])
-    candidate_us = statistics.median(samples["candidate"])
+    baseline_us, candidate_us = interleaved_samples(
+        {variant: (lambda variant=variant: compiled[variant](*inputs))
+         for variant in compiled},
+        args,
+        "",
+        case.CANDIDATE_NAME,
+    )
     print(f"FINAL {case.problem()} baseline={baseline_us:.3f}us "
           f"{case.CANDIDATE_NAME}={candidate_us:.3f}us "
           f"speedup={baseline_us / candidate_us:.3f}x")
+    if leaves:
+        baseline_us, candidate_us = interleaved_samples(
+            {
+                variant:
+                (lambda variant=variant: torch.autograd.grad(outputs[variant], leaves, grad_out, retain_graph=True))
+                for variant in compiled
+            },
+            args,
+            " bwd",
+            case.CANDIDATE_NAME,
+        )
+        print(f"FINAL_BWD {case.problem()} baseline={baseline_us:.3f}us "
+              f"{case.CANDIDATE_NAME}={candidate_us:.3f}us "
+              f"speedup={baseline_us / candidate_us:.3f}x")
 
 
 def main() -> None:
@@ -275,6 +319,8 @@ def main() -> None:
             continue
         if getattr(case, "INTERLEAVE_VARIANTS", False):
             run_interleaved_comparison(case, args)
+        elif getattr(case, "GRAD_INPUTS", ()) and not args.forward_only:
+            raise SystemExit("GRAD_INPUTS (backward) needs INTERLEAVE_VARIANTS = True")
         else:
             run_comparison(case)
 
