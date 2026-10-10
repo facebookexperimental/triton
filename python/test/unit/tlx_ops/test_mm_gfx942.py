@@ -139,6 +139,54 @@ def test_unaligned_row_base_vectorizes():
     assert "buffer_load_dwordx4" in compiled.asm["amdgcn"], "expected 16-byte VMEM load"
 
 
+@pytest.mark.parametrize("K", [513, 527, 528, 529])
+@pytest.mark.parametrize("block_k", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("add_bias", [False, True])
+def test_mm_small_k_tail(K, block_k, dtype, add_bias):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    torch.manual_seed(0)
+    M, N = 67, 73
+    a = torch.randn((M, K), device="cuda", dtype=dtype)
+    b = torch.randn((N, K), device="cuda", dtype=dtype).T
+    bias = torch.randn((M, N), device="cuda", dtype=dtype)
+    out = torch.empty((M, N), device="cuda", dtype=dtype)
+    gfx942.matmul_kernel_gfx942[(triton.cdiv(M, 64) * triton.cdiv(N, 64), )](
+        a,
+        b,
+        bias,
+        out,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        bias.stride(0),
+        bias.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=block_k,
+        GROUP_M=4,
+        NUM_XCDS=8,
+        XCD_CHUNK=8,
+        ADD_BIAS=add_bias,
+        matrix_instr_nonkdim=16,
+        num_warps=4,
+        num_stages=2,
+    )
+    expected = a.float() @ b.float()
+    if add_bias:
+        expected += bias.float()
+    expected = expected.to(dtype)
+    precision = 1e-3 if dtype == torch.float16 else 8e-3
+    torch.testing.assert_close(out, expected, atol=precision * expected.abs().max().item(), rtol=precision)
+
+
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", shapes())
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)

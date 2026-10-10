@@ -34,6 +34,16 @@ _MEASURED_LOCAL_SPLIT_U_PLANS = {
     _LocalSplitUPlan(tile_m=16, tile_n=16, local_split_u=16, wave_k=64, k_width=8),
 }
 
+# Full-space trials. These do not change heuristic dispatch until their
+# decision-tree configuration is refreshed independently.
+_FULL_LOCAL_SPLIT_U_PLANS = {
+    **_MEASURED_LOCAL_SPLIT_U_PLANS,
+    (128, 256, 6144):
+    _LocalSplitUPlan(tile_m=16, tile_n=16, local_split_u=16, wave_k=64, k_width=8),
+    (128, 256, 3072):
+    _LocalSplitUPlan(tile_m=16, tile_n=16, local_split_u=16, wave_k=64, k_width=8),
+}
+
 
 @triton.jit
 def _load_local_split_u_operands_gfx942(
@@ -83,15 +93,18 @@ def _local_split_u_kernel_gfx942(
     WAVE_K: tl.constexpr,
     LOCAL_SPLIT_U: tl.constexpr,
 ):
-    """Compute a short-M tile with one K partition per wave."""
+    """Compute one output tile with one K partition per wave."""
     MACRO_K: tl.constexpr = WAVE_K * LOCAL_SPLIT_U
     tl.static_assert(K % MACRO_K == 0)
 
-    tl.static_assert(M <= TILE_M)
-    pid_n = tl.program_id(0).to(tl.int32)
+    pid = tl.program_id(0).to(tl.int32)
+    grid_n = tl.cdiv(N, TILE_N)
+    pid_n = pid % grid_n
+    pid_m = pid // grid_n
     split_ids = tl.arange(0, LOCAL_SPLIT_U).to(tl.int32)
     rows = tl.arange(0, TILE_M).to(tl.int32)
-    global_rows = tl.where(rows < M, rows, 0)
+    output_rows = pid_m * TILE_M + rows
+    global_rows = tl.where(output_rows < M, output_rows, 0)
     local_cols = tl.arange(0, TILE_N).to(tl.int32)
     output_cols = pid_n * TILE_N + local_cols
     global_cols = tl.where(output_cols < N, output_cols, 0)
@@ -169,7 +182,6 @@ def _local_split_u_kernel_gfx942(
         partial = tlx.local_load(tlx.local_slice(partial_view, [split, 0, 0], [1, TILE_M, TILE_N]))
         result += tl.reshape(partial, (TILE_M, TILE_N))
 
-    output_rows = tl.arange(0, TILE_M).to(tl.int32)
     output_ptrs = c_ptr + output_rows[:, None] * stride_cm + output_cols[None, :] * stride_cn
     tl.store(
         output_ptrs,
@@ -302,6 +314,17 @@ def _direct_matmul_kernel_gfx942(
         reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
         reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
 
+        # Buffer descriptors use signed-i32 byte bounds. Keep generic pointer
+        # loads for wide/negative strides and views that exceed the descriptor.
+        # Include the final element's full byte width, not only its start.
+        USE_BUFFER_A: tl.constexpr = (not USE_I64_A_OFFSETS and 0 <= stride_am and stride_am <= 0x7fffffff
+                                      and 0 <= stride_ak and stride_ak <= 0x7fffffff
+                                      and ((M - 1) * stride_am + (K - 1) * stride_ak + 1) *
+                                      (a_ptr.dtype.element_ty.primitive_bitwidth // 8) <= 0x7ffffffe)
+        USE_BUFFER_B: tl.constexpr = (not USE_I64_B_OFFSETS and 0 <= stride_bk and stride_bk <= 0x7fffffff
+                                      and 0 <= stride_bn and stride_bn <= 0x7fffffff
+                                      and ((K - 1) * stride_bk + (N - 1) * stride_bn + 1) *
+                                      (b_ptr.dtype.element_ty.primitive_bitwidth // 8) <= 0x7ffffffe)
         acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
         even_k = K % BLOCK_K == 0
         k_main = K if even_k else (K // BLOCK_K) * BLOCK_K
@@ -314,27 +337,37 @@ def _direct_matmul_kernel_gfx942(
                 b_offsets = ((k + offs_k[:, None]).to(tl.int64) * stride_bk + reg_n.to(tl.int64)[None, :] * stride_bn)
             else:
                 b_offsets = (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-            a_ptrs = a_ptr + a_offsets
-            b_ptrs = b_ptr + b_offsets
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+            if USE_BUFFER_A:
+                a = tlx.buffer_load(a_ptr, a_offsets, contiguity=1)
+            else:
+                a = tl.load(a_ptr + a_offsets)
+            if USE_BUFFER_B:
+                b = tlx.buffer_load(b_ptr, b_offsets, contiguity=1)
+            else:
+                b = tl.load(b_ptr + b_offsets)
             acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
         if not even_k:
+            # Small FP16 deep-K remainders need only one K=16 MFMA tile.
+            # Masked lanes zero-fill the rest of that tile.
+            if a_ptr.dtype.element_ty == tl.float16 and K > 256 and BLOCK_K > 16 and K % BLOCK_K <= 16:
+                tail_k = tl.arange(0, 16).to(tl.int32)
+            else:
+                tail_k = offs_k
             if USE_I64_A_OFFSETS:
                 a_offsets = (reg_m.to(tl.int64)[:, None] * stride_am +
-                             (k_main + offs_k[None, :]).to(tl.int64) * stride_ak)
+                             (k_main + tail_k[None, :]).to(tl.int64) * stride_ak)
             else:
-                a_offsets = reg_m[:, None] * stride_am + (k_main + offs_k[None, :]) * stride_ak
+                a_offsets = reg_m[:, None] * stride_am + (k_main + tail_k[None, :]) * stride_ak
             if USE_I64_B_OFFSETS:
-                b_offsets = ((k_main + offs_k[:, None]).to(tl.int64) * stride_bk +
+                b_offsets = ((k_main + tail_k[:, None]).to(tl.int64) * stride_bk +
                              reg_n.to(tl.int64)[None, :] * stride_bn)
             else:
-                b_offsets = (k_main + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
-            a_ptrs = a_ptr + a_offsets
-            b_ptrs = b_ptr + b_offsets
-            tail = offs_k < K - k_main
-            a = tl.load(a_ptrs, mask=tail[None, :], other=0.0)
-            b = tl.load(b_ptrs, mask=tail[:, None], other=0.0)
+                b_offsets = (k_main + tail_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+            tail = tail_k < K - k_main
+            # Masked buffer loads do not supply the explicit zero fill required
+            # by the final dot tile. Keep the ragged tail on generic loads.
+            a = tl.load(a_ptr + a_offsets, mask=tail[None, :], other=0.0)
+            b = tl.load(b_ptr + b_offsets, mask=tail[:, None], other=0.0)
             acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
 
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
@@ -496,6 +529,7 @@ def _configs():
         (64, 64, 64, 4, 4, 0),
         (64, 64, 128, 16, 8, 0),
         (64, 64, 256, 4, 8, 0),
+        (64, 64, 256, 16, 8, 0),
         (64, 128, 32, 4, 4, 2),
         (64, 128, 32, 8, 8, 0),
         (64, 128, 64, 4, 8, 0),
@@ -536,7 +570,8 @@ def _configs():
             num_warps,
             waves_per_eu=waves_per_eu,
         ) for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in candidates
-    ]
+    ] + [_config(128, 128, 64, 16, 4, kpack=2),
+         _config(64, 64, 256, 4, 8, kpack=2)]
 
 
 CONFIGS = _configs
@@ -641,7 +676,7 @@ def _candidate_configs(shape, enable_local_split_u=False):
     """Return the candidate universe, including a shape-specific incumbent."""
     configs = CONFIGS()
     if enable_local_split_u:
-        configs.append(_local_split_u_config(_MEASURED_LOCAL_SPLIT_U_PLANS[shape]))
+        configs.append(_local_split_u_config(_FULL_LOCAL_SPLIT_U_PLANS[shape]))
     incumbent = heuristic_config(*shape)[0]
     incumbent_key = (incumbent.kwargs, incumbent.num_warps, incumbent.num_stages)
     if not any((config.kwargs, config.num_warps, config.num_stages) == incumbent_key for config in configs):
@@ -696,16 +731,16 @@ def _bias_strides(bias, M, N, a):
 
 
 def _precheck_local_split_u(a, b, bias):
-    """Enable LocalSplitU only for measured MM shapes and layouts."""
+    """Enable LocalSplitU only for selected MM shapes and layouts."""
     shape = (a.shape[0], b.shape[1], a.shape[1])
     return (ENABLE_LOCAL_SPLIT_U and bias is None and a.dtype == torch.float16 and a.stride(1) == 1 and b.stride(0) == 1
-            and shape in _MEASURED_LOCAL_SPLIT_U_PLANS)
+            and shape in _FULL_LOCAL_SPLIT_U_PLANS)
 
 
 def _launch_local_split_u(a, b, out, plan):
     M, K = a.shape
     N = b.shape[1]
-    _local_split_u_kernel_gfx942[(triton.cdiv(N, plan.tile_n), )](
+    _local_split_u_kernel_gfx942[(triton.cdiv(M, plan.tile_m) * triton.cdiv(N, plan.tile_n), )](
         a,
         b,
         out,
@@ -750,31 +785,42 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     enable_local_split_u = _precheck_local_split_u(a, b, bias)
-    if space == "heuristic" and enable_local_split_u:
+    if space == "heuristic" and (M, N, K) in _MEASURED_LOCAL_SPLIT_U_PLANS:
         plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
         return _launch_local_split_u(a, b, out, plan)
 
     def grid(meta):
         if meta.get("USE_LOCAL_SPLIT_U", False):
-            return (triton.cdiv(N, meta["BLOCK_N"]), )
+            return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
         return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
 
     shape = (M, N, K) if space in ("heuristic", "full") else None
     kernel = _tuned(space, shape, space == "full" and enable_local_split_u)
     fast_configs = None
     fast_key = None
-    if space == "full" and enable_local_split_u:
+    launch_meta = {}
+    if space == "full":
         fast_configs = getattr(kernel, "_tlx_fast_configs", None)
         if fast_configs is None:
             fast_configs = kernel._tlx_fast_configs = {}
-        fast_key = _full_config_key(a, b)
+        fast_key = (_full_config_key(a, b), bias is not None, bias_strides)
         cached = fast_configs.get(fast_key)
-        if cached is not None and cached[1] and cached[0].kwargs.get("USE_LOCAL_SPLIT_U", False):
-            plan = _MEASURED_LOCAL_SPLIT_U_PLANS[(M, N, K)]
-            return _launch_local_split_u(a, b, out, plan)
+        if cached is not None and cached[1]:
+            config = cached[0]
+            if config.kwargs.get("USE_LOCAL_SPLIT_U", False):
+                plan = _FULL_LOCAL_SPLIT_U_PLANS[(M, N, K)]
+                return _launch_local_split_u(a, b, out, plan)
+            # Reuse the measured launch configuration. The first two calls
+            # still pass through Autotuner so instrumentation sees the winner.
+            kernel.best_config = config
+            launch_meta = dict(config.kwargs)
+            launch_meta["num_warps"] = config.num_warps
+            launch_meta["num_stages"] = config.num_stages
+
+    launch_kernel = matmul_kernel_gfx942 if launch_meta else kernel
 
     bias_ptr = bias if bias is not None else out
-    kernel[grid](
+    launch_kernel[grid](
         a,
         b,
         bias_ptr,
@@ -795,10 +841,11 @@ def _gemm(a, b, bias=None, *, out=None, space="heuristic"):
         USE_I64_B_OFFSETS=_needs_i64_offsets(b),
         USE_I64_C_OFFSETS=_needs_i64_offsets(out),
         matrix_instr_nonkdim=16,
+        **launch_meta,
     )
     if fast_configs is not None:
         # Keep one cached Autotuner launch so runtime instrumentation can
-        # observe the winner before the short kernel takes its fast path.
+        # observe the winner before subsequent calls take the direct path.
         previous = fast_configs.get(fast_key)
         fast_configs[fast_key] = (kernel.best_config, previous is not None)
     return out
