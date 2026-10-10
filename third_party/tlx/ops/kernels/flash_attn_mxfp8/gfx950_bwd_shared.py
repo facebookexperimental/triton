@@ -709,7 +709,20 @@ def _bwd_kv_owner_causal_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, A
     keys = key_tile * BN + tl.arange(0, BN)
     base = head * sequence_length * D
     v, vs = _inline_prepare_v64(V, base, keys, D)
-    k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
+    if LSE_SPLIT:
+        # Keep immutable K/V in LDS for the split causal query reduction.
+        kv_layout: tl.constexpr = _stage_layout(D)
+        k = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+        vmem = tlx.local_alloc((BN, D), tl.float8e4nv, 1, layout=kv_layout)
+        kv_offsets = (keys[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+        tlx.buffer_load_to_local(k[0], K + base, kv_offsets, True, 0.0)
+        tlx.local_store(vmem[0], v)
+        v = vmem
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(0)
+        tlx.workgroup_barrier()
+    else:
+        k = _load_resident_kv64(K, base, keys, sequence_length, D, True)
     ks = _load_scale_native(KS, head, key_tile * BN, sequence_length, 64, 4, False, False)
     _store_inline_kdqs(KS, KDQS, head, key_tile, sequence_length)
     mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
@@ -728,31 +741,31 @@ def _bwd_kv_owner_causal_partial_arena(QK, V, LSE, Arena, DK, DV, N, sm_scale, A
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS, D,
                            BM, BN, True, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
                            deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin, 0, True, PACK_DSS=True,
-                           PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
+                           PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT, IMMUTABLE_KV=LSE_SPLIT)
     dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS, D,
                            BM, BN, True, False, True, True, False, True, False, qmem, domem, qmem, domem, lsemem,
                            deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin + 64, 1, begin
                            < sequence_length - 128, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True,
-                           LSE_SPLIT=LSE_SPLIT)
+                           LSE_SPLIT=LSE_SPLIT, IMMUTABLE_KV=LSE_SPLIT)
     for pair_start in range(begin + 128, sequence_length - 128, 128):
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
                                D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
                                lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start, 0, True,
-                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
+                               PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT, IMMUTABLE_KV=LSE_SPLIT)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
                                D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
                                lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, pair_start + 64, 1,
-                               True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
+                               True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT, IMMUTABLE_KV=LSE_SPLIT)
     if begin < sequence_length - 128:
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
                                D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
                                lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                sequence_length - 128, 0, True, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True,
-                               LSE_SPLIT=LSE_SPLIT)
+                               LSE_SPLIT=LSE_SPLIT, IMMUTABLE_KV=LSE_SPLIT)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, None, DOS, LSE, Delta, DK, DV, sequence_length, sm_scale, DS, DSS,
                                D, BM, BN, False, False, True, True, False, True, False, qmem, domem, qmem, domem,
                                lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, sequence_length - 64,
-                               1, False, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT)
+                               1, False, PACK_DSS=True, PACK_P_EARLY=True, DELAY_DO_HEAD=True, LSE_SPLIT=LSE_SPLIT, IMMUTABLE_KV=LSE_SPLIT)
     offsets = base + keys[:, None] * D + tl.arange(0, D)[None, :]
     tl.store(DK + offsets, dk * sm_scale)
     tl.store(DV + offsets, dv)
@@ -1627,8 +1640,8 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
                           NATIVE=True, RELAXED=False, DELAY_DO_HEAD=lse_split and not causal and n in (4096, 8192),
                           enable_fp_fusion=not lse_split,
                           XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0),
-                          WARPS_N=(2 if lse_split and not causal and n == 8192 else 1),
-                          num_warps=(4 if lse_split and not causal and n == 8192 else 2), num_stages=1,
+                          WARPS_N=(2 if lse_split and not causal and n in (4096, 8192) else 1),
+                          num_warps=(4 if lse_split and not causal and n in (4096, 8192) else 2), num_stages=1,
                           matrix_instr_nonkdim=32, waves_per_eu=0, LSE_SPLIT=lse_split, grid=(128,
                                                                                               n // 64), warmup=False)
         _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
