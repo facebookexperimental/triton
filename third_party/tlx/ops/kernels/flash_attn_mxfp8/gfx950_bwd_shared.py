@@ -240,13 +240,21 @@ def _stage_layout(COLS):
 
 @triton.jit
 def _load_scale_native(S, head, start, N, R: tl.constexpr, C: tl.constexpr, RHS: tl.constexpr,
-                       TRANSPOSED_SQUARE: tl.constexpr):
+                       TRANSPOSED_SQUARE: tl.constexpr, WARPS_N: tl.constexpr = 1):
     tl.static_assert((R == 64 and C == 4) or (R == 128 and C == 2 and RHS))
     tl.static_assert(not TRANSPOSED_SQUARE or (R == 128 and C == 2 and RHS))
-    if RHS:
-        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (C // 2, R // 32)), stride=((C, 1, 0), (2, 32 * C)))
+    if WARPS_N == 2:
+        if RHS:
+            layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (C // 2, R // 64)),
+                                              stride=((C, 1, 32 * C, 0), (2, 64 * C)))
+        else:
+            layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (C // 2, R // 64)),
+                                              stride=((C, 1, 0, 32 * C), (2, 64 * C)))
     else:
-        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (C // 2, R // 64)), stride=((C, 1, 32 * C), (2, 64 * C)))
+        if RHS:
+            layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (C // 2, R // 32)), stride=((C, 1, 0), (2, 32 * C)))
+        else:
+            layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (C // 2, R // 64)), stride=((C, 1, 32 * C), (2, 64 * C)))
     # Only an arange is redistributed: materialize its consumers natively.
     # Full-rank anchoring avoids unsupported slice_layout(linear) parents.
     linear = tlx.require_layout(tl.arange(0, R * C).reshape(R, C), layout, pin=True)
@@ -264,8 +272,11 @@ def _load_scale_native(S, head, start, N, R: tl.constexpr, C: tl.constexpr, RHS:
 
 
 @triton.jit
-def _store_ds_scale_native(S, value, head, key_start, start, N):
-    layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (1, 1)), stride=((2, 1, 64), (2, 128)))
+def _store_ds_scale_native(S, value, head, key_start, start, N, WARPS_N: tl.constexpr = 1):
+    if WARPS_N == 2:
+        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (1, 1)), stride=((2, 1, 0, 64), (2, 128)))
+    else:
+        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (1, 1)), stride=((2, 1, 64), (2, 128)))
     linear = tlx.require_layout(tl.arange(0, 128).reshape(64, 2), layout, pin=True)
     row = linear // 2
     col = linear % 2
@@ -277,9 +288,9 @@ def _store_ds_scale_native(S, value, head, key_start, start, N):
 
 
 @triton.jit
-def _load_resident_kv64(P, base, rows, N, D: tl.constexpr, EVEN_N: tl.constexpr):
+def _load_resident_kv64(P, base, rows, N, D: tl.constexpr, EVEN_N: tl.constexpr, WARPS_N: tl.constexpr = 1):
     tl.static_assert(rows.shape[0] == 64 and D == 128 and EVEN_N)
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, WARPS_N])
     operand: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=16)
     offsets = rows[:, None] * D + tl.arange(0, D)[None, :]
     offsets = tlx.require_layout(offsets.to(tl.int32), operand, pin=False)
@@ -288,9 +299,9 @@ def _load_resident_kv64(P, base, rows, N, D: tl.constexpr, EVEN_N: tl.constexpr)
 
 
 @triton.jit
-def _load_rhs_kv64(mem, TRANS: tl.constexpr, NATIVE: tl.constexpr, RELAXED: tl.constexpr):
+def _load_rhs_kv64(mem, TRANS: tl.constexpr, NATIVE: tl.constexpr, RELAXED: tl.constexpr, WARPS_N: tl.constexpr = 1):
     tl.static_assert(NATIVE and not RELAXED)
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, WARPS_N])
     operand: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=16)
     if TRANS:
         value = tlx.local_load(tlx.local_trans(mem), layout=operand, relaxed=False)
@@ -300,26 +311,30 @@ def _load_rhs_kv64(mem, TRANS: tl.constexpr, NATIVE: tl.constexpr, RELAXED: tl.c
 
 
 @triton.jit
-def _lhs_scale_kv64(value):
+def _lhs_scale_kv64(value, WARPS_N: tl.constexpr = 1):
     R: tl.constexpr = value.shape[0]
     C: tl.constexpr = value.shape[1]
     tl.static_assert(R == 64 and (C == 2 or C == 4))
-    layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (C // 2, R // 64)), stride=((C, 1, 32 * C), (2, 64 * C)))
+    if WARPS_N == 2:
+        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (C // 2, R // 64)),
+                                          stride=((C, 1, 0, 32 * C), (2, 64 * C)))
+    else:
+        layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (C // 2, R // 64)), stride=((C, 1, 32 * C), (2, 64 * C)))
     return tlx.require_layout(value, layout, pin=False)
 
 
 @triton.jit
-def _load_metadata(memory):
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+def _load_metadata(memory, WARPS_N: tl.constexpr = 1):
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, WARPS_N])
     columns: tl.constexpr = tlx.slice_layout(mma, 0)
     values = tlx.local_load(memory, layout=columns, relaxed=False)
     return tlx.require_layout(values, columns, pin=False)
 
 
 @triton.jit
-def _load_softmax_metadata(memory, BM: tl.constexpr):
+def _load_softmax_metadata(memory, BM: tl.constexpr, WARPS_N: tl.constexpr = 1):
     # Keep the full descriptor at the helper boundary to retain slice strides.
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True, warps_per_cta=[2, WARPS_N])
     columns: tl.constexpr = tlx.slice_layout(mma, 0)
     row_max = tlx.local_load(tlx.local_slice(memory, [0], [BM]), layout=columns, relaxed=False)
     log_norm = tlx.local_load(tlx.local_slice(memory, [BM], [BM]), layout=columns, relaxed=False)
@@ -329,9 +344,9 @@ def _load_softmax_metadata(memory, BM: tl.constexpr):
 @triton.jit
 def _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start, N, BM: tl.constexpr,
                 D: tl.constexpr, EVEN_N: tl.constexpr, SLOT: tl.constexpr, COMMON_PREP: tl.constexpr = False,
-                PREP_N: tl.constexpr = 0, LSE_SPLIT: tl.constexpr = False):
+                PREP_N: tl.constexpr = 0, LSE_SPLIT: tl.constexpr = False, WARPS_N: tl.constexpr = 1):
     tl.static_assert(SLOT == 0 or SLOT == 1)
-    copy_layout: tl.constexpr = tlx.layout(shape=((64, 2), (1, )), stride=((1, 0), (0, )))
+    copy_layout: tl.constexpr = tlx.layout(shape=((64, 2 * WARPS_N), (1, )), stride=((1, 0), (0, )))
     offsets = tlx.require_layout((start + tl.arange(0, 64)).to(tl.int32), copy_layout, pin=True)
     metadata_base = head.to(tl.int64) * N
     if LSE_SPLIT:
@@ -427,9 +442,9 @@ def _quantize_ds_square(ds, BN: tl.constexpr, BM: tl.constexpr):
 
 
 @triton.jit
-def _load_rhs_words(S, head, start, N, COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0):
+def _load_rhs_words(S, head, start, N, COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, WARPS_N: tl.constexpr = 1):
     # Both query-square words are logically register-local in every thread.
-    word_layout: tl.constexpr = tlx.layout(shape=((64, 2), (2, )), stride=((0, 0), (1, )))
+    word_layout: tl.constexpr = tlx.layout(shape=((64, 2 * WARPS_N), (2, )), stride=((0, 0), (1, )))
     groups = tlx.require_layout(tl.arange(0, 2), word_layout, pin=True)
     if COMMON_PREP:
         tl.static_assert(PREP_N == 1024 or PREP_N == 2048)
@@ -447,29 +462,48 @@ def _load_rhs_words(S, head, start, N, COMMON_PREP: tl.constexpr = False, PREP_N
 
 
 @triton.jit
-def _decode_rhs_head(words):
-    # Keep the asm domain at one i32 per lane half, not four i32 per head.
-    half_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), ()), stride=((0, 1, 0), ()))
-    half = tlx.require_layout(tl.arange(0, 2), half_layout, pin=True)
-    w0, w1 = tl.split(words.reshape(1, 2))
-    selector = (0x06040200 + half * 0x01010101).to(tl.uint32)
-    selector = tlx.require_layout(selector, half_layout, pin=True)
-    packed = tl.inline_asm_elementwise("v_perm_b32 $0, $1, $2, $3;", "=v,v,v,v", [w1, w0, selector], dtype=tl.uint32,
-                                       is_pure=True, pack=1)
-    packed = tlx.require_layout(packed, half_layout, pin=True)
-    # Bytes are (h, rR, rC); joins split one packed word without arithmetic.
-    halves = tl.join(packed.to(tl.uint16), (packed >> 16).to(tl.uint16))
-    octets = tl.join(halves.to(tl.uint8), (halves >> 8).to(tl.uint8))
-    expanded = tl.broadcast_to(tlx.release_layout(octets.reshape(2, 1, 2, 2)), (2, 32, 2, 2))
-    # (h,u,rR,rC) -> (rR,u,rC,h): row=u+32*rR, col=h+2*rC.
-    head_scales = expanded.permute(2, 1, 3, 0).reshape(64, 4)
-    head_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (2, 2)), stride=((4, 1, 0), (2, 128)))
-    return tlx.require_layout(head_scales, head_layout, pin=False)
+def _decode_rhs_head(words, WARPS_N: tl.constexpr = 1):
+    if WARPS_N == 2:
+        # Query32 belongs to the first warp bit in the four-warp result.
+        # Select that square's saved word directly in the native scale layout.
+        head_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (2, )),
+                                               stride=((4, 1, 128, 0), (2, )))
+        index = tlx.require_layout(tl.arange(0, 256).reshape(64, 4), head_layout, pin=True)
+        w0, w1 = tl.split(words.reshape(1, 2))
+        w0 = tlx.require_layout(tl.broadcast_to(tlx.release_layout(w0).reshape(1, 1), (64, 4)), head_layout,
+                               pin=False)
+        w1 = tlx.require_layout(tl.broadcast_to(tlx.release_layout(w1).reshape(1, 1), (64, 4)), head_layout,
+                               pin=False)
+        word = tl.where(index // 4 < 32, w0, w1)
+        scales = ((word >> ((index % 4) * 8)) & 255).to(tl.uint8)
+        return tlx.require_layout(scales, head_layout, pin=False)
+    else:
+        # Keep the asm domain at one i32 per lane half, not four i32 per head.
+        half_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), ()), stride=((0, 1, 0), ()))
+        half = tlx.require_layout(tl.arange(0, 2), half_layout, pin=True)
+        w0, w1 = tl.split(words.reshape(1, 2))
+        selector = (0x06040200 + half * 0x01010101).to(tl.uint32)
+        selector = tlx.require_layout(selector, half_layout, pin=True)
+        packed = tl.inline_asm_elementwise("v_perm_b32 $0, $1, $2, $3;", "=v,v,v,v", [w1, w0, selector], dtype=tl.uint32,
+                                           is_pure=True, pack=1)
+        packed = tlx.require_layout(packed, half_layout, pin=True)
+        # Bytes are (h, rR, rC); joins split one packed word without arithmetic.
+        halves = tl.join(packed.to(tl.uint16), (packed >> 16).to(tl.uint16))
+        octets = tl.join(halves.to(tl.uint8), (halves >> 8).to(tl.uint8))
+        expanded = tl.broadcast_to(tlx.release_layout(octets.reshape(2, 1, 2, 2)), (2, 32, 2, 2))
+        # (h,u,rR,rC) -> (rR,u,rC,h): row=u+32*rR, col=h+2*rC.
+        head_scales = expanded.permute(2, 1, 3, 0).reshape(64, 4)
+        head_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (2, 2)), stride=((4, 1, 0), (2, 128)))
+        return tlx.require_layout(head_scales, head_layout, pin=False)
 
 
 @triton.jit
-def _decode_rhs_late(words):
-    late_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (1, 4)), stride=((2, 1, 0), (2, 64)))
+def _decode_rhs_late(words, WARPS_N: tl.constexpr = 1):
+    if WARPS_N == 2:
+        late_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2, 2), (1, 2)),
+                                               stride=((2, 1, 64, 0), (2, 128)))
+    else:
+        late_layout: tl.constexpr = tlx.layout(shape=((32, 2, 2), (1, 4)), stride=((2, 1, 0), (2, 64)))
     late_index = tlx.require_layout(tl.arange(0, 256).reshape(128, 2), late_layout, pin=False)
     late_words = tl.broadcast_to(words.reshape(1, 2), (128, 2))
     late_words = tlx.require_layout(late_words, late_layout, pin=False)
@@ -732,24 +766,24 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   base, key_tile, keys, start, SLOT: tl.constexpr, PREFETCH, PACK_DSS: tl.constexpr,
                   PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
                   COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, IMMUTABLE_KV: tl.constexpr = False,
-                  EARLY_DP: tl.constexpr = False, LSE_SPLIT: tl.constexpr = False):
+                  EARLY_DP: tl.constexpr = False, LSE_SPLIT: tl.constexpr = False, WARPS_N: tl.constexpr = 1):
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
-                                                   warps_per_cta=[2, 1])
+                                                   warps_per_cta=[2, WARPS_N])
     export_layout: tl.constexpr = tlx.dot_operand_layout(0, export_mma, k_width=16)
     native_rhs: tl.constexpr = tlx.dot_operand_layout(1, export_mma, k_width=16)
     phase: tl.constexpr = 0
     queries = start + tl.arange(0, BM)
-    q_words = _load_rhs_words(QS, head, start, N)
-    do_words = _load_rhs_words(DOS, head, start, N, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N)
+    q_words = _load_rhs_words(QS, head, start, N, WARPS_N=WARPS_N)
+    do_words = _load_rhs_words(DOS, head, start, N, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, WARPS_N=WARPS_N)
     tlx.async_load_wait_group(0)
     tlx.workgroup_barrier()
     if PREFETCH:
         _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, start + BM, N, BM, D, EVEN_N,
-                    1 - SLOT, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
-    q = _load_rhs_kv64(qmem[SLOT], True, NATIVE, RELAXED)
+                    1 - SLOT, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
+    q = _load_rhs_kv64(qmem[SLOT], True, NATIVE, RELAXED, WARPS_N=WARPS_N)
     if not DELAY_DO_HEAD:
-        do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
-    qs = _decode_rhs_head(q_words)
+        do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED, WARPS_N=WARPS_N)
+    qs = _decode_rhs_head(q_words, WARPS_N=WARPS_N)
     if IMMUTABLE_KV:
         # The owner or first tile barrier publishes K before these immutable reads.
         k = tlx.local_load(k[0], layout=export_layout, relaxed=True)
@@ -757,20 +791,20 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         tl.static_assert(DELAY_DO_HEAD and IMMUTABLE_KV and NATIVE and not CAUSAL)
         # Retain both matrix results before their vector consumers.
         scores_mma = tlx.dot_scaled(
-            tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
+            tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks, WARPS_N=WARPS_N), 'e4m3',
             tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
             tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
         if LSE_SPLIT:
-            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM)
+            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM, WARPS_N=WARPS_N)
         else:
-            lse = _load_metadata(lsemem[SLOT])
-        do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
-        dos = _decode_rhs_head(do_words)
+            lse = _load_metadata(lsemem[SLOT], WARPS_N=WARPS_N)
+        do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED, WARPS_N=WARPS_N)
+        dos = _decode_rhs_head(do_words, WARPS_N=WARPS_N)
         # The owner or first tile barrier publishes V before these immutable reads.
         tlx.amd_sched_barrier(0)
         v = tlx.local_load(v[0], layout=export_layout, relaxed=True)
         dp_mma = tlx.dot_scaled(
-            tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
+            tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs, WARPS_N=WARPS_N), 'e4m3',
             tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
             tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
         scores = tlx.release_layout(scores_mma)
@@ -789,13 +823,13 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
         dp = tlx.release_layout(dp_mma)
     else:
         scores = tlx.release_layout(
-            tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks), 'e4m3',
+            tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks, WARPS_N=WARPS_N), 'e4m3',
                            tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
                            tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
         if LSE_SPLIT:
-            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM)
+            lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM, WARPS_N=WARPS_N)
         else:
-            lse = _load_metadata(lsemem[SLOT])
+            lse = _load_metadata(lsemem[SLOT], WARPS_N=WARPS_N)
         if LSE_SPLIT:
             scaled = scores * (sm_scale * 1.4426950408889634)
             logits = (scaled - lse[None, :]) - log_norm[None, :]
@@ -809,43 +843,43 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
             tlx.amd_iglp_opt(3)
         if DELAY_DO_HEAD:
             # The score/P computation does not consume the dO operand.
-            do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED)
-        dos = _decode_rhs_head(do_words)
+            do = _load_rhs_kv64(domem[SLOT], True, NATIVE, RELAXED, WARPS_N=WARPS_N)
+        dos = _decode_rhs_head(do_words, WARPS_N=WARPS_N)
         if IMMUTABLE_KV:
             # The owner or first tile barrier publishes V before these immutable reads.
             tlx.amd_sched_barrier(0)
             v = tlx.local_load(v[0], layout=export_layout, relaxed=True)
         dp = tlx.release_layout(
-            tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs), 'e4m3',
+            tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs, WARPS_N=WARPS_N), 'e4m3',
                            tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
                            tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
-    delta = _load_metadata(deltamem[SLOT])
+    delta = _load_metadata(deltamem[SLOT], WARPS_N=WARPS_N)
     ds = tl.where(valid, p * (dp - delta[None, :]), 0.0)
     if PACK_P_EARLY:
         # P has no FP32 consumers after dS is formed.
         p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
         ps = tl.full((BN, BM // 32), 119, tl.uint8)
     ds8, dsk, unused_compact_exponent = _quantize_ds_square(ds, BN, BM)
-    dsk = _lhs_scale_kv64(dsk)
+    dsk = _lhs_scale_kv64(dsk, WARPS_N=WARPS_N)
     if not PACK_P_EARLY:
         p8 = _guarded_p_words(p, tl.full((BN, BM // 2), 0.00390625, tl.float32))
         ps = tl.full((BN, BM // 32), 119, tl.uint8)
     if SEQ_K_CONTIG:
-        dodv = _load_rhs_kv64(dodvmem[SLOT], True, NATIVE, RELAXED)
+        dodv = _load_rhs_kv64(dodvmem[SLOT], True, NATIVE, RELAXED, WARPS_N=WARPS_N)
     else:
-        dodv = _load_rhs_kv64(dodvmem[SLOT], False, NATIVE, RELAXED)
-    dodvs = _decode_rhs_late(do_words)
+        dodv = _load_rhs_kv64(dodvmem[SLOT], False, NATIVE, RELAXED, WARPS_N=WARPS_N)
+    dodvs = _decode_rhs_late(do_words, WARPS_N=WARPS_N)
     # LLVM 850a2b1b: mask-zero ends the head IGLP scheduling region.
     tlx.amd_sched_barrier(0)
-    dv = tlx.dot_scaled(tlx.require_layout(p8, export_layout, pin=False), _lhs_scale_kv64(ps), 'e4m3',
+    dv = tlx.dot_scaled(tlx.require_layout(p8, export_layout, pin=False), _lhs_scale_kv64(ps, WARPS_N=WARPS_N), 'e4m3',
                         tlx.require_layout(dodv, native_rhs, pin=False), dodvs, 'e4m3',
                         tlx.require_layout(dv, export_mma, pin=False))
     if SEQ_K_CONTIG:
-        qdk = _load_rhs_kv64(qdkmem[SLOT], True, NATIVE, RELAXED)
+        qdk = _load_rhs_kv64(qdkmem[SLOT], True, NATIVE, RELAXED, WARPS_N=WARPS_N)
     else:
-        qdk = _load_rhs_kv64(qdkmem[SLOT], False, NATIVE, RELAXED)
-    qdks = _decode_rhs_late(q_words)
-    dk = tlx.dot_scaled(tlx.require_layout(ds8, export_layout, pin=False), _lhs_scale_kv64(dsk), 'e4m3',
+        qdk = _load_rhs_kv64(qdkmem[SLOT], False, NATIVE, RELAXED, WARPS_N=WARPS_N)
+    qdks = _decode_rhs_late(q_words, WARPS_N=WARPS_N)
+    dk = tlx.dot_scaled(tlx.require_layout(ds8, export_layout, pin=False), _lhs_scale_kv64(dsk, WARPS_N=WARPS_N), 'e4m3',
                         tlx.require_layout(qdk, native_rhs, pin=False), qdks, 'e4m3',
                         tlx.require_layout(dk, export_mma, pin=False))
     export_base = head * N * N
@@ -864,7 +898,7 @@ def _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if PACK_DSS:
         _store_ds_scale_packed(DSS_EXPORT, dsk, head, key_tile * BN, start, N)
     else:
-        _store_ds_scale_native(DSS_EXPORT, dsk, head, key_tile * BN, start, N)
+        _store_ds_scale_native(DSS_EXPORT, dsk, head, key_tile * BN, start, N, WARPS_N=WARPS_N)
     return (dk, dv)
 
 
@@ -874,7 +908,7 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                   EVEN_N: tl.constexpr, IGLP: tl.constexpr = False, PEEL: tl.constexpr = False,
                   NATIVE: tl.constexpr = False, RELAXED: tl.constexpr = False, XCD_KEY_TILES: tl.constexpr = 0,
                   PACK_P_EARLY: tl.constexpr = False, DELAY_DO_HEAD: tl.constexpr = False,
-                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, LSE_SPLIT: tl.constexpr = False):
+                  COMMON_PREP: tl.constexpr = False, PREP_N: tl.constexpr = 0, LSE_SPLIT: tl.constexpr = False, WARPS_N: tl.constexpr = 1):
     """One CTA owns the complete dK/dV reduction for BN keys."""
     tl.static_assert(not SEQ_K_CONTIG, 'Shared-LDS specialization requires ordinary contiguous payloads')
     tl.static_assert(D == 128 and BM == 64 and (BN == 64) and NATIVE and (not RELAXED) and (not PEEL))
@@ -882,8 +916,9 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if COMMON_PREP:
         tl.static_assert(CAUSAL and (PREP_N == 1024 or PREP_N == 2048))
         tl.static_assert(N == PREP_N)
+    tl.static_assert(WARPS_N == 1 or WARPS_N == 2)
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
-                                                   warps_per_cta=[2, 1])
+                                                   warps_per_cta=[2, WARPS_N])
     if XCD_KEY_TILES:
         # Interleave eight 32-owner chunks, as in gfx950 grouped GEMM.
         # Key-fast logical owners share a head within each chunk, grouping
@@ -903,10 +938,10 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     keys = key_tile * BN + tl.arange(0, BN)
     d = tl.arange(0, D)
     base = head * N * D
-    k = _load_resident_kv64(K, base, keys, N, D, EVEN_N)
-    v = _load_resident_kv64(V, base, keys, N, D, EVEN_N)
-    ks = _load_scale_native(KS, head, key_tile * BN, N, 64, 4, False, False)
-    vs = _load_scale_native(VS, head, key_tile * BN, N, 64, 4, False, False)
+    k = _load_resident_kv64(K, base, keys, N, D, EVEN_N, WARPS_N=WARPS_N)
+    v = _load_resident_kv64(V, base, keys, N, D, EVEN_N, WARPS_N=WARPS_N)
+    ks = _load_scale_native(KS, head, key_tile * BN, N, 64, 4, False, False, WARPS_N=WARPS_N)
+    vs = _load_scale_native(VS, head, key_tile * BN, N, 64, 4, False, False, WARPS_N=WARPS_N)
     dk = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), export_mma, pin=False)
     dv = tlx.require_layout(tl.full((BN, D), 0.0, tl.float32), export_mma, pin=False)
     shared_layout: tl.constexpr = _stage_layout(D)
@@ -925,7 +960,7 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
     if CAUSAL:
         begin = key_tile * BN // 128 * 128
     _stage_tile(qmem, domem, lsemem, deltamem, Q, DO, LSE, Delta, base, head, begin, N, BM, D, EVEN_N, 0,
-                COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
+                COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
     if CAUSAL:
         # The first physical128 block is always masked. Only its second
         # tile needs a runtime prefetch decision for the final-only CTA.
@@ -933,38 +968,38 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin, 0,
                                True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, begin + 64,
                                1, begin < N - 128, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
-                               DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
+                               DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
         for pair_start in range(begin + 128, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
                                    DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
-                                   LSE_SPLIT=LSE_SPLIT)
+                                   LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
                                    DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
-                                   LSE_SPLIT=LSE_SPLIT)
+                                   LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
         if begin < N - 128:
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    N - 128, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
                                    DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
-                                   LSE_SPLIT=LSE_SPLIT)
+                                   LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, False, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    N - 64, 1, False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
                                    DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
-                                   LSE_SPLIT=LSE_SPLIT)
+                                   LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
     else:
         for pair_start in range(begin, N - 128, 128):
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
@@ -972,23 +1007,23 @@ def _bwd_kv_owner(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start, 0, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
                                    DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
-                                   LSE_SPLIT=LSE_SPLIT)
+                                   LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
             dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT,
                                    D, BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem,
                                    qdkmem, dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys,
                                    pair_start + 64, 1, True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY,
                                    DELAY_DO_HEAD=DELAY_DO_HEAD, COMMON_PREP=COMMON_PREP, PREP_N=PREP_N,
-                                   LSE_SPLIT=LSE_SPLIT)
+                                   LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 128, 0,
                                True, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
         dk, dv = _compute_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_scale, DS_EXPORT, DSS_EXPORT, D,
                                BM, BN, CAUSAL, SEQ_K_CONTIG, EVEN_N, IGLP, PEEL, NATIVE, RELAXED, qmem, domem, qdkmem,
                                dodvmem, lsemem, deltamem, k, v, ks, vs, dk, dv, head, base, key_tile, keys, N - 64, 1,
                                False, PACK_DSS=CAUSAL, PACK_P_EARLY=PACK_P_EARLY, DELAY_DO_HEAD=DELAY_DO_HEAD,
-                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT)
+                               COMMON_PREP=COMMON_PREP, PREP_N=PREP_N, LSE_SPLIT=LSE_SPLIT, WARPS_N=WARPS_N)
     out = base + keys[:, None] * D + d[None, :]
     tl.store(DK + out, dk * sm_scale, EVEN_N | (keys[:, None] < N))
     tl.store(DV + out, dv, EVEN_N | (keys[:, None] < N))
@@ -1591,7 +1626,9 @@ def _launch_backward_shared_square(q_fp8, k_fp8, q_scale, k_scale, v_bf16, do_bf
                           D=128, BM=64, BN=64, CAUSAL=causal, SEQ_K_CONTIG=False, EVEN_N=True, IGLP=True, PEEL=False,
                           NATIVE=True, RELAXED=False, DELAY_DO_HEAD=lse_split and not causal and n in (4096, 8192),
                           enable_fp_fusion=not lse_split,
-                          XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0), num_warps=2, num_stages=1,
+                          XCD_KEY_TILES=(n // 64 if not causal and n in (4096, 8192) else 0),
+                          WARPS_N=(2 if lse_split and not causal and n == 8192 else 1),
+                          num_warps=(4 if lse_split and not causal and n == 8192 else 2), num_stages=1,
                           matrix_instr_nonkdim=32, waves_per_eu=0, LSE_SPLIT=lse_split, grid=(128,
                                                                                               n // 64), warmup=False)
         _bwd_q_consume.run(ds, dss, k_fp8, kdqs, dq, n, sm_scale, D=128, BM=128, BK=64, CAUSAL=causal, HEADS=128,
