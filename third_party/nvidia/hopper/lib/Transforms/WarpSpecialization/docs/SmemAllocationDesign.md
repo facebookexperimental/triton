@@ -37,6 +37,12 @@ Redesign the SMEM allocation in `MemoryPlanner::run()` so that:
 | **smem-circular-reuse** | Pass option (default: off). When on, enables reuse-group pairing in Phase 4. When off, every WSBuffer keeps its own `buffer.id`. |
 | **Cross-stage** | A WSBuffer whose channel has producer and consumer(s) in different `loop.stage` values. |
 
+Descriptor loads marked with `tt.requested_buffer_depth` are exact-depth
+allocations. Phase 1 pins their canonical destination `local_alloc` to that
+copy count. Later heuristic phases neither resize them nor combine them into a
+circular-reuse group; this preserves independently indexed operand rings such
+as A3/B2.
+
 ---
 
 ## Algorithm

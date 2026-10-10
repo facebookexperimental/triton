@@ -26,6 +26,16 @@ def anchor(v):
     pass
 
 
+@filecheck_test
+@triton.jit
+def test_operand_buffer_depth_loop_options():
+    # CHECK: scf.for
+    # CHECK: } {tt.lhs_buffer_depth = 3 : i32
+    # CHECK-SAME: tt.rhs_buffer_depth = 2 : i32
+    for i in tl.range(0, 4, warp_specialize=True, lhs_buffer_depth=3, rhs_buffer_depth=2):
+        anchor(i)
+
+
 @triton.aggregate
 class Pair:
     first: tl.tensor
