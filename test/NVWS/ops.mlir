@@ -132,3 +132,19 @@ tt.func @token_with_ws_constraints() {
   nvws.consumer_release %0, %c0_i32 {async_task_id = dense<1> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32
   tt.return
 }
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @aref_phi
+  tt.func @aref_phi() -> i32 {
+    // CHECK: %[[LOCAL:.*]] = arith.constant {ttg.partition = array<i32: 3>} 1 : i32
+    %local = arith.constant {ttg.partition = array<i32: 3>} 1 : i32
+    // CHECK: %[[REMOTE:.*]] = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 2 : i32
+    %remote = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 2 : i32
+    // CHECK: %[[SELECTED:.*]] = nvws.aref.phi %[[LOCAL]], %[[REMOTE]] {ttg.partition = array<i32: 0, 1, 2, 3>} : i32
+    %selected = nvws.aref.phi %local, %remote {ttg.partition = array<i32: 0, 1, 2, 3>} : i32
+    // CHECK: tt.return %[[SELECTED]] : i32
+    tt.return %selected : i32
+  }
+}
