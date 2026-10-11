@@ -77,6 +77,10 @@ def test_platform_registries_select_knowledge_and_profiler() -> None:
         path.name == "overlapping-tmem-accumulators.md"
         for path in knowledge_paths(KernelTarget(backend="cuda", architecture="H100"))
     )
+    hopper_paths = knowledge_paths(KernelTarget(backend="cuda", architecture="H100"))
+    assert any("knowledge/nvidia/hopper" in str(path) for path in hopper_paths)
+    assert any(path.name == "hopper-machine-limits.md" for path in hopper_paths)
+    assert not any(path.name == "hopper-machine-limits.md" for path in paths)
     assert native_profiler_for_backend("cuda") == "ncu"
 
     amd_paths = knowledge_paths(KernelTarget(backend="hip", architecture="gfx950"))
