@@ -1,4 +1,5 @@
 add_triton_library(TritonNvidiaGPUTransforms
+  ToCLC.cpp
   ClusterBarrierMbarAllocator.cpp
   ClusterBarrierInsertion.cpp
   CheckMatmulTwoCTAs.cpp

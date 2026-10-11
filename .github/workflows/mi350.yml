@@ -256,6 +256,8 @@ jobs:
       - name: Run TLX core tests
         id: run_core_tests
         timeout-minutes: 90
+        env:
+          PYTEST_ADDOPTS: --import-mode=importlib
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
@@ -282,7 +284,9 @@ jobs:
             [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
           fi
           echo "mi350 collects:" "${FILES[@]}"
-          pytest "${FILES[@]}" -v --junitxml=/tmp/tlx-core.xml
+          # Forkserver children must import the test module by its importlib name
+          # (python.test.unit.tlx_ops.*), not just its helpers from tlx_ops.
+          PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" pytest "${FILES[@]}" --import-mode=importlib -v --junitxml=/tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
@@ -515,7 +519,7 @@ jobs:
             echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
             exit 0
           fi
-          pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
+          pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
         if: always() && github.event_name == 'schedule'

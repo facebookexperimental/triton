@@ -36,6 +36,11 @@ def _gpu_cleanup():
 
 
 def pytest_addoption(parser):
+    # An installed pytest plugin may already provide --device. Reuse that
+    # option instead of registering it twice (pytest has no public lookup API).
+    for group in (parser._anonymous, *parser._groups):
+        if any("--device" in option.names() for option in group.options):
+            return
     parser.addoption("--device", action="store", default="cuda")
 
 
@@ -44,7 +49,9 @@ def device(request):
     # --device is unpassable under buck; cpu backend implies cpu tensors.
     if os.environ.get("TRITON_DEFAULT_BACKEND") == "cpu":
         return "cpu"
-    return request.config.getoption("--device")
+    selected = request.config.getoption("--device")
+    # The shared option may come from a plugin whose default is None.
+    return "cuda" if selected is None else selected
 
 
 @pytest.fixture
@@ -107,7 +114,7 @@ def pytest_collection_modifyitems(config, items):
     if os.environ.get("TRITON_INTERPRET") == "1":
         return
     try:
-        device = config.getoption("device")
+        device = config.getoption("--device")
     except ValueError:
         device = None
     # Some CI jobs select the CPU backend implicitly (GPU-less runners) and

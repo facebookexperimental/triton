@@ -89,7 +89,15 @@ int getSemaphoreGroupNumStages(ArrayRef<SemaphoreCreateOp> semas,
       if (!wsLoop)
         continue;
 
-      int loopNumStages = getNumStagesOrDefault(wsLoop, defaultNumStages);
+      int loopNumStages = defaultNumStages;
+      // The outer WS loop can be scf.for or scf.while. Honor the same
+      // tt.num_stages override on either kind of loop.
+      Operation *loopOp = wsLoop.getOperation();
+      auto stagesAttr =
+          TritonDialect::getLoaded(loopOp)->getNumStagesAttrHelper().getAttr(
+              loopOp);
+      if (stagesAttr)
+        loopNumStages = stagesAttr.getInt();
       // A physical semaphore group has one depth. If it is shared by multiple
       // WS loops, provision it for the largest authored loop depth.
       groupNumStages = std::max(groupNumStages.value_or(0), loopNumStages);

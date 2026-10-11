@@ -33,6 +33,7 @@ include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUOpInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUMemoryEffects.td"
 
 include "mlir/IR/EnumAttr.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
@@ -42,6 +43,7 @@ include "TritonAMDGPUDialect.td"
 include "TritonAMDGPUAttrDefs.td"
 include "TritonAMDGPUOpInterfaces.td"
 
+
 class TT_AMDGPU_Op<string mnemonic, list<Trait> traits = []>
     : Op<TritonAMDGPU_Dialect, mnemonic, !listconcat(traits, [])>;
 
@@ -49,7 +51,6 @@ class TT_AMDGPU_Op<string mnemonic, list<Trait> traits = []>
 // Interfaces
 //
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
-def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 def L2Cache : Resource<"::mlir::triton::amd::L2Cache">;
 
 //===----------------------------------------------------------------------===//
@@ -369,7 +370,7 @@ def BufferLoadToLocalOp
   let arguments =
       (ins Arg<
            TTG_MemDescType,
-           "Shared memory slice to write to", [MemWrite<SharedMemory>]>:$dest,
+           "Shared memory slice to write to", GenericSharedWrite>:$dest,
           Arg<TT_Ptr, "Global memory scalar base pointer to load from",
               [MemRead<GlobalMemory>]>:$ptr,
           I32Tensor:$offsets, Optional<TT_BoolTensor>:$mask,
@@ -724,7 +725,7 @@ def LocalLoadPackedTransposedOp
       The packing change will change the shape of the tensor by doubling the M/N dimension and halving the K dimension.
       For example if A is 16x64 in shared memory, the result of this operation will be 32x32.
     }];
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
       Optional<TTG_AsyncToken>:$token);
   let results = (outs TT_Tensor:$result);
 
@@ -972,7 +973,7 @@ def AsyncCopyLocalToGlobalOp
     This allows op to use async_copy_local_to_global even if the alignment cannot be proven based on IR.
   }];
 
-  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
       Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$dst,
       Optional<I1Tensor>:$mask,
       DefaultValuedAttr<TT_CacheModifierAttr,
@@ -994,8 +995,7 @@ def AsyncCopyLocalToGlobalOp
 // InitBarrierOp
 //===----------------------------------------------------------------------===//
 def InitBarrierOp
-    : TT_AMDGPU_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>,
-                                    DeclareOpInterfaceMethods<
+    : TT_AMDGPU_Op<"init_barrier", [DeclareOpInterfaceMethods<
                                         MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "Initialize a barrier in the given shared memory allocation.";
   let description = [{
@@ -1006,7 +1006,7 @@ def InitBarrierOp
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+      (ins Arg<TTG_MemDescType, "", GenericSharedWrite>:$alloc,
           I32Attr:$count);
   let assemblyFormat =
       "$alloc `,` $count attr-dict `:` qualified(type($alloc))";
@@ -1084,8 +1084,8 @@ def AsyncTDMCopyGlobalToLocalOp
 
   let arguments =
       (ins Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
-          Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-          Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+          Arg<TTG_MemDescType, "", GenericSharedWrite>:$result,
+          Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "triton::CacheModifier::NONE">:$cache,
           OptionalAttr<I32Attr>:$warp_used_hint);
@@ -1142,7 +1142,7 @@ def AsyncTDMFusedCopyGlobalToLocalOp
 
   let arguments = (ins
     Arg<Variadic<TT_TensorDescType>, "", [MemRead<GlobalMemory>]>:$descs,
-    Arg<Variadic<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$dests,
+    Arg<Variadic<TTG_MemDescType>, "", GenericSharedWrite>:$dests,
     Variadic<I32>:$multicast_masks,
     DenseI32ArrayAttr:$warp_used_hints,
     DefaultValuedAttr<TT_CacheModifierAttr,
@@ -1184,8 +1184,8 @@ def AsyncTDMCopyLocalToGlobalOp
 
   let arguments =
       (ins Arg<TT_TensorDescType, "", [MemWrite<GlobalMemory>]>:$desc,
-          Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-          Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+          Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+          Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "triton::CacheModifier::NONE">:$cache);
 
@@ -1230,8 +1230,8 @@ def AsyncTDMScatterOp
   let arguments = (ins Arg<TT_TensorDescType,
                            "", [MemWrite<GlobalMemory>]>:$desc,
       TensorOf<[I16, I32]>:$dst_row_indices,
-      Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-      Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier);
+      Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+      Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier);
   let results = (outs TTG_AsyncToken:$retToken);
 
   let assemblyFormat = [{
@@ -1274,8 +1274,8 @@ def AsyncTDMGatherOp
   let arguments = (ins Arg<TT_TensorDescType,
                            "", [MemRead<GlobalMemory>]>:$desc,
       TensorOf<[I16, I32]>:$src_row_indices,
-      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-      Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier);
+      Arg<TTG_MemDescType, "", GenericSharedWrite>:$dst,
+      Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier);
   let results = (outs TTG_AsyncToken:$token);
 
   let builders = [OpBuilder<
@@ -1492,6 +1492,7 @@ def MemoryCounterWaitOp : TT_AMDGPU_Op<"memory_counter_wait"> {
 }
 
 //===----------------------------------------------------------------------===//
+
 // WaitBarrierOp
 //===----------------------------------------------------------------------===//
 
@@ -1507,7 +1508,7 @@ def WaitBarrierOp
 
   let arguments =
       (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+               "", BarrierSharedReadWrite>:$alloc,
           I32:$phase);
 
   let assemblyFormat = [{
@@ -1539,7 +1540,7 @@ def ArriveBarrierOp
 
   let arguments =
       (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+               "", BarrierSharedReadWrite>:$alloc,
           I32Attr:$count);
 
   let results = (outs I32:$result);
@@ -1567,7 +1568,7 @@ def AsyncCopyMbarrierArriveOp
   }];
   let arguments =
       (ins Arg<TTG_MemDescType,
-               "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$barrier);
+               "", BarrierSharedReadWrite>:$barrier);
   let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
   let hasVerifier = 1;
 }
