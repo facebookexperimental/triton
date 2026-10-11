@@ -1392,6 +1392,19 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
                                8);
 }
 
+/// Copy i of a multi-buffered alloc starts at base + i * size. A TMA landing
+/// buffer must start at its encoding's alignment (128 bytes, or the swizzle
+/// period for a swizzled layout), so one whose size is not a multiple of that
+/// (e.g. a 1-D bias tile of 32 bf16 = 64 bytes) must stay single-buffered:
+/// every odd copy would fault with a misaligned address or land in the wrong
+/// swizzle phase.
+static bool isUnalignedTMALoadSlot(Operation *allocOp, unsigned sizeBytes,
+                                   SmallVector<Channel *> &channels) {
+  auto alloc = cast<ttg::LocalAllocOp>(allocOp);
+  return sizeBytes % alloc.getAlignmentOrDefault() != 0 &&
+         isSmemTMAChannel(allocOp, channels);
+}
+
 /// Compute total SMEM usage in bytes across all WSBuffers.
 /// Buffers sharing the same buffer.id (reuse group) contribute
 /// max(sizes) * copies instead of sum(sizes) * copies.
@@ -2404,6 +2417,11 @@ static unsigned allocateSmemBuffersViaSearch(
           ++storeUsers;
       if (storeUsers > 1)
         needsFallback = true; // subtiled staging (K|S) unmodeled
+      // A TMA landing buffer that is not a multiple of 128 bytes must stay
+      // single-buffered (see isUnalignedTMALoadSlot); the search does not
+      // model that cap.
+      if (isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+        needsFallback = true;
     }
   });
   if (needsFallback) {
@@ -2792,11 +2810,22 @@ static unsigned allocateSmemBuffers(
                         WSBufferPriority::P1_InnermostNonTMA}) {
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
+    // Candidates before dropping unaligned TMA landing buffers. Grouping is
+    // decided on this count so that dropping such a buffer never turns a
+    // three-buffer set into the two-buffer circular reuse group.
+    unsigned numCandidates = 0;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
-      if (wsBuffers[i].isPinned)
+      if (wsBuffers[i].isPinned || wsBuffers[i].priority != priority)
         continue;
-      if (wsBuffers[i].priority == priority)
-        candidateIndices.push_back(i);
+      ++numCandidates;
+      if (isUnalignedTMALoadSlot(wsBuffers[i].allocOp, wsBuffers[i].sizeBytes,
+                                 channels)) {
+        LDBG("Phase 4: WSBuffer["
+             << wsBuffers[i].bufferId << "] is a TMA landing buffer of "
+             << wsBuffers[i].sizeBytes << " bytes; keeping its copy count");
+        continue;
+      }
+      candidateIndices.push_back(i);
     }
     if (candidateIndices.empty())
       continue;
@@ -2815,7 +2844,8 @@ static unsigned allocateSmemBuffers(
 
     // Step 0: Decide grouping upfront.
     bool isReuseGroup = false;
-    if (smemCircularReuse && candidateIndices.size() == 2) {
+    if (smemCircularReuse && numCandidates == 2 &&
+        candidateIndices.size() == 2) {
       isReuseGroup = true;
       auto &bufA = wsBuffers[candidateIndices[0]];
       auto &bufB = wsBuffers[candidateIndices[1]];

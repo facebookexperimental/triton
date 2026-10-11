@@ -300,6 +300,12 @@
 - **Fix**: set the builder to the channel's producer task right before emitting the `ProducerCommit`.
 - **Tests**: `ws_code_partition_operand_d_tma_init_commit.mlir` (both `tmem_store` commits in task 0, a gemm-task wait before the MMA; the commit lands in task 1 without the fix). `test_autows_addmm.py::test_autows_addmm_tma_bias_single_k_tile[64-128]` (43% mismatched without the fix).
 
+### 41. Phase 4 multi-buffers a TMA landing buffer smaller than 128 bytes → misaligned address (2026-10-07, fixed)
+- **Symptom**: `CUDA error: misaligned address` (sanitizer: `UTMALDG.1D` in the load partition) for the kernel of #41 with a 32-wide bf16 bias tile (64 bytes).
+- **Root cause** (`WSMemoryPlanner.cpp`, Phase 4): with a single K tile the tile loop is the innermost loop, so the bias landing buffer is an innermost TMA buffer and Phase 4 raises it to `numBuffers` copies. Copy i starts at base + i * 64, but TMA needs a 128-byte aligned destination, so every odd copy faults. With `k_tiles > 1` the buffer is not innermost and stays at one copy, which is why only single-K-tile kernels hit it.
+- **Fix**: `isUnalignedTMALoadSlot` keeps TMA landing buffers whose size is not a multiple of their encoding alignment (128 bytes, or the swizzle period) out of the Phase 4 copy increase; the plan search falls back to the heuristic planner when such a buffer exists. Grouping is still decided on the unfiltered candidate count, so dropping the bias from {A, B, bias} does not turn A and B into the two-buffer circular reuse group. Not handled: a cross-stage floor, copy-safety floor or `buffer.copy` annotation above 1 on such a buffer.
+- **Tests**: `ws_memory_planner_unaligned_tma_load_slot.mlir` (bias alloc `buffer.copy = 1`; 3 without the fix). `test_autows_addmm.py::test_autows_addmm_tma_bias_single_k_tile[64-32]` (misaligned address without the fix).
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
