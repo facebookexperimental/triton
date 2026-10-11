@@ -51,6 +51,8 @@ autograd graph for higher-order derivatives.
 
 from __future__ import annotations
 
+import functools
+
 from ._catalog import InvalidInput, UnsupportedBackward, UnsupportedOp, check_backward, check_inputs, impl_for
 
 __all__ = [
@@ -59,6 +61,12 @@ __all__ = [
     "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
     "InvalidInput"
 ]
+
+
+@functools.lru_cache(maxsize=None)
+def _mm_impl_for_device(device):
+    """Cache the stable device-to-implementation lookup on the MM hot path."""
+    return impl_for("mm", device=device)
 
 
 def mm(a, b, *, out=None, space=None):
@@ -80,7 +88,7 @@ def mm(a, b, *, out=None, space=None):
     if a.dtype != b.dtype or a.device != b.device:
         raise InvalidInput("tlx.ops.mm operands must have the same dtype and device; "
                            f"got a=({a.dtype}, {a.device}), b=({b.dtype}, {b.device})")
-    fn, spec = impl_for("mm", device=a.device)
+    fn, spec = _mm_impl_for_device(a.device)
     if spec.accepts is None:
         check_inputs(spec, dtype=a.dtype)
     else:

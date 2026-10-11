@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 import math
+import threading
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -220,6 +221,7 @@ def _wg_regular_wave_grid_plan(
         streamk_tail_split=0,
         reduce_tile=(16, 64),
         reduce_warps=4,
+        workspace_dtype=torch.float32,
 ):
     """Build one compile-time regular-wave-grid specialization.
 
@@ -264,6 +266,7 @@ def _wg_regular_wave_grid_plan(
         "streamk_tail_split": streamk_tail_split,
         "reduce_tile": reduce_tile,
         "reduce_warps": reduce_warps,
+        "workspace_dtype": workspace_dtype,
     }
 
 
@@ -1216,6 +1219,160 @@ _wg_SOTA77_WAVE_GRID_PROMOTIONS = {
 }
 _wg_REGULAR_WAVE_GRID_SPECIALIZATIONS.update(_wg_SOTA77_WAVE_GRID_PROMOTIONS)
 
+# Measured winners for the D122929229 production-MM corpus.  Keep these
+# wave-grid plans separate from the fixed-register configuration table so the
+# production dispatcher preserves their split-K and reduction parameters.
+_wg_D122929229_WAVE_GRID_PROMOTIONS = {
+    # Transpose the robust MT160x128x64 winner into MT128x160x64.  Three
+    # equal K partitions turn the 58-output-tile problem into 174 CTAs and
+    # reduce the long single-CTA critical path. FP16 partials reduce workspace
+    # traffic while remaining within the FP16 output accuracy contract, and
+    # one resident wave keeps this long reduction schedule from interleaving.
+    (128, 9216, 7392):
+    _wg_regular_wave_grid_plan(
+        4,
+        5,
+        2,
+        2,
+        64,
+        local_stages=1,
+        pgr2_operands=True,
+        row_wise_epilogue=True,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+        waves_per_eu=1,
+        split_k=3,
+        reduce_tile=(16, 64),
+        reduce_warps=2,
+        workspace_dtype=torch.float16,
+    ),
+    # The unsplit path leaves only 81 output CTAs and cannot fill the device.
+    # Three pair-balanced K128 partitions expose 243 CTAs while preserving
+    # the lower-barrier PGR2 schedule.  Three partitions are faster than four
+    # because their larger K ranges amortize launch and output reduction.
+    # FP16 partials reduce the remaining workspace traffic while staying
+    # within the FP16 output accuracy contract after the final FP32 reduction.
+    (128, 10304, 20926):
+    _wg_regular_wave_grid_plan(
+        4,
+        4,
+        2,
+        2,
+        128,
+        local_stages=1,
+        pgr2_operands=True,
+        row_wise_epilogue=True,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+        split_k=3,
+        pair_balanced_split_k=True,
+        reduce_tile=(16, 32),
+        workspace_dtype=torch.float16,
+    ),
+    # Sixteen pair-balanced K128 partitions expose 256 exact MT32x64 CTAs.
+    # This matches the narrow vendor geometry while avoiding the extra N
+    # padding and reduction traffic of the former MT32x128 plan.
+    (128, 224, 20926):
+    _wg_regular_wave_grid_plan(
+        1,
+        2,
+        2,
+        2,
+        128,
+        local_stages=1,
+        pgr2_operands=True,
+        row_wise_epilogue=True,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+        split_k=16,
+        pair_balanced_split_k=True,
+        reduce_tile=(8, 32),
+        workspace_dtype=torch.float32,
+    ),
+}
+_wg_REGULAR_WAVE_GRID_SPECIALIZATIONS.update(_wg_D122929229_WAVE_GRID_PROMOTIONS)
+
+_wg_PRODUCTION_TRANSPOSED_WAVE_GRID_PROMOTIONS = {
+    (128, 2688, 4416):
+    _wg_regular_wave_grid_plan(
+        3,
+        4,
+        2,
+        2,
+        128,
+        pgr2_operands=True,
+        row_wise_epilogue=True,
+        num_xcds=8,
+        workgroup_mapping=6,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+        waves_per_eu=1,
+        split_k=8,
+        pair_balanced_split_k=True,
+        reduce_tile=(16, 32),
+        workspace_dtype=torch.float16,
+    ),
+    # Preserve the vendor's internal MT96x64 orientation.  XCD-aware six-tile
+    # bands keep the narrow transposed-N grid balanced across the deep K loop.
+    (128, 10304, 1728):
+    _wg_regular_wave_grid_plan(
+        3,
+        2,
+        2,
+        2,
+        128,
+        pgr2_operands=True,
+        row_wise_epilogue=True,
+        num_xcds=8,
+        workgroup_mapping=6,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+    ),
+    # Preserve the vendor's internal MT160x128 orientation for the short K64
+    # reduction instead of only transposing its numerical output geometry.
+    (128, 34272, 384):
+    _wg_regular_wave_grid_plan(
+        5,
+        4,
+        2,
+        2,
+        64,
+        local_stages=1,
+        pgr2_operands=True,
+        row_wise_epilogue=True,
+        num_xcds=8,
+        workgroup_mapping=6,
+        reverse_local_assignment=False,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+    ),
+    # Preserve the vendor's internal MT96x64 orientation.  Covering the full
+    # B read window shortens the deep K loop, while XCD-aware six-tile bands
+    # retain B.T locality. Reversing local assignment shortens the generated
+    # deep-K schedule without changing the tile geometry.
+    (128, 10752, 2560):
+    _wg_regular_wave_grid_plan(
+        3,
+        2,
+        2,
+        2,
+        128,
+        pgr2_operands=True,
+        read_cover_sixteenths=16,
+        row_wise_epilogue=True,
+        num_xcds=8,
+        workgroup_mapping=6,
+        reverse_local_assignment=True,
+        sink_insts_to_avoid_spills=True,
+        disable_unclustered_high_rp_reschedule=True,
+    ),
+}
+
 # BF16 uses the same 16-bit LDS representation as FP16.  Keep selection
 # explicit: only measured shapes enter this path while the broader BF16
 # corpus retains the established LDS fallback.
@@ -1771,7 +1928,6 @@ def _wg_kernel_register_split_m2(
     """Register-staged GEMM with two reusable power-of-two M fragments."""
     block_m: tl.constexpr = M_HEAD + M_TAIL
     tl.static_assert(M_HEAD >= 16 and M_TAIL >= 16)
-    tl.static_assert(K % BLOCK_K == 0)
 
     program = tl.program_id(0).to(tl.int32)
     grid_n: tl.constexpr = tl.cdiv(N, BLOCK_N)
@@ -1788,7 +1944,8 @@ def _wg_kernel_register_split_m2(
 
     acc_head = tl.zeros((M_HEAD, BLOCK_N), tl.float32)
     acc_tail = tl.zeros((M_TAIL, BLOCK_N), tl.float32)
-    for kb in tl.range(0, K // BLOCK_K, num_stages=1):
+    full_k_tiles: tl.constexpr = K // BLOCK_K
+    for kb in tl.range(0, full_k_tiles, num_stages=1):
         reduction = kb * BLOCK_K + rk
         b_value = tl.load(
             b_ptr + reduction[:, None] * stride_bk + input_cols[None, :] * stride_bn,
@@ -1796,6 +1953,39 @@ def _wg_kernel_register_split_m2(
         )
         a_head = tl.load(a_ptr + input_head_rows[:, None] * stride_am + reduction[None, :] * stride_ak, )
         a_tail = tl.load(a_ptr + input_tail_rows[:, None] * stride_am + reduction[None, :] * stride_ak, )
+        acc_head = tl.dot(
+            a_head,
+            b_value,
+            acc_head,
+            allow_tf32=False,
+            out_dtype=tl.float32,
+        )
+        acc_tail = tl.dot(
+            a_tail,
+            b_value,
+            acc_tail,
+            allow_tf32=False,
+            out_dtype=tl.float32,
+        )
+    if K % BLOCK_K != 0:
+        reduction = full_k_tiles * BLOCK_K + rk
+        k_mask = reduction < K
+        b_value = tl.load(
+            b_ptr + reduction[:, None] * stride_bk + input_cols[None, :] * stride_bn,
+            mask=k_mask[:, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        a_head = tl.load(
+            a_ptr + input_head_rows[:, None] * stride_am + reduction[None, :] * stride_ak,
+            mask=k_mask[None, :],
+            other=0.0,
+        )
+        a_tail = tl.load(
+            a_ptr + input_tail_rows[:, None] * stride_am + reduction[None, :] * stride_ak,
+            mask=k_mask[None, :],
+            other=0.0,
+        )
         acc_head = tl.dot(
             a_head,
             b_value,
@@ -1923,13 +2113,49 @@ _wg_B_BASES_64X16 = tl.constexpr(_wg_swizzled_offset_bases((64, 16), 0))
 _wg_B_BASES_64X32 = tl.constexpr(_wg_swizzled_offset_bases((64, 32), 0))
 _wg_B_BASES_64X64 = tl.constexpr(_wg_swizzled_offset_bases((64, 64), 0))
 _wg_B_BASES_64X128 = tl.constexpr(_wg_swizzled_offset_bases((64, 128), 0))
+# CDNA4's conflict-free async-copy layout keeps a 32-row MFMA group at a
+# contiguous 2,112-element offset (2,048 payload + four 16-element pads), but
+# rotates the low row bits after rows 4/8/16.  This preserves the vendor's
+# 4,224-byte fragment pitch without the bank conflicts of a plain identity
+# layout.  Keep these exact MT128x128 bases separate from the general direct
+# path, whose high-row-first order is tuned for independently allocated chunks.
+_wg_A_BASES_128X64_COMPACT = tl.constexpr([
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [0, 8],
+    [0, 16],
+    [0, 32],
+    [4, 0],
+    [8, 0],
+    [16, 0],
+    [1, 0],
+    [2, 0],
+    [32, 0],
+    [64, 0],
+])
+_wg_B_BASES_64X128_COMPACT = tl.constexpr([
+    [1, 0],
+    [2, 0],
+    [4, 0],
+    [8, 0],
+    [16, 0],
+    [32, 0],
+    [0, 4],
+    [0, 8],
+    [0, 16],
+    [0, 1],
+    [0, 2],
+    [0, 32],
+    [0, 64],
+])
 _wg_A_OFFSET_LAYOUT_64X32 = tlx.layout(
-    shape=((4, 4, 16), (8, )),
-    stride=((8, 512, 32), (1, )),
+    shape=((8, 32), (8, )),
+    stride=((8, 64), (1, )),
 )
 _wg_B_OFFSET_LAYOUT_32X128 = tlx.layout(
-    shape=((4, 8, 8), (8, 2)),
-    stride=((1024, 16, 1), (128, 8)),
+    shape=((4, 16, 4), (8, 2)),
+    stride=((1024, 1, 16), (128, 64)),
 )
 _wg_A_OFFSET_LAYOUT_128X64_4W = tlx.layout(
     shape=((8, 8, 4), (8, 4)),
@@ -2000,16 +2226,19 @@ def _wg_wave_grid_global_load_a(
     stride_ak: tl.constexpr,
     m: tl.constexpr,
     force_stream: tl.constexpr = False,
+    k128_macro_base: tl.constexpr = False,
+    k_half: tl.constexpr = 0,
 ):
     """Load one MI-height A row for a regular MI16 wave grid."""
     local_rows = tl.arange(0, a_group_m)
+    k_base = ((2 * kb + k_half) * block_k if k128_macro_base else kb * block_k)
     if m * stride_am >= 1 << 30:
         # tlx.buffer_load requires 32-bit vector offsets. Put the large tile
         # coordinate in the 64-bit scalar base and keep only one fragment's
         # small lane offsets in the buffer instruction.
         row_base = pid_m * block_m + row * a_group_m
         safe_row_base = tl.minimum(row_base, m - 1)
-        a_ptr += (safe_row_base.to(tl.int64) * stride_am + kb * block_k * stride_ak)
+        a_ptr += (safe_row_base.to(tl.int64) * stride_am + k_base * stride_ak)
         rows = local_rows
         if m % block_m != 0:
             absolute_rows = row_base + rows
@@ -2023,7 +2252,7 @@ def _wg_wave_grid_global_load_a(
         if m % block_m != 0:
             rows = tl.where(rows < m, rows, 0)
         # Keep the lane offsets loop-invariant; only the scalar K base advances.
-        a_ptr += kb * block_k * stride_ak
+        a_ptr += k_base * stride_ak
     reduction = tl.arange(0, block_k)
     offsets = rows[:, None] * stride_am + reduction[None, :] * stride_ak
     preferred_contiguity: tl.constexpr = (8 if a_group_m >= 32 else a_group_m // 8)
@@ -2037,11 +2266,17 @@ def _wg_wave_grid_global_load_a(
         # normal vector transaction width; buffer loads support unaligned rows.
         offset_layout: tl.constexpr = (_wg_A_OFFSET_LAYOUT_32X64_8W if cta_waves == 8 else _wg_A_OFFSET_LAYOUT_32X64_4W)
         offsets = tlx.require_layout(offsets, offset_layout)
-        return tlx.buffer_load(a_ptr, offsets, contiguity=a_contiguity)
+        return tlx.buffer_load(
+            a_ptr,
+            offsets,
+            contiguity=a_contiguity,
+        )
     # For tall-M/small-N grids, A advances to a new macro tile while B is
     # reused by many neighboring M programs.  Bypass L1 for the streaming A
     # operand so it does not evict that reusable B working set.
-    if force_stream or (
+    retain_long_k_a: tl.constexpr = (m == 128 and block_m == 128 and block_k == 64 and stride_am == 20926
+                                     and stride_ak == 1)
+    if (force_stream and not retain_long_k_a) or (
             m >= 32768 and
         ((block_m == 128 and b_group_n == 32) or block_m == 160 or (block_m >= 224 and block_m != 320)
          # This exact huge-M/K1024 production plan streams 1.6 GiB of A
@@ -2050,8 +2285,17 @@ def _wg_wave_grid_global_load_a(
          # 1.010x and 1.012x in independent 301-round runs.
          or (m == 819200 and block_m == 320 and block_k == 64 and b_group_n == 32 and stride_am == 1024
              and stride_ak == 1))):
-        return tlx.buffer_load(a_ptr, offsets, cache=".cg", contiguity=a_contiguity)
-    return tlx.buffer_load(a_ptr, offsets, contiguity=a_contiguity)
+        return tlx.buffer_load(
+            a_ptr,
+            offsets,
+            cache=".cg",
+            contiguity=a_contiguity,
+        )
+    return tlx.buffer_load(
+        a_ptr,
+        offsets,
+        contiguity=a_contiguity,
+    )
 
 
 @triton.jit
@@ -2175,15 +2419,16 @@ def _wg_wave_grid_global_load_b(
     # working set.  Bypassing L1 for B matches the selected hipBLASLt policy
     # and avoids evicting reusable A lines.  Tall plans retain the default
     # policy because neighboring M tiles can reuse B.
-    stream_b = block_n == 192
+    stream_b: tl.constexpr = block_n == 192
+    load_contiguity: tl.constexpr = min(b_group_n // 8, 8)
     if cache_cg and stream_b:
         return tlx.buffer_load(
             b_ptr,
             offsets,
             cache=".cg",
-            contiguity=min(b_group_n // 8, 8),
+            contiguity=load_contiguity,
         )
-    return tlx.buffer_load(b_ptr, offsets, contiguity=min(b_group_n // 8, 8))
+    return tlx.buffer_load(b_ptr, offsets, contiguity=load_contiguity)
 
 
 @triton.jit
@@ -2195,12 +2440,15 @@ def _wg_wave_grid_global_load_pgr2_b_half(
     half: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
+    a_row_count: tl.constexpr,
     block_k: tl.constexpr,
     b_group_n: tl.constexpr,
     stride_bk: tl.constexpr,
     stride_bn: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
+    k128_macro_base: tl.constexpr = False,
+    k_half: tl.constexpr = 0,
 ):
     """Load one 32-column machine fragment of a PGR2 B group."""
     tl.static_assert(b_group_n == 32 or b_group_n == 64)
@@ -2208,10 +2456,11 @@ def _wg_wave_grid_global_load_pgr2_b_half(
     tl.static_assert(half < b_group_n // half_n)
     reduction = tl.arange(0, block_k)
     local_cols = tl.arange(0, half_n)
+    k_base = ((2 * kb + k_half) * block_k if k128_macro_base else kb * block_k)
     if n * stride_bn >= 1 << 30:
         col_base = (pid_n * block_n + group * b_group_n + half * half_n)
         safe_col_base = tl.minimum(col_base, n - 1)
-        b_ptr += (safe_col_base.to(tl.int64) * stride_bn + kb * block_k * stride_bk)
+        b_ptr += (safe_col_base.to(tl.int64) * stride_bn + k_base * stride_bk)
         cols = local_cols
         if n % block_n != 0:
             absolute_cols = col_base + cols
@@ -2221,11 +2470,18 @@ def _wg_wave_grid_global_load_pgr2_b_half(
                 0,
             )
     else:
-        b_ptr += kb * block_k * stride_bk
+        b_ptr += k_base * stride_bk
         cols = (pid_n * block_n + group * b_group_n + half * half_n + local_cols)
         if n % block_n != 0:
             cols = tl.where(cols < n, cols, 0)
     offsets = reduction[:, None] * stride_bk + cols[None, :] * stride_bn
+    if stride_bk == 1:
+        a_group_m: tl.constexpr = block_m // a_row_count
+        cta_waves: tl.constexpr = ((a_group_m // 16) * (b_group_n // 16))
+        tl.static_assert(block_k == 64)
+        tl.static_assert(cta_waves == 4 or cta_waves == 8)
+        offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X32_8W if cta_waves == 8 else _wg_B_OFFSET_LAYOUT_64X32_4W)
+        offsets = tlx.require_layout(offsets, offset_layout)
     # Match the operand-level cache policy used by the regular global-load
     # path: only bypass L1 when B itself is the large streaming operand.
     # Tall-M/small-N grids reuse B across many neighboring M workgroups.
@@ -2233,10 +2489,28 @@ def _wg_wave_grid_global_load_pgr2_b_half(
     # its streaming MT224 operand so the many neighboring N workgroups can
     # retain their shared A rows.  Multi-row grids keep B cacheable because
     # the same B tile is consumed by each M workgroup.
-    stream_b: tl.constexpr = (block_n == 192 or (block_n == 224 and m <= block_m))
+    # The long-K M128 tile similarly reuses A across 81 N workgroups while
+    # each B tile is a one-pass stream, so bypass L1 for B there as well.
+    stream_b: tl.constexpr = (block_n == 192 or (block_m == 64 and block_n == 64 and m <= 2 * block_m)
+                              or (block_m == 64 and block_n == 96 and m <= 2 * block_m)
+                              or (block_n == 160 and m <= block_m) or (block_n == 224 and m <= block_m)
+                              or (m == 128 and block_m == 128 and ((block_n == 96 and stride_bn == 4416) or
+                                                                   (block_n == 128 and stride_bn == 20926))))
+    load_contiguity: tl.constexpr = (8 if (m == 128 and block_m == 128 and block_n == 128 and block_k == 64
+                                           and a_row_count == 4 and b_group_n == 32 and stride_bk == 1
+                                           and stride_bn == 20926) else half_n // 8)
     if stream_b:
-        return tlx.buffer_load(b_ptr, offsets, cache=".cg", contiguity=half_n // 8)
-    return tlx.buffer_load(b_ptr, offsets, contiguity=half_n // 8)
+        return tlx.buffer_load(
+            b_ptr,
+            offsets,
+            cache=".cg",
+            contiguity=load_contiguity,
+        )
+    return tlx.buffer_load(
+        b_ptr,
+        offsets,
+        contiguity=load_contiguity,
+    )
 
 
 @triton.jit
@@ -2322,6 +2596,8 @@ def _wg_wave_grid_global_loads_pgr2(
     stride_bn: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
+    k128_macro_base: tl.constexpr = False,
+    k_half: tl.constexpr = 0,
 ):
     """Prefetch PGR2 in the vendor's machine-width B-then-A order."""
     tl.static_assert(b_group_n == 32 or b_group_n == 64)
@@ -2338,12 +2614,15 @@ def _wg_wave_grid_global_loads_pgr2(
                     half,
                     block_m,
                     block_n,
+                    a_row_count,
                     block_k,
                     b_group_n,
                     stride_bk,
                     stride_bn,
                     m,
                     n,
+                    k128_macro_base,
+                    k_half,
                 )
             ])
     a_values = tl.tuple([])
@@ -2362,6 +2641,9 @@ def _wg_wave_grid_global_loads_pgr2(
                 stride_am,
                 stride_ak,
                 m,
+                False,
+                k128_macro_base,
+                k_half,
             )
         ])
     return a_values, b_values
@@ -2484,7 +2766,9 @@ def _wg_wave_grid_global_load_pgr2_b_tail_half(
         tl.static_assert(b_group_n == 32 and (cta_waves == 4 or cta_waves == 8))
         offset_layout: tl.constexpr = (_wg_B_OFFSET_LAYOUT_64X32_8W if cta_waves == 8 else _wg_B_OFFSET_LAYOUT_64X32_4W)
         safe_offsets = tlx.require_layout(safe_offsets, offset_layout)
-    stream_b: tl.constexpr = (block_n == 192 or (block_n == 224 and m <= block_m))
+    stream_b: tl.constexpr = (block_n == 192 or (block_m == 64 and block_n == 64 and m <= 2 * block_m)
+                              or (block_m == 64 and block_n == 96 and m <= 2 * block_m)
+                              or (block_n == 160 and m <= block_m) or (block_n == 224 and m <= block_m))
     if stream_b:
         return tlx.buffer_load(
             b_ptr,
@@ -2661,7 +2945,10 @@ def _wg_wave_grid_local_store_pgr2_fragment(
         b_local_group: tl.constexpr = (0 if exact_b_groups else b_group % b_groups_per_chunk)
         tlx.local_store(
             tlx.local_slice(
-                tlx.local_view(b_local[b_chunk], 0 if separate_b_stages else stage),
+                tlx.local_view(
+                    b_local[b_chunk],
+                    0 if separate_b_stages else stage,
+                ),
                 [0, b_local_group * b_group_n + b_half * 32],
                 [block_k, b_fragment_n],
             ),
@@ -2677,7 +2964,10 @@ def _wg_wave_grid_local_store_pgr2_fragment(
         a_local_row: tl.constexpr = (0 if exact_a_groups else row % a_groups_per_chunk)
         tlx.local_store(
             tlx.local_slice(
-                tlx.local_view(a_local[a_chunk], 0 if separate_a_stages else stage),
+                tlx.local_view(
+                    a_local[a_chunk],
+                    0 if separate_a_stages else stage,
+                ),
                 [a_local_row * a_group_m, 0],
                 [a_group_m, block_k],
             ),
@@ -2817,9 +3107,12 @@ def _wg_wave_grid_local_load_pgr2_a_half(
     groups_per_chunk: tl.constexpr = 256 // a_group_m
     chunk: tl.constexpr = (stage * a_row_count + row if separate_stages else row if exact_groups else row //
                            groups_per_chunk)
-    local_row: tl.constexpr = 0 if exact_groups else row % groups_per_chunk
+    local_row: tl.constexpr = (0 if exact_groups else row % groups_per_chunk)
     view = tlx.local_slice(
-        tlx.local_view(a_local[chunk], 0 if separate_stages else stage),
+        tlx.local_view(
+            a_local[chunk],
+            0 if separate_stages else stage,
+        ),
         [local_row * a_group_m, half * 32],
         [a_group_m, 32],
     )
@@ -2843,7 +3136,10 @@ def _wg_wave_grid_local_load_pgr2_b_half(
                            groups_per_chunk)
     local_group: tl.constexpr = (0 if exact_groups else group % groups_per_chunk)
     view = tlx.local_slice(
-        tlx.local_view(b_local[chunk], 0 if separate_stages else stage),
+        tlx.local_view(
+            b_local[chunk],
+            0 if separate_stages else stage,
+        ),
         [half * 32, local_group * b_group_n],
         [32, b_group_n],
     )
@@ -2863,6 +3159,7 @@ def _wg_wave_grid_dot_row(
     dot_a: tl.constexpr,
     dot_b: tl.constexpr,
     initialize: tl.constexpr = False,
+    accumulator_register_class: tl.constexpr = None,
     _semantic=None,
 ):
     """Update one MI-height row across the complete N wave grid."""
@@ -2880,6 +3177,7 @@ def _wg_wave_grid_dot_row(
             tlx.require_layout(values[index], mma, pin=False, _semantic=_semantic),
             accumulator_role="persistent",
             resident_operand=None,
+            accumulator_register_class=accumulator_register_class,
             initialize=initialize,
             _semantic=_semantic,
         )
@@ -2898,6 +3196,7 @@ def _wg_wave_grid_dot_column_major_at(
     dot_a: tl.constexpr,
     dot_b: tl.constexpr,
     initialize: tl.constexpr = False,
+    accumulator_register_class: tl.constexpr = None,
     _semantic=None,
 ):
     """Issue one MFMA from a column-major regular operand grid."""
@@ -2918,6 +3217,7 @@ def _wg_wave_grid_dot_column_major_at(
         dot_a,
         dot_b,
         initialize,
+        accumulator_register_class,
         _semantic=_semantic,
     )
 
@@ -3014,6 +3314,47 @@ def _wg_wave_grid_dot_column_major_range(
             values,
             first_mfma + offset,
             a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+            initialize,
+            _semantic=_semantic,
+        )
+    return values
+
+
+@tl.core.builtin
+def _wg_wave_grid_dot_b_group_major_range(
+    a_operands,
+    b_operands,
+    accumulators,
+    first_mfma: tl.constexpr,
+    mfma_count: tl.constexpr,
+    a_row_count: tl.constexpr,
+    b_group_count: tl.constexpr,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    initialize: tl.constexpr = False,
+    _semantic=None,
+):
+    """Issue a range with each B group reused across all A rows."""
+    first_mfma = tl.core._unwrap_if_constexpr(first_mfma)
+    mfma_count = tl.core._unwrap_if_constexpr(mfma_count)
+    a_row_count = tl.core._unwrap_if_constexpr(a_row_count)
+    b_group_count = tl.core._unwrap_if_constexpr(b_group_count)
+    values = accumulators
+    for offset in range(mfma_count):
+        index = first_mfma + offset
+        column = index // a_row_count
+        row = index % a_row_count
+        values = _wg_wave_grid_dot_at(
+            a_operands[row],
+            b_operands[column],
+            values,
+            row,
+            column,
             b_group_count,
             mma,
             dot_a,
@@ -3396,6 +3737,7 @@ def _wg_wave_grid_compute_stage_k64(
     a_row_count: tl.constexpr,
     b_group_count: tl.constexpr,
     initialize: tl.constexpr = False,
+    accumulator_register_class: tl.constexpr = None,
 ):
     """Consume both K32 halves of one regular K64 operand tile."""
     for half in tl.static_range(2):
@@ -3416,7 +3758,8 @@ def _wg_wave_grid_compute_stage_k64(
                 mma,
                 dot_a,
                 dot_b,
-                initialize,
+                initialize and half == 0,
+                accumulator_register_class,
             )
     return accumulators
 
@@ -5247,7 +5590,23 @@ def _wg_logical_rect_k128_direct_pgr2_step(
 ):
     """Advance one K128 stage while publishing the stage after next."""
     mfma_count: tl.constexpr = a_row_count * b_group_count
-    with tlx.warp_pipeline_stage("direct_k128_read", scope="intra_wave"):
+    with tlx.warp_pipeline_stage(
+            "direct_k128_read",
+            scope="intra_wave",
+    ):
+        accumulators = _wg_wave_grid_dot_column_major_range(
+            current_a,
+            current_b,
+            accumulators,
+            0,
+            mfma_count,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+            initialize=initialize,
+        )
         q1_a, q1_b = _wg_logical_rect_k128_local_load_quarter(
             a_local,
             b_local,
@@ -5283,19 +5642,6 @@ def _wg_logical_rect_k128_direct_pgr2_step(
             b_group_count,
             dot_a,
             dot_b,
-        )
-        accumulators = _wg_wave_grid_dot_column_major_range(
-            current_a,
-            current_b,
-            accumulators,
-            0,
-            mfma_count,
-            a_row_count,
-            b_group_count,
-            mma,
-            dot_a,
-            dot_b,
-            initialize=initialize,
         )
 
     tl.debug_barrier()
@@ -5347,19 +5693,10 @@ def _wg_logical_rect_k128_direct_pgr2_step(
     groups_per_stage: tl.constexpr = 2 * (len(a_local) // 4 + len(b_local) // 4)
     tlx.async_load_wait_group(groups_per_stage)
     tl.debug_barrier()
-    with tlx.warp_pipeline_stage("direct_k128_next", scope="intra_wave"):
-        next_a, next_b = _wg_logical_rect_k128_local_load_quarter(
-            a_local,
-            b_local,
-            next_stage,
-            0,
-            a_group_m,
-            b_group_n,
-            a_row_count,
-            b_group_count,
-            dot_a,
-            dot_b,
-        )
+    with tlx.warp_pipeline_stage(
+            "direct_k128_next",
+            scope="intra_wave",
+    ):
         accumulators = _wg_wave_grid_dot_column_major_range(
             q3_a,
             q3_b,
@@ -5369,6 +5706,18 @@ def _wg_logical_rect_k128_direct_pgr2_step(
             a_row_count,
             b_group_count,
             mma,
+            dot_a,
+            dot_b,
+        )
+        next_a, next_b = _wg_logical_rect_k128_local_load_quarter(
+            a_local,
+            b_local,
+            next_stage,
+            0,
+            a_group_m,
+            b_group_n,
+            a_row_count,
+            b_group_count,
             dot_a,
             dot_b,
         )
@@ -6626,12 +6975,13 @@ def _wg_wave_grid_compute_tile_rect_k64(
     n: tl.constexpr,
     k: tl.constexpr,
     local_stages: tl.constexpr,
+    accumulator_register_class: tl.constexpr = None,
 ):
     """Compute one tile using the geometry-derived rectangular K64 pipeline."""
     tl.static_assert(block_k == 64)
     a_group_m: tl.constexpr = block_m // a_row_count
     k_blocks: tl.constexpr = k // block_k
-    tl.static_assert(k_blocks % 2 == 0)
+    tl.static_assert(k_blocks > 0)
 
     _wg_wave_grid_local_store_all(
         a_local,
@@ -6645,6 +6995,26 @@ def _wg_wave_grid_compute_tile_rect_k64(
         b_group_n,
     )
     tl.debug_barrier()
+    accumulators = tl.tuple(
+        [tlx.zeros((a_group_m, b_group_n), tl.float32, layout=mma) for _ in range(a_row_count * b_group_count)])
+    if k_blocks == 1:
+        return _wg_wave_grid_compute_stage_k64(
+            a_local,
+            b_local,
+            0,
+            accumulators,
+            mma,
+            dot_a,
+            dot_b,
+            a_group_m,
+            b_group_n,
+            a_row_count,
+            b_group_count,
+            True,
+            accumulator_register_class,
+        )
+
+    tl.static_assert(k_blocks == 1 or k_blocks % 2 == 0)
     prefetched_a, prefetched_b = _wg_wave_grid_global_loads(
         a_ptr,
         b_ptr,
@@ -6668,9 +7038,6 @@ def _wg_wave_grid_compute_tile_rect_k64(
         [_wg_wave_grid_local_load_a_half(a_local, 0, row, 0, a_group_m, dot_a) for row in range(a_row_count)])
     current_b = tl.tuple(
         [_wg_wave_grid_local_load_b_half(b_local, 0, group, 0, b_group_n, dot_b) for group in range(b_group_count)])
-    accumulators = tl.tuple(
-        [tlx.zeros((a_group_m, b_group_n), tl.float32, layout=mma) for _ in range(a_row_count * b_group_count)])
-
     if local_stages == 2:
         for kb in tl.range(0, k_blocks - 2, 2, num_stages=1):
             state = _wg_wave_grid_pipeline_pair_rect_k64(
@@ -6762,6 +7129,8 @@ def _wg_wave_grid_compute_tile_rect_k64(
             mma,
             dot_a,
             dot_b,
+            False,
+            accumulator_register_class,
         )
     second_a = tl.tuple([
         _wg_wave_grid_local_load_a_half(a_local, (k_blocks - 2) % local_stages, row, 1, a_group_m, dot_a)
@@ -6807,11 +7176,196 @@ def _wg_wave_grid_compute_tile_rect_k64(
         b_group_n,
         a_row_count,
         b_group_count,
+        False,
+        accumulator_register_class,
     )
 
 
 @triton.jit
-def _wg_wave_grid_pgr2_stage_k64(
+def _wg_wave_grid_pgr2_compact_stage_k64(
+    a_ptr,
+    b_ptr,
+    pid_m,
+    pid_n,
+    future_kb,
+    a_local,
+    b_local,
+    current_stage,
+    next_stage,
+    current_a,
+    current_b,
+    prefetched_a,
+    prefetched_b,
+    accumulators,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    a_row_count: tl.constexpr,
+    b_group_count: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    prefetch_future: tl.constexpr,
+    double_buffered: tl.constexpr,
+    initialize: tl.constexpr = False,
+):
+    """Advance the vendor-sized 1x2 MFMA grid through one K64 bank."""
+    tl.static_assert(block_k == 64)
+    tl.static_assert(a_row_count == 1 and b_group_count == 2)
+    tl.static_assert(not double_buffered)
+    a_group_m: tl.constexpr = block_m // a_row_count
+    b_group_n: tl.constexpr = block_n // b_group_count
+
+    second_a = tl.tuple([])
+    second_b = tl.tuple([])
+    with tlx.warp_pipeline_stage(
+            "pgr2_compact_k64_read_current",
+            scope="intra_wave",
+    ):
+        for read in tl.static_range(a_row_count + b_group_count):
+            if read < b_group_count:
+                second_b += tl.tuple([
+                    _wg_wave_grid_local_load_pgr2_b_half(
+                        b_local,
+                        read,
+                        1,
+                        b_group_n,
+                        b_group_count,
+                        dot_b,
+                        current_stage,
+                    )
+                ])
+            else:
+                second_a += tl.tuple([
+                    _wg_wave_grid_local_load_pgr2_a_half(
+                        a_local,
+                        read - b_group_count,
+                        1,
+                        a_group_m,
+                        a_row_count,
+                        dot_a,
+                        current_stage,
+                    )
+                ])
+        for mfma_index in tl.static_range(a_row_count * b_group_count):
+            accumulators = _wg_wave_grid_dot_column_major_at(
+                current_a,
+                current_b,
+                accumulators,
+                mfma_index,
+                a_row_count,
+                b_group_count,
+                mma,
+                dot_a,
+                dot_b,
+                initialize,
+            )
+
+    tl.debug_barrier()
+    future_a = tl.tuple([])
+    future_b = tl.tuple([])
+    b_fragment_count: tl.constexpr = ((b_group_n // 32) * b_group_count)
+    publish_count: tl.constexpr = b_fragment_count + a_row_count
+    with tlx.warp_pipeline_stage(
+            "pgr2_compact_k64_publish",
+            scope="intra_wave",
+            pair=0,
+    ):
+        for publish in tl.static_range(publish_count):
+            _wg_wave_grid_local_store_pgr2_fragment(
+                a_local,
+                b_local,
+                prefetched_a,
+                prefetched_b,
+                publish,
+                b_group_count,
+                a_row_count,
+                a_group_m,
+                b_group_n,
+                block_k,
+                next_stage,
+            )
+            if prefetch_future:
+                if publish < b_fragment_count:
+                    future_b += tl.tuple([
+                        _wg_wave_grid_global_load_pgr2_b_half(
+                            b_ptr,
+                            pid_n,
+                            future_kb,
+                            publish // (b_group_n // 32),
+                            publish % (b_group_n // 32),
+                            block_m,
+                            block_n,
+                            a_row_count,
+                            block_k,
+                            b_group_n,
+                            stride_bk,
+                            stride_bn,
+                            m,
+                            n,
+                        )
+                    ])
+                else:
+                    future_a += tl.tuple([
+                        _wg_wave_grid_global_load_a(
+                            a_ptr,
+                            pid_m,
+                            future_kb,
+                            publish - b_fragment_count,
+                            a_group_m,
+                            b_group_n,
+                            block_m,
+                            block_k,
+                            stride_am,
+                            stride_ak,
+                            m,
+                        )
+                    ])
+    with tlx.warp_pipeline_stage(
+            "pgr2_compact_k64_cover_publish",
+            scope="intra_wave",
+            pair=0,
+    ):
+        for mfma_index in tl.static_range(a_row_count * b_group_count):
+            accumulators = _wg_wave_grid_dot_column_major_at(
+                second_a,
+                second_b,
+                accumulators,
+                mfma_index,
+                a_row_count,
+                b_group_count,
+                mma,
+                dot_a,
+                dot_b,
+            )
+
+    tl.debug_barrier()
+    next_a = tl.tuple([
+        _wg_wave_grid_local_load_pgr2_a_half(a_local, row, 0, a_group_m, a_row_count, dot_a, next_stage)
+        for row in range(a_row_count)
+    ])
+    next_b = tl.tuple([
+        _wg_wave_grid_local_load_pgr2_b_half(
+            b_local,
+            group,
+            0,
+            b_group_n,
+            b_group_count,
+            dot_b,
+            next_stage,
+        ) for group in range(b_group_count)
+    ])
+    return accumulators, future_a, future_b, next_a, next_b
+
+
+@triton.jit
+def _wg_wave_grid_pgr2_regular_stage_k64(
     a_ptr,
     b_ptr,
     pid_m,
@@ -7020,6 +7574,7 @@ def _wg_wave_grid_pgr2_stage_k64(
                                 publish % b_fragments_per_group,
                                 block_m,
                                 block_n,
+                                a_row_count,
                                 block_k,
                                 b_group_n,
                                 stride_bk,
@@ -7124,6 +7679,7 @@ def _wg_wave_grid_pgr2_stage_k64(
                                     late % b_fragments_per_group,
                                     block_m,
                                     block_n,
+                                    a_row_count,
                                     block_k,
                                     b_group_n,
                                     stride_bk,
@@ -7198,6 +7754,7 @@ def _wg_wave_grid_pgr2_stage_k64(
                                 publish % b_fragments_per_group,
                                 block_m,
                                 block_n,
+                                a_row_count,
                                 block_k,
                                 b_group_n,
                                 stride_bk,
@@ -7359,6 +7916,115 @@ def _wg_wave_grid_pgr2_stage_k64(
 
 
 @triton.jit
+def _wg_wave_grid_pgr2_stage_k64(
+    a_ptr,
+    b_ptr,
+    pid_m,
+    pid_n,
+    future_kb,
+    a_local,
+    b_local,
+    current_stage,
+    next_stage,
+    current_a,
+    current_b,
+    prefetched_a,
+    prefetched_b,
+    accumulators,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    a_row_count: tl.constexpr,
+    b_group_count: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    prefetch_future: tl.constexpr,
+    double_buffered: tl.constexpr,
+    late_read_count: tl.constexpr,
+    initialize: tl.constexpr = False,
+):
+    """Select the proven regular or vendor-sized compact K64 stage."""
+    operand_count: tl.constexpr = a_row_count + b_group_count
+    mfma_count: tl.constexpr = a_row_count * b_group_count
+    if mfma_count < operand_count:
+        return _wg_wave_grid_pgr2_compact_stage_k64(
+            a_ptr,
+            b_ptr,
+            pid_m,
+            pid_n,
+            future_kb,
+            a_local,
+            b_local,
+            current_stage,
+            next_stage,
+            current_a,
+            current_b,
+            prefetched_a,
+            prefetched_b,
+            accumulators,
+            mma,
+            dot_a,
+            dot_b,
+            block_m,
+            block_n,
+            block_k,
+            a_row_count,
+            b_group_count,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            m,
+            n,
+            prefetch_future,
+            double_buffered,
+            initialize,
+        )
+    else:
+        return _wg_wave_grid_pgr2_regular_stage_k64(
+            a_ptr,
+            b_ptr,
+            pid_m,
+            pid_n,
+            future_kb,
+            a_local,
+            b_local,
+            current_stage,
+            next_stage,
+            current_a,
+            current_b,
+            prefetched_a,
+            prefetched_b,
+            accumulators,
+            mma,
+            dot_a,
+            dot_b,
+            block_m,
+            block_n,
+            block_k,
+            a_row_count,
+            b_group_count,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            m,
+            n,
+            prefetch_future,
+            double_buffered,
+            late_read_count,
+            initialize,
+        )
+
+
+@triton.jit
 def _wg_wave_grid_pgr2_stage_pair_k64(
     kb,
     a_ptr,
@@ -7482,6 +8148,7 @@ def _wg_wave_grid_consume_final_pgr2_k64(
     b_group_n: tl.constexpr,
     a_row_count: tl.constexpr,
     b_group_count: tl.constexpr,
+    initialize: tl.constexpr = False,
 ):
     """Consume the final K64 after its first operand bank was preloaded."""
     second_a = tl.tuple([
@@ -7888,12 +8555,15 @@ def _wg_wave_grid_global_loads_pgr2_k128(
     n: tl.constexpr,
 ):
     """Load one logical K128 macro as two bank-safe K64 fragments."""
+    shared_macro_base: tl.constexpr = (m == 128 and block_m == 128 and block_n == 128 and a_row_count == 4
+                                       and b_group_count == 4 and b_group_n == 32 and stride_am == 20926
+                                       and stride_ak == 1 and stride_bk == 1 and stride_bn == 20926)
     first_a, first_b = _wg_wave_grid_global_loads_pgr2(
         a_ptr,
         b_ptr,
         pid_m,
         pid_n,
-        2 * macro,
+        macro if shared_macro_base else 2 * macro,
         block_m,
         block_n,
         64,
@@ -7906,13 +8576,15 @@ def _wg_wave_grid_global_loads_pgr2_k128(
         stride_bn,
         m,
         n,
+        shared_macro_base,
+        0,
     )
     second_a, second_b = _wg_wave_grid_global_loads_pgr2(
         a_ptr,
         b_ptr,
         pid_m,
         pid_n,
-        2 * macro + 1,
+        macro if shared_macro_base else 2 * macro + 1,
         block_m,
         block_n,
         64,
@@ -7925,6 +8597,8 @@ def _wg_wave_grid_global_loads_pgr2_k128(
         stride_bn,
         m,
         n,
+        shared_macro_base,
+        1,
     )
     return first_a + second_a, first_b + second_b
 
@@ -8020,6 +8694,30 @@ def _wg_wave_grid_local_load_pgr2_quarter_k128(
             ) for group in range(b_group_count)
         ]),
     )
+
+
+@triton.jit
+def _wg_wave_grid_local_load_pgr2_quarter_k128_b_group_major(
+    a_local,
+    b_local,
+    quarter: tl.constexpr,
+    a_group_m: tl.constexpr,
+    b_group_n: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+):
+    """Read operands in the next-use order of a 4x4 B-major MFMA grid."""
+    a_values = tl.tuple(
+        [_wg_wave_grid_local_load_pgr2_a_half(a_local, 0, quarter % 2, a_group_m, 4, dot_a, quarter // 2)])
+    b_values = tl.tuple(
+        [_wg_wave_grid_local_load_pgr2_b_half(b_local, 0, quarter % 2, b_group_n, 4, dot_b, quarter // 2)])
+    for row in tl.static_range(1, 4):
+        a_values += tl.tuple(
+            [_wg_wave_grid_local_load_pgr2_a_half(a_local, row, quarter % 2, a_group_m, 4, dot_a, quarter // 2)])
+    for group in tl.static_range(1, 4):
+        b_values += tl.tuple(
+            [_wg_wave_grid_local_load_pgr2_b_half(b_local, group, quarter % 2, b_group_n, 4, dot_b, quarter // 2)])
+    return a_values, b_values
 
 
 @triton.jit
@@ -8267,6 +8965,7 @@ def _wg_wave_grid_pgr2_stage_k128(
                             (publish % b_fragment_count) % b_fragments_per_group,
                             block_m,
                             block_n,
+                            a_row_count,
                             64,
                             b_group_n,
                             stride_bk,
@@ -8343,6 +9042,491 @@ def _wg_wave_grid_pgr2_stage_k128(
 
 
 @triton.jit
+def _wg_wave_grid_pgr2_stage_k128_4x4(
+    a_ptr,
+    b_ptr,
+    pid_m,
+    pid_n,
+    future_macro,
+    a_local,
+    b_local,
+    current_q0_a,
+    current_q0_b,
+    prefetched_a,
+    prefetched_b,
+    accumulators,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    prefetch_future: tl.constexpr,
+    initialize: tl.constexpr = False,
+):
+    """Advance one MT128x128 K128 stage with the vendor MFMA cadence."""
+    a_row_count: tl.constexpr = 4
+    b_group_count: tl.constexpr = 4
+    a_group_m: tl.constexpr = block_m // a_row_count
+    b_group_n: tl.constexpr = block_n // b_group_count
+    b_fragments_per_group: tl.constexpr = b_group_n // 32
+    b_fragment_count: tl.constexpr = (b_fragments_per_group * b_group_count)
+    publish_count: tl.constexpr = 2 * (b_fragment_count + a_row_count)
+    shared_macro_base: tl.constexpr = (m == 128 and block_m == 128 and block_n == 128 and stride_am == 20926
+                                       and stride_ak == 1 and stride_bk == 1 and stride_bn == 20926)
+    # Keep only Q0 across the loop edge. Read Q1/Q2 while Q0 executes, then
+    # Q3 while Q1 executes. This matches the selected hipBLASLt kernel's
+    # 16-read/16-MFMA then 8-read/13-MFMA LDS cadence.
+    # The loop backedge reads A0, B0, then A1..A3 before the remaining B
+    # groups.
+    with tlx.warp_pipeline_stage(
+            "pgr2_k128_4x4_read_q1_q2",
+            scope="intra_wave",
+    ):
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            current_q0_a,
+            current_q0_b,
+            accumulators,
+            0,
+            4,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+            initialize,
+        )
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            current_q0_a,
+            current_q0_b,
+            accumulators,
+            4,
+            12,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+            initialize,
+        )
+        q1_a, q1_b = (_wg_wave_grid_local_load_pgr2_quarter_k128_b_group_major(
+            a_local,
+            b_local,
+            1,
+            a_group_m,
+            b_group_n,
+            dot_a,
+            dot_b,
+        ))
+        q2_a, q2_b = (_wg_wave_grid_local_load_pgr2_quarter_k128_b_group_major(
+            a_local,
+            b_local,
+            2,
+            a_group_m,
+            b_group_n,
+            dot_a,
+            dot_b,
+        ))
+    with tlx.warp_pipeline_stage(
+            "pgr2_k128_4x4_read_q3",
+            scope="intra_wave",
+    ):
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            q1_a,
+            q1_b,
+            accumulators,
+            0,
+            13,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+        )
+        q3_a, q3_b = (_wg_wave_grid_local_load_pgr2_quarter_k128_b_group_major(
+            a_local,
+            b_local,
+            3,
+            a_group_m,
+            b_group_n,
+            dot_a,
+            dot_b,
+        ))
+
+    # Reuse each prefetched fragment immediately after publishing it, keeping
+    # a rolling window of 16 VMEM requests like the selected hipBLASLt kernel.
+    tl.debug_barrier()
+    accumulators = _wg_wave_grid_dot_b_group_major_range(
+        q1_a,
+        q1_b,
+        accumulators,
+        13,
+        1,
+        a_row_count,
+        b_group_count,
+        mma,
+        dot_a,
+        dot_b,
+    )
+    future_a = tl.tuple([])
+    future_b = tl.tuple([])
+    with tlx.warp_pipeline_stage(
+            "pgr2_k128_4x4_publish_and_prefetch",
+            scope="intra_wave",
+            pair=0,
+    ):
+        for publish in tl.static_range(publish_count):
+            _wg_wave_grid_local_store_pgr2_k128_fragment(
+                a_local,
+                b_local,
+                prefetched_a,
+                prefetched_b,
+                (publish + 2 * b_fragment_count if publish < 2 * a_row_count else publish - 2 * a_row_count),
+                b_group_count,
+                a_row_count,
+                a_group_m,
+                b_group_n,
+            )
+            if prefetch_future:
+                if publish < 2 * a_row_count:
+                    future_a += tl.tuple([
+                        _wg_wave_grid_global_load_a(
+                            a_ptr,
+                            pid_m,
+                            (future_macro if shared_macro_base else 2 * future_macro + publish // a_row_count),
+                            publish % a_row_count,
+                            a_group_m,
+                            b_group_n,
+                            block_m,
+                            64,
+                            stride_am,
+                            stride_ak,
+                            m,
+                            True,
+                            shared_macro_base,
+                            publish // a_row_count,
+                        )
+                    ])
+                else:
+                    future_b += tl.tuple([
+                        _wg_wave_grid_global_load_pgr2_b_half(
+                            b_ptr,
+                            pid_n,
+                            (future_macro if shared_macro_base else 2 * future_macro +
+                             (publish - 2 * a_row_count) // b_fragment_count),
+                            ((publish - 2 * a_row_count) % b_fragment_count) // b_fragments_per_group,
+                            ((publish - 2 * a_row_count) % b_fragment_count) % b_fragments_per_group,
+                            block_m,
+                            block_n,
+                            a_row_count,
+                            64,
+                            b_group_n,
+                            stride_bk,
+                            stride_bn,
+                            m,
+                            n,
+                            shared_macro_base,
+                            (publish - 2 * a_row_count) // b_fragment_count,
+                        )
+                    ])
+    with tlx.warp_pipeline_stage(
+            "pgr2_k128_4x4_cover_publish",
+            scope="intra_wave",
+            pair=0,
+    ):
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            q1_a,
+            q1_b,
+            accumulators,
+            14,
+            2,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+        )
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            q2_a,
+            q2_b,
+            accumulators,
+            0,
+            16,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+        )
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            q3_a,
+            q3_b,
+            accumulators,
+            0,
+            5,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+        )
+
+    tl.debug_barrier()
+    with tlx.warp_pipeline_stage(
+            "pgr2_k128_4x4_cover_q3_tail",
+            scope="intra_wave",
+            pair=1,
+    ):
+        accumulators = _wg_wave_grid_dot_b_group_major_range(
+            q3_a,
+            q3_b,
+            accumulators,
+            5,
+            11,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+        )
+    with tlx.warp_pipeline_stage(
+            "pgr2_k128_4x4_read_next_q0",
+            scope="intra_wave",
+            pair=1,
+    ):
+        next_q0_a, next_q0_b = (_wg_wave_grid_local_load_pgr2_quarter_k128_b_group_major(
+            a_local,
+            b_local,
+            0,
+            a_group_m,
+            b_group_n,
+            dot_a,
+            dot_b,
+        ))
+    if not prefetch_future:
+        # Steady state publishes stage 1 before the following iteration's
+        # first barrier. The final iteration has no successor, so make that
+        # publication visible before the caller drains Q1/Q2/Q3.
+        tl.debug_barrier()
+    return (
+        accumulators,
+        future_a,
+        future_b,
+        next_q0_a,
+        next_q0_b,
+    )
+
+
+@triton.jit
+def _wg_wave_grid_compute_tile_pgr2_k128_4x4(
+    a_ptr,
+    b_ptr,
+    pid_m,
+    pid_n,
+    first_a,
+    first_b,
+    a_local,
+    b_local,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    k: tl.constexpr,
+):
+    """Run the MT128x128 K128 pipeline with one backedge quarter."""
+    a_row_count: tl.constexpr = 4
+    b_group_count: tl.constexpr = 4
+    a_group_m: tl.constexpr = block_m // a_row_count
+    b_group_n: tl.constexpr = block_n // b_group_count
+    macro_blocks: tl.constexpr = k // 128
+    tl.static_assert(block_m == 128 and block_n == 128)
+    tl.static_assert(k % 128 == 0 and macro_blocks >= 3)
+    for fragment in tl.static_range(16):
+        _wg_wave_grid_local_store_pgr2_k128_fragment(
+            a_local,
+            b_local,
+            first_a,
+            first_b,
+            fragment,
+            b_group_count,
+            a_row_count,
+            a_group_m,
+            b_group_n,
+        )
+    tl.debug_barrier()
+    current_q0_a, current_q0_b = (_wg_wave_grid_local_load_pgr2_quarter_k128_b_group_major(
+        a_local,
+        b_local,
+        0,
+        a_group_m,
+        b_group_n,
+        dot_a,
+        dot_b,
+    ))
+    prefetched_a, prefetched_b = _wg_wave_grid_global_loads_pgr2_k128(
+        a_ptr,
+        b_ptr,
+        pid_m,
+        pid_n,
+        1,
+        block_m,
+        block_n,
+        a_row_count,
+        b_group_count,
+        b_group_n,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        m,
+        n,
+    )
+    accumulators = tl.tuple([tlx.zeros((a_group_m, b_group_n), tl.float32, layout=mma) for _ in range(16)])
+    (
+        accumulators,
+        prefetched_a,
+        prefetched_b,
+        current_q0_a,
+        current_q0_b,
+    ) = _wg_wave_grid_pgr2_stage_k128_4x4(
+        a_ptr,
+        b_ptr,
+        pid_m,
+        pid_n,
+        2,
+        a_local,
+        b_local,
+        current_q0_a,
+        current_q0_b,
+        prefetched_a,
+        prefetched_b,
+        accumulators,
+        mma,
+        dot_a,
+        dot_b,
+        block_m,
+        block_n,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        m,
+        n,
+        True,
+        True,
+    )
+    for macro in tl.range(1, macro_blocks - 2, num_stages=1):
+        (
+            accumulators,
+            prefetched_a,
+            prefetched_b,
+            current_q0_a,
+            current_q0_b,
+        ) = _wg_wave_grid_pgr2_stage_k128_4x4(
+            a_ptr,
+            b_ptr,
+            pid_m,
+            pid_n,
+            macro + 2,
+            a_local,
+            b_local,
+            current_q0_a,
+            current_q0_b,
+            prefetched_a,
+            prefetched_b,
+            accumulators,
+            mma,
+            dot_a,
+            dot_b,
+            block_m,
+            block_n,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            m,
+            n,
+            True,
+            False,
+        )
+    (
+        accumulators,
+        prefetched_a,
+        prefetched_b,
+        current_q0_a,
+        current_q0_b,
+    ) = _wg_wave_grid_pgr2_stage_k128_4x4(
+        a_ptr,
+        b_ptr,
+        pid_m,
+        pid_n,
+        macro_blocks,
+        a_local,
+        b_local,
+        current_q0_a,
+        current_q0_b,
+        prefetched_a,
+        prefetched_b,
+        accumulators,
+        mma,
+        dot_a,
+        dot_b,
+        block_m,
+        block_n,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        m,
+        n,
+        False,
+        False,
+    )
+    for quarter in tl.static_range(1, 4):
+        accumulators, next_a, next_b = (_wg_wave_grid_read_quarter_and_compute_k128(
+            a_local,
+            b_local,
+            quarter,
+            current_q0_a,
+            current_q0_b,
+            accumulators,
+            mma,
+            dot_a,
+            dot_b,
+            a_group_m,
+            b_group_n,
+            a_row_count,
+            b_group_count,
+        ))
+        current_q0_a = next_a
+        current_q0_b = next_b
+    return _wg_wave_grid_dot_column_major_range(
+        current_q0_a,
+        current_q0_b,
+        accumulators,
+        0,
+        16,
+        a_row_count,
+        b_group_count,
+        mma,
+        dot_a,
+        dot_b,
+    )
+
+
+@triton.jit
 def _wg_wave_grid_compute_tile_pgr2_k128(
     a_ptr,
     b_ptr,
@@ -8368,6 +9552,29 @@ def _wg_wave_grid_compute_tile_pgr2_k128(
     k: tl.constexpr,
 ):
     """Run a one-LDS-stage K128 pipeline with register PGR2 prefetching."""
+    if a_row_count == 4 and b_group_count == 4:
+        return _wg_wave_grid_compute_tile_pgr2_k128_4x4(
+            a_ptr,
+            b_ptr,
+            pid_m,
+            pid_n,
+            first_a,
+            first_b,
+            a_local,
+            b_local,
+            mma,
+            dot_a,
+            dot_b,
+            block_m,
+            block_n,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            m,
+            n,
+            k,
+        )
     block_k: tl.constexpr = 128
     a_group_m: tl.constexpr = block_m // a_row_count
     b_group_n: tl.constexpr = block_n // b_group_count
@@ -9541,18 +10748,12 @@ def _wg_wave_grid_compute_tile_pgr2_k32(
 
 
 @triton.jit
-def _wg_wave_grid_consume_register_k_tail(
+def _wg_wave_grid_load_register_k_tail(
     a_ptr,
     b_ptr,
-    a_local,
-    b_local,
     pid_m,
     pid_n,
     kb,
-    accumulators,
-    mma: tl.constexpr,
-    dot_a: tl.constexpr,
-    dot_b: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     a_row_count: tl.constexpr,
@@ -9565,18 +10766,11 @@ def _wg_wave_grid_consume_register_k_tail(
     m: tl.constexpr,
     n: tl.constexpr,
     tail_k: tl.constexpr,
+    compact_k32: tl.constexpr = False,
 ):
-    """Append one 1..64-element tail as ordered K32 MFMAs."""
-    tl.static_assert(tail_k > 0 and tail_k <= 64)
-    a_group_m: tl.constexpr = block_m // a_row_count
-    accumulators = tlx.amd_mfma_commit(
-        tl.tuple([tlx.require_layout(accumulator, mma, pin=False) for accumulator in accumulators]))
-    b_fragments_per_group: tl.constexpr = b_group_n // 32
-    # Preserve the exact distributed layouts produced by the proven PGR2
-    # loader while suppressing accesses beyond the logical K extent.
-    # Keep the tail tile coordinates opaque so LLVM rematerializes its small
-    # address set here instead of spilling the prologue's offsets across the
-    # entire K loop for a one-time reuse.
+    """Load one zero-padded 1..64-element register tail."""
+    # Keep tail coordinates opaque so LLVM rematerializes the small address
+    # set at this call instead of extending the tile prologue's live ranges.
     tail_pid_m = tl.inline_asm_elementwise(
         "s_mov_b32 $0, $1;",
         "=s,s,~{memory}",
@@ -9593,7 +10787,28 @@ def _wg_wave_grid_consume_register_k_tail(
         is_pure=False,
         pack=1,
     )
-    if tail_k == 64:
+    if compact_k32:
+        tl.static_assert(tail_k == 32)
+        tail_a, tail_b = _wg_wave_grid_global_loads(
+            a_ptr,
+            b_ptr,
+            tail_pid_m,
+            tail_pid_n,
+            kb,
+            block_m,
+            block_n,
+            32,
+            a_row_count,
+            b_group_count,
+            b_group_n,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            m,
+            n,
+        )
+    elif tail_k == 64:
         tail_a, tail_b = _wg_wave_grid_global_loads_pgr2(
             a_ptr,
             b_ptr,
@@ -9633,7 +10848,160 @@ def _wg_wave_grid_consume_register_k_tail(
             n,
             tail_k,
         )
+    return tail_a, tail_b
 
+
+@triton.jit
+def _wg_wave_grid_consume_register_k32_tail_compact(
+    a_ptr,
+    b_ptr,
+    a_local,
+    b_local,
+    pid_m,
+    pid_n,
+    kb,
+    accumulators,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    a_row_count: tl.constexpr,
+    b_group_count: tl.constexpr,
+    b_group_n: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+):
+    """Append one exact K32 tail through compact register and LDS fragments."""
+    a_group_m: tl.constexpr = block_m // a_row_count
+    tl.static_assert(a_group_m == 32 and a_row_count % 2 == 0)
+    tl.static_assert(len(a_local) == a_row_count)
+    tl.static_assert(len(b_local) == b_group_count)
+    accumulators = tl.tuple([tlx.require_layout(accumulator, mma, pin=False) for accumulator in accumulators])
+    tail_a, tail_b = _wg_wave_grid_load_register_k_tail(
+        a_ptr,
+        b_ptr,
+        pid_m,
+        pid_n,
+        kb,
+        block_m,
+        block_n,
+        a_row_count,
+        b_group_count,
+        b_group_n,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        m,
+        n,
+        32,
+        True,
+    )
+    tl.debug_barrier()
+    for group in tl.static_range(b_group_count):
+        tlx.local_store(
+            tlx.local_slice(
+                tlx.local_view(b_local[group], 0),
+                [0, 0],
+                [32, b_group_n],
+            ),
+            tail_b[group],
+        )
+    for row in tl.static_range(a_row_count):
+        tlx.local_store(
+            tlx.local_slice(
+                tlx.local_view(a_local[row], 0),
+                [0, 0],
+                [a_group_m, 32],
+            ),
+            tail_a[row],
+        )
+    tl.debug_barrier()
+    current_a = tl.tuple([
+        _wg_wave_grid_local_load_pgr2_a_half(a_local, row, 0, a_group_m, a_row_count, dot_a, 0)
+        for row in range(a_row_count)
+    ])
+    current_b = tl.tuple([
+        _wg_wave_grid_local_load_pgr2_b_half(b_local, group, 0, b_group_n, b_group_count, dot_b, 0)
+        for group in range(b_group_count)
+    ])
+    for mfma_index in tl.static_range(a_row_count * b_group_count):
+        accumulators = _wg_wave_grid_dot_column_major_at(
+            current_a,
+            current_b,
+            accumulators,
+            mfma_index,
+            a_row_count,
+            b_group_count,
+            mma,
+            dot_a,
+            dot_b,
+            initialize=False,
+            accumulator_register_class="vgpr",
+        )
+    committed = tlx.amd_mfma_commit(accumulators, current_a[0])
+    return tl.tuple([committed[index] for index in range(len(accumulators))])
+
+
+@triton.jit
+def _wg_wave_grid_consume_register_k_tail(
+    a_ptr,
+    b_ptr,
+    a_local,
+    b_local,
+    pid_m,
+    pid_n,
+    kb,
+    accumulators,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    a_row_count: tl.constexpr,
+    b_group_count: tl.constexpr,
+    b_group_n: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    tail_k: tl.constexpr,
+    active=True,
+    accumulator_register_class: tl.constexpr = None,
+):
+    """Append one 1..64-element tail as ordered K32 MFMAs."""
+    tl.static_assert(tail_k > 0 and tail_k <= 64)
+    a_group_m: tl.constexpr = block_m // a_row_count
+    accumulators = tl.tuple([tlx.require_layout(accumulator, mma, pin=False) for accumulator in accumulators])
+    if accumulator_register_class != "vgpr":
+        accumulators = tlx.amd_mfma_commit(accumulators)
+    b_fragments_per_group: tl.constexpr = b_group_n // 32
+    tail_a, tail_b = _wg_wave_grid_load_register_k_tail(
+        a_ptr,
+        b_ptr,
+        pid_m,
+        pid_n,
+        kb,
+        block_m,
+        block_n,
+        a_row_count,
+        b_group_count,
+        b_group_n,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        m,
+        n,
+        tail_k,
+    )
     # The main PGR2 epilogue has finished reading LDS. Reuse its first bank for
     # the zero-padded final K64, retaining the proven LDS -> MFMA layouts.
     tl.debug_barrier()
@@ -9652,7 +11020,8 @@ def _wg_wave_grid_consume_register_k_tail(
             0,
         )
     tl.debug_barrier()
-    for half in tl.static_range(2):
+    tail_halves: tl.constexpr = (tail_k + 31) // 32
+    for half in tl.static_range(tail_halves):
         current_a = tl.tuple([
             _wg_wave_grid_local_load_pgr2_a_half(a_local, row, half, a_group_m, a_row_count, dot_a, 0)
             for row in range(a_row_count)
@@ -9661,25 +11030,26 @@ def _wg_wave_grid_consume_register_k_tail(
             _wg_wave_grid_local_load_pgr2_b_half(b_local, group, half, b_group_n, b_group_count, dot_b, 0)
             for group in range(b_group_count)
         ])
-        if tail_k < (half + 1) * 32:
-            a_tail_mask = tlx.require_layout(
-                tl.broadcast_to(
-                    tl.arange(0, 32)[None, :] < tail_k - half * 32,
-                    (a_group_m, 32),
-                ),
-                dot_a,
-                pin=False,
-            )
-            b_tail_mask = tlx.require_layout(
-                tl.broadcast_to(
-                    tl.arange(0, 32)[:, None] < tail_k - half * 32,
-                    (32, b_group_n),
-                ),
-                dot_b,
-                pin=False,
-            )
-            current_a = tl.tuple([tl.where(a_tail_mask, value, 0.0) for value in current_a])
-            current_b = tl.tuple([tl.where(b_tail_mask, value, 0.0) for value in current_b])
+        a_tail_mask = tlx.require_layout(
+            tl.broadcast_to(
+                (tl.arange(0, 32)[None, :] < tail_k - half * 32)
+                & active,
+                (a_group_m, 32),
+            ),
+            dot_a,
+            pin=False,
+        )
+        b_tail_mask = tlx.require_layout(
+            tl.broadcast_to(
+                (tl.arange(0, 32)[:, None] < tail_k - half * 32)
+                & active,
+                (32, b_group_n),
+            ),
+            dot_b,
+            pin=False,
+        )
+        current_a = tl.tuple([tl.where(a_tail_mask, value, 0.0) for value in current_a])
+        current_b = tl.tuple([tl.where(b_tail_mask, value, 0.0) for value in current_b])
         for mfma_index in tl.static_range(a_row_count * b_group_count):
             accumulators = _wg_wave_grid_dot_column_major_at(
                 current_a,
@@ -9692,8 +11062,13 @@ def _wg_wave_grid_consume_register_k_tail(
                 dot_a,
                 dot_b,
                 initialize=False,
+                accumulator_register_class=accumulator_register_class,
             )
-    return tlx.amd_mfma_commit(accumulators)
+    if accumulator_register_class == "vgpr":
+        committed = tlx.amd_mfma_commit(accumulators, current_a[0])
+        return tl.tuple([committed[index] for index in range(len(accumulators))])
+    else:
+        return tlx.amd_mfma_commit(accumulators)
 
 
 @triton.jit
@@ -10950,13 +12325,16 @@ def _wg_store_mi16_wave_grid_output(
     wide_epilogue: tl.constexpr,
     use_mask: tl.constexpr,
     mma: tl.constexpr,
+    accumulators_committed: tl.constexpr = False,
 ):
     """Commit and store one regular MI16 accumulator grid."""
     if not row_wise:
-        accumulators = tlx.amd_mfma_commit(
-            tl.tuple([
-                tlx.require_layout(accumulators[index], mma, pin=False) for index in range(a_row_count * b_group_count)
-            ]))
+        if not accumulators_committed:
+            accumulators = tlx.amd_mfma_commit(
+                tl.tuple([
+                    tlx.require_layout(accumulators[index], mma, pin=False)
+                    for index in range(a_row_count * b_group_count)
+                ]))
     for row in tl.static_range(a_row_count):
         if row_wise:
             row_values = tlx.amd_mfma_commit(
@@ -10974,9 +12352,21 @@ def _wg_store_mi16_wave_grid_output(
             tl.static_assert(a_group_m == TILE)
             tl.static_assert(b_group_n == TILE)
             for wide_group in tl.static_range(b_group_count // N_GROUP_FRAGMENTS):
-                cols = (pid_n * block_n + wide_group * N_GROUP_FRAGMENTS * b_group_n +
-                        tl.arange(0, N_GROUP_FRAGMENTS * TILE))
-                ptrs = (c_ptr + rows[:, None] * stride_cm + cols[None, :] * stride_cn)
+                local_rows = tl.arange(0, a_group_m)
+                local_cols = tl.arange(0, N_GROUP_FRAGMENTS * TILE)
+                cols = (pid_n * block_n + wide_group * N_GROUP_FRAGMENTS * b_group_n + local_cols)
+                c_base = (c_ptr + (pid_m * block_m + row * a_group_m) * stride_cm +
+                          (pid_n * block_n + wide_group * N_GROUP_FRAGMENTS * b_group_n) * stride_cn)
+                offsets = (tl.mul(
+                    local_rows[:, None],
+                    stride_cm,
+                    sanitize_overflow=False,
+                ) + tl.mul(
+                    local_cols[None, :],
+                    stride_cn,
+                    sanitize_overflow=False,
+                ))
+                offsets = tlx.require_layout(offsets, _C_STORE_32X128_LAYOUT, pin=False)
                 lo = tl.cat(
                     tlx.require_layout(row_values[wide_group * N_GROUP_FRAGMENTS], mma, pin=False),
                     tlx.require_layout(row_values[wide_group * N_GROUP_FRAGMENTS + 1], mma, pin=False),
@@ -10993,11 +12383,17 @@ def _wg_store_mi16_wave_grid_output(
                     _C_STORE_32X128_LAYOUT,
                 )
                 if use_mask:
-                    mask = (rows[:, None] < m) & (cols[None, :] < n)
-                    mask = tlx.require_layout(mask, _C_STORE_32X128_LAYOUT, pin=False)
-                    tl.store(ptrs, value, mask=mask)
+                    full_region = (pid_m * block_m +
+                                   (row + 1) * a_group_m <= m) & (pid_n * block_n +
+                                                                  (wide_group + 1) * N_GROUP_FRAGMENTS * b_group_n <= n)
+                    if full_region:
+                        tlx.buffer_store(value, c_base, offsets, contiguity=8)
+                    else:
+                        mask = (rows[:, None] < m) & (cols[None, :] < n)
+                        mask = tlx.require_layout(mask, _C_STORE_32X128_LAYOUT, pin=False)
+                        tlx.buffer_store(value, c_base, offsets, mask=mask)
                 else:
-                    tl.store(ptrs, value)
+                    tlx.buffer_store(value, c_base, offsets, contiguity=8)
         for group in tl.static_range(
             (b_group_count // N_GROUP_FRAGMENTS * N_GROUP_FRAGMENTS if wide_epilogue else 0),
                 b_group_count,
@@ -11295,31 +12691,37 @@ def _wg_kernel_regular_mi16_wave_grid(
     b_group_count: tl.constexpr = MI_WAVE_TILE_N
     b_group_n: tl.constexpr = 16 * WARPS_N
     tl.static_assert(SPLIT_K >= 1)
-    tl.static_assert(K % SPLIT_K == 0)
+    tl.static_assert(PAIR_BALANCED_SPLIT_K or K % SPLIT_K == 0)
     split_k: tl.constexpr = K // SPLIT_K
-    tail_k: tl.constexpr = (split_k % BLOCK_K if PGR2_OPERANDS and (BLOCK_K == 64 or BLOCK_K == 128) else 0)
+    split_unit_k: tl.constexpr = (2 * BLOCK_K if BLOCK_K == 64 else BLOCK_K)
+    tail_k: tl.constexpr = (K % split_unit_k if PAIR_BALANCED_SPLIT_K else split_k % BLOCK_K if BLOCK_K == 64 or
+                            (PGR2_OPERANDS and BLOCK_K == 128) else 0)
     has_k_tail: tl.constexpr = tail_k != 0
-    # One or two masked K32 MFMAs can extend the K64 PGR2 pipeline without
-    # changing the unmasked main loop. Keep this fail-closed for outer Split-K
-    # and non-PGR2 paths, whose partition boundaries require separate proof.
-    tl.static_assert(split_k % BLOCK_K == 0 or (has_k_tail and PGR2_OPERANDS and ((BLOCK_K == 64 and SPLIT_K == 1) or
-                                                                                  (BLOCK_K == 128 and tail_k == 64))))
+    # One or two masked K32 MFMAs can extend the PGR2 pipeline without changing
+    # its unmasked main loop. Equal outer Split-K partitions shift both operand
+    # pointers to their exact boundary, so each K64 partition may consume its
+    # own final masked K32 fragment independently before workspace reduction.
+    tl.static_assert(PAIR_BALANCED_SPLIT_K or split_k % BLOCK_K == 0
+                     or (has_k_tail and (PGR2_OPERANDS or not DIRECT_TO_LDS) and ((BLOCK_K == 64 and tail_k <= 64) or
+                                                                                  (BLOCK_K == 128 and tail_k <= 64))))
     main_k: tl.constexpr = split_k - tail_k
     k_blocks: tl.constexpr = main_k // BLOCK_K
-    tl.static_assert(k_blocks >= 3)
+    single_regular_k64: tl.constexpr = (k_blocks == 1 and BLOCK_K == 64 and not PGR2_OPERANDS and not DIRECT_TO_LDS and
+                                        not (a_row_count == b_group_count and a_row_count >= 5 and a_row_count <= 8))
+    tl.static_assert(k_blocks >= 3 or single_regular_k64)
     if PAIR_BALANCED_SPLIT_K:
         tl.static_assert(SPLIT_K > 1)
-        tl.static_assert(BLOCK_K == 64)
-        tl.static_assert(LOCAL_STAGES == 2)
+        tl.static_assert(BLOCK_K == 64 or BLOCK_K == 128)
+        tl.static_assert(LOCAL_STAGES == 1 or LOCAL_STAGES == 2)
         tl.static_assert(PGR2_OPERANDS)
         tl.static_assert(not DIRECT_TO_LDS)
         tl.static_assert(TILES_PER_PROGRAM == 1)
-        tl.static_assert(K % (2 * BLOCK_K) == 0)
-        split_k_pairs: tl.constexpr = K // (2 * BLOCK_K)
-        base_pairs: tl.constexpr = split_k_pairs // SPLIT_K
-        extra_pairs: tl.constexpr = split_k_pairs % SPLIT_K
-        long_split_k: tl.constexpr = (base_pairs + 1) * 2 * BLOCK_K
-        short_split_k: tl.constexpr = base_pairs * 2 * BLOCK_K
+        tl.static_assert(tail_k <= 64)
+        split_k_units: tl.constexpr = K // split_unit_k
+        base_units: tl.constexpr = split_k_units // SPLIT_K
+        extra_units: tl.constexpr = split_k_units % SPLIT_K
+        long_split_k: tl.constexpr = (base_units + 1) * split_unit_k
+        short_split_k: tl.constexpr = base_units * split_unit_k
 
     grid_n: tl.constexpr = tl.cdiv(N, block_n)
     if LINEAR_TILES:
@@ -11332,8 +12734,8 @@ def _wg_kernel_regular_mi16_wave_grid(
         split_id = launch_program // program_count
         program = launch_program % program_count
         if PAIR_BALANCED_SPLIT_K:
-            split_start_pair = split_id * base_pairs + min(split_id, extra_pairs)
-            split_start = split_start_pair * 2 * BLOCK_K
+            split_start_unit = split_id * base_units + min(split_id, extra_units)
+            split_start = split_start_unit * split_unit_k
         else:
             split_start = split_id * split_k
         a_ptr += split_start.to(tl.int64) * stride_ak
@@ -11466,22 +12868,46 @@ def _wg_kernel_regular_mi16_wave_grid(
                     ROW_MAJOR_B_LDS,
                 )
             else:
-                a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
-                    block_m,
-                    a_group_m,
-                    BLOCK_K,
-                    1,
-                    True,
-                    a_element_type,
-                )
-                b_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
-                    block_n,
-                    b_group_n,
-                    BLOCK_K,
-                    1,
-                    False,
-                    b_element_type,
-                )
+                if block_m == 32 and block_n == 64:
+                    compact_a_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_identity_for([(64, 16)],
+                                                                                                          [32, 64],
+                                                                                                          order=[1, 0]))
+                    compact_b_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+                        [(512, 16)],
+                        _wg_B_BASES_64X32,
+                        [64, 32],
+                    ))
+                    a_local = tl.tuple([tlx.local_alloc(
+                        (32, 64),
+                        a_element_type,
+                        1,
+                        layout=compact_a_layout,
+                    )])
+                    b_local = tl.tuple([
+                        tlx.local_alloc(
+                            (64, 32),
+                            b_element_type,
+                            1,
+                            layout=compact_b_layout,
+                        ) for _ in range(b_group_count)
+                    ])
+                else:
+                    a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
+                        block_m,
+                        a_group_m,
+                        BLOCK_K,
+                        1,
+                        True,
+                        a_element_type,
+                    )
+                    b_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
+                        block_n,
+                        b_group_n,
+                        BLOCK_K,
+                        1,
+                        False,
+                        b_element_type,
+                    )
         elif (a_row_count == b_group_count and a_row_count >= 5 and a_row_count <= 8):
             # Pack four regular 32-wide fragments in one allocation and keep
             # the remaining 1..4 fragments in a second allocation.  Thus one
@@ -11646,22 +13072,80 @@ def _wg_kernel_regular_mi16_wave_grid(
         if PGR2_OPERANDS:
             tl.static_assert(LOCAL_STAGES == 1)
             if BLOCK_K == 128:
-                a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
-                    block_m,
-                    a_group_m,
-                    64,
-                    2,
-                    True,
-                    a_element_type,
-                )
-                b_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
-                    block_n,
-                    b_group_n,
-                    64,
-                    2,
-                    False,
-                    b_element_type,
-                )
+                if (M == 128 and N == 10304 and K == 20926 and block_m == 128 and block_n == 128):
+                    compact_a_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+                        [(512, 16)],
+                        _wg_A_BASES_128X64_COMPACT,
+                        [128, 64],
+                    ))
+                    compact_b_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+                        [(512, 16)],
+                        _wg_B_BASES_64X128_COMPACT,
+                        [64, 128],
+                    ))
+                    a_local = tl.tuple([tlx.local_alloc(
+                        (128, 64),
+                        a_element_type,
+                        2,
+                        layout=compact_a_layout,
+                    )])
+                    b_local = tl.tuple([tlx.local_alloc(
+                        (64, 128),
+                        b_element_type,
+                        2,
+                        layout=compact_b_layout,
+                    )])
+                elif block_m == 64 and block_n == 96:
+                    # Keep every physical K64 bank in an exact per-group
+                    # allocation for compact rectangular tiles.  This avoids
+                    # padding both operands to 128: MT64x96 uses 40 KiB
+                    # instead of 64 KiB.
+                    a_local = (_wg_wave_grid_allocate_pgr2_double_buffer_operand(
+                        block_m,
+                        a_group_m,
+                        64,
+                        True,
+                        a_element_type,
+                    ))
+                    b_local = (_wg_wave_grid_allocate_pgr2_double_buffer_operand(
+                        block_n,
+                        b_group_n,
+                        64,
+                        False,
+                        b_element_type,
+                    ))
+                else:
+                    a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
+                        block_m,
+                        a_group_m,
+                        64,
+                        2,
+                        True,
+                        a_element_type,
+                    )
+                    if block_m == 32 and block_n == 64:
+                        compact_b_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases(
+                            [(512, 16)],
+                            _wg_B_BASES_64X32,
+                            [64, 32],
+                        ))
+                        b_local = tl.tuple([
+                            tlx.local_alloc(
+                                (64, 32),
+                                b_element_type,
+                                1,
+                                layout=compact_b_layout,
+                            ) for _ in range(2 * b_group_count)
+                        ])
+                    else:
+                        b_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
+                            block_n,
+                            b_group_n,
+                            64,
+                            2,
+                            False,
+                            b_element_type,
+                        )
             else:
                 a_local = _wg_wave_grid_allocate_pgr2_operand_chunks(
                     block_m,
@@ -11905,34 +13389,86 @@ def _wg_kernel_regular_mi16_wave_grid(
         elif BLOCK_K == 128:
             tl.static_assert(PGR2_OPERANDS)
             tl.static_assert(LOCAL_STAGES == 1)
-            accumulators = _wg_wave_grid_compute_tile_pgr2_k128(
-                a_ptr,
-                b_ptr,
-                pid_m,
-                pid_n,
-                first_a,
-                first_b,
-                a_local,
-                b_local,
-                mma,
-                dot_a,
-                dot_b,
-                block_m,
-                block_n,
-                a_row_count,
-                b_group_count,
-                stride_am,
-                stride_ak,
-                stride_bk,
-                stride_bn,
-                M,
-                N,
-                main_k,
-            )
+            if PAIR_BALANCED_SPLIT_K:
+                if split_id < extra_units:
+                    accumulators = _wg_wave_grid_compute_tile_pgr2_k128(
+                        a_ptr,
+                        b_ptr,
+                        pid_m,
+                        pid_n,
+                        first_a,
+                        first_b,
+                        a_local,
+                        b_local,
+                        mma,
+                        dot_a,
+                        dot_b,
+                        block_m,
+                        block_n,
+                        a_row_count,
+                        b_group_count,
+                        stride_am,
+                        stride_ak,
+                        stride_bk,
+                        stride_bn,
+                        M,
+                        N,
+                        long_split_k,
+                    )
+                else:
+                    accumulators = _wg_wave_grid_compute_tile_pgr2_k128(
+                        a_ptr,
+                        b_ptr,
+                        pid_m,
+                        pid_n,
+                        first_a,
+                        first_b,
+                        a_local,
+                        b_local,
+                        mma,
+                        dot_a,
+                        dot_b,
+                        block_m,
+                        block_n,
+                        a_row_count,
+                        b_group_count,
+                        stride_am,
+                        stride_ak,
+                        stride_bk,
+                        stride_bn,
+                        M,
+                        N,
+                        short_split_k,
+                    )
+            else:
+                accumulators = _wg_wave_grid_compute_tile_pgr2_k128(
+                    a_ptr,
+                    b_ptr,
+                    pid_m,
+                    pid_n,
+                    first_a,
+                    first_b,
+                    a_local,
+                    b_local,
+                    mma,
+                    dot_a,
+                    dot_b,
+                    block_m,
+                    block_n,
+                    a_row_count,
+                    b_group_count,
+                    stride_am,
+                    stride_ak,
+                    stride_bk,
+                    stride_bn,
+                    M,
+                    N,
+                    main_k,
+                )
         elif BLOCK_K == 64:
             if PGR2_OPERANDS:
                 if PAIR_BALANCED_SPLIT_K:
-                    if split_id < extra_pairs:
+                    if split_id < extra_units:
                         accumulators = _wg_wave_grid_compute_tile_pgr2_k64(
                             a_ptr,
                             b_ptr,
@@ -12070,6 +13606,7 @@ def _wg_kernel_regular_mi16_wave_grid(
                     N,
                     main_k,
                     LOCAL_STAGES,
+                    "vgpr" if single_regular_k64 else None,
                 )
         else:
             if PGR2_OPERANDS:
@@ -12127,31 +13664,86 @@ def _wg_kernel_regular_mi16_wave_grid(
                     main_k,
                 )
         if has_k_tail:
-            accumulators = _wg_wave_grid_consume_register_k_tail(
-                a_ptr,
-                b_ptr,
-                a_local,
-                b_local,
-                pid_m,
-                pid_n,
-                main_k // 32,
-                accumulators,
-                mma,
-                dot_a,
-                dot_b,
-                block_m,
-                block_n,
-                a_row_count,
-                b_group_count,
-                b_group_n,
-                stride_am,
-                stride_ak,
-                stride_bk,
-                stride_bn,
-                M,
-                N,
-                tail_k,
-            )
+            if PAIR_BALANCED_SPLIT_K:
+                accumulators = _wg_wave_grid_consume_register_k_tail(
+                    a_ptr,
+                    b_ptr,
+                    a_local,
+                    b_local,
+                    pid_m,
+                    pid_n,
+                    short_split_k // 32,
+                    accumulators,
+                    mma,
+                    dot_a,
+                    dot_b,
+                    block_m,
+                    block_n,
+                    a_row_count,
+                    b_group_count,
+                    b_group_n,
+                    stride_am,
+                    stride_ak,
+                    stride_bk,
+                    stride_bn,
+                    M,
+                    N,
+                    tail_k,
+                    split_id == SPLIT_K - 1,
+                )
+            elif single_regular_k64 and tail_k == 32:
+                accumulators = (_wg_wave_grid_consume_register_k32_tail_compact(
+                    a_ptr,
+                    b_ptr,
+                    a_local,
+                    b_local,
+                    pid_m,
+                    pid_n,
+                    main_k // 32,
+                    accumulators,
+                    mma,
+                    dot_a,
+                    dot_b,
+                    block_m,
+                    block_n,
+                    a_row_count,
+                    b_group_count,
+                    b_group_n,
+                    stride_am,
+                    stride_ak,
+                    stride_bk,
+                    stride_bn,
+                    M,
+                    N,
+                ))
+            else:
+                accumulators = _wg_wave_grid_consume_register_k_tail(
+                    a_ptr,
+                    b_ptr,
+                    a_local,
+                    b_local,
+                    pid_m,
+                    pid_n,
+                    main_k // 32,
+                    accumulators,
+                    mma,
+                    dot_a,
+                    dot_b,
+                    block_m,
+                    block_n,
+                    a_row_count,
+                    b_group_count,
+                    b_group_n,
+                    stride_am,
+                    stride_ak,
+                    stride_bk,
+                    stride_bn,
+                    M,
+                    N,
+                    tail_k,
+                    True,
+                    "vgpr" if single_regular_k64 else None,
+                )
         # Issue the following tile's K0 global loads before draining and
         # storing this tile's persistent AGPR accumulators.  This is the
         # multi-tile prologue/epilogue overlap used by the persistent kernel.
@@ -12301,6 +13893,7 @@ def _wg_kernel_regular_mi16_wave_grid(
             WIDE_EPILOGUE,
             M % block_m != 0 or N % block_n != 0,
             mma,
+            single_regular_k64,
         )
 
 
@@ -12461,14 +14054,21 @@ def _wg_matmul(
         _reduce_tile = plan.get("reduce_tile", (16, 64))
     if _reduce_warps is None:
         _reduce_warps = plan.get("reduce_warps", 4)
-    if _split_k < 1 or k % _split_k != 0:
-        raise ValueError(f"invalid wave-grid Split-K={_split_k} for K={k}")
     pair_balanced_split_k = plan.get("pair_balanced_split_k", False)
-    if pair_balanced_split_k and (_split_k <= 1 or k % (2 * plan["block_k"]) != 0
-                                  or not plan.get("pgr2_operands", False) or plan.get("local_stages", 1) != 2
-                                  or plan.get("direct_to_lds", False) or plan.get("tiles_per_program", 1) != 1):
-        raise ValueError("pair-balanced wave-grid Split-K requires a one-tile, two-stage "
-                         "PGR2 plan and a whole number of K-block pairs")
+    if _split_k < 1 or (not pair_balanced_split_k and k % _split_k != 0):
+        raise ValueError(f"invalid wave-grid Split-K={_split_k} for K={k}")
+    if pair_balanced_split_k:
+        minimum_k_blocks = 4 if plan.get("local_stages", 1) == 2 else 3
+        split_unit_blocks = 2 if plan["block_k"] == 64 else 1
+        split_unit_k = split_unit_blocks * plan["block_k"]
+        base_unit_count = k // split_unit_k // _split_k
+        if (_split_k <= 1 or plan["block_k"] not in (64, 128) or k % split_unit_k > 64
+                or not plan.get("pgr2_operands", False) or plan.get("local_stages", 1) not in (1, 2)
+                or plan.get("direct_to_lds", False) or plan.get("tiles_per_program", 1) != 1
+                or split_unit_blocks * base_unit_count < minimum_k_blocks):
+            raise ValueError("pair-balanced wave-grid Split-K requires a one-tile PGR2 "
+                             "plan, at least three blocks per split, and at most one "
+                             "K64-equivalent tail")
     if (_split_k > 1 and plan.get("pgr2_operands", False) and plan.get("local_stages", 1) == 2
             and plan.get("direct_to_lds", False) and not pair_balanced_split_k
             and (k // _split_k // plan["block_k"]) % 2 != 0):
@@ -12589,7 +14189,11 @@ def _wg_matmul(
         else:
             grid = (triton.cdiv(m, block_m) * triton.cdiv(triton.cdiv(n, block_n), tiles_per_program), )
         if _split_k > 1:
-            workspace = torch.empty((_split_k * m, n), device=a.device, dtype=torch.float32)
+            workspace = torch.empty(
+                (_split_k * m, n),
+                device=a.device,
+                dtype=plan.get("workspace_dtype", torch.float32),
+            )
             kernel_operands = (
                 a,
                 b,
@@ -12702,9 +14306,26 @@ def _wg_supports_hybrid_n160(m, n, k):
 
 def _wg_transposed_wave_grid_plan(m, n, k):
     """Return a plan for computing ``(A @ B).T = B.T @ A.T``."""
+    specialization = _wg_PRODUCTION_TRANSPOSED_WAVE_GRID_PROMOTIONS.get((m, n, k))
+    if specialization is not None:
+        return specialization
     specialization = _wg_SOTA77_TRANSPOSED_WAVE_GRID_PROMOTIONS.get((m, n, k))
     if specialization is not None:
         return specialization
+    if (m, n, k) == (128, 70_770, 192):
+        return _wg_regular_wave_grid_plan(
+            6,
+            2,
+            2,
+            2,
+            64,
+            local_stages=1,
+            pgr2_operands=True,
+            row_wise_epilogue=True,
+            reverse_local_assignment=False,
+            sink_insts_to_avoid_spills=True,
+            disable_unclustered_high_rp_reschedule=True,
+        )
     # For shallow reductions with a very wide N dimension, transposition turns
     # thousands of short M-tail tiles into a regular MT160x160 grid while
     # preserving the same mathematical GEMM and output layout.
@@ -12789,8 +14410,9 @@ def _wg_transposed_wave_grid_plan(m, n, k):
 def _wg_prefer_tuned_wave_grid(m, n, k, plan):
     """Prefer measured non-power-of-two wave-grid decompositions."""
     return plan is not None and (
-        (m, n, k) in _wg_SOTA77_WAVE_GRID_PROMOTIONS or (k == 8192 and 480 <= m <= 576 and n >= 128 * m) or
-        (k == 6144 and 64 <= m <= 96 and n >= 32 * m) or (k == 6144 and 240 <= m <= 288 and n >= 32 * m) or
+        (m, n, k) in _wg_SOTA77_WAVE_GRID_PROMOTIONS or (m, n, k) in _wg_D122929229_WAVE_GRID_PROMOTIONS or
+        (k == 8192 and 480 <= m <= 576 and n >= 128 * m) or (k == 6144 and 64 <= m <= 96 and n >= 32 * m) or
+        (k == 6144 and 240 <= m <= 288 and n >= 32 * m) or
         (k == 6144 and 208 <= m <= 224 and n >= 65536 and n % 224 == 0) or
         (k == 512 and 160 <= m <= 240 and n >= 65536) or
         (k == 768 and plan.get("direct_to_lds", False) and plan.get("mi_wave_tile_m") == 8
@@ -12804,7 +14426,8 @@ def _wg_prefer_lds_over_wave_grid(m, n, k, plan):
     """Keep measured compute families on the mature eight-wave pipeline."""
     if plan is None:
         return False
-    if ((m, n, k) in _wg_SOTA77_WAVE_GRID_PROMOTIONS or (k == 8192 and 480 <= m <= 576 and n >= 128 * m)):
+    if ((m, n, k) in _wg_SOTA77_WAVE_GRID_PROMOTIONS or (m, n, k) in _wg_D122929229_WAVE_GRID_PROMOTIONS
+            or (k == 8192 and 480 <= m <= 576 and n >= 128 * m)):
         return False
     # At K256, a very tall output with a moderately wide N dimension has
     # enough CTA parallelism that the mature eight-wave pipeline beats the
@@ -13224,7 +14847,8 @@ _NUM_CU = 256
 _MIN_KTILES_PER_SPLIT = 16
 
 
-def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds, num_warps, num_stages, matrix_instr_nonkdim=16):
+def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds, num_warps, num_stages, matrix_instr_nonkdim=16,
+                         waves_per_eu=0):
     return MappingProxyType({
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
@@ -13232,7 +14856,7 @@ def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds, num_warps
         "GROUP_M": group_m,
         "NUM_XCDS": num_xcds,
         "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        "waves_per_eu": 0,
+        "waves_per_eu": waves_per_eu,
         "kpack": 1,
         "num_warps": num_warps,
         "num_stages": num_stages,
@@ -13241,6 +14865,15 @@ def _fixed_register_plan(block_m, block_n, block_k, group_m, num_xcds, num_warps
 
 _SMALL_SQUARE_REGISTER_CONFIG = _fixed_register_plan(32, 16, 256, 4, 1, 2, 2)
 _MT64X64_BK256_REGISTER_CONFIG = _fixed_register_plan(64, 64, 256, 4, 8, 8, 2)
+_LOW_M_MT32X32_BK128_REGISTER_CONFIG = _fixed_register_plan(32, 32, 128, 8, 1, 4, 2)
+_LOW_M_MT32X32_BK256_REGISTER_CONFIG = _fixed_register_plan(32, 32, 256, 16, 1, 4, 2)
+_LOW_M_MT32X32_BK256_WPE2_REGISTER_CONFIG = _fixed_register_plan(32, 32, 256, 16, 1, 4, 2, waves_per_eu=2)
+_LOW_M_MT16X16_BK256_REGISTER_CONFIG = _fixed_register_plan(16, 16, 256, 4, 1, 4, 2, waves_per_eu=2)
+_LOW_M_MT32X16_BK256_REGISTER_CONFIG = _fixed_register_plan(32, 16, 256, 4, 1, 4, 2)
+_LOW_M_MT32X64_BK64_REGISTER_CONFIG = _fixed_register_plan(32, 64, 64, 8, 1, 4, 2)
+_MT64X64_BK64_REGISTER_CONFIG = _fixed_register_plan(64, 64, 64, 4, 1, 4, 2)
+_LOW_M_MT64X64_BK128_REGISTER_CONFIG = _fixed_register_plan(64, 64, 128, 16, 1, 8, 2)
+_MT128X128_BK64_MI32_4W_REGISTER_CONFIG = _fixed_register_plan(128, 128, 64, 16, 1, 4, 2, matrix_instr_nonkdim=32)
 
 _TUNED_SHAPE_CONFIGS = {
     (2048, 256, 1024): _MT64X64_BK256_REGISTER_CONFIG,
@@ -13248,6 +14881,35 @@ _TUNED_SHAPE_CONFIGS = {
 }
 
 _FP16_TUNED_SHAPE_CONFIGS = {
+    # These low-M production shapes need more independent output tiles than
+    # the generic MT128 selector exposes.  The compact MI16 plans raise CTA
+    # occupancy while retaining a deep K tile for reduction-heavy problems.
+    (128, 448, 384):
+    _fixed_register_plan(64, 32, 128, 1, 1, 4, 3, waves_per_eu=2),
+    (128, 896, 576):
+    _LOW_M_MT32X32_BK256_REGISTER_CONFIG,
+    (128, 1152, 512):
+    _LOW_M_MT32X32_BK256_WPE2_REGISTER_CONFIG,
+    (128, 10304, 1152):
+    _fixed_register_plan(64, 64, 128, 16, 1, 4, 2, matrix_instr_nonkdim=32),
+    (128, 34272, 384):
+    _MT128X128_BK64_MI32_4W_REGISTER_CONFIG,
+    (128, 1344, 4032):
+    _fixed_register_plan(16, 16, 256, 8, 8, 4, 2),
+    (128, 70770, 192):
+    _fixed_register_plan(128, 64, 64, 4, 8, 4, 2),
+    # Balance the rectangular output tile so each workgroup reuses twice as
+    # much B while keeping the same 168-way grid as the old MT64x32 plan.
+    # Two waves are sufficient for the compact MT32x64 accumulator.
+    (128, 2688, 4416):
+    _fixed_register_plan(32, 64, 256, 16, 8, 2, 3, waves_per_eu=1),
+    # MI32 keeps the single K64 tile compact while MT128x128 limits padding
+    # for N80.  Four waves expose more CTAs than the old eight-wave K128 and
+    # N256 fallbacks on these shallow-reduction production shapes.
+    (196608, 80, 80):
+    _MT128X128_BK64_MI32_4W_REGISTER_CONFIG,
+    (245760, 80, 80):
+    _MT128X128_BK64_MI32_4W_REGISTER_CONFIG,
     (256, 257, 4096):
     _SMALL_SQUARE_REGISTER_CONFIG,
     (257, 257, 4096):
@@ -13353,8 +15015,20 @@ def _register_kernel_impl(  # noqa: TR001
         k = k_idx * BLOCK_K
         a_ptrs = (a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
         b_ptrs = (b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn)
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
+        # Tall transposed grids stream distinct A rows while reusing a compact
+        # B operand. Bypass L1 for A so B survives across neighboring M tiles.
+        if ((M == 25600 and N == 256 and K == 256) or (M == 56768 and N == 128 and K == 64)
+                or (M == 65462 and N == 128 and K == 96)):
+            a = tl.load(a_ptrs, cache_modifier=".cg")
+        else:
+            a = tl.load(a_ptrs)
+        # These single-M-tile production shapes reuse A across a wide N grid,
+        # while every B tile is consumed once.  Keep streaming B out of L1 so
+        # the shared A rows remain resident across neighboring workgroups.
+        if ((M == 128 and N == 2688 and K == 4416) or (M == 128 and N == 3456 and K == 2560)):
+            b = tl.load(b_ptrs, cache_modifier=".cg")
+        else:
+            b = tl.load(b_ptrs)
         acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
     if K % BLOCK_K != 0:
         k = full_k_tiles * BLOCK_K
@@ -13362,7 +15036,15 @@ def _register_kernel_impl(  # noqa: TR001
         a_ptrs = (a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)
         b_ptrs = (b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn)
         a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
-        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        if M == 128 and N == 2688 and K == 4416:
+            b = tl.load(
+                b_ptrs,
+                mask=k_mask[:, None],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+        else:
+            b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
         acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
@@ -13402,30 +15084,22 @@ def _register_kernel_impl(  # noqa: TR001
         tl.store(c_ptr + output_offsets, acc, mask=mask)
 
 
-def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False):
-    """Launch one validated register-resident plan."""
-    m, k = a.shape
-    b_k, n = b.shape
-    if not _validated and k != b_k:
-        raise ValueError(f"Incompatible matrix dimensions: {tuple(a.shape)} and "
-                         f"{tuple(b.shape)}")
-    if bias is not None:
-        if bias.shape != (m, n):
-            raise ValueError(f"Bias must expand to ({m}, {n}), got {tuple(bias.shape)}")
-        if bias.device != a.device or bias.dtype != a.dtype:
-            raise ValueError("Bias and matrix operands must have matching device and dtype")
-    if out is None:
-        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    disable_agpr = (k == 256 and n > 256) or (k > 512 and (k % _BLOCK_K != 0 or m * n <= 2 * 1024 * 1024))
+def _register_launch_options(m, n, k, config):
+    disable_agpr = ((k == 256 and n > 256) or (k > 512 and (k % _BLOCK_K != 0 or m * n <= 2 * 1024 * 1024)))
     launch_options = ({"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {})
     if config["BLOCK_K"] == 128 and config["num_stages"] == 3:
         launch_options["reverse_local_assignment"] = True
         if config["BLOCK_M"] == 64 and config["BLOCK_N"] == 64:
             launch_options["sink_insts_to_avoid_spills"] = True
             launch_options["disable_unclustered_high_rp_reschedule"] = True
+    return launch_options
+
+
+def _register_kernel_args(a, b, bias, out):
+    m, k = a.shape
+    n = b.shape[1]
     bias_ptr = bias if bias is not None else out
-    grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
-    _register_kernel_impl[grid](
+    return (
         a,
         b,
         bias_ptr,
@@ -13443,6 +15117,148 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
         bias.stride(1) if bias is not None else 0,
         out.stride(0),
         out.stride(1),
+    )
+
+
+def _fragmented_register_kernel_args(a, b, out):
+    """Return arguments for computing ``(A @ B).T = B.T @ A.T``."""
+    m, k = a.shape
+    n = b.shape[1]
+    return (
+        b,
+        a,
+        out,
+        n,
+        m,
+        k,
+        b.stride(1),
+        b.stride(0),
+        a.stride(1),
+        a.stride(0),
+        out.stride(1),
+        out.stride(0),
+    )
+
+
+@lru_cache(maxsize=8)
+def _fragmented_register_launcher(
+    _device_index,
+    _dtype,
+    m,
+    n,
+    k,
+    _a_strides,
+    _b_strides,
+    _out_strides,
+    plan_items,
+):
+    """Return one signature-exact launcher for a fragmented transposed tile."""
+    plan = dict(plan_items)
+    block_m = plan.pop("M_HEAD") + plan["M_TAIL"]
+    grid = (
+        triton.cdiv(n, block_m) * triton.cdiv(m, plan["BLOCK_N"]),
+        1,
+        1,
+    )
+    compile_lock = threading.Lock()
+    launcher = None
+
+    def run(a, b, out):
+        nonlocal launcher
+        kernel_args = _fragmented_register_kernel_args(a, b, out)
+        if launcher is None:
+            with compile_lock:
+                if launcher is None:
+                    compiled = _wg_kernel_register_split_m2.warmup(
+                        *kernel_args,
+                        grid=grid,
+                        M_HEAD=block_m - plan["M_TAIL"],
+                        **plan,
+                    )
+                    launcher = compiled[grid]
+        launcher(*kernel_args)
+        return out
+
+    return run
+
+
+@lru_cache(maxsize=32)
+def _dense_tn_register_launcher(
+    _device_index,
+    _dtype,
+    m,
+    n,
+    k,
+    a_strides,
+    b_strides,
+    out_strides,
+    config_items,
+):
+    """Return one bounded, signature-exact compiled register launcher."""
+    del a_strides, b_strides, out_strides
+    config = dict(config_items)
+    grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
+    launch_options = _register_launch_options(m, n, k, config)
+    compile_lock = threading.Lock()
+    launcher = None
+
+    def run(a, b, out):
+        nonlocal launcher
+        kernel_args = _register_kernel_args(a, b, None, out)
+        if launcher is None:
+            with compile_lock:
+                if launcher is None:
+                    compiled = _register_kernel_impl.warmup(
+                        *kernel_args,
+                        grid=grid,
+                        ADD_BIAS=False,
+                        WRITE_STATS=False,
+                        IS_RMS_NORM=False,
+                        **config,
+                        **launch_options,
+                    )
+                    launcher = compiled[(grid[0], 1, 1)]
+        launcher(*kernel_args)
+        return out
+
+    return run
+
+
+def _can_use_dense_tn_register_launcher(a, b, bias, out):
+    return (bias is None and a.stride(1) == 1 and b.stride(0) == 1 and a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0
+            and out.data_ptr() % 16 == 0)
+
+
+def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False):
+    """Launch one validated register-resident plan."""
+    m, k = a.shape
+    b_k, n = b.shape
+    if not _validated and k != b_k:
+        raise ValueError(f"Incompatible matrix dimensions: {tuple(a.shape)} and "
+                         f"{tuple(b.shape)}")
+    if bias is not None:
+        if bias.shape != (m, n):
+            raise ValueError(f"Bias must expand to ({m}, {n}), got {tuple(bias.shape)}")
+        if bias.device != a.device or bias.dtype != a.dtype:
+            raise ValueError("Bias and matrix operands must have matching device and dtype")
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    if _can_use_dense_tn_register_launcher(a, b, bias, out):
+        return _dense_tn_register_launcher(
+            a.device.index,
+            a.dtype,
+            m,
+            n,
+            k,
+            a.stride(),
+            b.stride(),
+            out.stride(),
+            tuple(sorted(config.items())),
+        )(a, b, out)
+    launch_options = _register_launch_options(m, n, k, config)
+    grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
+    _register_kernel_impl[grid](
+        *_register_kernel_args(a, b, bias, out),
         ADD_BIAS=bias is not None,
         WRITE_STATS=False,
         IS_RMS_NORM=False,
@@ -14967,14 +16783,13 @@ def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr, ready_value, K,
                                                          tile_b_right_off, k_step * stride_ak, k_step * stride_bk,
                                                          (segment_end - start_unit) * 2, stride_ak, stride_bk, BLOCK_M,
                                                          BLOCK_N, BLOCK_K)
-            acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
-            acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
-            acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
-            acc_br = tlx.require_layout(acc_br, acc_layout, pin=False)
-
             if start_unit != tile_start:
                 # A contributor publishes one partial. Its range can then start
                 # the next tile, so continue instead of returning immediately.
+                acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
+                acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
+                acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
+                acc_br = tlx.require_layout(acc_br, acc_layout, pin=False)
                 base = logical_pid * tile_elems
                 partial_tl_ptr = tlx.require_layout(partials_ptr + base + partial_tl_off, acc_layout, pin=False)
                 partial_bl_ptr = tlx.require_layout(partials_ptr + base + partial_bl_off, acc_layout, pin=False)
@@ -15044,6 +16859,168 @@ def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride
         acc += bias.to(tl.float32)
     output_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptr + output_offsets, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+_PRODUCTION_COMPILED_WAVE_GRID_SHAPES = frozenset({
+    # The first entry is the transposed launch for public 128x70770x192.
+    (70_770, 128, 192),
+    (2_688, 128, 4_416),
+    (10_304, 128, 1_728),
+    (10_752, 128, 2_560),
+    (34_272, 128, 384),
+    (128, 9_216, 7_392),
+    (128, 224, 20_926),
+})
+
+
+def _regular_wave_grid_kernel_args(a, b, out):
+    m, k = a.shape
+    n = b.shape[1]
+    return (
+        a,
+        b,
+        out,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        out.stride(0),
+        out.stride(1),
+    )
+
+
+def _regular_wave_grid_options(plan, split_k):
+    return {
+        "MI_WAVE_TILE_M": plan["mi_wave_tile_m"],
+        "MI_WAVE_TILE_N": plan["mi_wave_tile_n"],
+        "WARPS_M": plan["warps_m"],
+        "WARPS_N": plan["warps_n"],
+        "BLOCK_K": plan["block_k"],
+        "LOCAL_STAGES": plan.get("local_stages", 1),
+        "TILES_PER_PROGRAM": plan["tiles_per_program"],
+        "LINEAR_TILES": plan.get("linear_tiles", False),
+        "PGR2_OPERANDS": plan.get("pgr2_operands", False),
+        "DIRECT_TO_LDS": plan.get("direct_to_lds", False),
+        "REFILL_READ_WINDOW": plan.get("refill_read_window", 0),
+        "PGR2_LATE_READ_COUNT": plan.get("pgr2_late_read_count", 0),
+        "READ_COVER_SIXTEENTHS": plan.get("read_cover_sixteenths", 8),
+        "DIRECT_CHUNK": plan.get("direct_chunk", 128),
+        "PACK_DIRECT_CHUNKS": plan.get("pack_direct_chunks", False),
+        "ROW_MAJOR_B_LDS": plan.get("row_major_b_lds", False),
+        "ROW_WISE_EPILOGUE": plan.get("row_wise_epilogue", False),
+        "WIDE_EPILOGUE": plan.get("wide_epilogue", False),
+        "NUM_XCDS": plan.get("num_xcds", 1),
+        "WORKGROUP_MAPPING": plan.get("workgroup_mapping", 1),
+        "LOOP_UNROLL_FACTOR": plan.get("loop_unroll_factor", 1),
+        "SPLIT_K": split_k,
+        "PAIR_BALANCED_SPLIT_K": plan.get("pair_balanced_split_k", False),
+        "num_warps": plan["num_warps"],
+        "num_stages": 1,
+        "matrix_instr_nonkdim": 16,
+        "waves_per_eu": plan.get("waves_per_eu", 0),
+        "regclass_priority_trumps_globalness": True,
+        "reverse_local_assignment": plan.get("reverse_local_assignment", True),
+        "sink_insts_to_avoid_spills": plan.get("sink_insts_to_avoid_spills", False),
+        "disable_unclustered_high_rp_reschedule": plan.get("disable_unclustered_high_rp_reschedule", False),
+        "enable_sched_group_barrier_scheduler": plan.get("enable_sched_group_barrier_scheduler", False),
+        "sched_group_barrier_mfma_per_dwordx4": plan.get("sched_group_barrier_mfma_per_dwordx4", 4),
+        "llvm_fn_attrs": plan.get("llvm_fn_attrs", ""),
+    }
+
+
+def _regular_wave_grid_launch_grid(m, n, plan, split_k):
+    block_m = 16 * plan["mi_wave_tile_m"] * plan["warps_m"]
+    block_n = 16 * plan["mi_wave_tile_n"] * plan["warps_n"]
+    tiles = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+    return (tiles * split_k, 1, 1)
+
+
+def _compile_regular_wave_grid(kernel_args, grid, plan, split_k):
+    compiled = _wg_kernel_regular_mi16_wave_grid.warmup(
+        *kernel_args,
+        grid=grid,
+        **_regular_wave_grid_options(plan, split_k),
+    )
+    return compiled[grid]
+
+
+def _wave_grid_reduction_args(workspace, out, m, n, plan):
+    block_m, block_n = plan.get("reduce_tile", (16, 64))
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n), 1)
+    args = (workspace, out, out, m, n, 0, 0, out.stride(0), out.stride(1))
+    return grid, args, block_m, block_n
+
+
+def _compile_wave_grid_reduction(args, grid, out, plan, split_k, block_m, block_n):
+    compiled = _reduce_k_kernel.warmup(
+        *args,
+        grid=grid,
+        SPLIT_K=split_k,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        OUTPUT_DTYPE=_TORCH_TO_TL[out.dtype],
+        ADD_BIAS=False,
+        num_warps=plan.get("reduce_warps", 4),
+    )
+    return compiled[grid]
+
+
+@lru_cache(maxsize=7)
+def _production_wave_grid_launcher(
+    _device_index,
+    _dtype,
+    m,
+    n,
+    _k,
+    _a_strides,
+    _b_strides,
+    _out_strides,
+    plan_items,
+):
+    """Return a compiled launcher only for measured production plans."""
+    plan = dict(plan_items)
+    split_k = plan.get("split_k", 1)
+    grid = _regular_wave_grid_launch_grid(m, n, plan, split_k)
+    compile_lock = threading.Lock()
+    launchers = None
+
+    def run(a, b, out):
+        nonlocal launchers
+        workspace = None
+        target = out
+        if split_k > 1:
+            workspace = torch.empty(
+                (split_k * m, n),
+                device=a.device,
+                dtype=plan.get("workspace_dtype", torch.float32),
+            )
+            target = workspace
+        kernel_args = _regular_wave_grid_kernel_args(a, b, target)
+        reduction = (_wave_grid_reduction_args(workspace, out, m, n, plan) if workspace is not None else None)
+        if launchers is None:
+            with compile_lock:
+                if launchers is None:
+                    main = _compile_regular_wave_grid(kernel_args, grid, plan, split_k)
+                    reduce = (_compile_wave_grid_reduction(
+                        reduction[1],
+                        reduction[0],
+                        out,
+                        plan,
+                        split_k,
+                        reduction[2],
+                        reduction[3],
+                    ) if reduction is not None else None)
+                    launchers = main, reduce
+        main, reduce = launchers
+        main(*kernel_args)
+        if reduction is not None:
+            reduce(*reduction[1])
+        return out
+
+    return run
 
 
 NUM_CU = 256  # gfx950 (CDNA4) compute units
@@ -19252,6 +21229,95 @@ _BF16_INTER_WAVE_PROMOTIONS = {
 
 _BF16_STREAMK_PROMOTIONS = {}
 
+_FP16_INTER_WAVE_PROMOTIONS = {
+    # The MT256x256 inter-wave path keeps the full output grid resident and
+    # avoids the direct-to-LDS wave-grid kernel's occupancy loss.  A short
+    # group and one wave per EU are stable at the shape's 240 output CTAs.
+    (3072, 5120, 2048): {
+        "TILE": (256, 256),
+        "SPLIT_K": 1,
+        "GROUP_M_OVERRIDE": 2,
+        "NUM_XCDS_OVERRIDE": 1,
+        "WORKGROUP_MAPPING": 0,
+        "WAVES_PER_EU": 1,
+    },
+}
+
+_FP16_REGISTER_PROMOTIONS = {
+    # The bounded D122929229 search found the register plan materially faster
+    # than the otherwise preferred direct-to-LDS wave-grid specialization.
+    (25600, 256, 256),
+}
+
+_N80_K80_FRAGMENTED_REGISTER_PLAN = MappingProxyType({
+    "M_HEAD": 64,
+    "M_TAIL": 16,
+    "BLOCK_N": 256,
+    "BLOCK_K": 64,
+    "matrix_instr_nonkdim": 16,
+    "num_warps": 4,
+    "num_stages": 2,
+})
+
+_FP16_FRAGMENTED_REGISTER_PLANS = {
+    # Transposition makes N=80 the output-row dimension.  Splitting that tile
+    # into exact power-of-two 64+16 fragments avoids the 37.5% N padding of
+    # the generic MT128x128 register plan for both production M extents.
+    (196608, 80, 80):
+    _N80_K80_FRAGMENTED_REGISTER_PLAN,
+    (245760, 80, 80):
+    _N80_K80_FRAGMENTED_REGISTER_PLAN,
+}
+
+_FP16_TRANSPOSED_REGISTER_PLANS = {
+    # Although the output tile is square, swapping operands changes which
+    # physical rows are grouped.  Four transposed-M tiles retain the reused
+    # narrow operand without the original XCD remap.
+    (128, 1536, 2688):
+    _fixed_register_plan(32, 32, 256, 4, 1, 4, 3, waves_per_eu=2),
+    # Compute C.T = B.T @ A.T so the narrow vendor-style tile streams the
+    # physically contiguous operands in its preferred orientation.  Grouping
+    # the four transposed-M tiles keeps the shared B.T rows adjacent.
+    (128, 896, 2016):
+    _fixed_register_plan(32, 16, 256, 4, 1, 2, 3, waves_per_eu=2),
+    # The vendor-style MT32x64 geometry becomes an exact MT64x32 output tile
+    # after transposition.  Eight waves sustain the deep K256 pipeline while
+    # a four-row group preserves reuse of the narrow A.T operand.
+    (128, 2304, 2560):
+    _fixed_register_plan(32, 64, 256, 4, 1, 8, 3, waves_per_eu=2),
+    # Keep the vendor's MT64x32 orientation internally; exposing its
+    # transpose gives the public problem an MT32x64 output tile without
+    # duplicating the register kernel.
+    (128, 3456, 2560):
+    _fixed_register_plan(64, 32, 256, 4, 1, 8, 3, waves_per_eu=2),
+    # With one K64 tile, a four-wave MT64x128 workgroup raises parallelism.
+    # Transposition streams contiguous B rows while reusing the narrow A.T
+    # operand across the broad output.
+    (128, 56768, 64):
+    _fixed_register_plan(64, 128, 64, 1, 1, 4, 2, matrix_instr_nonkdim=32),
+    # K32 exposes three exact reduction tiles.  The square MI32 output tile
+    # keeps eight waves busy while transposition lets each workgroup stream
+    # contiguous rows from the wide physical output.
+    (128, 65462, 96):
+    _fixed_register_plan(128, 128, 32, 1, 8, 8, 3, matrix_instr_nonkdim=32),
+    (25600, 256, 256):
+    _fixed_register_plan(128, 128, 64, 16, 4, 4, 2, matrix_instr_nonkdim=32),
+    # The transposed operand order makes the K128 three-stage pipeline faster
+    # than the old K256 plan while retaining the same square output tile.
+    (128, 8064, 1728):
+    _fixed_register_plan(
+        64,
+        64,
+        128,
+        2,
+        1,
+        4,
+        3,
+        matrix_instr_nonkdim=32,
+        waves_per_eu=2,
+    ),
+}
+
 
 @lru_cache(maxsize=None)
 def _dispatch_plan(m, n, k, dtype, element_size):
@@ -19266,6 +21332,15 @@ def _dispatch_plan(m, n, k, dtype, element_size):
     if dtype == torch.bfloat16 and wave_grid_plan is not None:
         return "wave_grid", wave_grid_plan
     if dtype == torch.float16:
+        promotion = _FP16_INTER_WAVE_PROMOTIONS.get((m, n, k))
+        if promotion is not None:
+            return "inter_wave", promotion
+        transposed_register_plan = _FP16_TRANSPOSED_REGISTER_PLANS.get((m, n, k))
+        if transposed_register_plan is not None:
+            return "transposed_register", transposed_register_plan
+        fragmented_plan = _FP16_FRAGMENTED_REGISTER_PLANS.get((m, n, k))
+        if fragmented_plan is not None:
+            return "fragmented_register", fragmented_plan
         local_split_u_plan = _KNOWN_PLANS.get((m, n, k))
         if local_split_u_plan is not None:
             return "local_split_u", local_split_u_plan
@@ -19277,6 +21352,8 @@ def _dispatch_plan(m, n, k, dtype, element_size):
         transposed_plan = transposed_wave_grid_plan(m, n, k)
         if transposed_plan is not None:
             return "transposed_wave_grid", transposed_plan
+        if (m, n, k) in _FP16_REGISTER_PROMOTIONS:
+            return "register", _FP16_TUNED_SHAPE_CONFIGS[(m, n, k)]
         if (prefer_tuned_wave_grid(m, n, k, wave_grid_plan) and not prefer_lds_over_wave_grid(m, n, k, wave_grid_plan)):
             return "wave_grid", wave_grid_plan
     strong_lds_plan = _strong_lds_plan(m, n, k)
@@ -19433,6 +21510,40 @@ def supports(a, b):
     return _dispatch_for(a, b) is not None
 
 
+def _launch_fragmented_register(a, b, out, plan):
+    m, k = a.shape
+    n = b.shape[1]
+    return _fragmented_register_launcher(
+        a.device.index,
+        a.dtype,
+        m,
+        n,
+        k,
+        a.stride(),
+        b.stride(),
+        out.stride(),
+        tuple(sorted(plan.items())),
+    )(a, b, out)
+
+
+def _launch_production_wave_grid(a, b, out, plan):
+    shape = (a.shape[0], b.shape[1], a.shape[1])
+    can_use_compiled = (shape in _PRODUCTION_COMPILED_WAVE_GRID_SHAPES and plan.get("kind") == "regular_mi16_wave_grid"
+                        and not plan.get("streamk_tail_split", 0) and not plan.get("persistent_program_count", 0)
+                        and a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0)
+    if not can_use_compiled:
+        return _launch_wave_grid(a, b, out=out, _candidate_plan=plan)
+    return _production_wave_grid_launcher(
+        a.device.index,
+        a.dtype,
+        *shape,
+        a.stride(),
+        b.stride(),
+        out.stride(),
+        tuple(sorted(plan.items())),
+    )(a, b, out)
+
+
 def _launch_dispatch(a, b, out, dispatch):
     path, plan = dispatch
     if path == "row_major_direct":
@@ -19442,15 +21553,26 @@ def _launch_dispatch(a, b, out, dispatch):
     if path in ("inter_wave", "streamk", "ragged_n", "m192n256"):
         return _launch_optimized_inter_wave(a, b, out, path, plan)
     if path == "transposed_wave_grid":
-        _launch_wave_grid(
+        _launch_production_wave_grid(
             b.T,
             a.T,
-            out=out.T,
-            _candidate_plan=plan,
+            out.T,
+            plan,
         )
         return out
+    if path == "transposed_register":
+        _launch_register_plan(
+            b.T,
+            a.T,
+            config=plan,
+            out=out.T,
+            _validated=True,
+        )
+        return out
+    if path == "fragmented_register":
+        return _launch_fragmented_register(a, b, out, plan)
     if path == "wave_grid":
-        return _launch_wave_grid(a, b, out=out, _candidate_plan=plan)
+        return _launch_production_wave_grid(a, b, out, plan)
     if path == "persistent":
         return _launch_persistent(a, b, out=out)
     if path == "register":
@@ -19527,7 +21649,14 @@ def mm(a, b, *, out=None, space="heuristic"):
     # Preserve the measured family selector for dense TN inputs.  The broader
     # master heuristic remains the fallback for layouts such as row-major B
     # that are outside the promoted selector's validated domain.
-    dispatch = _dispatch_for(a, b)
+    # Catalog validation already established the device, dtype, rank, and
+    # matching reduction extent.  Dense TN is the production hot path, so skip
+    # the generic architecture/layout probe and consult the cached geometry
+    # selector directly.
+    if a.stride(1) == 1 and b.stride(0) == 1:
+        dispatch = _dispatch_plan(m, n, k, a.dtype, a.element_size())
+    else:
+        dispatch = _dispatch_for(a, b)
     if dispatch is None:
         dispatch = heuristic_config(
             m,
@@ -19551,15 +21680,26 @@ def mm(a, b, *, out=None, space="heuristic"):
     if path in ("inter_wave", "streamk", "ragged_n", "m192n256"):
         return _launch_optimized_inter_wave(a, b, out, path, plan)
     if path == "transposed_wave_grid":
-        _launch_wave_grid(
+        _launch_production_wave_grid(
             b.T,
             a.T,
-            out=out.T,
-            _candidate_plan=plan,
+            out.T,
+            plan,
         )
         return out
+    if path == "transposed_register":
+        _launch_register_plan(
+            b.T,
+            a.T,
+            config=plan,
+            out=out.T,
+            _validated=True,
+        )
+        return out
+    if path == "fragmented_register":
+        return _launch_fragmented_register(a, b, out, plan)
     if path == "wave_grid":
-        return _launch_wave_grid(a, b, out=out, _candidate_plan=plan)
+        return _launch_production_wave_grid(a, b, out, plan)
     if path == "persistent":
         return _launch_persistent(a, b, out=out)
     if path == "register":
