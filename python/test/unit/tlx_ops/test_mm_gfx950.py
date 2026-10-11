@@ -227,6 +227,206 @@ def test_mm_tuned_rectangular_register_plans():
         ) == wanted
 
 
+def test_mm_new_production_register_plans():
+    expected = {
+        (128, 2688, 4416): (32, 64, 256, 16, 8, 2, 3, 1),
+        (128, 448, 384): (64, 32, 128, 1, 1, 4, 3, 2),
+        (128, 10304, 1152): (64, 64, 128, 16, 1, 4, 2, 0),
+        (128, 34272, 384): (128, 128, 64, 16, 1, 4, 2, 0),
+        (128, 896, 576): (32, 32, 256, 16, 1, 4, 2, 0),
+        (128, 70770, 192): (128, 64, 64, 4, 8, 4, 2, 0),
+        (128, 1152, 512): (32, 32, 256, 16, 1, 4, 2, 2),
+        (128, 1344, 4032): (16, 16, 256, 8, 8, 4, 2, 0),
+    }
+    for shape, wanted in expected.items():
+        plan = _gfx950._register_plan_for_shape(*shape, torch.float16)
+        assert (
+            plan["BLOCK_M"],
+            plan["BLOCK_N"],
+            plan["BLOCK_K"],
+            plan["GROUP_M"],
+            plan["NUM_XCDS"],
+            plan["num_warps"],
+            plan["num_stages"],
+            plan["waves_per_eu"],
+        ) == wanted
+
+
+@pytest.mark.parametrize(
+    "shape,wanted",
+    [
+        ((128, 1536, 2688), (32, 32, 256, 4, 1, 4, 3, 2, 16)),
+        ((128, 896, 2016), (32, 16, 256, 4, 1, 2, 3, 2, 16)),
+        ((128, 2304, 2560), (32, 64, 256, 4, 1, 8, 3, 2, 16)),
+        ((128, 3456, 2560), (64, 32, 256, 4, 1, 8, 3, 2, 16)),
+        ((128, 56768, 64), (64, 128, 64, 1, 1, 4, 2, 0, 32)),
+        ((128, 65462, 96), (128, 128, 32, 1, 8, 8, 3, 0, 32)),
+        ((25600, 256, 256), (128, 128, 64, 16, 4, 4, 2, 0, 32)),
+        ((128, 8064, 1728), (64, 64, 128, 2, 1, 4, 3, 2, 32)),
+    ],
+)
+def test_mm_production_uses_transposed_register_plan(shape, wanted):
+    path, plan = _gfx950._dispatch_plan(*shape, torch.float16, 2)
+    assert path == "transposed_register"
+    assert (
+        plan["BLOCK_M"],
+        plan["BLOCK_N"],
+        plan["BLOCK_K"],
+        plan["GROUP_M"],
+        plan["NUM_XCDS"],
+        plan["num_warps"],
+        plan["num_stages"],
+        plan["waves_per_eu"],
+        plan["matrix_instr_nonkdim"],
+    ) == wanted
+
+
+def test_mm_production_deep_k_uses_split_wave_grid():
+    path, plan = _gfx950._dispatch_plan(128, 224, 20926, torch.float16, 2)
+    assert path == "wave_grid"
+    assert plan["mi_wave_tile_m"] == 1
+    assert plan["mi_wave_tile_n"] == 2
+    assert plan["warps_m"] == 2
+    assert plan["warps_n"] == 2
+    assert plan["block_k"] == 128
+    assert plan["split_k"] == 16
+    assert plan["pair_balanced_split_k"]
+
+
+def test_mm_production_large_split_k_uses_fp16_workspace():
+    path, plan = _gfx950._dispatch_plan(128, 10304, 20926, torch.float16, 2)
+    assert path == "wave_grid"
+    assert plan["split_k"] == 3
+    assert plan["pair_balanced_split_k"]
+    assert plan["workspace_dtype"] == torch.float16
+
+
+def test_mm_production_ranking_split_k_uses_fp16_workspace():
+    path, plan = _gfx950._dispatch_plan(128, 9216, 7392, torch.float16, 2)
+    assert path == "wave_grid"
+    assert plan["split_k"] == 3
+    assert not plan["pair_balanced_split_k"]
+    assert plan["workspace_dtype"] == torch.float16
+    assert plan["waves_per_eu"] == 1
+
+
+@pytest.mark.parametrize("m", [196608, 245760])
+def test_mm_production_fragmented_register_plan(m):
+    path, plan = _gfx950._dispatch_plan(m, 80, 80, torch.float16, 2)
+    assert path == "fragmented_register"
+    assert dict(plan) == {
+        "M_HEAD": 64,
+        "M_TAIL": 16,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "matrix_instr_nonkdim": 16,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+
+
+def test_mm_production_short_k_uses_exact_wave_grid():
+    path, plan = _gfx950._dispatch_plan(128, 34272, 384, torch.float16, 2)
+    assert path == "transposed_wave_grid"
+    assert plan["pgr2_operands"]
+    assert (
+        plan["mi_wave_tile_m"],
+        plan["mi_wave_tile_n"],
+        plan["warps_m"],
+        plan["warps_n"],
+    ) == (5, 4, 2, 2)
+    assert plan["num_xcds"] == 8
+    assert plan["workgroup_mapping"] == 6
+
+
+def test_mm_production_deep_reduction_uses_exact_wave_grid():
+    path, plan = _gfx950._dispatch_plan(128, 10304, 1728, torch.float16, 2)
+    assert path == "transposed_wave_grid"
+    assert plan["pgr2_operands"]
+    assert plan["num_xcds"] == 8
+    assert plan["workgroup_mapping"] == 6
+    assert (
+        plan["mi_wave_tile_m"],
+        plan["mi_wave_tile_n"],
+        plan["warps_m"],
+        plan["warps_n"],
+    ) == (3, 2, 2, 2)
+
+
+def test_mm_production_ranking_shape_uses_full_read_wave_grid():
+    path, plan = _gfx950._dispatch_plan(128, 10752, 2560, torch.float16, 2)
+    assert path == "transposed_wave_grid"
+    assert plan["pgr2_operands"]
+    assert plan["read_cover_sixteenths"] == 16
+    assert plan["reverse_local_assignment"]
+    assert plan["num_xcds"] == 8
+    assert plan["workgroup_mapping"] == 6
+    assert (
+        plan["mi_wave_tile_m"],
+        plan["mi_wave_tile_n"],
+        plan["warps_m"],
+        plan["warps_n"],
+    ) == (3, 2, 2, 2)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (128, 2688, 4416),
+        (128, 10304, 1728),
+        (128, 34272, 384),
+        (128, 10752, 2560),
+    ],
+)
+def test_mm_production_reuses_compiled_wave_grid_launcher(monkeypatch, m, n, k):
+    from triton.tlx.ops import mm as tlx_mm
+
+    _gfx950._production_wave_grid_launcher.cache_clear()
+    compile_kernel = _gfx950._compile_regular_wave_grid
+    compiled = []
+
+    def record_compile(*args, **kwargs):
+        launcher = compile_kernel(*args, **kwargs)
+        compiled.append(launcher)
+        return launcher
+
+    monkeypatch.setattr(_gfx950, "_compile_regular_wave_grid", record_compile)
+    operands = [(
+        torch.randn((m, k), device="cuda", dtype=torch.float16),
+        torch.randn((n, k), device="cuda", dtype=torch.float16).T,
+        torch.empty((m, n), device="cuda", dtype=torch.float16),
+    ) for _ in range(2)]
+    for a, b, out in operands:
+        assert tlx_mm(a, b, out=out, space="heuristic") is out
+        expected = torch.matmul(a, b)
+        torch.testing.assert_close(
+            out,
+            expected,
+            atol=1e-3 * expected.abs().max().item(),
+            rtol=1e-3,
+        )
+    assert len(compiled) == 1
+
+
+def test_mm_reuses_out_tensor():
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+    out = torch.empty((128, 128), device="cuda", dtype=torch.float16)
+
+    actual = tlx_mm(a, b, out=out, space="heuristic")
+    expected = torch.matmul(a, b)
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=1e-3 * expected.abs().max().item(),
+        rtol=1e-3,
+    )
+
+
 def test_mm_row_major_uses_tuned_register_plan():
     path, plan = _gfx950.heuristic_config(
         61440,

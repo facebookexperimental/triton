@@ -62,9 +62,11 @@ def prepare(case: Case, space: str) -> Prepared:
     M, N, K, a_strides, b_strides = case.shape
     dtype = getattr(torch, case.dtype)
     a, b = operand(M, K, a_strides, dtype), operand(K, N, b_strides, dtype)
+    tlx_out = torch.empty((M, N), device=a.device, dtype=dtype)
+    ref_out = torch.empty_like(tlx_out)
 
-    tlx_fn = lambda: tlx_mm(a, b, space=space)  # noqa: E731
-    ref_fn = lambda: torch.matmul(a, b)  # noqa: E731
+    tlx_fn = lambda: tlx_mm(a, b, out=tlx_out, space=space)  # noqa: E731
+    ref_fn = lambda: torch.matmul(a, b, out=ref_out)  # noqa: E731
     return Prepared(
         tlx_fn=tlx_fn,
         ref_fn=ref_fn,
