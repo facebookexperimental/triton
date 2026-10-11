@@ -96,6 +96,28 @@ inline bool isNamedBarrierOp(Operation *op) {
   return isa<NamedBarrierArriveOp, NamedBarrierWaitOp>(op);
 }
 
+// Token lowering puts a proxy fence directly before the arrive that releases a
+// TMA-filled buffer read through the generic proxy (see WSLowerToken). The
+// fence belongs to the arrive: it must stay after the reads the arrive guards
+// and before the arrive, so every arrive move carries it along.
+inline FenceAsyncSharedOp getAttachedFence(ArriveBarrierOp arrive) {
+  return dyn_cast_or_null<FenceAsyncSharedOp>(arrive->getPrevNode());
+}
+
+inline void moveArriveBefore(ArriveBarrierOp arrive, Operation *insertPt) {
+  FenceAsyncSharedOp fence = getAttachedFence(arrive);
+  arrive->moveBefore(insertPt);
+  if (fence)
+    fence->moveBefore(arrive);
+}
+
+inline void moveArriveAfter(ArriveBarrierOp arrive, Operation *anchor) {
+  FenceAsyncSharedOp fence = getAttachedFence(arrive);
+  arrive->moveAfter(anchor);
+  if (fence)
+    fence->moveBefore(arrive);
+}
+
 inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,
                                 Operation *op) {
   if (op->getNumRegions() != 0)
@@ -199,7 +221,7 @@ inline bool sinkWSArrives(Block &block) {
       insertPt = cur->getNextNode();
     }
     if (insertPt != arrive->getNextNode()) {
-      arrive->moveBefore(insertPt);
+      moveArriveBefore(arrive, insertPt);
       changed = true;
     }
   }
@@ -261,7 +283,10 @@ buildBarrierToMemoryOpMap(Block &block) {
     if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
       if (!hasWSBarrierConstraints(arrive.getConstraints()))
         continue;
-      for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+      Operation *start = arrive->getPrevNode();
+      if (getAttachedFence(arrive))
+        start = start->getPrevNode();
+      for (auto *cur = start; cur; cur = cur->getPrevNode()) {
         if (isNamedBarrierOp(cur))
           break;
         if (isMemoryOp(cur)) {
@@ -296,10 +321,12 @@ inline void optimizeWSBarrierLocations(
       continue;
     if (auto arrive = dyn_cast<ArriveBarrierOp>(barrier)) {
       Operation *anchor = getArriveAnchorAfterOperands(arrive, memOp);
-      if (barrier->getPrevNode() != anchor) {
+      FenceAsyncSharedOp fence = getAttachedFence(arrive);
+      Operation *prev = fence ? fence->getPrevNode() : barrier->getPrevNode();
+      if (prev != anchor) {
         Operation *target = anchor->getNextNode();
         if (!wouldBreakOperandDominance(barrier, target))
-          barrier->moveAfter(anchor);
+          moveArriveAfter(arrive, anchor);
       }
     } else {
       if (barrier->getNextNode() != memOp) {

@@ -70,7 +70,9 @@ bool canUnifyWaitLocations(WaitBarrierOp earlier, WaitBarrierOp later) {
     if (!op || !canRaiseWSWaitPast(later, op))
       return false;
 
-    if (isBarrierLikeOp(op))
+    // A proxy fence attached to a release (see WSLowerToken) only orders the
+    // reads before it; waiting earlier does not affect it.
+    if (isBarrierLikeOp(op) || isa<FenceAsyncSharedOp>(op))
       continue;
     if (!isAllowedRegionOp(op) && !isBarrierBookkeepingOp(op))
       return false;
@@ -208,6 +210,11 @@ bool prioritizeTMemOperand(
       while (releaseCandidate && releaseCandidate != commonUser &&
              isPure(releaseCandidate))
         releaseCandidate = releaseCandidate->getNextNode();
+      // A proxy fence attached to the release moves with it.
+      auto releaseFence =
+          dyn_cast_or_null<FenceAsyncSharedOp>(releaseCandidate);
+      if (releaseFence)
+        releaseCandidate = releaseFence->getNextNode();
       auto release = dyn_cast_or_null<ArriveBarrierOp>(releaseCandidate);
       if (!release || !release->isBeforeInBlock(commonUser) ||
           !hasWSBarrierConstraints(release.getConstraints()))
@@ -258,6 +265,8 @@ bool prioritizeTMemOperand(
         acquire->moveBefore(commonUser);
       }
       localLoad->moveBefore(commonUser);
+      if (releaseFence)
+        releaseFence->moveBefore(commonUser);
       release->moveBefore(commonUser);
       for (Operation *op : llvm::reverse(reverseChain))
         op->moveBefore(commonUser);

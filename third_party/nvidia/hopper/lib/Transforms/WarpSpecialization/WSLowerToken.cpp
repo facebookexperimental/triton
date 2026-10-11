@@ -130,9 +130,21 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
-                              Value bufferEmpty, int numCTAs,
-                              unsigned emptyCnt) {
+                              Value bufferEmpty, int numCTAs, unsigned emptyCnt,
+                              ttnvws::TokenLoadType loadType) {
   auto loc = op.getLoc();
+  if (loadType == ttnvws::TokenLoadType::TMALoadOp &&
+      op->hasAttr(kGenericSmemReadsAttrName)) {
+    // The producer refills this buffer with a TMA load, which writes through
+    // the async proxy, while the consumer read it through the generic proxy
+    // (a local_load, e.g. of an epilogue bias). Order those reads before the
+    // buffer is handed back, or the next TMA write can land before they are
+    // performed. Async-proxy readers (wgmma, tcgen05) need no fence.
+    auto fenceOp = ttng::FenceAsyncSharedOp::create(builder, loc,
+                                                    /*bCluster=*/false);
+    setAsyncTaskIds(fenceOp, getAsyncTaskIds(op.getOperation()));
+    copyLoopScheduleInfo(fenceOp, op);
+  }
   auto arriveOp = ttng::ArriveBarrierOp::create(
       builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
       op.getConstraintsAttr());
@@ -319,7 +331,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
-                                 bufferEmptyCount);
+                                 bufferEmptyCount, loadType);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
