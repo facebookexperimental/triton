@@ -1146,6 +1146,11 @@ def TTNG_TMAStoreTokenWaitOp
   let extraClassDeclaration = [{
     void addBarrier(Value barrier, Value pred);
     void addToken(Value token, Value idx);
+    // Set the planned ring pending count computed by doTMAStoreWaitReorder,
+    // but only when this wait carries no barriers or deferred nvws tokens.
+    // Barrierful waits rotate differently and must use program-order counting,
+    // so the planned count does not apply to them.
+    void trySetPlannedPendingCount(int count);
   }];
 }
 

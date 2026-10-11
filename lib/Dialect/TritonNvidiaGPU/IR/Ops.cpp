@@ -1462,11 +1462,23 @@ void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
 void TMAStoreTokenWaitOp::addBarrier(Value barrier, Value pred) {
   getBarriersMutable().append(barrier);
   getBarrierPredsMutable().append(pred);
+  (*this)->removeAttr(kPlannedPendingCount);
 }
 
 void TMAStoreTokenWaitOp::addToken(Value token, Value idx) {
   getNvwsTokensMutable().append(token);
   getNvwsTokenIndicesMutable().append(idx);
+  (*this)->removeAttr(kPlannedPendingCount);
+}
+
+void TMAStoreTokenWaitOp::trySetPlannedPendingCount(int count) {
+  // Barrierful waits (carrying barriers or deferred nvws tokens) rotate
+  // differently and must use program-order counting, so the planned ring
+  // count does not apply to them.
+  if (!getBarriers().empty() || !getNvwsTokens().empty())
+    return;
+  (*this)->setAttr(kPlannedPendingCount,
+                   IntegerAttr::get(IntegerType::get(getContext(), 32), count));
 }
 
 // nvws-tokens-and-indices := (`nvws_token` ssa-value `[` ssa-value `]`)*
