@@ -38,7 +38,7 @@ high and is not sustained — steady-state under load is the number reported her
 | v4_global_prefetch | 866 | 836 | 72% | Manual 2-stage pipeline + inferred padded layout |
 | v5_local_prefetch | 868 | 836 | 72% | Manual 3-stage pipeline + inferred padded layout |
 | v6_loop_unroll | 833 | 859 | 74% | Step-2 loop unrolling, alternating register sets |
-| v7_slice | 958 | 913 | 79% | N-sliced B + inferred padded layout, manual 4-region pipeline |
+| v7_slice | 958 | 913² | 79%² | N-sliced B, manual 4-region pipeline; conflict-free LDS layout, AGPR accumulator pins, scalar K offsets |
 | v8_warp_pipeline | — | **1005** | **86%** | v7 + `warp_pipeline_stage` for `s_setprio` mem/MFMA interleave (8 warps) |
 | v9_beyond_hotloop | —¹ | **1026** | **89%** | v8 + PID remap (8 XCDs) + workgroup swizzle (GROUP_SIZE_M=4) |
 
@@ -64,14 +64,74 @@ win is the warp pipeline; the grid remap is the finishing polish.
 passes — that scheduler control is the main remaining headroom over the LLVM backend's
 default scheduling.
 
+² Measured before v7 gained its explicit LDS layout, accumulator pins and scalar K offsets.
+For the current kernel, unscheduled and with the MFMA scheduler, see
+[v7 and the MFMA scheduler](#v7-and-the-mfma-scheduler).
+
 ### Layout inference
 
-From v4 onward the padded shared layout is **inferred by the compiler** from the dot
+From v4 to v6 the padded shared layout is **inferred by the compiler** from the dot
 operands — `tlx.local_alloc(...)` with no `layout=` argument produces the exact same
 `padded_shared<[512:+16]>` encoding (and identical assembly) as the hand-written
 `tlx.padded_shared_layout.with_identity_for([(512,16)], ...)`. v3 keeps the explicit
 form to teach what the layout is; v2 keeps an explicit *swizzled* layout to stay the
 pre-padding step. See `InsertRequireLayout.cpp`.
+
+v7 pins explicit offset bases again. For direct-to-LDS buffers the inferred layout keeps
+plain row-major order, which costs 4 bank conflicts per LDS instruction; the bit
+permutation v7 uses measures 0 (see [below](#v7-and-the-mfma-scheduler)).
+
+## v7 and the MFMA scheduler
+
+v7 is the last 4-wave step: one wave both loads and computes. v8 closes the remaining
+scheduling gap with hardware (8 waves and `warp_pipeline_stage`). The other way is the one the
+Gluon tutorial uses: a compiler pass that interleaves the MFMAs with the memory work inside each
+wave. That pass is the AMD backend's MFMA scheduler (upstream
+[triton-lang/triton#12209](https://github.com/triton-lang/triton/pull/12209)), an LLVM-IR pass
+that runs on gfx950 when a kernel is compiled with `schedule_hint="mfma-schedule"`. It models the
+MFMA <-> memory interleave of GEMM hot loops only; `bench.py --schedule-hint mfma-schedule` and
+`matmul(a, b, schedule_hint="mfma-schedule")` pass the option to v7.
+
+For the pass to deliver, v7 has to be the same kernel as the Gluon `v7_sliceN`. Three details
+of the kernel source matter:
+
+| | Without it | In v7 |
+|---|---|---|
+| LDS layout | inferred padded layout, plain row-major order: 4 bank conflicts per LDS instruction | explicit conflict-free offset bases: 0 |
+| Accumulator | LLVM splits it across VGPRs and AGPRs: ~140 `v_accvgpr` copies in the hot loop | `tlx.amd_dot(..., register_class="agpr")` pins every MFMA tile to AGPRs: 0 copies |
+| K offset | added to every element of the i32 offset tensors: vector adds in the hot loop | advances the scalar base pointer: none |
+
+Measured with this `bench.py` on one gfx950 (MI355X), fp16, M=N=4096, K=8192, two rounds, on
+the current `main` (AMD codegen LLVM d26ff26e). `triton` is the default `do_bench` median;
+`batched` is `--timing-mode batched`. This is a different GPU from the table at the top, so
+compare by the ratio to rocBLAS. "Before" is v7 with the inferred layout, no pins and tensor K
+offsets.
+
+| Kernel | `triton` TFLOPS | %rocBLAS | `batched` TFLOPS | %rocBLAS | `SQ_LDS_BANK_CONFLICT` per launch |
+|---|---:|---:|---:|---:|---:|
+| rocBLAS | 1402 / 1406 | | 1450 / 1456 | | |
+| v7 before | 959 / 957 | 68% | 1087 / 1088 | 75% | 1.68e7 |
+| v7 before + scheduler | 1200 / 1204 | 86% | 1264 / 1264 | 87% | 1.68e7 |
+| v7 | 749 / 752 | 53% | 960 / 962 | 66% | 0 |
+| v7 + scheduler | **1393 / 1398** | **99%** | **1466 / 1475** | **101%** | 0 |
+
+The three details are not a win on their own: without the scheduler, LLVM's default schedule
+still decides the outcome, and the current codegen LLVM (d26ff26e) has a register-pressure
+regression that the accumulator pins expose when nothing fixes the MFMA order (the unscheduled
+v7 carries 636 `v_accvgpr` copies in its hot loop; on the previous LLVM pin it carried 0 and ran at
+75% / 84%). Upstream moved to 6bc4aaf6 for that reason. The details are what lets the scheduler
+deliver, and the scheduled hot loop is then instruction-for-instruction the scheduled Gluon v7
+loop (256 MFMA, 64 `ds_read_b128`, 32 direct-to-LDS loads, 0 `v_accvgpr`, 0 vector ALU), unaffected
+by the pin.
+
+The scheduler is for 4-wave kernels. Do not enable it for v8 / v9 or other
+`warp_pipeline_stage` kernels: their interleave is already fixed by the pipeline stages, and the
+pass measured 2-5% slower there as a plugin.
+
+```bash
+python bench.py --version 7 --K 8192                                 # unscheduled
+python bench.py --version 7 --K 8192 --schedule-hint mfma-schedule   # scheduled
+```
 
 ## Compiler Fixes Applied
 
@@ -97,7 +157,10 @@ All versions use `num_stages=1` with manual pipeline management (matching Gluon'
 - **v0-v3**: TLX matches or exceeds Gluon — layout propagation works well.
 - **v4-v7**: Manual pipelines reach ~72-77% of rocBLAS, a few % behind Gluon. The gap
   is LLVM-backend instruction scheduling — Gluon's published best uses custom
-  `llirSched` / `amdgcnSched` passes that the default backend scheduler doesn't match.
+  MFMA scheduler (`llirSched`, now in-tree) / `amdgcnSched` passes that the default backend scheduler doesn't match.
+  v7 can now be scheduled by the same pass, in-tree as the AMD backend's MFMA scheduler
+  (`schedule_hint="mfma-schedule"`): 99% of rocBLAS at 4 waves (see
+  [v7 and the MFMA scheduler](#v7-and-the-mfma-scheduler)).
 - **v8**: `warp_pipeline_stage` (`s_setprio` mem/compute interleaving) is the big
   hot-loop win — 1005T / 86% of rocBLAS, ahead of Gluon v7 (958T) measured here.
   TLX-only (Gluon has no warp-pipeline step).
