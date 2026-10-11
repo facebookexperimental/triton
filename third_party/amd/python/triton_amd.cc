@@ -4,6 +4,7 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
+#include "amd/lib/Target/MFMASchedule/MFMASchedule.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
 #include "mlir/Pass/PassManager.h"
@@ -579,6 +580,10 @@ void init_triton_amd(py::module_ &m) {
 
   m.def("add_scalarize_packed_fops_llvm_pass", [](llvm::Function *fn) {
     mlir::triton::AMD::runScalarizePackedFOpsPass(*fn);
+  });
+
+  m.def("add_mfma_schedule_pass", [](llvm::Function *fn) -> bool {
+    return mlir::triton::AMD::runMFMASchedulePass(*fn);
   });
 
   auto hipBlas = m.def_submodule("hipblas");
