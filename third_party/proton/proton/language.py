@@ -1,6 +1,7 @@
 from triton.language import core as tl
 from triton.language.core import builtin
 from triton._C.libtriton import proton as triton_proton
+from triton.compiler.code_generator import WITH_DISPATCH
 from triton.language.semantic import TritonSemantic
 from triton.experimental.gluon.language._semantic import GluonSemantic
 
@@ -145,3 +146,33 @@ class scope:
 
     def __exit__(self, exc_type, exc_value, traceback):
         exit_scope(self.name, predicate=self.predicate, _semantic=self.semantic)
+
+
+def _visit_with_proton_scope(codegen, node):
+    """Lower `with pl.scope(...)` inside JIT functions.
+
+    The JIT only calls ``__enter__``/``__exit__`` for context managers
+    registered in its ``WITH_DISPATCH`` table; anything else is silently
+    reduced to its body. Registering this handler restores instrumentation
+    for the context-manager form (equivalent to ``enter_scope`` /
+    ``exit_scope``), threading the code generator's semantic through so the
+    builtin calls succeed.
+    """
+    if len(node.items) != 1:
+        raise ValueError("pl.scope cannot be combined with other context managers in a single 'with' statement")
+    item = node.items[0]
+    if item.optional_vars is not None:
+        raise ValueError("pl.scope does not support 'as' targets")
+    context = item.context_expr
+    args = [codegen.visit(arg) for arg in context.args]
+    kwargs = {kw.arg: codegen.visit(kw.value) for kw in context.keywords}
+    kwargs["_semantic"] = codegen.semantic
+    ctx = scope(*args, **kwargs)
+    ctx.__enter__()
+    try:
+        codegen.visit_compound_statement(node.body)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+WITH_DISPATCH[scope] = _visit_with_proton_scope
