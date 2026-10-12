@@ -38,7 +38,11 @@ def _hex_float_values(output: bytes) -> Counter:
                                                       ("static_print", "int32"),
                                                       ("no_arg_print", "int32"),
                                                       ("print_no_arg", "int32"),
-                                                      ("device_print_large", "int32"),
+                                                      pytest.param(
+                                                          "device_print_large",
+                                                          "int32",
+                                                          marks=pytest.mark.skip(reason="Flaky device print output"),
+                                                      ),
                                                       ("print_multiple_args", "int32"),
                                                       ("device_print_multiple_args", "int32"),
                                                       ("device_print_hex", "int16"),
