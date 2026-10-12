@@ -58,6 +58,7 @@
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.named_barrier_arrive(bar_id, num_threads)</code> <strong>[sm90+]</strong></div></div>
 <p>Signal arrival at a named mbarrier.</p>
 <p>For both APIs, <code>num_threads</code> is the total number of threads required to flip the barrier phase: <code>num_waiting_threads + num_arriving_threads</code>. Wait and Arrive calls for the same barrier phase must use the same value.</p>
+<p>The backend lowers these to PTX <code>bar.sync</code>/<code>bar.arrive</code> (the <code>.aligned</code> forms) whenever the barrier provably executes warp-uniformly -- i.e. all threads in a warp execute the same barrier instruction -- and to the non-aligned <code>barrier.sync</code>/<code>barrier.arrive</code> otherwise. Warp-level divergence (warp specialization, branches on warp IDs) is compatible with <code>.aligned</code>; divergence on thread IDs or on data that can vary by thread within a warp is not.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_expect_bytes(bar, bytes)</code> <strong>[sm90+]</strong></div></div>
 <p>Signal a barrier of an expected number of bytes to be copied.</p>
 <h2 id="scheduling-barriers">Scheduling barriers</h2>
