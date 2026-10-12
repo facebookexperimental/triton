@@ -89,3 +89,25 @@ def test_compile_module_bad_cache(fresh_knobs):
 
         assert mod.go("huh") == "huh"
         assert mod.go("hello") == "hiya"
+
+
+def _cache_key(build, root, library_dirs, include_dirs):
+    config = dict(language=["c"], library_dirs=library_dirs, include_dirs=include_dirs, libraries=None, ccflags=None)
+    return build._get_cache_manager(b"src", config=config).key
+
+
+def test_cache_key_ignores_triton_install_location(monkeypatch, fresh_triton_cache):
+    from triton.runtime import build
+
+    keys = []
+    for root in ("/mnt/xarfuse/uid-0/seed-a/triton", "/mnt/xarfuse/uid-1/seed-b/triton"):
+        monkeypatch.setattr(build, "_TRITON_ROOT", root)
+        keys.append(_cache_key(build, root, [f"{root}/backends/nvidia/lib"], [f"{root}/backends/nvidia/include"]))
+    assert keys[0] == keys[1]
+
+
+def test_cache_key_tracks_dirs_outside_triton(monkeypatch, fresh_triton_cache):
+    from triton.runtime import build
+
+    monkeypatch.setattr(build, "_TRITON_ROOT", "/opt/triton")
+    assert _cache_key(build, "/opt/triton", ["/usr/lib/a"], None) != _cache_key(build, "/opt/triton", ["/usr/lib/b"], None)
