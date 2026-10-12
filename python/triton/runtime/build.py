@@ -114,6 +114,19 @@ def _load_module_from_path(name: str, path: str) -> ModuleType:
     return mod
 
 
+# Root of the installed triton package. A packaged install (e.g. a XAR) can be
+# mounted at a different path in every process, so directories inside it are
+# keyed relative to this root; otherwise the same package never hits its own cache.
+_TRITON_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _cache_key_path(path: str) -> str:
+    abs_path = os.path.abspath(path)
+    if os.path.commonpath([abs_path, _TRITON_ROOT]) != _TRITON_ROOT:
+        return path
+    return os.path.join("<triton>", os.path.relpath(abs_path, _TRITON_ROOT))
+
+
 def _get_cache_manager(src: bytes, config: dict[str, list[str] | None]):
     digest = hashlib.sha256()
     digest.update(src)
@@ -123,6 +136,8 @@ def _get_cache_manager(src: bytes, config: dict[str, list[str] | None]):
             continue
         digest.update(k.encode("utf-8"))
         for v in vs:
+            if k in ("library_dirs", "include_dirs"):
+                v = _cache_key_path(v)
             digest.update(v.encode("utf-8"))
             digest.update(b":")
     key = digest.hexdigest()
