@@ -185,7 +185,58 @@ not validate the protocol assumptions above. Promotion remains disabled by
 default behind `TRITON_PROMOTE_MBAR_TO_NAMED_BARRIER`; enable it only for
 protocols whose equivalence has been established.
 
-### 5.2 Profitability
+### 5.2 Phase-offset and backward-edge barriers
+
+An mbarrier wait may be initially satisfied because its requested parity does
+not match the phase established by `init_barrier`. This is common for backward
+edges in a pipelined or circular-buffer schedule: the consumer must not wait
+before the buffer's first use, but subsequent uses must wait for the producer
+from an earlier iteration. A named barrier has no initial parity state, so an
+unconditional named-barrier wait would introduce a synchronization that was
+not present in the original program.
+
+Such a barrier may be promoted only when the pass can statically prove the
+complete arrival-to-wait schedule for every physical barrier slot:
+
+1. The loop iteration can be normalized from statically understood induction
+   variables, bounds, and steps.
+2. The slot-selection expression and the distance between the producer
+   arrival and its corresponding consumer wait are statically known. For a
+   circular buffer, this is typically a fixed distance `K`, with
+   `slot = iteration mod K` and the wait in iteration `i` consuming the arrival
+   from iteration `i - K`. The arrivals for `i - K < 0` are priming arrivals:
+   statically placed prologue arrivals that execute before the loop and
+   establish the initial phases the first waits observe. A fixed-distance
+   schedule without its priming arrivals leaves the first `K` waits satisfied
+   with no paired arrival, which item 3 rejects.
+3. Every wait executes unconditionally: its predicate must be provably
+   always-true, and no generation may skip the wait. Waits that begin
+   satisfied with no paired priming arrival (initially-skipped phases), waits
+   predicated on a loop-nonempty condition (peeled prologues), and any other
+   schedule whose enabling condition cannot be proven true on entry and every
+   iteration are rejected (see §5.3).
+4. Every wait is paired with exactly one arrival in the same named
+   barrier generation. No data-dependent exit, divergent branch, dynamic trip
+   count, or task-local iteration skew may cause the producer and consumer to
+   advance different numbers of generations.
+5. Arrivals outside the steady-state pairing need static placement. A
+   trailing arrival with no later wait is allowed only when it is statically
+   terminal and the named-barrier ID cannot be reused afterward. A leading
+   (priming) arrival with no earlier wait is allowed only when it executes
+   at most once, before the loop it primes. Otherwise, the candidate is
+   rejected.
+
+The participant count remains the sum of all producer and consumer threads.
+Named-barrier arrivals have no producer or consumer identity, so every counted
+thread must arrive every generation; this is why predicated participation is
+excluded rather than approximated with a reduced thread count.
+
+For multi-buffer groups, the proof applies to the group as a whole. Every slot
+must have a consistent fixed-distance schedule and a provably aligned first
+use. If any slot or control-flow path cannot be resolved simply and
+statically, the entire group remains an mbarrier group.
+
+### 5.3 Profitability
 
 The initial profitability policy is deliberately conservative:
 
@@ -193,11 +244,22 @@ The initial profitability policy is deliberately conservative:
   not eliminate the group's allocation and phase-management cost.
 - Do not promote per-thread-arrival barriers. Independent arrival is an
   mbarrier advantage and removing it may require extra synchronization.
+- Do not promote predicated, initially-skipped, or loop-peeled schedules.
+  These are rejected on safety grounds first (§5.2 item 3): their enabling
+  conditions cannot be proven, so no sound unconditional named-barrier
+  program exists for them. They would additionally be unprofitable: the
+  compiler could generate predicated named-barrier waits for these shapes,
+  but the predicate computation and extra control flow cost more than the
+  mbarrier savings in every case observed so far. Rejected candidates keep
+  working mbarriers.
 
-These restrictions can be relaxed after evaluation provides a stronger cost
-model.
+The profitability-driven restrictions above can be relaxed after evaluation
+provides a stronger cost model. That does not apply to the §5.2 safety
+rules. Admitting predicated or initially-skipped schedules would first
+require a soundness proof (for example, predicated named-barrier waits with
+proven generation alignment), and only then a cost argument.
 
-### 5.3 Priority
+### 5.4 Priority
 
 When there are fewer named-barrier IDs than promotable groups, rank candidates
 with these initial rules:
@@ -233,4 +295,7 @@ contract, verifier failures, allocator behavior, safety analysis, candidate
 ranking, and rewrites. Final end-to-end tests must expose the
 disabled-by-default promotion knob and demonstrate correct execution and code
 generation for regular AutoWS Triton, TLX without named barriers, and TLX with
-named barriers.
+named barriers. Phase-offset coverage must include positive fixed-distance
+schedules and rejection cases for predicated waits, initially-skipped
+generations, peeled prologues, dynamic distance, divergent predication,
+mismatched trip counts, and unmatched non-terminal generations.
