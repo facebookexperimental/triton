@@ -1,0 +1,20 @@
+{
+  "priority": 20,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": ["gfx950", "cdna4", "mi350", "mi350x", "mi355x"],
+  "selection": "optimize-amd-gfx950-gemm",
+  "documents": [
+    "gfx950-gemm-optimization.md",
+    "references/measurement-and-baselines.md",
+    "references/experiment-workflow.md",
+    "references/production-kernel-architecture.md",
+    "references/gfx950-gemm-design-space.md",
+    "references/work-distribution.md",
+    "references/pipeline-and-machine-scheduling.md",
+    "references/irregular-tiles-and-k-tails.md",
+    "references/locality-resources-and-cache.md",
+    "references/profiling-and-artifact-analysis.md",
+    "references/compiler-integration-contract.md",
+    "references/gfx950-gemm-shape-families.md"
+  ]
+}

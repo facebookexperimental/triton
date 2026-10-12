@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from ..contracts import (
@@ -63,6 +64,8 @@ def test_target_registry_resolves_vendor_architecture_bundle() -> None:
     )
     assert cases.name == "cases.json"
     assert target.name == "target.json"
+    target_payload = json.loads(target.read_text())
+    assert target_payload["optimization_skills"] == ["optimize-amd-gfx950-gemm"]
 
 
 def test_platform_registries_select_knowledge_and_profiler() -> None:
@@ -81,4 +84,14 @@ def test_platform_registries_select_knowledge_and_profiler() -> None:
 
     amd_paths = knowledge_paths(KernelTarget(backend="hip", architecture="gfx950"))
     assert any("knowledge/amd/common" in str(path) for path in amd_paths)
+    assert not any("knowledge/amd/gfx950_gemm" in str(path) for path in amd_paths)
+
+    gfx950_gemm_paths = knowledge_paths(
+        KernelTarget(
+            backend="hip",
+            architecture="gfx950",
+            optimization_skills=("optimize-amd-gfx950-gemm",),
+        )
+    )
+    assert any("knowledge/amd/gfx950_gemm" in str(path) for path in gfx950_gemm_paths)
     assert native_profiler_for_backend("hip") == "rocprofv3"
